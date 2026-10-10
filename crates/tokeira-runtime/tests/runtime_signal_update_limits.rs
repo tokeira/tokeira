@@ -11,6 +11,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::{sync::Arc, time::Instant};
+use tokeira_storage::WriteFence;
 
 use anyhow::Result;
 use proptest::prelude::*;
@@ -29,8 +30,7 @@ use tokeira_runtime::{
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
     ExecutionRef, Memo, NamespaceId, Payloads, QueueKey, RequestContext, RequestId, RunId, RunKey,
-    SearchAttributes, ShardEpoch, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
-    WorkflowType,
+    SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
 };
 
 const QUEUE: &str = "limits-queue";
@@ -290,7 +290,7 @@ async fn seed(
                 events_numbered_at_close: 0,
                 growth_limits: None,
             },
-            ShardEpoch::ZERO,
+            WriteFence::Unfenced,
         )
         .await?;
     Ok(())

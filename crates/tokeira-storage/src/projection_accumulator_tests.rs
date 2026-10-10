@@ -47,14 +47,14 @@ pub(crate) async fn commit(
     repo: &dyn RunRepository,
     transition: Transition,
     bundle: bool,
-    epoch: ShardEpoch,
+    fence: WriteFence,
 ) -> Result<CommitResult> {
     let key = transition.next_state.run_key;
     if bundle {
-        repo.commit_transition_for_bundle(key, ShardId(0), transition, epoch)
+        repo.commit_transition_for_bundle(key, ShardId(0), transition, fence)
             .await
     } else {
-        repo.commit_transition(key, transition, epoch).await
+        repo.commit_transition(key, transition, fence).await
     }
 }
 
@@ -401,7 +401,7 @@ proptest! {
                 for observation in &steps {
                     observe(&mut transition.next_state, observation);
                     let expected = baseline_image(&transition.next_state, previous.as_ref(), 0).unwrap();
-                    let new_state = applied(commit(&store, transition, bundle, ShardEpoch::ZERO).await.unwrap());
+                    let new_state = applied(commit(&store, transition, bundle, WriteFence::Unfenced).await.unwrap());
                     assert_eq!(new_state.used_worker_deployment_versions, Some(image_versions(&expected)));
                     assert_eq!(store.load_run(key).await.unwrap(), LoadedRun::Existing(new_state.clone()));
                     let durable = store.inner.lock().await;
@@ -433,7 +433,7 @@ proptest! {
                     let mut transition = following(&state);
                     transition.next_state.search_attributes.0.insert("TemporalUsedWorkerDeploymentVersions".into(), SearchAttrValue::KeywordList(values.clone()));
                     transition.request_dedupe_ops.push(RequestDedupeOp { request_id: RequestId("not-written".into()) });
-                    let error = commit(&store, transition, bundle, ShardEpoch::ZERO).await.unwrap_err();
+                    let error = commit(&store, transition, bundle, WriteFence::Unfenced).await.unwrap_err();
                     assert!(error.downcast_ref::<ProjectionAccumulatorError>().is_some());
                     assert_eq!(store.snapshot().await.unwrap(), before);
                     assert_eq!(store.inner.lock().await.projection_image_lookups.load(Ordering::Relaxed), 0);
@@ -453,14 +453,21 @@ proptest! {
                 let mut start = fresh_transition(key);
                 start.next_state.used_worker_deployment_versions = Some(values.clone());
                 start.request_dedupe_ops.push(RequestDedupeOp { request_id: RequestId("duplicate".into()) });
-                let winner = applied(commit(&store, start, bundle, ShardEpoch::ZERO).await.unwrap());
+                let winner = applied(commit(&store, start, bundle, WriteFence::Unfenced).await.unwrap());
                 for failure in 0..6 {
                     let before = store.snapshot().await.unwrap();
                     let mut transition = following(&winner);
                     transition.next_state.used_worker_deployment_versions = None;
-                    let mut epoch = ShardEpoch::ZERO;
+                    let mut fence = WriteFence::Unfenced;
                     match failure {
-                        0 => epoch = ShardEpoch(1),
+                        // A lease fence where no lease exists.
+                        0 => {
+                            fence = WriteFence::Lease(crate::ExecutionHomeFence {
+                                home: ShardId(0),
+                                owner: "owner".into(),
+                                epoch: ShardEpoch(1),
+                            })
+                        }
                         1 => transition.expected_seq = TransitionSeq::ZERO,
                         2 => transition.request_dedupe_ops.push(RequestDedupeOp { request_id: RequestId("duplicate".into()) }),
                         3 => {},
@@ -474,9 +481,10 @@ proptest! {
                             transition.next_state.run_id = RunId::new();
                         },
                     }
-                    let result = commit(&store, transition, bundle, epoch).await;
+                    let result = commit(&store, transition, bundle, fence).await;
                     match failure {
-                        0 | 1 => assert!(matches!(result, Ok(CommitResult::Conflict { .. }))),
+                        0 => assert!(result.as_ref().is_err_and(|error| error.downcast_ref::<crate::LeaseFenceLost>().is_some())),
+                        1 => assert!(matches!(result, Ok(CommitResult::Conflict { .. }))),
                         2 => assert!(matches!(result, Ok(CommitResult::Duplicate))),
                         3 | 4 => assert!(result.is_err()),
                         _ => assert!(matches!(result, Ok(CommitResult::CurrentExecutionConflict { .. }))),
@@ -486,9 +494,9 @@ proptest! {
                 let mut close = following(&winner);
                 close.next_state.status = ExecutionStatus::Completed;
                 close.next_state.closed_at = Some(winner.started_at);
-                let closed = applied(commit(&store, close, bundle, ShardEpoch::ZERO).await.unwrap());
+                let closed = applied(commit(&store, close, bundle, WriteFence::Unfenced).await.unwrap());
                 let home = tokeira_types::execution_home_bundle(closed.namespace_id.0.as_bytes(), closed.workflow_id.0.as_bytes(), InMemoryStore::effective_shard_count(&*store.inner.lock().await));
-                let result = store.delete_run_for_bundle(key, home, DeleteRunRequest { expected_seq: closed.transition_seq, deleted_at: closed.started_at }, ShardEpoch::ZERO).await.unwrap();
+                let result = store.delete_run_for_bundle(key, home, DeleteRunRequest { expected_seq: closed.transition_seq, deleted_at: closed.started_at }, WriteFence::Unfenced).await.unwrap();
                 let DeleteRunResult::Deleted { tombstone } = result else { panic!("delete failed") };
                 assert!(tombstone.context.search_attributes.0.is_empty());
                 assert!(tombstone.context.memo.0.is_empty());
@@ -510,7 +518,7 @@ proptest! {
                 let key = RunKey::new();
                 let mut start = fresh_transition(key);
                 start.growth_limits = Some(state_limit(0));
-                let state = applied(commit(&store, start, bundle, ShardEpoch::ZERO).await.unwrap());
+                let state = applied(commit(&store, start, bundle, WriteFence::Unfenced).await.unwrap());
                 let mut transition = following(&state);
                 transition.next_state.used_worker_deployment_versions = Some(values.clone());
                 observe(&mut transition.next_state, &(Some("new-observation".into()), 0, false));
@@ -526,16 +534,16 @@ proptest! {
                 assert_eq!(crate::codec::measured_state_len(bytes.len(), &folded).unwrap(), measured);
                 transition.growth_limits = Some(state_limit(measured - 1));
                 let before = store.snapshot().await.unwrap();
-                let error = commit(&store, transition.clone(), bundle, ShardEpoch::ZERO).await.unwrap_err();
+                let error = commit(&store, transition.clone(), bundle, WriteFence::Unfenced).await.unwrap_err();
                 assert_eq!(error.downcast_ref::<RunLimitExceeded>().unwrap().limit, RunLimit::StateSize);
                 assert_eq!(store.snapshot().await.unwrap(), before);
                 transition.growth_limits = Some(state_limit(measured));
-                let state = applied(commit(&store, transition, bundle, ShardEpoch::ZERO).await.unwrap());
+                let state = applied(commit(&store, transition, bundle, WriteFence::Unfenced).await.unwrap());
                 assert_eq!(state, folded);
                 let mut close = following(&state);
                 close.next_state.status = ExecutionStatus::Completed;
                 close.growth_limits = Some(state_limit(0));
-                applied(commit(&store, close, bundle, ShardEpoch::ZERO).await.unwrap());
+                applied(commit(&store, close, bundle, WriteFence::Unfenced).await.unwrap());
             }
         });
     }
@@ -556,14 +564,14 @@ proptest! {
                     start.history_events = reset_history(&start.next_state).into();
                     start.event_principals = vec![None; start.history_events.len()].into();
                     start.next_state.last_event_id = 10;
-                    let base_state = applied(commit(&store, start, bundle, ShardEpoch::ZERO).await.unwrap());
+                    let base_state = applied(commit(&store, start, bundle, WriteFence::Unfenced).await.unwrap());
                     let mut predecessor = base;
                     for generation in 0..2 {
                         let run_id = RunId::new();
                         let key = RunKey::derive(base_state.namespace_id, &base_state.workflow_id, run_id);
                         let fork = if generation == 0 { 10 } else { 7 };
                         let expected = store.find_latest_run(base_state.namespace_id, &base_state.workflow_id).await.unwrap();
-                        store.materialize_reset_successor(predecessor, fork, run_id, expected).await.unwrap();
+                        store.materialize_reset_successor(predecessor, fork, run_id, expected, WriteFence::Unfenced).await.unwrap();
                         {
                             let mut durable = store.inner.lock().await;
                             assert_eq!(durable.runs[&key].used_worker_deployment_versions, Some(Vec::new()));
@@ -578,7 +586,7 @@ proptest! {
                         let mut transition = following(&state);
                         if change { observe(&mut transition.next_state, &(Some("v3".into()), 0, false)); }
                         let expected = baseline_image(&transition.next_state, None, store.inner.lock().await.history_size[&key]).unwrap();
-                        let new_state = applied(commit(&store, transition, bundle, ShardEpoch::ZERO).await.unwrap());
+                        let new_state = applied(commit(&store, transition, bundle, WriteFence::Unfenced).await.unwrap());
                         let current_version = if change { "deployment:v3" } else if generation == 0 { "deployment:v2" } else { "deployment:v1" };
                         assert_eq!(new_state.used_worker_deployment_versions, Some(vec![current_version.into()]));
                         assert_eq!(store.inner.lock().await.projection_log.last().unwrap().context, expected);
@@ -612,11 +620,11 @@ proptest! {
                     start.next_state.last_event_id = 10;
                     start.next_state.status = ExecutionStatus::Completed;
                 }
-                let first = applied(commit(&store, start, bundle, ShardEpoch::ZERO).await.unwrap());
+                let first = applied(commit(&store, start, bundle, WriteFence::Unfenced).await.unwrap());
                 if boundary == 2 {
                     let new_id = RunId::new();
                     let expected = store.find_latest_run(first.namespace_id, &first.workflow_id).await.unwrap();
-                    store.materialize_reset_successor(key, 10, new_id, expected).await.unwrap();
+                    store.materialize_reset_successor(key, 10, new_id, expected, WriteFence::Unfenced).await.unwrap();
                     key = RunKey::derive(first.namespace_id, &first.workflow_id, new_id);
                 }
                 for (index, observation) in steps.iter().enumerate() {
@@ -634,7 +642,7 @@ proptest! {
                         memory_legacy_step(&store, key, observation).await;
                         assert!(store.inner.lock().await.runs[&key].used_worker_deployment_versions.is_none());
                     } else {
-                        let applied = applied(commit(&store, transition, bundle, ShardEpoch::ZERO).await.unwrap());
+                        let applied = applied(commit(&store, transition, bundle, WriteFence::Unfenced).await.unwrap());
                         assert_eq!(applied.used_worker_deployment_versions, Some(image_versions(&expected)));
                         assert_eq!(store.inner.lock().await.runs[&key], applied);
                     }
@@ -650,7 +658,7 @@ proptest! {
                 let mut persist = following(&state);
                 observe(&mut persist.next_state, &(None, 0, false));
                 persist.next_state.used_worker_deployment_versions.as_mut().unwrap().push("retained-only".into());
-                let ready = applied(commit(&store, persist, bundle, ShardEpoch::ZERO).await.unwrap());
+                let ready = applied(commit(&store, persist, bundle, WriteFence::Unfenced).await.unwrap());
                 let persisted = store.snapshot().await.unwrap();
                 let pruned = InMemoryStore::from_snapshot(&persisted).unwrap();
                 prune_fixture_images(&pruned).await;
@@ -658,8 +666,8 @@ proptest! {
                     let LoadedRun::Existing(state) = store.load_run(key).await.unwrap() else { panic!("control") };
                     let mut transition = following(&state);
                     observe(&mut transition.next_state, observation);
-                    let control = applied(commit(&store, transition.clone(), bundle, ShardEpoch::ZERO).await.unwrap());
-                    let after_prune = applied(commit(&pruned, transition, bundle, ShardEpoch::ZERO).await.unwrap());
+                    let control = applied(commit(&store, transition.clone(), bundle, WriteFence::Unfenced).await.unwrap());
+                    let after_prune = applied(commit(&pruned, transition, bundle, WriteFence::Unfenced).await.unwrap());
                     assert_eq!(control, after_prune);
                     assert_eq!(store.inner.lock().await.projection_log.last().unwrap().context, pruned.inner.lock().await.projection_log.last().unwrap().context);
                 }

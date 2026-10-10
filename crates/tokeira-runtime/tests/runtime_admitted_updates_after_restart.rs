@@ -16,6 +16,7 @@ use std::{
     },
     time::Instant,
 };
+use tokeira_storage::WriteFence;
 
 use anyhow::Result;
 use proptest::prelude::*;
@@ -34,8 +35,8 @@ use tokeira_runtime::{
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
     ExecutionRef, Memo, NamespaceId, Payload, Payloads, QueueKey, RequestContext, RequestId, RunId,
-    RunKey, SearchAttributes, ShardEpoch, ShardId, TaskKind, TaskQueueName, WorkerIdentity,
-    WorkflowId, WorkflowType,
+    RunKey, SearchAttributes, ShardId, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
+    WorkflowType,
 };
 
 const QUEUE: &str = "restart-queue";
@@ -287,7 +288,7 @@ async fn seed(
                 events_numbered_at_close: 0,
                 growth_limits: None,
             },
-            ShardEpoch::ZERO,
+            WriteFence::Unfenced,
         )
         .await?;
     Ok(())

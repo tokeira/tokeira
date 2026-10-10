@@ -523,7 +523,6 @@ where
             update_registry,
             message.run_key,
             message.command,
-            config,
             config.max_occ_retries,
             cache,
             &mut write_admission,
@@ -551,7 +550,6 @@ where
                     update_registry,
                     message.run_key,
                     terminate.clone(),
-                    config,
                     config.max_occ_retries,
                     cache,
                     &mut write_admission,
@@ -913,14 +911,31 @@ where
                             // Reapply extraction failed: surface the error to the
                             // reset RPC and do NOT materialize a successor missing
                             // its reapplied events.
-                        } else if let Err(error) = repo
-                            .materialize_reset_successor(
+                        } else if let Err(error) = async {
+                            // The materialization is fenced by the home's lease,
+                            // as the reset's commit was (`bundle-lease-fence`).
+                            let fence = {
+                                let owner = shard_owner.read().expect("shard_owner lock poisoned");
+                                let home = execution_home_bundle(
+                                    new_state.namespace_id.0.as_bytes(),
+                                    new_state.workflow_id.0.as_bytes(),
+                                    owner.shard_count(),
+                                );
+                                owner.write_fence(home).ok_or_else(|| {
+                                    crate::errors::NotShardOwner::local(home, ShardEpoch::ZERO)
+                                })?
+                            };
+                            repo.materialize_reset_successor(
                                 message.run_key,
                                 fork_event_id,
                                 successor_run_id,
                                 expected_current,
+                                fence,
                             )
                             .await
+                            .map_err(|error| crate::errors::lease_loss(error, shard_owner))
+                        }
+                        .await
                         {
                             tracing::error!(
                                 ?error,
@@ -1660,7 +1675,6 @@ where
         &UpdateRegistry::new(),
         run_key,
         command,
-        config,
         max_retries,
         &mut cache,
         &mut None,
@@ -1722,7 +1736,6 @@ async fn handle_message_with_cache<K, R>(
     update_registry: &UpdateRegistry,
     run_key: RunKey,
     command: Command,
-    config: &LaneConfig,
     max_retries: u32,
     cache: &mut LaneCache,
     write_admission: &mut Option<crate::serving_gate::WritePermit>,
@@ -1773,7 +1786,7 @@ where
             "tokeira.transition_number",
             transition.next_state.transition_seq.0 as i64,
         );
-        let (execution_home_bundle, epoch) = {
+        let (execution_home_bundle, fence) = {
             let owner = shard_owner.read().expect("shard_owner lock poisoned");
             let bundle_id = execution_home_bundle(
                 transition.next_state.namespace_id.0.as_bytes(),
@@ -1787,7 +1800,7 @@ where
             processing_span.record("tokeira.bundle_id", bundle_id.0);
             // Fast local reject if we plainly don't hold the bundle. This is an
             // optimization, not the safety boundary: a stale owner that still
-            // believes it owns the bundle is fenced by the epoch carried into
+            // believes it owns the bundle is refused by the fence carried into
             // the storage commit below, which is the only authoritative check.
             let Some(local_epoch) = owner.epoch_of(bundle_id) else {
                 return Ok((
@@ -1798,16 +1811,11 @@ where
                     SmallVec::new(),
                 ));
             };
-            // With no placement controller there is no durable lease to fence
-            // against, so committing at ZERO skips the lease read. Under a
-            // controller the real epoch must travel to storage so a superseded
-            // owner's writes are rejected by lease fencing.
-            let commit_epoch = if config.controller_managed_placement {
-                local_epoch
-            } else {
-                ShardEpoch::ZERO
-            };
-            (bundle_id, commit_epoch)
+            // Under controller-managed placement the fence carries the home's
+            // lease at the epoch this node holds it, so storage refuses a
+            // superseded owner's write (`bundle-lease-fence`). With no
+            // placement controller there is no lease to fence against.
+            (bundle_id, owner.fence_at(bundle_id, local_epoch))
         };
         transition_span.record(
             "transition_seq",
@@ -1836,13 +1844,14 @@ where
         let history_events = transition.history_events.clone();
 
         match repo
-            .commit_transition_for_bundle(run_key, execution_home_bundle, transition, epoch)
+            .commit_transition_for_bundle(run_key, execution_home_bundle, transition, fence)
             .instrument(storage_commit_span(
                 execution_home_bundle,
                 "commit_transition_for_bundle",
                 attempts,
             ))
-            .await?
+            .await
+            .map_err(|error| crate::errors::lease_loss(error, shard_owner))?
         {
             CommitResult::Applied { new_state } => {
                 cache.insert(run_key, LoadedRun::Existing(new_state.clone()));
@@ -2249,6 +2258,7 @@ mod tests {
         task::Poll,
         time::{Duration as StdDuration, Instant},
     };
+    use tokeira_storage::WriteFence;
 
     use opentelemetry::trace::TracerProvider;
     use proptest::prelude::*;
@@ -2608,7 +2618,7 @@ mod tests {
             &self,
             _run_key: RunKey,
             transition: Transition,
-            _epoch: ShardEpoch,
+            _fence: WriteFence,
         ) -> Result<CommitResult> {
             let gate = self.state.lock().await.commit_gate.take();
             if let Some(gate) = gate {
@@ -2641,9 +2651,9 @@ mod tests {
             run_key: RunKey,
             _execution_home_bundle: ShardId,
             transition: Transition,
-            epoch: ShardEpoch,
+            fence: WriteFence,
         ) -> Result<CommitResult> {
-            self.commit_transition(run_key, transition, epoch).await
+            self.commit_transition(run_key, transition, fence).await
         }
 
         async fn delete_run_for_bundle(
@@ -2651,12 +2661,16 @@ mod tests {
             _run_key: RunKey,
             _execution_home_bundle: ShardId,
             _request: tokeira_storage::DeleteRunRequest,
-            _epoch: ShardEpoch,
+            _fence: WriteFence,
         ) -> Result<tokeira_storage::DeleteRunResult> {
             Err(anyhow!("unused"))
         }
 
-        async fn abandon_materialization(&self, _run_key: RunKey) -> Result<()> {
+        async fn abandon_materialization(
+            &self,
+            _run_key: RunKey,
+            _fence: WriteFence,
+        ) -> Result<()> {
             Ok(())
         }
 
@@ -2679,6 +2693,7 @@ mod tests {
             _fork_event_id: i64,
             successor_run_id: RunId,
             _expected_current: Option<RunKey>,
+            _fence: WriteFence,
         ) -> Result<()> {
             let mut state = self.state.lock().await;
             let successor_run_key = RunKey::derive(
@@ -3278,7 +3293,6 @@ mod tests {
             &UpdateRegistry::new(),
             run_key,
             sample_command("first"),
-            &config,
             config.max_occ_retries,
             &mut cache,
             &mut None,
@@ -3294,7 +3308,6 @@ mod tests {
             &UpdateRegistry::new(),
             run_key,
             sample_command("second"),
-            &config,
             config.max_occ_retries,
             &mut cache,
             &mut None,
@@ -3348,7 +3361,6 @@ mod tests {
             &UpdateRegistry::new(),
             key,
             sample_command("cold"),
-            &config,
             2,
             &mut cache,
             &mut None,
@@ -3389,7 +3401,6 @@ mod tests {
             &UpdateRegistry::new(),
             key,
             sample_command("occ"),
-            &config,
             2,
             &mut cache,
             &mut None,
@@ -3416,7 +3427,6 @@ mod tests {
             &UpdateRegistry::new(),
             key,
             sample_command("evicted"),
-            &config,
             2,
             &mut cache,
             &mut None,
@@ -3482,7 +3492,6 @@ mod tests {
             &UpdateRegistry::new(),
             run_key,
             sample_command("conflict"),
-            &config,
             config.max_occ_retries,
             &mut cache,
             &mut None,

@@ -3,6 +3,7 @@
 //! caller is answered with the breach.
 
 use std::sync::Arc;
+use tokeira_storage::WriteFence;
 
 use anyhow::Result;
 use time::{Duration, OffsetDateTime};
@@ -20,8 +21,8 @@ use tokeira_runtime::{
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
     ExecutionRef, ExecutionStatus, Memo, NamespaceId, Payload, Payloads, QueueKey, RequestContext,
-    RequestId, RetryPolicy, RunKey, SearchAttributes, ShardEpoch, TaskKind, TaskQueueName,
-    WorkerIdentity, WorkflowId, WorkflowType,
+    RequestId, RetryPolicy, RunKey, SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity,
+    WorkflowId, WorkflowType,
 };
 
 fn start_request(namespace_id: NamespaceId, workflow_id: WorkflowId) -> StartRequest {
@@ -143,7 +144,7 @@ async fn the_history_count_terminates_the_run_one_write_after_the_limit() -> Res
                 events_numbered_at_close: 0,
                 growth_limits: None,
             },
-            ShardEpoch::ZERO,
+            WriteFence::Unfenced,
         )
         .await?;
 
@@ -232,7 +233,7 @@ async fn projection_accumulator_growth_breach_terminates_through_the_lane() -> R
                 events_numbered_at_close: 0,
                 growth_limits: None,
             },
-            ShardEpoch::ZERO,
+            WriteFence::Unfenced,
         )
         .await?;
     let error = runtime
@@ -508,7 +509,7 @@ async fn seed_history_size_over_the_limit(store: &InMemoryStore, run_key: RunKey
                 events_numbered_at_close: 0,
                 growth_limits: None,
             },
-            ShardEpoch::ZERO,
+            WriteFence::Unfenced,
         )
         .await?;
     Ok(())

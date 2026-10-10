@@ -20,7 +20,8 @@ use sqlx::{PgPool, postgres::PgPoolOptions};
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{PendingWorkflowTask, Transition, WorkflowState};
 use tokeira_storage::{
-    CommitResult, CurrentExecutionConflictPolicy, LeaseOutcome, LeaseRepository, RunRepository,
+    CommitResult, CurrentExecutionConflictPolicy, ExecutionHomeFence, LeaseFenceLost, LeaseOutcome,
+    LeaseRepository, RunRepository, WriteFence,
     dsql::{DsqlPoolConfig, DsqlStore, MigrationConfig},
 };
 use tokeira_types::{
@@ -144,17 +145,37 @@ async fn stale_epoch_is_fenced_after_expired_takeover() -> Result<()> {
     );
 
     let run_key = RunKey::new();
+    let fence = |owner: &str, epoch| {
+        WriteFence::Lease(ExecutionHomeFence {
+            home: shard_id,
+            owner: owner.to_owned(),
+            epoch,
+        })
+    };
     let stale = context
         .store
         .run_repository()
-        .commit_transition(run_key, sample_transition(run_key), ShardEpoch(1))
-        .await?;
-    assert!(matches!(stale, CommitResult::Conflict { .. }));
+        .commit_transition(
+            run_key,
+            sample_transition(run_key),
+            fence("owner-a", ShardEpoch(1)),
+        )
+        .await;
+    assert!(
+        stale
+            .as_ref()
+            .is_err_and(|error| error.downcast_ref::<LeaseFenceLost>().is_some()),
+        "{stale:?}"
+    );
 
     let current = context
         .store
         .run_repository()
-        .commit_transition(run_key, sample_transition(run_key), ShardEpoch(2))
+        .commit_transition(
+            run_key,
+            sample_transition(run_key),
+            fence("owner-b", ShardEpoch(2)),
+        )
         .await?;
     assert!(matches!(current, CommitResult::Applied { .. }));
     Ok(())

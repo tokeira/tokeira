@@ -30,6 +30,8 @@ pub mod codec;
 #[cfg(feature = "dsql")]
 pub mod dsql;
 mod growth;
+#[cfg(test)]
+mod lease_fence_tests;
 pub mod memory;
 pub mod metrics;
 pub mod placement_upgrade;

@@ -601,6 +601,7 @@ pub(crate) fn lease_rejected_error(shard_id: ShardId) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    use tokeira_storage::WriteFence;
     // These tests use `ShardEpoch::ZERO` intentionally: they exercise recovery
     // sweep logic against an InMemoryStore with no placement controller. Fencing
     // is not relevant here — the tests validate timeout reconstruction, not
@@ -812,7 +813,7 @@ mod tests {
         let namespace_id = transition.next_state.namespace_id;
         assert!(matches!(
             store
-                .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                .commit_transition(run_key, transition, WriteFence::Unfenced)
                 .await
                 .unwrap(),
             CommitResult::Applied { .. }
@@ -892,7 +893,7 @@ mod tests {
             attempt: 2,
         });
         let result = store
-            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .unwrap();
         assert!(matches!(result, CommitResult::Applied { .. }));
@@ -964,7 +965,7 @@ mod tests {
                         .commit_transition(
                             run_key,
                             t,
-                            ShardEpoch::ZERO,
+                            WriteFence::Unfenced,
                         )
                         .await
                         .unwrap();
@@ -1140,7 +1141,7 @@ mod tests {
                         .commit_transition(
                             run_key,
                             t,
-                            ShardEpoch::ZERO,
+                            WriteFence::Unfenced,
                         )
                         .await
                         .unwrap();
@@ -1319,7 +1320,7 @@ mod tests {
                     priority: activity_priority.clone(),
                 });
                 store
-                    .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                    .commit_transition(run_key, transition, WriteFence::Unfenced)
                     .await
                     .unwrap();
 
@@ -1434,7 +1435,7 @@ mod tests {
                         .commit_transition(
                             run_key,
                             t,
-                            ShardEpoch::ZERO,
+                            WriteFence::Unfenced,
                         )
                         .await
                         .unwrap();
@@ -1527,7 +1528,7 @@ mod tests {
                     .commit_transition(
                         run_key,
                         t,
-                        ShardEpoch::ZERO,
+                        WriteFence::Unfenced,
                     )
                     .await
                     .unwrap();
@@ -1689,7 +1690,7 @@ mod tests {
                     .commit_transition(
                         run_key,
                         t,
-                        ShardEpoch::ZERO,
+                        WriteFence::Unfenced,
                     )
                     .await
                     .unwrap();
@@ -1821,7 +1822,7 @@ mod tests {
             t.activity_ops.push(ActivityOp::Upsert(act.clone()));
             t.next_state.activities.insert("act-1".into(), act);
             store
-                .commit_transition(run_key, t, ShardEpoch::ZERO)
+                .commit_transition(run_key, t, WriteFence::Unfenced)
                 .await
                 .unwrap();
             runs.push(run_key);
@@ -1913,7 +1914,7 @@ mod tests {
             .activities
             .insert(act.activity_id.clone(), act.clone());
         store
-            .commit_transition(run_key, t, ShardEpoch::ZERO)
+            .commit_transition(run_key, t, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -1977,7 +1978,7 @@ mod tests {
                     .commit_transition(
                         run_key,
                         t,
-                        ShardEpoch::ZERO,
+                        WriteFence::Unfenced,
                     )
                     .await
                     .unwrap();
@@ -2097,7 +2098,7 @@ mod tests {
                     .commit_transition(
                         run_key,
                         t,
-                        ShardEpoch::ZERO,
+                        WriteFence::Unfenced,
                     )
                     .await
                     .unwrap();
@@ -2203,7 +2204,7 @@ mod tests {
                         .commit_transition(
                             run_key,
                             t,
-                            ShardEpoch::ZERO,
+                            WriteFence::Unfenced,
                         )
                         .await
                         .unwrap();
@@ -2260,7 +2261,7 @@ mod tests {
 
     async fn commit(store: &InMemoryStore, run_key: RunKey, transition: Transition) {
         let result = store
-            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .unwrap();
         assert!(matches!(result, CommitResult::Applied { .. }));

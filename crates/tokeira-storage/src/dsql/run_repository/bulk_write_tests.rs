@@ -287,9 +287,16 @@ async fn dsql_bulk_abandoned_materialization_fences_its_stragglers() -> Result<(
         fire_at: OffsetDateTime::now_utc() + Duration::hours(1),
     };
     let page = [CopyItem::Timer(&timer)];
-    repo.record_materialization(successor, shard).await?;
-    repo.copy_materialization_page(successor, shard, TransitionSeq(1), &page)
+    repo.record_materialization(successor, shard, &WriteFence::Unfenced)
         .await?;
+    repo.copy_materialization_page(
+        successor,
+        shard,
+        TransitionSeq(1),
+        &page,
+        &WriteFence::Unfenced,
+    )
+    .await?;
 
     let mut straggler = fixture.pool.begin().await?;
     let (phase,) = sqlx::query_as::<_, (i16,)>(SELECT_RECORD_FOR_UPDATE)
@@ -310,7 +317,8 @@ async fn dsql_bulk_abandoned_materialization_fences_its_stragglers() -> Result<(
     .execute(&mut *straggler)
     .await?;
 
-    repo.abandon_materialization(successor).await?;
+    repo.abandon_materialization(successor, WriteFence::Unfenced)
+        .await?;
     let refused = straggler
         .commit()
         .await
@@ -320,9 +328,15 @@ async fn dsql_bulk_abandoned_materialization_fences_its_stragglers() -> Result<(
         "{refused:?}"
     );
     assert!(
-        repo.copy_materialization_page(successor, shard, TransitionSeq(1), &page)
-            .await
-            .is_err(),
+        repo.copy_materialization_page(
+            successor,
+            shard,
+            TransitionSeq(1),
+            &page,
+            &WriteFence::Unfenced
+        )
+        .await
+        .is_err(),
         "a copy that starts after the switch reads it"
     );
 

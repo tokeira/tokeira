@@ -16,6 +16,53 @@ use crate::{
 use super::{DsqlRunRepository, epoch_from_sql, epoch_to_sql};
 use crate::dsql::convert;
 
+// The lease's statements (`bundle-lease-fence`). Only a change of ownership
+// writes the epoch, which `idx_shard_lease_epoch` makes a key column: an
+// acquisition's insert at epoch 1, a takeover of a released or expired lease,
+// and a release. A refresh and a renewal write the expiry and the endpoint
+// alone, and nothing reads the lease `FOR UPDATE`.
+
+/// Acquisition's insert of a new lease, at epoch 1.
+pub(super) const INSERT_LEASE: &str =
+    "INSERT INTO shard_lease (shard_id, owner, epoch, lease_expiry, node_endpoint)
+     VALUES ($1, $2, 1, $3, $4)
+     ON CONFLICT (shard_id) DO NOTHING
+     RETURNING epoch";
+
+/// Acquisition by the owner of an unexpired lease, which keeps the epoch.
+pub(super) const REFRESH_LEASE: &str = "UPDATE shard_lease
+     SET lease_expiry = $3, node_endpoint = $4
+     WHERE shard_id = $1 AND owner = $2 AND lease_expiry > $5
+     RETURNING epoch";
+
+/// Acquisition of a released or expired lease, the owner's own included, which
+/// advances the epoch.
+pub(super) const TAKE_OVER_LEASE: &str = "UPDATE shard_lease
+     SET owner = $2, epoch = epoch + 1, lease_expiry = $3, node_endpoint = $4
+     WHERE shard_id = $1 AND (owner IS NULL OR lease_expiry <= $5)
+     RETURNING epoch";
+
+/// The owner's renewal at its epoch.
+pub(super) const RENEW_LEASE: &str = "UPDATE shard_lease
+     SET lease_expiry = $3, node_endpoint = $4
+     WHERE shard_id = $1 AND owner = $2 AND epoch = $5";
+
+/// The owner's release, which clears the owner and advances the epoch.
+pub(super) const RELEASE_LEASE: &str = "UPDATE shard_lease
+     SET owner = NULL, epoch = epoch + 1, node_endpoint = NULL
+     WHERE shard_id = $1 AND owner = $2 AND epoch = $3
+     RETURNING epoch";
+
+/// An acquisition statement's failure, as a serialization conflict or with the
+/// statement's own context.
+fn acquire_error(err: sqlx::Error, failure: &'static str) -> anyhow::Error {
+    if DsqlRunRepository::is_serialization_failure(&err) {
+        anyhow!(err).context("DSQL serialization conflict during lease acquire")
+    } else {
+        anyhow::Error::from(err).context(failure)
+    }
+}
+
 #[async_trait]
 impl LeaseRepository for DsqlRunRepository {
     fn bundle_lease_duration(&self) -> Option<time::Duration> {
@@ -37,97 +84,75 @@ impl LeaseRepository for DsqlRunRepository {
             let mut permit = self.director.acquire(DbClass::Control).await?;
             let mut tx = permit.connection()?.begin().await?;
 
-            let insert_result = sqlx::query(
-                "INSERT INTO shard_lease (shard_id, owner, epoch, lease_expiry, node_endpoint)
-             VALUES ($1, $2, 1, $3, $4)
-             ON CONFLICT (shard_id) DO NOTHING",
-            )
-            .bind(shard_uuid)
-            .bind(&owner)
-            .bind(new_expiry)
-            .bind(&node_endpoint)
-            .execute(&mut *tx)
-            .await;
-
-            let insert_rows_affected = match insert_result {
-                Ok(result) => result.rows_affected(),
-                Err(err) if Self::is_serialization_failure(&err) => {
-                    tx.rollback().await?;
-                    return Err(anyhow!(err))
-                        .context("DSQL serialization conflict during lease acquire");
-                }
-                Err(err) => {
-                    tx.rollback().await?;
-                    return Err(err).context("failed to insert shard lease");
-                }
-            };
-
-            let mut update_rows_affected = 0;
-            if insert_rows_affected == 0 {
-                let update_result = sqlx::query(
-                    "UPDATE shard_lease
-                 SET owner = $2,
-                     epoch = CASE
-                         WHEN owner = $2 AND lease_expiry > $4 THEN epoch
-                         ELSE epoch + 1
-                     END,
-                     lease_expiry = $3,
-                     node_endpoint = $5
-                 WHERE shard_id = $1
-                   AND (owner = $2 OR owner IS NULL OR lease_expiry <= $4)",
-                )
+            // Each statement writes the epoch only when ownership changes: the
+            // owner's refresh conflicts with none of its fenced writes, and a
+            // takeover with every one (`bundle-lease-fence`).
+            let inserted = match sqlx::query_as::<_, (i64,)>(INSERT_LEASE)
                 .bind(shard_uuid)
                 .bind(&owner)
                 .bind(new_expiry)
-                .bind(app_now)
                 .bind(&node_endpoint)
-                .execute(&mut *tx)
-                .await;
+                .fetch_optional(&mut *tx)
+                .await
+            {
+                Ok(row) => row,
+                Err(err) => {
+                    tx.rollback().await?;
+                    return Err(acquire_error(err, "failed to insert shard lease"));
+                }
+            };
+            let insert_rows_affected = u64::from(inserted.is_some());
 
-                update_rows_affected = match update_result {
-                    Ok(result) => result.rows_affected(),
-                    Err(err) if Self::is_serialization_failure(&err) => {
-                        tx.rollback().await?;
-                        return Err(anyhow!(err))
-                            .context("DSQL serialization conflict during lease acquire");
-                    }
+            let mut acquired = inserted;
+            for (statement, failure) in [
+                (REFRESH_LEASE, "failed to refresh shard lease"),
+                (TAKE_OVER_LEASE, "failed to take over shard lease"),
+            ] {
+                if acquired.is_some() {
+                    break;
+                }
+                acquired = match sqlx::query_as::<_, (i64,)>(statement)
+                    .bind(shard_uuid)
+                    .bind(&owner)
+                    .bind(new_expiry)
+                    .bind(&node_endpoint)
+                    .bind(app_now)
+                    .fetch_optional(&mut *tx)
+                    .await
+                {
+                    Ok(row) => row,
                     Err(err) => {
                         tx.rollback().await?;
-                        return Err(err).context("failed to update shard lease");
+                        return Err(acquire_error(err, failure));
                     }
                 };
             }
 
-            let outcome = if insert_rows_affected == 1 || update_rows_affected == 1 {
-                let (epoch,) = sqlx::query_as::<_, (i64,)>(
-                    "SELECT epoch FROM shard_lease WHERE shard_id = $1",
-                )
-                .bind(shard_uuid)
-                .fetch_one(&mut *tx)
-                .await
-                .context("failed to read acquired shard lease epoch")?;
-                interpret_acquire(
+            let outcome = match acquired {
+                Some((epoch,)) => interpret_acquire(
                     insert_rows_affected,
-                    update_rows_affected,
+                    1 - insert_rows_affected,
                     Some(epoch),
                     None,
-                )?
-            } else {
-                let row = sqlx::query_as::<_, (Option<String>, i64)>(
-                    "SELECT owner, epoch FROM shard_lease WHERE shard_id = $1",
-                )
-                .bind(shard_uuid)
-                .fetch_optional(&mut *tx)
-                .await
-                .context("failed to read rejected shard lease holder")?;
-                let rejected_row = row.map(|(owner, epoch)| (owner.unwrap_or_default(), epoch));
-                interpret_acquire(
-                    insert_rows_affected,
-                    update_rows_affected,
-                    None,
-                    rejected_row,
-                )?
+                )?,
+                None => {
+                    let row = sqlx::query_as::<_, (Option<String>, i64)>(
+                        "SELECT owner, epoch FROM shard_lease WHERE shard_id = $1",
+                    )
+                    .bind(shard_uuid)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .context("failed to read rejected shard lease holder")?;
+                    let rejected_row = row.map(|(owner, epoch)| (owner.unwrap_or_default(), epoch));
+                    interpret_acquire(0, 0, None, rejected_row)?
+                }
             };
+
+            #[cfg(all(test, feature = "dsql-integration"))]
+            if matches!(outcome, LeaseOutcome::Acquired { .. }) {
+                super::pause_point::reached(super::pause_point::PauseKey::Acquisition(bundle))
+                    .await;
+            }
 
             match outcome {
                 LeaseOutcome::Acquired { .. } => match tx.commit().await {
@@ -164,65 +189,63 @@ impl LeaseRepository for DsqlRunRepository {
             let mut permit = self.director.acquire(DbClass::Control).await?;
             let mut tx = permit.connection()?.begin().await?;
 
+            // One conditional update, which writes no key column and reads
+            // nothing `FOR UPDATE`, so it aborts none of the owner's fenced
+            // writes. A takeover updates the same row, so DSQL commits at most
+            // one of the two (`bundle-lease-fence`).
+            let renewed = match sqlx::query(RENEW_LEASE)
+                .bind(shard_uuid)
+                .bind(&owner)
+                .bind(new_expiry)
+                .bind(&node_endpoint)
+                .bind(caller_epoch)
+                .execute(&mut *tx)
+                .await
+            {
+                Ok(result) => result.rows_affected(),
+                Err(err) if Self::is_serialization_failure(&err) => {
+                    tx.rollback().await?;
+                    return Err(anyhow!(err))
+                        .context("DSQL serialization conflict during lease renewal");
+                }
+                Err(err) => {
+                    tx.rollback().await?;
+                    return Err(err).context("failed to update shard lease renewal");
+                }
+            };
+            if renewed == 1 {
+                return match tx.commit().await {
+                    Ok(()) => Ok(LeaseOutcome::Renewed { epoch }),
+                    Err(err) if Self::is_serialization_failure(&err) => Err(anyhow!(err))
+                        .context("DSQL serialization conflict during lease renewal"),
+                    Err(err) => Err(err).context("failed to commit shard lease renewal"),
+                };
+            }
+
             let row = sqlx::query_as::<_, (Option<String>, i64)>(
-                "SELECT owner, epoch
-             FROM shard_lease
-             WHERE shard_id = $1
-             FOR UPDATE",
+                "SELECT owner, epoch FROM shard_lease WHERE shard_id = $1",
             )
             .bind(shard_uuid)
             .fetch_optional(&mut *tx)
             .await
             .context("failed to read shard lease for renewal")?;
-
-            let decision = decide_renew(
+            tx.rollback().await?;
+            match decide_renew(
                 row.as_ref()
                     .map(|(owner, epoch)| (owner.as_deref().unwrap_or(""), *epoch)),
                 &owner,
                 caller_epoch,
-            )?;
-            match decision {
-                RenewDecision::Renew => {
-                    let update_result = sqlx::query(
-                        "UPDATE shard_lease
-                     SET lease_expiry = $1,
-                         node_endpoint = $3
-                     WHERE shard_id = $2",
-                    )
-                    .bind(new_expiry)
-                    .bind(shard_uuid)
-                    .bind(&node_endpoint)
-                    .execute(&mut *tx)
-                    .await;
-
-                    match update_result {
-                        Ok(_) => match tx.commit().await {
-                            Ok(()) => Ok(LeaseOutcome::Renewed { epoch }),
-                            Err(err) if Self::is_serialization_failure(&err) => Err(anyhow!(err))
-                                .context("DSQL serialization conflict during lease renewal"),
-                            Err(err) => Err(err).context("failed to commit shard lease renewal"),
-                        },
-                        Err(err) if Self::is_serialization_failure(&err) => {
-                            tx.rollback().await?;
-                            Err(anyhow!(err))
-                                .context("DSQL serialization conflict during lease renewal")
-                        }
-                        Err(err) => {
-                            tx.rollback().await?;
-                            Err(err).context("failed to update shard lease renewal")
-                        }
-                    }
-                }
+            )? {
                 RenewDecision::Reject {
                     current_owner,
                     current_epoch,
-                } => {
-                    tx.rollback().await?;
-                    Ok(LeaseOutcome::Rejected {
-                        current_owner,
-                        current_epoch,
-                    })
-                }
+                } => Ok(LeaseOutcome::Rejected {
+                    current_owner,
+                    current_epoch,
+                }),
+                RenewDecision::Renew => bail!(
+                    "the renewal of {bundle:?} changed no row, yet the lease names its owner at its epoch"
+                ),
             }
         })
     }
@@ -278,20 +301,13 @@ impl LeaseRepository for DsqlRunRepository {
             let caller_epoch = epoch_to_sql(epoch)?;
             let mut permit = self.director.acquire(DbClass::Control).await?;
             let mut tx = permit.connection()?.begin().await?;
-            let row = sqlx::query_as::<_, (i64,)>(
-                "UPDATE shard_lease
-             SET owner = NULL,
-                 epoch = epoch + 1,
-                 node_endpoint = NULL
-             WHERE shard_id = $1 AND owner = $2 AND epoch = $3
-             RETURNING epoch",
-            )
-            .bind(shard_uuid)
-            .bind(&owner)
-            .bind(caller_epoch)
-            .fetch_optional(&mut *tx)
-            .await
-            .context("failed to relinquish shard lease")?;
+            let row = sqlx::query_as::<_, (i64,)>(RELEASE_LEASE)
+                .bind(shard_uuid)
+                .bind(&owner)
+                .bind(caller_epoch)
+                .fetch_optional(&mut *tx)
+                .await
+                .context("failed to relinquish shard lease")?;
 
             if let Some((new_epoch,)) = row {
                 tx.commit().await?;
@@ -493,4 +509,51 @@ pub(super) fn decide_renew(
         current_owner: current_owner.to_owned(),
         current_epoch: epoch_from_sql(current_epoch)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{INSERT_LEASE, REFRESH_LEASE, RELEASE_LEASE, RENEW_LEASE, TAKE_OVER_LEASE};
+
+    /// The columns an update's `SET` clause writes.
+    fn set_clause(statement: &str) -> &str {
+        let set = statement.find("SET").expect("an update has a SET clause");
+        let condition = statement
+            .find("WHERE")
+            .expect("an update has a WHERE clause");
+        &statement[set..condition]
+    }
+
+    // Feature: bundle-lease-fence, Property 5: Only a change of ownership writes the epoch
+    #[test]
+    fn only_a_change_of_ownership_writes_the_epoch() {
+        for statement in [REFRESH_LEASE, RENEW_LEASE] {
+            assert!(
+                !set_clause(statement).contains("epoch"),
+                "a refresh or a renewal writes the epoch: {statement}"
+            );
+        }
+        for statement in [TAKE_OVER_LEASE, RELEASE_LEASE] {
+            assert!(
+                set_clause(statement).contains("epoch = epoch + 1"),
+                "a change of ownership leaves the epoch: {statement}"
+            );
+        }
+        assert!(INSERT_LEASE.contains("VALUES ($1, $2, 1, $3, $4)"));
+        assert!(REFRESH_LEASE.contains("owner = $2 AND lease_expiry > $5"));
+        assert!(TAKE_OVER_LEASE.contains("owner IS NULL OR lease_expiry <= $5"));
+        assert!(RENEW_LEASE.contains("owner = $2 AND epoch = $5"));
+        for statement in [
+            INSERT_LEASE,
+            REFRESH_LEASE,
+            TAKE_OVER_LEASE,
+            RENEW_LEASE,
+            RELEASE_LEASE,
+        ] {
+            assert!(
+                !statement.contains("FOR UPDATE"),
+                "a lease statement reads the row FOR UPDATE: {statement}"
+            );
+        }
+    }
 }

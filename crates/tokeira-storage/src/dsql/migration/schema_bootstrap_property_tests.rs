@@ -247,13 +247,15 @@ fn selected_metadata_version(current: u32, seed: u32) -> Option<u32> {
 fn startup_schema_contract_migrates_and_accepts_required_tables() {
     let recognized = recognized_migrations();
     let contract = MigrationRunner::compatibility_contract();
-    // Default-gate startup reads CHASM pointers and the placement progress marker.
-    // A self-consistent digest of an older prefix cannot make that schema usable.
+    // Default-gate startup reads CHASM pointers and the placement progress marker,
+    // and fenced writes need the lease's epoch index (`bundle-lease-fence`). A
+    // self-consistent digest of an older prefix cannot make that schema usable.
     for (version, name) in [
         (69, "chasm_current_execution"),
         (70, "idx_chasm_current_execution_status"),
         (71, "chasm_backfill_marker"),
         (81, "workflow_placement_upgrade"),
+        (82, "idx_shard_lease_epoch"),
     ] {
         assert!(
             recognized
@@ -261,31 +263,33 @@ fn startup_schema_contract_migrates_and_accepts_required_tables() {
                 .any(|migration| { migration.version == version && migration.name == name })
         );
     }
-    for current in [0, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81] {
+    for current in [
+        0, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82,
+    ] {
         let observed = observation(&recognized, current, (current > 0).then_some(current));
         for policy in [
             SchemaMigrationPolicy::Automatic,
             SchemaMigrationPolicy::ValidateOnly,
         ] {
             let expected = match (current, policy) {
-                (81, _) => SchemaDecision::Compatible {
-                    current: 81,
+                (82, _) => SchemaDecision::Compatible {
+                    current: 82,
                     legacy_backfill: false,
                 },
-                (0, SchemaMigrationPolicy::Automatic) => SchemaDecision::Initialize { target: 81 },
+                (0, SchemaMigrationPolicy::Automatic) => SchemaDecision::Initialize { target: 82 },
                 (_, SchemaMigrationPolicy::Automatic) => SchemaDecision::Migrate {
                     from: current,
-                    to: 81,
+                    to: 82,
                 },
                 (_, SchemaMigrationPolicy::ValidateOnly) => SchemaDecision::MigrationRequired {
                     current,
-                    target: 81,
+                    target: 82,
                 },
             };
             assert_eq!(
                 assess_schema_compatibility(&contract, &recognized, &observed, policy),
                 expected,
-                "Unconditional startup requires V081: current={current}, policy={policy:?}",
+                "Unconditional startup requires V082: current={current}, policy={policy:?}",
             );
         }
     }

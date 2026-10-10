@@ -58,13 +58,13 @@ async fn commit(
     repo: &dyn RunRepository,
     transition: Transition,
     bundle: bool,
-    epoch: ShardEpoch,
+    fence: WriteFence,
 ) -> Result<CommitResult> {
     // DSQL can abort even serial test writes during asynchronous catalog work.
     // Exercise the existing caller retry contract only for the repository's
     // normalized transaction abort; stale sequence/fence outcomes remain visible.
     for attempt in 0..10 {
-        let result = commit_once(repo, transition.clone(), bundle, epoch).await?;
+        let result = commit_once(repo, transition.clone(), bundle, fence.clone()).await?;
         if attempt < 9
             && matches!(&result, CommitResult::Conflict { reason } if reason == "DSQL serialization conflict")
         {
@@ -414,7 +414,7 @@ fn dsql_projection_accumulator_commit_images() {
                         baseline_image(&transition.next_state, previous.as_ref(), 0).unwrap();
                     fixture.statements.take();
                     let state = applied(
-                        commit(fixture.repo(), transition, bundle, ShardEpoch::ZERO)
+                        commit(fixture.repo(), transition, bundle, WriteFence::Unfenced)
                             .await
                             .unwrap(),
                     );
@@ -448,9 +448,14 @@ fn dsql_projection_accumulator_commit_images() {
                     panic!("ready")
                 };
                 applied(
-                    commit(fixture.repo(), following(&state), bundle, ShardEpoch::ZERO)
-                        .await
-                        .unwrap(),
+                    commit(
+                        fixture.repo(),
+                        following(&state),
+                        bundle,
+                        WriteFence::Unfenced,
+                    )
+                    .await
+                    .unwrap(),
                 );
                 fixture.statements.assert_no_projection_reads();
             }
@@ -472,7 +477,7 @@ fn dsql_projection_accumulator_legacy_seeds() {
         |runtime, fixture, (values, partition, defect)| {
             runtime.block_on(async {
                 let mut state = applied(
-                    commit(fixture.repo(), fixture.fresh(), false, ShardEpoch::ZERO)
+                    commit(fixture.repo(), fixture.fresh(), false, WriteFence::Unfenced)
                         .await
                         .unwrap(),
                 );
@@ -560,7 +565,7 @@ async fn dsql_projection_accumulator_snapshot_races() {
     for stage in [LoadStage::BeforeSnapshot, LoadStage::AfterHotRead] {
         for change in 0..3 {
             let mut original = applied(
-                commit(fixture.repo(), fixture.fresh(), false, ShardEpoch::ZERO)
+                commit(fixture.repo(), fixture.fresh(), false, WriteFence::Unfenced)
                     .await
                     .unwrap(),
             );
@@ -625,9 +630,14 @@ async fn dsql_projection_accumulator_snapshot_races() {
                         Some(vec!["before".into()])
                     );
                     assert!(matches!(
-                        commit(fixture.repo(), following(&state), false, ShardEpoch::ZERO)
-                            .await
-                            .unwrap(),
+                        commit(
+                            fixture.repo(),
+                            following(&state),
+                            false,
+                            WriteFence::Unfenced
+                        )
+                        .await
+                        .unwrap(),
                         CommitResult::Conflict { .. }
                     ));
                 } else {
@@ -666,7 +676,7 @@ fn dsql_projection_accumulator_failure_isolation() {
                         request_id: RequestId("duplicate".into()),
                     });
                     let winner = applied(
-                        commit(fixture.repo(), start, bundle, ShardEpoch::ZERO)
+                        commit(fixture.repo(), start, bundle, WriteFence::Unfenced)
                             .await
                             .unwrap(),
                     );
@@ -675,9 +685,16 @@ fn dsql_projection_accumulator_failure_isolation() {
                         let before = fixture.durable(key).await;
                         let mut transition = following(&winner);
                         transition.next_state.used_worker_deployment_versions = None;
-                        let mut epoch = ShardEpoch::ZERO;
+                        let mut fence = WriteFence::Unfenced;
                         match failure {
-                            0 => epoch = ShardEpoch(999_999),
+                            // A fence no lease matches.
+                            0 => {
+                                fence = WriteFence::Lease(crate::ExecutionHomeFence {
+                                    home: ShardId(0),
+                                    owner: "owner".into(),
+                                    epoch: ShardEpoch(999_999),
+                                })
+                            }
                             1 => transition.expected_seq = TransitionSeq::ZERO,
                             2 => transition.request_dedupe_ops.push(RequestDedupeOp {
                                 request_id: RequestId("duplicate".into()),
@@ -695,12 +712,18 @@ fn dsql_projection_accumulator_failure_isolation() {
                                 fixture.track(&transition.next_state);
                             }
                         }
-                        let result = commit(fixture.repo(), transition, bundle, epoch).await;
+                        let result = commit(fixture.repo(), transition, bundle, fence).await;
                         match failure {
-                            0 | 1 => {
+                            0 => prop_assert!(
+                                result.as_ref().is_err_and(|error| error
+                                    .downcast_ref::<crate::LeaseFenceLost>()
+                                    .is_some()),
+                                "the fence must win"
+                            ),
+                            1 => {
                                 prop_assert!(
                                     matches!(result, Ok(CommitResult::Conflict { .. })),
-                                    "fence/OCC must win"
+                                    "OCC must win"
                                 )
                             }
                             2 => prop_assert!(matches!(result, Ok(CommitResult::Duplicate))),
@@ -733,7 +756,8 @@ fn dsql_projection_accumulator_failure_isolation() {
                     transition.request_dedupe_ops.push(RequestDedupeOp {
                         request_id: RequestId("rolled-back".into()),
                     });
-                    let result = commit(fixture.repo(), transition, bundle, ShardEpoch::ZERO).await;
+                    let result =
+                        commit(fixture.repo(), transition, bundle, WriteFence::Unfenced).await;
                     prop_assert!(
                         result.is_err() || matches!(result, Ok(CommitResult::Conflict { .. })),
                         "collision must roll back"
@@ -744,7 +768,7 @@ fn dsql_projection_accumulator_failure_isolation() {
                     close.next_state.status = ExecutionStatus::Completed;
                     close.next_state.closed_at = Some(winner.started_at);
                     let closed = applied(
-                        commit(fixture.repo(), close, bundle, ShardEpoch::ZERO)
+                        commit(fixture.repo(), close, bundle, WriteFence::Unfenced)
                             .await
                             .unwrap(),
                     );
@@ -757,7 +781,7 @@ fn dsql_projection_accumulator_failure_isolation() {
                                 expected_seq: closed.transition_seq,
                                 deleted_at: closed.started_at,
                             },
-                            ShardEpoch::ZERO,
+                            WriteFence::Unfenced,
                         )
                         .await
                         .unwrap();
@@ -789,7 +813,7 @@ fn dsql_projection_accumulator_growth_accounting() {
                     let mut start = fixture.fresh();
                     start.growth_limits = Some(state_limit(0));
                     let state = applied(
-                        commit(fixture.repo(), start, bundle, ShardEpoch::ZERO)
+                        commit(fixture.repo(), start, bundle, WriteFence::Unfenced)
                             .await
                             .unwrap(),
                     );
@@ -820,10 +844,14 @@ fn dsql_projection_accumulator_growth_accounting() {
                     let measured = expected.len() - excluded;
                     transition.growth_limits = Some(state_limit(measured - 1));
                     let before = fixture.durable(key).await;
-                    let error =
-                        commit(fixture.repo(), transition.clone(), bundle, ShardEpoch::ZERO)
-                            .await
-                            .unwrap_err();
+                    let error = commit(
+                        fixture.repo(),
+                        transition.clone(),
+                        bundle,
+                        WriteFence::Unfenced,
+                    )
+                    .await
+                    .unwrap_err();
                     prop_assert_eq!(
                         error.downcast_ref::<RunLimitExceeded>().unwrap().limit,
                         RunLimit::StateSize
@@ -831,7 +859,7 @@ fn dsql_projection_accumulator_growth_accounting() {
                     prop_assert_eq!(fixture.durable(key).await, before);
                     transition.growth_limits = Some(state_limit(measured));
                     let state = applied(
-                        commit(fixture.repo(), transition, bundle, ShardEpoch::ZERO)
+                        commit(fixture.repo(), transition, bundle, WriteFence::Unfenced)
                             .await
                             .unwrap(),
                     );
@@ -844,7 +872,7 @@ fn dsql_projection_accumulator_growth_accounting() {
                     close.next_state.status = ExecutionStatus::Completed;
                     close.growth_limits = Some(state_limit(0));
                     applied(
-                        commit(fixture.repo(), close, bundle, ShardEpoch::ZERO)
+                        commit(fixture.repo(), close, bundle, WriteFence::Unfenced)
                             .await
                             .unwrap(),
                     );
@@ -871,7 +899,7 @@ fn dsql_projection_accumulator_reset_boundaries() {
                     start.next_state.last_event_id = 10;
                     start.next_state.status = ExecutionStatus::Completed;
                     let base = applied(
-                        commit(fixture.repo(), start, bundle, ShardEpoch::ZERO)
+                        commit(fixture.repo(), start, bundle, WriteFence::Unfenced)
                             .await
                             .unwrap(),
                     );
@@ -891,6 +919,7 @@ fn dsql_projection_accumulator_reset_boundaries() {
                                 if generation == 0 { 10 } else { 7 },
                                 id,
                                 expected,
+                                WriteFence::Unfenced,
                             )
                             .await
                             .unwrap();
@@ -902,9 +931,13 @@ fn dsql_projection_accumulator_reset_boundaries() {
                         if generation == 1 {
                             state.used_worker_deployment_versions = None;
                             fixture.replace(&state, stats, None).await;
-                            let result =
-                                commit(fixture.repo(), following(&state), bundle, ShardEpoch::ZERO)
-                                    .await;
+                            let result = commit(
+                                fixture.repo(),
+                                following(&state),
+                                bundle,
+                                WriteFence::Unfenced,
+                            )
+                            .await;
                             prop_assert!(result.is_err());
                         }
                         let LoadedRun::Existing(state) =
@@ -918,7 +951,7 @@ fn dsql_projection_accumulator_reset_boundaries() {
                         }
                         let expected = baseline_image(&transition.next_state, None, stats).unwrap();
                         let committed = applied(
-                            commit(fixture.repo(), transition, bundle, ShardEpoch::ZERO)
+                            commit(fixture.repo(), transition, bundle, WriteFence::Unfenced)
                                 .await
                                 .unwrap(),
                         );
@@ -963,7 +996,7 @@ fn dsql_projection_accumulator_mixed_writers_and_pruning() {
                         start.next_state.status = ExecutionStatus::Completed;
                     }
                     let initial = applied(
-                        commit(fixture.repo(), start, bundle, ShardEpoch::ZERO)
+                        commit(fixture.repo(), start, bundle, WriteFence::Unfenced)
                             .await
                             .unwrap(),
                     );
@@ -977,7 +1010,13 @@ fn dsql_projection_accumulator_mixed_writers_and_pruning() {
                             .unwrap();
                         fixture
                             .repo()
-                            .materialize_reset_successor(key, 10, id, expected)
+                            .materialize_reset_successor(
+                                key,
+                                10,
+                                id,
+                                expected,
+                                WriteFence::Unfenced,
+                            )
                             .await
                             .unwrap();
                         key = RunKey::derive(initial.namespace_id, &initial.workflow_id, id);
@@ -1012,7 +1051,7 @@ fn dsql_projection_accumulator_mixed_writers_and_pruning() {
                             );
                         } else {
                             let state = applied(
-                                commit(&repo, transition, bundle, ShardEpoch::ZERO)
+                                commit(&repo, transition, bundle, WriteFence::Unfenced)
                                     .await
                                     .unwrap(),
                             );
@@ -1046,7 +1085,7 @@ fn dsql_projection_accumulator_mixed_writers_and_pruning() {
                         .unwrap()
                         .push("retained-only".into());
                     let ready = applied(
-                        commit(fixture.repo(), persist, bundle, ShardEpoch::ZERO)
+                        commit(fixture.repo(), persist, bundle, WriteFence::Unfenced)
                             .await
                             .unwrap(),
                     );
@@ -1062,7 +1101,7 @@ fn dsql_projection_accumulator_mixed_writers_and_pruning() {
                         baseline_image(&transition.next_state, Some(&retained), history_size)
                             .unwrap();
                     let persisted = applied(
-                        commit(&repo, transition, bundle, ShardEpoch::ZERO)
+                        commit(&repo, transition, bundle, WriteFence::Unfenced)
                             .await
                             .unwrap(),
                     );

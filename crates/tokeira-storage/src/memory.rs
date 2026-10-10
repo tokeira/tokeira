@@ -50,15 +50,16 @@ use crate::{
         ConnectionDirector, ControlRepository, CurrentExecutionConflictPolicy, DbClass, DbPermit,
         DeleteRunRequest, DeleteRunResult, DeploymentCasResult, DeploymentKey, DeploymentName,
         DispatchableActivityTask, DispatchableWorkflowTask, DueActivityDispatch, DueTimer,
-        GenerationAdvanceResult, LeaseOutcome, LeaseRepository, ProjectionBatch, ProjectionLog,
-        ProjectionRecord, ProvenancePut, RequestRecord, RunBulkWrite, RunHistoryStats,
-        RunRepository, StaleTimer, StoredTaskQueueConfig, StoredTaskQueueConfigKey,
-        StoredWorkerDeployment, TaskQueueConfigCasResult, TaskQueueConfigRepository,
-        TransitionAuditRecord, WorkerDeploymentRepository, WorkerDeploymentVersionKey,
-        WorkerTaskProvenance, WorkerTaskProvenanceError, WorkerTaskProvenanceStore,
-        WorkflowRuleCreateResult, WorkflowRuleDeleteResult, deleted_workflow_projection_context,
-        dispatchable_workflow_task, prepare_workflow_projection,
-        seed_workflow_projection_accumulator, workflow_is_open_and_pinned_to_version,
+        GenerationAdvanceResult, LeaseFenceLost, LeaseOutcome, LeaseRepository, ProjectionBatch,
+        ProjectionLog, ProjectionRecord, ProvenancePut, RequestRecord, RunBulkWrite,
+        RunHistoryStats, RunRepository, StaleTimer, StoredTaskQueueConfig,
+        StoredTaskQueueConfigKey, StoredWorkerDeployment, TaskQueueConfigCasResult,
+        TaskQueueConfigRepository, TransitionAuditRecord, WorkerDeploymentRepository,
+        WorkerDeploymentVersionKey, WorkerTaskProvenance, WorkerTaskProvenanceError,
+        WorkerTaskProvenanceStore, WorkflowRuleCreateResult, WorkflowRuleDeleteResult, WriteFence,
+        deleted_workflow_projection_context, dispatchable_workflow_task,
+        prepare_workflow_projection, seed_workflow_projection_accumulator,
+        workflow_is_open_and_pinned_to_version,
     },
     codec::{
         ExtensionSection, apply_state_extension, decode_exact, decode_extension, encode_extension,
@@ -92,6 +93,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub struct InMemoryStore {
     inner: Arc<Mutex<StoreState>>,
     placement_ready: Arc<AtomicBool>,
+    /// How long a lease lasts, when the store grants leases for a duration as
+    /// DSQL does (`bundle-lease-fence`). Without one a lease lasts until it is
+    /// released.
+    lease_duration: Option<time::Duration>,
 }
 
 impl Default for InMemoryStore {
@@ -181,6 +186,12 @@ struct StoreState {
     projection_image_lookups: AtomicUsize,
     /// Shard lease state keyed by shard id.
     bundle_leases: HashMap<ShardId, BundleLeaseRow>,
+    /// When each lease expires, under a lease duration. It follows the tokio
+    /// clock, so a test can advance it, and snapshots don't carry it.
+    bundle_lease_expiries: HashMap<ShardId, tokio::time::Instant>,
+    /// Test-only: renewals never complete, as if the owner couldn't reach
+    /// storage.
+    lease_renewals_stalled: bool,
     /// Controller routing generation singleton.
     routing_generation: GenerationCounter,
     /// CAS version for controller connection-budget allocation.
@@ -270,6 +281,29 @@ impl StoreState {
             _ => Err(anyhow::anyhow!(
                 "the materialization of {run_key:?} was abandoned"
             )),
+        }
+    }
+
+    /// The fence check of a write of a run's authoritative state
+    /// (`bundle-lease-fence`): the lease must still name the fence's owner at
+    /// its epoch. It runs under the store's lock, which orders it with every
+    /// change of ownership, as DSQL's fence read does at commit.
+    fn check_fence(&self, fence: &WriteFence) -> Result<(), LeaseFenceLost> {
+        let WriteFence::Lease(fence) = fence else {
+            return Ok(());
+        };
+        match self.bundle_leases.get(&fence.home) {
+            Some((Some(owner), epoch, _endpoint))
+                if *owner == fence.owner && *epoch == fence.epoch =>
+            {
+                Ok(())
+            }
+            found => Err(LeaseFenceLost {
+                home: fence.home,
+                epoch: fence.epoch,
+                found: found
+                    .map(|(owner, epoch, _endpoint)| (owner.clone().unwrap_or_default(), *epoch)),
+            }),
         }
     }
 
@@ -457,7 +491,24 @@ impl InMemoryStore {
         Self {
             inner: Arc::new(Mutex::new(state)),
             placement_ready: Arc::new(AtomicBool::new(true)),
+            lease_duration: None,
         }
+    }
+
+    /// Grant leases for `duration`, as DSQL does: a lease its owner hasn't
+    /// renewed in time can be taken over (`bundle-lease-fence`). Expiry follows
+    /// the tokio clock, so a test can advance it.
+    pub fn with_lease_duration(mut self, duration: time::Duration) -> Self {
+        assert!(duration.is_positive(), "a lease duration must be positive");
+        self.lease_duration = Some(duration);
+        self
+    }
+
+    /// When a lease granted at `now` expires, under a lease duration.
+    fn lease_expiry(&self, now: tokio::time::Instant) -> Option<tokio::time::Instant> {
+        self.lease_duration.map(|duration| {
+            now + std::time::Duration::try_from(duration).expect("a positive lease duration")
+        })
     }
 
     /// Inject `count` synthetic OCC conflicts for
@@ -468,6 +519,13 @@ impl InMemoryStore {
     pub async fn inject_conflict(&self, run_key: RunKey, count: usize) {
         let mut store = self.inner.lock().await;
         store.conflict_injections.insert(run_key, count);
+    }
+
+    /// Make every later lease renewal wait forever, as if its owner couldn't
+    /// reach storage, so its lease lapses while it keeps working. Tests use it
+    /// for the owner's local deadline (`bundle-lease-fence`).
+    pub async fn stall_lease_renewals(&self) {
+        self.inner.lock().await.lease_renewals_stalled = true;
     }
 
     /// Make the covered bulk writes (`bounded-bulk-writes`) fail after
@@ -589,6 +647,7 @@ impl InMemoryStore {
         Ok(Self {
             inner: Arc::new(Mutex::new(state)),
             placement_ready: Arc::new(AtomicBool::new(false)),
+            lease_duration: None,
         })
     }
 }
@@ -818,6 +877,8 @@ impl SnapshotDoc {
             #[cfg(test)]
                 projection_image_lookups: _,
             bundle_leases,
+            bundle_lease_expiries: _,
+            lease_renewals_stalled: _,
             routing_generation,
             budget_version,
             activity_dispatch,
@@ -921,6 +982,8 @@ impl SnapshotDoc {
             #[cfg(test)]
             projection_image_lookups: AtomicUsize::new(0),
             bundle_leases: self.bundle_leases.into_iter().collect(),
+            bundle_lease_expiries: HashMap::new(),
+            lease_renewals_stalled: false,
             routing_generation: self.routing_generation,
             budget_version: self.budget_version,
             activity_dispatch: self.activity_dispatch.into_iter().collect(),
@@ -1221,12 +1284,12 @@ impl RunRepository for InMemoryStore {
             .unwrap_or_default())
     }
 
-    #[tracing::instrument(name = "storage.commit_transition", skip(self, transition), fields(run_key = %run_key.0, expected_seq = transition.expected_seq.0, epoch = epoch.0))]
+    #[tracing::instrument(name = "storage.commit_transition", skip(self, transition), fields(run_key = %run_key.0, expected_seq = transition.expected_seq.0, epoch = fence.epoch().0))]
     async fn commit_transition(
         &self,
         run_key: RunKey,
         transition: Transition,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<CommitResult> {
         let started = Instant::now();
         if transition.history_events.len() != transition.event_principals.len() {
@@ -1239,43 +1302,20 @@ impl RunRepository for InMemoryStore {
         let mut state = transition.next_state.clone();
         let namespace = Some(state.namespace_id.0.to_string());
         let mut store = self.inner.lock().await;
-        if epoch != ShardEpoch::ZERO {
-            let shard_id = tokeira_types::execution_home_bundle(
-                state.namespace_id.0.as_bytes(),
-                state.workflow_id.0.as_bytes(),
-                Self::effective_shard_count(&store),
+        let home = tokeira_types::execution_home_bundle(
+            state.namespace_id.0.as_bytes(),
+            state.workflow_id.0.as_bytes(),
+            Self::effective_shard_count(&store),
+        );
+        fence.ensure_home(home)?;
+        if let Err(lost) = store.check_fence(&fence) {
+            storage_metrics::record_commit_transition_duration(
+                namespace.clone(),
+                "lease_lost",
+                started.elapsed(),
             );
-            match store.bundle_leases.get(&shard_id) {
-                Some((_owner, current_epoch, _endpoint)) if *current_epoch == epoch => {}
-                Some((_owner, current_epoch, _endpoint)) => {
-                    storage_metrics::record_commit_transition_duration(
-                        namespace.clone(),
-                        "conflict",
-                        started.elapsed(),
-                    );
-                    storage_metrics::record_storage_operation("commit_transition", "conflict");
-                    return Ok(CommitResult::Conflict {
-                        reason: format!(
-                            "stale shard epoch {:?} for shard {:?}; current {:?}",
-                            epoch, shard_id, current_epoch
-                        ),
-                    });
-                }
-                None => {
-                    storage_metrics::record_commit_transition_duration(
-                        namespace.clone(),
-                        "conflict",
-                        started.elapsed(),
-                    );
-                    storage_metrics::record_storage_operation("commit_transition", "conflict");
-                    return Ok(CommitResult::Conflict {
-                        reason: format!(
-                            "no active lease for shard {:?} at epoch {:?}",
-                            shard_id, epoch
-                        ),
-                    });
-                }
-            }
+            storage_metrics::record_storage_operation("commit_transition", "lease_lost");
+            return Err(lost.into());
         }
         if let Some(remaining) = store.conflict_injections.get_mut(&run_key)
             && *remaining > 0
@@ -1642,18 +1682,14 @@ impl RunRepository for InMemoryStore {
     async fn commit_transition_for_bundle(
         &self,
         run_key: RunKey,
-        _execution_home_bundle: ShardId,
+        execution_home_bundle: ShardId,
         transition: Transition,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<CommitResult> {
-        // Pass the real epoch through to commit_transition so the epoch check
-        // and the mutation write execute under the same Mutex lock acquisition.
-        // Previously this method acquired the lock for an epoch check, dropped
-        // it, then called commit_transition with ShardEpoch::ZERO — creating a
-        // TOCTOU race window. commit_transition already performs an atomic epoch
-        // check when epoch != ShardEpoch::ZERO, so forwarding the real epoch is
-        // sufficient to close the race.
-        self.commit_transition(run_key, transition, epoch).await
+        // The fence passes through, so its check and the write happen under one
+        // acquisition of the store's lock (`bundle-lease-fence`).
+        fence.ensure_home(execution_home_bundle)?;
+        self.commit_transition(run_key, transition, fence).await
     }
 
     #[tracing::instrument(
@@ -1663,7 +1699,7 @@ impl RunRepository for InMemoryStore {
             run_key = %run_key.0,
             bundle = execution_home_bundle.0,
             expected_seq = request.expected_seq.0,
-            epoch = epoch.0
+            epoch = fence.epoch().0
         )
     )]
     async fn delete_run_for_bundle(
@@ -1671,9 +1707,13 @@ impl RunRepository for InMemoryStore {
         run_key: RunKey,
         execution_home_bundle: ShardId,
         request: DeleteRunRequest,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<DeleteRunResult> {
+        fence.ensure_home(execution_home_bundle)?;
         let mut store = self.inner.lock().await;
+        // The fence comes first, as DSQL's fence read is the first statement of
+        // the deletion's transaction.
+        store.check_fence(&fence)?;
         let Some(state) = store.runs.get(&run_key).cloned() else {
             return Ok(DeleteRunResult::NotFound);
         };
@@ -1689,26 +1729,6 @@ impl RunRepository for InMemoryStore {
                     "execution-home bundle mismatch for {run_key:?}: expected {derived_bundle:?}, got {execution_home_bundle:?}"
                 ),
             });
-        }
-
-        if epoch != ShardEpoch::ZERO {
-            match store.bundle_leases.get(&execution_home_bundle) {
-                Some((_owner, current_epoch, _endpoint)) if *current_epoch == epoch => {}
-                Some((_owner, current_epoch, _endpoint)) => {
-                    return Ok(DeleteRunResult::Conflict {
-                        reason: format!(
-                            "stale shard epoch {epoch:?} for shard {execution_home_bundle:?}; current {current_epoch:?}"
-                        ),
-                    });
-                }
-                None => {
-                    return Ok(DeleteRunResult::Conflict {
-                        reason: format!(
-                            "no active lease for shard {execution_home_bundle:?} at epoch {epoch:?}"
-                        ),
-                    });
-                }
-            }
         }
 
         if state.transition_seq != request.expected_seq {
@@ -1794,6 +1814,7 @@ impl RunRepository for InMemoryStore {
         fork_event_id: i64,
         successor_run_id: RunId,
         expected_current: Option<RunKey>,
+        fence: WriteFence,
     ) -> Result<()> {
         // The steps of DSQL's materialization (`bounded-bulk-writes`), each a
         // transaction of its own under the lock and the model, so a test can stop
@@ -1880,6 +1901,7 @@ impl RunRepository for InMemoryStore {
             successor_state.workflow_id.0.as_bytes(),
             shard_count,
         );
+        fence.ensure_home(home)?;
         let dispatch = derive_workflow_dispatch(&successor_state, home);
         if let Some(row) = &dispatch {
             row.validate()?;
@@ -1913,6 +1935,7 @@ impl RunRepository for InMemoryStore {
 
         {
             let mut store = self.inner.lock().await;
+            store.check_fence(&fence)?;
             anyhow::ensure!(
                 !store.runs.contains_key(&successor_run_key),
                 "successor run already exists for {:?}: {:?}",
@@ -1949,6 +1972,7 @@ impl RunRepository for InMemoryStore {
             // Let other operations run between transactions, as they can on DSQL.
             tokio::task::yield_now().await;
             let mut store = self.inner.lock().await;
+            store.check_fence(&fence)?;
             store.ensure_materializing(successor_run_key)?;
             let mut model = store.begin_bulk_transaction()?;
             for (cost, principals) in &costs[page.clone()] {
@@ -1995,6 +2019,7 @@ impl RunRepository for InMemoryStore {
         // common/persistence/sql/execution_util.go:966-1009 @ v1.31.0).
         tokio::task::yield_now().await;
         let mut store = self.inner.lock().await;
+        store.check_fence(&fence)?;
         store.ensure_materializing(successor_run_key)?;
         let workflow_key = (
             successor_state.namespace_id,
@@ -2080,8 +2105,9 @@ impl RunRepository for InMemoryStore {
         Ok(())
     }
 
-    async fn abandon_materialization(&self, run_key: RunKey) -> Result<()> {
+    async fn abandon_materialization(&self, run_key: RunKey, fence: WriteFence) -> Result<()> {
         let mut store = self.inner.lock().await;
+        store.check_fence(&fence)?;
         if !store
             .bulk_writes
             .get(&run_key)
@@ -2099,7 +2125,9 @@ impl RunRepository for InMemoryStore {
     }
 
     async fn purge_run(&self, run_key: RunKey) -> Result<()> {
-        self.abandon_materialization(run_key).await?;
+        // A purge runs from any node, so its own switch is unfenced.
+        self.abandon_materialization(run_key, WriteFence::Unfenced)
+            .await?;
         let budget = WriteBudget::TRANSACTION.rows;
         loop {
             // Let other operations run between transactions, as they can on DSQL.
@@ -2816,42 +2844,61 @@ impl ProjectionLog for InMemoryStore {
 
 #[async_trait]
 impl LeaseRepository for InMemoryStore {
+    fn bundle_lease_duration(&self) -> Option<time::Duration> {
+        self.lease_duration
+    }
+
     async fn try_acquire_bundle(
         &self,
         bundle: ShardId,
         owner: String,
         node_endpoint: String,
     ) -> Result<LeaseOutcome> {
-        let mut store = self.inner.lock().await;
-        match store.bundle_leases.get_mut(&bundle) {
+        let now = tokio::time::Instant::now();
+        let expiry = self.lease_expiry(now);
+        let mut guard = self.inner.lock().await;
+        let StoreState {
+            bundle_leases,
+            bundle_lease_expiries,
+            ..
+        } = &mut *guard;
+        // DSQL's three statements (`bundle-lease-fence`): an insert at epoch 1,
+        // a refresh by the owner of an unexpired lease that keeps the epoch, and
+        // a takeover of a released or expired lease that advances it.
+        let lapsed = bundle_lease_expiries
+            .get(&bundle)
+            .is_some_and(|expiry| *expiry <= now);
+        let outcome = match bundle_leases.get_mut(&bundle) {
             Some((current_owner, current_epoch, current_endpoint)) => {
-                if current_owner.as_deref() == Some(owner.as_str()) {
+                if current_owner.as_deref() == Some(owner.as_str()) && !lapsed {
                     *current_endpoint = Some(node_endpoint);
-                    Ok(LeaseOutcome::Acquired {
+                    LeaseOutcome::Acquired {
                         epoch: *current_epoch,
-                    })
-                } else if current_owner.is_none() {
+                    }
+                } else if current_owner.is_none() || lapsed {
                     *current_epoch = current_epoch.next();
                     *current_owner = Some(owner);
                     *current_endpoint = Some(node_endpoint);
-                    Ok(LeaseOutcome::Acquired {
+                    LeaseOutcome::Acquired {
                         epoch: *current_epoch,
-                    })
+                    }
                 } else {
-                    Ok(LeaseOutcome::Rejected {
+                    return Ok(LeaseOutcome::Rejected {
                         current_owner: current_owner.clone().unwrap_or_default(),
                         current_epoch: *current_epoch,
-                    })
+                    });
                 }
             }
             None => {
                 let epoch = ShardEpoch(1);
-                store
-                    .bundle_leases
-                    .insert(bundle, (Some(owner), epoch, Some(node_endpoint)));
-                Ok(LeaseOutcome::Acquired { epoch })
+                bundle_leases.insert(bundle, (Some(owner), epoch, Some(node_endpoint)));
+                LeaseOutcome::Acquired { epoch }
             }
+        };
+        if let Some(expiry) = expiry {
+            bundle_lease_expiries.insert(bundle, expiry);
         }
+        Ok(outcome)
     }
 
     async fn renew_bundle(
@@ -2861,29 +2908,43 @@ impl LeaseRepository for InMemoryStore {
         epoch: ShardEpoch,
         node_endpoint: String,
     ) -> Result<LeaseOutcome> {
-        let mut store = self.inner.lock().await;
-        match store.bundle_leases.get_mut(&bundle) {
+        let expiry = self.lease_expiry(tokio::time::Instant::now());
+        let mut guard = self.inner.lock().await;
+        if guard.lease_renewals_stalled {
+            drop(guard);
+            match std::future::pending::<std::convert::Infallible>().await {}
+        }
+        let StoreState {
+            bundle_leases,
+            bundle_lease_expiries,
+            ..
+        } = &mut *guard;
+        // One conditional update, as DSQL's renewal: the owner at its epoch
+        // extends its lease, and nothing else changes (`bundle-lease-fence`).
+        match bundle_leases.get_mut(&bundle) {
             Some((current_owner, current_epoch, current_endpoint))
                 if current_owner.as_deref() == Some(owner.as_str()) && *current_epoch == epoch =>
             {
                 *current_endpoint = Some(node_endpoint);
+                if let Some(expiry) = expiry {
+                    bundle_lease_expiries.insert(bundle, expiry);
+                }
                 Ok(LeaseOutcome::Renewed { epoch })
             }
             Some((current_owner, current_epoch, _endpoint)) => Ok(LeaseOutcome::Rejected {
                 current_owner: current_owner.clone().unwrap_or_default(),
                 current_epoch: *current_epoch,
             }),
-            None => {
-                store
-                    .bundle_leases
-                    .insert(bundle, (Some(owner), epoch, Some(node_endpoint)));
-                Ok(LeaseOutcome::Acquired { epoch })
-            }
+            None => Ok(LeaseOutcome::Rejected {
+                current_owner: String::new(),
+                current_epoch: ShardEpoch::ZERO,
+            }),
         }
     }
 
     async fn list_bundle_leases(&self) -> Result<Vec<BundleLease>> {
         let store = self.inner.lock().await;
+        let (now, wall) = (tokio::time::Instant::now(), OffsetDateTime::now_utc());
         Ok(store
             .bundle_leases
             .iter()
@@ -2891,7 +2952,10 @@ impl LeaseRepository for InMemoryStore {
                 bundle_id: *bundle_id,
                 owner_node_id: owner.clone(),
                 epoch: *epoch,
-                lease_until: OffsetDateTime::now_utc(),
+                lease_until: store
+                    .bundle_lease_expiries
+                    .get(bundle_id)
+                    .map_or(wall, |expiry| wall + expiry.saturating_duration_since(now)),
                 node_endpoint: endpoint.clone(),
             })
             .collect())
@@ -2904,26 +2968,32 @@ impl LeaseRepository for InMemoryStore {
         epoch: ShardEpoch,
     ) -> Result<LeaseOutcome> {
         let mut store = self.inner.lock().await;
-        match store.bundle_leases.get_mut(&bundle) {
+        let outcome = match store.bundle_leases.get_mut(&bundle) {
             Some((current_owner, current_epoch, current_endpoint))
                 if current_owner.as_deref() == Some(owner.as_str()) && *current_epoch == epoch =>
             {
                 *current_owner = None;
                 *current_epoch = current_epoch.next();
                 *current_endpoint = None;
-                Ok(LeaseOutcome::Acquired {
+                LeaseOutcome::Acquired {
                     epoch: *current_epoch,
-                })
+                }
             }
-            Some((current_owner, current_epoch, _endpoint)) => Ok(LeaseOutcome::Rejected {
-                current_owner: current_owner.clone().unwrap_or_default(),
-                current_epoch: *current_epoch,
-            }),
-            None => Ok(LeaseOutcome::Rejected {
-                current_owner: String::new(),
-                current_epoch: ShardEpoch::ZERO,
-            }),
-        }
+            Some((current_owner, current_epoch, _endpoint)) => {
+                return Ok(LeaseOutcome::Rejected {
+                    current_owner: current_owner.clone().unwrap_or_default(),
+                    current_epoch: *current_epoch,
+                });
+            }
+            None => {
+                return Ok(LeaseOutcome::Rejected {
+                    current_owner: String::new(),
+                    current_epoch: ShardEpoch::ZERO,
+                });
+            }
+        };
+        store.bundle_lease_expiries.remove(&bundle);
+        Ok(outcome)
     }
 }
 
@@ -3053,6 +3123,10 @@ mod bulk_write_tests;
 #[cfg(test)]
 #[path = "bulk_write_memory_properties.rs"]
 mod bulk_write_properties;
+
+#[cfg(test)]
+#[path = "lease_fence_memory_tests.rs"]
+mod lease_fence_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3643,7 +3717,7 @@ mod tests {
                         }),
                         ..Default::default()
                     });
-                    let result = super::projection_accumulator_tests::commit(&store, transition.clone(), bundle, ShardEpoch::ZERO).await.unwrap();
+                    let result = super::projection_accumulator_tests::commit(&store, transition.clone(), bundle, WriteFence::Unfenced).await.unwrap();
                     let CommitResult::Applied { new_state } = result else {
                         panic!("valid transition rejected: {result:?}");
                     };
@@ -3766,7 +3840,7 @@ mod tests {
                                 events_numbered_at_close: 0,
                                 growth_limits: None,
                             },
-                            ShardEpoch::ZERO,
+                            WriteFence::Unfenced,
                         )
                         .await
                         .expect("commit");
@@ -3800,7 +3874,7 @@ mod tests {
                             expected_seq,
                             deleted_at: fixed_now(),
                         },
-                        ShardEpoch::ZERO,
+                        WriteFence::Unfenced,
                     )
                     .await
                     .expect("delete");
@@ -3826,7 +3900,7 @@ mod tests {
         let CommitResult::Applied {
             new_state: mut run_a_state,
         } = store
-            .commit_transition(run_a, start_transition(run_a), ShardEpoch::ZERO)
+            .commit_transition(run_a, start_transition(run_a), WriteFence::Unfenced)
             .await
             .unwrap()
         else {
@@ -3836,12 +3910,12 @@ mod tests {
             .commit_transition(
                 other_partition,
                 start_transition(other_partition),
-                ShardEpoch::ZERO,
+                WriteFence::Unfenced,
             )
             .await
             .unwrap();
         store
-            .commit_transition(run_b, start_transition(run_b), ShardEpoch::ZERO)
+            .commit_transition(run_b, start_transition(run_b), WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -3861,7 +3935,7 @@ mod tests {
                     events_numbered_at_close: 0,
                     growth_limits: None,
                 },
-                ShardEpoch::ZERO,
+                WriteFence::Unfenced,
             )
             .await
             .unwrap();
@@ -3921,7 +3995,7 @@ mod tests {
         transition.event_principals.push(Some(principal.clone()));
 
         store
-            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .expect("commit attributed event");
         let attributed = store
@@ -4057,7 +4131,7 @@ mod tests {
             callback(CallbackState::Succeeded),
         ];
         store
-            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -4111,7 +4185,7 @@ mod tests {
                         shard_count,
                     );
                     store
-                        .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                        .commit_transition(run_key, transition, WriteFence::Unfenced)
                         .await
                         .unwrap();
                     if needs_work && home == ShardId(0) {
@@ -4159,7 +4233,7 @@ mod tests {
                     transition.expected_seq = TransitionSeq(index as u64);
                     transition.next_state = state.clone();
                     let result = store
-                        .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                        .commit_transition(run_key, transition, WriteFence::Unfenced)
                         .await
                         .unwrap();
                     let applied = matches!(result, CommitResult::Applied { .. });
@@ -4258,7 +4332,7 @@ mod tests {
                 priority: None,
             });
         store
-            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .unwrap();
         (run_key, queue)
@@ -4283,7 +4357,7 @@ mod tests {
                 .timers
                 .insert(timer.timer_id.clone(), timer);
             store
-                .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                .commit_transition(run_key, transition, WriteFence::Unfenced)
                 .await
                 .unwrap();
         }
@@ -4451,7 +4525,7 @@ mod tests {
             .insert(updated.activity_id.clone(), updated.clone());
         update.activity_ops.push(ActivityOp::Upsert(updated));
         store
-            .commit_transition(run_key, update, ShardEpoch::ZERO)
+            .commit_transition(run_key, update, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -4515,7 +4589,7 @@ mod tests {
             priority: None,
         });
         store
-            .commit_transition(run_key, replace, ShardEpoch::ZERO)
+            .commit_transition(run_key, replace, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -4592,7 +4666,7 @@ mod tests {
                 priority: None,
             });
         store
-            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -4607,7 +4681,7 @@ mod tests {
             .activity_ops
             .push(ActivityOp::Upsert(started));
         store
-            .commit_transition(run_key, started_transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, started_transition, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -4651,7 +4725,7 @@ mod tests {
                 priority: None,
             });
         store
-            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -4666,7 +4740,7 @@ mod tests {
             .activity_ops
             .push(ActivityOp::Upsert(updated));
         store
-            .commit_transition(run_key, update_transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, update_transition, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -4722,7 +4796,7 @@ mod tests {
                 priority: None,
             });
         store
-            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -4741,7 +4815,7 @@ mod tests {
             .activity_ops
             .push(ActivityOp::Upsert(paused));
         store
-            .commit_transition(run_key, pause_transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, pause_transition, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -4787,7 +4861,7 @@ mod tests {
                 });
         }
         store
-            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -4803,7 +4877,7 @@ mod tests {
             request_id: "pause-1".to_owned(),
         });
         store
-            .commit_transition(run_key, pause_transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, pause_transition, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -4835,7 +4909,7 @@ mod tests {
         });
         transition.activity_ops.push(ActivityOp::Upsert(paused));
         store
-            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -4864,7 +4938,7 @@ mod tests {
                 priority: None,
             });
         store
-            .commit_transition(run_key, unpause_transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, unpause_transition, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -4953,7 +5027,7 @@ mod tests {
                     priority: None,
                 });
 
-                let result = store.commit_transition(run_key, transition, ShardEpoch::ZERO).await.unwrap();
+                let result = store.commit_transition(run_key, transition, WriteFence::Unfenced).await.unwrap();
                 assert!(matches!(result, CommitResult::Applied { .. }));
                 let tasks = store.list_all_dispatchable_activity_tasks(&queue, 10).await.unwrap();
                 assert_eq!(tasks.len(), 1);
@@ -4999,7 +5073,7 @@ mod tests {
                     priority: None,
                 });
                 transition.activity_ops.push(ActivityOp::Upsert(activity_state(&activity_id)));
-                let _ = store.commit_transition(run_key, transition, ShardEpoch::ZERO).await.unwrap();
+                let _ = store.commit_transition(run_key, transition, WriteFence::Unfenced).await.unwrap();
 
                 let mut delete_transition = Transition {
                     expected_seq: TransitionSeq(1),
@@ -5017,7 +5091,7 @@ mod tests {
                 delete_transition
                     .activity_ops
                     .push(ActivityOp::Delete { activity_id: activity_id.clone() });
-                let _ = store.commit_transition(run_key, delete_transition, ShardEpoch::ZERO).await.unwrap();
+                let _ = store.commit_transition(run_key, delete_transition, WriteFence::Unfenced).await.unwrap();
 
                 let tasks = store.list_all_dispatchable_activity_tasks(&queue, 10).await.unwrap();
                 assert!(tasks.is_empty());
@@ -5056,7 +5130,7 @@ mod tests {
                     priority: None,
                 });
                 first.activity_ops.push(ActivityOp::Upsert(activity_state(&activity_id)));
-                let _ = store.commit_transition(run_key, first, ShardEpoch::ZERO).await.unwrap();
+                let _ = store.commit_transition(run_key, first, WriteFence::Unfenced).await.unwrap();
                 let before = store.list_all_dispatchable_activity_tasks(&queue, 10).await.unwrap();
 
                 store.inject_conflict(run_key, 1).await;
@@ -5089,7 +5163,7 @@ mod tests {
                     heartbeat_timeout: None,
                     priority: None,
                 });
-                let result = store.commit_transition(run_key, conflict, ShardEpoch::ZERO).await.unwrap();
+                let result = store.commit_transition(run_key, conflict, WriteFence::Unfenced).await.unwrap();
                 assert!(matches!(result, CommitResult::Conflict { .. }));
 
                 let after = store.list_all_dispatchable_activity_tasks(&queue, 10).await.unwrap();
@@ -5124,7 +5198,7 @@ mod tests {
                     heartbeat_timeout: None,
                     priority: None,
                 });
-                    let _ = store.commit_transition(run_key, transition, ShardEpoch::ZERO).await.unwrap();
+                    let _ = store.commit_transition(run_key, transition, WriteFence::Unfenced).await.unwrap();
                 }
 
                 let tasks = store.list_all_dispatchable_activity_tasks(&activity_queue, limit).await.unwrap();
@@ -5241,10 +5315,10 @@ mod tests {
                 let run_key = RunKey::new();
                 store.inject_conflict(run_key, count).await;
                 for _ in 0..count {
-                    let result = store.commit_transition(run_key, start_transition(run_key), ShardEpoch::ZERO).await.unwrap();
+                    let result = store.commit_transition(run_key, start_transition(run_key), WriteFence::Unfenced).await.unwrap();
                     assert!(matches!(result, CommitResult::Conflict { .. }));
                 }
-                let result = store.commit_transition(run_key, start_transition(run_key), ShardEpoch::ZERO).await.unwrap();
+                let result = store.commit_transition(run_key, start_transition(run_key), WriteFence::Unfenced).await.unwrap();
                 assert!(matches!(result, CommitResult::Applied { .. }));
             });
         }
@@ -5274,7 +5348,7 @@ mod tests {
                         transition.next_state.workflow_id =
                             WorkflowId(format!("{prefix}-{index}"));
                         let result = store
-                            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                            .commit_transition(run_key, transition, WriteFence::Unfenced)
                             .await
                             .unwrap();
                         assert!(matches!(result, CommitResult::Applied { .. }));
@@ -5310,13 +5384,13 @@ mod tests {
                 let mut t1 = start_transition(run_key_1);
                 t1.next_state.namespace_id = namespace_id;
                 t1.next_state.workflow_id = workflow_id.clone();
-                let _ = store.commit_transition(run_key_1, t1, ShardEpoch::ZERO).await.unwrap();
+                let _ = store.commit_transition(run_key_1, t1, WriteFence::Unfenced).await.unwrap();
 
                 let run_key_2 = RunKey::new();
                 let mut t2 = start_transition(run_key_2);
                 t2.next_state.namespace_id = namespace_id;
                 t2.next_state.workflow_id = workflow_id;
-                let result = store.commit_transition(run_key_2, t2, ShardEpoch::ZERO).await.unwrap();
+                let result = store.commit_transition(run_key_2, t2, WriteFence::Unfenced).await.unwrap();
                 assert!(matches!(result, CommitResult::CurrentExecutionConflict { .. }));
             });
         }
@@ -5330,7 +5404,7 @@ mod tests {
                 let mut upsert = start_transition(run_key);
                 upsert.activity_ops.push(ActivityOp::Upsert(activity_state(&activity_id)));
                 upsert.timer_ops.push(TimerOp::Upsert(timer_state("timer-1", fixed_now())));
-                let _ = store.commit_transition(run_key, upsert, ShardEpoch::ZERO).await.unwrap();
+                let _ = store.commit_transition(run_key, upsert, WriteFence::Unfenced).await.unwrap();
                 assert_eq!(store.list_due_timers(fixed_now(), 10).await.unwrap().len(), 1);
 
                 let mut delete = Transition {
@@ -5348,7 +5422,7 @@ mod tests {
                 delete.next_state.transition_seq = TransitionSeq(2);
                 delete.activity_ops.push(ActivityOp::Delete { activity_id });
                 delete.timer_ops.push(TimerOp::Delete { timer_id: "timer-1".into() });
-                let _ = store.commit_transition(run_key, delete, ShardEpoch::ZERO).await.unwrap();
+                let _ = store.commit_transition(run_key, delete, WriteFence::Unfenced).await.unwrap();
                 assert!(store.list_due_timers(fixed_now(), 10).await.unwrap().is_empty());
             });
         }
@@ -5368,7 +5442,7 @@ mod tests {
                 let mut open = start_transition(run_key_1);
                 open.next_state.namespace_id = namespace_id;
                 open.next_state.workflow_id = workflow_id.clone();
-                let _ = store.commit_transition(run_key_1, open, ShardEpoch::ZERO).await.unwrap();
+                let _ = store.commit_transition(run_key_1, open, WriteFence::Unfenced).await.unwrap();
 
                 let mut close = Transition {
                     expected_seq: TransitionSeq(1),
@@ -5388,13 +5462,13 @@ mod tests {
                 close.next_state.closed_at = Some(fixed_now());
                 close.next_state.pending_workflow_task = None;
                 close.next_state.transition_seq = TransitionSeq(2);
-                let _ = store.commit_transition(run_key_1, close, ShardEpoch::ZERO).await.unwrap();
+                let _ = store.commit_transition(run_key_1, close, WriteFence::Unfenced).await.unwrap();
 
                 let run_key_2 = RunKey::new();
                 let mut reopen = start_transition(run_key_2);
                 reopen.next_state.namespace_id = namespace_id;
                 reopen.next_state.workflow_id = workflow_id;
-                let result = store.commit_transition(run_key_2, reopen, ShardEpoch::ZERO).await.unwrap();
+                let result = store.commit_transition(run_key_2, reopen, WriteFence::Unfenced).await.unwrap();
                 assert!(matches!(result, CommitResult::Applied { .. }));
             });
         }
@@ -5415,7 +5489,7 @@ mod tests {
                 t1.timer_ops.push(TimerOp::Upsert(tmr.clone()));
                 t1.next_state.activities.insert(activity_id.clone(), act);
                 t1.next_state.timers.insert(timer_id.clone(), tmr);
-                let _ = store.commit_transition(run_key, t1, ShardEpoch::ZERO).await.unwrap();
+                let _ = store.commit_transition(run_key, t1, WriteFence::Unfenced).await.unwrap();
 
                 let inner = store.inner.lock().await;
                 for (rk, state) in &inner.runs {
@@ -5612,7 +5686,7 @@ mod tests {
         t1.next_state.namespace_id = namespace_id;
         t1.next_state.workflow_id = workflow_id.clone();
         let _ = store
-            .commit_transition(run_key_1, t1, ShardEpoch::ZERO)
+            .commit_transition(run_key_1, t1, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -5621,7 +5695,7 @@ mod tests {
         t2.next_state.namespace_id = namespace_id;
         t2.next_state.workflow_id = workflow_id;
         let result = store
-            .commit_transition(run_key_2, t2, ShardEpoch::ZERO)
+            .commit_transition(run_key_2, t2, WriteFence::Unfenced)
             .await
             .unwrap();
         assert!(matches!(
@@ -5645,7 +5719,7 @@ mod tests {
         open.next_state.namespace_id = namespace_id;
         open.next_state.workflow_id = workflow_id.clone();
         let _ = store
-            .commit_transition(run_key_1, open, ShardEpoch::ZERO)
+            .commit_transition(run_key_1, open, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -5668,7 +5742,7 @@ mod tests {
         close.next_state.pending_workflow_task = None;
         close.next_state.transition_seq = TransitionSeq(2);
         let _ = store
-            .commit_transition(run_key_1, close, ShardEpoch::ZERO)
+            .commit_transition(run_key_1, close, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -5677,7 +5751,7 @@ mod tests {
         reopen.next_state.namespace_id = namespace_id;
         reopen.next_state.workflow_id = workflow_id;
         let result = store
-            .commit_transition(run_key_2, reopen, ShardEpoch::ZERO)
+            .commit_transition(run_key_2, reopen, WriteFence::Unfenced)
             .await
             .unwrap();
         assert!(matches!(result, CommitResult::Applied { .. }));
@@ -5692,7 +5766,7 @@ mod tests {
             .timer_ops
             .push(TimerOp::Upsert(timer_state("timer-1", fixed_now())));
         let _ = store
-            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .unwrap();
         let due = store.list_due_timers(fixed_now(), 10).await.unwrap();
@@ -5709,7 +5783,7 @@ mod tests {
             .timer_ops
             .push(TimerOp::Upsert(timer_state("timer-1", fixed_now())));
         let _ = store
-            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .unwrap();
         let read = store
@@ -5779,11 +5853,11 @@ mod tests {
         store.inject_conflict(run_key, 3).await;
         store.inject_conflict(run_key, 1).await;
         let first = store
-            .commit_transition(run_key, start_transition(run_key), ShardEpoch::ZERO)
+            .commit_transition(run_key, start_transition(run_key), WriteFence::Unfenced)
             .await
             .unwrap();
         let second = store
-            .commit_transition(run_key, start_transition(run_key), ShardEpoch::ZERO)
+            .commit_transition(run_key, start_transition(run_key), WriteFence::Unfenced)
             .await
             .unwrap();
         assert!(matches!(first, CommitResult::Conflict { .. }));
@@ -5877,7 +5951,7 @@ mod tests {
                 priority: None,
             });
         let _ = store
-            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .unwrap();
         assert!(
@@ -5927,7 +6001,7 @@ mod tests {
             .activity_ops
             .push(ActivityOp::Upsert(activity_state("a1")));
         let _ = store
-            .commit_transition(run_key, first, ShardEpoch::ZERO)
+            .commit_transition(run_key, first, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -5959,7 +6033,7 @@ mod tests {
             request_id: RequestId("req-1".into()),
         });
         let result = store
-            .commit_transition(run_key, duplicate, ShardEpoch::ZERO)
+            .commit_transition(run_key, duplicate, WriteFence::Unfenced)
             .await
             .unwrap();
         assert!(matches!(result, CommitResult::Duplicate));
@@ -6119,6 +6193,7 @@ mod tests {
             4,
             successor_run_id,
             expected,
+            WriteFence::Unfenced,
         )
         .await
         .unwrap();
@@ -6216,6 +6291,7 @@ mod tests {
             99,
             RunId::new(),
             Some(base_run_key),
+            WriteFence::Unfenced,
         )
         .await
         .unwrap_err();
@@ -6311,6 +6387,7 @@ mod tests {
             2,
             successor_run_id,
             expected,
+            WriteFence::Unfenced,
         )
         .await
         .unwrap();
@@ -6430,7 +6507,7 @@ mod tests {
                     base_run_key,
                     2,
                     successor_run_id,
-                    expected,
+                    expected, WriteFence::Unfenced,
                 )
                 .await
                 .unwrap();
@@ -6510,13 +6587,20 @@ mod tests {
                 ));
 
                 let run_key = RunKey::new();
-                // First commit with correct epoch
+                let fence = |epoch| {
+                    WriteFence::Lease(crate::ExecutionHomeFence {
+                        home: shard_id,
+                        owner: "owner".into(),
+                        epoch,
+                    })
+                };
+                // First commit with the correct fence
                 let t = start_transition(run_key);
                 let result = store
                     .commit_transition(
                         run_key,
                         t,
-                        current_epoch,
+                        fence(current_epoch),
                     )
                     .await
                     .unwrap();
@@ -6543,18 +6627,18 @@ mod tests {
                     };
                     t2.next_state.transition_seq =
                         TransitionSeq(2);
-                    let result = store
+                    let error = store
                         .commit_transition(
                             run_key,
                             t2,
-                            stale,
+                            fence(stale),
                         )
                         .await
-                        .unwrap();
-                    assert!(matches!(
-                        result,
-                        CommitResult::Conflict { .. }
-                    ));
+                        .expect_err("a stale fence must not commit");
+                    assert!(
+                        error.downcast_ref::<LeaseFenceLost>().is_some(),
+                        "{error:?}"
+                    );
                 }
             });
         }
@@ -6685,7 +6769,7 @@ mod tests {
                         .commit_transition(
                             run_key,
                             t,
-                            ShardEpoch::ZERO,
+                            WriteFence::Unfenced,
                         )
                         .await
                         .unwrap();
@@ -6822,7 +6906,7 @@ mod tests {
         start.next_state.run_id = run_id;
         let mut closed_state = start.next_state.clone();
         store
-            .commit_transition(run_key, start, ShardEpoch::ZERO)
+            .commit_transition(run_key, start, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -6843,7 +6927,7 @@ mod tests {
             growth_limits: None,
         };
         store
-            .commit_transition(run_key, close, ShardEpoch::ZERO)
+            .commit_transition(run_key, close, WriteFence::Unfenced)
             .await
             .unwrap();
     }
@@ -6926,7 +7010,7 @@ mod tests {
                     });
                 }
                 let commit = store
-                    .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                    .commit_transition(run_key, transition, WriteFence::Unfenced)
                     .await
                     .unwrap();
                 prop_assert!(
@@ -7007,7 +7091,7 @@ mod tests {
                             expected_seq: TransitionSeq(1),
                             deleted_at: fixed_now() + Duration::seconds(1),
                         },
-                        ShardEpoch::ZERO,
+                        WriteFence::Unfenced,
                     )
                     .await
                     .unwrap();
@@ -7122,7 +7206,7 @@ mod tests {
                     start.next_state.workflow_id = workflow_id.clone();
                     start.next_state.run_id = run_id;
                     let result = store
-                        .commit_transition(run_key, start, ShardEpoch::ZERO)
+                        .commit_transition(run_key, start, WriteFence::Unfenced)
                         .await
                         .unwrap();
                     prop_assert!(
@@ -7142,7 +7226,7 @@ mod tests {
                             expected_seq: TransitionSeq(2),
                             deleted_at: fixed_now(),
                         },
-                        ShardEpoch::ZERO,
+                        WriteFence::Unfenced,
                     )
                     .await
                     .unwrap();
@@ -7572,7 +7656,7 @@ mod tests {
                         .commit_transition(
                             run_key,
                             seeded_start_transition(run_key, op),
-                            ShardEpoch::ZERO,
+                            WriteFence::Unfenced,
                         )
                         .await
                         .unwrap();
@@ -7660,7 +7744,7 @@ mod tests {
                 transition.activity_ops.push(ActivityOp::Upsert(activity));
             }
             store
-                .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                .commit_transition(run_key, transition, WriteFence::Unfenced)
                 .await
                 .unwrap();
             expected.push((run_key, times));
@@ -7982,7 +8066,7 @@ mod tests {
                     .commit_transition(
                         injected_key,
                         start_transition(injected_key),
-                        ShardEpoch::ZERO,
+                        WriteFence::Unfenced,
                     )
                     .await
                     .unwrap();
@@ -8064,7 +8148,7 @@ mod tests {
                     name: "operator".into(),
                 }));
                 writer_store
-                    .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                    .commit_transition(run_key, transition, WriteFence::Unfenced)
                     .await
                     .unwrap();
             }
@@ -8119,7 +8203,7 @@ mod tests {
         let mut start = start_transition(run_key);
         start.next_state = base.clone();
         let _ = store
-            .commit_transition(run_key, start, ShardEpoch::ZERO)
+            .commit_transition(run_key, start, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -8194,7 +8278,7 @@ mod tests {
             }
             transition.next_state.activities = activities.clone().into_iter().collect();
             let result = store
-                .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                .commit_transition(run_key, transition, WriteFence::Unfenced)
                 .await
                 .unwrap();
             assert!(matches!(result, CommitResult::Applied { .. }));
@@ -8453,7 +8537,7 @@ mod tests {
                     start.history_events = scheduled_events(1, 1).into();
                     start.event_principals = vec![None].into();
                     store
-                        .commit_transition(run_key, start, ShardEpoch::ZERO)
+                        .commit_transition(run_key, start, WriteFence::Unfenced)
                         .await
                         .expect("start");
                     let limits = RunGrowthLimits {
@@ -8481,7 +8565,7 @@ mod tests {
                             None
                         };
                         let result = store
-                            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                            .commit_transition(run_key, transition, WriteFence::Unfenced)
                             .await;
                         match want {
                             Some(limit) => {
@@ -8588,7 +8672,7 @@ mod tests {
             });
             let breach = refused(
                 store
-                    .commit_transition(run_key, start, ShardEpoch::ZERO)
+                    .commit_transition(run_key, start, WriteFence::Unfenced)
                     .await,
             )
             .expect("refused");
@@ -8606,7 +8690,7 @@ mod tests {
             let mut start = start_transition(run_key);
             start.next_state.last_event_id = 99;
             store
-                .commit_transition(run_key, start, ShardEpoch::ZERO)
+                .commit_transition(run_key, start, WriteFence::Unfenced)
                 .await
                 .expect("start");
             let limits = RunGrowthLimits {
@@ -8616,7 +8700,11 @@ mod tests {
 
             let (state, _, _) = current(&store, run_key).await;
             let at_limit = store
-                .commit_transition(run_key, next_commit(&state, 1, limits), ShardEpoch::ZERO)
+                .commit_transition(
+                    run_key,
+                    next_commit(&state, 1, limits),
+                    WriteFence::Unfenced,
+                )
                 .await
                 .expect("commit");
             assert!(matches!(at_limit, CommitResult::Applied { .. }));
@@ -8624,7 +8712,11 @@ mod tests {
             let (state, _, _) = current(&store, run_key).await;
             let breach = refused(
                 store
-                    .commit_transition(run_key, next_commit(&state, 1, limits), ShardEpoch::ZERO)
+                    .commit_transition(
+                        run_key,
+                        next_commit(&state, 1, limits),
+                        WriteFence::Unfenced,
+                    )
                     .await,
             )
             .expect("refused");
@@ -8635,7 +8727,7 @@ mod tests {
             let mut finishing = next_commit(&state, 1, limits);
             finishing.events_numbered_at_close = 1;
             let applied = store
-                .commit_transition(run_key, finishing, ShardEpoch::ZERO)
+                .commit_transition(run_key, finishing, WriteFence::Unfenced)
                 .await
                 .expect("commit");
             assert!(matches!(applied, CommitResult::Applied { .. }));

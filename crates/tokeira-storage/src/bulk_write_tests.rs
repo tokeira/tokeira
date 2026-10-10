@@ -6,6 +6,7 @@
 //! in one transaction, each fails with DSQL's refusal, or with the in-memory
 //! store's model of it.
 
+use crate::WriteFence;
 use anyhow::Result;
 use async_trait::async_trait;
 use time::{Duration, OffsetDateTime};
@@ -13,8 +14,8 @@ use tokeira_kernel::{
     HistoryEvent, HistoryEventKind, LoadedRun, RequestDedupeOp, Transition, WorkflowState,
 };
 use tokeira_types::{
-    ExecutionStatus, NamespaceId, Payload, Payloads, QueueKey, RequestId, RunId, RunKey,
-    ShardEpoch, ShardId, TaskKind, TaskQueueName, WorkflowId,
+    ExecutionStatus, NamespaceId, Payload, Payloads, QueueKey, RequestId, RunId, RunKey, ShardId,
+    TaskKind, TaskQueueName, WorkflowId,
 };
 
 use crate::{
@@ -227,7 +228,7 @@ pub(crate) async fn commit(backend: &impl Backend, transition: Transition) -> cr
     let run_key = transition.next_state.run_key;
     backend
         .repo()
-        .commit_transition(run_key, transition, ShardEpoch::ZERO)
+        .commit_transition(run_key, transition, WriteFence::Unfenced)
         .await
         .expect("the fixture's commits fit DSQL's limits")
 }
@@ -252,7 +253,7 @@ pub(crate) async fn delete_first(backend: &impl Backend, state: &WorkflowState) 
                 expected_seq: state.transition_seq,
                 deleted_at: OffsetDateTime::now_utc(),
             },
-            ShardEpoch::ZERO,
+            WriteFence::Unfenced,
         )
         .await
         .expect("a deletion's transactions fit DSQL's limits");
@@ -329,7 +330,13 @@ pub(crate) async fn materialize(
 ) -> Result<()> {
     backend
         .repo()
-        .materialize_reset_successor(base.run_key, fork_event_id, successor_run_id, expected)
+        .materialize_reset_successor(
+            base.run_key,
+            fork_event_id,
+            successor_run_id,
+            expected,
+            WriteFence::Unfenced,
+        )
         .await
 }
 

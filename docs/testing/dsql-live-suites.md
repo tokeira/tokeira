@@ -54,6 +54,7 @@ point them at a database holding application data.
 | Storage `workflow_dispatch_live_query_plans` | 1 | Before/after queue Live/Exact and actual home page SQL, including full traversal of deep equal-time pages, with 16,384 seeded rows; set `TOKEIRA_WORKFLOW_DISPATCH_PLAN_OUTPUT` to save plans and selectivity; `dsql-integration`, URL gate only |
 | Storage `placement_live_` | 4 | Stopped-cluster hot/timer relocation, concurrent starters and late-page exclusion, raw legacy-encoded lease refusal, corruption diagnostics, reset preservation, duplicates/orphans, exact joined continuation plans and screening latency; `dsql-integration`, URL gate only |
 | Storage `dsql_bulk_` (`bulk_write_tests`) | 10 | The paged bulk writes: spills of more than 3,000 rows or 10 MiB, the deletion of a run owning more than 3,000 rows, resets whose copied history is over 1 MiB or 10 MiB or whose successor holds 3,500 timers, a reset of a closed workflow, a start between a reset's commit and its materialization, a purge resumed by two purges at once, and an abandoned materialization refusing its open transaction; `dsql-integration`, URL gate only |
+| Storage `dsql_lease_fence_` (`lease_fence_tests`) | 11 | The bundle lease fence through Tokeira's repository: stale transition commits and a deletion held after their fence reads while another node takes the home over, each aborted and refused on its retry; a materialization stopped between its transactions and a recovery switch, both refused after a takeover; 100 generated lease histories in which only a change of ownership writes the epoch; a lost fence under each loss and write, changing nothing; the owner's renewals and refreshes beside its writes in flight; a write that commits first aborting a takeover; and 100 generated interleavings of fenced writes with renewals, refreshes, takeovers and releases; `dsql-integration`, URL gate only |
 | Storage `dsql_transaction_limits` | 6 | DSQL's transaction limits, apart from the bulk writes' budgets: 3,000 rows, deleted rows included and rows read `FOR UPDATE` not; 9 MiB of values but not 10, deleted rows not counted; 1 MiB a value; `dsql-integration`, URL gate only |
 
 Run the suites and their test cases serially against the selected database. The shard
@@ -112,6 +113,15 @@ table, `dsql_limits_probe`. Run them serially on an ephemeral cluster:
 ```bash
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(dsql_bulk_)'
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test dsql_transaction_limits --test-threads 1
+```
+
+The lease-fence tests also use only `TOKEIRA_DSQL_TEST_DATABASE_URL` and apply the embedded
+migrations. They hold writes and acquisitions at test-only pause points, so each takeover
+lands at a chosen moment. Each test takes the leases of the homes its runs live on and
+clears them when it finishes. Run them serially:
+
+```bash
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(/^dsql::run_repository::lease_fence_tests::/)'
 ```
 
 ## Endpoint-gated IAM connector

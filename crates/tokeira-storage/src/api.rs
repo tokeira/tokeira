@@ -188,11 +188,71 @@ pub enum DeleteRunResult {
     },
     /// The target run did not exist when the fenced deletion was admitted.
     NotFound,
-    /// The sequence or shard-epoch fence no longer matched durable state.
+    /// The sequence fence no longer matched durable state.
     Conflict {
         /// Diagnostic reason; callers reload the same run and retry.
         reason: String,
     },
+}
+
+/// The lease that admitted a write of a run's authoritative state: the run's
+/// execution home, the node that owned it, and the epoch of that ownership
+/// (`bundle-lease-fence`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionHomeFence {
+    /// The execution home whose lease admitted the write.
+    pub home: ShardId,
+    /// The owner the lease named when it admitted the write.
+    pub owner: String,
+    /// The lease's epoch when it admitted the write.
+    pub epoch: ShardEpoch,
+}
+
+/// How a write of a run's authoritative state is fenced (`bundle-lease-fence`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WriteFence {
+    /// No lease read, for a node that assigns itself every execution home.
+    Unfenced,
+    /// Commit only while the home's lease still names this owner at this
+    /// epoch, read in the write's own transaction.
+    Lease(ExecutionHomeFence),
+}
+
+impl WriteFence {
+    /// The fence's epoch, or zero when unfenced, for diagnostics.
+    pub fn epoch(&self) -> ShardEpoch {
+        match self {
+            Self::Unfenced => ShardEpoch::ZERO,
+            Self::Lease(fence) => fence.epoch,
+        }
+    }
+
+    /// Fail unless a lease fence is for `home`, the execution home of the run
+    /// it fences.
+    pub fn ensure_home(&self, home: ShardId) -> Result<()> {
+        match self {
+            Self::Lease(fence) if fence.home != home => Err(anyhow!(
+                "a fence for execution home {:?} can't fence a write at {home:?}",
+                fence.home
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// A fenced write found that the execution home's lease no longer names its
+/// owner at its epoch. The write changed nothing, and no caller retries it: the
+/// node has lost the home (`bundle-lease-fence`).
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("lost the lease of execution home {home:?} at epoch {epoch:?}; the lease holds {found:?}")]
+pub struct LeaseFenceLost {
+    /// The execution home the write was fenced by.
+    pub home: ShardId,
+    /// The epoch the write was admitted under.
+    pub epoch: ShardEpoch,
+    /// The lease's owner (empty once released) and epoch, or `None` when the
+    /// home has no lease.
+    pub found: Option<(String, ShardEpoch)>,
 }
 
 /// What a run's bulk-write record says is happening to the run's rows.
@@ -1137,11 +1197,16 @@ pub trait RunRepository: Send + Sync {
     /// Commits never read a preceding image to repair unseeded input. The
     /// [`CommitResult::Applied`] state includes the folded observations and is
     /// the state callers must retain for subsequent transitions.
+    ///
+    /// With [`WriteFence::Lease`] the implementation reads the execution home's
+    /// lease in the commit's own transaction and, unless the lease still names
+    /// the fence's owner at its epoch, changes nothing and fails with
+    /// [`LeaseFenceLost`] (`bundle-lease-fence`).
     async fn commit_transition(
         &self,
         run_key: RunKey,
         transition: Transition,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<CommitResult>;
 
     /// Atomically persist a transition fenced by the caller-resolved
@@ -1151,14 +1216,14 @@ pub trait RunRepository: Send + Sync {
     /// [`RunRepository::commit_transition`] entry point remains for tests and
     /// pre-placement callers, but production routing must carry the bundle that
     /// was resolved from `(namespace_id, workflow_id)`.
-    /// Accumulator admission and returned-state guarantees are identical to
-    /// [`Self::commit_transition`].
+    /// Accumulator admission, fencing and returned-state guarantees are
+    /// identical to [`Self::commit_transition`].
     async fn commit_transition_for_bundle(
         &self,
         run_key: RunKey,
         execution_home_bundle: ShardId,
         transition: Transition,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<CommitResult>;
 
     /// Make one closed run unreachable, under OCC and execution-home shard
@@ -1170,14 +1235,16 @@ pub trait RunRepository: Send + Sync {
     /// records the run with phase [`BulkWritePhase::Purging`]. From that commit
     /// on no lookup finds the run. [`Self::purge_run`] removes its remaining
     /// rows, which can outnumber what one transaction may change
-    /// (`bounded-bulk-writes`). A mismatch returns [`DeleteRunResult::Conflict`]
-    /// and changes nothing.
+    /// (`bounded-bulk-writes`). A sequence mismatch returns
+    /// [`DeleteRunResult::Conflict`]. The transaction is fenced as
+    /// [`Self::commit_transition`] is, and a lost fence fails with
+    /// [`LeaseFenceLost`]. Neither changes anything.
     async fn delete_run_for_bundle(
         &self,
         run_key: RunKey,
         execution_home_bundle: ShardId,
         request: DeleteRunRequest,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<DeleteRunResult>;
 
     /// Materialize a reset successor by copying the base run's committed
@@ -1192,13 +1259,15 @@ pub trait RunRepository: Send + Sync {
     /// run it named when the reset was admitted, open or closed, or is absent
     /// when that is `None`; otherwise the call fails. A failed call can leave
     /// the record and the rows written so far: the caller hands the successor
-    /// to [`Self::purge_run`].
+    /// to [`Self::purge_run`]. Every transaction that writes is fenced as
+    /// [`Self::commit_transition`] is (`bundle-lease-fence`).
     async fn materialize_reset_successor(
         &self,
         base_run_key: RunKey,
         fork_event_id: i64,
         successor_run_id: RunId,
         expected_current: Option<RunKey>,
+        fence: WriteFence,
     ) -> Result<()>;
 
     /// Switch a run's [`BulkWritePhase::Materializing`] record to
@@ -1207,8 +1276,10 @@ pub trait RunRepository: Send + Sync {
     ///
     /// A record that is already purging, or none, is left as it is. Callers
     /// pass only a materialization that will never finish: one whose attempt
-    /// failed, or one found when a shard is taken over.
-    async fn abandon_materialization(&self, run_key: RunKey) -> Result<()>;
+    /// failed, or one found when a shard is taken over. A takeover's recovery
+    /// passes its fence, so a node that has lost the home switches nothing; a
+    /// purge's own switch is unfenced (`bundle-lease-fence`).
+    async fn abandon_materialization(&self, run_key: RunKey, fence: WriteFence) -> Result<()>;
 
     /// Remove the remaining rows of a run that has a bulk-write record.
     ///
@@ -2741,9 +2812,9 @@ where
         &self,
         run_key: RunKey,
         transition: Transition,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<CommitResult> {
-        (**self).commit_transition(run_key, transition, epoch).await
+        (**self).commit_transition(run_key, transition, fence).await
     }
 
     async fn commit_transition_for_bundle(
@@ -2751,10 +2822,10 @@ where
         run_key: RunKey,
         execution_home_bundle: ShardId,
         transition: Transition,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<CommitResult> {
         (**self)
-            .commit_transition_for_bundle(run_key, execution_home_bundle, transition, epoch)
+            .commit_transition_for_bundle(run_key, execution_home_bundle, transition, fence)
             .await
     }
 
@@ -2763,10 +2834,10 @@ where
         run_key: RunKey,
         execution_home_bundle: ShardId,
         request: DeleteRunRequest,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<DeleteRunResult> {
         (**self)
-            .delete_run_for_bundle(run_key, execution_home_bundle, request, epoch)
+            .delete_run_for_bundle(run_key, execution_home_bundle, request, fence)
             .await
     }
 
@@ -2776,6 +2847,7 @@ where
         fork_event_id: i64,
         successor_run_id: RunId,
         expected_current: Option<RunKey>,
+        fence: WriteFence,
     ) -> Result<()> {
         (**self)
             .materialize_reset_successor(
@@ -2783,12 +2855,13 @@ where
                 fork_event_id,
                 successor_run_id,
                 expected_current,
+                fence,
             )
             .await
     }
 
-    async fn abandon_materialization(&self, run_key: RunKey) -> Result<()> {
-        (**self).abandon_materialization(run_key).await
+    async fn abandon_materialization(&self, run_key: RunKey, fence: WriteFence) -> Result<()> {
+        (**self).abandon_materialization(run_key, fence).await
     }
 
     async fn purge_run(&self, run_key: RunKey) -> Result<()> {

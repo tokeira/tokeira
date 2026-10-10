@@ -1,10 +1,11 @@
 //! Shared stopped-upgrade reset lineage for both placement backends.
 
+use crate::WriteFence;
 use anyhow::{Result, ensure};
 use tokeira_kernel::{
     BasicKernel, HistoryEvent, HistoryEventKind, LoadedRun, ReplayContext, TimerOp, WorkflowState,
 };
-use tokeira_types::{LogicalTaskSeq, RunId, RunKey, ShardEpoch, WorkerIdentity};
+use tokeira_types::{LogicalTaskSeq, RunId, RunKey, WorkerIdentity};
 use uuid::Uuid;
 
 use crate::{
@@ -88,14 +89,20 @@ pub(crate) async fn reset_successor(repo: &dyn RunRepository) -> Result<Workflow
     transition.history_events = history.into();
     ensure!(
         matches!(
-            repo.commit_transition(template.run_key, transition, ShardEpoch::ZERO)
+            repo.commit_transition(template.run_key, transition, WriteFence::Unfenced)
                 .await?,
             CommitResult::Applied { .. }
         ),
         "reset source must commit"
     );
-    repo.materialize_reset_successor(template.run_key, 7, run_id, Some(template.run_key))
-        .await?;
+    repo.materialize_reset_successor(
+        template.run_key,
+        7,
+        run_id,
+        Some(template.run_key),
+        WriteFence::Unfenced,
+    )
+    .await?;
     let LoadedRun::Existing(state) = repo.load_run(key).await? else {
         anyhow::bail!("reset successor missing")
     };

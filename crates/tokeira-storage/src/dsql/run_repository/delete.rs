@@ -35,14 +35,14 @@ impl DsqlRunRepository {
         run_key: RunKey,
         execution_home_bundle: ShardId,
         request: DeleteRunRequest,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<DeleteRunResult> {
         let span = tracing::info_span!(
             "dsql.delete_run_for_bundle",
             run_key = %run_key.0,
             bundle = execution_home_bundle.0,
             expected_seq = request.expected_seq.0,
-            epoch = epoch.0,
+            epoch = fence.epoch().0,
             tokeira.storage_operation = "delete_run_for_bundle",
             tokeira.dsql_class = "commit",
             tokeira.bundle_id = execution_home_bundle.0,
@@ -50,36 +50,19 @@ impl DsqlRunRepository {
         async move {
             record_dsql_operation!(self, "delete_run_for_bundle", Some(execution_home_bundle), {
                 convert::i64_from_u64(request.expected_seq.0, "delete expected transition_seq")?;
-                if epoch != ShardEpoch::ZERO {
-                    convert::i64_from_u64(epoch.0, "caller shard epoch")?;
+                if let WriteFence::Lease(fence) = &fence {
+                    epoch_to_sql(fence.epoch)?;
                 }
+                fence.ensure_home(execution_home_bundle)?;
 
                 let mut permit = self.director.acquire(DbClass::Commit).await?;
                 let mut tx = permit.connection()?.begin().await?;
 
-                if epoch != ShardEpoch::ZERO {
-                    let row = sqlx::query_as::<_, (i64,)>(
-                        "SELECT epoch FROM shard_lease WHERE shard_id = $1",
-                    )
-                    .bind(Self::shard_id_to_uuid(execution_home_bundle))
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                    let Some((durable_epoch,)) = row else {
-                        tx.rollback().await?;
-                        return Ok(DeleteRunResult::Conflict {
-                            reason: format!(
-                                "no active lease for execution-home bundle {execution_home_bundle:?} at epoch {epoch:?}"
-                            ),
-                        });
-                    };
-                    if durable_epoch != convert::i64_from_u64(epoch.0, "caller shard epoch")? {
-                        tx.rollback().await?;
-                        return Ok(DeleteRunResult::Conflict {
-                            reason: format!(
-                                "stale shard epoch {epoch:?} for execution-home bundle {execution_home_bundle:?}; current {durable_epoch}"
-                            ),
-                        });
-                    }
+                // The fence read is the transaction's first statement
+                // (`bundle-lease-fence`).
+                if let Some(lost) = Self::check_fence(&mut tx, &fence, run_key).await? {
+                    tx.rollback().await?;
+                    return Err(lost.into());
                 }
 
                 let row = sqlx::query_as::<_, (i64, Option<i64>, Vec<u8>)>(

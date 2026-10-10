@@ -363,6 +363,7 @@ mod tests {
         collections::{HashMap, VecDeque},
         sync::Mutex,
     };
+    use tokeira_storage::WriteFence;
 
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
@@ -373,8 +374,8 @@ mod tests {
         RunRepository, TransitionAuditRecord,
     };
     use tokeira_types::{
-        ExecutionRef, LogicalTaskSeq, NamespaceId, QueueKey, RequestId, RunKey, ShardEpoch,
-        ShardId, TaskKind, TaskQueueName,
+        ExecutionRef, LogicalTaskSeq, NamespaceId, QueueKey, RequestId, RunKey, ShardId, TaskKind,
+        TaskQueueName,
     };
 
     use super::*;
@@ -432,7 +433,7 @@ mod tests {
             &self,
             _run_key: RunKey,
             _transition: Transition,
-            _epoch: ShardEpoch,
+            _fence: WriteFence,
         ) -> Result<CommitResult> {
             Err(anyhow!("unused"))
         }
@@ -441,7 +442,7 @@ mod tests {
             _run_key: RunKey,
             _execution_home_bundle: ShardId,
             _transition: Transition,
-            _epoch: ShardEpoch,
+            _fence: WriteFence,
         ) -> Result<CommitResult> {
             Err(anyhow!("unused"))
         }
@@ -450,7 +451,7 @@ mod tests {
             _run_key: RunKey,
             _execution_home_bundle: ShardId,
             _request: tokeira_storage::DeleteRunRequest,
-            _epoch: ShardEpoch,
+            _fence: WriteFence,
         ) -> Result<tokeira_storage::DeleteRunResult> {
             Err(anyhow!("unused"))
         }
@@ -460,11 +461,16 @@ mod tests {
             _fork_event_id: i64,
             _successor_run_id: tokeira_types::RunId,
             _expected_current: Option<RunKey>,
+            _fence: WriteFence,
         ) -> Result<()> {
             Err(anyhow!("unused"))
         }
 
-        async fn abandon_materialization(&self, _run_key: RunKey) -> Result<()> {
+        async fn abandon_materialization(
+            &self,
+            _run_key: RunKey,
+            _fence: WriteFence,
+        ) -> Result<()> {
             Ok(())
         }
 

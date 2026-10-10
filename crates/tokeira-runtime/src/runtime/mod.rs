@@ -92,6 +92,8 @@ mod commit;
 mod discovery_tests;
 #[cfg(all(test, feature = "dsql-integration"))]
 mod dsql_tests;
+#[cfg(test)]
+mod lease_fence_tests;
 mod lifecycle;
 mod membership;
 mod query;
@@ -823,6 +825,12 @@ where
                 .write()
                 .expect("shard owner lock poisoned")
                 .enable_reconciliation();
+        }
+        if config.controller_managed_placement {
+            shard_owner
+                .write()
+                .expect("shard owner lock poisoned")
+                .fence_writes(owner_identity.clone());
         }
         wft_timeout_tracking.set_owner(shard_owner.clone());
         workflow_timeout_tracking.set_owner(shard_owner.clone());
@@ -1908,6 +1916,7 @@ pub(crate) mod tests {
         collections::VecDeque,
         sync::{Arc, Mutex},
     };
+    use tokeira_storage::WriteFence;
 
     use proptest::prelude::*;
     use tokio::runtime::Runtime;
@@ -2784,7 +2793,7 @@ pub(crate) mod tests {
         };
         let item = crate::discovery::tests::transition(&queue, 0);
         let run_key = item.next_state.run_key;
-        repo.commit_transition(run_key, item, ShardEpoch::ZERO)
+        repo.commit_transition(run_key, item, WriteFence::Unfenced)
             .await
             .unwrap();
 
@@ -2866,7 +2875,7 @@ pub(crate) mod tests {
                 events_numbered_at_close: 0,
                 growth_limits: None,
             },
-            ShardEpoch::ZERO,
+            WriteFence::Unfenced,
         )
         .await
         .expect("seed versioned workflow");
@@ -4020,7 +4029,7 @@ pub(crate) mod tests {
             &self,
             _run_key: RunKey,
             _transition: Transition,
-            _epoch: ShardEpoch,
+            _fence: WriteFence,
         ) -> Result<CommitResult> {
             panic!("unused in timer scanner tests")
         }
@@ -4030,7 +4039,7 @@ pub(crate) mod tests {
             _run_key: RunKey,
             _execution_home_bundle: ShardId,
             _transition: Transition,
-            _epoch: ShardEpoch,
+            _fence: WriteFence,
         ) -> Result<CommitResult> {
             panic!("unused in timer scanner tests")
         }
@@ -4040,7 +4049,7 @@ pub(crate) mod tests {
             _run_key: RunKey,
             _execution_home_bundle: ShardId,
             _request: tokeira_storage::DeleteRunRequest,
-            _epoch: ShardEpoch,
+            _fence: WriteFence,
         ) -> Result<tokeira_storage::DeleteRunResult> {
             panic!("unused in timer scanner tests")
         }
@@ -4051,11 +4060,16 @@ pub(crate) mod tests {
             _fork_event_id: i64,
             _successor_run_id: RunId,
             _expected_current: Option<RunKey>,
+            _fence: WriteFence,
         ) -> Result<()> {
             panic!("unused in timer scanner tests")
         }
 
-        async fn abandon_materialization(&self, _run_key: RunKey) -> Result<()> {
+        async fn abandon_materialization(
+            &self,
+            _run_key: RunKey,
+            _fence: WriteFence,
+        ) -> Result<()> {
             panic!("unused in timer scanner tests")
         }
 

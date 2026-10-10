@@ -16,7 +16,7 @@ use tokeira_storage::{
     AttributedHistoryEvent, BacklogEntry, BundleLease, CommitResult, DeleteRunRequest,
     DeleteRunResult, DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, LeaseOutcome,
     LeaseRepository, RequestRecord, RunHistoryStats, RunRepository, TransitionAuditRecord,
-    WorkerDeploymentVersionKey, WorkflowRuleCreateResult, WorkflowRuleDeleteResult,
+    WorkerDeploymentVersionKey, WorkflowRuleCreateResult, WorkflowRuleDeleteResult, WriteFence,
 };
 use tokeira_types::{
     ExecutionRef, NamespaceId, QueueKey, RequestId, RunId, RunKey, ShardEpoch, ShardId, WorkflowId,
@@ -202,12 +202,12 @@ where
         &self,
         run_key: RunKey,
         transition: Transition,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<CommitResult> {
         let last_event_id = transition.history_events.last().map(|event| event.event_id);
         let result = self
             .inner
-            .commit_transition(run_key, transition, epoch)
+            .commit_transition(run_key, transition, fence)
             .await?;
         if matches!(result, CommitResult::Applied { .. })
             && let Some(last_event_id) = last_event_id
@@ -222,12 +222,12 @@ where
         run_key: RunKey,
         execution_home_bundle: ShardId,
         transition: Transition,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<CommitResult> {
         let last_event_id = transition.history_events.last().map(|event| event.event_id);
         let result = self
             .inner
-            .commit_transition_for_bundle(run_key, execution_home_bundle, transition, epoch)
+            .commit_transition_for_bundle(run_key, execution_home_bundle, transition, fence)
             .await?;
         if matches!(result, CommitResult::Applied { .. })
             && let Some(last_event_id) = last_event_id
@@ -242,11 +242,11 @@ where
         run_key: RunKey,
         execution_home_bundle: ShardId,
         request: DeleteRunRequest,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<DeleteRunResult> {
         let result = self
             .inner
-            .delete_run_for_bundle(run_key, execution_home_bundle, request, epoch)
+            .delete_run_for_bundle(run_key, execution_home_bundle, request, fence)
             .await?;
         if matches!(result, DeleteRunResult::Deleted { .. }) {
             // Wake long-polling history readers after the purge. Their next loop
@@ -263,6 +263,7 @@ where
         fork_event_id: i64,
         successor_run_id: RunId,
         expected_current: Option<RunKey>,
+        fence: WriteFence,
     ) -> Result<()> {
         self.inner
             .materialize_reset_successor(
@@ -270,6 +271,7 @@ where
                 fork_event_id,
                 successor_run_id,
                 expected_current,
+                fence,
             )
             .await?;
         let loaded = self.inner.load_run(base_run_key).await?;
@@ -355,8 +357,8 @@ where
 
     // Purges and abandoned materializations change no visible run: a recorded
     // run has no mutable state, so no waiter can be watching it.
-    async fn abandon_materialization(&self, run_key: RunKey) -> Result<()> {
-        self.inner.abandon_materialization(run_key).await
+    async fn abandon_materialization(&self, run_key: RunKey, fence: WriteFence) -> Result<()> {
+        self.inner.abandon_materialization(run_key, fence).await
     }
 
     async fn purge_run(&self, run_key: RunKey) -> Result<()> {
@@ -558,7 +560,7 @@ mod tests {
             )
             .expect("pinned start transition");
         assert!(matches!(
-            repo.commit_transition(run_key, transition, ShardEpoch::ZERO)
+            repo.commit_transition(run_key, transition, WriteFence::Unfenced)
                 .await
                 .expect("commit pinned start"),
             CommitResult::Applied { .. }

@@ -629,27 +629,25 @@ where
                 growth_limits: Some(crate::run_growth::run_growth_limits()),
             };
 
-            let (bundle, commit_epoch) = {
+            let (bundle, fence) = {
                 let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
                 let bundle_id = execution_home_bundle(
                     state.namespace_id.0.as_bytes(),
                     state.workflow_id.0.as_bytes(),
                     owner.shard_count(),
                 );
-                let local_epoch = owner.epoch_of(bundle_id).unwrap_or(ShardEpoch::ZERO);
-                let epoch = if self.config.controller_managed_placement {
-                    local_epoch
-                } else {
-                    ShardEpoch::ZERO
-                };
-                (bundle_id, epoch)
+                let fence = owner.write_fence(bundle_id).ok_or_else(|| {
+                    crate::errors::NotShardOwner::local(bundle_id, ShardEpoch::ZERO)
+                })?;
+                (bundle_id, fence)
             };
 
             let mut write_admission = crate::serving_gate::admit(&self.shard_owner, bundle).await?;
             let committed = self
                 .repo
-                .commit_transition_for_bundle(token.run_key, bundle, transition, commit_epoch)
-                .await;
+                .commit_transition_for_bundle(token.run_key, bundle, transition, fence)
+                .await
+                .map_err(|error| crate::errors::lease_loss(error, &self.shard_owner));
             match terminate_on_growth_breach(
                 &self.lanes,
                 token.run_key,
@@ -813,30 +811,26 @@ where
                 .map_err(|reject| anyhow::Error::new(KernelRejected(reject)))?;
             transition.growth_limits = Some(crate::run_growth::run_growth_limits());
 
-            // Same commit-epoch rule as start_activity_task: ZERO without a
-            // placement controller (no lease to fence), real local epoch under
-            // one so storage lease-fences a superseded owner's write.
-            let (bundle, commit_epoch) = {
+            // Same fence as start_activity_task (`bundle-lease-fence`).
+            let (bundle, fence) = {
                 let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
                 let bundle_id = execution_home_bundle(
                     state.namespace_id.0.as_bytes(),
                     state.workflow_id.0.as_bytes(),
                     owner.shard_count(),
                 );
-                let local_epoch = owner.epoch_of(bundle_id).unwrap_or(ShardEpoch::ZERO);
-                let epoch = if self.config.controller_managed_placement {
-                    local_epoch
-                } else {
-                    ShardEpoch::ZERO
-                };
-                (bundle_id, epoch)
+                let fence = owner.write_fence(bundle_id).ok_or_else(|| {
+                    crate::errors::NotShardOwner::local(bundle_id, ShardEpoch::ZERO)
+                })?;
+                (bundle_id, fence)
             };
 
             let mut write_admission = crate::serving_gate::admit(&self.shard_owner, bundle).await?;
             let committed = self
                 .repo
-                .commit_transition_for_bundle(run_key, bundle, transition, commit_epoch)
-                .await;
+                .commit_transition_for_bundle(run_key, bundle, transition, fence)
+                .await
+                .map_err(|error| crate::errors::lease_loss(error, &self.shard_owner));
             match terminate_on_growth_breach(&self.lanes, run_key, committed, &mut write_admission)
                 .await?
             {
@@ -1130,33 +1124,30 @@ where
                 .cloned()
                 .expect("the kernel keeps the activity it just started");
 
-            // Mirror the lane's commit-epoch rule (see lane.rs): with no
-            // placement controller there is no durable lease to fence against,
-            // so commit at ZERO and skip the lease read. Under a controller the
-            // real local epoch must travel to storage so a superseded owner's
-            // write is rejected by lease fencing — the authoritative ownership
-            // check.
-            let (bundle, commit_epoch) = {
+            // Mirror the lane's fence (see lane.rs): under controller-managed
+            // placement, the home's lease at the epoch this node holds it, so
+            // storage refuses a superseded owner's write — the authoritative
+            // ownership check. With no placement controller there is no lease
+            // to fence against (`bundle-lease-fence`).
+            let (bundle, fence) = {
                 let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
                 let bundle_id = execution_home_bundle(
                     state.namespace_id.0.as_bytes(),
                     state.workflow_id.0.as_bytes(),
                     owner.shard_count(),
                 );
-                let local_epoch = owner.epoch_of(bundle_id).unwrap_or(ShardEpoch::ZERO);
-                let epoch = if self.config.controller_managed_placement {
-                    local_epoch
-                } else {
-                    ShardEpoch::ZERO
-                };
-                (bundle_id, epoch)
+                let fence = owner.write_fence(bundle_id).ok_or_else(|| {
+                    crate::errors::NotShardOwner::local(bundle_id, ShardEpoch::ZERO)
+                })?;
+                (bundle_id, fence)
             };
 
             let mut write_admission = crate::serving_gate::admit(&self.shard_owner, bundle).await?;
             let committed = self
                 .repo
-                .commit_transition_for_bundle(task.run_key, bundle, transition, commit_epoch)
-                .await;
+                .commit_transition_for_bundle(task.run_key, bundle, transition, fence)
+                .await
+                .map_err(|error| crate::errors::lease_loss(error, &self.shard_owner));
             let committed = terminate_on_growth_breach(
                 &self.lanes,
                 task.run_key,
@@ -1621,30 +1612,26 @@ where
             growth_limits: Some(crate::run_growth::run_growth_limits()),
         };
 
-        // Same commit-epoch rule as start_activity_task: ZERO without a
-        // placement controller (no lease to fence), real local epoch under
-        // one so storage lease-fences a superseded owner's write.
-        let (bundle, commit_epoch) = {
+        // Same fence as start_activity_task (`bundle-lease-fence`).
+        let (bundle, fence) = {
             let owner = deps.shard_owner.read().expect("shard_owner lock poisoned");
             let bundle_id = execution_home_bundle(
                 state.namespace_id.0.as_bytes(),
                 state.workflow_id.0.as_bytes(),
                 owner.shard_count(),
             );
-            let local_epoch = owner.epoch_of(bundle_id).unwrap_or(ShardEpoch::ZERO);
-            let epoch = if deps.controller_managed_placement {
-                local_epoch
-            } else {
-                ShardEpoch::ZERO
-            };
-            (bundle_id, epoch)
+            let fence = owner
+                .write_fence(bundle_id)
+                .ok_or_else(|| crate::errors::NotShardOwner::local(bundle_id, ShardEpoch::ZERO))?;
+            (bundle_id, fence)
         };
 
         let mut write_admission = crate::serving_gate::admit(&deps.shard_owner, bundle).await?;
         let committed = deps
             .repo
-            .commit_transition_for_bundle(run_key, bundle, transition, commit_epoch)
-            .await;
+            .commit_transition_for_bundle(run_key, bundle, transition, fence)
+            .await
+            .map_err(|error| crate::errors::lease_loss(error, &deps.shard_owner));
         match terminate_on_growth_breach(&deps.lanes, run_key, committed, &mut write_admission)
             .await?
         {
@@ -2039,27 +2026,25 @@ where
             events_numbered_at_close: 0,
             growth_limits: Some(crate::run_growth::run_growth_limits()),
         };
-        let (bundle, commit_epoch) = {
+        let (bundle, fence) = {
             let owner = deps.shard_owner.read().expect("shard_owner lock poisoned");
             let bundle_id = execution_home_bundle(
                 state.namespace_id.0.as_bytes(),
                 state.workflow_id.0.as_bytes(),
                 owner.shard_count(),
             );
-            let local_epoch = owner.epoch_of(bundle_id).unwrap_or(ShardEpoch::ZERO);
-            let epoch = if deps.controller_managed_placement {
-                local_epoch
-            } else {
-                ShardEpoch::ZERO
-            };
-            (bundle_id, epoch)
+            let fence = owner
+                .write_fence(bundle_id)
+                .ok_or_else(|| crate::errors::NotShardOwner::local(bundle_id, ShardEpoch::ZERO))?;
+            (bundle_id, fence)
         };
 
         let mut write_admission = crate::serving_gate::admit(&deps.shard_owner, bundle).await?;
         let committed = deps
             .repo
-            .commit_transition_for_bundle(task.run_key, bundle, transition, commit_epoch)
-            .await;
+            .commit_transition_for_bundle(task.run_key, bundle, transition, fence)
+            .await
+            .map_err(|error| crate::errors::lease_loss(error, &deps.shard_owner));
         match terminate_on_growth_breach(&deps.lanes, task.run_key, committed, &mut write_admission)
             .await?
         {
@@ -2084,6 +2069,7 @@ mod tests {
         collections::{BTreeMap, HashSet},
         sync::Arc,
     };
+    use tokeira_storage::WriteFence;
 
     use proptest::prelude::*;
     use time::{Duration, OffsetDateTime};
@@ -2413,7 +2399,7 @@ mod tests {
             events_numbered_at_close: 0,
             growth_limits: None,
         };
-        repo.commit_transition(run_key, transition, ShardEpoch::ZERO)
+        repo.commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .expect("seed activity state");
         let token = ActivityTaskToken {
@@ -2541,7 +2527,7 @@ mod tests {
             events_numbered_at_close: 0,
             growth_limits: None,
         };
-        repo.commit_transition(run_key, transition, ShardEpoch::ZERO)
+        repo.commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .expect("seed scheduled activity state");
         runtime
@@ -2784,7 +2770,7 @@ mod tests {
             transition
                 .timer_ops
                 .push(tokeira_kernel::TimerOp::Upsert(timer.clone()));
-            repo.commit_transition(state.run_key, transition, ShardEpoch::ZERO)
+            repo.commit_transition(state.run_key, transition, WriteFence::Unfenced)
                 .await
                 .unwrap();
             let before = repo.snapshot().await.unwrap();
@@ -3163,7 +3149,7 @@ mod tests {
             events_numbered_at_close: 0,
             growth_limits: None,
         };
-        repo.commit_transition(run_key, transition, ShardEpoch::ZERO)
+        repo.commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .expect("close seeded run");
         closed
@@ -3692,7 +3678,7 @@ mod tests {
             events_numbered_at_close: 0,
             growth_limits: None,
         };
-        repo.commit_transition(token.run_key, transition, ShardEpoch::ZERO)
+        repo.commit_transition(token.run_key, transition, WriteFence::Unfenced)
             .await
             .expect("start the current attempt");
         ActivityTaskToken {
@@ -4209,7 +4195,7 @@ mod tests {
             events_numbered_at_close: 0,
             growth_limits: None,
         };
-        repo.commit_transition(zombie_run, zombie_transition, ShardEpoch::ZERO)
+        repo.commit_transition(zombie_run, zombie_transition, WriteFence::Unfenced)
             .await
             .expect("commit zombie row");
 
@@ -4342,5 +4328,38 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    /// An activity heartbeat, which commits directly, ends as `NotShardOwner`
+    /// once another node has taken the home over, changing nothing, and the
+    /// home's acquisition is cancelled.
+    // Feature: bundle-lease-fence, Property 4: A lost fence is final
+    #[tokio::test]
+    async fn a_heartbeat_under_a_lost_fence_ends_the_homes_acquisition() {
+        use super::super::lease_fence_tests::{HOME, fenced_runtime, take_over_behind_its_back};
+
+        let repo = Arc::new(InMemoryStore::with_shard_count(1));
+        let runtime = fenced_runtime(repo.clone());
+        let epoch = runtime.acquire_shard(HOME).await.unwrap();
+        let (_state, token, _queue) = seed_started_activity(&runtime, &repo, None).await;
+        let taken = take_over_behind_its_back(&repo, epoch).await;
+        let acquisition = runtime
+            .shard_owner
+            .read()
+            .unwrap()
+            .acquisition(HOME)
+            .unwrap();
+
+        let before = repo.snapshot().await.unwrap();
+        let error = runtime
+            .record_activity_heartbeat(token, Some(payloads(b"late-heartbeat")), None)
+            .await
+            .unwrap_err();
+        let not_owner = error
+            .downcast_ref::<crate::errors::NotShardOwner>()
+            .unwrap_or_else(|| panic!("{error:?}"));
+        assert_eq!(not_owner.current_epoch, taken);
+        assert_eq!(repo.snapshot().await.unwrap(), before);
+        assert!(acquisition.cancel.is_cancelled());
     }
 }

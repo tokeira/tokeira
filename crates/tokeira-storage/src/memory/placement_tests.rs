@@ -3,7 +3,7 @@
 use proptest::prelude::*;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{TimerOp, TimerState};
-use tokeira_types::{RunKey, ShardEpoch, ShardId};
+use tokeira_types::{RunKey, ShardId};
 use uuid::Uuid;
 
 use super::{projection_accumulator_tests::fresh_transition, *};
@@ -41,7 +41,7 @@ async fn seed(
         .insert(timer.timer_id.clone(), timer.clone());
     transition.timer_ops.push(TimerOp::Upsert(timer.clone()));
     store
-        .commit_transition(key, transition, ShardEpoch::ZERO)
+        .commit_transition(key, transition, WriteFence::Unfenced)
         .await
         .unwrap();
     let mut inner = store.inner.lock().await;

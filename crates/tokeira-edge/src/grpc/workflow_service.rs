@@ -4072,6 +4072,8 @@ mod tests {
 
     mod standalone;
 
+    use tokeira_storage::WriteFence;
+
     use std::{
         collections::BTreeMap,
         sync::{Arc, Mutex},
@@ -4120,9 +4122,9 @@ mod tests {
     use tokeira_storage::{CommitResult, DispatchableWorkflowTask, RunRepository};
     use tokeira_types::{
         EventPrincipal, EvictionReport, HeartbeatStore, HeartbeatStoreError, LogicalTaskSeq, Memo,
-        Payloads, QueueKey, RequestContext, RequestId, RunId, RunKey, SearchAttributes, ShardEpoch,
-        TaskKind, TaskQueueName, WorkerHeartbeat as HeartbeatObservation, WorkerIdentity,
-        WorkerInstanceKey, WorkflowId, WorkflowType,
+        Payloads, QueueKey, RequestContext, RequestId, RunId, RunKey, SearchAttributes, TaskKind,
+        TaskQueueName, WorkerHeartbeat as HeartbeatObservation, WorkerIdentity, WorkerInstanceKey,
+        WorkflowId, WorkflowType,
     };
 
     #[test]
@@ -7192,7 +7194,7 @@ mod tests {
             .apply(LoadedRun::Absent, Command::Start(start))
             .expect("start transition");
         let result = repo
-            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .expect("commit start");
         assert!(matches!(result, CommitResult::Applied { .. }));
@@ -7222,7 +7224,7 @@ mod tests {
             )
             .expect("signal transition");
         let result = repo
-            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .expect("commit signal");
         assert!(matches!(result, CommitResult::Applied { .. }));

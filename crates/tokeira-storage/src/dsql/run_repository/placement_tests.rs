@@ -1,13 +1,14 @@
 //! Live placement upgrade atomicity, diagnostics and bounded query-plan evidence.
 //! All data belongs to the disposable URL-gated test cluster.
 
+use crate::WriteFence;
 use std::time::Instant;
 
 use anyhow::{Result, ensure};
 use sqlx::{Execute, Postgres, QueryBuilder};
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{TimerOp, TimerState};
-use tokeira_types::{NamespaceId, RunKey, ShardEpoch, ShardId, execution_home_bundle};
+use tokeira_types::{NamespaceId, RunKey, ShardId, execution_home_bundle};
 use uuid::Uuid;
 
 use super::{
@@ -59,7 +60,7 @@ async fn seed(
     let result = f
         .store
         .run_repository()
-        .commit_transition(key, transition, ShardEpoch::ZERO)
+        .commit_transition(key, transition, WriteFence::Unfenced)
         .await?;
     ensure!(
         matches!(result, CommitResult::Applied { .. }),

@@ -9,14 +9,14 @@ impl DsqlRunRepository {
         &self,
         run_key: RunKey,
         transition: Transition,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<CommitResult> {
         let shard_id = self.shard_for_run_key(run_key);
         let span = tracing::info_span!(
             "dsql.commit_transition",
             run_key = %run_key.0,
             expected_seq = transition.expected_seq.0,
-            epoch = epoch.0,
+            epoch = fence.epoch().0,
             tokeira.storage_operation = "commit_transition",
             tokeira.dsql_class = "commit",
             tokeira.shard_id = shard_id.0,
@@ -27,8 +27,8 @@ impl DsqlRunRepository {
                 // transaction. This prevents mid-transaction failures from overflow on
                 // values that are structurally u64 but stored as BIGINT (i64) in DSQL.
                 convert::i64_from_u64(transition.next_state.transition_seq.0, "transition_seq")?;
-                if should_check_epoch(epoch) {
-                    convert::i64_from_u64(epoch.0, "caller shard epoch")?;
+                if let WriteFence::Lease(fence) = &fence {
+                    epoch_to_sql(fence.epoch)?;
                 }
 
                 let mut permit = self.director.acquire(DbClass::Commit).await?;
@@ -43,33 +43,13 @@ impl DsqlRunRepository {
                 // runtime ShardOwner. A mismatch here would make leases and rows
                 // disagree about execution-home ownership.
 
-                if should_check_epoch(epoch) {
-                    // Epoch fencing ties a commit to the lane/shard lease that produced
-                    // it. A stale owner must fail before reading or writing run state.
-                    let row = sqlx::query_as::<_, (i64,)>(
-                        "SELECT epoch FROM shard_lease WHERE shard_id = $1",
-                    )
-                    .bind(Self::shard_id_to_uuid(shard_id))
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                    let Some((durable_epoch,)) = row else {
-                        tx.rollback().await?;
-                        return Ok(CommitResult::Conflict {
-                            reason: format!(
-                                "no active lease for shard {:?} at epoch {:?}",
-                                shard_id, epoch
-                            ),
-                        });
-                    };
-                    if durable_epoch != convert::i64_from_u64(epoch.0, "caller shard epoch")? {
-                        tx.rollback().await?;
-                        return Ok(CommitResult::Conflict {
-                            reason: format!(
-                                "stale shard epoch {:?} for shard {:?}; current {}",
-                                epoch, shard_id, durable_epoch
-                            ),
-                        });
-                    }
+                fence.ensure_home(shard_id)?;
+                // The fence read is the transaction's first statement: a node
+                // that has lost the home fails before reading or writing run
+                // state (`bundle-lease-fence`).
+                if let Some(lost) = Self::check_fence(&mut tx, &fence, run_key).await? {
+                    tx.rollback().await?;
+                    return Err(lost.into());
                 }
 
                 let started = Instant::now();
@@ -227,14 +207,14 @@ impl DsqlRunRepository {
         run_key: RunKey,
         execution_home_bundle: ShardId,
         transition: Transition,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<CommitResult> {
         let span = tracing::info_span!(
             "dsql.commit_transition_for_bundle",
             run_key = %run_key.0,
             bundle = execution_home_bundle.0,
             expected_seq = transition.expected_seq.0,
-            epoch = epoch.0,
+            epoch = fence.epoch().0,
             tokeira.storage_operation = "commit_transition_for_bundle",
             tokeira.dsql_class = "commit",
             tokeira.bundle_id = execution_home_bundle.0,
@@ -245,47 +225,14 @@ impl DsqlRunRepository {
                 "commit_transition_for_bundle",
                 Some(execution_home_bundle),
                 {
-                if should_check_epoch(epoch) {
-                    // Multi-node/controller-managed deployments keep the
-                    // durable shard_lease fence. Single-node compose passes
-                    // ShardEpoch::ZERO and skips this read because there is no
-                    // takeover actor that can advance the epoch.
-                    convert::i64_from_u64(epoch.0, "caller shard epoch")?;
-                    let mut permit = self.director.acquire(DbClass::Commit).await?;
-                    let mut tx = permit.connection()?.begin().await?;
-                    let row = sqlx::query_as::<_, (i64,)>(
-                        "SELECT epoch FROM shard_lease WHERE shard_id = $1",
-                    )
-                    .bind(Self::shard_id_to_uuid(execution_home_bundle))
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                    let Some((durable_epoch,)) = row else {
-                        tx.rollback().await?;
-                        return Ok(CommitResult::Conflict {
-                            reason: format!(
-                                "no active lease for execution-home bundle {:?} at epoch {:?}",
-                                execution_home_bundle, epoch
-                            ),
-                        });
-                    };
-                    if durable_epoch != convert::i64_from_u64(epoch.0, "caller shard epoch")? {
-                        tx.rollback().await?;
-                        return Ok(CommitResult::Conflict {
-                            reason: format!(
-                                "stale shard epoch {:?} for execution-home bundle {:?}; current {}",
-                                epoch, execution_home_bundle, durable_epoch
-                            ),
-                        });
-                    }
-                    tx.rollback().await?;
-                }
-
-                metrics::increment_dsql_commits_in_flight();
-                let result = self
-                    .commit_transition(run_key, transition, ShardEpoch::ZERO)
-                    .await;
-                metrics::decrement_dsql_commits_in_flight();
-                result
+                    // The fence is read in the commit's own transaction: a check in
+                    // a transaction of its own would leave a takeover room to commit
+                    // in between (`bundle-lease-fence`).
+                    fence.ensure_home(execution_home_bundle)?;
+                    metrics::increment_dsql_commits_in_flight();
+                    let result = self.commit_transition(run_key, transition, fence).await;
+                    metrics::decrement_dsql_commits_in_flight();
+                    result
                 }
             )
         }

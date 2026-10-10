@@ -1,19 +1,21 @@
 //! Bug condition exploration tests for commit fencing correctness.
 //!
 //! These tests validate that the fencing fix works correctly:
-//! - Mode 1: `commit_transition_for_bundle` with a stale epoch returns Conflict
+//! - Mode 1: `commit_transition_for_bundle` with a stale fence fails with
+//!   `LeaseFenceLost` and changes nothing (`bundle-lease-fence`)
 //! - The property test verifies this holds for any shard
 //!
 //! Modes 2/3 (unfenced activity start/retry) were removed because the fix is
 //! structural: the runtime callers now route through `commit_transition_for_bundle`
 //! instead of calling `commit_transition` directly with `ShardEpoch::ZERO`.
-//! The preservation tests confirm that ZERO-epoch bypass still works for
+//! The preservation tests confirm that an unfenced write still works for
 //! single-node/test paths.
 //!
 //! **Validates: Requirements 2.1, 2.5**
 
 #[cfg(test)]
 mod tests {
+    use crate::WriteFence;
     use proptest::prelude::*;
     use time::{Duration, OffsetDateTime};
     use tokeira_kernel::{LoadedRun, PendingWorkflowTask, Transition, WorkflowState};
@@ -23,7 +25,10 @@ mod tests {
     };
 
     use crate::{
-        api::{CommitResult, LeaseOutcome, LeaseRepository, RunRepository},
+        api::{
+            CommitResult, ExecutionHomeFence, LeaseFenceLost, LeaseOutcome, LeaseRepository,
+            RunRepository,
+        },
         memory::InMemoryStore,
     };
 
@@ -133,15 +138,41 @@ mod tests {
         }
     }
 
-    /// Mode 1: Verify that `commit_transition_for_bundle` with a stale epoch
-    /// returns `CommitResult::Conflict`.
+    /// A run's start whose execution home is `bundle` among `shard_count`.
+    fn start_at(bundle: ShardId, shard_count: u32) -> Transition {
+        let mut transition = start_transition(RunKey::new());
+        let namespace_id = transition.next_state.namespace_id;
+        transition.next_state.workflow_id = (0..)
+            .map(|index| WorkflowId(format!("workflow-{index}")))
+            .find(|workflow_id| {
+                tokeira_types::execution_home_bundle(
+                    namespace_id.0.as_bytes(),
+                    workflow_id.0.as_bytes(),
+                    shard_count,
+                ) == bundle
+            })
+            .expect("some workflow id lands on the bundle");
+        transition
+    }
+
+    /// A lease fence for `owner` at `epoch` on `bundle`.
+    fn fence(bundle: ShardId, owner: &str, epoch: ShardEpoch) -> WriteFence {
+        WriteFence::Lease(ExecutionHomeFence {
+            home: bundle,
+            owner: owner.to_owned(),
+            epoch,
+        })
+    }
+
+    /// Mode 1: Verify that `commit_transition_for_bundle` with a stale fence
+    /// fails with `LeaseFenceLost`.
     ///
-    /// This validates the fix: the epoch check and mutation write now execute
+    /// This validates the fix: the fence check and mutation write execute
     /// atomically within the same lock scope. A stale caller is rejected.
     ///
     /// **Validates: Requirements 2.1, 2.5**
     #[tokio::test]
-    async fn mode1_stale_epoch_commit_for_bundle_returns_conflict() {
+    async fn mode1_stale_fence_commit_for_bundle_is_lease_lost() {
         let store = InMemoryStore::with_shard_count(32);
         let bundle = ShardId(7);
 
@@ -157,11 +188,11 @@ mod tests {
             panic!("expected initial acquire");
         };
 
-        // Create a run
-        let run_key = RunKey::new();
-        let t = start_transition(run_key);
+        // Create a run at the bundle
+        let t = start_at(bundle, 32);
+        let run_key = t.next_state.run_key;
         let result = store
-            .commit_transition(run_key, t, ShardEpoch::ZERO)
+            .commit_transition(run_key, t, WriteFence::Unfenced)
             .await
             .unwrap();
         assert!(matches!(result, CommitResult::Applied { .. }));
@@ -203,18 +234,24 @@ mod tests {
             growth_limits: None,
         };
 
-        // Runtime A (stale) calls commit_transition_for_bundle with its old epoch.
-        // After the fix, this is rejected atomically because the epoch check
+        // Runtime A (stale) calls commit_transition_for_bundle with its old fence.
+        // After the fix, this is rejected atomically because the fence check
         // and write happen under the same lock.
         let result = store
-            .commit_transition_for_bundle(run_key, bundle, transition, runtime_a_epoch)
-            .await
-            .unwrap();
+            .commit_transition_for_bundle(
+                run_key,
+                bundle,
+                transition,
+                fence(bundle, "runtime-a", runtime_a_epoch),
+            )
+            .await;
 
         assert!(
-            matches!(result, CommitResult::Conflict { .. }),
-            "commit_transition_for_bundle with stale epoch {:?} should return Conflict \
-             (durable epoch is now {:?}), but got {:?}",
+            result
+                .as_ref()
+                .is_err_and(|error| error.downcast_ref::<LeaseFenceLost>().is_some()),
+            "commit_transition_for_bundle with stale epoch {:?} should fail with \
+             LeaseFenceLost (durable epoch is now {:?}), but got {:?}",
             runtime_a_epoch,
             runtime_b_epoch,
             result
@@ -222,14 +259,15 @@ mod tests {
     }
 
     // Property-based test: for any shard, commit_transition_for_bundle with a
-    // stale epoch returns Conflict. This validates the fix holds universally.
+    // stale fence fails with LeaseFenceLost. This validates the fix holds
+    // universally.
     //
     // **Validates: Requirements 2.1, 2.5**
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(50))]
 
         #[test]
-        fn property_stale_epoch_commit_for_bundle_returns_conflict(
+        fn property_stale_fence_commit_for_bundle_is_lease_lost(
             shard_id_val in 0u32..32,
         ) {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -254,11 +292,11 @@ mod tests {
                     panic!("expected acquire");
                 };
 
-                // Create a run
-                let run_key = RunKey::new();
-                let t = start_transition(run_key);
+                // Create a run at the bundle
+                let t = start_at(bundle, 32);
+                let run_key = t.next_state.run_key;
                 store
-                    .commit_transition(run_key, t, ShardEpoch::ZERO)
+                    .commit_transition(run_key, t, WriteFence::Unfenced)
                     .await
                     .unwrap();
 
@@ -300,17 +338,23 @@ mod tests {
                     growth_limits: None,
                 };
 
-                // Stale caller uses commit_transition_for_bundle with old epoch.
-                // After the fix, this returns Conflict.
+                // Stale caller uses commit_transition_for_bundle with its old
+                // fence. After the fix, this fails with LeaseFenceLost.
                 let result = store
-                    .commit_transition_for_bundle(run_key, bundle, transition, epoch_a)
-                    .await
-                    .unwrap();
+                    .commit_transition_for_bundle(
+                        run_key,
+                        bundle,
+                        transition,
+                        fence(bundle, "owner-a", epoch_a),
+                    )
+                    .await;
 
                 prop_assert!(
-                    matches!(result, CommitResult::Conflict { .. }),
-                    "commit_transition_for_bundle with stale epoch {:?} should return \
-                     Conflict (durable epoch is {:?}), but got {:?}",
+                    result
+                        .as_ref()
+                        .is_err_and(|error| error.downcast_ref::<LeaseFenceLost>().is_some()),
+                    "commit_transition_for_bundle with stale epoch {:?} should fail with \
+                     LeaseFenceLost (durable epoch is {:?}), but got {:?}",
                     epoch_a,
                     epoch_b,
                     result

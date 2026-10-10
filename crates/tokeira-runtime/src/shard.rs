@@ -12,6 +12,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use tokeira_storage::{ExecutionHomeFence, WriteFence};
 use tokeira_types::{RunKey, ShardEpoch, ShardId};
 use tokio_util::sync::CancellationToken;
 
@@ -80,6 +81,9 @@ pub struct ShardOwner {
     next_generation: u64,
     reconciliation: bool,
     write_barriers: HashMap<ShardId, Arc<tokio::sync::RwLock<()>>>,
+    /// The lease owner this node's writes are fenced with, under
+    /// controller-managed placement (`bundle-lease-fence`).
+    lease_owner: Option<String>,
 }
 
 /// Identity of one local acquisition attempt, including repeated sweeps at the
@@ -111,6 +115,55 @@ impl ShardOwner {
     pub(crate) fn reconciliation_enabled(&self) -> bool {
         self.reconciliation
     }
+
+    /// Fence this node's writes with its leases, which name it as
+    /// `owner_identity`: for controller-managed placement
+    /// (`bundle-lease-fence`). A node that assigns itself every home writes
+    /// unfenced.
+    pub(crate) fn fence_writes(&mut self, owner_identity: String) {
+        self.lease_owner = Some(owner_identity);
+    }
+
+    /// Whether this node's writes are fenced with its leases.
+    pub(crate) fn fences_writes(&self) -> bool {
+        self.lease_owner.is_some()
+    }
+
+    /// The fence of a write at `home` under the acquisition at `epoch`: the
+    /// home's lease at that epoch when this node's writes are fenced, or
+    /// unfenced.
+    pub(crate) fn fence_at(&self, home: ShardId, epoch: ShardEpoch) -> WriteFence {
+        match &self.lease_owner {
+            Some(owner) => WriteFence::Lease(ExecutionHomeFence {
+                home,
+                owner: owner.clone(),
+                epoch,
+            }),
+            None => WriteFence::Unfenced,
+        }
+    }
+
+    /// The fence of a write at `home` now, from the epoch at which this node
+    /// holds it. `None` when this node's writes are fenced and it doesn't hold
+    /// the home, so the write mustn't happen.
+    pub(crate) fn write_fence(&self, home: ShardId) -> Option<WriteFence> {
+        if self.lease_owner.is_none() {
+            return Some(WriteFence::Unfenced);
+        }
+        self.epoch_of(home).map(|epoch| self.fence_at(home, epoch))
+    }
+
+    /// Cancel the home's acquisition at `epoch` once a write has found its
+    /// lease lost, as a lost renewal cancels it, so the home admits nothing
+    /// more (`bundle-lease-fence`). An acquisition at another epoch, a later
+    /// one, is left alone.
+    pub(crate) fn cancel_lost_acquisition(&self, home: ShardId, epoch: ShardEpoch) {
+        if let Some(owned) = self.shards.get(&home)
+            && owned.epoch == epoch
+        {
+            owned.cancel.cancel();
+        }
+    }
     pub(crate) fn write_barrier(&self, home: ShardId) -> Arc<tokio::sync::RwLock<()>> {
         self.write_barriers
             .get(&home)
@@ -129,6 +182,7 @@ impl ShardOwner {
             next_generation: 0,
             reconciliation: false,
             write_barriers: HashMap::new(),
+            lease_owner: None,
         }
     }
 
@@ -374,6 +428,42 @@ mod tests {
         assert!(!owner.is_active(ShardId(3)));
         assert_eq!(owner.owns(ShardId(3)), None);
         assert!(cancel.is_cancelled());
+    }
+
+    /// Under controller-managed placement each write's fence is the home's
+    /// lease at the epoch this node holds it, and a home it doesn't hold has
+    /// none; without a placement controller every write is unfenced
+    /// (`bundle-lease-fence` criterion 2.7).
+    #[test]
+    fn write_fences_come_from_the_lease_this_node_holds() {
+        let mut owner = ShardOwner::new(4);
+        let _cancel = owner.record_acquired(ShardId(1), ShardEpoch(7));
+        assert_eq!(owner.write_fence(ShardId(1)), Some(WriteFence::Unfenced));
+        assert_eq!(owner.write_fence(ShardId(2)), Some(WriteFence::Unfenced));
+
+        owner.fence_writes("node-a".to_owned());
+        assert!(owner.fences_writes());
+        assert_eq!(
+            owner.write_fence(ShardId(1)),
+            Some(WriteFence::Lease(ExecutionHomeFence {
+                home: ShardId(1),
+                owner: "node-a".to_owned(),
+                epoch: ShardEpoch(7),
+            }))
+        );
+        assert_eq!(owner.write_fence(ShardId(2)), None);
+
+        let previous = owner.acquisition(ShardId(1)).unwrap();
+        let _cancel = owner.record_acquired(ShardId(1), ShardEpoch(8));
+        owner.cancel_lost_acquisition(ShardId(1), ShardEpoch(7));
+        let current = owner.acquisition(ShardId(1)).unwrap();
+        assert!(previous.cancel.is_cancelled());
+        assert!(
+            !current.cancel.is_cancelled(),
+            "a later acquisition is left alone"
+        );
+        owner.cancel_lost_acquisition(ShardId(1), ShardEpoch(8));
+        assert!(current.cancel.is_cancelled());
     }
 
     #[test]

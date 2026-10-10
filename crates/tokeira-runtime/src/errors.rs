@@ -7,8 +7,13 @@
 //! describe *placement* and *resolution* failures: the local node is not the
 //! owner, or authoritative state needed to answer is absent.
 
+use std::sync::RwLock;
+
 use thiserror::Error;
+use tokeira_storage::LeaseFenceLost;
 use tokeira_types::{BundleId, IncarnationId, RunKey, ShardEpoch};
+
+use crate::shard::ShardOwner;
 
 /// Runtime rejected a mutation because the local node is not the active bundle owner.
 ///
@@ -40,6 +45,29 @@ impl NotShardOwner {
             current_owner_node_id: None,
         }
     }
+}
+
+/// End a write whose fence was lost (`bundle-lease-fence`): the error becomes
+/// [`NotShardOwner`], which no lane retries, carrying the epoch the lease now
+/// holds, and the home's acquisition at the fence's epoch is cancelled, as a
+/// lost renewal cancels it, so the home admits nothing more. Any other error
+/// passes through.
+pub(crate) fn lease_loss(error: anyhow::Error, owner: &RwLock<ShardOwner>) -> anyhow::Error {
+    let Some(lost) = error.downcast_ref::<LeaseFenceLost>() else {
+        return error;
+    };
+    tracing::warn!(
+        home = ?lost.home,
+        epoch = ?lost.epoch,
+        found = ?lost.found,
+        "a write found its execution home's lease lost"
+    );
+    owner
+        .read()
+        .expect("shard owner lock poisoned")
+        .cancel_lost_acquisition(lost.home, lost.epoch);
+    let current_epoch = lost.found.as_ref().map_or(lost.epoch, |(_, epoch)| *epoch);
+    NotShardOwner::local(lost.home, current_epoch).into()
 }
 
 /// The exact workflow run selected for deletion no longer exists.

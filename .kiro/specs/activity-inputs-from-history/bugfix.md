@@ -36,7 +36,9 @@ This spec keeps an activity's input and header only in history, as v1.31.0 does.
 
 2.1 WHEN an activity is scheduled, started, retried, updated, paused, unpaused, reset or re-dispatched THEN the run's state, the activity's dispatch row and any backlog entry for its task SHALL hold no copy of its input or header. The ActivityTaskScheduled event SHALL be their only store, as in v1.31.0.
 
-2.2 WHEN a worker is given an activity task THEN the task SHALL carry the input and header of the activity's ActivityTaskScheduled event. This covers a task the worker polls, and one it receives eagerly in the answer to the workflow task completion that scheduled the activity. The event SHALL be read from the run's history before the start commits. v1.31.0 also reads it before it records the start (`recordactivitytaskstarted/api.go:139, 242 @ v1.31.0`). For an eager start, v1.31.0 takes the input and header from the command it has just recorded as that event (`service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:594-598 @ v1.31.0`), so the values are the same.
+2.2 WHEN a worker is given an activity task THEN the task SHALL carry the input and header of the activity's ActivityTaskScheduled event:
+- For a task the worker polls, the event SHALL be read from the run's history before the start commits. v1.31.0 also reads it before it records the start (`recordactivitytaskstarted/api.go:139, 242 @ v1.31.0`).
+- For a task the worker receives eagerly, in the answer to the workflow task completion that scheduled the activity, the input and header SHALL come from that completion's command, which the event was written from, and nothing SHALL be read. v1.31.0 answers an eager start the same way (`service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:594-598 @ v1.31.0`).
 
 2.3 The read SHALL be one bounded read. It SHALL be one lookup by the run and the event's id, returning the history batch that holds the event and no other batch. That SHALL hold whatever the length of the run's history, and however its batches were cut, including a reset successor's copied batches.
 
@@ -51,7 +53,7 @@ This spec keeps an activity's input and header only in history, as v1.31.0 does.
 
 2.7 This release SHALL write a run's state under a new envelope version, which the release before it refuses to read. Each activity's input and header SHALL keep their positions in the state's layout, written empty. So a state of the previous version decodes with the same layout, and no state needs converting on upgrade. Downgrade after the upgrade is unsupported: the earlier release refuses every state this one has written.
 
-2.8 The measured state of the run growth limits ([run-growth-limits](../run-growth-limits/bugfix.md) criterion 2.9) SHALL be the state's encoded size, since the state no longer holds the inputs that the measure left out.
+2.8 The measured state of the run growth limits ([run-growth-limits](../run-growth-limits/bugfix.md) criterion 2.9) SHALL be the state's encoded size less the two bytes of each activity's retired fields. Neither an activity's input nor its header SHALL count, as v1.31.0's mutable state holds neither. Today's measure leaves out each input but counts each header.
 
 ### Unchanged Behavior (Regression Prevention)
 
@@ -70,7 +72,7 @@ This spec keeps an activity's input and header only in history, as v1.31.0 does.
 
 3.5 Nexus operations and standalone activities SHALL CONTINUE TO keep their inputs as today.
 
-3.6 The run growth limits SHALL CONTINUE TO refuse, and terminate runs, at the sizes they do today for the same runs.
+3.6 The run growth limits SHALL CONTINUE TO refuse, and terminate runs, as today, except that a pending activity's header no longer counts toward the measured state (2.8).
 
 ### Out of Scope
 

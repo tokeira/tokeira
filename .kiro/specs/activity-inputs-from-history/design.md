@@ -4,7 +4,7 @@
 
 An activity's input and header stay in its ActivityTaskScheduled event, and nowhere else:
 - **No copies.** The run's state, the activity's dispatch row and its backlog entries no longer carry them. The state keeps each copy's position in its stored layout, written empty, so states that the previous release wrote still decode.
-- **One read at the start.** Starting an activity task reads the scheduled event with one lookup, which returns the history batch that holds it. The task carries that event's input and header.
+- **One read at a polled start.** Starting a polled activity task reads the scheduled event with one lookup, which returns the history batch that holds it, and the task carries that event's input and header. An eager start answers from the command that the workflow task completion has just recorded as the event, as v1.31.0's does, and reads nothing.
 - **A new state version.** This release writes the run's state under a new envelope version, which the previous release refuses, so a downgrade fails loudly instead of delivering empty inputs.
 
 ## Glossary
@@ -17,12 +17,11 @@ An activity's input and header stay in its ActivityTaskScheduled event, and nowh
 
 ## How this maps onto Tokeira's architecture
 
-v1.31.0 keeps the input and header only in history, and its start reads the scheduled event. Tokeira does the same, with four departures.
+v1.31.0 keeps the input and header only in history, and its start reads the scheduled event. Tokeira does the same, with three departures.
 
 1. **No batch id.** v1.31.0 stores, beside the scheduled event's id, the id of the batch that holds the event, and reads the event through that batch (`ScheduledEventBatchId`; `executions.proto:525`, `mutable_state_impl.go:1462-1474 @ v1.31.0`). A Tokeira run's history batches are keyed by their first event id, and they cover the run's event ids from 1 without gaps or overlaps. That is true of a reset successor's copied batches too ([bounded-bulk-writes](../bounded-bulk-writes/design.md)). So the batch that holds an event is the one with the greatest first event id not after the event's id, and one lookup by the event's id finds it, with no batch id to store.
 2. **No events cache.** v1.31.0 caches events, the scheduled event among them, when it writes them (`service/history/events/cache.go @ v1.31.0`), so most starts don't touch persistence. Here every start reads the store once.
-3. **An eager start reads too.** v1.31.0 answers an eager start from the command it has just recorded (`workflow_task_completed_handler.go:594-598 @ v1.31.0`). Here an eager start takes the same path as a polled one and reads the event that the workflow task completion has just committed. The values are the same, since the event is written from the command.
-4. **Retired fields.** v1.31.0's protobuf state drops a field and keeps decoding. Tokeira's state is positional postcard, so the copies' positions stay, written empty. A new envelope version marks the change for the previous release.
+3. **Retired fields.** v1.31.0's protobuf state drops a field and keeps decoding. Tokeira's state is positional postcard, so the copies' positions stay, written empty. A new envelope version marks the change for the previous release.
 
 ## Bug Details
 
@@ -45,7 +44,7 @@ The bug condition holds when a run has pending activities with inputs or headers
 - History stays as it is (3.3).
 - Restoring an activity's original options still reads the scheduled event by its id (3.4).
 - Nexus operations and standalone activities are untouched (3.5).
-- The run growth limits refuse the same runs at the same sizes (3.6).
+- The run growth limits refuse and terminate as today, except that headers no longer count toward the measured state (3.6).
 
 ## Root Cause
 
@@ -131,12 +130,13 @@ The previous release's state decoder SHALL refuse every state this release write
 - The new method is `read_history_event(run_key, event_id) -> Result<Option<HistoryEvent>>`.
 - **Default implementation.** It reads `read_history(run_key, event_id - 1, 1)` and keeps the event only if its id matches. That is correct on any store, and the test doubles use it.
 - **DSQL.** One read statement: `SELECT first_event_id, last_event_id, events_data FROM history_batch WHERE run_key = $1 AND first_event_id <= $2 ORDER BY first_event_id DESC LIMIT 1`.
-  - The primary key `(run_key, first_event_id)` serves it as one index seek, and it returns at most one row: the batch that holds the event, by departure 1.
+  - The primary key `(run_key, first_event_id)` serves it, and it returns at most one row: the batch that holds the event, by departure 1.
+  - A live cluster plans it as a backward scan of the primary key that starts at the event's id: `Index Only Scan Backward`, with both key columns in its index condition, no sort, and the limit pushed down to storage. On a run of 5,000 batches it returned one row, in under a millisecond, both for an event near the end and for one near the start.
   - It decodes that batch, and returns the event with the id, or none.
-  - The general read is no substitute. `READ_HISTORY_BATCHES_SQL` filters on `last_event_id`, which no index covers. So it walks the run's batches from the first until one matches, and each statement fetches up to 64 batches (`HISTORY_BATCH_PAGE`).
+  - The general read is no substitute. `READ_HISTORY_BATCHES_SQL` filters on `last_event_id`, which no index covers. So it walks the run's batches from the first until one matches, and each statement fetches up to 64 batches (`HISTORY_BATCH_PAGE`). On the same 5,000-batch run, for an event near the end, its statement read all 5,000 batches to keep 4.
 - **Memory.** A search of the run's ordered history by event id.
 - **Wrappers.** The `Arc` implementation and the edge's `HistoryNotifyingRepository` forward the method. Otherwise they would fall back to the default and to the general read.
-- **Cost on the poll path.** The read adds one read per start: one row, as large as the batch that holds the event. On DSQL that is at most 1,048,576 bytes, the value limit. A reset successor's copied batches hold at most 512 KiB of events each.
+- **Cost on the poll path.** A polled start adds this read: one row, as large as the batch that holds the event. On DSQL that is at most 1,048,576 bytes, the value limit, and a reset successor's copied batches hold at most 512 KiB of events each. The start still loads the run's state, as today, but a state that holds no inputs. Today that load carries every pending input, up to the same 1 MiB. So each statement of a start stays within DSQL's value limit either way, and a run with several pending inputs reads far less. That is why no events cache is needed yet.
 - **Restoring options.** `original_activity_options` reads the scheduled event with this method too (3.4).
 
 ### Storage: dispatch rows, backlog entries, the codec and the snapshot
@@ -164,7 +164,7 @@ The previous release's state decoder SHALL refuse every state this release write
   - deployment transitions.
 - **What it does.** It reads the scheduled event with `read_history_event(run_key, schedule_event_id)` before the started transition commits. The answer's input and header come from the event's `ActivityTaskScheduled` attributes; every other field comes from where it does today (3.1).
 - **When it fails.** If the read fails, or finds no event, the start commits nothing. The task goes back to its queue, as when the start's commit fails, and the start answers the read's error, or an internal error naming the missing event (2.4).
-- **Eager starts.** An eager start goes through this path too (departure 3).
+- **Eager starts.** The eager path hands the start the input and header of the command that scheduled the activity, which the completion request holds. Given them, the start reads nothing (2.2).
 
 ### Runtime: re-publishing
 
@@ -172,7 +172,7 @@ The publisher, the backlog drain, dispatch reconciliation, recovery, an options 
 
 ### The run growth limits' measure
 
-`measured_state_len` becomes the state's encoded size ([run-growth-limits](../run-growth-limits/bugfix.md) criterion 2.9). The inputs it subtracted are no longer in the state. The retired fields add two bytes per activity.
+`measured_state_len` becomes the state's encoded size less two bytes per activity, the encoding of its retired fields: an empty input and no header, one byte each ([run-growth-limits](../run-growth-limits/bugfix.md) criterion 2.9). Neither an input nor a header counts, as v1.31.0's mutable state holds neither. Today's measure subtracts each input but counts each header. So a run's measure falls by the encoded size of its pending activities' headers, one byte for an activity without one, and by nothing else.
 
 ### Upgrade and downgrade
 
@@ -211,6 +211,7 @@ The suite runs on an ephemeral cluster under the `dsql-live` profile ([docs/test
 - **The previous release's data.**
   - A dispatch row written with an input reads without it.
   - A backlog entry written with an input drains, and its activity is delivered from history.
+- **The lookup's plan.** On a run of thousands of batches, for an event near the end and one near the start, the lookup's `EXPLAIN` shows a backward scan of the primary key with both key columns in its index condition, no sort, and the limit pushed down to storage. The test asserts it, as the workflow-dispatch suite asserts its continuation plans.
 
 ### Property-Based Tests
 
@@ -223,7 +224,7 @@ The suite runs on an ephemeral cluster under the `dsql-live` profile ([docs/test
   - one-event batches and a multi-event batch;
   - a reset successor's copied batches;
   - an id past the end of the history.
-- **The start.** A refused start reads nothing. A failed read leaves the state and the dispatch rows unchanged, and returns the task to its queue.
+- **The start.** A refused start reads nothing, and so does an eager start. A failed read leaves the state and the dispatch rows unchanged, and returns the task to its queue.
 - **The state codec.**
   - The previous release's frozen state bytes decode, and their inputs and headers are dropped.
   - A new state carries the new envelope version.
@@ -232,7 +233,7 @@ The suite runs on an ephemeral cluster under the `dsql-live` profile ([docs/test
   - A backlog entry the previous release wrote decodes.
   - A dispatch row written with an input reads without it.
   - The snapshot version is 5.
-- **The measure.** The measured state equals the encoded state.
+- **The measure.** The measured state is the encoded state less two bytes per activity, and a run's measure falls by exactly its pending activities' encoded headers.
 
 ### Negative controls
 
@@ -243,6 +244,8 @@ Each control is patched in alone, then run, then reversed so that the tree is by
 - the DSQL lookup without its descending order, which finds the first batch;
 - the lookup with `<` for `<=`, which misses an event that opens its batch;
 - the read moved before a refusing check;
+- an eager start that reads the event instead of using its command;
+- the measure counting the retired fields, or the headers;
 - a failed read that drops the task instead of returning it to its queue;
 - the decoder refusing the previous version;
 - the encoder writing the previous version.

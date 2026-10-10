@@ -48,14 +48,15 @@ First show the defect, with tests that fail on the current code. Then:
     - accept the previous version on decode;
     - widen `BlobFormatError`'s message.
     - _Requirements: 2.6, 2.7_
-  - [ ] 3.4 Make the measured state the encoded state
+  - [ ] 3.4 Make the measured state the encoded state less two bytes per activity, so that no header counts
     - _Requirements: 2.8, 3.6_
 
 - [ ] 4. Answer starts from the scheduled event
   - [ ] 4.1 In `start_activity_task_inner`:
     - read the scheduled event after the checks that can refuse the start, and before the commit;
     - build the answer's input and header from the event;
-    - return the task to its queue when the read fails or finds no event.
+    - return the task to its queue when the read fails or finds no event;
+    - take an eager start's input and header from the command that scheduled it, and skip the read.
     - _Requirements: 2.2, 2.4, 3.1, 3.2_
   - [ ] 4.2 Make `original_activity_options` read the scheduled event with `read_history_event`
     - _Requirements: 3.4_
@@ -71,7 +72,7 @@ First show the defect, with tests that fail on the current code. Then:
 
 - [ ] 6. Write the unit tests:
   - the read on both stores;
-  - the start's order and its failed read;
+  - the start's order, its failed read, and an eager start that reads nothing;
   - the codec, on the previous release's frozen bytes and the new version;
   - a backlog entry and a dispatch row that the previous release wrote;
   - the snapshot version;
@@ -82,7 +83,8 @@ First show the defect, with tests that fail on the current code. Then:
   - the first example;
   - a multi-event batch;
   - a reset successor's copied batch;
-  - the previous release's dispatch rows and backlog entries.
+  - the previous release's dispatch rows and backlog entries;
+  - the lookup's plan, asserted on a run of thousands of batches for an event near the end and one near the start.
   - _Requirements: 2.1-2.7_
 
 - [ ] 8. Align the specs this changes:

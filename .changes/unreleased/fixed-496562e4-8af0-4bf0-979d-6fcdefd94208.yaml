@@ -1,5 +1,5 @@
 kind: fixed
-body: DeleteWorkflowExecution, ResetWorkflowExecution and the move of unclaimed tasks to the durable backlog no longer fail on DSQL for a run or a pass too large for one transaction, with more than 3,000 rows, more than 10 MiB or a value over 1 MiB; they now write in transactions within those limits. DeleteWorkflowExecution returns once the run can no longer be found, and the run's remaining rows are removed in the background. A reset now fails if the workflow started another run before the reset finished, instead of making its new run current beside it. Migrations V077 to V080 add a table that records these writes and three indexes. Upgrade with every node stopped.
+body: Deletions, resets and backlog spills now stay within DSQL's transaction limits, and a reset no longer leaves two runs open when a start lands while it runs.
 time: 2026-10-09T04:23:13.000000+01:00
 custom:
     Slice: 496562e4-8af0-4bf0-979d-6fcdefd94208

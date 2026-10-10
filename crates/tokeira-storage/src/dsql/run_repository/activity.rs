@@ -1,5 +1,7 @@
 use super::*;
 
+/// One `activity_dispatch` row as the reads select it. No read selects
+/// `input_data`, which holds no input (`activity-inputs-from-history`).
 pub(super) type ActivityDispatchRow = (
     Uuid,
     String,
@@ -12,7 +14,6 @@ pub(super) type ActivityDispatchRow = (
     i32,
     i64,
     i64,
-    Vec<u8>,
     Option<Vec<u8>>,
     OffsetDateTime,
 );
@@ -37,7 +38,7 @@ impl DsqlRunRepository {
             let rows = sqlx::query_as::<_, ActivityDispatchRow>(
                 "SELECT run_key, activity_id, queue_namespace, queue_name, task_kind,
                     deployment, build_id, schedule_event_id, attempt, dispatch_revision, stamp,
-                    input_data, priority_data, dispatch_at
+                    priority_data, dispatch_at
              FROM activity_dispatch
              WHERE queue_namespace = $1
                AND queue_name = $2
@@ -83,7 +84,7 @@ impl DsqlRunRepository {
             let rows = sqlx::query_as::<_, ActivityDispatchRow>(
                 "SELECT run_key, activity_id, queue_namespace, queue_name, task_kind,
                     deployment, build_id, schedule_event_id, attempt, dispatch_revision, stamp,
-                    input_data, priority_data, dispatch_at
+                    priority_data, dispatch_at
              FROM activity_dispatch
              WHERE queue_namespace = $1
                AND queue_name = $2
@@ -140,7 +141,7 @@ impl DsqlRunRepository {
                         None => sqlx::query_as::<_, ActivityDispatchRow>(
                             "SELECT run_key, activity_id, queue_namespace, queue_name, task_kind,
                     deployment, build_id, schedule_event_id, attempt, dispatch_revision, stamp,
-                    input_data, priority_data, dispatch_at
+                    priority_data, dispatch_at
              FROM activity_dispatch
              WHERE shard_id = $1
                AND dispatch_at <= $2
@@ -155,7 +156,7 @@ impl DsqlRunRepository {
                         Some(after) => sqlx::query_as::<_, ActivityDispatchRow>(
                             "SELECT run_key, activity_id, queue_namespace, queue_name, task_kind,
                     deployment, build_id, schedule_event_id, attempt, dispatch_revision, stamp,
-                    input_data, priority_data, dispatch_at
+                    priority_data, dispatch_at
              FROM activity_dispatch
              WHERE shard_id = $1
                AND dispatch_at <= $2
@@ -231,7 +232,6 @@ pub(super) fn activity_dispatch_from_row(row: ActivityDispatchRow) -> Result<Due
         attempt,
         dispatch_revision,
         stamp,
-        input_data,
         priority_data,
         dispatch_at,
     ) = row;
@@ -246,7 +246,6 @@ pub(super) fn activity_dispatch_from_row(row: ActivityDispatchRow) -> Result<Due
                 build_id: build_id.map(BuildId),
             },
             activity_id,
-            input: codec::decode_payloads(&input_data)?,
             schedule_event_id,
             attempt: convert::u32_from_i32(attempt, "activity_dispatch.attempt")?,
             dispatch_revision,

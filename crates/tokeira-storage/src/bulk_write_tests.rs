@@ -78,18 +78,29 @@ pub(crate) fn activity_queue(namespace_id: NamespaceId) -> QueueKey {
     }
 }
 
+/// A backlog entry for activity `index` that encodes to more than `size` bytes.
+///
+/// Its size comes from its activity id. An entry holds no input
+/// (`activity-inputs-from-history`), and the store takes an id of any length, so
+/// a long id is how these cases still make entries that page by bytes.
 pub(crate) fn backlog_entry(
     run_key: RunKey,
     queue: &QueueKey,
     index: usize,
-    input: usize,
+    size: usize,
 ) -> BacklogEntry {
+    let mut activity_id = format!("activity-{index}-");
+    activity_id.extend(
+        noise(size, index as u64)
+            .into_iter()
+            .map(|byte| char::from(b'a' + byte % 26)),
+    );
     BacklogEntry {
         run_key,
         queue: queue.clone(),
         payload: BacklogPayload::Activity {
-            activity_id: format!("activity-{index}"),
-            input: Payloads(vec![Payload::new(noise(input, index as u64))]),
+            activity_id,
+            retired_input: Default::default(),
             schedule_event_id: 5,
             attempt: 1,
             dispatch_revision: 0,
@@ -105,11 +116,11 @@ pub(crate) fn backlog_entry(
     }
 }
 
-async fn spill(backend: &impl Backend, count: usize, input: usize) {
+async fn spill(backend: &impl Backend, count: usize, size: usize) {
     let run_key = RunKey::new();
     let queue = activity_queue(NamespaceId::new());
     let entries = (0..count)
-        .map(|index| backlog_entry(run_key, &queue, index, input))
+        .map(|index| backlog_entry(run_key, &queue, index, size))
         .collect::<Vec<_>>();
     backend
         .repo()

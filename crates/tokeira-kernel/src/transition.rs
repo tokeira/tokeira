@@ -160,10 +160,12 @@ pub enum DispatchOp {
     },
     /// Place an activity task on the task queue for a worker
     /// to pick up.
+    ///
+    /// It carries no input or header: a start reads them from the activity's
+    /// ActivityTaskScheduled event (`activity-inputs-from-history`).
     EnqueueActivityTask {
         queue: QueueKey,
         activity_id: String,
-        input: Payloads,
         schedule_event_id: i64,
         attempt: u32,
         /// Worker Deployment routing revision captured when the activity was enqueued.

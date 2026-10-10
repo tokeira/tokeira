@@ -2804,7 +2804,6 @@ pub(crate) mod tests {
                 &[DispatchOp::EnqueueActivityTask {
                     queue: queue.clone(),
                     activity_id: "activity-1".to_string(),
-                    input: Payloads::default(),
                     schedule_event_id: 11,
                     attempt: 2,
                     dispatch_revision: 0,

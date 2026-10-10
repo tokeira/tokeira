@@ -45,7 +45,7 @@ Since [activity-state-writes](../activity-state-writes/bugfix.md), no release wr
 - `shard_id` is bound as UUID via `DsqlRunRepository::shard_id_to_uuid(shard_id)`.
 - `workflow_hot.state_data` stores the full `WorkflowState` as postcard-serialized BYTEA. The dispatch and sweep methods deserialize it to extract specific fields (`pending_workflow_task`, `workflow_execution_timeout`, `workflow_run_timeout`, `pending_nexus_operations`, etc.).
 - `activity_state.state_data` stores `ActivityState` as postcard-serialized BYTEA in rows that earlier releases wrote. Nothing reads it, and nothing writes it since [activity-state-writes](../activity-state-writes/bugfix.md). Activity dispatch queries read from the dedicated `activity_dispatch` table.
-- `activity_dispatch` stores dispatch-ready activity tasks with denormalized queue identity columns. Dispatch queries do not deserialize `ActivityState`; they decode only `input_data` as postcard-encoded `Payloads`.
+- `activity_dispatch` stores dispatch-ready activity tasks with denormalized queue identity columns. Dispatch queries do not deserialize `ActivityState`, and they don't select `input_data`, which every row holds as an empty payload list: an activity's input lives only in its ActivityTaskScheduled event ([activity-inputs-from-history](../activity-inputs-from-history/bugfix.md)).
 - `timer_bucket.timer_data` stores `TimerState` as postcard-serialized BYTEA.
 - The `limit` parameter bounds the result set size for all methods.
 - The in-memory store in `memory.rs` is the behavioral reference for all methods.
@@ -76,7 +76,7 @@ Since [activity-state-writes](../activity-state-writes/bugfix.md), no release wr
 - **Codec**: The `tokeira-storage/src/dsql/codec.rs` module providing postcard-based `encode`/`decode` helpers for all BYTEA column types.
 - **StickyAffinity**: Binding a run to a specific worker for cache-local dispatch. Contains `worker_identity` and `expires_at`.
 - **DispatchableWorkflowTask**: Return type for workflow dispatch queries. Contains `run_key`, `queue`, `logical_seq`, `sticky_preferred`, `sticky_expires_at`.
-- **DispatchableActivityTask**: Return type for activity dispatch queries. Contains `run_key`, `queue`, `activity_id`, `input`, `schedule_event_id`, `attempt`.
+- **DispatchableActivityTask**: Return type for activity dispatch queries. Contains `run_key`, `queue`, `activity_id`, `schedule_event_id`, `attempt`.
 - **DueTimer**: Return type for timer sweep queries. Contains `run_key` and `timer_id`.
 - **WorkflowTimeoutSweepEntry**: Return type for workflow timeout sweep. Contains `run_key`, `workflow_execution_timeout`, `workflow_run_timeout`, `started_at`, `first_run_started_at`, `has_retry_policy`.
 - **WftTimeoutSweepEntry**: Return type for WFT timeout sweep. Contains `run_key`, `logical_seq`, `started_event_id`, `started_at`, `workflow_task_timeout`.
@@ -108,7 +108,7 @@ Since [activity-state-writes](../activity-state-writes/bugfix.md), no release wr
 2. THE DsqlRunRepository SHALL filter results to only include activities whose full queue identity (including `task_kind`, `deployment`, `build_id`) matches the given `QueueKey`.
 3. THE DsqlRunRepository SHALL return at most `limit` results.
 4. THE DsqlRunRepository SHALL use a `DbClass::Read` connection for the query.
-5. THE DsqlRunRepository SHALL populate `DispatchableActivityTask` fields (`run_key`, `queue`, `activity_id`, `input`, `schedule_event_id`, `attempt`) from the `activity_dispatch` row columns.
+5. THE DsqlRunRepository SHALL populate `DispatchableActivityTask` fields (`run_key`, `queue`, `activity_id`, `schedule_event_id`, `attempt`) from the `activity_dispatch` row columns.
 
 ### Requirement 3: Global Due Timer Query
 
@@ -254,7 +254,7 @@ Since [activity-state-writes](../activity-state-writes/bugfix.md), no release wr
 #### Acceptance Criteria
 
 1. THE `activity_dispatch` table SHALL store one row per dispatchable activity task, keyed by a spread UUID derived from `(run_key, activity_id)`.
-2. THE table SHALL include columns for the full queue identity (`queue_namespace`, `queue_name`, `task_kind`, `deployment`, `build_id`), `shard_id`, `run_key`, `activity_id`, `schedule_event_id`, `attempt`, `input_data` (BYTEA, postcard-encoded `Payloads` using `codec::encode_payloads`/`codec::decode_payloads` helpers), and `created_at`.
+2. THE table SHALL include columns for the full queue identity (`queue_namespace`, `queue_name`, `task_kind`, `deployment`, `build_id`), `shard_id`, `run_key`, `activity_id`, `schedule_event_id`, `attempt`, `input_data` (BYTEA, `NOT NULL`, written as the encoded empty payload list and never read; [activity-inputs-from-history](../activity-inputs-from-history/bugfix.md)), and `created_at`.
 3. THE table SHALL have secondary async indexes for shard-filtered queries (`shard_id`), queue-filtered queries (`queue_namespace, queue_name, task_kind, deployment, build_id`), and run-scoped bulk deletes on workflow pause (`run_key`).
 4. THE table DDL SHALL be added as a new migration file in the `migrations/` directory. Tokeira targets schema version 1 — no migration from existing data is needed.
 
@@ -264,10 +264,10 @@ Since [activity-state-writes](../activity-state-writes/bugfix.md), no release wr
 
 #### Acceptance Criteria
 
-1. WHEN `commit_transition` processes a `DispatchOp::EnqueueActivityTask`, THE DsqlRunRepository SHALL insert a row into `activity_dispatch` with the full queue identity, input, and scheduling metadata using `INSERT ... ON CONFLICT (key) DO UPDATE` so that re-enqueue after reset/retry/unpause refreshes the existing row rather than failing on a primary-key conflict.
+1. WHEN `commit_transition` processes a `DispatchOp::EnqueueActivityTask`, THE DsqlRunRepository SHALL insert a row into `activity_dispatch` with the full queue identity, the scheduling metadata and an empty `input_data`, using `INSERT ... ON CONFLICT (key) DO UPDATE` so that re-enqueue after reset/retry/unpause refreshes the existing row rather than failing on a primary-key conflict.
 2. WHEN `commit_transition` processes an `ActivityOp::Delete`, THE DsqlRunRepository SHALL delete the corresponding row from `activity_dispatch` (by computing the spread key from `run_key` and `activity_id`). It writes nothing to `activity_state` ([activity-state-writes](../activity-state-writes/bugfix.md)).
 3. WHEN `commit_transition` processes an `ActivityOp::Upsert` where the upserted `ActivityState` has `pause_info.is_some()` or `started_at.is_some()`, THE DsqlRunRepository SHALL delete the corresponding row from `activity_dispatch` — paused and started activities are not dispatchable.
-4. WHEN `commit_transition` processes an `ActivityOp::Upsert` where the upserted `ActivityState` has `pause_info.is_none()` and `started_at.is_none()` and a corresponding `activity_dispatch` row exists, THE DsqlRunRepository SHALL UPDATE (not INSERT) the row with the current queue identity, attempt, and input from the upserted state — this handles `UpdateActivityOptions` which can change the task queue. Only `DispatchOp::EnqueueActivityTask` creates new dispatch rows.
+4. WHEN `commit_transition` processes an `ActivityOp::Upsert` where the upserted `ActivityState` has `pause_info.is_none()` and `started_at.is_none()` and a corresponding `activity_dispatch` row exists, THE DsqlRunRepository SHALL UPDATE (not INSERT) the row with the current queue identity and attempt from the upserted state, and an empty `input_data`, — this handles `UpdateActivityOptions` which can change the task queue. Only `DispatchOp::EnqueueActivityTask` creates new dispatch rows.
 5. WHEN `commit_transition` transitions the workflow to `ExecutionStatus::Paused`, THE DsqlRunRepository SHALL delete all `activity_dispatch` rows for the run — a paused workflow suppresses all activity dispatch.
 6. WHEN `commit_transition` transitions the workflow from `ExecutionStatus::Paused` to an open status (unpause), activity re-enqueue is handled by `DispatchOp::EnqueueActivityTask` emitted by the kernel's `apply_unpause_workflow` — no special dispatch-table logic needed.
 7. ALL `activity_dispatch` writes SHALL occur within the same fenced transaction as the rest of the commit write set.

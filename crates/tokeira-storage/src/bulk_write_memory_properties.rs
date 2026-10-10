@@ -121,9 +121,8 @@ async fn closed_run(
         );
     }
     for index in 0..dispatch {
-        let BacklogPayload::Activity {
-            activity_id, input, ..
-        } = backlog_entry(run_key, &queue, index, 8).payload
+        let BacklogPayload::Activity { activity_id, .. } =
+            backlog_entry(run_key, &queue, index, 8).payload
         else {
             unreachable!("backlog_entry builds activity entries");
         };
@@ -134,7 +133,6 @@ async fn closed_run(
                     run_key,
                     queue: queue.clone(),
                     activity_id,
-                    input,
                     schedule_event_id: 5,
                     attempt: 1,
                     dispatch_revision: 0,

@@ -333,7 +333,6 @@ mod tests {
     use time::OffsetDateTime;
     use tokeira_types::{
         ids::{LogicalTaskSeq, NamespaceId, RunKey},
-        payload::Payloads,
         task_queue::{BuildId, DeploymentId, QueueKey, TaskKind, TaskQueueName},
     };
     use uuid::Uuid;
@@ -442,7 +441,7 @@ mod tests {
     fn payloads(variant: i64) -> Vec<BacklogPayload> {
         let activity = |activity_id: &str, attempt, stamp| BacklogPayload::Activity {
             activity_id: activity_id.into(),
-            input: Payloads::default(),
+            retired_input: Default::default(),
             schedule_event_id: 7 + variant,
             attempt,
             dispatch_revision: variant,

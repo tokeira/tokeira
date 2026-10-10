@@ -366,7 +366,6 @@ async fn write_transition(
         if let DispatchOp::EnqueueActivityTask {
             queue,
             activity_id,
-            input,
             schedule_event_id,
             attempt,
             dispatch_revision,
@@ -384,7 +383,6 @@ async fn write_transition(
                 shard_id,
                 queue,
                 activity_id,
-                input,
                 *schedule_event_id,
                 *attempt,
                 *dispatch_revision,
@@ -550,7 +548,6 @@ async fn upsert_activity_dispatch_from_dispatch_op(
     shard_id: ShardId,
     queue: &QueueKey,
     activity_id: &str,
-    input: &Payloads,
     schedule_event_id: i64,
     attempt: u32,
     dispatch_revision: i64,
@@ -595,7 +592,7 @@ async fn upsert_activity_dispatch_from_dispatch_op(
     .bind(i32::try_from(attempt)?)
     .bind(dispatch_revision)
     .bind(i64::try_from(stamp).unwrap_or(i64::MAX))
-    .bind(codec::encode_payloads(input)?)
+    .bind(codec::empty_input_data()?)
     .bind(priority.map(codec::encode_priority).transpose()?)
     .bind(dispatch_at)
     .execute(&mut **tx)
@@ -652,7 +649,8 @@ async fn update_existing_activity_dispatch(
     // recovery-reconstructed task carries the current stamp and is never
     // spuriously fenced at start.
     .bind(i64::try_from(activity.stamp).unwrap_or(i64::MAX))
-    .bind(codec::encode_payloads(&activity.input)?)
+    // Empty, which also clears an input that an earlier release wrote in the row.
+    .bind(codec::empty_input_data()?)
     .bind(
         merge_priority(state.priority.as_ref(), activity.priority.as_ref())
             .as_ref()

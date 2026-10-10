@@ -94,18 +94,15 @@ pub fn decode_activity_state(bytes: &[u8]) -> Result<ActivityState> {
     decode(bytes)
 }
 
-/// Serialize activity input payloads for `activity_dispatch.input_data`.
+/// The `activity_dispatch.input_data` every row is written with: an empty payload
+/// list, one byte.
 ///
-/// This intentionally stores only `Payloads`: row columns already carry the
-/// queue, activity id, attempt, and schedule event id, so duplicating a whole
-/// backlog payload would create two sources of truth.
-pub fn encode_payloads(payloads: &Payloads) -> Result<Vec<u8>> {
-    encode(payloads)
-}
-
-/// Deserialize activity input payloads from `activity_dispatch.input_data`.
-pub fn decode_payloads(bytes: &[u8]) -> Result<Payloads> {
-    decode(bytes)
+/// An activity's input lives only in its ActivityTaskScheduled event
+/// (`activity-inputs-from-history`). The column is `NOT NULL`, so it stays, and no
+/// read selects it, so a row an earlier release wrote, input and all, reads the
+/// same.
+pub fn empty_input_data() -> Result<Vec<u8>> {
+    encode(&Payloads::default())
 }
 
 /// Serialize effective activity dispatch Priority.
@@ -246,6 +243,15 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn dispatch_rows_write_an_empty_input_of_one_byte() {
+        assert_eq!(empty_input_data().unwrap(), [0]);
+        assert_eq!(
+            decode::<Payloads>(&empty_input_data().unwrap()).unwrap(),
+            Payloads::default()
+        );
+    }
 
     // Encoded by `encode_history_events` at f27ee1d9, before the append-only
     // started-event V2 variant existed. Keeping literal bytes avoids a shadow
@@ -444,14 +450,6 @@ mod tests {
             let encoded = encode_backlog_payload(&payload, priority.as_ref()).unwrap();
             let decoded = decode_backlog_payload(&encoded).unwrap();
             prop_assert_eq!(decoded, (payload, priority));
-        }
-
-        #[test]
-        fn payloads_round_trips(bytes in prop::collection::vec(any::<u8>(), 0..128)) {
-            let payloads = Payloads(vec![tokeira_types::Payload::new(bytes)]);
-            let encoded = encode_payloads(&payloads).unwrap();
-            let decoded = decode_payloads(&encoded).unwrap();
-            prop_assert_eq!(decoded, payloads);
         }
 
         // Feature: configuration-policy, Property 10: task-queue codec equivalence

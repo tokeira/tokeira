@@ -391,9 +391,11 @@ where
         run_key: tokeira_types::RunKey,
         activity_id: String,
         worker_identity: tokeira_types::WorkerIdentity,
+        input: tokeira_types::Payloads,
+        header: Option<tokeira_types::Headers>,
     ) -> Result<Option<StartedActivityTask>> {
         self.runtime
-            .try_claim_activity_task(queue, run_key, activity_id, worker_identity)
+            .try_claim_activity_task(queue, run_key, activity_id, worker_identity, input, header)
             .await
     }
 

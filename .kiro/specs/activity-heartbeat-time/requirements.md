@@ -9,7 +9,7 @@ Tokeira stores heartbeat details in the activity's durable state, but keeps the 
 Kernel state is persisted with postcard, which is positional. Adding a field to `WorkflowState` directly would make every stored state unreadable. This feature defines a compatible way to add data to a stored state: an extension appended after the state, inside the existing envelope. It then uses that extension to persist each activity's last heartbeat time.
 
 - States written by Tokeira 0.2.0 through 0.5.1 still decode; their activities have no time.
-- States written by this feature still decode in 0.2.0–0.5.1; those releases ignore the extension.
+- States written by this feature still decode in 0.2.0–0.5.1; those releases ignore the extension. Since [activity-inputs-from-history](../activity-inputs-from-history/bugfix.md), states are written under a later envelope version, which those releases refuse.
 
 The target behaviour is Temporal v1.31.0's.
 
@@ -49,7 +49,7 @@ Amends:
 - The heartbeat deadline is computed as v1.31.0 computes it, from durable state, on whichever node owns the shard.
 - `DescribeWorkflowExecution` reports `last_heartbeat_time`.
 - Hot_State_Blobs written by 0.2.0–0.5.1 decode unchanged.
-- Blobs written by this feature decode in 0.2.0–0.5.1, without the times.
+- Blobs written by this feature decode in 0.2.0–0.5.1, without the times, under the envelope version those releases read.
 - No schema migration, backfill or cluster recreation is needed.
 - In-memory snapshots written by 0.2.0–0.5.1 still restore, and snapshots carry the times.
 - The State_Extension can be reused: a later feature adds data to stored state with a new Extension_Section, without a new envelope version.
@@ -135,8 +135,8 @@ No request gains a new validation error.
 #### Acceptance Criteria
 
 1. WHEN the storage codec decodes a Hot_State_Blob without a State_Extension, THE storage codec SHALL return the state with no Last_Heartbeat_Time on any activity.
-2. WHEN the storage codec encodes a state with no Last_Heartbeat_Time, THE storage codec SHALL write the bytes that Tokeira 0.2.0–0.5.1 write for that state.
-3. THE storage codec SHALL write Hot_State_Blobs that a Pre-Extension_Reader decodes to the written state without its Last_Heartbeat_Times.
+2. WHEN the storage codec encodes a state with no Last_Heartbeat_Time, THE storage codec SHALL write the envelope and the State_Layout only, as Tokeira 0.2.0–0.5.1 write that state under their envelope version.
+3. THE storage codec SHALL write Hot_State_Blobs that a reader of the same envelope version without the State_Extension decodes to the written state without its Last_Heartbeat_Times. Pre-Extension_Readers refuse the later envelope version of [activity-inputs-from-history](../activity-inputs-from-history/bugfix.md).
 4. THE feature SHALL require no schema migration, no backfill and no cluster recreation.
 
 ### Requirement 3: Heartbeat section
@@ -197,7 +197,7 @@ No request gains a new validation error.
 1. THE InMemoryStore SHALL return each activity's Last_Heartbeat_Time as committed.
 2. WHEN any run in the store has a State_Extension, THE snapshot SHALL append a Snapshot_Extension after the snapshot document. Its section SHALL list, in run-key order, each such run's key and the State_Extension bytes the storage codec writes for that run.
 3. WHEN no run in the store has a State_Extension, THE snapshot SHALL write no Snapshot_Extension.
-4. THE snapshot format version SHALL remain 4.
+4. THE Snapshot_Extension SHALL leave the snapshot format version unchanged. It was 4 when this feature shipped, and is 5 since [activity-inputs-from-history](../activity-inputs-from-history/design.md) changed the snapshot document.
 5. WHEN restoring a snapshot without a Snapshot_Extension, THE store SHALL hold no Last_Heartbeat_Time.
 6. IF the bytes after the snapshot document are not a well-formed Snapshot_Extension, or a section names a run that the document does not hold, or names a run twice, THEN `from_snapshot` SHALL return a decode error and SHALL NOT construct a store.
 7. WHEN a Snapshot_Extension holds a section whose tag `from_snapshot` does not know, `from_snapshot` SHALL ignore that section.

@@ -56,6 +56,8 @@ point them at a database holding application data.
 | Storage `dsql_bulk_` (`bulk_write_tests`) | 10 | The paged bulk writes: spills of more than 3,000 rows or 10 MiB, the deletion of a run owning more than 3,000 rows, resets whose copied history is over 1 MiB or 10 MiB or whose successor holds 3,500 timers, a reset of a closed workflow, a start between a reset's commit and its materialization, a purge resumed by two purges at once, and an abandoned materialization refusing its open transaction; `dsql-integration`, URL gate only |
 | Storage `dsql_lease_fence_` (`lease_fence_tests`) | 11 | The bundle lease fence through Tokeira's repository: stale transition commits and a deletion held after their fence reads while another node takes the home over, each aborted and refused on its retry; a materialization stopped between its transactions and a recovery switch, both refused after a takeover; 100 generated lease histories in which only a change of ownership writes the epoch; a lost fence under each loss and write, changing nothing; the owner's renewals and refreshes beside its writes in flight; a write that commits first aborting a takeover; and 100 generated interleavings of fenced writes with renewals, refreshes, takeovers and releases; `dsql-integration`, URL gate only |
 | Storage `dsql_transaction_limits` | 6 | DSQL's transaction limits, apart from the bulk writes' budgets: 3,000 rows, deleted rows included and rows read `FOR UPDATE` not; 9 MiB of values but not 10, deleted rows not counted; 1 MiB a value; `dsql-integration`, URL gate only |
+| Storage `history_event_tests` | 4 | The one-lookup read of a history event: each event of batches of one and of several events and of a reset successor's copied batches; the lookup's plan on a run of 5,000 batches, for an event near the end and one near the start: a backward scan of the primary key with both key columns in its index condition, no sort, and the limit pushed down to storage, which returns one row; and dispatch rows and backlog entries an earlier release wrote with an activity's input; set `TOKEIRA_HISTORY_EVENT_PLAN_OUTPUT` to save the plans; `dsql-integration`, URL gate only |
+| Runtime `dsql_activity_inputs` | 3 | Activity inputs read from history: six pending activities with inputs of about 200 KB each, three activities scheduled in one batch, and a reset successor's activities delivered from its copied batches; runtime `dsql-integration`, URL gate only; run after storage schema bootstrap |
 
 Run the suites and their test cases serially against the selected database. The shard
 fixtures reuse a deterministic shard ID across nextest's separate test processes:
@@ -122,6 +124,16 @@ clears them when it finishes. Run them serially:
 
 ```bash
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(/^dsql::run_repository::lease_fence_tests::/)'
+```
+
+The history-event tests also use only `TOKEIRA_DSQL_TEST_DATABASE_URL` and apply the
+embedded migrations. The runtime's activity-input tests reuse the migrated database from
+a preceding storage test, as the acquisition check does. Run both serially in the same
+cluster lifecycle:
+
+```bash
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(/^dsql::run_repository::history_event_tests::/)'
+cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --test dsql_activity_inputs --test-threads 1
 ```
 
 ## Endpoint-gated IAM connector

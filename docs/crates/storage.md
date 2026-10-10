@@ -44,17 +44,24 @@ persistence.
   transition commit atomically.
 - Workflow-state and history-batch blobs carry a versioned envelope; a blob of any
   other version fails to decode with `BlobFormatError` instead of being
-  reinterpreted under the current layout.
+  reinterpreted under the current layout. The state is also read under the version
+  before the current one, which has the same layout.
+- An activity's input and header live only in its ActivityTaskScheduled event. The
+  state keeps their positions as retired fields, written empty, and drops what an
+  earlier release wrote there; dispatch rows write `input_data` empty and no read
+  selects it; backlog entries keep the input's position, written empty.
+  `read_history_event` reads one event with one lookup, which on DSQL returns only
+  the batch that holds it.
 - Data kept outside `WorkflowState`'s positional layout, such as each activity's
   last heartbeat time, travels in a state extension written after the state:
   a magic, then tagged sections. A state with nothing to carry writes no
   extension, so its blob is byte-identical to one written before the extension
-  existed. Releases 0.2.0–0.5.1 decode the state and ignore the extension; this
-  reader rejects a malformed extension with `StateExtensionError` and ignores
-  sections it does not know. A section may carry only data whose absence is
-  safe; anything else, and any change to the positional layout, needs a new
-  envelope version. In-memory snapshots carry each run's extension after their
-  document.
+  existed. A release that knows the envelope version decodes the state and ignores
+  the extension; this reader rejects a malformed extension with
+  `StateExtensionError` and ignores sections it does not know. A section may carry
+  only data whose absence is safe; anything else, and any change to the
+  positional layout, needs a new envelope version. In-memory snapshots carry each
+  run's extension after their document.
 - Each commit accounts the run's persisted history size in the same transaction
   as the batch it appends (`RunHistoryStats`); readers consult that statistic and
   never re-read history to derive it.

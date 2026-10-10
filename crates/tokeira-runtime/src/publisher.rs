@@ -2261,7 +2261,6 @@ where
                     if let DispatchOp::EnqueueActivityTask {
                         queue,
                         activity_id,
-                        input,
                         schedule_event_id,
                         attempt,
                         dispatch_revision,
@@ -2278,7 +2277,6 @@ where
                             run_key,
                             queue,
                             activity_id: activity_id.clone(),
-                            input: input.clone(),
                             schedule_event_id: *schedule_event_id,
                             attempt: *attempt,
                             dispatch_revision,

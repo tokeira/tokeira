@@ -65,7 +65,7 @@ use tokeira_storage::{
     worker_task_token_digest,
 };
 use tokeira_types::{
-    ActivityTaskToken, ArchetypeId, BuildId, DeploymentId, ExecutionRef, ExecutionStatus,
+    ActivityTaskToken, ArchetypeId, BuildId, DeploymentId, ExecutionRef, ExecutionStatus, Headers,
     HeartbeatStore, Payload, Payloads, QueueKey, RequestContext, RequestId, RunId, RunKey,
     TaskKind, TaskQueueName, WorkerIdentity, WorkerInstanceKey, WorkflowId,
 };
@@ -804,14 +804,19 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         false
     }
 
+    /// Eagerly claim and start an activity task. `input` and `header` are those
+    /// of the ScheduleActivity command that scheduled it, which the start answers
+    /// with instead of reading the activity's scheduled event.
     async fn try_claim_activity_task(
         &self,
         queue: tokeira_types::QueueKey,
         run_key: RunKey,
         activity_id: String,
         worker_identity: tokeira_types::WorkerIdentity,
+        input: Payloads,
+        header: Option<Headers>,
     ) -> Result<Option<StartedActivityTask>> {
-        let _ = (queue, run_key, activity_id, worker_identity);
+        let _ = (queue, run_key, activity_id, worker_identity, input, header);
         Ok(None)
     }
 
@@ -5245,13 +5250,13 @@ impl WorkflowService {
                 }
 
                 if let Some(workflow_namespace) = eager_activity_namespace.as_deref() {
-                    for (activity_id, task_queue, deployment, build_id) in eager_activity_specs {
+                    for eager in eager_activity_specs {
                         let queue = tokeira_types::QueueKey {
                             namespace_id,
-                            task_queue,
+                            task_queue: eager.task_queue,
                             task_kind: TaskKind::Activity,
-                            deployment,
-                            build_id,
+                            deployment: eager.deployment,
+                            build_id: eager.build_id,
                         };
                         let prospective_origin = tokeira_types::WorkerTaskOrigin::from_queue_key(
                             &queue,
@@ -5270,8 +5275,10 @@ impl WorkflowService {
                             .try_claim_activity_task(
                                 queue,
                                 run_key,
-                                activity_id,
+                                eager.activity_id,
                                 WorkerIdentity(completion_identity.clone()),
+                                eager.input,
+                                eager.header,
                             )
                             .await
                             .map_err(EdgeError::from)?
@@ -9633,15 +9640,23 @@ fn is_internal_nexus_task_queue(task_queue: &str) -> bool {
     task_queue.starts_with("/temporal-sys/")
 }
 
+/// What an eager start needs from a ScheduleActivity command that asks for one:
+/// where the activity's task waits, and the input and header the command records
+/// in the activity's ActivityTaskScheduled event, which the start answers with.
+#[derive(Clone, Debug, PartialEq)]
+struct EagerActivity {
+    activity_id: String,
+    task_queue: TaskQueueName,
+    deployment: Option<DeploymentId>,
+    build_id: Option<BuildId>,
+    input: Payloads,
+    header: Option<Headers>,
+}
+
 fn collect_eager_activity_specs(
     commands: &[tokeira_kernel::WorkflowCommand],
     limit: usize,
-) -> Vec<(
-    String,
-    TaskQueueName,
-    Option<tokeira_types::DeploymentId>,
-    Option<tokeira_types::BuildId>,
-)> {
+) -> Vec<EagerActivity> {
     commands
         .iter()
         .filter_map(|command| match command {
@@ -9650,14 +9665,18 @@ fn collect_eager_activity_specs(
                 task_queue,
                 deployment,
                 build_id,
+                input,
+                header,
                 request_eager_execution: true,
                 ..
-            } => Some((
-                activity_id.clone(),
-                task_queue.clone(),
-                deployment.clone(),
-                build_id.clone(),
-            )),
+            } => Some(EagerActivity {
+                activity_id: activity_id.clone(),
+                task_queue: task_queue.clone(),
+                deployment: deployment.clone(),
+                build_id: build_id.clone(),
+                input: input.clone(),
+                header: header.clone(),
+            }),
             _ => None,
         })
         .take(limit)
@@ -9850,7 +9869,7 @@ mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
     use super::{
-        EmptyVisibilityApi, ExecutionResolver, WorkflowService,
+        EagerActivity, EmptyVisibilityApi, ExecutionResolver, WorkflowService,
         activity_offer_requires_rule_evaluation, apply_matrix_capability_field,
         build_update_activity_options_command, collect_eager_activity_specs,
         cross_namespace_authorization_targets, resolve_build_id_reset_point,
@@ -11816,14 +11835,18 @@ mod tests {
                         task_queue,
                         deployment,
                         build_id,
+                        input,
+                        header,
                         request_eager_execution: true,
                         ..
-                    } => Some((
-                        activity_id.clone(),
-                        task_queue.clone(),
-                        deployment.clone(),
-                        build_id.clone(),
-                    )),
+                    } => Some(EagerActivity {
+                        activity_id: activity_id.clone(),
+                        task_queue: task_queue.clone(),
+                        deployment: deployment.clone(),
+                        build_id: build_id.clone(),
+                        input: input.clone(),
+                        header: header.clone(),
+                    }),
                     _ => None,
                 })
                 .collect();

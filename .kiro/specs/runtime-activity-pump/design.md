@@ -58,7 +58,7 @@ flowchart TD
 
 **Activity-task-start as a direct storage commit, not a kernel command.** The kernel's `apply` method produces history events. Since `ActivityTaskStarted` is not a history event (it's recorded retroactively at resolution time), the start transaction bypasses the kernel entirely. Instead, the runtime loads the current `WorkflowState`, validates the activity is still pending, updates the `ActivityState` (recording the start), and commits the updated state directly to storage using the same fenced `commit_transition` path. This preserves the history-as-authority invariant: the activity start is recorded in mutable state that is explained by the original `ActivityTaskScheduled` transition.
 
-**Retry evaluation in the runtime, not the kernel.** The kernel should only see terminal activity outcomes. Retry logic (max_attempts check, non_retryable_error_types check, backoff computation) lives in a pure function in the runtime crate. The retry policy is obtained from `ActivityState.retry_policy` (per-activity), falling back to `WorkflowState.retry_policy` (workflow-level) if no per-activity policy is set. This requires extending `ActivityState` with `input` and `retry_policy` fields as a prerequisite (Requirement 0). When retry is permitted, the runtime publishes a new activity task to the broker with an incremented attempt — no kernel command, no history event. When retry is exhausted, the runtime submits `Command::ActivityResolved` with a `Failed` resolution through the lane.
+**Retry evaluation in the runtime, not the kernel.** The kernel should only see terminal activity outcomes. Retry logic (max_attempts check, non_retryable_error_types check, backoff computation) lives in a pure function in the runtime crate. The retry policy is obtained from `ActivityState.retry_policy` (per-activity), falling back to `WorkflowState.retry_policy` (workflow-level) if no per-activity policy is set. This requires extending `ActivityState` with the `retry_policy` field as a prerequisite (Requirement 0). When retry is permitted, the runtime publishes a new activity task to the broker with an incremented attempt — no kernel command, no history event. When retry is exhausted, the runtime submits `Command::ActivityResolved` with a `Failed` resolution through the lane.
 
 **Token validation before any mutation.** Every `complete_activity_task` and `fail_activity_task` call validates the `ActivityTaskToken` against the current `ActivityState` before doing anything. The three checks are: (1) `activity_id` exists in the run's activities map, (2) `attempt` matches the current attempt, (3) `shard_epoch` matches the current epoch. If any check fails, the request is rejected with an error. Note: until shard lease ownership is implemented (Feature 11), `shard_epoch` is always `ShardEpoch::ZERO` and the epoch check is a no-op.
 
@@ -248,10 +248,8 @@ pub struct StartedActivityTask {
 
 | Type | Crate | Change |
 |------|-------|--------|
-| `ActivityState` | `tokeira-kernel` | Add `input: Payloads` and `retry_policy: Option<RetryPolicy>` fields |
+| `ActivityState` | `tokeira-kernel` | Add `retry_policy: Option<RetryPolicy>` field; the input and header live only in the ActivityTaskScheduled event ([activity-inputs-from-history](../activity-inputs-from-history/design.md)) |
 | `ScheduleActivity` (WorkflowCommand) | `tokeira-kernel` | Add `retry_policy: Option<RetryPolicy>` field |
-| `DispatchOp::EnqueueActivityTask` | `tokeira-kernel` | Add `input: Payloads` field |
-| `DispatchableActivityTask` | `tokeira-storage` | Add `input: Payloads` field |
 | `ActivityTaskToken` | `tokeira-types` | Add `activity_id: String`, remove `started_event_id: i64` |
 | `RuntimeDispatchPublisher` | `tokeira-runtime` | Add `activity_broker: InMemoryActivityBroker` field, wire `EnqueueActivityTask` |
 | `TokeiraRuntime` | `tokeira-runtime` | Add `activity_broker: InMemoryActivityBroker` field, add 4 new facade methods |

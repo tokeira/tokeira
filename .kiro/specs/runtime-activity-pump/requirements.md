@@ -29,19 +29,19 @@ This feature depends on Feature 1 (Lane OCC Retry and Mailbox Coalescing), which
 
 ---
 
-### Requirement 0: Extend ActivityState and DispatchableActivityTask with Input and Retry Policy
+### Requirement 0: Extend ActivityState with the Retry Policy
 
-**User Story:** As a Tokeira developer, I want `ActivityState` to carry the activity's input payload and retry policy, and `DispatchableActivityTask` to carry the input payload, so that the runtime can deliver input to workers and evaluate per-activity retry policy without requiring additional storage lookups.
+**User Story:** As a Tokeira developer, I want `ActivityState` to carry the activity's retry policy, so that the runtime can evaluate per-activity retry policy without requiring additional storage lookups. The activity's input and header live only in its ActivityTaskScheduled event, which a start reads ([activity-inputs-from-history](../activity-inputs-from-history/bugfix.md)).
 
 #### Acceptance Criteria
 
-1. THE `ActivityState` struct in `tokeira-kernel` SHALL be extended with an `input: Payloads` field that stores the activity's input payload from the `ScheduleActivity` workflow command.
+1. THE `ActivityState` struct in `tokeira-kernel` SHALL hold no copy of the activity's input or header. It SHALL keep their positions in its stored layout as retired fields, written empty ([activity-inputs-from-history](../activity-inputs-from-history/bugfix.md) criteria 2.1 and 2.7).
 2. THE `ActivityState` struct SHALL be extended with a `retry_policy: Option<RetryPolicy>` field that stores the per-activity retry policy from the `ScheduleActivity` workflow command.
 3. THE `ScheduleActivity` workflow command in `tokeira-kernel` SHALL be extended with a `retry_policy: Option<RetryPolicy>` field.
-4. THE kernel's `apply_workflow_command` handler for `ScheduleActivity` SHALL populate `ActivityState.input` and `ActivityState.retry_policy` from the command fields.
-5. THE `DispatchableActivityTask` struct in `tokeira-storage` SHALL be extended with an `input: Payloads` field.
-6. THE `DispatchOp::EnqueueActivityTask` variant SHALL be extended with an `input: Payloads` field.
-7. ALL existing code that constructs `ActivityState`, `DispatchableActivityTask`, or `DispatchOp::EnqueueActivityTask` SHALL be updated to populate the new fields.
+4. THE kernel's `apply_workflow_command` handler for `ScheduleActivity` SHALL populate `ActivityState.retry_policy` from the command, and SHALL write the command's input and header only into the ActivityTaskScheduled event.
+5. THE `DispatchableActivityTask` struct in `tokeira-storage` SHALL carry no input; the start that delivers the task reads it from the scheduled event.
+6. THE `DispatchOp::EnqueueActivityTask` variant SHALL carry no input.
+7. ALL existing code that constructs `ActivityState` SHALL populate `retry_policy`.
 
 ---
 

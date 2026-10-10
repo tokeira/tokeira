@@ -72,6 +72,12 @@ due deadlines from durable state through the engine's configured clock.
 and keep pollers process-local. Work that must outlive live pollers moves through
 the durable backlog and scanner paths.
 
+An activity task carries no input. A polled start reads the activity's input and
+header from its ActivityTaskScheduled event, after every check that can refuse the
+start and before the start commits; a read that fails returns the task to its queue.
+An eager start answers from the command that scheduled the activity and reads
+nothing.
+
 Schedules are a native runtime engine. Schedule state, overlap bookkeeping, and
 time evaluation produce ordinary workflow starts; the edge only translates the
 public Schedule APIs.

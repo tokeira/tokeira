@@ -18,8 +18,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    ActivityOp, DispatchOp, HistoryEvent, LoadedRun, RequestIdInfo, TimerOp, Transition,
-    WorkflowState,
+    ActivityOp, DispatchOp, HistoryEvent, LoadedRun, RequestIdInfo, RetiredField, TimerOp,
+    Transition, WorkflowState,
     state::{
         NexusOperationCancellationState, Priority, VersioningBehavior, VersioningOverride,
         WorkerDeploymentVersionRef,
@@ -989,6 +989,28 @@ pub trait RunRepository: Send + Sync {
         }
     }
 
+    /// Read the one event with id `event_id`, or none when the run's history
+    /// doesn't hold it.
+    ///
+    /// An activity start reads its ActivityTaskScheduled event with this, for the
+    /// input and header that live only there (`activity-inputs-from-history`
+    /// criterion 2.3). The default reads one event with [`Self::read_history`], so
+    /// it is correct on any store. The DSQL store overrides it with one lookup that
+    /// returns only the batch holding the event, and wrappers must forward it
+    /// explicitly so they don't fall back to the general read.
+    async fn read_history_event(
+        &self,
+        run_key: RunKey,
+        event_id: i64,
+    ) -> Result<Option<HistoryEvent>> {
+        Ok(self
+            .read_history(run_key, event_id.saturating_sub(1), 1)
+            .await?
+            .into_iter()
+            .next()
+            .filter(|event| event.event_id == event_id))
+    }
+
     /// Read authoritative history with durable event attribution.
     ///
     /// Implementations predating attribution may rely on this default, which
@@ -1594,6 +1616,10 @@ pub(crate) fn dispatchable_workflow_task(
 
 /// An activity task that is ready for dispatch to a
 /// worker. Produced by [`RunRepository::list_due_dispatchable_activity_tasks`].
+///
+/// It carries no input or header. The start that delivers it reads them from the
+/// activity's ActivityTaskScheduled event, `schedule_event_id`
+/// (`activity-inputs-from-history`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DispatchableActivityTask {
     /// Durable storage key for the owning run.
@@ -1602,8 +1628,6 @@ pub struct DispatchableActivityTask {
     pub queue: QueueKey,
     /// Application-level activity identifier.
     pub activity_id: String,
-    /// Serialized input payloads for the activity.
-    pub input: Payloads,
     /// History event id that scheduled this activity.
     pub schedule_event_id: i64,
     /// Current retry attempt (starts at 1).
@@ -1683,7 +1707,6 @@ impl PartialEq for DispatchableActivityTask {
         self.run_key == other.run_key
             && self.queue == other.queue
             && self.activity_id == other.activity_id
-            && self.input == other.input
             && self.schedule_event_id == other.schedule_event_id
             && self.attempt == other.attempt
             && self.dispatch_revision == other.dispatch_revision
@@ -1701,12 +1724,15 @@ pub enum BacklogPayload {
         /// Monotonic workflow-task sequence.
         logical_seq: tokeira_types::LogicalTaskSeq,
     },
-    /// Activity backlog entry carrying the full dispatch payload.
+    /// Activity backlog entry carrying the activity's dispatch identity.
     Activity {
         /// Application-level activity identifier.
         activity_id: String,
-        /// Serialized input payloads for the activity.
-        input: Payloads,
+        /// The position of the input in the stored layout. A new entry writes it
+        /// empty, and an entry an earlier release wrote with an input still decodes:
+        /// the input is dropped, and the start reads it from the scheduled event
+        /// (`activity-inputs-from-history`).
+        retired_input: RetiredField<Payloads>,
         /// History event id that scheduled this activity.
         schedule_event_id: i64,
         /// Current retry attempt.
@@ -2739,6 +2765,14 @@ where
         limit: usize,
     ) -> Result<Vec<HistoryEvent>> {
         (**self).read_history(run_key, after_event_id, limit).await
+    }
+
+    async fn read_history_event(
+        &self,
+        run_key: RunKey,
+        event_id: i64,
+    ) -> Result<Option<HistoryEvent>> {
+        (**self).read_history_event(run_key, event_id).await
     }
 
     async fn read_attributed_history(

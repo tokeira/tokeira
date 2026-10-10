@@ -384,7 +384,7 @@ fn split_once_ascii_case<'a>(input: &'a str, needle: &str) -> Option<(&'a str, &
 mod tests {
     use proptest::prelude::*;
     use time::Duration;
-    use tokeira_types::{Headers, Payloads, TaskQueueName, WorkflowRuleAction};
+    use tokeira_types::{TaskQueueName, WorkflowRuleAction};
 
     use super::*;
 
@@ -410,8 +410,8 @@ mod tests {
             task_queue: TaskQueueName("queue".to_string()),
             deployment: None,
             build_id: None,
-            input: Payloads::default(),
-            header: Some(Headers::default()),
+            retired_input: Default::default(),
+            retired_header: Default::default(),
             attempt,
             retry_policy: None,
             schedule_to_close_timeout: None,

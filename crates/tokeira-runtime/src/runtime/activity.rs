@@ -29,6 +29,10 @@ use tokeira_observability::OutcomeLabel;
 use tokeira_types::{TaskKind, WorkerTaskClass, WorkerTaskOrigin};
 use tracing::Instrument as _;
 
+/// An activity's input and header, which live only in its ActivityTaskScheduled
+/// event (`activity-inputs-from-history`).
+type ScheduledInput = (Payloads, Option<Headers>);
+
 const ACTIVITY_BACKLOG_REPROCESS_BATCH: usize = 100;
 
 /// Decide whether an activity-start poller should move the workflow deployment.
@@ -158,7 +162,7 @@ where
             for entry in entries {
                 let tokeira_storage::BacklogPayload::Activity {
                     activity_id,
-                    input,
+                    retired_input: _,
                     schedule_event_id,
                     attempt,
                     dispatch_revision,
@@ -195,7 +199,6 @@ where
                     run_key: entry.run_key,
                     queue,
                     activity_id,
-                    input,
                     schedule_event_id,
                     attempt,
                     dispatch_revision,
@@ -269,7 +272,7 @@ where
         offer: ActivityTaskOffer,
         worker_identity: WorkerIdentity,
     ) -> Result<Option<StartedActivityTask>> {
-        self.start_activity_task(&offer.task, offer.entered_at, &worker_identity)
+        self.start_activity_task(&offer.task, offer.entered_at, &worker_identity, None)
             .await
     }
 
@@ -319,12 +322,19 @@ where
     /// that as "no work available" rather than an error. Used by the eager
     /// dispatch path where a worker that just completed a task is handed the
     /// next one directly, skipping a broker round-trip.
+    ///
+    /// `input` and `header` are those of the ScheduleActivity command the
+    /// completion just recorded as the activity's ActivityTaskScheduled event,
+    /// so the start answers with them and reads nothing, as v1.31.0's eager
+    /// start does (`workflow_task_completed_handler.go:594-598 @ v1.31.0`).
     pub async fn try_claim_activity_task(
         &self,
         queue: QueueKey,
         run_key: RunKey,
         activity_id: String,
         worker_identity: WorkerIdentity,
+        input: Payloads,
+        header: Option<Headers>,
     ) -> Result<Option<StartedActivityTask>> {
         let Some(offered) = self
             .activity_broker
@@ -334,8 +344,13 @@ where
             return Ok(None);
         };
         self.delivery_metrics.record_poll_success(&queue);
-        self.start_activity_task(&offered.0, offered.1, &worker_identity)
-            .await
+        self.start_activity_task(
+            &offered.0,
+            offered.1,
+            &worker_identity,
+            Some((input, header)),
+        )
+        .await
     }
 
     /// Record a successful activity completion and
@@ -931,11 +946,16 @@ where
     /// start is retried up to `max_occ_retries`; if that is exhausted the offer
     /// is republished to the broker (reject-and-reschedule) rather than dropped,
     /// so the task is not lost when contention is high.
+    ///
+    /// The task's input and header are `scheduled` when the caller has them, as
+    /// an eager start does; otherwise the start reads them from the activity's
+    /// ActivityTaskScheduled event.
     async fn start_activity_task(
         &self,
         task: &DispatchableActivityTask,
         entered_at: tokio::time::Instant,
         worker_identity: &WorkerIdentity,
+        scheduled: Option<ScheduledInput>,
     ) -> Result<Option<StartedActivityTask>> {
         let span = tracing::info_span!(
             "activity_task.process",
@@ -948,7 +968,7 @@ where
             tokeira.attempt = i64::from(task.attempt),
         );
         let result = self
-            .start_activity_task_inner(task, entered_at, worker_identity)
+            .start_activity_task_inner(task, entered_at, worker_identity, scheduled)
             .instrument(span.clone())
             .await;
         if let Ok(Some(started)) = &result {
@@ -964,6 +984,7 @@ where
         task: &DispatchableActivityTask,
         entered_at: tokio::time::Instant,
         worker_identity: &WorkerIdentity,
+        mut scheduled: Option<ScheduledInput>,
     ) -> Result<Option<StartedActivityTask>> {
         let mut attempts = 0u32;
         loop {
@@ -1124,6 +1145,16 @@ where
                 .cloned()
                 .expect("the kernel keeps the activity it just started");
 
+            // Every check that can refuse the start has passed, so a refused
+            // start reads nothing. The read precedes the commit, as v1.31.0 reads
+            // the event before it records the start
+            // (`recordactivitytaskstarted/api.go:139-145, 242 @ v1.31.0`). The
+            // event never changes, so a retry after a conflict keeps what the
+            // first pass read.
+            if scheduled.is_none() {
+                scheduled = Some(self.read_scheduled_input(task).await?);
+            }
+
             // Mirror the lane's fence (see lane.rs): under controller-managed
             // placement, the home's lease at the epoch this node holds it, so
             // storage refuses a superseded owner's write — the authoritative
@@ -1167,6 +1198,9 @@ where
             }
             match committed? {
                 CommitResult::Applied { .. } => {
+                    let (input, header) = scheduled
+                        .take()
+                        .expect("the start reads its input before it commits");
                     runtime_metrics::record_activity_task_started(OutcomeLabel::Success);
                     self.delivery_metrics
                         .record_latency(&task.queue, entered_at.elapsed());
@@ -1193,11 +1227,11 @@ where
                             attempt: next_activity.attempt,
                             shard_epoch: self.current_shard_epoch(&state).await?,
                         },
-                        input: next_activity.input.clone(),
+                        input,
                         attempt: next_activity.attempt,
                         workflow_id: state.workflow_id.0.clone(),
                         workflow_type: state.workflow_type.0.clone(),
-                        header: next_activity.header.clone(),
+                        header,
                         retry_policy: next_activity.retry_policy.clone(),
                         heartbeat_details: next_activity.heartbeat_details.clone(),
                         scheduled_time: next_activity.scheduled_at,
@@ -1229,6 +1263,61 @@ where
                 }
             }
         }
+    }
+
+    /// The input and header of `task`'s ActivityTaskScheduled event, the only
+    /// place they live (`activity-inputs-from-history` criterion 2.2), read with
+    /// one lookup (criterion 2.3).
+    ///
+    /// When the read fails, or the history holds no such event, the start
+    /// commits nothing: the task goes back to its queue, as when the start's
+    /// commit retries run out, and the start answers the read's error, or an
+    /// internal error for the missing event, as v1.31.0 answers
+    /// `ErrMissingActivityScheduledEvent` (`mutable_state_impl.go:109-110,
+    /// 1476-1481 @ v1.31.0`; criterion 2.4).
+    async fn read_scheduled_input(
+        &self,
+        task: &DispatchableActivityTask,
+    ) -> Result<ScheduledInput> {
+        let read = match self
+            .repo
+            .read_history_event(task.run_key, task.schedule_event_id)
+            .await
+        {
+            // An event of another kind or activity at the id means history and
+            // state disagree; it answers as a missing event does.
+            Ok(Some(tokeira_kernel::HistoryEvent {
+                kind:
+                    HistoryEventKind::ActivityTaskScheduled {
+                        activity_id,
+                        input,
+                        header,
+                        ..
+                    },
+                ..
+            })) if activity_id == task.activity_id => Ok((input, header)),
+            Ok(_) => Err(anyhow!(
+                "unable to get activity scheduled event {} of activity {} in run {}",
+                task.schedule_event_id,
+                task.activity_id,
+                task.run_key.0
+            )),
+            Err(error) => Err(error),
+        };
+        if read.is_err()
+            && let Err(error) = self
+                .activity_broker
+                .publish_activity_task(task.clone(), Some(&self.delivery_metrics))
+                .await
+        {
+            tracing::warn!(
+                ?error,
+                run_key = ?task.run_key,
+                activity_id = task.activity_id,
+                "failed to republish activity task after its scheduled-event read failed"
+            );
+        }
+        read
     }
 
     async fn republish_rejected_activity_task(&self, task: &DispatchableActivityTask) {
@@ -1583,7 +1672,6 @@ where
             Some(task) => smallvec![DispatchOp::EnqueueActivityTask {
                 queue: task.queue.clone(),
                 activity_id: task.activity_id.clone(),
-                input: task.input.clone(),
                 schedule_event_id: task.schedule_event_id,
                 attempt: task.attempt,
                 dispatch_revision: task.dispatch_revision,
@@ -1742,7 +1830,6 @@ pub(crate) fn activity_dispatch_task(
             build_id: activity.build_id.clone().or_else(|| state.build_id.clone()),
         },
         activity_id: activity.activity_id.clone(),
-        input: activity.input.clone(),
         schedule_event_id: activity.schedule_event_id,
         attempt: activity.attempt,
         dispatch_revision: state
@@ -2327,6 +2414,29 @@ mod tests {
             .expect("set current activity worker deployment version");
     }
 
+    /// The ActivityTaskScheduled event a seeded activity's start reads its input
+    /// and header from.
+    fn scheduled_event(activity: &tokeira_kernel::ActivityState) -> tokeira_kernel::HistoryEvent {
+        tokeira_kernel::HistoryEvent {
+            event_id: activity.schedule_event_id,
+            happened_at: activity.scheduled_at,
+            kind: HistoryEventKind::ActivityTaskScheduled {
+                workflow_task_completed_event_id: activity.schedule_event_id - 1,
+                activity_id: activity.activity_id.clone(),
+                activity_type: activity.activity_type.clone(),
+                task_queue: activity.task_queue.clone(),
+                input: payloads(b"input"),
+                header: None,
+                retry_policy: activity.retry_policy.clone(),
+                schedule_to_close_timeout: activity.schedule_to_close_timeout,
+                schedule_to_start_timeout: activity.schedule_to_start_timeout,
+                start_to_close_timeout: activity.start_to_close_timeout,
+                heartbeat_timeout: activity.heartbeat_timeout,
+                priority: activity.priority.clone(),
+            },
+        }
+    }
+
     async fn seed_started_activity(
         runtime: &TokeiraRuntime<InMemoryStore>,
         repo: &InMemoryStore,
@@ -2358,8 +2468,8 @@ mod tests {
             task_queue: TaskQueueName("activity-q".to_string()),
             deployment: None,
             build_id: None,
-            input: payloads(b"input"),
-            header: None,
+            retired_input: Default::default(),
+            retired_header: Default::default(),
             attempt: 1,
             retry_policy: Some(retry_policy()),
             schedule_to_close_timeout: Some(Duration::minutes(5)),
@@ -2390,8 +2500,8 @@ mod tests {
         let transition = Transition {
             expected_seq: TransitionSeq::ZERO,
             next_state: state.clone(),
-            history_events: SmallVec::new(),
-            event_principals: SmallVec::new(),
+            history_events: smallvec![scheduled_event(&activity)],
+            event_principals: smallvec![None],
             request_dedupe_ops: SmallVec::new(),
             activity_ops: smallvec![ActivityOp::Upsert(activity.clone())],
             timer_ops: SmallVec::new(),
@@ -2442,6 +2552,25 @@ mod tests {
         repo: &InMemoryStore,
         versioning_info: Option<WorkflowVersioningInfo>,
     ) -> (WorkflowState, QueueKey, DispatchableActivityTask) {
+        seed_scheduled(runtime, repo, versioning_info, true).await
+    }
+
+    /// A scheduled activity whose run's history lacks its ActivityTaskScheduled
+    /// event, so any read of the event fails: a start that answers without
+    /// reading it shows it read nothing.
+    async fn seed_scheduled_activity_lacking_its_event(
+        runtime: &TokeiraRuntime<InMemoryStore>,
+        repo: &InMemoryStore,
+    ) -> (WorkflowState, QueueKey, DispatchableActivityTask) {
+        seed_scheduled(runtime, repo, None, false).await
+    }
+
+    async fn seed_scheduled(
+        runtime: &TokeiraRuntime<InMemoryStore>,
+        repo: &InMemoryStore,
+        versioning_info: Option<WorkflowVersioningInfo>,
+        with_event: bool,
+    ) -> (WorkflowState, QueueKey, DispatchableActivityTask) {
         let mut state = open_state(versioning_info);
         let run_key = state.run_key;
         let scheduled_at = OffsetDateTime::now_utc();
@@ -2458,8 +2587,8 @@ mod tests {
             task_queue: TaskQueueName("activity-q".to_string()),
             deployment: None,
             build_id: None,
-            input: payloads(b"input"),
-            header: None,
+            retired_input: Default::default(),
+            retired_header: Default::default(),
             attempt: 1,
             retry_policy: Some(retry_policy()),
             schedule_to_close_timeout: Some(Duration::minutes(5)),
@@ -2491,7 +2620,6 @@ mod tests {
             run_key,
             queue: queue.clone(),
             activity_id: activity.activity_id.clone(),
-            input: activity.input.clone(),
             schedule_event_id: activity.schedule_event_id,
             attempt: activity.attempt,
             dispatch_revision: 0,
@@ -2499,11 +2627,16 @@ mod tests {
             priority: None,
             order: None,
         };
+        let (history_events, event_principals) = if with_event {
+            (smallvec![scheduled_event(&activity)], smallvec![None])
+        } else {
+            (SmallVec::new(), SmallVec::new())
+        };
         let transition = Transition {
             expected_seq: TransitionSeq::ZERO,
             next_state: state.clone(),
-            history_events: SmallVec::new(),
-            event_principals: SmallVec::new(),
+            history_events,
+            event_principals,
             request_dedupe_ops: SmallVec::new(),
             activity_ops: smallvec![ActivityOp::Upsert(activity.clone())],
             timer_ops: SmallVec::new(),
@@ -2512,7 +2645,6 @@ mod tests {
             dispatch_ops: smallvec![DispatchOp::EnqueueActivityTask {
                 queue: queue.clone(),
                 activity_id: activity.activity_id.clone(),
-                input: activity.input.clone(),
                 schedule_event_id: activity.schedule_event_id,
                 attempt: activity.attempt,
                 dispatch_revision: 0,
@@ -2689,6 +2821,7 @@ mod tests {
                 &task,
                 tokio::time::Instant::now(),
                 &WorkerIdentity("activity-worker".to_string()),
+                None,
             )
             .await
             .expect("activity poll should be evaluated");
@@ -2877,6 +3010,8 @@ mod tests {
                         task.run_key,
                         task.activity_id.clone(),
                         WorkerIdentity("worker".to_string()),
+                        Payloads::default(),
+                        None,
                     )
                     .await
                     .expect("eager claim")
@@ -3076,7 +3211,6 @@ mod tests {
             run_key: token.run_key,
             queue: queue.clone(),
             activity_id: activity.activity_id.clone(),
-            input: activity.input.clone(),
             schedule_event_id: activity.schedule_event_id,
             attempt: activity.attempt,
             dispatch_revision: 0,
@@ -3449,7 +3583,8 @@ mod tests {
                             .start_activity_task(
                                 &task.unwrap(),
                                 tokio::time::Instant::now(),
-                                &WorkerIdentity("poller".into())
+                                &WorkerIdentity("poller".into()),
+                                None,
                             )
                             .await
                             .unwrap()
@@ -4052,8 +4187,8 @@ mod tests {
             task_queue: TaskQueueName("activity-q".into()),
             deployment: None,
             build_id: None,
-            input: tokeira_types::Payloads::default(),
-            header: None,
+            retired_input: Default::default(),
+            retired_header: Default::default(),
             last_failure: None,
             heartbeat_details: None,
             attempt,
@@ -4180,7 +4315,6 @@ mod tests {
             dispatch_ops: smallvec![DispatchOp::EnqueueActivityTask {
                 queue: queue.clone(),
                 activity_id: "zombie".into(),
-                input: tokeira_types::Payloads::default(),
                 schedule_event_id: 3,
                 attempt: 1,
                 dispatch_revision: 0,
@@ -4361,5 +4495,237 @@ mod tests {
         assert_eq!(not_owner.current_epoch, taken);
         assert_eq!(repo.snapshot().await.unwrap(), before);
         assert!(acquisition.cancel.is_cancelled());
+    }
+
+    // ---- The start's read of the scheduled event (`activity-inputs-from-history`) ----
+
+    /// A runtime whose activity scanner doesn't re-offer dispatch rows while a
+    /// test runs, so a task that a start didn't return to its queue stays gone.
+    fn quiet_runtime(repo: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
+        TokeiraRuntime::new_with_nexus(
+            repo,
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+            crate::ActivityTimeoutScannerConfig {
+                scan_interval: tokio::time::Duration::from_secs(3600),
+                ..crate::ActivityTimeoutScannerConfig::default()
+            },
+            crate::NexusTimeoutScannerConfig::default(),
+            crate::NexusEndpointRegistry::default(),
+            Arc::new(crate::NoopNexusHttpClient),
+            crate::NexusCompletionDeps::default(),
+        )
+    }
+
+    fn inputs_runtime(repo: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
+        TokeiraRuntime::new(
+            repo,
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        )
+    }
+
+    /// Each check that can refuse a start comes before the read of the scheduled
+    /// event: a start refused for a stale attempt or stamp, a paused activity or
+    /// workflow, a workflow rule or a closed run answers no task, never the
+    /// missing event's error (criterion 3.2).
+    #[tokio::test]
+    async fn a_refused_start_reads_nothing() {
+        for refusal in 0..6 {
+            let repo = Arc::new(InMemoryStore::default());
+            let runtime = inputs_runtime(repo.clone());
+            let (state, _queue, task) =
+                seed_scheduled_activity_lacking_its_event(&runtime, &repo).await;
+            let mut offered = task.clone();
+            let request = RequestContext::unattributed(OffsetDateTime::now_utc());
+            match refusal {
+                0 => offered.attempt += 1,
+                1 => offered.stamp += 1,
+                2 => {
+                    runtime
+                        .pause_activities(
+                            state.run_key,
+                            tokeira_kernel::PauseActivityRequest {
+                                target: ActivityControlTarget::Id(task.activity_id.clone()),
+                                identity: "operator".to_string(),
+                                reason: "refused".to_string(),
+                                rule_id: None,
+                                request,
+                                now: OffsetDateTime::now_utc(),
+                            },
+                        )
+                        .await
+                        .expect("pauses the activity");
+                }
+                3 => {
+                    runtime
+                        .pause_workflow(
+                            ExecutionRef {
+                                namespace_id: state.namespace_id,
+                                workflow_id: state.workflow_id.clone(),
+                                run_id: Some(state.run_id),
+                            },
+                            PauseWorkflowRequest {
+                                identity: "operator".to_string(),
+                                reason: "refused".to_string(),
+                                request,
+                                now: OffsetDateTime::now_utc(),
+                            },
+                        )
+                        .await
+                        .expect("pauses the workflow");
+                }
+                4 => {
+                    repo.create_workflow_rule(
+                        state.namespace_id,
+                        pause_rule("pause", "ActivityType = 'activity-type'"),
+                        10,
+                    )
+                    .await
+                    .expect("stores the rule");
+                }
+                _ => {
+                    let LoadedRun::Existing(open) = repo.load_run(state.run_key).await.unwrap()
+                    else {
+                        panic!("the seeded run");
+                    };
+                    let mut closed = open.clone();
+                    closed.status = ExecutionStatus::Completed;
+                    closed.closed_at = Some(OffsetDateTime::now_utc());
+                    closed.transition_seq = open.transition_seq.next();
+                    repo.commit_transition(
+                        state.run_key,
+                        Transition {
+                            expected_seq: open.transition_seq,
+                            next_state: closed,
+                            history_events: SmallVec::new(),
+                            event_principals: SmallVec::new(),
+                            request_dedupe_ops: SmallVec::new(),
+                            activity_ops: SmallVec::new(),
+                            timer_ops: SmallVec::new(),
+                            dispatch_ops: SmallVec::new(),
+                            events_numbered_at_close: 0,
+                            growth_limits: None,
+                        },
+                        WriteFence::Unfenced,
+                    )
+                    .await
+                    .expect("closes the run");
+                }
+            }
+            let started = runtime
+                .start_activity_task(
+                    &offered,
+                    tokio::time::Instant::now(),
+                    &WorkerIdentity("poller".into()),
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(started, Ok(None)),
+                "refusal {refusal} answered {started:?}"
+            );
+        }
+    }
+
+    /// An eager start answers with the input and header of the command that
+    /// scheduled the activity, and reads nothing (criterion 2.2).
+    #[tokio::test]
+    async fn an_eager_start_answers_from_its_command() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = inputs_runtime(repo.clone());
+        let (_state, queue, task) =
+            seed_scheduled_activity_lacking_its_event(&runtime, &repo).await;
+        let input = payloads(b"from-the-command");
+        let header = Some(Headers(BTreeMap::from([(
+            "trace".to_string(),
+            payload(b"command"),
+        )])));
+        let started = runtime
+            .try_claim_activity_task(
+                queue,
+                task.run_key,
+                task.activity_id.clone(),
+                WorkerIdentity("worker".into()),
+                input.clone(),
+                header.clone(),
+            )
+            .await
+            .expect("an eager start reads no event")
+            .expect("claims the task");
+        assert_eq!((started.input, started.header), (input, header));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        // Feature: activity-inputs-from-history, Property 4: A start whose read
+        // fails changes nothing
+        #[test]
+        fn property_a_start_whose_read_fails_changes_nothing(
+            missing in any::<bool>(),
+            failures in 1usize..4,
+        ) {
+            tokio::runtime::Runtime::new().unwrap().block_on(async move {
+                let repo = Arc::new(InMemoryStore::default());
+                let runtime = quiet_runtime(repo.clone());
+                let (state, queue, _task) = if missing {
+                    seed_scheduled_activity_lacking_its_event(&runtime, &repo).await
+                } else {
+                    seed_scheduled_activity(&runtime, &repo).await
+                };
+                if !missing {
+                    repo.fail_history_event_reads(failures).await;
+                }
+                let before = repo.load_run(state.run_key).await.unwrap();
+                let rows = repo.list_all_dispatchable_activity_tasks(&queue, 10).await.unwrap();
+                // A poll finds the task each time, so each failed start put it back:
+                // nothing else re-offers it while the test runs.
+                for _ in 0..failures {
+                    let error = runtime
+                        .poll_activity_task(
+                            queue.clone(),
+                            WorkerIdentity("poller".into()),
+                            tokio::time::Duration::from_secs(1),
+                        )
+                        .await
+                        .expect_err("the start answers the failed read");
+                    let message = error.to_string();
+                    prop_assert!(
+                        message.contains(if missing {
+                            "unable to get activity scheduled event 7"
+                        } else {
+                            "injected failure"
+                        }),
+                        "{}",
+                        message
+                    );
+                    prop_assert_eq!(&repo.load_run(state.run_key).await.unwrap(), &before);
+                    prop_assert_eq!(
+                        &repo.list_all_dispatchable_activity_tasks(&queue, 10).await.unwrap(),
+                        &rows
+                    );
+                }
+                if !missing {
+                    let started = runtime
+                        .poll_activity_task(
+                            queue.clone(),
+                            WorkerIdentity("poller".into()),
+                            tokio::time::Duration::from_secs(1),
+                        )
+                        .await
+                        .unwrap()
+                        .expect("the task is back in its queue");
+                    prop_assert_eq!(started.input, payloads(b"input"));
+                }
+                Ok(())
+            })?;
+        }
     }
 }

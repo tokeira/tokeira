@@ -11,7 +11,7 @@ The stores check each commit's growth against limits the runtime hands them with
 - **Buffered event limits:** 100 events and 2 MiB (`constants.go:2340-2350 @ v1.31.0`).
 - **Stored activity failure limit:** 4 KiB (`limit.mutableStateActivityFailureSize.error`, `constants.go:386-396 @ v1.31.0`).
 - **Terminating breach:** a commit refused for history size, count or state size, or for its batch size when it completes a workflow task. The run is terminated. Any other refusal for batch size only fails the write.
-- **Measured state:** a run's encoded state less each activity's encoded input.
+- **Measured state:** a run's encoded state less each activity's retired input and header fields, one byte each.
 - **Finishing events:** the events of a write that v1.31.0 numbers only when it finishes the write, after the growth checks (criterion 2.2).
 
 ## Bug Details
@@ -81,7 +81,7 @@ _For any_ failure, the activity's stored last failure SHALL be the failure itsel
 - One check function, shared by both stores, takes the stored History Size, the transition, the measured state's size and the batch's size, and returns `RunLimitExceeded` for the first breach in criterion 2.4's order, then the batch (criterion 2.6). The history, count and state checks apply only when the transition has an existing run (`expected_seq` above zero) and leaves it open.
 - **DSQL** (`run_repository/commit.rs`): `write_transition` encodes the state and the batch first, measures them, and runs the check. On a breach it returns the error before its first write, and the transaction rolls back. `insert_workflow_hot` takes the encoded state rather than encoding it again.
 - **In memory** (`memory.rs`): `commit_transition` runs the check before its first change, when the transition carries limits, measuring the state's encoded size as DSQL stores it without encoding it (`codec::workflow_state_encoded_len`).
-- The measured state subtracts each activity's input, measured with the codec's encoding of `Payloads`, from the encoded state (criterion 2.9; `codec::measured_state_len`).
+- The measured state subtracts each activity's retired input and header fields, an empty payload list and an absent header of one byte each, from the encoded state (criterion 2.9; `codec::measured_state_len`). The input and header live only in history ([activity-inputs-from-history](../activity-inputs-from-history/design.md)).
 - Above a warn limit, the check logs, at most once a second for each limit, as v1.31.0 logs through its throttled logger (criterion 2.10).
 - Nothing retries the error: neither store's commit retries an error, and the lane retries only a conflict.
 
@@ -138,7 +138,7 @@ _For any_ failure, the activity's stored last failure SHALL be the failure itsel
 - The history count limit through the runtime on a run seeded at the limit: a signal while its workflow task is scheduled succeeds, and the next one terminates the run, as in v1.31.0's `TestTerminateWorkflowCausedByHistoryCountLimit`.
 - An activity start and a retry on a run seeded over the History Size limit: the run is terminated through its lane, the poll hands out no task, and the failure call is answered with the breach.
 - An activity's start that buffers the 101st event leaves the force-close to the run's next transition.
-- The measured state against the encoded state of the same run with its activities' inputs emptied.
+- The measured state against the encoded state less two bytes per activity.
 - A run's first write with a batch over 4 MiB is refused and creates nothing.
 - Each breach's message and reason.
 

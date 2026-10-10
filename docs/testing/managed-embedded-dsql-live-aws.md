@@ -16,8 +16,8 @@ an already-migrated V071 database was rejected as a future schema.
 
 The default test suite now checks initialization, V068–V070 upgrade decisions,
 validate-only refusal below V071, and V071 admission. The live lifecycle test below
-asserts V071 after managed startup and restart, then starts the same cluster through
-`ExistingDsql` with `ValidateOnly`, with both activity gates off. The storage bootstrap
+asserts the embedded target version after managed startup and restart, then starts the
+same cluster through `ExistingDsql` with `ValidateOnly`, with both activity gates off. The storage bootstrap
 regression also queries both CHASM tables after migration, rather than accepting the
 ledger alone as evidence. These live paths require a separate authorized execution;
 compile success does not establish live DSQL startup.
@@ -191,14 +191,15 @@ engine's normal drop and shutdown paths.
 
 ## V068 upgrade regression
 
-`v68_upgrade_installs_chasm_tables_and_accepts_v71` in
+`v68_upgrade_installs_chasm_tables_and_reaches_the_target` in
 `crates/tokeira-storage/tests/dsql_schema_bootstrap.rs` exercises the real fenced
 migration runner on a **separate disposable database already initialized through
-V068**. Prepare it with the preceding release; do not downgrade an existing V071
-database or use the preserved bootstrap fixture above. Stop other engines using the
-disposable database before the test. The test refuses any starting ledger other than
-V068 before mutation, applies exactly three migrations, checks both CHASM tables and
-the complete ledger/digest, and verifies validate-only admission at V071.
+V068**. Prepare it with v0.3.1, the last release whose schema target is V068; do not
+downgrade a newer database or use the preserved bootstrap fixture above. Stop other
+engines using the disposable database before the test. The test refuses any starting
+ledger other than V068 before mutation, applies every migration from V069 through the
+embedded target, checks both CHASM tables and the complete ledger and digest, and
+verifies validate-only admission at that target.
 
 Set `TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_DATABASE_URL` privately using fresh IAM
 authentication, and supply the fixture's canonical identity through
@@ -210,10 +211,10 @@ claim. With explicit authorization to upgrade that disposable database, run:
 ```bash
 TOKEIRA_DSQL_SCHEMA_UPGRADE_TEST_ACK=MIGRATE_DISPOSABLE_V068_DATABASE \
 cargo nextest run -p tokeira-storage --test dsql_schema_bootstrap --locked \
-  --features dsql-integration --run-ignored only \
-  -E 'test(=v68_upgrade_installs_chasm_tables_and_accepts_v71)'
+  --features dsql-integration --profile dsql-live --run-ignored only \
+  -E 'test(=v68_upgrade_installs_chasm_tables_and_reaches_the_target)'
 ```
 
-This test leaves the database at V071 and performs no destructive cleanup. Use a new
-disposable V068 fixture for another run. Its evidence complements the full engine
+This test leaves the database at the embedded target and performs no destructive
+cleanup. Use a new disposable V068 fixture for another run. Its evidence complements the full engine
 lifecycle test; it does not by itself exercise engine construction.

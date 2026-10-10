@@ -450,9 +450,10 @@ fn verify_chasm_schema_report(engine: &Engine) -> Result<()> {
         .schema
         .as_ref()
         .context("DSQL startup must report its schema contract")?;
-    ensure!(schema.observed_version == 71);
-    ensure!(schema.target_version == 71);
-    ensure!(schema.maximum_readable_version == 71);
+    let contract = tokeira_storage::dsql::MigrationRunner::compatibility_contract();
+    ensure!(schema.observed_version == contract.target_version);
+    ensure!(schema.target_version == contract.target_version);
+    ensure!(schema.maximum_readable_version == contract.maximum_readable_version);
     Ok(())
 }
 
@@ -523,7 +524,7 @@ async fn exercise_ready_cluster(
     let restart_shutdown = restarted.shutdown().await;
     combine_generation_result(restart_result, restart_shutdown, "restarted")?;
 
-    // Existing-cluster validate-only admission must accept the same V071 schema
+    // Existing-cluster validate-only admission must accept the same target schema
     // that managed automatic startup installed, with both activity gates still off.
     let existing_config = EmbeddedEngineConfig {
         storage: EmbeddedStorageConfig::ExistingDsql(ExistingEmbeddedDsqlConfig {

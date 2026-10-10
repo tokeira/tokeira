@@ -213,9 +213,10 @@ async fn reconcile_workflow_dispatch_run(
 ```
 
 The implemented repair interface carries a single-owner execution home. The caller
-holds its local writer barrier throughout acquisition. Tasks 17–18 will add the
-transaction-local `ExecutionHomeFence`; this interface makes no competing-owner
-claim. A typed `WorkflowDispatchRepairConflict` requests a whole-call retry.
+holds its local writer barrier throughout acquisition. The transaction-local
+`ExecutionHomeFence` is [bundle-lease-fence](../bundle-lease-fence/design.md)'s, which
+every write of a run's authoritative state carries; tasks 17–18 will thread it through
+this repair interface, which until then makes no competing-owner claim. A typed `WorkflowDispatchRepairConflict` requests a whole-call retry.
 
 `Derive` returns a row exactly when status is `Running`, the pending task is
 unstarted, and its type is normal. A transient retry is normal for this purpose.

@@ -6,13 +6,15 @@
 //! **Validates: Requirements 3.1, 3.2, 3.3, 3.4, 3.5**
 //!
 //! Properties tested:
-//! - Zero-epoch bypass: commits with `ShardEpoch::ZERO` skip fencing entirely
-//! - Matching-epoch commit: when caller epoch matches durable epoch, result is Applied
-//! - OCC conflict on stale transition_seq: result is Conflict regardless of epoch
+//! - Unfenced bypass: commits with `WriteFence::Unfenced` skip fencing entirely
+//! - Matching-fence commit: when the caller's fence matches the lease, result is
+//!   Applied
+//! - OCC conflict on stale transition_seq: result is Conflict regardless of fence
 //! - Lane OCC retry loop: retries up to max_occ_retries before surfacing error
 
 #[cfg(test)]
 mod tests {
+    use crate::WriteFence;
     use std::collections::{BTreeMap, BTreeSet};
 
     use proptest::prelude::*;
@@ -26,10 +28,10 @@ mod tests {
     use crate::{
         api::{
             BuildId, CommitResult, ComputeConfig, ConflictToken, DeploymentCasResult,
-            DeploymentName, DrainageInfo, LeaseOutcome, LeaseRepository, RoutingConfigUpdateState,
-            RunRepository, StoredRoutingConfig, StoredVersion, StoredWorkerDeployment,
-            VersionDrainageStatus, VersionMetadata, WorkerDeploymentRepository,
-            WorkerDeploymentVersionKey, WorkerDeploymentVersionStatus,
+            DeploymentName, DrainageInfo, ExecutionHomeFence, LeaseFenceLost, LeaseOutcome,
+            LeaseRepository, RoutingConfigUpdateState, RunRepository, StoredRoutingConfig,
+            StoredVersion, StoredWorkerDeployment, VersionDrainageStatus, VersionMetadata,
+            WorkerDeploymentRepository, WorkerDeploymentVersionKey, WorkerDeploymentVersionStatus,
         },
         memory::InMemoryStore,
     };
@@ -140,6 +142,39 @@ mod tests {
         }
     }
 
+    /// A run's start whose execution home is `bundle` among `shard_count`.
+    fn start_at(bundle: ShardId, shard_count: u32) -> Transition {
+        let mut transition = start_transition(RunKey::new());
+        let namespace_id = transition.next_state.namespace_id;
+        transition.next_state.workflow_id = (0..)
+            .map(|index| WorkflowId(format!("workflow-{index}")))
+            .find(|workflow_id| {
+                tokeira_types::execution_home_bundle(
+                    namespace_id.0.as_bytes(),
+                    workflow_id.0.as_bytes(),
+                    shard_count,
+                ) == bundle
+            })
+            .expect("some workflow id lands on the bundle");
+        transition
+    }
+
+    /// A lease fence for `owner` at `epoch` on `bundle`.
+    fn fence(bundle: ShardId, owner: &str, epoch: ShardEpoch) -> WriteFence {
+        WriteFence::Lease(ExecutionHomeFence {
+            home: bundle,
+            owner: owner.to_owned(),
+            epoch,
+        })
+    }
+
+    /// Whether a commit failed with a lost fence.
+    fn is_lease_lost(result: &anyhow::Result<CommitResult>) -> bool {
+        result
+            .as_ref()
+            .is_err_and(|error| error.downcast_ref::<LeaseFenceLost>().is_some())
+    }
+
     /// Helper: create a follow-up transition from an existing state.
     fn followup_transition(state: &WorkflowState) -> Transition {
         let mut next_state = state.clone();
@@ -158,9 +193,9 @@ mod tests {
         }
     }
 
-    // ─── Property: Zero-Epoch Bypass ────────────────────────────────────────────
+    // ─── Property: Unfenced Bypass ──────────────────────────────────────────────
     //
-    // For all commits with `ShardEpoch::ZERO`, the result depends only on
+    // For all commits with `WriteFence::Unfenced`, the result depends only on
     // `transition_seq` OCC — fencing is skipped entirely. This preserves the
     // single-node compose and test experience.
     //
@@ -170,7 +205,7 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(50))]
 
         #[test]
-        fn property_zero_epoch_bypass_skips_fencing(
+        fn property_unfenced_commit_skips_fencing(
             shard_id_val in 0u32..32,
         ) {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -200,7 +235,7 @@ mod tests {
                 let run_key = RunKey::new();
                 let t = start_transition(run_key);
                 let result = store
-                    .commit_transition(run_key, t, ShardEpoch::ZERO)
+                    .commit_transition(run_key, t, WriteFence::Unfenced)
                     .await
                     .unwrap();
                 let is_applied = matches!(result, CommitResult::Applied { .. });
@@ -221,7 +256,7 @@ mod tests {
                     32,
                 );
                 let result = store
-                    .commit_transition_for_bundle(run_key, ehb, transition, ShardEpoch::ZERO)
+                    .commit_transition_for_bundle(run_key, ehb, transition, WriteFence::Unfenced)
                     .await
                     .unwrap();
                 let is_applied = matches!(result, CommitResult::Applied { .. });
@@ -247,7 +282,7 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(50))]
 
         #[test]
-        fn property_matching_epoch_produces_applied(
+        fn property_matching_fence_produces_applied(
             shard_id_val in 0u32..32,
         ) {
             // shard_id_val is used only to vary the random seed; the actual
@@ -289,7 +324,7 @@ mod tests {
 
                 // Commit the initial transition
                 let result = store
-                    .commit_transition(run_key, t, ShardEpoch::ZERO)
+                    .commit_transition(run_key, t, WriteFence::Unfenced)
                     .await
                     .unwrap();
                 let is_applied = matches!(result, CommitResult::Applied { .. });
@@ -302,13 +337,18 @@ mod tests {
                 };
                 let transition = followup_transition(&state);
                 let result = store
-                    .commit_transition_for_bundle(run_key, bundle, transition, epoch)
+                    .commit_transition_for_bundle(
+                        run_key,
+                        bundle,
+                        transition,
+                        fence(bundle, "owner", epoch),
+                    )
                     .await
                     .unwrap();
                 let is_applied = matches!(result, CommitResult::Applied { .. });
                 prop_assert!(
                     is_applied,
-                    "matching epoch should produce Applied, got {:?}",
+                    "matching fence should produce Applied, got {:?}",
                     result
                 );
 
@@ -328,7 +368,7 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(50))]
 
         #[test]
-        fn property_stale_transition_seq_produces_conflict_regardless_of_epoch(
+        fn property_stale_transition_seq_produces_conflict_regardless_of_fence(
             shard_id_val in 0u32..32,
             use_zero_epoch in proptest::bool::ANY,
         ) {
@@ -354,11 +394,11 @@ mod tests {
                     panic!("expected acquire");
                 };
 
-                // Create a run
-                let run_key = RunKey::new();
-                let t = start_transition(run_key);
+                // Create a run at the bundle
+                let t = start_at(bundle, 32);
+                let run_key = t.next_state.run_key;
                 let result = store
-                    .commit_transition(run_key, t, ShardEpoch::ZERO)
+                    .commit_transition(run_key, t, WriteFence::Unfenced)
                     .await
                     .unwrap();
                 let is_applied = matches!(result, CommitResult::Applied { .. });
@@ -386,22 +426,27 @@ mod tests {
                     growth_limits: None,
                 };
 
-                // Choose epoch based on the property parameter
-                let commit_epoch = if use_zero_epoch {
-                    ShardEpoch::ZERO
+                // Choose the fence based on the property parameter
+                let commit_fence = if use_zero_epoch {
+                    WriteFence::Unfenced
                 } else {
-                    epoch
+                    fence(bundle, "owner", epoch)
                 };
 
                 let result = store
-                    .commit_transition_for_bundle(run_key, bundle, stale_transition, commit_epoch)
+                    .commit_transition_for_bundle(
+                        run_key,
+                        bundle,
+                        stale_transition,
+                        commit_fence.clone(),
+                    )
                     .await
                     .unwrap();
                 let is_conflict = matches!(result, CommitResult::Conflict { .. });
                 prop_assert!(
                     is_conflict,
-                    "stale transition_seq should produce Conflict regardless of epoch (epoch={:?}, use_zero={}), got {:?}",
-                    commit_epoch,
+                    "stale transition_seq should produce Conflict regardless of fence (fence={:?}, unfenced={}), got {:?}",
+                    commit_fence,
                     use_zero_epoch,
                     result
                 );
@@ -414,7 +459,8 @@ mod tests {
     // ─── Property: In-Memory Store Fencing Parity ───────────────────────────────
     //
     // The in-memory store produces the same fencing behavior as expected for
-    // non-zero epochs: rejects stale epochs, skips for zero epoch.
+    // lease fences: rejects a stale fence with LeaseFenceLost, skips an
+    // unfenced write.
     //
     // **Validates: Requirements 3.4**
 
@@ -460,7 +506,7 @@ mod tests {
 
                 // Commit the initial transition
                 store
-                    .commit_transition(run_key, t, ShardEpoch::ZERO)
+                    .commit_transition(run_key, t, WriteFence::Unfenced)
                     .await
                     .unwrap();
 
@@ -488,59 +534,65 @@ mod tests {
                     panic!("expected existing run");
                 };
 
-                // Test 1: commit_transition with non-zero STALE epoch → Conflict
+                // Test 1: commit_transition with a STALE fence → LeaseFenceLost
                 let transition1 = followup_transition(&state);
                 let result = store
-                    .commit_transition(run_key, transition1, epoch_a)
-                    .await
-                    .unwrap();
-                let is_conflict = matches!(result, CommitResult::Conflict { .. });
+                    .commit_transition(run_key, transition1, fence(bundle, "owner-a", epoch_a))
+                    .await;
                 prop_assert!(
-                    is_conflict,
-                    "stale non-zero epoch should produce Conflict in commit_transition, got {:?}",
+                    is_lease_lost(&result),
+                    "a stale fence should fail with LeaseFenceLost in commit_transition, got {:?}",
                     result
                 );
 
-                // Test 2: commit_transition with non-zero MATCHING epoch → Applied
+                // Test 2: commit_transition with a MATCHING fence → Applied
                 let transition2 = followup_transition(&state);
                 let result = store
-                    .commit_transition(run_key, transition2, epoch_b)
+                    .commit_transition(run_key, transition2, fence(bundle, "owner-b", epoch_b))
                     .await
                     .unwrap();
                 let is_applied = matches!(result, CommitResult::Applied { .. });
                 prop_assert!(
                     is_applied,
-                    "matching non-zero epoch should produce Applied in commit_transition, got {:?}",
+                    "a matching fence should produce Applied in commit_transition, got {:?}",
                     result
                 );
 
-                // Test 3: commit_transition_for_bundle with stale epoch → Conflict
+                // Test 3: commit_transition_for_bundle with a stale fence → LeaseFenceLost
                 let loaded = store.load_run(run_key).await.unwrap();
                 let LoadedRun::Existing(state2) = loaded else {
                     panic!("expected existing run");
                 };
                 let transition3 = followup_transition(&state2);
                 let result = store
-                    .commit_transition_for_bundle(run_key, bundle, transition3, epoch_a)
-                    .await
-                    .unwrap();
-                let is_conflict = matches!(result, CommitResult::Conflict { .. });
+                    .commit_transition_for_bundle(
+                        run_key,
+                        bundle,
+                        transition3,
+                        fence(bundle, "owner-a", epoch_a),
+                    )
+                    .await;
                 prop_assert!(
-                    is_conflict,
-                    "stale epoch in commit_transition_for_bundle should produce Conflict, got {:?}",
+                    is_lease_lost(&result),
+                    "a stale fence in commit_transition_for_bundle should fail with LeaseFenceLost, got {:?}",
                     result
                 );
 
-                // Test 4: commit_transition_for_bundle with matching epoch → Applied
+                // Test 4: commit_transition_for_bundle with a matching fence → Applied
                 let transition4 = followup_transition(&state2);
                 let result = store
-                    .commit_transition_for_bundle(run_key, bundle, transition4, epoch_b)
+                    .commit_transition_for_bundle(
+                        run_key,
+                        bundle,
+                        transition4,
+                        fence(bundle, "owner-b", epoch_b),
+                    )
                     .await
                     .unwrap();
                 let is_applied = matches!(result, CommitResult::Applied { .. });
                 prop_assert!(
                     is_applied,
-                    "matching epoch in commit_transition_for_bundle should produce Applied, got {:?}",
+                    "a matching fence in commit_transition_for_bundle should produce Applied, got {:?}",
                     result
                 );
 
@@ -773,7 +825,7 @@ mod tests {
                 let run_key = RunKey::new();
                 let t = start_transition(run_key);
                 let result = store
-                    .commit_transition(run_key, t, ShardEpoch::ZERO)
+                    .commit_transition(run_key, t, WriteFence::Unfenced)
                     .await
                     .unwrap();
                 let is_applied = matches!(result, CommitResult::Applied { .. });
@@ -794,7 +846,7 @@ mod tests {
                     };
                     let transition = followup_transition(&state);
                     let result = store
-                        .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                        .commit_transition(run_key, transition, WriteFence::Unfenced)
                         .await
                         .unwrap();
 

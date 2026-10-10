@@ -28,6 +28,10 @@ Additionally, multiple runtime mutation paths bypass the fenced commit entirely 
 
 2.1 WHEN `commit_transition_for_bundle` is called with a valid epoch THEN the system SHALL verify the shard_lease epoch and write the workflow mutation within the SAME DSQL transaction, so that OCC detects any concurrent epoch change and rejects the stale write atomically
 
+> The separate check remained after this fix, and a plain read wouldn't have fenced on DSQL.
+> [bundle-lease-fence](../bundle-lease-fence/bugfix.md) 2.2 removes the check and fences the
+> commit's own transaction.
+
 2.2 WHEN the activity start path commits a transition THEN the system SHALL route through the fenced `commit_transition_for_bundle` path with the caller's current shard epoch and execution-home bundle
 
 2.3 WHEN the activity retry path commits a transition THEN the system SHALL route through the fenced `commit_transition_for_bundle` path with the caller's current shard epoch and execution-home bundle

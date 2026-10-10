@@ -53,7 +53,7 @@ async fn workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs(
         8,
     );
     let expected = repo
-        .commit_transition(run_key, item, ShardEpoch::ZERO)
+        .commit_transition(run_key, item, tokeira_storage::WriteFence::Unfenced)
         .await?;
     anyhow::ensure!(
         matches!(expected, CommitResult::Applied { .. }),

@@ -1,6 +1,7 @@
 //! Shared generated storage traces, with an oracle expressed from fixture
 //! coordinates rather than calls to production row derivation.
 
+use crate::WriteFence;
 use std::num::NonZeroU32;
 
 use anyhow::Result;
@@ -15,8 +16,8 @@ use tokeira_kernel::{
     WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTaskType,
 };
 use tokeira_types::{
-    BuildId, DeploymentId, ExecutionStatus, LogicalTaskSeq, RequestId, RunId, RunKey, ShardEpoch,
-    ShardId, StickyAffinity, TaskQueueName, WorkerIdentity,
+    BuildId, DeploymentId, ExecutionStatus, LogicalTaskSeq, RequestId, RunId, RunKey, ShardId,
+    StickyAffinity, TaskQueueName, WorkerIdentity,
 };
 
 use crate::{
@@ -41,7 +42,7 @@ pub(crate) async fn commit(backend: &impl Backend, transition: Transition) -> Re
                     transition.next_state.run_key,
                     ShardId(0),
                     transition.clone(),
-                    ShardEpoch::ZERO,
+                    WriteFence::Unfenced,
                 )
                 .await?
         } else {
@@ -50,7 +51,7 @@ pub(crate) async fn commit(backend: &impl Backend, transition: Transition) -> Re
                 .commit_transition(
                     transition.next_state.run_key,
                     transition.clone(),
-                    ShardEpoch::ZERO,
+                    WriteFence::Unfenced,
                 )
                 .await?
         };
@@ -280,7 +281,7 @@ pub(crate) fn run_page_cases(backend: &impl Backend, runtime: &tokio::runtime::R
                 applied(
                     backend
                         .repo()
-                        .commit_transition(last_key, moved, ShardEpoch::ZERO)
+                        .commit_transition(last_key, moved, WriteFence::Unfenced)
                         .await
                         .unwrap(),
                 );
@@ -443,7 +444,13 @@ async fn atomic_case(
             .unwrap();
         backend
             .repo()
-            .materialize_reset_successor(state.run_key, [0, 3, 4, 7][reset], run_id, expected)
+            .materialize_reset_successor(
+                state.run_key,
+                [0, 3, 4, 7][reset],
+                run_id,
+                expected,
+                WriteFence::Unfenced,
+            )
             .await
             .unwrap();
         let LoadedRun::Existing(successor) = backend.repo().load_run(key).await.unwrap() else {
@@ -549,7 +556,7 @@ async fn atomic_case(
                 expected_seq: state.transition_seq.next(),
                 deleted_at: state.started_at,
             },
-            ShardEpoch::ZERO,
+            WriteFence::Unfenced,
         )
         .await
         .unwrap();
@@ -567,7 +574,7 @@ async fn atomic_case(
                 expected_seq: state.transition_seq,
                 deleted_at: state.started_at,
             },
-            ShardEpoch::ZERO,
+            WriteFence::Unfenced,
         )
         .await
         .unwrap();
@@ -599,7 +606,13 @@ pub(crate) async fn reset_materialization(backend: &impl Backend) {
             .unwrap();
         backend
             .repo()
-            .materialize_reset_successor(source.run_key, boundary, run_id, expected)
+            .materialize_reset_successor(
+                source.run_key,
+                boundary,
+                run_id,
+                expected,
+                WriteFence::Unfenced,
+            )
             .await
             .unwrap();
         let LoadedRun::Existing(state) = backend.repo().load_run(key).await.unwrap() else {

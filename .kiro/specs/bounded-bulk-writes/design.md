@@ -242,6 +242,8 @@ Today the materialization is one transaction. It becomes:
 
 The record's check in every transaction is the fence. A purge's switch to `purging` updates the record, and every transaction of the materialization reads it `FOR UPDATE`, so DSQL commits at most one of two that overlap. A straggler that starts after the switch reads `purging` and changes nothing. So once a purge's switch commits, the abandoned materialization writes no further row, and its final transaction can't make the successor visible (Property 6).
 
+Under controller-managed placement every transaction of a materialization, and a takeover's recovery switch, also reads the execution home's lease `FOR KEY SHARE` first, so a node that has lost the home writes nothing: neither a copy page nor the final transaction of a materialization it started, nor a switch of its recovery ([bundle-lease-fence](../bundle-lease-fence/design.md)). A purge's own switch stays unfenced, since a purge runs from any node.
+
 The memory store runs the same steps, each under its lock and its limits, so the steps commit separately and a test can stop it between them.
 
 ### The timer scanner (`delete_due_timer_if_matches`, `settle_failed_due_timer`)

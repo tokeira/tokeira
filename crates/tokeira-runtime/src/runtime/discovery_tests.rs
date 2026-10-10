@@ -9,7 +9,7 @@ use crate::{
     shard::shard_for,
 };
 use proptest::prelude::*;
-use tokeira_storage::{InMemoryStore, WorkflowDiscoveryRange, WorkflowDispatchRouting};
+use tokeira_storage::{InMemoryStore, WorkflowDiscoveryRange, WorkflowDispatchRouting, WriteFence};
 
 fn runtime(store: Arc<InMemoryStore>, home: QueueHome) -> TokeiraRuntime<InMemoryStore> {
     let homes: Arc<dyn QueueHomeProvider> = Arc::new(Homes(Mutex::new(home)));
@@ -70,7 +70,7 @@ proptest! {
             let expected_home = execution_home_bundle(queue.namespace_id.0.as_bytes(), item.next_state.workflow_id.0.as_bytes(), 8);
             let task = offer(&item);
             let initial_seq = item.next_state.transition_seq;
-            store.commit_transition(task.run_key, item, ShardEpoch::ZERO).await.unwrap();
+            store.commit_transition(task.run_key, item, WriteFence::Unfenced).await.unwrap();
             for _ in 0..duplicates { first.broker.publish_workflow_task(task.clone(), None).await; }
             if started {
                 // Drop the response just as a caller whose transport lost it would.
@@ -176,7 +176,7 @@ async fn polling_without_any_publication_delivers_from_another_execution_home() 
     let run_key = item.next_state.run_key;
     let original_seq = item.next_state.transition_seq;
     store
-        .commit_transition(run_key, item, ShardEpoch::ZERO)
+        .commit_transition(run_key, item, WriteFence::Unfenced)
         .await
         .unwrap();
     assert!(!runtime.broker.has_runnable_backlog(&queue).await);
@@ -229,7 +229,7 @@ async fn overlapping_queue_homes_can_commit_only_one_start() {
     let task = offer(&item);
     let seq = item.next_state.transition_seq;
     store
-        .commit_transition(task.run_key, item, ShardEpoch::ZERO)
+        .commit_transition(task.run_key, item, WriteFence::Unfenced)
         .await
         .unwrap();
     first.broker.publish_workflow_task(task.clone(), None).await;
@@ -293,14 +293,14 @@ async fn stale_missing_closed_and_paused_offers_do_not_escape_the_poll() {
                 ExecutionStatus::Paused
             };
             store
-                .commit_transition(stale_offer.run_key, stale, ShardEpoch::ZERO)
+                .commit_transition(stale_offer.run_key, stale, WriteFence::Unfenced)
                 .await
                 .unwrap();
         }
         let valid = transition(&queue, 1);
         let valid_offer = offer(&valid);
         store
-            .commit_transition(valid_offer.run_key, valid, ShardEpoch::ZERO)
+            .commit_transition(valid_offer.run_key, valid, WriteFence::Unfenced)
             .await
             .unwrap();
         runtime

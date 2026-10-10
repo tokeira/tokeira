@@ -28,11 +28,11 @@ use crate::{
     ActivityDispatchIdentity, AttributedHistoryEvent, BacklogEntry, BacklogPayload, CommitResult,
     CurrentExecutionConflictPolicy, DbClass, DeleteRunRequest, DeleteRunResult, DeliveryOrder,
     DispatchableActivityTask, DispatchableWorkflowTask, DueActivityDispatch, DueTimer,
-    ProjectionRecord, RequestRecord, RunHistoryStats, RunRepository, TransitionAuditRecord,
-    WorkerDeploymentVersionKey, WorkflowRuleCreateResult, WorkflowRuleDeleteResult,
-    deleted_workflow_projection_context, dispatchable_workflow_task, metrics,
-    prepare_workflow_projection, seed_workflow_projection_accumulator,
-    workflow_is_open_and_pinned_to_version,
+    LeaseFenceLost, ProjectionRecord, RequestRecord, RunHistoryStats, RunRepository,
+    TransitionAuditRecord, WorkerDeploymentVersionKey, WorkflowRuleCreateResult,
+    WorkflowRuleDeleteResult, WriteFence, deleted_workflow_projection_context,
+    dispatchable_workflow_task, metrics, prepare_workflow_projection,
+    seed_workflow_projection_accumulator, workflow_is_open_and_pinned_to_version,
 };
 
 use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert};
@@ -86,6 +86,8 @@ mod bulk_write_tests;
 mod commit;
 mod delete;
 mod dispatch;
+#[cfg(all(test, feature = "dsql-integration"))]
+mod lease_fence_tests;
 mod leases;
 mod load;
 mod placement;
@@ -101,6 +103,82 @@ mod workflow_rules;
 #[cfg(test)]
 #[cfg(feature = "dsql-integration")]
 mod projection_accumulator_tests;
+
+/// Test-only pause points (`bundle-lease-fence`): a write held after its fence
+/// read and before its commit, or an acquisition held after its statements and
+/// before its commit, so a live test can let another transaction commit in
+/// between. They exist only in this crate's live tests.
+#[cfg(all(test, feature = "dsql-integration"))]
+pub(crate) mod pause_point {
+    use std::sync::Mutex;
+
+    use tokeira_types::{RunKey, ShardId};
+    use tokio::sync::oneshot;
+
+    /// What a pause point holds.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum PauseKey {
+        /// A fenced write of this run, after its fence read.
+        Write(RunKey),
+        /// An acquisition of this home, before its commit.
+        Acquisition(ShardId),
+        /// A copy page of this materialized run, before its transaction.
+        Page(RunKey),
+    }
+
+    struct Armed {
+        key: PauseKey,
+        skip: usize,
+        reached: oneshot::Sender<()>,
+        resume: oneshot::Receiver<()>,
+    }
+
+    static ARMED: Mutex<Vec<Armed>> = Mutex::new(Vec::new());
+
+    /// Hold the next transaction of `key` that reaches its pause point. It
+    /// signals the returned receiver when it gets there, and waits until the
+    /// returned sender sends or drops. Other transactions pass.
+    pub(crate) fn arm(key: PauseKey) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        arm_after(key, 0)
+    }
+
+    /// As [`arm`], after `skip` transactions of `key` have passed.
+    pub(crate) fn arm_after(
+        key: PauseKey,
+        skip: usize,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        let mut armed = ARMED.lock().expect("pause point lock poisoned");
+        armed.retain(|armed| armed.key != key);
+        armed.push(Armed {
+            key,
+            skip,
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+        (reached_rx, resume_tx)
+    }
+
+    /// A transaction of `key` at its pause point.
+    pub(crate) async fn reached(key: PauseKey) {
+        let held = {
+            let mut armed = ARMED.lock().expect("pause point lock poisoned");
+            match armed.iter().position(|armed| armed.key == key) {
+                Some(index) if armed[index].skip == 0 => Some(armed.remove(index)),
+                Some(index) => {
+                    armed[index].skip -= 1;
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(held) = held {
+            let _ = held.reached.send(());
+            let _ = held.resume.await;
+        }
+    }
+}
 
 #[cfg(test)]
 use activity::{ActivityDispatchRow, activity_dispatch_from_row};
@@ -366,6 +444,7 @@ impl DsqlRunRepository {
             Ok(CommitResult::Conflict { .. }) => "conflict",
             Ok(_) => "success",
             Err(error) if is_serialization_failure_error(error) => "conflict",
+            Err(error) if is_lease_fence_lost(error) => "lease_lost",
             Err(_) => "error",
         };
         metrics::record_dsql_operation_duration(operation, outcome, duration);
@@ -405,6 +484,7 @@ fn classify_outcome<T>(result: &Result<T>) -> &'static str {
     match result {
         Ok(_) => "success",
         Err(error) if is_serialization_failure_error(error) => "conflict",
+        Err(error) if is_lease_fence_lost(error) => "lease_lost",
         Err(_) => "error",
     }
 }
@@ -559,9 +639,9 @@ impl RunRepository for DsqlRunRepository {
         &self,
         run_key: RunKey,
         transition: Transition,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<CommitResult> {
-        self.do_commit_transition(run_key, transition, epoch).await
+        self.do_commit_transition(run_key, transition, fence).await
     }
 
     async fn commit_transition_for_bundle(
@@ -569,9 +649,9 @@ impl RunRepository for DsqlRunRepository {
         run_key: RunKey,
         execution_home_bundle: ShardId,
         transition: Transition,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<CommitResult> {
-        self.do_commit_transition_for_bundle(run_key, execution_home_bundle, transition, epoch)
+        self.do_commit_transition_for_bundle(run_key, execution_home_bundle, transition, fence)
             .await
     }
 
@@ -580,9 +660,9 @@ impl RunRepository for DsqlRunRepository {
         run_key: RunKey,
         execution_home_bundle: ShardId,
         request: DeleteRunRequest,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<DeleteRunResult> {
-        self.do_delete_run_for_bundle(run_key, execution_home_bundle, request, epoch)
+        self.do_delete_run_for_bundle(run_key, execution_home_bundle, request, fence)
             .await
     }
 
@@ -592,18 +672,20 @@ impl RunRepository for DsqlRunRepository {
         fork_event_id: i64,
         successor_run_id: RunId,
         expected_current: Option<RunKey>,
+        fence: WriteFence,
     ) -> Result<()> {
         self.do_materialize_reset_successor(
             base_run_key,
             fork_event_id,
             successor_run_id,
             expected_current,
+            fence,
         )
         .await
     }
 
-    async fn abandon_materialization(&self, run_key: RunKey) -> Result<()> {
-        self.do_abandon_materialization(run_key).await
+    async fn abandon_materialization(&self, run_key: RunKey, fence: WriteFence) -> Result<()> {
+        self.do_abandon_materialization(run_key, &fence).await
     }
 
     async fn purge_run(&self, run_key: RunKey) -> Result<()> {
@@ -794,14 +876,60 @@ pub(crate) fn epoch_from_sql(value: i64) -> Result<ShardEpoch> {
     )?))
 }
 
-fn should_check_epoch(epoch: ShardEpoch) -> bool {
-    // `ShardEpoch::ZERO` is reserved for tests and unfenced local flows. Real
-    // DSQL commit paths should pass a lease epoch obtained from the controller.
-    epoch != ShardEpoch::ZERO
+/// The fence read (`bundle-lease-fence`): the execution home's lease, read
+/// `FOR KEY SHARE` as the first statement of a write's transaction. A takeover
+/// or a release writes the lease's epoch, a key column through
+/// `idx_shard_lease_epoch`, so DSQL commits at most one of the two
+/// transactions; a renewal or a refresh writes no key column and conflicts with
+/// neither.
+pub(super) const FENCE_READ: &str =
+    "SELECT owner, epoch FROM shard_lease WHERE shard_id = $1 FOR KEY SHARE";
+
+/// Whether the error is a lost fence, which no caller retries.
+fn is_lease_fence_lost(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<LeaseFenceLost>().is_some()
+}
+
+impl DsqlRunRepository {
+    /// Read the lease of a fenced write in `tx`, and return its loss when the
+    /// lease no longer names the fence's owner at its epoch; the caller then
+    /// rolls `tx` back and fails with it. An unfenced write reads nothing.
+    pub(super) async fn check_fence(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        fence: &WriteFence,
+        run_key: RunKey,
+    ) -> Result<Option<LeaseFenceLost>> {
+        let WriteFence::Lease(fence) = fence else {
+            return Ok(None);
+        };
+        let row = sqlx::query_as::<_, (Option<String>, i64)>(FENCE_READ)
+            .bind(Self::shard_id_to_uuid(fence.home))
+            .fetch_optional(&mut **tx)
+            .await?;
+        let found = row
+            .map(|(owner, epoch)| epoch_from_sql(epoch).map(|epoch| (owner, epoch)))
+            .transpose()?;
+        if let Some((Some(owner), epoch)) = &found
+            && *owner == fence.owner
+            && *epoch == fence.epoch
+        {
+            #[cfg(all(test, feature = "dsql-integration"))]
+            pause_point::reached(pause_point::PauseKey::Write(run_key)).await;
+            #[cfg(not(all(test, feature = "dsql-integration")))]
+            let _ = run_key;
+            return Ok(None);
+        }
+        Ok(Some(LeaseFenceLost {
+            home: fence.home,
+            epoch: fence.epoch,
+            found: found.map(|(owner, epoch)| (owner.unwrap_or_default(), epoch)),
+        }))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::WriteFence;
     use std::{
         borrow::Cow,
         error::Error,
@@ -829,7 +957,6 @@ mod tests {
         activity_dispatch_from_row, classify_connection_error, classify_outcome,
         collect_dispatchable_workflow_tasks, decide_renew, dispatchable_workflow_task,
         epoch_from_sql, epoch_to_sql, extract_sqlstate, interpret_acquire, partition_for,
-        should_check_epoch,
     };
     use crate::{
         BacklogPayload, CurrentExecutionConflictPolicy, DbClass, LeaseOutcome, LeaseRepository,
@@ -1320,10 +1447,13 @@ mod tests {
         assert_eq!(classify_connection_error(&refused), Some("refused"));
     }
 
+    // Feature: bundle-lease-fence, Property 1: No stale owner commits
     #[test]
-    fn zero_epoch_bypasses_fence_check() {
-        assert!(!should_check_epoch(tokeira_types::ShardEpoch::ZERO));
-        assert!(should_check_epoch(tokeira_types::ShardEpoch(1)));
+    fn the_fence_read_is_a_key_share_read_of_the_lease() {
+        assert_eq!(
+            super::FENCE_READ,
+            "SELECT owner, epoch FROM shard_lease WHERE shard_id = $1 FOR KEY SHARE"
+        );
     }
 
     #[test]
@@ -1484,14 +1614,10 @@ mod tests {
         let run_key = RunKey::new();
 
         let _ = repo
-            .commit_transition(
-                run_key,
-                sample_transition(run_key),
-                tokeira_types::ShardEpoch::ZERO,
-            )
+            .commit_transition(run_key, sample_transition(run_key), WriteFence::Unfenced)
             .await;
         let _ = repo
-            .materialize_reset_successor(run_key, 1, RunId::new(), None)
+            .materialize_reset_successor(run_key, 1, RunId::new(), None, WriteFence::Unfenced)
             .await;
 
         assert_eq!(recorder.classes(), vec![DbClass::Commit, DbClass::Commit]);

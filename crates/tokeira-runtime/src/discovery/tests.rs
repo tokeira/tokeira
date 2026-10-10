@@ -7,9 +7,9 @@ use tokeira_kernel::{
     BasicKernel, Command, Kernel, Priority, Transition, VersioningBehavior,
     WorkerDeploymentVersionRef, WorkflowVersioningInfo,
 };
-use tokeira_storage::{CommitResult, InMemoryStore};
+use tokeira_storage::{CommitResult, InMemoryStore, WriteFence};
 use tokeira_types::{
-    BuildId, DeploymentId, NamespaceId, RunKey, ShardEpoch, TaskKind, TaskQueueName, WorkerIdentity,
+    BuildId, DeploymentId, NamespaceId, RunKey, TaskKind, TaskQueueName, WorkerIdentity,
 };
 
 #[derive(Debug)]
@@ -76,7 +76,11 @@ fn offer(transition: &Transition) -> DispatchableWorkflowTask {
 async fn commit(store: &InMemoryStore, transition: Transition) {
     assert!(matches!(
         store
-            .commit_transition(transition.next_state.run_key, transition, ShardEpoch::ZERO)
+            .commit_transition(
+                transition.next_state.run_key,
+                transition,
+                WriteFence::Unfenced
+            )
             .await
             .unwrap(),
         CommitResult::Applied { .. }

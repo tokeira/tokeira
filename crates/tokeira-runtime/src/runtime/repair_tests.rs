@@ -133,7 +133,11 @@ async fn seed(repo: &Repo) -> WorkflowState {
     let transition = crate::discovery::tests::transition(&queue, 0);
     let CommitResult::Applied { new_state } = repo
         .inner
-        .commit_transition(transition.next_state.run_key, transition, ShardEpoch::ZERO)
+        .commit_transition(
+            transition.next_state.run_key,
+            transition,
+            WriteFence::Unfenced,
+        )
         .await
         .unwrap()
     else {
@@ -464,10 +468,10 @@ impl RunRepository for Repo {
         &self,
         run_key: RunKey,
         transition: Transition,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<CommitResult> {
         self.inner
-            .commit_transition(run_key, transition, epoch)
+            .commit_transition(run_key, transition, fence)
             .await
     }
 
@@ -476,11 +480,11 @@ impl RunRepository for Repo {
         run_key: RunKey,
         execution_home_bundle: ShardId,
         transition: Transition,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<CommitResult> {
         self.hit(Point::Commit).await?;
         self.inner
-            .commit_transition_for_bundle(run_key, execution_home_bundle, transition, epoch)
+            .commit_transition_for_bundle(run_key, execution_home_bundle, transition, fence)
             .await
     }
 
@@ -489,10 +493,10 @@ impl RunRepository for Repo {
         run_key: RunKey,
         execution_home_bundle: ShardId,
         request: DeleteRunRequest,
-        epoch: ShardEpoch,
+        fence: WriteFence,
     ) -> Result<DeleteRunResult> {
         self.inner
-            .delete_run_for_bundle(run_key, execution_home_bundle, request, epoch)
+            .delete_run_for_bundle(run_key, execution_home_bundle, request, fence)
             .await
     }
 
@@ -502,6 +506,7 @@ impl RunRepository for Repo {
         fork_event_id: i64,
         successor_run_id: RunId,
         expected_current: Option<RunKey>,
+        fence: WriteFence,
     ) -> Result<()> {
         self.inner
             .materialize_reset_successor(
@@ -509,12 +514,13 @@ impl RunRepository for Repo {
                 fork_event_id,
                 successor_run_id,
                 expected_current,
+                fence,
             )
             .await
     }
 
-    async fn abandon_materialization(&self, run_key: RunKey) -> Result<()> {
-        self.inner.abandon_materialization(run_key).await
+    async fn abandon_materialization(&self, run_key: RunKey, fence: WriteFence) -> Result<()> {
+        self.inner.abandon_materialization(run_key, fence).await
     }
 
     async fn purge_run(&self, run_key: RunKey) -> Result<()> {
@@ -1125,7 +1131,7 @@ async fn execution_home_lookup_reuses_the_lane_load_for_cold_and_hot_commands() 
         .apply(LoadedRun::Absent, Command::Start(request.clone()))
         .unwrap();
     repo.inner
-        .commit_transition(key, transition, ShardEpoch::ZERO)
+        .commit_transition(key, transition, WriteFence::Unfenced)
         .await
         .unwrap();
     let runtime = home_runtime(repo.clone(), home, false);

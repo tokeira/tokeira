@@ -168,7 +168,7 @@ async fn delete_first(store: &InMemoryStore, state: &WorkflowState) {
                 expected_seq: state.transition_seq,
                 deleted_at: state.started_at,
             },
-            ShardEpoch::ZERO,
+            WriteFence::Unfenced,
         )
         .await
         .expect("the first transaction fits the budgets");
@@ -274,7 +274,7 @@ proptest! {
                 base.run_key,
                 fork,
                 successor_run_id,
-                expected,
+                expected, WriteFence::Unfenced,
             );
             let result = match abandon_after {
                 Some(yields) => {
@@ -384,7 +384,7 @@ proptest! {
                     start.next_state.workflow_id = base.workflow_id.clone();
                     start.next_state.run_id = run_id;
                     let _ = store
-                        .commit_transition(start.next_state.run_key, start, ShardEpoch::ZERO)
+                        .commit_transition(start.next_state.run_key, start, WriteFence::Unfenced)
                         .await;
                 }
                 2 if base_open => {
@@ -405,7 +405,7 @@ proptest! {
             let successor =
                 RunKey::derive(base.namespace_id, &base.workflow_id, successor_run_id);
             let result = store
-                .materialize_reset_successor(base.run_key, fork, successor_run_id, admitted)
+                .materialize_reset_successor(base.run_key, fork, successor_run_id, admitted, WriteFence::Unfenced)
                 .await;
             prop_assert_eq!(result.is_ok(), before == admitted, "{:?}", result);
             let after = store
@@ -528,7 +528,7 @@ proptest! {
                     let run_id = RunId::new();
                     store.fail_bulk_write_after(1).await;
                     store
-                        .materialize_reset_successor(base.run_key, fork, run_id, Some(base.run_key))
+                        .materialize_reset_successor(base.run_key, fork, run_id, Some(base.run_key), WriteFence::Unfenced)
                         .await
                         .unwrap_err();
                     clear_failure(&store).await;
@@ -617,7 +617,13 @@ async fn a_straggler_copy_writes_nothing_once_a_purge_has_run() {
     let successor_run_id = RunId::new();
     let successor = RunKey::derive(base.namespace_id, &base.workflow_id, successor_run_id);
     let (result, purged) = tokio::join!(
-        store.materialize_reset_successor(base.run_key, fork, successor_run_id, Some(base.run_key)),
+        store.materialize_reset_successor(
+            base.run_key,
+            fork,
+            successor_run_id,
+            Some(base.run_key),
+            WriteFence::Unfenced
+        ),
         async {
             // The record and the first page commit first.
             tokio::task::yield_now().await;
@@ -661,7 +667,13 @@ async fn a_purge_of_an_abandoned_materialization_removes_its_history_and_timers(
     // The record and the one copy page commit; the final transaction fails.
     store.fail_bulk_write_after(2).await;
     store
-        .materialize_reset_successor(base.run_key, fork, successor_run_id, Some(base.run_key))
+        .materialize_reset_successor(
+            base.run_key,
+            fork,
+            successor_run_id,
+            Some(base.run_key),
+            WriteFence::Unfenced,
+        )
         .await
         .unwrap_err();
     let rows = store.owned_rows(successor).await.unwrap();

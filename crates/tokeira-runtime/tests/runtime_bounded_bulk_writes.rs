@@ -10,6 +10,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::sync::Arc;
+use tokeira_storage::WriteFence;
 
 use anyhow::Result;
 use time::{Duration, OffsetDateTime};
@@ -311,7 +312,13 @@ async fn a_takeover_abandons_a_stopped_materialization() -> Result<()> {
     store.fail_bulk_write_after(1).await;
     let successor_run_id = RunId::new();
     store
-        .materialize_reset_successor(base_run_key, 4, successor_run_id, Some(base_run_key))
+        .materialize_reset_successor(
+            base_run_key,
+            4,
+            successor_run_id,
+            Some(base_run_key),
+            WriteFence::Unfenced,
+        )
         .await
         .expect_err("the copy stops");
     let successor = RunKey::derive(

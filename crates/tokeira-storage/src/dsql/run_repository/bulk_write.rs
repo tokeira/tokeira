@@ -15,6 +15,9 @@
 //!   switch of the record to purging fences the materialization: DSQL commits at
 //!   most one of two transactions that overlap on the record, and a later one
 //!   reads the switch.
+//! - Under a lease, every transaction of a materialization, and a recovery's
+//!   switch of its record, reads the execution home's lease first, as a
+//!   transition commit does (`bundle-lease-fence`).
 //!
 //! [`purge_run`]: crate::RunRepository::purge_run
 
@@ -131,10 +134,19 @@ impl CopyItem<'_> {
 }
 
 impl DsqlRunRepository {
-    pub(super) async fn do_abandon_materialization(&self, run_key: RunKey) -> Result<()> {
+    pub(super) async fn do_abandon_materialization(
+        &self,
+        run_key: RunKey,
+        fence: &WriteFence,
+    ) -> Result<()> {
         record_dsql_operation!(self, "abandon_materialization", None, {
             retry_on_conflict(|| async {
                 let mut permit = self.director.acquire(DbClass::Commit).await?;
+                let mut tx = permit.connection()?.begin().await?;
+                if let Some(lost) = Self::check_fence(&mut tx, fence, run_key).await? {
+                    tx.rollback().await?;
+                    return Err(lost.into());
+                }
                 // The update writes the record, which every transaction of the
                 // materialization reads `FOR UPDATE`: once it commits, none of
                 // them can commit a write after it.
@@ -144,8 +156,9 @@ impl DsqlRunRepository {
                 .bind(run_key.0)
                 .bind(BulkWritePhase::Purging.to_db_smallint())
                 .bind(BulkWritePhase::Materializing.to_db_smallint())
-                .execute(permit.connection()?)
+                .execute(&mut *tx)
                 .await?;
+                tx.commit().await?;
                 Ok(())
             })
             .await
@@ -153,7 +166,9 @@ impl DsqlRunRepository {
     }
 
     pub(super) async fn do_purge_run(&self, run_key: RunKey) -> Result<()> {
-        self.do_abandon_materialization(run_key).await?;
+        // A purge runs from any node, so its own switch is unfenced.
+        self.do_abandon_materialization(run_key, &WriteFence::Unfenced)
+            .await?;
         record_dsql_operation!(self, "purge_run", None, {
             // A run without a record has mutable state, or is already purged;
             // either way it isn't this purge's to touch.
@@ -305,6 +320,7 @@ impl DsqlRunRepository {
         fork_event_id: i64,
         successor_run_id: RunId,
         expected_current: Option<RunKey>,
+        fence: WriteFence,
     ) -> Result<()> {
         record_dsql_operation!(
             self,
@@ -351,6 +367,7 @@ impl DsqlRunRepository {
                     successor_state.workflow_id.0.as_bytes(),
                     self.shard_count,
                 );
+                fence.ensure_home(successor_shard)?;
 
                 // The copied history in batches DSQL can store. Its History
                 // Size is the sum of their encoded sizes, as for any run
@@ -385,7 +402,7 @@ impl DsqlRunRepository {
                     .collect::<Result<Vec<_>>>()?;
 
                 retry_on_conflict(|| {
-                    self.record_materialization(successor_run_key, successor_shard)
+                    self.record_materialization(successor_run_key, successor_shard, &fence)
                 })
                 .await?;
                 for page in pages(&costs, WriteBudget::TRANSACTION) {
@@ -396,6 +413,7 @@ impl DsqlRunRepository {
                             successor_shard,
                             successor_state.transition_seq,
                             page_items,
+                            &fence,
                         )
                     })
                     .await?;
@@ -409,6 +427,7 @@ impl DsqlRunRepository {
                         &state_data,
                         history_size,
                         expected_current,
+                        &fence,
                     )
                 })
                 .await
@@ -486,9 +505,14 @@ impl DsqlRunRepository {
         &self,
         run_key: RunKey,
         shard_id: ShardId,
+        fence: &WriteFence,
     ) -> Result<()> {
         let mut permit = self.director.acquire(DbClass::Commit).await?;
         let mut tx = permit.connection()?.begin().await?;
+        if let Some(lost) = Self::check_fence(&mut tx, fence, run_key).await? {
+            tx.rollback().await?;
+            return Err(lost.into());
+        }
         let existing = sqlx::query_as::<_, (i32,)>("SELECT 1 FROM workflow_hot WHERE run_key = $1")
             .bind(run_key.0)
             .fetch_optional(&mut *tx)
@@ -538,9 +562,16 @@ impl DsqlRunRepository {
         shard_id: ShardId,
         transition_seq: TransitionSeq,
         items: &[CopyItem<'_>],
+        fence: &WriteFence,
     ) -> Result<()> {
+        #[cfg(all(test, feature = "dsql-integration"))]
+        super::pause_point::reached(super::pause_point::PauseKey::Page(run_key)).await;
         let mut permit = self.director.acquire(DbClass::Commit).await?;
         let mut tx = permit.connection()?.begin().await?;
+        if let Some(lost) = Self::check_fence(&mut tx, fence, run_key).await? {
+            tx.rollback().await?;
+            return Err(lost.into());
+        }
         Self::ensure_materializing(&mut tx, run_key).await?;
         for item in items {
             match item {
@@ -585,9 +616,14 @@ impl DsqlRunRepository {
         state_data: &[u8],
         history_size: i64,
         expected_current: Option<RunKey>,
+        fence: &WriteFence,
     ) -> Result<()> {
         let mut permit = self.director.acquire(DbClass::Commit).await?;
         let mut tx = permit.connection()?.begin().await?;
+        if let Some(lost) = Self::check_fence(&mut tx, fence, run_key).await? {
+            tx.rollback().await?;
+            return Err(lost.into());
+        }
         Self::ensure_materializing(&mut tx, run_key).await?;
         // v1.31.0 moves the current pointer to a reset's run only while the
         // pointer names the run its reset updates

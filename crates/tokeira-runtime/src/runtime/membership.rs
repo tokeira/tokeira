@@ -59,11 +59,13 @@ where
             acquisition: recovery.acquisition.clone(),
             max_retries: self.config.max_occ_retries,
         };
-        let reconciliation = self
-            .shard_owner
-            .read()
-            .expect("shard owner lock poisoned")
-            .reconciliation_enabled();
+        let (reconciliation, fence) = {
+            let owner = self.shard_owner.read().expect("shard owner lock poisoned");
+            (
+                owner.reconciliation_enabled(),
+                owner.fence_at(shard_id, epoch),
+            )
+        };
         let shutdown = self.runtime_shutdown.cancellation_token();
         let _exclusive = tokio::select! {
             biased;
@@ -87,7 +89,7 @@ where
                 // materializations recorded on the shard and hand its records
                 // to the purger, checking the acquisition as the repair does.
                 crate::purge::recover_bulk_writes(shard_id, self.repo.as_ref(), &self.purger,
-                    reconciliation.then_some(&repair)).await?;
+                    reconciliation.then_some(&repair), &fence).await?;
                 anyhow::Ok(swept)
             } => result?,
         };
@@ -187,12 +189,19 @@ where
         }
 
         let recovery = self.begin_acquisition(shard_id, epoch);
-        let reconciliation = self
-            .shard_owner
-            .read()
-            .expect("shard owner lock poisoned")
-            .reconciliation_enabled();
-        if reconciliation && let Some(duration) = self.repo.bundle_lease_duration() {
+        // The local deadline: under controller-managed placement the owner
+        // stops admitting writes once its lease has expired by its own clock,
+        // whether or not dispatch reconciliation is on, so a takeover isn't
+        // starved by fenced writes that keep landing first
+        // (`bundle-lease-fence`).
+        let (deadline_tracked, fence) = {
+            let owner = self.shard_owner.read().expect("shard owner lock poisoned");
+            (
+                owner.reconciliation_enabled() || owner.fences_writes(),
+                owner.fence_at(shard_id, epoch),
+            )
+        };
+        if deadline_tracked && let Some(duration) = self.repo.bundle_lease_duration() {
             *recovery
                 .acquisition
                 .deadline
@@ -214,7 +223,7 @@ where
                 3,
                 cancel.clone(),
                 lost_tx,
-                reconciliation.then(|| recovery.acquisition.clone()),
+                deadline_tracked.then(|| recovery.acquisition.clone()),
             ));
         let tracking = self
             .wft_timeout_tracking
@@ -265,7 +274,7 @@ where
                 // materializations recorded on the shard and hand its records
                 // to the purger, checking the acquisition as the repair does.
                 crate::purge::recover_bulk_writes(shard_id, self.repo.as_ref(), &self.purger,
-                    reconciliation.then_some(&repair)).await?;
+                    reconciliation.then_some(&repair), &fence).await?;
                 anyhow::Ok(())
             } => { result?; }
         }
@@ -441,7 +450,7 @@ mod tests {
     use tokeira_proto::connect::tokeira::internal::controller::v1::{
         self as pb, controller_directive,
     };
-    use tokeira_storage::InMemoryStore;
+    use tokeira_storage::{InMemoryStore, WriteFence};
     use tokeira_types::{
         Memo, NodeEndpoint, RequestId, SearchAttributes, WorkflowId, WorkflowType,
     };
@@ -706,7 +715,7 @@ mod tests {
                     .unwrap()
                     .schedule_to_start_deadline = Some(deadline);
                 store
-                    .commit_transition(run_key, item, ShardEpoch::ZERO)
+                    .commit_transition(run_key, item, WriteFence::Unfenced)
                     .await
                     .unwrap();
                 let (runtime, _) = runtime_with_membership_client(store);

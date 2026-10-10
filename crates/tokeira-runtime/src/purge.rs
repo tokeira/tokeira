@@ -23,7 +23,7 @@ use std::{
 };
 
 use anyhow::Result;
-use tokeira_storage::{BulkWritePhase, RunRepository};
+use tokeira_storage::{BulkWritePhase, RunRepository, WriteFence};
 use tokeira_types::{RunKey, ShardId};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -184,11 +184,16 @@ where
 /// runs under. Each page and each switch first checks that it is still
 /// current, as the repair's transactions do, so a recovery a newer acquisition
 /// replaced stops before it switches a materialization that ownership began.
+///
+/// Each switch is fenced by `fence`, the lease of the acquisition the recovery
+/// runs under, so a recovery whose node has lost the shard switches nothing
+/// (`bundle-lease-fence`).
 pub(crate) async fn recover_bulk_writes<R>(
     shard_id: ShardId,
     repo: &R,
     purger: &RunPurger,
     repair: Option<&RepairAcquisition>,
+    fence: &WriteFence,
 ) -> Result<usize>
 where
     R: RunRepository + ?Sized,
@@ -207,7 +212,8 @@ where
                 if let Some(repair) = repair {
                     repair.validate()?;
                 }
-                repo.abandon_materialization(record.run_key).await?;
+                repo.abandon_materialization(record.run_key, fence.clone())
+                    .await?;
             }
             purger.enqueue(record.run_key);
         }

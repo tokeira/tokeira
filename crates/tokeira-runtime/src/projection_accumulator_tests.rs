@@ -3,6 +3,7 @@
 //! positional state, heartbeat extensions, images and every other durable map.
 
 use std::sync::Arc;
+use tokeira_storage::WriteFence;
 
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
@@ -18,7 +19,7 @@ use tokeira_storage::{
     memory::{RUN_STATE_EXTENSION_SECTION, SNAPSHOT_EXTENSION_MAGIC},
 };
 use tokeira_types::{
-    ExecutionRef, Payloads, RequestContext, RetryPolicy, RunId, RunKey, ShardEpoch, TransitionSeq,
+    ExecutionRef, Payloads, RequestContext, RetryPolicy, RunId, RunKey, TransitionSeq,
     WorkerIdentity,
 };
 
@@ -48,7 +49,7 @@ pub(crate) async fn commit_state(
                 events_numbered_at_close: 0,
                 growth_limits: None,
             },
-            ShardEpoch::ZERO,
+            WriteFence::Unfenced,
         )
         .await
         .unwrap();
@@ -203,7 +204,7 @@ async fn projection_accumulator_runtime_reset_commits_from_materialized_state() 
                 events_numbered_at_close: 0,
                 growth_limits: None,
             },
-            ShardEpoch::ZERO,
+            WriteFence::Unfenced,
         )
         .await
         .unwrap();

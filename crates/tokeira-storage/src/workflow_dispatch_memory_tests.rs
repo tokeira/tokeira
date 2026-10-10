@@ -79,7 +79,7 @@ async fn workflow_dispatch_queue_pages_span_execution_homes() {
         );
         homes.insert(home);
         store
-            .commit_transition(key, transition, ShardEpoch::ZERO)
+            .commit_transition(key, transition, WriteFence::Unfenced)
             .await
             .unwrap();
         let row = store.row(key).await.unwrap().unwrap();
@@ -119,10 +119,10 @@ async fn workflow_dispatch_digest_collision_advances_past_rejected_coordinates()
         queue_name: wanted.next_state.task_queue.clone(),
         routing: crate::WorkflowDispatchRouting::Live,
     };
-    super::projection_accumulator_tests::commit(&store, wanted, false, ShardEpoch::ZERO)
+    super::projection_accumulator_tests::commit(&store, wanted, false, WriteFence::Unfenced)
         .await
         .unwrap();
-    super::projection_accumulator_tests::commit(&store, collision, false, ShardEpoch::ZERO)
+    super::projection_accumulator_tests::commit(&store, collision, false, WriteFence::Unfenced)
         .await
         .unwrap();
     let state = store.inner.lock().await;
@@ -199,7 +199,7 @@ async fn repair_rejects_wrong_home_and_invalid_encoding_without_partial_changes(
     let transition = super::projection_accumulator_tests::fresh_transition(RunKey::new());
     let key = transition.next_state.run_key;
     store
-        .commit_transition(key, transition, ShardEpoch::ZERO)
+        .commit_transition(key, transition, WriteFence::Unfenced)
         .await
         .unwrap();
     let row = store.row(key).await.unwrap();

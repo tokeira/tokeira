@@ -1,0 +1,4 @@
+kind: fixed
+body: A node that has lost an execution home's lease can no longer commit writes for that home; every write of a run now checks the lease in its own transaction.
+custom:
+    Slice: 8058df2d-dba2-4259-a594-e35febccfb5c

@@ -1002,7 +1002,7 @@ where
                 }
             }
 
-            let (bundle, epoch) = {
+            let (bundle, fence) = {
                 let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
                 let bundle = execution_home_bundle(
                     state.namespace_id.0.as_bytes(),
@@ -1015,12 +1015,9 @@ where
                 if self.runtime_drain.is_draining() || !owner.is_active(bundle) {
                     return Err(NotShardOwner::local(bundle, local_epoch).into());
                 }
-                let commit_epoch = if self.config.controller_managed_placement {
-                    local_epoch
-                } else {
-                    ShardEpoch::ZERO
-                };
-                (bundle, commit_epoch)
+                // The deletion's first transaction is fenced by the home's
+                // lease, as a lane's commit is (`bundle-lease-fence`).
+                (bundle, owner.fence_at(bundle, local_epoch))
             };
 
             // The first transaction removes the run's workflow dispatch row,
@@ -1037,6 +1034,7 @@ where
             // (`service/history/api/deleteworkflow/api.go:86-98 @ v1.31.0`).
             let repo = self.repo.clone();
             let purger = self.purger.clone();
+            let shard_owner = self.shard_owner.clone();
             let purge_inline = request.purge_inline;
             let deletion = DeleteRunRequest {
                 expected_seq: state.transition_seq,
@@ -1044,8 +1042,9 @@ where
             };
             let outcome = tokio::spawn(async move {
                 let outcome = repo
-                    .delete_run_for_bundle(run_key, bundle, deletion, epoch)
-                    .await;
+                    .delete_run_for_bundle(run_key, bundle, deletion, fence)
+                    .await
+                    .map_err(|error| crate::errors::lease_loss(error, &shard_owner));
                 // The purge writes none of the rows a repair reconciles, so it
                 // doesn't hold a recovery of the home up.
                 drop(write);
@@ -1897,6 +1896,7 @@ fn patched_retry_policy(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use tokeira_storage::WriteFence;
 
     use super::*;
     use proptest::prelude::*;
@@ -2176,7 +2176,7 @@ mod tests {
                     expected_seq: state.transition_seq,
                     deleted_at: OffsetDateTime::UNIX_EPOCH + Duration::seconds(2),
                 },
-                ShardEpoch::ZERO,
+                WriteFence::Unfenced,
             )
             .await
             .unwrap();
@@ -2202,9 +2202,15 @@ mod tests {
         // The record commits; the copy's first transaction fails, as a node
         // stopping there leaves it.
         repo.fail_bulk_write_after(1).await;
-        repo.materialize_reset_successor(base, 2, successor_run_id, Some(base))
-            .await
-            .unwrap_err();
+        repo.materialize_reset_successor(
+            base,
+            2,
+            successor_run_id,
+            Some(base),
+            WriteFence::Unfenced,
+        )
+        .await
+        .unwrap_err();
         let records = repo
             .list_run_bulk_writes(ShardId(0), None, 10)
             .await
@@ -2217,9 +2223,15 @@ mod tests {
         // it switches the materialization before the shard could admit a
         // command, whether or not a purge has run.
         let (recovered, _queue) = crate::purge::RunPurger::new();
-        let found = crate::purge::recover_bulk_writes(ShardId(0), repo.as_ref(), &recovered, None)
-            .await
-            .unwrap();
+        let found = crate::purge::recover_bulk_writes(
+            ShardId(0),
+            repo.as_ref(),
+            &recovered,
+            None,
+            &WriteFence::Unfenced,
+        )
+        .await
+        .unwrap();
         assert_eq!(found, 2);
         assert!(
             repo.list_run_bulk_writes(ShardId(0), None, 10)

@@ -3345,6 +3345,7 @@ fn decode_page_token(token: &str) -> Option<DeploymentName> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use tokeira_storage::WriteFence;
 
     #[cfg(feature = "conformance")]
     use std::time::Duration as StdDuration;
@@ -3363,7 +3364,7 @@ mod tests {
     };
     use tokeira_types::{
         Memo, NamespaceId, Payloads, RequestContext, RequestId, RunId, RunKey, SearchAttributes,
-        ShardEpoch, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
+        TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
     };
     use tokio::task::JoinSet;
 
@@ -3876,7 +3877,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store
-                .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                .commit_transition(run_key, transition, WriteFence::Unfenced)
                 .await
                 .unwrap(),
             CommitResult::Applied { .. }
@@ -3904,7 +3905,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store
-                .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                .commit_transition(run_key, transition, WriteFence::Unfenced)
                 .await
                 .unwrap(),
             CommitResult::Applied { .. }

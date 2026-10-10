@@ -60,6 +60,8 @@ toml.workspace = true
 metrics-util.workspace = true
 proptest = "1"
 toml.workspace = true
+# Lease tests advance a paused tokio clock.
+tokio = { workspace = true, features = ["test-util"] }
 tokeira-types = { path = "../tokeira-types", features = ["test-support"] }
 tracing-subscriber.workspace = true
 uuid.workspace = true

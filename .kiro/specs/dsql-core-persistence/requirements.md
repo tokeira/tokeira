@@ -228,6 +228,13 @@ The `RunRepository` trait methods assigned to Feature 2 in the umbrella spec aud
 4. THE epoch check SHALL be performed within the same transaction as the state mutation to prevent TOCTOU races.
 5. THE DsqlRunRepository SHALL derive the shard assignment from `RunKey` using the same deterministic mapping as the runtime and in-memory store.
 
+> Since [bundle-lease-fence](../bundle-lease-fence/design.md), the epoch check is that spec's fence
+> read of the run's execution home: `SELECT owner, epoch FROM shard_lease WHERE shard_id = $1 FOR
+> KEY SHARE`, comparing the owner as well as the epoch, as the transaction's first statement. A
+> caller passes a `WriteFence` in place of the bare epoch, `WriteFence::Unfenced` in place of
+> `ShardEpoch::ZERO`, and a lost fence fails with `LeaseFenceLost` rather than
+> `CommitResult::Conflict`, so no lane retries it.
+
 ### Requirement 14: Transition Audit Log
 
 **User Story:** As a Tokeira developer, I want `read_transition_audit` to return a debug view of persisted transitions, so that semantic tests can verify that history and derived ops are all persisted together.

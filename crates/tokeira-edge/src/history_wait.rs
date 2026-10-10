@@ -78,6 +78,14 @@ impl<R> RunRepository for HistoryNotifyingRepository<R>
 where
     R: RunRepository + Send + Sync + 'static,
 {
+    fn placement_ready(&self) -> bool {
+        self.inner.placement_ready()
+    }
+
+    async fn prepare_placement_page(&self) -> Result<tokeira_storage::PlacementPage> {
+        self.inner.prepare_placement_page().await
+    }
+
     async fn resolve_execution(&self, execution: &ExecutionRef) -> Result<Option<RunKey>> {
         self.inner.resolve_execution(execution).await
     }

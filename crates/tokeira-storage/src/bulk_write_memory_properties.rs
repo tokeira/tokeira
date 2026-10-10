@@ -107,7 +107,12 @@ async fn closed_run(
     for index in 0..timers {
         let timer_id = format!("timer-{index}");
         inner.timer_bucket.insert(
-            (run_key, timer_id.clone()),
+            TimerPosition {
+                run_key,
+                timer_id: timer_id.clone(),
+                shard: shard_uuid(ShardId(0)),
+                fire_at: state.started_at,
+            },
             tokeira_kernel::TimerState {
                 timer_id,
                 started_event_id: 1,
@@ -544,7 +549,7 @@ proptest! {
             };
             let fire_at = OffsetDateTime::UNIX_EPOCH;
             store.inner.lock().await.timer_bucket.insert(
-                (run_key, "due".into()),
+                TimerPosition { run_key, timer_id: "due".into(), shard: shard_uuid(ShardId(0)), fire_at },
                 tokeira_kernel::TimerState {
                     timer_id: "due".into(),
                     started_event_id: 1,
@@ -555,7 +560,7 @@ proptest! {
             let deleted = store.delete_due_timer_if_matches(&due, reason).await.unwrap();
             prop_assert_eq!(deleted, case >= 2);
             prop_assert_eq!(
-                store.inner.lock().await.timer_bucket.contains_key(&(run_key, "due".into())),
+                store.inner.lock().await.timer_bucket.keys().any(|key| key.run_key == run_key && key.timer_id == "due"),
                 case < 2
             );
             Ok(())

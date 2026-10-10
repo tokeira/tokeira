@@ -34,15 +34,14 @@ use tokeira_proto::{
     conversions::common::failure_to_payload, public::temporal::api::failure::v1 as failure_proto,
 };
 use tokeira_storage::{CommitResult, RunRepository, metrics as storage_metrics};
-use tokeira_types::{ExecutionStatus, RunKey, ShardEpoch, ShardId, execution_home_bundle};
+use tokeira_types::{
+    ExecutionStatus, NamespaceId, RunKey, ShardEpoch, ShardId, WorkflowId, execution_home_bundle,
+};
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::{
-    UpdateRegistry, UpdateResolution, metrics as runtime_metrics,
-    shard::{ShardOwner, shard_for},
-};
+use crate::{UpdateRegistry, UpdateResolution, metrics as runtime_metrics, shard::ShardOwner};
 
 /// Configuration knobs for a single lane executor.
 ///
@@ -117,6 +116,13 @@ pub trait DispatchPublisher: Send + Sync {
 pub struct LaneHandle {
     lane_id: usize,
     tx: mpsc::Sender<LaneMessage>,
+    identity_tx: mpsc::Sender<IdentityRequest>,
+}
+
+#[derive(Debug)]
+struct IdentityRequest {
+    run_key: RunKey,
+    reply: oneshot::Sender<Result<(NamespaceId, WorkflowId)>>,
 }
 
 impl LaneHandle {
@@ -132,6 +138,19 @@ impl LaneHandle {
             .send(LaneMessage::new(self.lane_id, run_key, command, reply_tx))
             .await?;
         reply_rx.await?
+    }
+
+    /// Resolve routing identity from the lane's existing cache. A cold lookup
+    /// installs the ordinary load result so the following command reuses it.
+    pub(crate) async fn execution_identity(
+        &self,
+        run_key: RunKey,
+    ) -> Result<(NamespaceId, WorkflowId)> {
+        let (reply, received) = oneshot::channel();
+        self.identity_tx
+            .send(IdentityRequest { run_key, reply })
+            .await?;
+        received.await?
     }
 
     /// Current number of queued lane messages waiting behind the bounded channel.
@@ -202,6 +221,11 @@ impl LaneCache {
     }
 
     fn get(&mut self, run_key: RunKey) -> Option<LoadedRun> {
+        self.get_with(run_key, Clone::clone)
+    }
+
+    // Admission needs only identity; it must not copy the whole cached state.
+    fn get_with<T>(&mut self, run_key: RunKey, extract: impl FnOnce(&LoadedRun) -> T) -> Option<T> {
         let now = std::time::Instant::now();
         let entry = self.entries.get_mut(&run_key)?;
         if now.duration_since(entry.last_accessed) > self.idle_timeout {
@@ -209,7 +233,7 @@ impl LaneCache {
             return None;
         }
         entry.last_accessed = now;
-        Some(entry.loaded.clone())
+        Some(extract(&entry.loaded))
     }
 
     fn insert(&mut self, run_key: RunKey, loaded: LoadedRun) {
@@ -242,6 +266,38 @@ impl LaneCache {
             self.entries.remove(&run_key);
         }
     }
+}
+
+fn loaded_execution_identity(loaded: &LoadedRun) -> Result<(NamespaceId, WorkflowId)> {
+    match loaded {
+        LoadedRun::Existing(state) => Ok((state.namespace_id, state.workflow_id.clone())),
+        LoadedRun::Absent => Err(anyhow::Error::new(KernelRejected(
+            tokeira_kernel::Reject::MissingRun,
+        ))),
+    }
+}
+
+async fn resolve_identity_request<R: RunRepository>(
+    repo: &R,
+    cache: &mut LaneCache,
+    request: IdentityRequest,
+) {
+    if request.reply.is_closed() {
+        return;
+    }
+    let result = async {
+        match cache.get_with(request.run_key, loaded_execution_identity) {
+            Some(identity) => identity,
+            None => {
+                let loaded = repo.load_run(request.run_key).await?;
+                let identity = loaded_execution_identity(&loaded);
+                cache.insert(request.run_key, loaded);
+                identity
+            }
+        }
+    }
+    .await;
+    let _ = request.reply.send(result);
 }
 
 /// Spawn a new lane executor as a background Tokio task.
@@ -304,6 +360,7 @@ where
     P: DispatchPublisher + Clone + 'static,
 {
     let (tx, mut rx) = mpsc::channel::<LaneMessage>(1024);
+    let (identity_tx, mut identity_rx) = mpsc::channel::<IdentityRequest>(1024);
     tokio::spawn(async move {
         // One lane-local cache shared across activations: a run's loaded state
         // survives between commands so repeated work on the same run avoids a
@@ -318,13 +375,26 @@ where
         // slot that only this task can free.
         let mut carry_over: Option<LaneMessage> = None;
         loop {
+            // A perpetually nonempty command queue can retain a carry-over
+            // forever. Serve a bounded batch of immutable identity reads between
+            // activations so admission cannot starve, without reordering writes.
+            for _ in 0..config.max_drain_per_activation.max(1) {
+                let Ok(request) = identity_rx.try_recv() else {
+                    break;
+                };
+                resolve_identity_request(&repo, &mut cache, request).await;
+            }
             let message = match carry_over.take() {
                 Some(message) => message,
-                None => match rx.recv().await {
-                    Some(message) => message,
-                    // Every handle is dropped and the channel is empty. The
-                    // lane holds no sender of its own, so it ends here.
-                    None => break,
+                None => tokio::select! {
+                    message = rx.recv() => match message {
+                        Some(message) => message,
+                        None => break,
+                    },
+                    Some(request) = identity_rx.recv() => {
+                        resolve_identity_request(&repo, &mut cache, request).await;
+                        continue;
+                    }
                 },
             };
             carry_over = run_activation_with_cache(
@@ -354,7 +424,11 @@ where
             );
         }
     });
-    LaneHandle { lane_id, tx }
+    LaneHandle {
+        lane_id,
+        tx,
+        identity_tx,
+    }
 }
 
 #[cfg(test)]
@@ -440,11 +514,7 @@ where
         let command_type = command_type_name(&message.command);
         runtime_metrics::record_lane_queue_wait(message.enqueued_at.elapsed());
         let processing_start = std::time::Instant::now();
-        let shard_id = {
-            let owner = shard_owner.read().expect("shard_owner lock poisoned");
-            shard_for(message.run_key, owner.shard_count())
-        };
-        let processing_span = lane_processing_span(&message, command_type, shard_id);
+        let processing_span = lane_processing_span(&message, command_type);
         let mut write_admission = None;
         let result = handle_message_with_cache(
             kernel,
@@ -504,21 +574,23 @@ where
         let stop_draining = result.is_err() || breach.is_some();
         let reply = match result {
             Ok((commit_result, mut dispatch_ops, history_events)) => {
-                // Every post-commit index uses stable execution ownership; the
-                // run hash above only identifies the processing span.
+                // Only an applied transition has post-commit effects. Derive
+                // their home from that state, with no run-hash fallback for a
+                // duplicate or conflict.
                 let shard_id = match &commit_result {
-                    CommitResult::Applied { new_state } => tokeira_types::execution_home_bundle(
+                    CommitResult::Applied { new_state } => Some(execution_home_bundle(
                         new_state.namespace_id.0.as_bytes(),
                         new_state.workflow_id.0.as_bytes(),
                         shard_owner
                             .read()
                             .expect("shard_owner lock poisoned")
                             .shard_count(),
-                    ),
-                    _ => shard_id,
+                    )),
+                    _ => None,
                 };
                 let mut reset_materialization_error = None;
                 if let CommitResult::Applied { new_state } = &commit_result {
+                    let shard_id = shard_id.expect("applied transition has an execution home");
                     if history_events.iter().any(|event| {
                         matches!(
                             event.kind,
@@ -1037,6 +1109,7 @@ where
                     dispatch_ops.retain(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. }));
                 }
                 if !dispatch_ops.is_empty()
+                    && let Some(shard_id) = shard_id
                     && let Err(error) = publisher
                         .publish(message.run_key, shard_id, &dispatch_ops)
                         .instrument(processing_span.clone())
@@ -1051,6 +1124,7 @@ where
                     Err(error)
                 } else {
                     if let CommitResult::Applied { new_state } = &commit_result {
+                        let shard_id = shard_id.expect("applied transition has an execution home");
                         if let Command::NexusOperationResolved(request) = &committed_command
                             && matches!(
                                 request.resolution,
@@ -1530,11 +1604,7 @@ where
     carry_over
 }
 
-fn lane_processing_span(
-    message: &LaneMessage,
-    command_type: &'static str,
-    shard_id: tokeira_types::ShardId,
-) -> tracing::Span {
+fn lane_processing_span(message: &LaneMessage, command_type: &'static str) -> tracing::Span {
     let origin_trace_id = message
         .trace_context
         .as_ref()
@@ -1548,8 +1618,8 @@ fn lane_processing_span(
     let span = tracing::info_span!(
         "lane.process",
         tokeira.lane_id = message.lane_id,
-        tokeira.shard_id = shard_id.0,
-        tokeira.bundle_id = shard_id.0,
+        tokeira.shard_id = tracing::field::Empty,
+        tokeira.bundle_id = tracing::field::Empty,
         tokeira.run_key = %message.run_key.0,
         tokeira.command_type = command_type,
         tokeira.origin_trace_id = origin_trace_id.as_str(),
@@ -1710,6 +1780,11 @@ where
                 transition.next_state.workflow_id.0.as_bytes(),
                 owner.shard_count(),
             );
+            // The processing span starts before identity is available. Record
+            // the actual execution home once, using this already-loaded state.
+            let processing_span = tracing::Span::current();
+            processing_span.record("tokeira.shard_id", bundle_id.0);
+            processing_span.record("tokeira.bundle_id", bundle_id.0);
             // Fast local reject if we plainly don't hold the bundle. This is an
             // optimization, not the safety boundary: a stale owner that still
             // believes it owns the bundle is fenced by the epoch carried into
@@ -3499,7 +3574,12 @@ mod tests {
     #[test]
     fn queued_depth_reflects_bounded_channel_occupancy() {
         let (tx, _rx) = mpsc::channel(4);
-        let handle = LaneHandle { lane_id: 0, tx };
+        let (identity_tx, _) = mpsc::channel(1);
+        let handle = LaneHandle {
+            lane_id: 0,
+            tx,
+            identity_tx,
+        };
         assert_eq!(handle.queued_depth(), 0);
 
         let (reply_tx, _reply_rx) = oneshot::channel();
@@ -3561,7 +3641,7 @@ mod tests {
                 let expected_trace_id = context.trace_id_hex();
                 let expected_span_id = context.span_id_hex();
                 let _processing_span =
-                    lane_processing_span(&message, command_type_name(&message.command), ShardId(3));
+                    lane_processing_span(&message, command_type_name(&message.command));
                 (message, expected_trace_id, expected_span_id)
             });
 
@@ -3580,7 +3660,8 @@ mod tests {
             Some(&expected_span_id)
         );
         assert_eq!(fields.get("tokeira.lane_id"), Some(&"7".to_string()));
-        assert_eq!(fields.get("tokeira.shard_id"), Some(&"3".to_string()));
+        assert!(!fields.contains_key("tokeira.shard_id"));
+        assert!(!fields.contains_key("tokeira.bundle_id"));
         assert_eq!(
             fields.get("tokeira.command_type"),
             Some(&"Signal".to_string())
@@ -3598,14 +3679,26 @@ mod tests {
         let dispatch = tracing::Dispatch::new(subscriber);
         let _guard = tracing::dispatcher::set_default(&dispatch);
 
-        let run_key = RunKey::new();
-        let state = sample_state(run_key);
+        let mut state = sample_state(RunKey::new());
+        let home = execution_home_bundle(
+            state.namespace_id.0.as_bytes(),
+            state.workflow_id.0.as_bytes(),
+            8,
+        );
+        state.run_key = RunKey(uuid::Uuid::from_u128(u128::from((home.0 + 1) % 8)));
+        let run_key = state.run_key;
         let repo = MockRepo::new(
             LoadedRun::Existing(state.clone()),
             vec![CommitBehavior::Applied],
         );
         let kernel = MockKernel::new(SmallVec::new());
-        let shard_owner = test_shard_owner();
+        let mut owner = ShardOwner::new(8);
+        owner.record_acquired(home, ShardEpoch(17));
+        owner.mark_active(home);
+        let shard_owner = Arc::new(RwLock::new(owner));
+        let (reply, _) = oneshot::channel();
+        let message = LaneMessage::new(0, run_key, sample_command("span-attrs"), reply);
+        let processing_span = lane_processing_span(&message, command_type_name(&message.command));
 
         let result = handle_message(
             &kernel,
@@ -3616,11 +3709,24 @@ mod tests {
             &LaneConfig::default(),
             5,
         )
+        .instrument(processing_span)
         .await
         .unwrap();
 
         assert!(matches!(result.0, CommitResult::Applied { .. }));
         let captured = capture.0.lock().expect("0 lock poisoned");
+        let processing = captured
+            .iter()
+            .find(|(name, _)| name == "lane.process")
+            .unwrap();
+        assert_eq!(
+            processing.1.get("tokeira.shard_id"),
+            Some(&home.0.to_string())
+        );
+        assert_eq!(
+            processing.1.get("tokeira.bundle_id"),
+            Some(&home.0.to_string())
+        );
         let kernel_span = captured
             .iter()
             .find(|(name, _)| name == "kernel.transition")

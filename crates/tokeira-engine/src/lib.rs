@@ -3148,6 +3148,9 @@ where
     V: VisibilityStore + Clone + 'static,
     F: Fn() -> S + Clone + Send + Sync + 'static,
 {
+    // Construction spawns scanners and may seed an Active home. No runtime
+    // may exist until every physical legacy row has reached its execution home.
+    tokeira_storage::prepare_execution_placement(run_repository.as_ref()).await?;
     // Freeze declarations before constructing the operator wrapper, so later
     // namespaces receive the same set as startup. Stateful CHASM admission stays
     // in its existing block below, shared by both storage paths.

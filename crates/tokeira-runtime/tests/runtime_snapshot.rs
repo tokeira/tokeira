@@ -291,6 +291,7 @@ async fn assert_recovery_equivalence(
 ) -> Result<()> {
     let snapshot = store.snapshot().await?;
     let restored = Arc::new(InMemoryStore::from_snapshot(&snapshot)?);
+    tokeira_storage::prepare_execution_placement(restored.as_ref()).await?;
 
     let original_runs = store.list_runs_for_namespace(namespace_id).await?;
     let restored_runs = restored.list_runs_for_namespace(namespace_id).await?;
@@ -368,6 +369,7 @@ async fn past_due_start_delay_fires_immediately_after_restore() -> Result<()> {
 
     let snapshot = store.snapshot().await?;
     let restored = Arc::new(InMemoryStore::from_snapshot(&snapshot)?);
+    tokeira_storage::prepare_execution_placement(restored.as_ref()).await?;
     let restarted = recovering_runtime(restored);
     restarted.acquire_shard(ShardId(0)).await?;
 
@@ -445,6 +447,7 @@ async fn scheduled_activity_recovers_identically_from_restored_store() -> Result
 
     let snapshot = store.snapshot().await?;
     let restored = Arc::new(InMemoryStore::from_snapshot(&snapshot)?);
+    tokeira_storage::prepare_execution_placement(restored.as_ref()).await?;
 
     let mut recovered = Vec::new();
     for candidate in [store, restored] {

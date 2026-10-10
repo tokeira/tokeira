@@ -60,6 +60,7 @@ async fn workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs(
         "live fixture commit did not apply"
     );
     let homes: Arc<dyn QueueHomeProvider> = Arc::new(Homes(Mutex::new(home(0))));
+    tokeira_storage::prepare_execution_placement(repo.as_ref()).await?;
     let runtime = Arc::new(TokeiraRuntime::new_with_delivery(
         repo.clone(),
         1,

@@ -17,14 +17,14 @@
 //!   any owned state (even mid-sweep/drain) as long as ownership is recorded,
 //!   so in-flight work can finish a clean handoff.
 //!
-//! These are runtime-local *admission* checks, not the authority: the durable
-//! lease fence at commit time is what actually rejects a superseded owner.
-//! Checking here just avoids handing doomed work to a lane and produces a clean
-//! `NotShardOwner` for the edge to map.
+//! These runtime-local admission checks reject work whose execution home is
+//! unavailable and produce `NotShardOwner` for the edge. Storage retains its
+//! existing epoch checks; transaction-local competing-owner fencing is separate.
 use super::*;
 use tokeira_observability::{
     ErrorBiasedSamplingReason, NotShardOwnerOperationLabel, mark_error_biased_sample,
 };
+use tokeira_types::WorkflowId;
 
 impl<R> TokeiraRuntime<R>
 where
@@ -43,7 +43,7 @@ where
     /// the edge maps to the retryable not-owner status. Routing is by run key,
     /// so the same run always serializes on the same lane.
     pub async fn submit(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
-        let shard_id = self.shard_id_for(run_key).await;
+        let shard_id = self.command_home(run_key, &command).await?;
         // Drain check precedes the active check on purpose: a draining shard is
         // still Active, so without this an external request would slip through
         // and reopen work the drain is trying to quiesce.
@@ -91,7 +91,7 @@ where
         run_key: RunKey,
         command: Command,
     ) -> Result<CommitResult> {
-        let shard_id = self.shard_id_for(run_key).await;
+        let shard_id = self.command_home(run_key, &command).await?;
         {
             let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
             if owner.epoch_of(shard_id).is_none() {
@@ -188,7 +188,7 @@ where
         }
     }
 
-    /// The current shard epoch for `run_key`, requiring the shard to be
+    /// The epoch of the loaded state's execution home, requiring it to be
     /// `Active`.
     ///
     /// Used when minting task tokens for *newly started* work: a token must
@@ -197,8 +197,8 @@ where
     /// shard is not actively owned. Contrast
     /// [`shard_epoch_for_completion`](Self::shard_epoch_for_completion), which
     /// is laxer because it validates *already-issued* tokens.
-    pub(super) async fn current_shard_epoch(&self, run_key: RunKey) -> Result<ShardEpoch> {
-        let shard_id = self.shard_id_for(run_key).await;
+    pub(super) async fn current_shard_epoch(&self, state: &WorkflowState) -> Result<ShardEpoch> {
+        let shard_id = self.execution_home(state);
         let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
         owner.owns(shard_id).ok_or_else(|| {
             runtime_metrics::record_not_shard_owner(NotShardOwnerOperationLabel::CurrentShardEpoch);
@@ -211,7 +211,7 @@ where
         })
     }
 
-    /// The current shard epoch for `run_key`, accepting any owned state.
+    /// The epoch of the loaded state's execution home, accepting any owned state.
     ///
     /// Used to validate completions of work that was already started: it reads
     /// the epoch via `epoch_of`, which still returns a value while the shard is
@@ -219,8 +219,15 @@ where
     /// began draining must still be able to report its result during the drain
     /// window, so completion validation must not require `Active`. Errors with
     /// [`NotShardOwner`] only when the shard is not owned at all.
-    pub(super) async fn shard_epoch_for_completion(&self, run_key: RunKey) -> Result<ShardEpoch> {
-        let shard_id = self.shard_id_for(run_key).await;
+    pub(super) async fn shard_epoch_for_completion(
+        &self,
+        state: &WorkflowState,
+    ) -> Result<ShardEpoch> {
+        self.epoch_for_completion_home(self.execution_home(state))
+    }
+
+    /// Validate an already-resolved home without loading the run again.
+    pub(super) fn epoch_for_completion_home(&self, shard_id: ShardId) -> Result<ShardEpoch> {
         let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
         owner.epoch_of(shard_id).ok_or_else(|| {
             runtime_metrics::record_not_shard_owner(
@@ -231,18 +238,42 @@ where
         })
     }
 
-    /// Map a run to its shard using the current live shard count.
-    ///
-    /// The count is read from the shard owner on every call rather than cached,
-    /// because shard topology can change (rebalancing) and a stale count would
-    /// route a run to the wrong shard. The mapping itself is the pure
-    /// [`shard_for`] function.
-    pub(super) async fn shard_id_for(&self, run_key: RunKey) -> ShardId {
-        let shard_count = self
-            .shard_owner
-            .read()
-            .expect("shard_owner lock poisoned")
-            .shard_count();
-        shard_for(run_key, shard_count)
+    /// Stable execution identity, never the run hash used for local lane choice.
+    pub(super) fn execution_home(&self, state: &WorkflowState) -> ShardId {
+        self.home_for_identity(state.namespace_id, &state.workflow_id)
+    }
+
+    fn home_for_identity(&self, namespace_id: NamespaceId, workflow_id: &WorkflowId) -> ShardId {
+        tokeira_types::execution_home_bundle(
+            namespace_id.0.as_bytes(),
+            workflow_id.0.as_bytes(),
+            self.shard_owner
+                .read()
+                .expect("shard_owner lock poisoned")
+                .shard_count(),
+        )
+    }
+
+    async fn command_home(&self, run_key: RunKey, command: &Command) -> Result<ShardId> {
+        // New executions have no stored identity. Every other command shares
+        // the lane's ordinary loaded state instead of reading a second copy.
+        match command {
+            Command::Start(start) => {
+                Ok(self.home_for_identity(start.namespace_id, &start.workflow_id))
+            }
+            Command::StartAndUpdate(request) => {
+                Ok(self.home_for_identity(request.start.namespace_id, &request.start.workflow_id))
+            }
+            Command::SignalWithStart(request) => {
+                Ok(self.home_for_identity(request.namespace_id, &request.workflow_id))
+            }
+            _ => self.shard_id_for(run_key).await,
+        }
+    }
+
+    /// Resolve identity through the lane's cache so routing shares its cold load.
+    pub(super) async fn shard_id_for(&self, run_key: RunKey) -> Result<ShardId> {
+        let (namespace, workflow) = self.pick_lane(run_key).execution_identity(run_key).await?;
+        Ok(self.home_for_identity(namespace, &workflow))
     }
 }

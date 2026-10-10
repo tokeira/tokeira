@@ -52,6 +52,7 @@ point them at a database holding application data.
 | Storage `workflow_dispatch_live_repair_decode_and_encoding_failures_preserve_authority` | 1 | Wrong-home, corrupt hot bytes and invalid sequence encoding abort repair without partial changes; `dsql-integration`, URL gate only |
 | Runtime `workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs` | 1 | Real lease acquisition, interrupted recovery and rejected old-generation installs in all recovery trackers; runtime `dsql-integration`, URL gate only; run after storage schema bootstrap |
 | Storage `workflow_dispatch_live_query_plans` | 1 | Before/after queue Live/Exact and actual home page SQL, including full traversal of deep equal-time pages, with 16,384 seeded rows; set `TOKEIRA_WORKFLOW_DISPATCH_PLAN_OUTPUT` to save plans and selectivity; `dsql-integration`, URL gate only |
+| Storage `placement_live_` | 4 | Stopped-cluster hot/timer relocation, concurrent starters and late-page exclusion, raw legacy-encoded lease refusal, corruption diagnostics, reset preservation, duplicates/orphans, exact joined continuation plans and screening latency; `dsql-integration`, URL gate only |
 | Storage `dsql_bulk_` (`bulk_write_tests`) | 10 | The paged bulk writes: spills of more than 3,000 rows or 10 MiB, the deletion of a run owning more than 3,000 rows, resets whose copied history is over 1 MiB or 10 MiB or whose successor holds 3,500 timers, a reset of a closed workflow, a start between a reset's commit and its materialization, a purge resumed by two purges at once, and an abandoned materialization refusing its open transaction; `dsql-integration`, URL gate only |
 | Storage `dsql_transaction_limits` | 6 | DSQL's transaction limits, apart from the bulk writes' budgets: 3,000 rows, deleted rows included and rows read `FOR UPDATE` not; 9 MiB of values but not 10, deleted rows not counted; 1 MiB a value; `dsql-integration`, URL gate only |
 
@@ -83,6 +84,17 @@ ephemeral cluster. The generated transaction suite also runs for several minutes
 
 ```bash
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_)'
+```
+
+The placement suite uses the same gate and migrated database. Its screening
+fixture inserts 12,288 hot rows and timers, explains the exact first/deep joined
+page SQL, and measures the unchanged placement pass. Set
+`TOKEIRA_PLACEMENT_REPORT` to a local output path to retain the plans and the
+explicitly labelled extrapolation. Test-only marker resets require a disposable
+database with every other writer stopped.
+
+```bash
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(placement_live_)'
 ```
 
 The runtime acquisition check reuses the migrated database from a preceding

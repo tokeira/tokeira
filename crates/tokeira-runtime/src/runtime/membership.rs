@@ -539,10 +539,12 @@ mod tests {
             .owns(ShardId(0))
             .expect("directive takeover must finish in Active");
         let request = start_request();
-        let run_key = request.run_key;
         let result = runtime.start_workflow(request).await?;
         assert!(matches!(result, CommitResult::Applied { .. }));
-        assert_eq!(runtime.current_shard_epoch(run_key).await?, epoch);
+        let CommitResult::Applied { new_state } = result else {
+            unreachable!()
+        };
+        assert_eq!(runtime.current_shard_epoch(&new_state).await?, epoch);
         Ok(())
     }
 

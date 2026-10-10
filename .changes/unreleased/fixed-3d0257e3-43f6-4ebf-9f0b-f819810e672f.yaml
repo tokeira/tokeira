@@ -1,0 +1,4 @@
+kind: fixed
+body: Workflow admission and task-token epochs now use execution homes, and startup repairs legacy reset placement before serving.
+custom:
+    Slice: 3d0257e3-43f6-4ebf-9f0b-f819810e672f

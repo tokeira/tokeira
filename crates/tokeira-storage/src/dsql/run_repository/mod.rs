@@ -88,6 +88,9 @@ mod delete;
 mod dispatch;
 mod leases;
 mod load;
+mod placement;
+#[cfg(all(test, feature = "dsql-integration"))]
+mod placement_tests;
 mod timers;
 mod visibility;
 mod workflow_dispatch;
@@ -114,6 +117,7 @@ pub struct DsqlRunRepository {
     /// Production uses `DsqlConnectionDirector`; tests use a fake acquirer to
     /// prove routing and zero-limit behavior without opening SQL connections.
     director: Arc<dyn DsqlConnectionAcquirer>,
+    placement_ready: std::sync::atomic::AtomicBool,
     /// Non-zero runtime shard count used to map run keys to shard ownership.
     shard_count: u32,
     /// Non-zero projection partition count used when writing projection logs.
@@ -143,6 +147,7 @@ impl DsqlRunRepository {
             bail!("lease_duration must be positive");
         }
         Ok(Self {
+            placement_ready: std::sync::atomic::AtomicBool::new(false),
             director: director as Arc<dyn DsqlConnectionAcquirer>,
             shard_count,
             projection_partition_count,
@@ -169,6 +174,7 @@ impl DsqlRunRepository {
             bail!("lease_duration must be positive");
         }
         Ok(Self {
+            placement_ready: std::sync::atomic::AtomicBool::new(false),
             director,
             shard_count,
             projection_partition_count,
@@ -443,6 +449,15 @@ fn classify_connection_error(error: &anyhow::Error) -> Option<&'static str> {
 
 #[async_trait]
 impl RunRepository for DsqlRunRepository {
+    fn placement_ready(&self) -> bool {
+        self.placement_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    async fn prepare_placement_page(&self) -> Result<crate::PlacementPage> {
+        self.do_prepare_placement_page().await
+    }
+
     async fn resolve_execution(&self, execution: &ExecutionRef) -> Result<Option<RunKey>> {
         self.do_resolve_execution(execution).await
     }

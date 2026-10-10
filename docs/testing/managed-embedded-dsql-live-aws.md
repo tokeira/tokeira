@@ -73,6 +73,33 @@ compatibility metadata to the release target, and start the engine without manua
 or row repair. Keep the fixture live until that regression has passed or the operator
 separately authorizes its explicit descriptor-bound destruction.
 
+## Workflow placement preparation
+
+Before runtime construction, startup walks the hot rows and timers and logs its
+phase and committed rows examined/moved. Every older node must remain stopped
+throughout this pass. An unfinished pass refuses a live owned row in
+`shard_lease`, including an unrecognized shard encoding. That check detects a
+live owner at the check’s snapshot; it cannot stop an older binary acquiring or
+renewing afterwards. Keep the operational precondition in force.
+
+A placement error names the run key, stored shard, computed execution home when
+available, and failed check. An unexplained source means the row is at neither
+its execution home nor the known legacy run-key location: inspect the row’s
+namespace/workflow columns, routing shard count, and reset lineage. An invalid
+relocation identity means the state bytes cannot be decoded or disagree with
+those columns: inspect the hot row and authoritative history together.
+Conflicting timer payloads mean source and destination hold different bytes for
+the same timer key: inspect both complete rows, their creation metadata, and the
+run’s timer history. Preserve that evidence before any corrective action.
+Preparation fails globally because skipping the row could let its actual home
+serve without its work. There is no override that skips these checks.
+
+A stopped or disconnected participant can resume from the durable progress row.
+Restart with the same routing configuration; only committed pages count in the
+progress log. A routing-count mismatch or undecodable progress row requires
+inspection of the recorded migration state before retrying. Do not reset a
+completion marker to bypass a failure.
+
 ## Verified AWS contract
 
 The harness follows the current official Aurora DSQL APIs:

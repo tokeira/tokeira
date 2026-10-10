@@ -15,7 +15,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
     time::Instant,
 };
 
@@ -35,7 +38,12 @@ use tokio::sync::Mutex;
 
 #[cfg(test)]
 use crate::DeliveryOrder;
+
+mod placement;
+#[cfg(test)]
+mod placement_tests;
 use crate::{
+    PlacementPage, PlacementProgress, TimerPosition,
     api::{
         ActivityDispatchIdentity, AttributedHistoryEvent, BacklogEntry, BacklogPersistError,
         BudgetAllocationResult, BulkWritePhase, BundleLease, CommitResult, ConflictToken,
@@ -57,6 +65,7 @@ use crate::{
         encode_state_extension,
     },
     metrics as storage_metrics,
+    placement_upgrade::shard_uuid,
     recovery_index::{
         RecoveryCursor, RecoveryPage, RecoveryPhase, read_candidate_page, recovery_needed,
     },
@@ -79,9 +88,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// authoritative history stream, request-dedupe records, and a transition audit
 /// log instead of silently dropping them. That makes crash/recovery semantics
 /// visible in tests and keeps the dev store aligned with the architecture docs.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct InMemoryStore {
     inner: Arc<Mutex<StoreState>>,
+    placement_ready: Arc<AtomicBool>,
+}
+
+impl Default for InMemoryStore {
+    fn default() -> Self {
+        Self::with_shard_count(0)
+    }
 }
 
 // Manual impl: summarizes without taking the interior lock — a `Debug` that
@@ -183,7 +199,11 @@ struct StoreState {
     conflict_policy: CurrentExecutionConflictPolicy,
     /// Timer sweep materialization. Activities have no counterpart: they live
     /// only in run state, as on DSQL (`activity-state-writes`).
-    timer_bucket: HashMap<(RunKey, String), tokeira_kernel::TimerState>,
+    timer_bucket: BTreeMap<TimerPosition, tokeira_kernel::TimerState>,
+    /// Persisted separately from semantic state so restore cannot repair a fixture.
+    placement_progress: Option<PlacementProgress>,
+    /// Independent hot columns, present only when a fixture differs from state.
+    placement_columns: BTreeMap<RunKey, (NamespaceId, WorkflowId)>,
     /// Deterministic run-to-shard mapping.
     run_shard_map: HashMap<RunKey, ShardId>,
     /// Total shard count for deterministic assignment.
@@ -198,6 +218,19 @@ struct StoreState {
     /// Every covered write transaction's total, for the budget properties.
     #[cfg(test)]
     modeled_transactions: Vec<WriteCost>,
+}
+
+fn timer_position(
+    run_key: RunKey,
+    shard: ShardId,
+    timer: &tokeira_kernel::TimerState,
+) -> TimerPosition {
+    TimerPosition {
+        shard: shard_uuid(shard),
+        run_key,
+        timer_id: timer.timer_id.clone(),
+        fire_at: timer.fire_at,
+    }
 }
 
 impl StoreState {
@@ -423,6 +456,7 @@ impl InMemoryStore {
         };
         Self {
             inner: Arc::new(Mutex::new(state)),
+            placement_ready: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -494,8 +528,9 @@ impl InMemoryStore {
     /// Restore is boot-only by design: there is deliberately no way to load a
     /// snapshot into a live store, because swapping state under a running
     /// runtime would violate every lease and fencing assumption built on top
-    /// of the repository. Hand the restored store to a fresh runtime and let
-    /// the normal recovery sweep rebuild derived dispatch state — the result
+    /// of the repository. Call [`crate::prepare_execution_placement`] before
+    /// handing the restored store to a fresh runtime. The normal recovery sweep
+    /// then rebuilds derived dispatch state — the result
     /// is indistinguishable from a process restart against durable storage.
     ///
     /// Absolute-time semantics carry over: a timer whose fire time passed
@@ -537,22 +572,6 @@ impl InMemoryStore {
             }
             apply_snapshot_extension(&mut state, trailing).map_err(SnapshotError::Extension)?;
         }
-        // Placement is derived from stable execution identity, including when
-        // restoring snapshots whose timer/activity index used run-hash placement.
-        state.run_shard_map = state
-            .runs
-            .values()
-            .map(|run| {
-                (
-                    run.run_key,
-                    tokeira_types::execution_home_bundle(
-                        run.namespace_id.0.as_bytes(),
-                        run.workflow_id.0.as_bytes(),
-                        Self::effective_shard_count(&state),
-                    ),
-                )
-            })
-            .collect();
         // Reconstruct after applying every extension; the frozen snapshot layout
         // contains all authoritative inputs and needs no redundant row payload.
         state.workflow_dispatch = state
@@ -569,6 +588,7 @@ impl InMemoryStore {
             .collect();
         Ok(Self {
             inner: Arc::new(Mutex::new(state)),
+            placement_ready: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -611,6 +631,9 @@ pub const RUN_STATE_EXTENSION_SECTION: u32 = 1;
 /// records, and with them its knowledge of the unfinished writes; their rows
 /// stay unreachable, since a recorded run has no mutable state.
 pub const BULK_WRITE_SECTION: u32 = 2;
+
+/// Physical placement and startup progress, outside the frozen run-state layout.
+pub const PLACEMENT_SECTION: u32 = 3;
 
 /// Errors from the [`InMemoryStore`] snapshot persist/restore surface.
 #[derive(Debug, thiserror::Error)]
@@ -710,12 +733,17 @@ fn snapshot_extension(state: &StoreState) -> Result<Vec<u8>, SnapshotError> {
             payload: postcard::to_allocvec(&records).map_err(SnapshotError::Encode)?,
         });
     }
+    placement::capture_extension(state, &mut sections)?;
     encode_extension(SNAPSHOT_EXTENSION_MAGIC, &sections).map_err(SnapshotError::Encode)
 }
 
 /// Apply a snapshot extension to the store restored from the same snapshot.
 fn apply_snapshot_extension(state: &mut StoreState, bytes: &[u8]) -> Result<(), &'static str> {
     for section in decode_extension(SNAPSHOT_EXTENSION_MAGIC, bytes)? {
+        if section.tag == PLACEMENT_SECTION {
+            placement::apply_extension(state, &section.payload)?;
+            continue;
+        }
         if section.tag == BULK_WRITE_SECTION {
             let records = decode_exact::<Vec<RunBulkWrite>>(&section.payload)
                 .ok_or("undecodable bulk-write section")?;
@@ -797,6 +825,8 @@ impl SnapshotDoc {
             conflict_injections: _,
             conflict_policy: _,
             timer_bucket,
+            placement_progress: _,
+            placement_columns: _,
             run_shard_map,
             shard_count,
             // Carried by the snapshot extension, after the document.
@@ -841,13 +871,30 @@ impl SnapshotDoc {
             activity_dispatch: sorted_pairs(activity_dispatch),
             dispatch_backlog: dispatch_backlog.iter().cloned().collect(),
             activity_state_table: Vec::new(),
-            timer_bucket: sorted_pairs(timer_bucket),
+            // The frozen document retains a logical view. The extension
+            // preserves physical duplicates and locations when they differ.
+            timer_bucket: {
+                let logical: BTreeMap<_, _> = timer_bucket
+                    .iter()
+                    .map(|(key, timer)| ((key.run_key, key.timer_id.clone()), timer.clone()))
+                    .collect();
+                logical.into_iter().collect()
+            },
             run_shard_map: sorted_pairs(run_shard_map),
             shard_count: *shard_count,
         }
     }
 
     fn into_state(self) -> StoreState {
+        let run_shard_map: HashMap<_, _> = self.run_shard_map.into_iter().collect();
+        let timer_bucket = self
+            .timer_bucket
+            .iter()
+            .map(|((run_key, _), timer)| {
+                let shard = run_shard_map.get(run_key).copied().unwrap_or(ShardId(0));
+                (timer_position(*run_key, shard, timer), timer.clone())
+            })
+            .collect();
         let mut state = StoreState {
             current_open: self.current_open.into_iter().collect(),
             current_execution: self.current_execution.into_iter().collect(),
@@ -884,8 +931,10 @@ impl SnapshotDoc {
             conflict_policy: CurrentExecutionConflictPolicy::default(),
             // `self.activity_state_table` is discarded: entries there come from
             // earlier releases, and nothing reads them.
-            timer_bucket: self.timer_bucket.into_iter().collect(),
-            run_shard_map: self.run_shard_map.into_iter().collect(),
+            timer_bucket,
+            placement_progress: None,
+            placement_columns: BTreeMap::new(),
+            run_shard_map,
             shard_count: self.shard_count,
             // Restored from the snapshot extension when the snapshot has one.
             bulk_writes: BTreeMap::new(),
@@ -903,6 +952,14 @@ impl SnapshotDoc {
 
 #[async_trait]
 impl RunRepository for InMemoryStore {
+    fn placement_ready(&self) -> bool {
+        self.placement_ready.load(AtomicOrdering::Acquire)
+    }
+
+    async fn prepare_placement_page(&self) -> Result<PlacementPage> {
+        self.prepare_memory_placement_page().await
+    }
+
     #[tracing::instrument(name = "storage.resolve_execution", skip(self), fields(namespace_id = %execution.namespace_id.0, workflow_id = %execution.workflow_id.0))]
     async fn resolve_execution(&self, execution: &ExecutionRef) -> Result<Option<RunKey>> {
         let _started = Instant::now();
@@ -1458,15 +1515,23 @@ impl RunRepository for InMemoryStore {
             }
         }
 
+        let execution_home = tokeira_types::execution_home_bundle(
+            state.namespace_id.0.as_bytes(),
+            state.workflow_id.0.as_bytes(),
+            Self::effective_shard_count(&store),
+        );
         for op in &transition.timer_ops {
             match op {
                 TimerOp::Upsert(timer) => {
-                    store
-                        .timer_bucket
-                        .insert((run_key, timer.timer_id.clone()), timer.clone());
+                    store.timer_bucket.insert(
+                        timer_position(run_key, execution_home, timer),
+                        timer.clone(),
+                    );
                 }
                 TimerOp::Delete { timer_id } => {
-                    store.timer_bucket.remove(&(run_key, timer_id.clone()));
+                    store
+                        .timer_bucket
+                        .retain(|key, _| key.run_key != run_key || key.timer_id != *timer_id);
                 }
             }
         }
@@ -1567,14 +1632,7 @@ impl RunRepository for InMemoryStore {
             context,
         });
 
-        if transition.expected_seq == tokeira_types::TransitionSeq::ZERO {
-            let shard_id = tokeira_types::execution_home_bundle(
-                state.namespace_id.0.as_bytes(),
-                state.workflow_id.0.as_bytes(),
-                Self::effective_shard_count(&store),
-            );
-            store.run_shard_map.insert(run_key, shard_id);
-        }
+        store.run_shard_map.insert(run_key, execution_home);
 
         storage_metrics::record_commit_transition_duration(namespace, "applied", started.elapsed());
         storage_metrics::record_storage_operation("commit_transition", "success");
@@ -1923,9 +1981,10 @@ impl RunRepository for InMemoryStore {
                         });
                 } else {
                     let timer = &timers[index - batches.len()];
-                    store
-                        .timer_bucket
-                        .insert((successor_run_key, timer.timer_id.clone()), timer.clone());
+                    store.timer_bucket.insert(
+                        timer_position(successor_run_key, home, timer),
+                        timer.clone(),
+                    );
                 }
             }
         }
@@ -2071,7 +2130,7 @@ impl RunRepository for InMemoryStore {
             let timers = store
                 .timer_bucket
                 .keys()
-                .filter(|(candidate, _)| *candidate == run_key)
+                .filter(|key| key.run_key == run_key)
                 .take(budget)
                 .cloned()
                 .collect::<Vec<_>>();
@@ -2419,10 +2478,10 @@ impl RunRepository for InMemoryStore {
     async fn list_due_timers(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<DueTimer>> {
         let store = self.inner.lock().await;
         let mut due = Vec::new();
-        for ((run_key, _), timer) in &store.timer_bucket {
+        for (position, timer) in &store.timer_bucket {
             if timer.fire_at <= now {
                 due.push(DueTimer {
-                    run_key: *run_key,
+                    run_key: position.run_key,
                     timer_id: timer.timer_id.clone(),
                     fire_at: timer.fire_at,
                 });
@@ -2452,11 +2511,7 @@ impl RunRepository for InMemoryStore {
                     .runs
                     .values()
                     .filter(|state| {
-                        tokeira_types::execution_home_bundle(
-                            state.namespace_id.0.as_bytes(),
-                            state.workflow_id.0.as_bytes(),
-                            Self::effective_shard_count(&store),
-                        ) == shard_id
+                        store.run_shard_map.get(&state.run_key) == Some(&shard_id)
                             && recovery_needed(state)
                             && after.is_none_or(|after| state.run_key > after)
                     })
@@ -2534,11 +2589,11 @@ impl RunRepository for InMemoryStore {
         let mut due = store
             .timer_bucket
             .iter()
-            .filter(|((run_key, _), timer)| {
-                store.run_shard_map.get(run_key) == Some(&shard_id) && timer.fire_at <= now
+            .filter(|(position, timer)| {
+                position.shard == shard_uuid(shard_id) && timer.fire_at <= now
             })
-            .map(|((run_key, _), timer)| DueTimer {
-                run_key: *run_key,
+            .map(|(position, timer)| DueTimer {
+                run_key: position.run_key,
                 timer_id: timer.timer_id.clone(),
                 fire_at: timer.fire_at,
             })
@@ -2569,14 +2624,13 @@ impl RunRepository for InMemoryStore {
         {
             return Ok(false);
         }
-        let key = (timer.run_key, timer.timer_id.clone());
-        let matches = store
-            .timer_bucket
-            .get(&key)
-            .is_some_and(|row| row.fire_at == timer.fire_at);
-        if matches {
-            store.timer_bucket.remove(&key);
-        }
+        let before = store.timer_bucket.len();
+        store.timer_bucket.retain(|key, _| {
+            key.run_key != timer.run_key
+                || key.timer_id != timer.timer_id
+                || key.fire_at != timer.fire_at
+        });
+        let matches = before != store.timer_bucket.len();
         Ok(matches)
     }
 }
@@ -5365,8 +5419,8 @@ mod tests {
 
                 let inner = store.inner.lock().await;
                 for (rk, state) in &inner.runs {
-                    for (tid, tmr_state) in &state.timers {
-                        assert_eq!(inner.timer_bucket.get(&(*rk, tid.clone())), Some(tmr_state));
+                    for tmr_state in state.timers.values() {
+                        assert_eq!(inner.timer_bucket.get(&timer_position(*rk, inner.run_shard_map[rk], tmr_state)), Some(tmr_state));
                     }
                 }
                 assert_eq!(
@@ -5669,10 +5723,14 @@ mod tests {
             fire_at: fixed_now() + Duration::seconds(5),
             ..read.clone()
         };
-        store.inner.lock().await.timer_bucket.insert(
-            (run_key, "timer-1".into()),
-            timer_state("timer-1", replacement.fire_at),
-        );
+        {
+            let mut inner = store.inner.lock().await;
+            inner.timer_bucket.retain(|key, _| key.run_key != run_key);
+            let timer = timer_state("timer-1", replacement.fire_at);
+            inner
+                .timer_bucket
+                .insert(timer_position(run_key, ShardId(0), &timer), timer);
+        }
 
         assert!(
             !store
@@ -6919,7 +6977,7 @@ mod tests {
                         inner
                             .timer_bucket
                             .keys()
-                            .filter(|(candidate, _)| *candidate == run_key)
+                            .filter(|key| key.run_key == run_key)
                             .count(),
                         side_row_count,
                     );
@@ -6992,7 +7050,7 @@ mod tests {
                 prop_assert!(!inner.run_shard_map.contains_key(&run_key));
                 prop_assert!(!inner.conflict_injections.contains_key(&run_key));
                 prop_assert!(inner.request_dedupe.values().all(|record| record.run_key != run_key));
-                prop_assert!(inner.timer_bucket.keys().all(|(candidate, _)| *candidate != run_key));
+                prop_assert!(inner.timer_bucket.keys().all(|key| key.run_key != run_key));
                 prop_assert!(inner.activity_dispatch.keys().all(|(candidate, _)| *candidate != run_key));
                 prop_assert!(inner.dispatch_backlog.iter().all(|entry| entry.run_key != run_key));
                 prop_assert!(!inner.bulk_writes.contains_key(&run_key));
@@ -7709,8 +7767,8 @@ mod tests {
         #[test]
         fn property_malformed_snapshot_extensions_are_rejected(
             malformed in arb_malformed_snapshot_extension(),
-            // Tags 1 and 2 are the run-state and bulk-write sections.
-            unknown_tag in 3u32..64,
+            // Tags 1–3 hold run state, bulk writes and physical placement.
+            unknown_tag in 4u32..64,
         ) {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

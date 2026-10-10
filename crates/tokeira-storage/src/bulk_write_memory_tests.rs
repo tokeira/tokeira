@@ -30,7 +30,7 @@ impl Backend for InMemoryStore {
             timers: store
                 .timer_bucket
                 .keys()
-                .filter(|(candidate, _)| *candidate == run_key)
+                .filter(|key| key.run_key == run_key)
                 .count(),
             activity_dispatch: store
                 .activity_dispatch

@@ -34,6 +34,8 @@ struct Repo {
     conflicts: AtomicUsize,
     repair_attempts: AtomicUsize,
     loads: AtomicUsize,
+    preparation_retries: AtomicUsize,
+    preparation_attempts: AtomicUsize,
     pause: Mutex<Option<Pause>>,
 }
 
@@ -321,6 +323,21 @@ async fn acquisition_drains_an_admitted_lane_commit_before_reading_repair_pages(
 
 #[async_trait]
 impl RunRepository for Repo {
+    fn placement_ready(&self) -> bool {
+        self.inner.placement_ready()
+    }
+    async fn prepare_placement_page(&self) -> Result<PlacementPage> {
+        self.preparation_attempts.fetch_add(1, Ordering::SeqCst);
+        if self
+            .preparation_retries
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Ok(PlacementPage::Retry);
+        }
+        self.inner.prepare_placement_page().await
+    }
+
     async fn resolve_execution(&self, execution: &ExecutionRef) -> Result<Option<RunKey>> {
         self.inner.resolve_execution(execution).await
     }
@@ -641,6 +658,14 @@ impl RunRepository for Repo {
 }
 
 fn timeout_runtime(repo: Arc<Repo>, home: ShardId) -> Arc<TokeiraRuntime<Repo>> {
+    home_runtime(repo, home, true)
+}
+
+pub(super) fn home_runtime<R: RunRepository + 'static>(
+    repo: Arc<R>,
+    home: ShardId,
+    repair: bool,
+) -> Arc<TokeiraRuntime<R>> {
     let runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
         repo,
         1,
@@ -667,7 +692,9 @@ fn timeout_runtime(repo: Arc<Repo>, home: ShardId) -> Arc<TokeiraRuntime<Repo>> 
     ));
     {
         let mut owner = runtime.shard_owner.write().unwrap();
-        owner.enable_reconciliation();
+        if repair {
+            owner.enable_reconciliation();
+        }
         owner.record_acquired(home, ShardEpoch::ZERO);
         owner.mark_active(home);
     }
@@ -962,4 +989,193 @@ fn signal_start(start: StartRequest) -> SignalWithStartRequest {
         signal_name: "signal-at-start".into(),
         signal_input: Payloads::default(),
     }
+}
+
+#[tokio::test]
+async fn execution_home_admission_delivery_and_completion_use_the_same_epoch() {
+    for repair in [false, true] {
+        let repo = Arc::new(Repo {
+            inner: InMemoryStore::with_shard_count(8),
+            ..Default::default()
+        });
+        let (request, home) = timeout_start();
+        let key = request.run_key;
+        let other = crate::shard::shard_for(key, 8);
+        let runtime = home_runtime(repo.clone(), home, repair);
+        {
+            let mut owner = runtime.shard_owner.write().unwrap();
+            owner.record_acquired(home, ShardEpoch(17));
+            owner.mark_active(home);
+        }
+        runtime.start_workflow(request.clone()).await.unwrap();
+        assert_eq!(runtime.active_shards(), [home]);
+        let task = runtime
+            .poll_workflow_task(
+                QueueKey {
+                    namespace_id: request.namespace_id,
+                    task_queue: request.task_queue.clone(),
+                    task_kind: TaskKind::Workflow,
+                    deployment: None,
+                    build_id: None,
+                },
+                WorkerIdentity("home-worker".into()),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.token.shard_epoch, ShardEpoch(17));
+        {
+            let mut owner = runtime.shard_owner.write().unwrap();
+            owner.record_acquired(other, ShardEpoch(33));
+            owner.mark_active(other);
+        }
+        let mut completion = WorkflowTaskCompletedRequest {
+            token: task.token,
+            identity: WorkerIdentity("home-worker".into()),
+            client_discards_speculative_with_events: false,
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky: None,
+            commands: vec![],
+            command_sizes: vec![],
+            force_new_workflow_task: false,
+            limits: Default::default(),
+            delivered_update_ids: vec![],
+            request: RequestContext::unattributed(request.now),
+            now: request.now,
+        };
+        completion.token.shard_epoch = ShardEpoch(33);
+        assert!(
+            runtime
+                .complete_workflow_task(completion.clone())
+                .await
+                .unwrap_err()
+                .is::<crate::errors::NotShardOwner>()
+        );
+        completion.token.shard_epoch = ShardEpoch(17);
+        assert!(matches!(
+            runtime.complete_workflow_task(completion).await.unwrap(),
+            CommitResult::Applied { .. }
+        ));
+        stop(&runtime).await;
+
+        let wrong = home_runtime(
+            Arc::new(Repo {
+                inner: InMemoryStore::with_shard_count(8),
+                ..Default::default()
+            }),
+            other,
+            repair,
+        );
+        let error = wrong.start_workflow(request).await.unwrap_err();
+        assert!(error.is::<crate::errors::NotShardOwner>());
+        stop(&wrong).await;
+    }
+}
+
+#[tokio::test]
+async fn execution_home_lookup_reuses_the_lane_load_for_cold_and_hot_commands() {
+    let repo = Arc::new(Repo {
+        inner: InMemoryStore::with_shard_count(8),
+        ..Default::default()
+    });
+    let (request, home) = timeout_start();
+    let key = request.run_key;
+    let transition = BasicKernel
+        .apply(LoadedRun::Absent, Command::Start(request.clone()))
+        .unwrap();
+    repo.inner
+        .commit_transition(key, transition, ShardEpoch::ZERO)
+        .await
+        .unwrap();
+    let runtime = home_runtime(repo.clone(), home, false);
+    for index in 0..2 {
+        runtime
+            .submit(
+                key,
+                Command::Signal(SignalRequest {
+                    signal_name: "cache".into(),
+                    input: Payloads::default(),
+                    header: None,
+                    links: vec![],
+                    request: RequestContext {
+                        request_id: RequestId(format!("cache-{index}")),
+                        ..request.request.clone()
+                    },
+                    now: request.now,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.loads.load(Ordering::SeqCst),
+            1,
+            "routing and execution share the normal cold load"
+        );
+    }
+    stop(&runtime).await;
+}
+
+#[tokio::test]
+async fn restored_store_requires_preparation_before_any_runtime_construction() {
+    let store = InMemoryStore::default();
+    let restored =
+        Arc::new(InMemoryStore::from_snapshot(&store.snapshot().await.unwrap()).unwrap());
+    assert!(!restored.placement_ready());
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        TokeiraRuntime::new(
+            restored.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        )
+    }));
+    assert!(
+        refused.is_err(),
+        "the assertion is before spawning or seeding any runtime work"
+    );
+    prepare_execution_placement(restored.as_ref())
+        .await
+        .unwrap();
+    let runtime = TokeiraRuntime::new(
+        restored,
+        1,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+    );
+    runtime.runtime_shutdown.begin_shutdown();
+    runtime
+        .runtime_shutdown
+        .wait(std::time::Instant::now() + std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn placement_preparation_retries_without_restart_and_backoff_is_cancellable() {
+    let repo = Repo::default();
+    repo.preparation_retries.store(2, Ordering::SeqCst);
+    assert!(prepare_execution_placement(&repo).await.unwrap().complete());
+    assert_eq!(repo.preparation_attempts.load(Ordering::SeqCst), 3);
+
+    repo.preparation_retries.store(100, Ordering::SeqCst);
+    let mut waiting = Box::pin(prepare_execution_placement(&repo));
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(
+            std::future::Future::poll(waiting.as_mut(), cx).is_pending()
+        ))
+        .await
+    );
+    assert_eq!(repo.preparation_attempts.load(Ordering::SeqCst), 4);
+    drop(waiting);
+    assert_eq!(repo.preparation_retries.load(Ordering::SeqCst), 99);
 }

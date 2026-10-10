@@ -17,9 +17,9 @@ use crate::{
     },
 };
 
-struct Fixture {
-    pool: PgPool,
-    store: DsqlStore,
+pub(super) struct Fixture {
+    pub(super) pool: PgPool,
+    pub(super) store: DsqlStore,
 }
 
 #[tokio::test]
@@ -257,7 +257,7 @@ fn legacy_queue_page_query(
 }
 
 impl Fixture {
-    async fn connect(shard_count: u32) -> Result<Self> {
+    pub(super) async fn connect(shard_count: u32) -> Result<Self> {
         let url = std::env::var("TOKEIRA_DSQL_TEST_DATABASE_URL")?;
         let pool = PgPoolOptions::new()
             .max_connections(4)

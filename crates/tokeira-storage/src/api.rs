@@ -824,6 +824,23 @@ pub const HISTORY_READ_PAGE: usize = 1024;
 /// table X with join Y".
 #[async_trait]
 pub trait RunRepository: Send + Sync {
+    /// Whether startup preparation has completed for this repository handle.
+    /// Runtime construction must check this before spawning any tasks. Defaults
+    /// serve test doubles; authoritative stores and wrappers implement it.
+    fn placement_ready(&self) -> bool {
+        true
+    }
+
+    /// Commit one bounded placement-upgrade page before runtime construction.
+    /// Wrappers must forward this method. The default represents an already
+    /// prepared test double and performs no persistence.
+    async fn prepare_placement_page(&self) -> Result<crate::PlacementPage> {
+        Ok(crate::PlacementPage::Committed(crate::PlacementProgress {
+            phase: crate::PlacementPhase::Complete,
+            ..Default::default()
+        }))
+    }
+
     /// Resolve an execution reference to a concrete durable run key.
     ///
     /// Semantics:
@@ -2613,6 +2630,13 @@ impl<T> RunRepository for std::sync::Arc<T>
 where
     T: RunRepository + ?Sized,
 {
+    fn placement_ready(&self) -> bool {
+        (**self).placement_ready()
+    }
+    async fn prepare_placement_page(&self) -> Result<crate::PlacementPage> {
+        (**self).prepare_placement_page().await
+    }
+
     async fn resolve_execution(&self, execution: &ExecutionRef) -> Result<Option<RunKey>> {
         (**self).resolve_execution(execution).await
     }

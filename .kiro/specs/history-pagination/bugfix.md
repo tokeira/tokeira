@@ -46,7 +46,7 @@ Each DSQL read also fetches every history batch after its cursor before decoding
 
 2.7 WHEN the edge needs a run's last event id THEN it SHALL take `last_event_id` from the run's state.
 
-2.8 WHEN the runtime restores an activity's original options THEN it SHALL read each matching activity's scheduled event by its event id.
+2.8 WHEN the runtime restores an activity's original options THEN it SHALL read each matching activity's scheduled event by its event id, with the one lookup that returns only the history batch holding it ([activity-inputs-from-history](../activity-inputs-from-history/bugfix.md) criterion 2.3).
 
 2.9 WHEN reset validation, batch reset, batch reset target resolution, a direct query's poll response, or the update lifecycle snapshot needs a run's history THEN it SHALL read it to the end (criterion 2.2).
 

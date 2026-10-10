@@ -83,7 +83,7 @@ The edge's last event id SHALL equal the run state's `last_event_id`, and each r
 
 ### Runtime (`tokeira-runtime`)
 
-- `original_activity_options` reads each matching activity's scheduled event with `read_history(run_key, schedule_event_id - 1, 1)`, and fails as today when that event isn't an `ActivityTaskScheduled`.
+- `original_activity_options` reads each matching activity's scheduled event with `read_history_event(run_key, schedule_event_id)`, the one lookup that returns only the batch holding it ([activity-inputs-from-history](../activity-inputs-from-history/design.md)), and fails as today when that event isn't an `ActivityTaskScheduled`.
 - `update_lifecycle_snapshot` reads the history with `read_history_to_end`. A completed update leaves no record in run state (`pending_updates` holds only accepted ones), so its outcome has to come from history.
 
 ### Other specs

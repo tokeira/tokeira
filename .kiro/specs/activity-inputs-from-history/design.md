@@ -191,6 +191,7 @@ The code PR aligns these specs with the fix:
 - [run-growth-limits](../run-growth-limits/bugfix.md): criterion 2.9 and its design measure the state as its encoded size.
 - [activity-state-writes](../activity-state-writes/bugfix.md) and [bounded-bulk-writes](../bounded-bulk-writes/bugfix.md): their Out of Scope points here.
 - [history-pagination](../history-pagination/bugfix.md): criterion 2.8 reads the scheduled event with the one-batch lookup.
+- [activity-heartbeat-time](../activity-heartbeat-time/requirements.md) and [continue-as-new-advice](../continue-as-new-advice/design.md): their statements about the envelope version and the snapshot version name the versions before this change.
 
 ## Testing Strategy
 

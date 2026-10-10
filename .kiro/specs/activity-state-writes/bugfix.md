@@ -39,4 +39,4 @@ The copy is paid on every activity change: one more statement, the activity's pa
 ### Out of Scope
 
 - Dropping the `activity_state` table and its indexes. A node running an earlier release still writes the table, so a migration can drop it only once no such node remains.
-- Taking activity inputs out of run state and out of `activity_dispatch`, which is a separate change.
+- Taking activity inputs out of run state and out of `activity_dispatch`, which [activity-inputs-from-history](../activity-inputs-from-history/bugfix.md) does.

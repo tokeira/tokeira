@@ -47,7 +47,7 @@ flowchart LR
 
 ```text
 workflow_hot.state_data
-  varint WORKFLOW_STATE_ENVELOPE_VERSION ("TKWS")    unchanged
+  varint WORKFLOW_STATE_ENVELOPE_VERSION             "TKWS"; "TKW2" since activity-inputs-from-history
   WorkflowState, positional postcard                 unchanged; the time is #[serde(skip)]
   [ State_Extension ]                                absent when no section has data
       varint WORKFLOW_STATE_EXTENSION_MAGIC ("TKWX")
@@ -56,7 +56,7 @@ workflow_hot.state_data
                                   in activity-id order, one entry per activity with a time
 
 in-memory snapshot
-  varint SNAPSHOT_FORMAT_VERSION (4)                 unchanged
+  varint SNAPSHOT_FORMAT_VERSION                     4; 5 since activity-inputs-from-history
   SnapshotDoc, positional postcard                   unchanged
   [ Snapshot_Extension ]                             absent when no run has a State_Extension
       varint SNAPSHOT_EXTENSION_MAGIC ("TKSX")
@@ -210,7 +210,7 @@ No schema migration. The `activity_state` blob and the history batch blob keep t
 
 ### Property 2: Without times, the bytes are unchanged
 
-*For any* `WorkflowState` with no Last_Heartbeat_Time, `encode_workflow_state(s)` SHALL equal the postcard encoding of `(WORKFLOW_STATE_ENVELOPE_VERSION, s)`, which is what Tokeira 0.2.0–0.5.1 write. Decoding those bytes SHALL return `s` with no times.
+*For any* `WorkflowState` with no Last_Heartbeat_Time, `encode_workflow_state(s)` SHALL equal the postcard encoding of `(WORKFLOW_STATE_ENVELOPE_VERSION, s)`, the layout Tokeira 0.2.0–0.5.1 write under their envelope version. Decoding those bytes SHALL return `s` with no times.
 
 **Validates: Requirements 1.4, 2.1, 2.2**
 

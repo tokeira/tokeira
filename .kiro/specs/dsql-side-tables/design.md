@@ -144,19 +144,19 @@ No SQL LIMIT — the application filters after deserialization and stops at `lim
 
 Activity dispatch and sweep use different tables:
 
-**Dispatch queries** (`list_dispatchable_activity_tasks_for_shard`, `list_dispatchable_activity_tasks`) read from `activity_dispatch` — a dedicated table storing one row per dispatchable activity. Queue identity and scheduling fields are stored directly; `input_data` is decoded as postcard-encoded `Payloads` via `codec::decode_payloads`. Rows are inserted or refreshed by `DispatchOp::EnqueueActivityTask`, removed on activity start, individual activity pause, workflow pause, and `ActivityOp::Delete`, and updated in place when a still-dispatchable `ActivityOp::Upsert` changes queue identity, attempt, or input.
+**Dispatch queries** (`list_dispatchable_activity_tasks_for_shard`, `list_dispatchable_activity_tasks`) read from `activity_dispatch` — a dedicated table storing one row per dispatchable activity. Queue identity and scheduling fields are stored directly; `input_data` holds an empty payload list and no query selects it, since an activity's input lives only in its ActivityTaskScheduled event ([activity-inputs-from-history](../activity-inputs-from-history/design.md)). Rows are inserted or refreshed by `DispatchOp::EnqueueActivityTask`, removed on activity start, individual activity pause, workflow pause, and `ActivityOp::Delete`, and updated in place when a still-dispatchable `ActivityOp::Upsert` changes queue identity or attempt.
 
 **Shard-filtered dispatch SQL:**
 ```sql
 SELECT run_key, activity_id, queue_namespace, queue_name, task_kind,
-       deployment, build_id, schedule_event_id, attempt, input_data
+       deployment, build_id, schedule_event_id, attempt
 FROM activity_dispatch WHERE shard_id = $1 LIMIT $2
 ```
 
 **Queue-filtered dispatch SQL:**
 ```sql
 SELECT run_key, activity_id, queue_namespace, queue_name, task_kind,
-       deployment, build_id, schedule_event_id, attempt, input_data
+       deployment, build_id, schedule_event_id, attempt
 FROM activity_dispatch
 WHERE queue_namespace = $1 AND queue_name = $2 AND task_kind = $3
   AND deployment IS NOT DISTINCT FROM $4 AND build_id IS NOT DISTINCT FROM $5
@@ -266,10 +266,10 @@ All 10 methods are read-only. No tables are written.
 | Method | Table Read | Columns Used |
 |--------|-----------|-------------|
 | `list_dispatchable_workflow_tasks` | `workflow_hot` | `run_key`, `state_data` |
-| `list_dispatchable_activity_tasks` | `activity_dispatch` | `run_key`, `activity_id`, `queue_namespace`, `queue_name`, `task_kind`, `deployment`, `build_id`, `schedule_event_id`, `attempt`, `input_data` |
+| `list_dispatchable_activity_tasks` | `activity_dispatch` | `run_key`, `activity_id`, `queue_namespace`, `queue_name`, `task_kind`, `deployment`, `build_id`, `schedule_event_id`, `attempt` |
 | `list_due_timers` | `timer_bucket` | (shard fanout) `run_key`, `timer_id` |
 | `list_dispatchable_workflow_tasks_for_shard` | `workflow_hot` | `run_key`, `state_data` |
-| `list_dispatchable_activity_tasks_for_shard` | `activity_dispatch` | `run_key`, `activity_id`, `queue_namespace`, `queue_name`, `task_kind`, `deployment`, `build_id`, `schedule_event_id`, `attempt`, `input_data` |
+| `list_dispatchable_activity_tasks_for_shard` | `activity_dispatch` | `run_key`, `activity_id`, `queue_namespace`, `queue_name`, `task_kind`, `deployment`, `build_id`, `schedule_event_id`, `attempt` |
 | `list_due_timers_for_shard` | `timer_bucket` | `run_key`, `timer_id` |
 | `list_runs_with_workflow_timeouts_for_shard` | `workflow_hot` | `run_key`, `state_data` |
 | `list_started_workflow_tasks_for_shard` | `workflow_hot` | `run_key`, `state_data` |
@@ -282,7 +282,7 @@ All 10 methods are read-only. No tables are written.
 |-------|--------|---------------|-----------|---------|
 | `workflow_hot` | `state_data` | `decode_workflow_state` | `WorkflowState` | 6 methods (all except timers and activity dispatch) |
 | `activity_state` | `state_data` | `decode_activity_state` | `ActivityState` | 1 method (`list_open_activities_for_shard` only) |
-| `activity_dispatch` | `input_data` | `decode_payloads` | `Payloads` | 2 methods (activity dispatch — queue/scheduling fields are columns) |
+| `activity_dispatch` | — | none needed | — | 2 methods (activity dispatch — queue/scheduling fields are columns; `input_data` is written empty and not read) |
 | `timer_bucket` | — | none needed | — | 2 methods (timer queries use columns directly) |
 
 ### Application Filter Map
@@ -353,7 +353,7 @@ The following properties are derived from the acceptance criteria prework analys
 
 ### Property 3: Activity Dispatch Field Fidelity
 
-*For any* row in the `activity_dispatch` table, the activity dispatch methods SHALL return it as a `DispatchableActivityTask` with `run_key`, `activity_id`, `input`, `schedule_event_id`, and `attempt` matching the stored row values, with `queue` constructed from the stored queue columns and `task_kind` set to `Activity`. For queue-filtered dispatch, only rows whose full `QueueKey` matches the given key SHALL be included. Started, paused, and resolved activities SHALL NOT appear in `activity_dispatch` because they are removed by the write path.
+*For any* row in the `activity_dispatch` table, the activity dispatch methods SHALL return it as a `DispatchableActivityTask` with `run_key`, `activity_id`, `schedule_event_id`, and `attempt` matching the stored row values, with `queue` constructed from the stored queue columns and `task_kind` set to `Activity`. For queue-filtered dispatch, only rows whose full `QueueKey` matches the given key SHALL be included. Started, paused, and resolved activities SHALL NOT appear in `activity_dispatch` because they are removed by the write path.
 
 **Validates: Requirements 2.1, 2.2, 2.5, 5.1, 5.5**
 

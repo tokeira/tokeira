@@ -123,7 +123,7 @@ The store SHALL count a run's history as DSQL stores it, one row per batch.
 
 ### Out of Scope
 
-- A value over DSQL's 1 MiB limit. A backlog payload or an activity dispatch row can carry such a value in an activity input, and a run's state or a history batch can reach it ([run-growth-limits](../run-growth-limits/bugfix.md) Out of Scope). A later change takes activity inputs out of state, dispatch rows and backlog payloads. A value that is still too large waits for a step that splits values.
+- A value over DSQL's 1 MiB limit. A run's state or a history batch can reach it ([run-growth-limits](../run-growth-limits/bugfix.md) Out of Scope). [activity-inputs-from-history](../activity-inputs-from-history/bugfix.md) takes activity inputs out of state, dispatch rows and backlog payloads. A value that is still too large waits for a step that splits values.
 - A single transition whose own writes exceed DSQL's limits, such as a workflow task completion with thousands of commands.
 - A reset's commit on its base and its successor's creation being separate. If the materialization fails, including under 2.13, the base stays reset and names a successor that never exists, as today; v1.31.0 commits both in one transaction (`persistToDB`, `service/history/ndc/workflow_resetter.go:340-432 @ v1.31.0`). The successor's first commit, which fails its fork-point workflow task and reapplies the base's later events, is still lost if its node stops before making it.
 - Reads. A reset still reads its base's history in one read transaction, and the drain still reads up to its requested number of entries at once.

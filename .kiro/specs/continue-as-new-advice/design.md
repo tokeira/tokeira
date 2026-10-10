@@ -103,7 +103,7 @@ describe resolver, and the visibility builder; no reader scans history.
 **Codec envelopes** (`src/dsql/codec.rs`), following `BacklogEnvelope`:
 
 ```rust
-const WORKFLOW_STATE_ENVELOPE_VERSION: u32 = 0x544B_5753; // "TKWS"
+const WORKFLOW_STATE_ENVELOPE_VERSION: u32 = 0x544B_5753; // "TKWS"; "TKW2" since activity-inputs-from-history, which still reads "TKWS"
 const HISTORY_BATCH_ENVELOPE_VERSION: u32 = 0x544B_4842;  // "TKHB"
 
 #[derive(Serialize, Deserialize)]

@@ -279,9 +279,19 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
       commit. Preserve eventual execution-home recovery; skipping such a row alone
       is insufficient. This placement issue blocks cutover until covered by a
       stopped-upgrade regression on both stores (see the design).
+      Implementation evidence: V081 and the pre-construction placement pass;
+      the approved [note](placement-recovery-note.md), shared reset fixture,
+      restart/conservation properties and live placement contracts establish
+      the prerequisite independently of default delivery.
     - Align outer runtime admission and task-token epoch lookup with execution
       home, then verify a public start and delivery when only that home is held
       and its run-key hash selects another shard.
+      Implementation evidence: admission resolves execution identity through
+      the lane cache; epoch helpers use already-loaded state. Runtime tests
+      cover both construction modes, distinct epochs, wrong-shard tokens,
+      same-home reacquisition from epoch 17 to 18 rejecting old workflow completions
+      and activity heartbeats without mutation, activity completion and unchanged
+      hot-path load counts.
     - Preserve activity backlog, its shared loops, `activity_dispatch`, and
       `reconcile_due_activity_dispatches_once`. Add no mixed-release branch or
       durable workflow delivery checkpoint.

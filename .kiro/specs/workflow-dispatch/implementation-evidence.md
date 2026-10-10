@@ -1,5 +1,151 @@
 # Workflow dispatch implementation evidence
 
+## Fourth implementation PR: placement and execution-home prerequisites
+
+Base: `2a4474057aff90e46468afdc3bdde51b8f5c6065`; the PR records its final base
+and head. Task 11.1 remains unchecked until default cutover. Tasks 17–18 and
+requirements 8.4–8.6 still depend on the transaction-local competing-owner lease
+fence.
+
+The approved [placement note](placement-recovery-note.md) is implemented before
+runtime construction in the shared engine path. V081 adds the versioned startup
+marker. Its revision and each page's hot/timer moves commit atomically; a losing
+or uncertain participant rereads durable progress after jittered cancellable
+backoff. Screening reads up to 1,000 metadata keys; pages that move data process
+at most 64 source keys under the existing 1,000-row/4 MiB write budgets, including
+marker overhead. Timer scanning is independent of hot-row placement and retains
+orphan keys.
+
+Public constructors retain synchronous convenience for fresh memory stores,
+while restored memory and DSQL repositories require asynchronous preparation.
+The constructor checks readiness before spawning tasks or seeding Active ownership.
+Memory snapshots preserve physical hot locations, timer duplicates and upgrade
+progress through snapshot extension section 3; frozen workflow-state layout and
+its extension tags are unchanged. An existing malformed-extension generator now
+chooses unknown snapshot tags above that assigned section.
+
+Both delivery modes use execution-home admission and token epochs. Discovery,
+offers and acquisition repair remain opt-in. No dependency, feature or lockfile
+change is introduced; V001–V080 remain byte-for-byte unchanged.
+
+### Routing audit
+
+| Call site | Identity/home source |
+|---|---|
+| `runtime/commit.rs::submit` and `submit_for_owned_shard` | Start, signal-with-start and start-and-update commands supply namespace/workflow identity; other commands share the lane cache's ordinary load. |
+| `runtime/commit.rs::shard_id_for` | Asks the owning local lane for immutable execution identity; derives the home using the configured shard count. |
+| `runtime/mod.rs::validate_workflow_task_token` | Resolves the home once through that cache, then checks its current completion epoch. |
+| `runtime/workflow_task.rs` normal and reserved task-token minting | Passes already-loaded committed state to `current_shard_epoch`. |
+| `runtime/activity.rs` activity task-token minting | Passes already-loaded committed state to `current_shard_epoch`. |
+| `runtime/activity.rs` heartbeat, by-ID resolution, forced-start token creation and completion validation | Passes existing loaded state to `shard_epoch_for_completion`. |
+| `lane.rs` tracking, publication and processing-span shard fields | Uses execution identity from the existing transition/committed state; no run-hash fallback. |
+| Local lane selection | Still hashes the run key to serialize commands. Remaining calls to `shard::shard_for` are test oracles, not admission or epoch routing. |
+
+### Executable contracts
+
+Memory runs 100 generated relocation/restart traces with an independent expected
+placement map, whole-page failure injection, snapshot restoration between pages,
+row conservation, semantic snapshot preservation, committed-only counters and
+shared budget assertions. Fixed fixtures cover the actual reset materialization,
+timers remaining on the old shard after hot placement is correct, equivalent and
+conflicting copies, orphan timers, unexplained placement, invalid identity,
+1,000-key screening and a byte-limited page of large states. An oversized memory
+timer whose relocation fits alone but cannot fit with its cursor fails with row
+identity before any page progress or physical mutation commits.
+
+The same reset fixture is exercised through real DSQL. Live contracts cover
+concurrent starters, a stale transaction attempting to write after completion,
+unchanged authoritative bytes, complete dispatch repair, raw live leases with
+unrecognized shard encodings, corruption diagnostics, duplicates/orphans, and the
+exact SQL used by first and deep continuation pages. Runtime regressions cover
+both construction modes with only the execution home held, distinct nonzero
+epochs, wrong-home rejection, heartbeat and completion, cold-load reuse and no
+extra hot-cache load. Both modes mint tokens at the home's epoch 17, reacquire
+that home at 18, and reject the original workflow completion and activity
+heartbeat without mutating storage. The history-notifying wrapper preserves
+not-ready status for a restored memory snapshot and completes its scan through
+the wrapper. Retry coverage checks warning-level causes and consecutive attempts
+beyond the backoff cap, as well as cancellation without restart.
+
+### Live DSQL and workspace validation
+
+Two disposable Aurora DSQL clusters were used and deleted, with absence confirmed.
+The initial run exposed an unbounded hot-index hash build in a plain timer-page
+join. The final query materializes the bounded timer keys and restricts the hot
+input to those keys. The final cluster ran all four placement contracts and the
+runtime acquisition check serially under the `dsql-live` profile:
+
+| Contract | Result |
+|---|---|
+| Concurrent starters and rejection of a late page after completion | Passed, 640.480 s including fresh schema bootstrap |
+| Fail-stop identity/placement checks and raw legacy-encoded live lease guard | Passed, 7.821 s |
+| Joined continuation plans and unchanged-row screening | Passed, 28.220 s including fixture setup and cleanup |
+| Actual stopped reset, equivalent/conflicting timer copies and orphan preservation | Passed, 11.214 s |
+| Runtime acquisition and superseded tracker installs | Passed, 3.829 s |
+
+Commands:
+
+```sh
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 --lib --no-fail-fast -E 'test(placement_live_)'
+cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --test-threads 1 --lib -E 'test(workflow_dispatch_live_acquisition)'
+```
+
+The exact query builders are explained at the first timer page and continuation
+positions 4,096 and 11,000 in a 12,288-pair fixture. Every continuation component
+appears in a primary-key `Index Cond`, including equality on the preceding
+components. The hot side uses `workflow_hot_pkey` with
+`Index Cond: (run_key = ANY ($1))`, where the array is derived from the
+materialized timer page. The optimizer may choose a hash join, but both inputs
+are bounded. The hot-row walk's deep continuation also has a primary-key
+`run_key >` bound.
+
+With the other contract fixtures present, the unchanged-row pass screened
+24,778 committed hot/timer keys in 4.535 s. This is about 183 ms per 1,000 keys,
+including marker initialization and empty phase-ending pages. Linear extrapolation
+for one million runs plus one million timers is 366.1 s, about six minutes.
+This is a small-sample extrapolation with short identities, no relocation and
+one participant, not a million-row benchmark or a relocation-throughput claim.
+The deliberately undecodable payloads in this fixture prove unchanged rows do
+not require state or timer decoding.
+
+The full root §10.4 bar passed: nightly formatting, `cargo lint --locked`,
+workspace check, workspace nextest, workspace doctests, and documentation with
+`RUSTDOCFLAGS="-D warnings"`. Nextest ran **3,806 tests, all passed**; the two
+existing ignored external SDK integration tests remained ignored. The additional
+DSQL-feature check passed:
+
+```sh
+cargo clippy -p tokeira-storage -p tokeira-runtime --all-targets --features tokeira-storage/dsql-integration,tokeira-runtime/dsql-integration --locked
+```
+
+The review update repeated the full bar and DSQL-feature Clippy. Its focused
+filter passed seven checks, including same-home token staleness, retry diagnostics,
+wrapper preparation and oversized timer/cursor rejection. The live DSQL checks
+above were not repeated: their SQL and transaction logic are unchanged. No new
+cluster was created for this update.
+
+Offline Markdown links and `git diff --check` passed. The link command uses the
+CI exclusions plus the ignored generated `.tokeira-build` scratch directory.
+No default-bar command was skipped. The separate functional conformance corpus,
+Dagger CI gates and full cutover/service-limit suites were not run for this
+prerequisite PR; the latter remain in the following cutover PR.
+
+### Known risks and boundaries
+
+Every older node must remain stopped during unfinished preparation. The raw
+live-lease check detects an existing owner but cannot fence an older binary
+acquiring or renewing after its snapshot. The marker protocol excludes competing
+new starters; it does not close that older-writer enforcement gap. The runbook
+documents fail-stop diagnostics and investigation without a skip override.
+
+The first startup scans all hot and timer keys. Screening estimates exclude
+relocation, larger identity columns and contention. Marker shard-count mismatch
+or unclassifiable corruption fails startup instead of serving an incomplete home.
+Per-home acquisition repair never moves authoritative placement. The unchanged
+delivery switch, backlog retirement, telemetry and full cutover contracts belong
+to the following PR. No modelled dispatch/repair step is changed here, so the
+existing model-checker results remain applicable; neither checker was rerun.
+
 ## Third implementation PR: reconciliation and serving admission
 
 Original base: `059f2c1b1291bc176c5005617df6328925e56845`.

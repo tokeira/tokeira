@@ -72,7 +72,7 @@ use crate::{
         TimerScannerConfig, lane_index_for_run_key, pick_lane_for_run_key, run_timer_scanner,
     },
     schedule::cron_initial_backoff,
-    shard::{ShardOwner, shard_for},
+    shard::ShardOwner,
     shutdown::RuntimeShutdownHandle,
     timeout::{
         WorkflowTimeoutScannerConfig, WorkflowTimeoutTrackingState, run_workflow_timeout_scanner,
@@ -566,6 +566,11 @@ where
     /// ownership, node endpoint) and delegates inward, so all paths
     /// converge on `new_with_nexus_and_shards_and_endpoint`, the single place
     /// that actually wires brokers, lanes, and scanners.
+    /// # Panics
+    ///
+    /// The repository must report completed execution-placement preparation.
+    /// Fresh memory stores are ready immediately; restored memory and DSQL
+    /// repositories require [`tokeira_storage::prepare_execution_placement`].
     pub fn new(
         repo: Arc<R>,
         lane_count: usize,
@@ -589,6 +594,11 @@ where
         )
     }
 
+    /// Construct using runtime configuration and the defaults of [`Self::new`].
+    ///
+    /// # Panics
+    ///
+    /// As with [`Self::new`], placement preparation must complete first.
     pub fn new_with_config(repo: Arc<R>, runtime_config: RuntimeConfig) -> Self {
         Self::new(
             repo,
@@ -600,6 +610,11 @@ where
         )
     }
 
+    /// Construct with explicit Nexus dependencies and a single seeded shard.
+    ///
+    /// # Panics
+    ///
+    /// As with [`Self::new`], placement preparation must complete first.
     pub fn new_with_nexus(
         repo: Arc<R>,
         lane_count: usize,
@@ -631,6 +646,11 @@ where
         )
     }
 
+    /// Construct from runtime configuration and explicit Nexus dependencies.
+    ///
+    /// # Panics
+    ///
+    /// As with [`Self::new`], placement preparation must complete first.
     pub fn new_with_nexus_config(
         repo: Arc<R>,
         runtime_config: RuntimeConfig,
@@ -653,6 +673,11 @@ where
         )
     }
 
+    /// Construct with explicit shard ownership configuration.
+    ///
+    /// # Panics
+    ///
+    /// As with [`Self::new`], placement preparation must complete first.
     pub fn new_with_nexus_and_shards(
         repo: Arc<R>,
         lane_count: usize,
@@ -689,6 +714,11 @@ where
         )
     }
 
+    /// Construct with explicit ownership, endpoint and namespace resolution.
+    ///
+    /// # Panics
+    ///
+    /// As with [`Self::new`], placement preparation must complete first.
     pub fn new_with_nexus_and_shards_and_endpoint(
         repo: Arc<R>,
         lane_count: usize,
@@ -751,6 +781,10 @@ where
         namespace_resolver: Option<Arc<dyn NexusNamespaceResolver>>,
         queue_homes: Option<Arc<dyn crate::discovery::QueueHomeProvider>>,
     ) -> Self {
+        assert!(
+            repo.placement_ready(),
+            "prepare_execution_placement must complete before runtime construction"
+        );
         // Temporary construction-only choice: bounded offers become the default
         // only with dispatch reconstruction and backlog retirement at cutover.
         let broker = queue_homes
@@ -1427,9 +1461,9 @@ where
         &self,
         token: &WorkflowTaskToken,
     ) -> Result<()> {
-        let current_epoch = self.shard_epoch_for_completion(token.run_key).await?;
+        let shard_id = self.shard_id_for(token.run_key).await?;
+        let current_epoch = self.epoch_for_completion_home(shard_id)?;
         if token.shard_epoch != current_epoch {
-            let shard_id = self.shard_id_for(token.run_key).await;
             return Err(NotShardOwner::local(shard_id, current_epoch).into());
         }
         Ok(())
@@ -1880,6 +1914,8 @@ pub(crate) mod tests {
     use uuid::Uuid;
 
     use super::*;
+    #[cfg(test)]
+    use crate::shard::shard_for;
     use crate::{
         broker::InMemoryBroker,
         deployment_registry::{RegisterPolledDeployment, SetCurrent},

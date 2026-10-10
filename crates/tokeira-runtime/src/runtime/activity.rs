@@ -586,7 +586,7 @@ where
                 }
                 .into());
             }
-            if token.shard_epoch != self.shard_epoch_for_completion(token.run_key).await? {
+            if token.shard_epoch != self.shard_epoch_for_completion(&state).await? {
                 return Err(anyhow!("activity heartbeat shard epoch mismatch"));
             }
 
@@ -731,7 +731,7 @@ where
             });
         }
         let shard_epoch = self
-            .shard_epoch_for_completion(run_key)
+            .shard_epoch_for_completion(&state)
             .await
             .map_err(|error| ActivityTokenResolutionError::Runtime(error.to_string()))?;
         Ok(ActivityTaskToken {
@@ -787,7 +787,7 @@ where
                 activity_id: activity_id.to_string(),
                 schedule_event_id: current.schedule_event_id,
                 attempt: current.attempt,
-                shard_epoch: self.shard_epoch_for_completion(run_key).await?,
+                shard_epoch: self.shard_epoch_for_completion(&state).await?,
             };
             if current.started_event_id.is_some() {
                 return Ok(token);
@@ -1200,7 +1200,7 @@ where
                             activity_id: next_activity.activity_id.clone(),
                             schedule_event_id: next_activity.schedule_event_id,
                             attempt: next_activity.attempt,
-                            shard_epoch: self.current_shard_epoch(task.run_key).await?,
+                            shard_epoch: self.current_shard_epoch(&state).await?,
                         },
                         input: next_activity.input.clone(),
                         attempt: next_activity.attempt,
@@ -1302,7 +1302,7 @@ where
             }
             .into());
         }
-        if token.shard_epoch != self.shard_epoch_for_completion(token.run_key).await? {
+        if token.shard_epoch != self.shard_epoch_for_completion(&state).await? {
             return Err(anyhow!("activity shard epoch mismatch"));
         }
         Ok((activity, state.retry_policy.clone()))
@@ -2347,6 +2347,11 @@ mod tests {
         details: Option<Payloads>,
     ) -> (WorkflowState, ActivityTaskToken, QueueKey) {
         let mut state = open_state(None);
+        let count = runtime.shard_owner.read().unwrap().shard_count();
+        if count > 1 {
+            let home = runtime.execution_home(&state);
+            state.run_key = RunKey(uuid::Uuid::from_u128(u128::from((home.0 + 1) % count)));
+        }
         let run_key = state.run_key;
         // Anchor at real time: the retry path measures the schedule-to-close
         // retry-expiration against `OffsetDateTime::now_utc()` (retry.go:108-110
@@ -2417,7 +2422,7 @@ mod tests {
             schedule_event_id: activity.schedule_event_id,
             attempt: activity.attempt,
             shard_epoch: runtime
-                .shard_epoch_for_completion(run_key)
+                .shard_epoch_for_completion(&state)
                 .await
                 .expect("runtime owns seeded run"),
         };
@@ -3693,7 +3698,7 @@ mod tests {
         ActivityTaskToken {
             attempt: activity.attempt,
             shard_epoch: runtime
-                .shard_epoch_for_completion(token.run_key)
+                .shard_epoch_for_completion(&state)
                 .await
                 .expect("runtime owns seeded run"),
             ..token.clone()
@@ -4246,5 +4251,96 @@ mod tests {
             .expect("poll broker")
             .expect("republished live offer");
         assert_eq!(redelivered.0.run_key, state.run_key);
+    }
+
+    #[tokio::test]
+    async fn execution_home_activity_heartbeat_and_completion_check_current_and_stale_epochs() {
+        for (repair, reacquire) in [(false, false), (true, false), (false, true), (true, true)] {
+            let repo = Arc::new(InMemoryStore::with_shard_count(8));
+            let runtime =
+                super::super::repair_tests::home_runtime(repo.clone(), ShardId(0), repair);
+            for index in 0..8 {
+                let mut owner = runtime.shard_owner.write().unwrap();
+                owner.record_acquired(ShardId(index), ShardEpoch(17));
+                owner.mark_active(ShardId(index));
+            }
+            let (state, token, _) = seed_started_activity(&runtime, &repo, None).await;
+            let home = runtime.execution_home(&state);
+            let other = crate::shard::shard_for(state.run_key, 8);
+            assert_ne!(other, home);
+            {
+                let mut owner = runtime.shard_owner.write().unwrap();
+                *owner = ShardOwner::new(8);
+                if repair {
+                    owner.enable_reconciliation();
+                }
+                owner.record_acquired(home, ShardEpoch(17));
+                owner.mark_active(home);
+            }
+            runtime
+                .record_activity_heartbeat(token.clone(), Some(payloads(b"home-heartbeat")), None)
+                .await
+                .unwrap();
+            {
+                let mut owner = runtime.shard_owner.write().unwrap();
+                owner.record_acquired(other, ShardEpoch(33));
+                owner.mark_active(other);
+            }
+            assert_eq!(token.shard_epoch, ShardEpoch(17));
+            let wrong_epoch = ActivityTaskToken {
+                shard_epoch: ShardEpoch(33),
+                ..token.clone()
+            };
+            assert!(
+                runtime
+                    .record_activity_heartbeat(wrong_epoch.clone(), None, None)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                runtime
+                    .complete_activity_task(
+                        wrong_epoch,
+                        Payloads::default(),
+                        None,
+                        RequestContext::unattributed(OffsetDateTime::now_utc())
+                    )
+                    .await
+                    .is_err()
+            );
+            if reacquire {
+                {
+                    let mut owner = runtime.shard_owner.write().unwrap();
+                    owner.record_acquired(home, ShardEpoch(18));
+                    owner.mark_active(home);
+                }
+                let before = repo.snapshot().await.unwrap();
+                let error = runtime
+                    .record_activity_heartbeat(token, Some(payloads(b"stale-heartbeat")), None)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.to_string(), "activity heartbeat shard epoch mismatch");
+                assert_eq!(repo.snapshot().await.unwrap(), before);
+            } else {
+                assert!(matches!(
+                    runtime
+                        .complete_activity_task(
+                            token,
+                            Payloads::default(),
+                            None,
+                            RequestContext::unattributed(OffsetDateTime::now_utc())
+                        )
+                        .await
+                        .unwrap(),
+                    CommitResult::Applied { .. }
+                ));
+            }
+            runtime.runtime_shutdown.begin_shutdown();
+            runtime
+                .runtime_shutdown
+                .wait(std::time::Instant::now() + std::time::Duration::from_secs(10))
+                .await
+                .unwrap();
+        }
     }
 }

@@ -107,6 +107,9 @@ pub(crate) async fn legacy_copy(
     }
     let legacy = InMemoryStore::from_snapshot(&snapshot).unwrap();
     assert_eq!(legacy.snapshot().await.unwrap(), snapshot);
+    tokeira_storage::prepare_execution_placement(&legacy)
+        .await
+        .unwrap();
     legacy
 }
 

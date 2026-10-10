@@ -1921,7 +1921,7 @@ where
             logical_seq: pending.logical_seq,
             started_event_id,
             attempt: pending.attempt,
-            shard_epoch: self.current_shard_epoch(new_state.run_key).await?,
+            shard_epoch: self.current_shard_epoch(&new_state).await?,
         };
         self.delivery_metrics
             .record_latency(&offered.queue, entered_at.elapsed());
@@ -1985,7 +1985,7 @@ where
             logical_seq: pending.logical_seq,
             started_event_id,
             attempt: pending.attempt,
-            shard_epoch: self.current_shard_epoch(state.run_key).await?,
+            shard_epoch: self.current_shard_epoch(state).await?,
         };
         let queue = QueueKey {
             namespace_id: state.namespace_id,

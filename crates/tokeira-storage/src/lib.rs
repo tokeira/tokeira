@@ -32,6 +32,9 @@ pub mod dsql;
 mod growth;
 pub mod memory;
 pub mod metrics;
+pub mod placement_upgrade;
+#[cfg(test)]
+mod placement_upgrade_tests;
 #[cfg(test)]
 mod preservation_property_tests;
 #[cfg(test)]
@@ -48,6 +51,7 @@ pub use api::*;
 pub use chasm::*;
 pub use memory::*;
 pub use metrics::*;
+pub use placement_upgrade::*;
 pub use recovery_index::*;
 pub use worker_compute::*;
 pub use workflow_dispatch::*;

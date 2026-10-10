@@ -8127,6 +8127,22 @@ mod tests {
         }
     }
 
+    /// A snapshot of version 4, whose dispatch entries and enqueue ops carry an
+    /// activity's input, is refused before its document is decoded
+    /// (`activity-inputs-from-history`).
+    #[test]
+    fn from_snapshot_refuses_v4_whose_entries_carry_inputs() {
+        assert_eq!(SNAPSHOT_FORMAT_VERSION, 5);
+        let bytes = postcard::to_allocvec(&4_u32).unwrap();
+        match InMemoryStore::from_snapshot(&bytes) {
+            Err(SnapshotError::VersionMismatch { found, supported }) => {
+                assert_eq!(found, 4);
+                assert_eq!(supported, 5);
+            }
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn truncated_and_padded_snapshots_are_refused() {
         let store = InMemoryStore::default();

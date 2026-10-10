@@ -4,11 +4,11 @@
 
 This design covers the `LeaseRepository` implementation for `DsqlRunRepository`, providing `try_acquire_bundle` and `renew_bundle` against the existing `shard_lease` table. This is Feature 4 from the umbrella `dsql-storage-implementation` spec.
 
-The central design principle is **one lease operation = one fenced DSQL transaction**. Both methods acquire a `DbClass::Control` permit and open a transaction. `try_acquire_bundle` first attempts `INSERT ... ON CONFLICT DO NOTHING`; if the insert is a no-op because the row already exists, it then executes a conditional `UPDATE` to handle active same-owner refresh, expired takeover, or rejection. `renew_bundle` uses `SELECT ... FOR UPDATE` followed by a conditional `UPDATE`. DSQL's OCC detects concurrent mutations at commit time — conflicts surface as errors without silent retry.
+The central design principle is **one lease operation = one fenced DSQL transaction**. Both methods acquire a `DbClass::Control` permit and open a transaction. `try_acquire_bundle` first attempts `INSERT ... ON CONFLICT DO NOTHING`; if the insert is a no-op because the row already exists, it then tries a refresh of the owner's unexpired lease, which leaves the epoch, and then a takeover of a released or expired lease, which advances it; otherwise it rejects. `renew_bundle` is one conditional `UPDATE` of the expiry. Only a change of ownership writes the epoch, and nothing reads the lease `FOR UPDATE`, so a renewal or a refresh aborts none of the owner's fenced writes ([bundle-lease-fence](../bundle-lease-fence/design.md)). DSQL's OCC detects concurrent mutations at commit time — conflicts surface as errors without silent retry.
 
-The in-memory `LeaseRepository` in `memory.rs` is the behavioral reference for basic semantics, but the DSQL implementation adds two capabilities the in-memory store omits:
+The in-memory `LeaseRepository` in `memory.rs` is the behavioral reference for basic semantics. The DSQL implementation has two capabilities the in-memory store has only when it is built with a lease duration (`InMemoryStore::with_lease_duration`, by the tokio clock, for tests):
 
-1. **Expiry-based takeover.** The in-memory store always rejects when a lease exists. The DSQL implementation checks `lease_expiry` against the current wall-clock time and allows takeover of expired leases.
+1. **Expiry-based takeover.** Without a lease duration, the in-memory store rejects while a lease is held. The DSQL implementation checks `lease_expiry` against the current wall-clock time and allows takeover of expired leases.
 2. **Same-owner re-acquire is idempotent.** When the current owner calls `try_acquire_bundle` on a shard it already holds (active), the DSQL implementation refreshes the expiry without incrementing the epoch. This avoids the stale-renewer self-fencing problem — the runtime's existing renewer continues working with the same epoch. For expired same-owner leases, the epoch IS incremented (takeover semantics).
 
 ### Key Design Decisions
@@ -19,9 +19,9 @@ The in-memory `LeaseRepository` in `memory.rs` is the behavioral reference for b
 
 3. **No internal retry.** OCC conflicts (SQLSTATE 40001) are surfaced as `anyhow::Error` to the caller. The runtime's lease manager decides whether and when to retry. This matches the `commit_transition` pattern from Feature 2.
 
-4. **`FOR UPDATE` on primary key.** DSQL requires `FOR UPDATE` to use an equality predicate on the primary key. Since `shard_id` is the sole PK column of `shard_lease`, the `SELECT ... WHERE shard_id = $1 FOR UPDATE` pattern satisfies this constraint.
+4. **No `FOR UPDATE`.** DSQL treats a `FOR UPDATE` read as a write of the row, which would abort the owner's fenced writes, so renewal is one conditional update instead, and every statement of the lease uses the primary key's equality predicate (`bundle-lease-fence`).
 
-5. **Application clock for expiry.** Both the expiry comparison and expiry computation use the same application-side `OffsetDateTime::now_utc()` value, bound as a SQL parameter (`$4` for comparison, `$3` for the new expiry). This avoids mixing SQL `now()` with application-computed values under clock skew.
+5. **Application clock for expiry.** Both the expiry comparison and expiry computation use the same application-side `OffsetDateTime::now_utc()` value, bound as a SQL parameter (`$5` for comparison, `$3` for the new expiry). This avoids mixing SQL `now()` with application-computed values under clock skew.
 
 6. **Epoch stored as `i64` with checked conversions.** `ShardEpoch` is `u64` in Rust but DSQL's `BIGINT` is signed `i64`. Conversions use the existing checked `i64_from_u64` / `u64_from_i64` helpers from `DsqlRunRepository` — the same helpers used by `commit_transition` in Feature 2. No unchecked `as` casts. Values above `i64::MAX` are rejected on write; negative values are rejected on read.
 
@@ -80,11 +80,11 @@ sequenceDiagram
     REPO->>DIR: acquire(DbClass::Control)
     DIR-->>REPO: DsqlPermit
     REPO->>DB: BEGIN
-    REPO->>DB: INSERT INTO shard_lease ... ON CONFLICT DO NOTHING
-    REPO->>DB: UPDATE shard_lease SET owner, epoch = CASE active_same_owner THEN epoch ELSE epoch+1 END, lease_expiry WHERE shard_id = $1 AND (owner = $2 OR lease_expiry <= $app_now)
+    REPO->>DB: INSERT INTO shard_lease ... ON CONFLICT DO NOTHING RETURNING epoch
+    REPO->>DB: refresh: UPDATE shard_lease SET lease_expiry, node_endpoint WHERE shard_id = $1 AND owner = $2 AND lease_expiry > $app_now RETURNING epoch
+    REPO->>DB: takeover: UPDATE shard_lease SET owner, epoch = epoch + 1, lease_expiry, node_endpoint WHERE shard_id = $1 AND (owner IS NULL OR lease_expiry <= $app_now) RETURNING epoch
 
-    alt INSERT or UPDATE affected rows (acquired)
-        REPO->>DB: SELECT epoch FROM shard_lease WHERE shard_id = $1
+    alt a statement returned the epoch (acquired)
         REPO->>DB: COMMIT
         REPO-->>RT: LeaseOutcome::Acquired { epoch }
     else neither affected rows (rejected — active lease, different owner)
@@ -111,18 +111,15 @@ sequenceDiagram
     REPO->>DIR: acquire(DbClass::Control)
     DIR-->>REPO: DsqlPermit
     REPO->>DB: BEGIN
-    REPO->>DB: SELECT owner, epoch FROM shard_lease WHERE shard_id = $1 FOR UPDATE
+    REPO->>DB: UPDATE shard_lease SET lease_expiry, node_endpoint WHERE shard_id = $1 AND owner = $2 AND epoch = $5
 
-    alt no row exists
-        REPO->>DB: ROLLBACK
-        REPO-->>RT: LeaseOutcome::Rejected { owner: "", epoch: ZERO }
-    else owner matches AND epoch matches
-        REPO->>DB: UPDATE shard_lease SET lease_expiry = $1 WHERE shard_id = $2
+    alt one row changed
         REPO->>DB: COMMIT
         REPO-->>RT: LeaseOutcome::Renewed { epoch }
-    else owner or epoch mismatch
+    else no row changed
+        REPO->>DB: SELECT owner, epoch FROM shard_lease WHERE shard_id = $1
         REPO->>DB: ROLLBACK
-        REPO-->>RT: LeaseOutcome::Rejected { current_owner, current_epoch }
+        REPO-->>RT: LeaseOutcome::Rejected { current_owner, current_epoch } (or "" and ZERO without a row)
     end
 
     alt SQLSTATE 40001 on COMMIT
@@ -179,72 +176,46 @@ impl LeaseRepository for DsqlRunRepository {
 
 ### `try_acquire_bundle` SQL
 
-The method uses a two-statement transactional acquire path. It first attempts `INSERT ... ON CONFLICT DO NOTHING` for the new-lease path. If that insert affects zero rows, the row already exists, so the method executes a conditional `UPDATE` for active same-owner refresh, expired takeover, or rejection. This eliminates the race condition where two first-time acquirers both observe no row and race on a plain INSERT, while keeping the rows-affected contract unambiguous.
+The method acquires in one transaction of up to three statements, each of which writes the epoch only when ownership changes ([bundle-lease-fence](../bundle-lease-fence/design.md)). It first attempts `INSERT ... ON CONFLICT DO NOTHING` for the new-lease path. If that inserts nothing, the row already exists: a refresh renews the owner's unexpired lease and leaves the epoch, and otherwise a takeover claims a released or expired lease and advances it. This eliminates the race where two first-time acquirers both observe no row and race on a plain INSERT, and a refresh never writes a key column, so it aborts none of the owner's fenced writes.
 
 ```sql
--- Transactional acquire: insert new lease or update existing.
--- Uses two SQL statements in one transaction to handle the three cases:
---
--- 1. No row exists → INSERT succeeds, epoch = 1
--- 2. Row exists, active same owner → UPDATE refreshes expiry, epoch unchanged (idempotent)
--- 3. Row exists, expired same owner → UPDATE increments epoch (takeover)
--- 4. Row exists, expired different owner → UPDATE sets new owner, epoch + 1 (takeover)
--- 5. Row exists, active different owner → no update (0 rows affected, rejected)
---
--- $1 = shard_id UUID, $2 = owner, $3 = new_expiry, $4 = app_now
+-- $1 = shard_id UUID, $2 = owner, $3 = new_expiry, $4 = node_endpoint, $5 = app_now
 
--- Step 1: Attempt insert for new lease
-INSERT INTO shard_lease (shard_id, owner, epoch, lease_expiry)
-VALUES ($1, $2, 1, $3)
+-- 1. No row exists: a new lease at epoch 1.
+INSERT INTO shard_lease (shard_id, owner, epoch, lease_expiry, node_endpoint)
+VALUES ($1, $2, 1, $3, $4)
 ON CONFLICT (shard_id) DO NOTHING
+RETURNING epoch
 
--- Step 2: Only if insert affected 0 rows, attempt conditional update.
--- Active same owner: refresh expiry, keep epoch (idempotent)
--- Expired same owner: takeover with epoch + 1
--- Expired different owner: takeover with new owner, epoch + 1
--- Active different owner: WHERE clause rejects, 0 rows affected
+-- 2. Active same owner: refresh the expiry and keep the epoch.
 UPDATE shard_lease
-SET owner = $2,
-    epoch = CASE
-        WHEN owner = $2 AND lease_expiry > $4 THEN epoch
-        ELSE epoch + 1
-    END,
-    lease_expiry = $3
-WHERE shard_id = $1
-  AND (owner = $2 OR lease_expiry <= $4)
+SET lease_expiry = $3, node_endpoint = $4
+WHERE shard_id = $1 AND owner = $2 AND lease_expiry > $5
+RETURNING epoch
+
+-- 3. Released, or expired whoever the owner: take over and advance the epoch.
+UPDATE shard_lease
+SET owner = $2, epoch = epoch + 1, lease_expiry = $3, node_endpoint = $4
+WHERE shard_id = $1 AND (owner IS NULL OR lease_expiry <= $5)
+RETURNING epoch
 ```
 
-After executing the necessary statement(s), the application reads the result:
-- If the INSERT affected 1 row: new lease acquired at epoch 1. Do not run the UPDATE, because the newly inserted row would also match the active same-owner predicate.
-- If the INSERT affected 0 rows and the UPDATE affected 1 row: either same-owner refresh (epoch unchanged) or expired takeover (epoch incremented). Read the authoritative epoch with `SELECT epoch FROM shard_lease WHERE shard_id = $1`.
-- If both INSERT and UPDATE affected 0 rows: active lease held by a different owner. Read the current holder with `SELECT owner, epoch FROM shard_lease WHERE shard_id = $1` and return `Rejected`.
+The first statement that returns an epoch acquires the lease at that epoch, and the later statements don't run. If none returns one, an active lease is held by a different owner: the method reads the current holder with `SELECT owner, epoch FROM shard_lease WHERE shard_id = $1` and returns `Rejected`.
 
-Both `$3` (new expiry = `app_now + lease_duration`) and `$4` (comparison = `app_now`) use the same application `OffsetDateTime::now_utc()` captured once at the start of the method. No SQL `now()` is used.
+Both `$3` (new expiry = `app_now + lease_duration`) and `$5` (comparison = `app_now`) use the same application `OffsetDateTime::now_utc()` captured once at the start of the method. No SQL `now()` is used.
 
-**DSQL validation**: The `INSERT ... ON CONFLICT DO NOTHING` + conditional `UPDATE ... CASE WHEN` pattern has been validated against a live Aurora DSQL cluster. All five cases work correctly: new-lease insert (epoch 1), active same-owner refresh (epoch unchanged), expired same-owner takeover (epoch incremented), expired different-owner takeover (epoch incremented), and active different-owner rejection (0 rows affected, row unchanged).
+**DSQL validation**: the five cases — a new lease at epoch 1, an active same-owner refresh with the epoch unchanged, expired same-owner and different-owner takeovers with the epoch incremented, and an active different-owner rejection — were first validated on a live Aurora DSQL cluster with the earlier single conditional `UPDATE`. `bundle-lease-fence` split that update so a refresh no longer assigns the epoch; its live suite covers the statements as they are.
 
 ### `renew_bundle` SQL
 
 ```sql
--- Step 1: Lock the row
-SELECT owner, epoch
-FROM shard_lease
-WHERE shard_id = $1
-FOR UPDATE
-```
-
-If no row: ROLLBACK, return `Rejected { owner: "", epoch: ZERO }`.
-
-If owner and epoch match:
-
-```sql
--- Step 2: Extend expiry
+-- One conditional update: the owner at its epoch extends its lease.
 UPDATE shard_lease
-SET lease_expiry = $1
-WHERE shard_id = $2
+SET lease_expiry = $3, node_endpoint = $4
+WHERE shard_id = $1 AND owner = $2 AND epoch = $5
 ```
 
-If owner or epoch mismatch: ROLLBACK, return `Rejected { current_owner, current_epoch }`.
+One changed row commits and returns `Renewed`. No changed row reads `SELECT owner, epoch FROM shard_lease WHERE shard_id = $1`, rolls back, and returns `Rejected` with the current owner and epoch, or `Rejected { owner: "", epoch: ZERO }` without a row. Nothing reads the lease `FOR UPDATE`. A renewal and a takeover update the same row, so DSQL commits at most one of them if they overlap.
 
 ### `DsqlPoolConfig` Changes
 
@@ -322,10 +293,10 @@ These use the same `i64_from_u64` / `u64_from_i64` helpers already used by `comm
 
 | Operation | Tables Read | Tables Written |
 |-----------|------------|----------------|
-| `try_acquire_bundle` | `shard_lease` (INSERT ON CONFLICT + optional SELECT) | `shard_lease` (INSERT or UPDATE via ON CONFLICT) |
-| `renew_bundle` | `shard_lease` (FOR UPDATE) | `shard_lease` (UPDATE) |
+| `try_acquire_bundle` | `shard_lease` (INSERT ON CONFLICT, then refresh or takeover, + SELECT on rejection) | `shard_lease` (INSERT or UPDATE) |
+| `renew_bundle` | `shard_lease` (SELECT after a refused update) | `shard_lease` (conditional UPDATE) |
 
-### `shard_lease` Table (Existing — No Changes)
+### `shard_lease` Table
 
 ```sql
 CREATE TABLE IF NOT EXISTS shard_lease (
@@ -337,7 +308,7 @@ CREATE TABLE IF NOT EXISTS shard_lease (
 );
 ```
 
-No schema changes are required. The table was created by Feature 1 with all columns needed for lease management.
+The table was created by Feature 1 with all columns needed for lease management. `bundle-lease-fence` adds a unique index on `(shard_id, epoch)`: `shard_id` alone is unique, and the index exists only to make the epoch a key column, which DSQL's conflict rules need for a takeover to fence a write.
 
 ### Write Set Size
 
@@ -401,7 +372,7 @@ If `director.acquire(DbClass::Control)` fails (semaphore closed, reservoir empty
 
 ### Transaction Failures
 
-If `BEGIN`, `SELECT ... FOR UPDATE`, `INSERT`, `UPDATE`, or `COMMIT` fails for reasons other than OCC (network error, DSQL internal error), the error propagates with `anyhow` context describing the operation and shard.
+If `BEGIN`, `SELECT`, `INSERT`, `UPDATE`, or `COMMIT` fails for reasons other than OCC (network error, DSQL internal error), the error propagates with `anyhow` context describing the operation and shard.
 
 ### Clock Skew
 

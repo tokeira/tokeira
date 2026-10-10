@@ -190,6 +190,10 @@ changes. No statement of a refresh or a renewal SHALL write the epoch, and no re
   changed row is `Renewed`. Otherwise it reads the row and answers `Rejected`, as today. Nothing reads the row
   `FOR UPDATE`.
 - **Release** stays an update that clears the owner and advances the epoch.
+- **The in-memory store** follows the same statements under its lock. Built with a lease duration
+  (`InMemoryStore::with_lease_duration`), it also expires a lease its owner hasn't renewed, by the tokio clock,
+  so tests can take a lapsed lease over; without one, a lease lasts until it is released. A renewal of a lease it
+  doesn't hold is refused, as on DSQL.
 - A renewal and a takeover update the same row, so DSQL commits at most one of them if they overlap. A renewal that
   loses answers a conflict, and the renewer's next attempt answers `Rejected`.
 
@@ -205,7 +209,10 @@ changes. No statement of a refresh or a renewal SHALL write the epoch, and no re
   - the takeover's recovery switch.
 
   A test audits every caller of the fenced write methods, so that none passes `Unfenced` under controller-managed
-  placement.
+  placement. Every fence comes from `ShardOwner`, which builds the home's lease fence under controller-managed
+  placement. The audit lists the runtime's writers file by file and fails on a new one, or on any
+  `WriteFence::Unfenced` outside `ShardOwner`. Behaviour tests refuse the lane's commit, a deletion and an activity
+  heartbeat under a lost fence.
 - **A lost fence.** `LeaseFenceLost` maps to `NotShardOwner`, which the lane doesn't retry. The runtime then cancels
   the home's acquisition, as a lost renewal does, so the home admits nothing more. A serialization failure is still
   retried, and the retry's fence read finds the new owner (Property 4).
@@ -270,7 +277,9 @@ Each is patched in alone, run, then reversed so the tree is byte-identical. Each
 - the fence checked in a separate transaction;
 - the fence read's comparison of the epoch removed;
 - renewal reading the row `FOR UPDATE`;
-- a refresh that writes the epoch;
+- a refresh that writes the epoch, in two forms. Advancing it fails the live suite. Assigning it its current value
+  fails only the check of the statements' text: live, such a refresh aborted none of the owner's fenced writes, so DSQL
+  doesn't count an unchanged key value as a write of a key column;
 - `LeaseFenceLost` retried as a conflict;
 - the local deadline left unset;
 - a materialization copy page without its fence read;

@@ -92,6 +92,14 @@ _For any_ commit attempt where the caller's epoch does not match the durable `sh
 
 **Validates: Requirements 2.1, 2.5**
 
+> **Since [bundle-lease-fence](../bundle-lease-fence/design.md).** On Aurora DSQL a plain read
+> conflicts with nothing, so an in-transaction read of `shard_lease.epoch` doesn't fence a takeover,
+> and `commit_transition_for_bundle` had kept its separate check. This property now holds through
+> that spec's fence: a `FOR KEY SHARE` read of the lease, whose epoch is a key column, in the
+> write's own transaction, comparing the owner and the epoch. A lost fence fails with
+> `LeaseFenceLost` rather than `CommitResult::Conflict`, and `WriteFence::Unfenced` replaces
+> `ShardEpoch::ZERO` (its Properties 1 and 4).
+
 Property 2: Preservation - Zero-Epoch Bypass
 
 _For any_ commit attempt where `epoch == ShardEpoch::ZERO`, the fixed code SHALL produce exactly the same behavior as the original code — skipping the epoch check and committing the transition based solely on the `transition_seq` OCC fence — preserving single-node and test behaviour.

@@ -1018,6 +1018,11 @@ where
         namespace_id: NamespaceId,
         initiated_event_id: i64,
     ) {
+        // The target namespace's name, which the resolving event records when
+        // the command named no namespace, as v1.31.0 records the name of the
+        // namespace it looks up from the target id
+        // (transfer_queue_active_task_executor.go:655-680 @ v1.31.0).
+        let target_namespace = self.resolve_namespace_name(namespace_id).await;
         // A workflow cannot signal-external ITSELF: same target namespace and
         // workflow id fails with EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND before
         // any delivery — "it does not matter if the run ID is a mismatch"
@@ -1037,6 +1042,7 @@ where
                 result: ExternalSignalResult::Failed {
                     cause: crate::signal_limits::EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND.to_string(),
                 },
+                target_namespace,
                 now: OffsetDateTime::now_utc(),
             });
             if let Err(error) = self
@@ -1160,6 +1166,7 @@ where
         let resolve = Command::ExternalSignalResolved(ExternalSignalResolvedRequest {
             initiated_event_id,
             result: signal_result,
+            target_namespace,
             now: OffsetDateTime::now_utc(),
         });
         if let Err(error) = self
@@ -1188,6 +1195,9 @@ where
         initiated_event_id: i64,
         reason: String,
     ) {
+        // The target namespace's name, for the resolving event, as for a signal
+        // (transfer_queue_active_task_executor.go:520-543 @ v1.31.0).
+        let target_namespace = self.resolve_namespace_name(namespace_id).await;
         // A workflow cannot cancel-external ITSELF: same target namespace and
         // workflow id fails with EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND before
         // any delivery — "it does not matter if the run ID is a mismatch"
@@ -1200,6 +1210,7 @@ where
                 result: ExternalCancelResult::Failed {
                     cause: "EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND".to_string(),
                 },
+                target_namespace,
                 now: OffsetDateTime::now_utc(),
             });
             if let Err(error) = self
@@ -1290,6 +1301,7 @@ where
         let resolve = Command::ExternalCancelResolved(ExternalCancelResolvedRequest {
             initiated_event_id,
             result: cancel_result,
+            target_namespace,
             now: OffsetDateTime::now_utc(),
         });
         if let Err(error) = self

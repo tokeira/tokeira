@@ -1825,6 +1825,10 @@ pub struct ExternalSignalResolvedRequest {
     pub initiated_event_id: i64,
     /// Whether the signal was delivered or failed.
     pub result: ExternalSignalResult,
+    /// The target namespace's name as the runtime looked it up from the target
+    /// namespace id, or none when it couldn't. The resolving event records it when
+    /// the command named no namespace.
+    pub target_namespace: Option<String>,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
 }
@@ -1846,6 +1850,10 @@ pub struct ExternalCancelResolvedRequest {
     pub initiated_event_id: i64,
     /// Whether the cancel was delivered or failed.
     pub result: ExternalCancelResult,
+    /// The target namespace's name as the runtime looked it up from the target
+    /// namespace id, or none when it couldn't. The resolving event records it when
+    /// the command named no namespace.
+    pub target_namespace: Option<String>,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
 }

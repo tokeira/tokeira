@@ -6467,6 +6467,7 @@ fn external_signal_resolved_signaled_no_wft() {
         .apply(
             LoadedRun::Existing(state),
             Command::ExternalSignalResolved(ExternalSignalResolvedRequest {
+                target_namespace: None,
                 initiated_event_id: 10,
                 result: ExternalSignalResult::Signaled,
                 now: now(),
@@ -6546,6 +6547,7 @@ fn external_cancel_resolved_success_no_wft() {
         .apply(
             LoadedRun::Existing(state),
             Command::ExternalCancelResolved(ExternalCancelResolvedRequest {
+                target_namespace: None,
                 initiated_event_id: 10,
                 result: ExternalCancelResult::CancelRequested,
                 now: now(),

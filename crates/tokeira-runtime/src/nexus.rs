@@ -207,14 +207,17 @@ pub struct NexusHttpFailureBody {
     pub details: serde_json::Value,
 }
 
-/// Resolves a namespace id to its human-readable name for outbound-metric tagging.
+/// Resolves a namespace id to its human-readable name for the runtime publisher.
 ///
-/// The caller-side StartOperation against an *External* endpoint is dispatched from the
-/// runtime publisher, which holds only the originator's [`RunKey`]/[`NamespaceId`] — never
-/// the namespace *name* (tokeira namespace ids are a non-invertible function of the name).
-/// The edge owns the name registry, so the bootstrap injects an implementation backed by
-/// the namespace cache; when absent (e.g. unit harnesses) the outbound metric simply omits
-/// the request rather than tagging it with an unresolved namespace.
+/// The publisher holds only namespace ids — never names (tokeira namespace ids are a
+/// non-invertible function of the name) — and needs a name twice: to tag the outbound
+/// metric of a caller-side StartOperation against an *External* endpoint with the
+/// originator's namespace, and to name the target namespace in the event that resolves an
+/// external signal or cancel request whose command named none. The edge owns the name
+/// registry, so the bootstrap injects an implementation backed by the namespace cache;
+/// when absent (e.g. unit harnesses) the outbound metric simply omits the request rather
+/// than tagging it with an unresolved namespace, and the resolving event keeps an empty
+/// name.
 #[async_trait]
 pub trait NexusNamespaceResolver: Send + Sync {
     /// The namespace name for `namespace_id`, or `None` when it is unknown.

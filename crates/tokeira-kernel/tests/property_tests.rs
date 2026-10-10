@@ -1906,6 +1906,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
         arb_external_signal_result().prop_map(move |result| {
             let state = with_pending_external_signal(make_open_state(now), 55);
             let req = ExternalSignalResolvedRequest {
+                target_namespace: None,
                 initiated_event_id: 55,
                 result,
                 now,
@@ -1918,6 +1919,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
         arb_external_cancel_result().prop_map(move |result| {
             let state = with_pending_external_cancel(make_open_state(now), 56);
             let req = ExternalCancelResolvedRequest {
+                target_namespace: None,
                 initiated_event_id: 56,
                 result,
                 now,
@@ -4227,6 +4229,7 @@ proptest! {
         let external_signal_transition = kernel().apply(
             LoadedRun::Existing(with_pending_external_signal(paused.clone(), 60)),
             Command::ExternalSignalResolved(ExternalSignalResolvedRequest {
+                target_namespace: None,
                 initiated_event_id: 60,
                 result: ExternalSignalResult::Signaled,
                 now,
@@ -4237,6 +4240,7 @@ proptest! {
         let external_cancel_transition = kernel().apply(
             LoadedRun::Existing(with_pending_external_cancel(paused.clone(), 61)),
             Command::ExternalCancelResolved(ExternalCancelResolvedRequest {
+                target_namespace: None,
                 initiated_event_id: 61,
                 result: ExternalCancelResult::CancelRequested,
                 now,
@@ -5280,12 +5284,165 @@ proptest! {
         prop_assert_eq!(transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::SignalExternalWorkflow { .. })), true);
     }
 
+    // Feature: external-command-namespace-default, Property 1: An empty namespace
+    // means the workflow's own
+    #[test]
+    fn property_external_command_namespace_defaults_to_the_workflows_own(
+        target_workflow_id in arb_small_string(),
+        named in proptest::option::of(arb_small_string()),
+        cancel in any::<bool>(),
+    ) {
+        let now = fixed_now();
+        let state = with_pending_wft(make_open_state(now), 32, Some(15), 1);
+        // The edge maps a named namespace to its id, and an empty one to the nil id.
+        let (target_namespace_id, target_namespace) = match &named {
+            Some(name) => (NamespaceId::new(), Some(name.clone())),
+            None => (NamespaceId(Default::default()), None),
+        };
+        let expected = if named.is_some() { target_namespace_id } else { state.namespace_id };
+        let command = if cancel {
+            WorkflowCommand::RequestCancelExternalWorkflowExecution {
+                target_namespace_id,
+                target_namespace: target_namespace.clone(),
+                target_workflow_id: WorkflowId(target_workflow_id),
+                target_run_id: None,
+                control: String::new(),
+            }
+        } else {
+            WorkflowCommand::SignalExternalWorkflowExecution {
+                target_namespace_id,
+                target_namespace: target_namespace.clone(),
+                target_workflow_id: WorkflowId(target_workflow_id),
+                target_run_id: None,
+                signal_name: "sig".into(),
+                input: Payloads::default(),
+                header: None,
+                control: String::new(),
+            }
+        };
+        let transition = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(32),
+                    started_event_id: 15,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                metering_metadata: None,
+                worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
+                sticky: None,
+                commands: vec![command],
+                force_new_workflow_task: false,
+                limits: Default::default(),
+                delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
+                now,
+                command_sizes: Vec::new(),
+            }),
+        ).unwrap();
+
+        // The initiated event records the command's namespace as given.
+        let initiated = transition.history_events.iter().find_map(|event| match &event.kind {
+            HistoryEventKind::SignalExternalWorkflowExecutionInitiated { namespace_id, namespace, .. }
+            | HistoryEventKind::RequestCancelExternalWorkflowExecutionInitiated { namespace_id, namespace, .. } => {
+                Some((*namespace_id, namespace.clone()))
+            }
+            _ => None,
+        });
+        prop_assert_eq!(initiated, Some((expected, target_namespace)));
+        // The pending request and the delivery use the same id.
+        let (pending_id, delivered) = if cancel {
+            let pending = transition.next_state.pending_external_cancels.values().next().unwrap();
+            let delivered = transition.dispatch_ops.iter().any(|op| matches!(
+                op,
+                DispatchOp::RequestCancelExternalWorkflow { namespace_id, .. } if *namespace_id == expected
+            ));
+            (pending.target_namespace_id, delivered)
+        } else {
+            let pending = transition.next_state.pending_external_signals.values().next().unwrap();
+            let delivered = transition.dispatch_ops.iter().any(|op| matches!(
+                op,
+                DispatchOp::SignalExternalWorkflow { namespace_id, .. } if *namespace_id == expected
+            ));
+            (pending.target_namespace_id, delivered)
+        };
+        prop_assert_eq!(pending_id, expected);
+        prop_assert!(delivered, "no delivery to {:?}", expected);
+    }
+
+    // Feature: external-command-namespace-default, Property 2: A resolving event
+    // names the target namespace
+    #[test]
+    fn property_a_resolving_event_names_the_target_namespace(
+        command_namespace in proptest::option::of(arb_small_string()),
+        looked_up in proptest::option::of(arb_small_string()),
+        signal_result in arb_external_signal_result(),
+        cancel_result in arb_external_cancel_result(),
+    ) {
+        let now = fixed_now();
+        let mut state =
+            with_pending_external_cancel(with_pending_external_signal(make_open_state(now), 60), 61);
+        state.pending_external_signals.get_mut(&60).unwrap().target_namespace =
+            command_namespace.clone();
+        state.pending_external_cancels.get_mut(&61).unwrap().target_namespace =
+            command_namespace.clone();
+        // The command's name when it gave one; otherwise the looked-up one.
+        let expected = command_namespace.or(looked_up.clone());
+
+        let signal = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::ExternalSignalResolved(ExternalSignalResolvedRequest {
+                initiated_event_id: 60,
+                result: signal_result,
+                target_namespace: looked_up.clone(),
+                now,
+            }),
+        ).unwrap();
+        match &signal.history_events[0].kind {
+            HistoryEventKind::ExternalWorkflowExecutionSignaled { namespace_id, namespace, .. }
+            | HistoryEventKind::SignalExternalWorkflowExecutionFailed { namespace_id, namespace, .. } => {
+                prop_assert_eq!(*namespace_id, state.namespace_id);
+                prop_assert_eq!(namespace, &expected);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let cancel = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::ExternalCancelResolved(ExternalCancelResolvedRequest {
+                initiated_event_id: 61,
+                result: cancel_result,
+                target_namespace: looked_up,
+                now,
+            }),
+        ).unwrap();
+        match &cancel.history_events[0].kind {
+            HistoryEventKind::ExternalWorkflowExecutionCancelRequested { namespace_id, namespace, .. }
+            | HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed { namespace_id, namespace, .. } => {
+                prop_assert_eq!(*namespace_id, state.namespace_id);
+                prop_assert_eq!(namespace, &expected);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
     #[test]
     fn property_46_external_signal_resolved_event_and_removal(result in arb_external_signal_result()) {
         let now = fixed_now();
         let transition = kernel().apply(
             LoadedRun::Existing(with_pending_external_signal(make_open_state(now), 60)),
             Command::ExternalSignalResolved(ExternalSignalResolvedRequest {
+                target_namespace: None,
                 initiated_event_id: 60,
                 result: result.clone(),
                 now,
@@ -5308,6 +5465,7 @@ proptest! {
         let transition = kernel().apply(
             LoadedRun::Existing(with_pending_external_cancel(make_open_state(now), 61)),
             Command::ExternalCancelResolved(ExternalCancelResolvedRequest {
+                target_namespace: None,
                 initiated_event_id: 61,
                 result: result.clone(),
                 now,
@@ -5333,6 +5491,7 @@ proptest! {
         let signal_transition = kernel().apply(
             LoadedRun::Existing(with_pending_external_signal(make_open_state(now), 70)),
             Command::ExternalSignalResolved(ExternalSignalResolvedRequest {
+                target_namespace: None,
                 initiated_event_id: 70,
                 result: signal_result,
                 now,
@@ -5343,6 +5502,7 @@ proptest! {
         let cancel_transition = kernel().apply(
             LoadedRun::Existing(with_pending_external_cancel(make_open_state(now), 71)),
             Command::ExternalCancelResolved(ExternalCancelResolvedRequest {
+                target_namespace: None,
                 initiated_event_id: 71,
                 result: cancel_result,
                 now,
@@ -8901,6 +9061,7 @@ fn step_input(
         }),
         RunStep::ExternalSignalResolved => {
             Command::ExternalSignalResolved(ExternalSignalResolvedRequest {
+                target_namespace: None,
                 initiated_event_id: *state.pending_external_signals.keys().next()?,
                 result: ExternalSignalResult::Signaled,
                 now: at,

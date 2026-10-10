@@ -1,2 +1,30 @@
 syntax = "proto3";
 package tokeira.internal.runtime.v1;
+
+// Queue-home matching delegates the authoritative start to the execution owner.
+// Only this operation is exposed; it cannot submit arbitrary kernel commands.
+service WorkflowTaskDispatch {
+  rpc StartWorkflowTask(StartWorkflowTaskRequest) returns (StartWorkflowTaskResponse);
+}
+
+message StartWorkflowTaskRequest {
+  bytes run_key = 1;
+  uint64 logical_seq = 2;
+  string namespace = 3;
+  string task_queue = 4;
+  optional string deployment = 5;
+  optional string build_id = 6;
+  string worker_identity = 7;
+  bool sticky = 8;
+  optional string normal_task_queue = 9;
+  bool scoped_versioned = 10;
+}
+
+message StartWorkflowTaskResponse {
+  // Same-release start metadata; the polling edge reads history bounded by
+  // the committed last event in this value.
+  bytes started_task_json = 1;
+  // Update messages and buffered queries selected by the execution owner.
+  // Their response waiters remain on that owner. The entire response is capped.
+  bytes decorations_json = 2;
+}

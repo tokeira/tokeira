@@ -819,29 +819,50 @@ async fn restart_preserves_wft_completion_routing_metadata() -> Result<()> {
     let runtime_after_restart = recovering_runtime_with_store(store.clone());
     runtime_after_restart.acquire_shard(ShardId(0)).await?;
 
+    // Reconstruction retains the sticky deadline. Cold affinity alone cannot
+    // make a normal queue discover this task before its authoritative timeout.
+    assert!(
+        runtime_after_restart
+            .poll_workflow_task(
+                queue(namespace_id, queue_name),
+                WorkerIdentity("worker-b".into()),
+                tokio::time::Duration::ZERO,
+            )
+            .await?
+            .is_none()
+    );
+    let pending = completed.pending_workflow_task.as_ref().unwrap();
+    runtime_after_restart
+        .submit(
+            started.run_key,
+            Command::WorkflowTaskTimedOut(tokeira_kernel::WorkflowTaskTimedOutRequest {
+                logical_seq: pending.logical_seq,
+                started_event_id: 0,
+                timeout_type: tokeira_kernel::WorkflowTaskTimeoutType::ScheduleToStart,
+                now: pending.schedule_to_start_deadline.unwrap() + Duration::milliseconds(1),
+            }),
+        )
+        .await?;
+
     let recovered_task = runtime_after_restart
         .poll_workflow_task(
             queue(namespace_id, queue_name),
             WorkerIdentity("worker-b".to_string()),
-            tokio::time::Duration::ZERO,
+            tokio::time::Duration::from_secs(1),
         )
         .await?
         .expect("recovered pending WFT should retain durable affinity and versioned routing");
     assert_eq!(recovered_task.run_key, started.run_key);
-    // Broker liveness is intentionally volatile. After restart there is no
-    // observation for the durable sticky queue, so recovery falls back to the
-    // normal versioned queue without clearing affinity. Partial-history attach
-    // requires actual sticky-queue dispatch (`setHistoryForRecordWfTaskStartedResp`,
-    // recordworkflowtaskstarted/api.go:272-278 @ v1.31.0).
+    // The timeout has rescheduled on the normal queue, so its delivery sends
+    // full history (`setHistoryForRecordWfTaskStartedResp`,
+    // recordworkflowtaskstarted/api.go @ v1.31.0).
     assert!(!recovered_task.is_sticky_match);
 
     Ok(())
 }
 
-// A WFT published with NO poller parked ages past the grace window into the
-// durable backlog; a poller arriving later must still receive it via the
-// demand-driven drain loop (TestGetWorkflowExecutionHistory_All starts the
-// workflow 8s before its first poll and hung forever on this path).
+// A late poll still receives work whose initial publication preceded demand;
+// durable discovery also recovers it after its bounded offer expires.
 #[tokio::test]
 async fn late_poller_receives_workflow_task_from_backlog() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
@@ -852,7 +873,6 @@ async fn late_poller_receives_workflow_task_from_backlog() -> Result<()> {
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
         BacklogConfig {
-            workflow_grace_window: tokio::time::Duration::from_millis(100),
             activity_grace_window: tokio::time::Duration::from_millis(100),
             grace_scan_interval: tokio::time::Duration::from_millis(25),
             drain_interval: tokio::time::Duration::from_millis(50),

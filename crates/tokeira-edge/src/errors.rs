@@ -281,6 +281,15 @@ impl EdgeError {
 
 impl From<anyhow::Error> for EdgeError {
     fn from(value: anyhow::Error) -> Self {
+        // Preserve an internal start's envelope refusal through the public
+        // poll boundary. Matching returns non-busy ResourceExhausted to the
+        // worker so it backs off (service/matching/matching_engine.go,
+        // PollWorkflowTaskQueue @ v1.31.0).
+        if let Some(status) = value.downcast_ref::<tonic::Status>()
+            && status.code() == tonic::Code::ResourceExhausted
+        {
+            return Self::ResourceExhausted(status.message().to_owned());
+        }
         // A failed activity-token revalidation surfaces as v1.31.0's
         // `ErrActivityTaskNotFound`: code NotFound with this exact message,
         // asserted verbatim by clients (`service/history/consts/const.go:44-45
@@ -453,15 +462,18 @@ impl From<anyhow::Error> for EdgeError {
         // A workflow-task mutation whose token no longer matches the run's
         // current task — the task was completed, timed out, or superseded — is
         // v1.31.0's `ErrWorkflowTaskNotFound`: NOT_FOUND "Workflow task not
-        // found." (consts/const.go @ v1.31.0). Asserted verbatim by the
-        // speculative start-to-close timeout leaf, whose late completion races
-        // the in-memory timeout (`TestSpeculativeWorkflowTask_StartToCloseTimeout`).
+        // found." (consts/const.go @ v1.31.0). A missing pending task has the
+        // same response (service/history/api/respondworkflowtaskcompleted/api.go
+        // @ v1.31.0). The speculative start-to-close timeout leaf asserts this
+        // verbatim when its late completion races the in-memory timeout
+        // (`TestSpeculativeWorkflowTask_StartToCloseTimeout`).
         if value
             .downcast_ref::<tokeira_runtime::KernelRejected>()
             .is_some_and(|rejected| {
                 matches!(
                     rejected.0,
-                    tokeira_kernel::Reject::WorkflowTaskSeqMismatch { .. }
+                    tokeira_kernel::Reject::NoPendingWorkflowTask
+                        | tokeira_kernel::Reject::WorkflowTaskSeqMismatch { .. }
                         | tokeira_kernel::Reject::WorkflowTaskTokenMismatch
                         | tokeira_kernel::Reject::WorkflowTaskNotStarted { .. }
                 )

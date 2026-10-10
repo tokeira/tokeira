@@ -1523,6 +1523,126 @@
         "proto3_optional": false,
         "type": "TYPE_STRING",
         "type_name": ""
+      },
+      {
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "field": "build_id",
+        "number": 6,
+        "type": "TYPE_STRING",
+        "type_name": "",
+        "label": "LABEL_OPTIONAL",
+        "oneof": 1,
+        "proto3_optional": true
+      },
+      {
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskResponse",
+        "field": "decorations_json",
+        "number": 2,
+        "type": "TYPE_BYTES",
+        "type_name": "",
+        "label": "LABEL_OPTIONAL",
+        "oneof": null,
+        "proto3_optional": false
+      },
+      {
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "field": "deployment",
+        "number": 5,
+        "type": "TYPE_STRING",
+        "type_name": "",
+        "label": "LABEL_OPTIONAL",
+        "oneof": 0,
+        "proto3_optional": true
+      },
+      {
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "field": "logical_seq",
+        "number": 2,
+        "type": "TYPE_UINT64",
+        "type_name": "",
+        "label": "LABEL_OPTIONAL",
+        "oneof": null,
+        "proto3_optional": false
+      },
+      {
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "field": "namespace",
+        "number": 3,
+        "type": "TYPE_STRING",
+        "type_name": "",
+        "label": "LABEL_OPTIONAL",
+        "oneof": null,
+        "proto3_optional": false
+      },
+      {
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "field": "normal_task_queue",
+        "number": 9,
+        "type": "TYPE_STRING",
+        "type_name": "",
+        "label": "LABEL_OPTIONAL",
+        "oneof": 2,
+        "proto3_optional": true
+      },
+      {
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "field": "run_key",
+        "number": 1,
+        "type": "TYPE_BYTES",
+        "type_name": "",
+        "label": "LABEL_OPTIONAL",
+        "oneof": null,
+        "proto3_optional": false
+      },
+      {
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "field": "scoped_versioned",
+        "number": 10,
+        "type": "TYPE_BOOL",
+        "type_name": "",
+        "label": "LABEL_OPTIONAL",
+        "oneof": null,
+        "proto3_optional": false
+      },
+      {
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskResponse",
+        "field": "started_task_json",
+        "number": 1,
+        "type": "TYPE_BYTES",
+        "type_name": "",
+        "label": "LABEL_OPTIONAL",
+        "oneof": null,
+        "proto3_optional": false
+      },
+      {
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "field": "sticky",
+        "number": 8,
+        "type": "TYPE_BOOL",
+        "type_name": "",
+        "label": "LABEL_OPTIONAL",
+        "oneof": null,
+        "proto3_optional": false
+      },
+      {
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "field": "task_queue",
+        "number": 4,
+        "type": "TYPE_STRING",
+        "type_name": "",
+        "label": "LABEL_OPTIONAL",
+        "oneof": null,
+        "proto3_optional": false
+      },
+      {
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "field": "worker_identity",
+        "number": 7,
+        "type": "TYPE_STRING",
+        "type_name": "",
+        "label": "LABEL_OPTIONAL",
+        "oneof": null,
+        "proto3_optional": false
       }
     ],
     "files": [
@@ -1583,7 +1703,9 @@
       "tokeira.internal.controller.v1.RuntimeMembershipRequest",
       "tokeira.internal.controller.v1.RuntimeRegistration",
       "tokeira.internal.controller.v1.ScaleInCandidate",
-      "tokeira.internal.controller.v1.SubscribeRoutingRequest"
+      "tokeira.internal.controller.v1.SubscribeRoutingRequest",
+      "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+      "tokeira.internal.runtime.v1.StartWorkflowTaskResponse"
     ],
     "services": [
       {
@@ -1689,6 +1811,14 @@
         "output": ".tokeira.internal.controller.v1.ControllerDirective",
         "server_streaming": true,
         "service": "tokeira.internal.controller.v1.PlacementController"
+      },
+      {
+        "service": "tokeira.internal.runtime.v1.WorkflowTaskDispatch",
+        "method": "StartWorkflowTask",
+        "input": ".tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "output": ".tokeira.internal.runtime.v1.StartWorkflowTaskResponse",
+        "client_streaming": false,
+        "server_streaming": false
       }
     ]
   },

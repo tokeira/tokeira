@@ -3449,6 +3449,10 @@ where
     // The edge always exposes Worker Deployment v2 RPCs. Wiring the
     // repository here keeps their registry durable for both in-memory and
     // DSQL backends instead of falling back to a detached test registry.
+    .with_queue_placement(
+        effective_config.infrastructure.placement.partition_count,
+        effective_config.infrastructure.placement.bundle_count,
+    )
     .with_worker_deployment_repository(worker_deployment_repository)
     .with_task_queue_config_store(task_queue_config_store.clone())
     .with_delivery_mode_provider(Arc::new(
@@ -3458,6 +3462,7 @@ where
             },
         ),
     ));
+    runtime.ready().await?;
     let runtime = Arc::new(runtime);
     let runtime_tasks = runtime.shutdown_handle();
     let engine_tasks = RuntimeShutdownHandle::new();
@@ -3664,6 +3669,11 @@ where
                 tracing::warn!(?error, "routing subscription exited");
             }
         });
+        runtime.set_workflow_task_starter(Arc::new(
+            tokeira_edge::grpc::workflow_dispatch::RemoteWorkflowTaskStarter::new(
+                routing_cache.clone(),
+            ),
+        ));
         Arc::new(CacheBackedRouter::new(routing_cache, node_id))
     } else {
         Arc::new(LocalOnlyRouter)
@@ -3770,6 +3780,11 @@ where
         )),
         nexus_endpoint_limits,
     ));
+    let dispatch_grpc = tokeira_edge::grpc::workflow_dispatch::WorkflowTaskDispatchGrpc::new(
+        runtime.clone(),
+        interceptors.clone(),
+        workflow_service.clone(),
+    );
     let operator_service = OperatorService::new(operator_api, interceptors)
         .with_nexus_endpoints(nexus_endpoint_admin)
         .with_namespace_deletion(namespaces.clone(), Arc::new(workflow_service.clone()));
@@ -4080,6 +4095,7 @@ where
                     .add_service(workflow_grpc.into_service())
                     .add_service(operator_grpc.into_service())
                     .add_service(admin_grpc.into_service())
+                    .add_service(dispatch_grpc.into_service())
                     .add_service(reflection_v1)
                     .add_service(reflection_v1alpha)
                     .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal)
@@ -4095,6 +4111,7 @@ where
                     .add_service(workflow_grpc.into_service())
                     .add_service(operator_grpc.into_service())
                     .add_service(admin_grpc.into_service())
+                    .add_service(dispatch_grpc.into_service())
                     .add_service(reflection_v1)
                     .add_service(reflection_v1alpha)
                     .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal)
@@ -5461,6 +5478,45 @@ mod tests {
             Engine::start_with_embedded_config(config).await,
             Err(EmbeddedEngineStartError::InvalidConfiguration(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn unequal_home_counts_fail_before_descriptor_or_listener_work() {
+        let descriptor_path = std::env::temp_dir().join(format!(
+            "tokeira-home-count-preflight-{}.json",
+            IncarnationId::new()
+        ));
+        let mut config = EmbeddedEngineConfig::default();
+        config.server.infrastructure.placement.shard_count = 8;
+        config.server.infrastructure.placement.bundle_count = 4;
+        config.storage =
+            EmbeddedStorageConfig::ManagedDsql(tokeira_config::ManagedEmbeddedDsqlConfig {
+                intent: tokeira_config::ManagedClusterIntent::CreateOrRecover,
+                descriptor_path: descriptor_path.clone(),
+                region: "test-region".to_owned(),
+                migration_policy: None,
+                limits: tokeira_config::EmbeddedDsqlLimits::default(),
+                tags: std::collections::BTreeMap::new(),
+            });
+        let error = Engine::start_with_embedded_config(config.clone())
+            .await
+            .expect_err("unequal counts must fail before any AWS work");
+        assert!(matches!(
+            error,
+            EmbeddedEngineStartError::InvalidConfiguration(_)
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("shard_count (8) must equal bundle_count (4)")
+        );
+        assert!(!descriptor_path.exists());
+
+        let address = "127.0.0.1:0".parse().expect("test address");
+        let error = TokeiradHandle::start_in_memory_with_config(address, config.server)
+            .await
+            .expect_err("unequal counts must fail before binding a listener");
+        assert!(format!("{error:#}").contains("shard_count (8) must equal bundle_count (4)"));
     }
 
     #[tokio::test]

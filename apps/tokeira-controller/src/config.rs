@@ -91,6 +91,7 @@ impl ControllerProcessConfig {
         if self.cluster_name.is_empty() {
             anyhow::bail!("cluster_name must not be empty");
         }
+        self.to_controller_config().validate()?;
         Ok(())
     }
 
@@ -211,6 +212,15 @@ mod tests {
         assert_eq!(config.membership.budget_directive_validity_secs, 60);
 
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn process_validation_rejects_unequal_execution_home_counts() {
+        let config: ControllerProcessConfig = toml::from_str(
+            "dsql_endpoint = 'test.invalid'\ncluster_name = 'test'\n[placement]\nshard_count = 8\nbundle_count = 4\n",
+        ).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("placement.shard_count (8) must equal placement.bundle_count (4)"));
     }
 
     #[test]

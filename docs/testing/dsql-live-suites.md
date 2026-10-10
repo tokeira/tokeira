@@ -14,6 +14,53 @@ test twenty minutes. On a new cluster the first test that migrates applies the w
 embedded corpus and waits for every asynchronous index build, which takes about ten
 minutes, longer than the default profile's three-minute ceiling.
 
+## Shared-cluster order and isolation
+
+Run the preparation-sensitive suites in these separate commands, in this order,
+before any suite that acquires a shard lease. A nextest filter does not specify
+execution order. Placement preparation rejects every live lease, including the
+lease left by `dsql_shard_leasing::stale_epoch_is_fenced_after_expired_takeover`.
+The activity-input runtime fixture also prepares placement and belongs before
+lease-taking suites. Its repository and runtime use the same eight homes as
+the placement and acquisition fixtures.
+
+```bash
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_generated_complete_repair)'
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(placement_live_)'
+cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --test dsql_activity_inputs --test-threads 1
+cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs)'
+```
+
+Then run the remaining suites below. The generated complete-repair contract uses
+1024 logical homes and selects identities that derive to reserved home 1023; other
+shared-cluster fixtures use homes below 256. Both complete repair walks assert that
+every inspected key belongs to the current generated case, then remove its hot
+and dispatch rows. The contract still runs 100 cases under the unchanged timeout.
+Run it again after the bulk-write and other dispatch suites to exercise isolation
+against their leftovers. The projection-log pagination fixture uses a fresh
+positive partition and fresh run keys, then removes only those keys. Run its
+suite again after storage suites to check isolation without clearing their logs.
+
+Capture these counts before the first suite and after each suite to identify which
+fixtures leave work on shard zero. Keep the suite name and counts with local run
+results; the queries expose no workflow identifiers.
+
+```sql
+SELECT COUNT(*) AS shard_zero_recovery_candidates
+FROM workflow_hot
+WHERE shard_id = '746f6b65-6972-612d-7368-617200000000'
+  AND (recovery_needed = true OR recovery_needed IS NULL);
+SELECT COUNT(*) AS shard_zero_dispatch_rows
+FROM workflow_dispatch
+WHERE shard_id = '746f6b65-6972-612d-7368-617200000000';
+```
+
+The read-only `dsql_shared_cluster_counts` integration probe runs the same
+queries through SQLx. Set `TOKEIRA_DSQL_COUNTS_OUTPUT` to an operator-selected
+local file, then run that test with the URL gate and `dsql-integration` enabled.
+It writes only counts, or a `not bootstrapped` schema status on a fresh cluster.
+It neither creates tables nor takes a lease.
+
 ## URL-gated storage and projection
 
 Set `TOKEIRA_DSQL_TEST_DATABASE_URL` to a connection URL for a disposable test database.
@@ -51,10 +98,12 @@ point them at a database holding application data.
 | Storage `workflow_dispatch_live_generated_complete_repair` | 1 | Property 8: 100 generated two-walk repairs, interrupted head restarts, stale/orphan/sticky rows, NULL/false recovery flags and unchanged authoritative bytes; `dsql-integration`, URL gate only |
 | Storage `workflow_dispatch_live_repair_decode_and_encoding_failures_preserve_authority` | 1 | Wrong-home, corrupt hot bytes and invalid sequence encoding abort repair without partial changes; `dsql-integration`, URL gate only |
 | Runtime `workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs` | 1 | Real lease acquisition, interrupted recovery and rejected old-generation installs in all recovery trackers; runtime `dsql-integration`, URL gate only; run after storage schema bootstrap |
-| Storage `workflow_dispatch_live_query_plans` | 1 | Before/after queue Live/Exact and actual home page SQL, including full traversal of deep equal-time pages, with 16,384 seeded rows; set `TOKEIRA_WORKFLOW_DISPATCH_PLAN_OUTPUT` to save plans and selectivity; `dsql-integration`, URL gate only |
+| Storage `workflow_dispatch_live_query_plans` | 1 | Before/after queue Live/Exact and actual home page SQL, including full traversal of deep equal-time pages, with 16,384 seeded rows; set `TOKEIRA_WORKFLOW_DISPATCH_PLAN_OUTPUT` to save plans, selectivity, returned-row/page-statement counts and traversal durations; `dsql-integration`, URL gate only |
 | Storage `placement_live_` | 4 | Stopped-cluster hot/timer relocation, concurrent starters and late-page exclusion, raw legacy-encoded lease refusal, corruption diagnostics, reset preservation, duplicates/orphans, exact joined continuation plans and screening latency; `dsql-integration`, URL gate only |
 | Storage `dsql_bulk_` (`bulk_write_tests`) | 10 | The paged bulk writes: spills of more than 3,000 rows or 10 MiB, the deletion of a run owning more than 3,000 rows, resets whose copied history is over 1 MiB or 10 MiB or whose successor holds 3,500 timers, a reset of a closed workflow, a start between a reset's commit and its materialization, a purge resumed by two purges at once, and an abandoned materialization refusing its open transaction; `dsql-integration`, URL gate only |
 | Storage `dsql_lease_fence_` (`lease_fence_tests`) | 11 | The bundle lease fence through Tokeira's repository: stale transition commits and a deletion held after their fence reads while another node takes the home over, each aborted and refused on its retry; a materialization stopped between its transactions and a recovery switch, both refused after a takeover; 100 generated lease histories in which only a change of ownership writes the epoch; a lost fence under each loss and write, changing nothing; the owner's renewals and refreshes beside its writes in flight; a write that commits first aborting a takeover; and 100 generated interleavings of fenced writes with renewals, refreshes, takeovers and releases; `dsql-integration`, URL gate only |
+| Storage `workflow_dispatch_live_generated_legacy_disposal` | 1 | Property 10: 100 interrupted disposal and concurrent-commit cases, preserving activity bytes and authoritative state; `dsql-integration`, URL gate only |
+| Storage `workflow_dispatch_live_disposal_rolls_back_cancelled_page_and_keeps_bounds` | 1 | Cancellation before page commit leaves legacy rows intact; resumed pages inspect at most 64 keys; `dsql-integration`, URL gate only |
 | Storage `dsql_transaction_limits` | 6 | DSQL's transaction limits, apart from the bulk writes' budgets: 3,000 rows, deleted rows included and rows read `FOR UPDATE` not; 9 MiB of values but not 10, deleted rows not counted; 1 MiB a value; `dsql-integration`, URL gate only |
 | Storage `history_event_tests` | 4 | The one-lookup read of a history event: each event of batches of one and of several events and of a reset successor's copied batches; the lookup's plan on a run of 5,000 batches, for an event near the end and one near the start: a backward scan of the primary key with both key columns in its index condition, no sort, and the limit pushed down to storage, which returns one row; and dispatch rows and backlog entries an earlier release wrote with an activity's input; set `TOKEIRA_HISTORY_EVENT_PLAN_OUTPUT` to save the plans; `dsql-integration`, URL gate only |
 | Runtime `dsql_activity_inputs` | 3 | Activity inputs read from history: six pending activities with inputs of about 200 KB each, three activities scheduled in one batch, and a reset successor's activities delivered from its copied batches; runtime `dsql-integration`, URL gate only; run after storage schema bootstrap |
@@ -86,7 +135,7 @@ embedded migrations, and await ASYNC index readiness. Run them serially on an
 ephemeral cluster. The generated transaction suite also runs for several minutes.
 
 ```bash
-cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_)'
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_) & !test(workflow_dispatch_live_generated_complete_repair)'
 ```
 
 The placement suite uses the same gate and migrated database. Its screening
@@ -100,8 +149,9 @@ database with every other writer stopped.
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(placement_live_)'
 ```
 
-The runtime acquisition check reuses the migrated database from a preceding
-storage workflow-dispatch test. It adds no dependency; its opt-in feature enables
+The runtime acquisition check reuses the migrated database from the storage
+preparation suites above. It must precede lease-taking suites. It adds no dependency;
+its opt-in feature enables
 the existing DSQL storage dependency. Run it serially in the same cluster lifecycle:
 
 ```bash
@@ -128,8 +178,9 @@ cargo nextest run -p tokeira-storage --features dsql-integration --locked --prof
 
 The history-event tests also use only `TOKEIRA_DSQL_TEST_DATABASE_URL` and apply the
 embedded migrations. The runtime's activity-input tests reuse the migrated database from
-a preceding storage test, as the acquisition check does. Run both serially in the same
-cluster lifecycle:
+a preceding storage test, as the acquisition check does. Run the activity-input
+suite in the preparation-sensitive order above, before lease-taking suites. Both
+commands run serially in the same cluster lifecycle:
 
 ```bash
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(/^dsql::run_repository::history_event_tests::/)'

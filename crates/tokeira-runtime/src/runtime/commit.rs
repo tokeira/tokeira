@@ -14,12 +14,13 @@
 //!   admitting new commands.
 //! - [`submit_for_owned_shard`](TokeiraRuntime::submit_for_owned_shard) is the
 //!   internal entry point for task-completion follow-ups. It accepts a shard in
-//!   any owned state (even mid-sweep/drain) as long as ownership is recorded,
-//!   so in-flight work can finish a clean handoff.
+//!   recorded ownership at the facade, then takes the lane's Active-acquisition
+//!   permit before applying a transition. It cannot write across recovery.
 //!
 //! These runtime-local admission checks reject work whose execution home is
-//! unavailable and produce `NotShardOwner` for the edge. Storage retains its
-//! existing epoch checks; transaction-local competing-owner fencing is separate.
+//! unavailable and produce `NotShardOwner` for the edge. Authoritative storage
+//! writes additionally consume the transaction-local lease fence. Integrating that
+//! fence into acquisition repair remains separate from runtime admission.
 use super::*;
 use tokeira_observability::{
     ErrorBiasedSamplingReason, NotShardOwnerOperationLabel, mark_error_biased_sample,
@@ -43,6 +44,7 @@ where
     /// the edge maps to the retryable not-owner status. Routing is by run key,
     /// so the same run always serializes on the same lane.
     pub async fn submit(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
+        self.ready().await?;
         let shard_id = self.command_home(run_key, &command).await?;
         // Drain check precedes the active check on purpose: a draining shard is
         // still Active, so without this an external request would slip through
@@ -83,15 +85,27 @@ where
     ///
     /// This is the path for work generated *by* in-flight execution — activity
     /// resolutions, Nexus resolutions, workflow-task completions. It admits the
-    /// command as long as the shard's epoch is recorded at all (owned in any
-    /// state), so a sweeping or draining shard can still finish settling its
-    /// outstanding tasks. New external work must go through `submit` instead.
+    /// command only while ownership is recorded; the lane rechecks Active
+    /// acquisition under its serving permit. It cannot write through a sweep.
+    /// New external work must go through `submit` instead.
     pub(super) async fn submit_for_owned_shard(
         &self,
         run_key: RunKey,
         command: Command,
     ) -> Result<CommitResult> {
         let shard_id = self.command_home(run_key, &command).await?;
+        self.submit_for_owned_home(run_key, shard_id, command).await
+    }
+
+    /// Submit using identity already validated from the run's state. The lane
+    /// still validates ownership and the durable fence; avoiding an identity
+    /// request prevents a second wait behind an unrelated lane activation.
+    pub(super) async fn submit_for_owned_home(
+        &self,
+        run_key: RunKey,
+        shard_id: ShardId,
+        command: Command,
+    ) -> Result<CommitResult> {
         {
             let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
             if owner.epoch_of(shard_id).is_none() {

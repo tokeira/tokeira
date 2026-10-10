@@ -260,7 +260,6 @@ async fn a_lapsed_owner_admits_nothing_and_is_taken_over() {
     let store =
         Arc::new(InMemoryStore::with_shard_count(1).with_lease_duration(Duration::seconds(10)));
     let runtime = fenced_runtime(store.clone());
-    assert!(!runtime.shard_owner.read().unwrap().reconciliation_enabled());
     let acquired_at = tokio::time::Instant::now();
     let epoch = runtime.acquire_shard(HOME).await.unwrap();
     let request = start_request();

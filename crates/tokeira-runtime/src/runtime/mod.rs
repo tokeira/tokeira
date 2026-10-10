@@ -86,7 +86,7 @@ use crate::{
     workflow_rules::{matching_pause_rule, pause_info_for_rule},
 };
 
-mod activity;
+pub(crate) mod activity;
 mod commit;
 #[cfg(test)]
 mod discovery_tests;
@@ -105,7 +105,7 @@ pub use workflow_task::continue_as_new_advice_policy;
 
 pub(crate) use activity::{
     ActivityRetryDeps, ActivityRetryTarget, commit_activity_retry, exhausted_reason_to_retry_state,
-    reconcile_activity_dispatch_candidates, reconcile_due_activity_dispatches_once,
+    reconcile_due_activity_dispatches_once,
 };
 
 /// v1.31.0 default number of consecutive workflow-task problems required
@@ -211,10 +211,13 @@ pub struct TokeiraRuntime<R> {
     repo: Arc<R>,
     /// In-memory workflow-task broker.
     broker: InMemoryBroker,
-    discovery: Option<(
+    discovery: (
         crate::discovery::DiscoveryRegistry,
-        Arc<dyn crate::discovery::QueueHomeProvider>,
-    )>,
+        Arc<crate::discovery::PlacementQueueHomes>,
+    ),
+    startup: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
+    disposal_wake: Arc<tokio::sync::Notify>,
+    task_starter: RwLock<Option<Arc<dyn crate::WorkflowTaskStarter>>>,
     /// In-memory activity-task broker.
     activity_broker: InMemoryActivityBroker,
     /// Lane executor handles (one per lane).
@@ -741,59 +744,21 @@ where
         // wired by the server bootstrap, `None` for the simpler constructors and tests.
         namespace_resolver: Option<Arc<dyn NexusNamespaceResolver>>,
     ) -> Self {
-        Self::new_with_delivery(
-            repo,
-            lane_count,
-            config,
-            timer_config,
-            workflow_timeout_config,
-            backlog_config,
-            activity_timeout_config,
-            nexus_timeout_config,
-            nexus_registry,
-            nexus_client,
-            nexus_completion,
-            shard_count,
-            owner_identity,
-            node_endpoint,
-            seed_default_shard,
-            namespace_resolver,
-            None,
-        )
-    }
-
-    fn new_with_delivery(
-        repo: Arc<R>,
-        lane_count: usize,
-        config: LaneConfig,
-        timer_config: TimerScannerConfig,
-        workflow_timeout_config: WorkflowTimeoutScannerConfig,
-        backlog_config: BacklogConfig,
-        activity_timeout_config: ActivityTimeoutScannerConfig,
-        nexus_timeout_config: NexusTimeoutScannerConfig,
-        nexus_registry: NexusEndpointRegistry,
-        nexus_client: Arc<dyn NexusHttpClient>,
-        nexus_completion: NexusCompletionDeps,
-        shard_count: u32,
-        owner_identity: String,
-        node_endpoint: String,
-        seed_default_shard: bool,
-        // Resolves originator namespace names for the External-endpoint outbound metric;
-        // wired by the server bootstrap, `None` for the simpler constructors and tests.
-        namespace_resolver: Option<Arc<dyn NexusNamespaceResolver>>,
-        queue_homes: Option<Arc<dyn crate::discovery::QueueHomeProvider>>,
-    ) -> Self {
         assert!(
             repo.placement_ready(),
             "prepare_execution_placement must complete before runtime construction"
         );
-        // Temporary construction-only choice: bounded offers become the default
-        // only with dispatch reconstruction and backlog retirement at cutover.
-        let broker = queue_homes
-            .clone()
-            .map_or_else(InMemoryBroker::default, InMemoryBroker::with_discovery);
-        let discovery =
-            queue_homes.map(|homes| (crate::discovery::DiscoveryRegistry::default(), homes));
+        let shard_count = shard_count.max(1);
+        let shard_owner = Arc::new(RwLock::new(ShardOwner::new(shard_count)));
+        let homes = Arc::new(crate::discovery::PlacementQueueHomes {
+            owner: shard_owner.clone(),
+            counts: RwLock::new((shard_count, shard_count)),
+        });
+        let broker = InMemoryBroker::with_discovery(homes.clone());
+        let discovery = (crate::discovery::DiscoveryRegistry::default(), homes);
+        let needs_recovery = seed_default_shard && !repo.recovery_is_empty();
+        let (startup_tx, startup) =
+            tokio::sync::watch::channel((!needs_recovery).then_some(Ok(())));
         let activity_broker = InMemoryActivityBroker::default();
         let workflow_timeout_tracking = WorkflowTimeoutTrackingState::default();
         let wft_timeout_tracking = WftTimeoutTrackingState::default();
@@ -818,14 +783,6 @@ where
         nexus_task_broker.set_worker_compute_queue_metrics(worker_compute_queue_metrics.clone());
         let fairness_state = FairnessState::new();
         let runtime_drain = Arc::new(RuntimeDrain::default());
-        let shard_count = shard_count.max(1);
-        let shard_owner = Arc::new(RwLock::new(ShardOwner::new(shard_count)));
-        if discovery.is_some() {
-            shard_owner
-                .write()
-                .expect("shard owner lock poisoned")
-                .enable_reconciliation();
-        }
         if config.controller_managed_placement {
             shard_owner
                 .write()
@@ -888,7 +845,7 @@ where
             })
             .collect();
         *shared_lanes.lock().expect("shared_lanes lock poisoned") = lanes.clone();
-        if seed_default_shard {
+        if seed_default_shard && !needs_recovery {
             // Single-node / no-controller deployments have no placement
             // controller to grant shard ownership, so seed shard 0 as locally
             // owned at the zero epoch. Controller-managed deployments pass
@@ -1036,7 +993,8 @@ where
                 completion_callback_scanner_config,
                 completion_callback_scanner_cancel.clone(),
             )));
-        if let Some((registry, _)) = &discovery {
+        {
+            let registry = &discovery.0;
             let cancel = CancellationToken::new();
             runtime_shutdown.register_cancellation(cancel.clone());
             let _discovery_handle = runtime_shutdown.spawn(crate::discovery::run_discovery(
@@ -1049,11 +1007,20 @@ where
                 cancel,
             ));
         }
+        let disposal_wake = Arc::new(tokio::sync::Notify::new());
+        let _disposal = runtime_shutdown.spawn(crate::legacy_workflow_backlog::run_disposal(
+            repo.clone(),
+            disposal_wake.clone(),
+            runtime_shutdown.cancellation_token(),
+        ));
         runtime_shutdown.close_registration();
-        Self {
+        let runtime = Self {
             repo,
             broker,
             discovery,
+            startup,
+            disposal_wake,
+            task_starter: RwLock::new(None),
             activity_broker,
             lanes,
             config,
@@ -1102,6 +1069,50 @@ where
             worker_deployment_repository: None,
             worker_deployment_registry,
             purger,
+        };
+        if needs_recovery {
+            runtime.start_seeded_recovery(startup_tx);
+        }
+        runtime
+    }
+
+    /// Attach the placement-aware transport before network polls are accepted.
+    /// Locally owned homes still start directly through their own lane.
+    pub fn set_workflow_task_starter(&self, starter: Arc<dyn crate::WorkflowTaskStarter>) {
+        *self
+            .task_starter
+            .write()
+            .expect("workflow starter lock poisoned") = Some(starter);
+    }
+
+    /// Set the queue partition cardinalities published by placement before
+    /// admitting traffic. Workflow edge routing uses these same hash inputs.
+    pub fn with_queue_placement(self, partition_count: u32, bundle_count: u32) -> Self {
+        assert!(
+            partition_count > 0 && bundle_count > 0,
+            "queue placement counts must be positive"
+        );
+        *self
+            .discovery
+            .1
+            .counts
+            .write()
+            .expect("queue placement lock poisoned") = (partition_count, bundle_count);
+        self
+    }
+
+    /// Wait for seeded startup reconstruction. A failure leaves the home
+    /// non-serving and returns its diagnostic; no partially repaired state serves.
+    pub async fn ready(&self) -> Result<()> {
+        let mut startup = self.startup.clone();
+        loop {
+            if let Some(result) = startup.borrow_and_update().clone() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            startup
+                .changed()
+                .await
+                .map_err(|_| anyhow!("startup recovery stopped before completion"))?;
         }
     }
 
@@ -1191,6 +1202,7 @@ where
             self.worker_compute_queue_metrics.clone(),
             writer_id,
         )
+        .with_deployment_registry(self.worker_deployment_registry.clone())
     }
 
     /// Snapshot active shard ownership for one advisory recovery scan.
@@ -1211,7 +1223,12 @@ where
             TaskKind::Workflow => self.broker.backlog_stats_by_priority(queue).await,
             TaskKind::Activity => self.activity_broker.backlog_stats_by_priority(queue).await,
         };
-        self.merge_durable_backlog_stats(queue, &mut stats).await;
+        if queue.task_kind == TaskKind::Workflow {
+            self.merge_workflow_dispatch_stats(queue, false, &mut stats)
+                .await;
+        } else {
+            self.merge_durable_backlog_stats(queue, &mut stats).await;
+        }
         stats
     }
 
@@ -1224,8 +1241,102 @@ where
         queue: &QueueKey,
     ) -> crate::PriorityBacklogStats {
         let mut stats = self.broker.sticky_backlog_stats_by_priority(queue).await;
-        self.merge_durable_backlog_stats(queue, &mut stats).await;
+        self.merge_workflow_dispatch_stats(queue, true, &mut stats)
+            .await;
         stats
+    }
+
+    async fn merge_workflow_dispatch_stats(
+        &self,
+        queue: &QueueKey,
+        sticky: bool,
+        stats: &mut crate::PriorityBacklogStats,
+    ) {
+        let source = crate::discovery::WorkflowSource {
+            repo: self.repo.clone(),
+            registry: self.worker_deployment_registry.clone(),
+        };
+        let result: Result<()> = async {
+            let limit =
+                std::num::NonZeroU32::new(crate::discovery::PAGE_SIZE).expect("nonzero page");
+            if sticky {
+                // Sticky intent is deliberately absent from the normal queue
+                // index. This rarely used diagnostic walks bounded home pages;
+                // it never widens the normal discovery query to include sticky work.
+                let count = self
+                    .shard_owner
+                    .read()
+                    .expect("shard owner lock poisoned")
+                    .shard_count();
+                for id in 0..count {
+                    let mut after = None;
+                    loop {
+                        let keys = self
+                            .repo
+                            .list_workflow_dispatch_for_home(ShardId(id), after, limit)
+                            .await?;
+                        for key in &keys {
+                            let LoadedRun::Existing(state) = self.repo.load_run(*key).await? else {
+                                continue;
+                            };
+                            if let Some(row) =
+                                tokeira_storage::derive_workflow_dispatch(&state, ShardId(id))
+                                && row.sticky
+                                && row.namespace_id == queue.namespace_id
+                                && row.queue_name == queue.task_queue
+                                && let Some(task) = source.resolve(&row).await?
+                                && task.queue == *queue
+                            {
+                                add_dispatch_stat(stats, &row);
+                            }
+                        }
+                        if keys.len() < limit.get() as usize {
+                            break;
+                        }
+                        after = keys.last().copied();
+                    }
+                }
+            } else {
+                let mut routes = vec![tokeira_storage::WorkflowDispatchRouting::Live];
+                if let Some(deployment) = &queue.deployment {
+                    routes.push(tokeira_storage::WorkflowDispatchRouting::Exact {
+                        deployment: deployment.clone(),
+                        build_id: queue.build_id.clone(),
+                    });
+                }
+                for routing in routes {
+                    let range = tokeira_storage::WorkflowDiscoveryRange {
+                        namespace_id: queue.namespace_id,
+                        queue_name: queue.task_queue.clone(),
+                        routing,
+                    };
+                    let mut after = None;
+                    loop {
+                        let page = self
+                            .repo
+                            .list_workflow_dispatch_page(&range, after, limit)
+                            .await?;
+                        for row in &page.candidates {
+                            if range.matches(row)
+                                && let Some(task) = source.resolve(row).await?
+                                && task.queue == *queue
+                            {
+                                add_dispatch_stat(stats, row);
+                            }
+                        }
+                        if page.exhausted {
+                            break;
+                        }
+                        after = page.last_examined;
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(?error, "failed to read workflow dispatch statistics");
+        }
     }
 
     async fn merge_durable_backlog_stats(
@@ -1603,28 +1714,39 @@ where
         Ok(())
     }
 
-    /// Sweep helper used by recovery/admin flows.
-    ///
-    /// Re-publishes up to `limit` dispatchable workflow
-    /// tasks from durable storage into the in-memory
-    /// broker.
-    ///
-    /// This is the sweeper contract that makes ephemeral-first delivery safe:
-    /// because the broker is never authoritative, lost in-memory offers can be
-    /// rebuilt from the durable dispatch backlog after a restart or shard
-    /// failover.
+    /// Republish at most `limit` authoritative workflow tasks for an admin hint.
+    /// Normal tasks remain discoverable independently; stored speculative tasks
+    /// use volatile delivery because they deliberately have no dispatch row.
     pub async fn republish_queue(&self, queue: QueueKey, limit: usize) -> Result<usize> {
         let tasks = self
             .repo
             .list_dispatchable_workflow_tasks(&queue, limit)
             .await?;
-        let count = tasks.len();
+        let mut published = 0;
         for task in tasks {
-            self.broker
-                .publish_workflow_task(task, Some(&self.delivery_metrics))
-                .await;
+            let LoadedRun::Existing(state) = self.repo.load_run(task.run_key).await? else {
+                continue;
+            };
+            let Some(pending) = state.pending_workflow_task.as_ref().filter(|pending| {
+                pending.logical_seq == task.logical_seq && pending.started_event_id.is_none()
+            }) else {
+                continue;
+            };
+            // The legacy envelope has no task-type bit. Recheck the incarnation
+            // before choosing a publisher; treating speculative work as retained
+            // durable intent would omit it from both accounting sources.
+            if pending.task_type == tokeira_kernel::WorkflowTaskType::Speculative {
+                self.broker
+                    .publish_speculative_workflow_task(task, Some(&self.delivery_metrics))
+                    .await;
+            } else {
+                self.broker
+                    .publish_workflow_task(task, Some(&self.delivery_metrics))
+                    .await;
+            }
+            published += 1;
         }
-        Ok(count)
+        Ok(published)
     }
 
     /// Like [`republish_queue`](Self::republish_queue) but
@@ -1699,7 +1821,7 @@ fn mutation_metadata(state: &WorkflowState) -> MutationMetadata {
 }
 
 /// A workflow task that has been polled and started.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StartedWorkflowTask {
     /// Unique key for the workflow run.
     pub run_key: RunKey,
@@ -1908,6 +2030,18 @@ pub struct ResetActivitiesRequest {
     pub request: RequestContext,
     /// Admission time supplied to the deterministic transition.
     pub now: OffsetDateTime,
+}
+
+fn add_dispatch_stat(
+    stats: &mut crate::PriorityBacklogStats,
+    row: &tokeira_storage::WorkflowDispatchRow,
+) {
+    let age = (OffsetDateTime::now_utc() - row.scheduled_at)
+        .try_into()
+        .unwrap_or(std::time::Duration::ZERO);
+    let band = stats.entry(i32::from(row.priority_key)).or_default();
+    band.count += 1;
+    band.oldest_age = band.oldest_age.max(age);
 }
 
 #[cfg(test)]

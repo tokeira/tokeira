@@ -176,6 +176,22 @@ pub fn queue_partition_for(placement_key: &[u8], partition_count: u32) -> QueueP
     QueuePartition(first_hash_word(hash.as_bytes()) % partition_count)
 }
 
+/// Compute workflow queue placement from the durable namespace identity.
+/// Worker deployment and build selection share this home; they select discovery
+/// ranges within the queue rather than separate owners.
+pub fn workflow_queue_partition(
+    namespace_id: crate::NamespaceId,
+    task_queue: &str,
+    partition_count: u32,
+) -> QueuePartition {
+    let key = format!(
+        "{}\0{task_queue}\0{}",
+        namespace_id.0,
+        crate::TaskKind::Workflow.to_db_smallint()
+    );
+    queue_partition_for(key.as_bytes(), partition_count)
+}
+
 /// Map a queue partition into a smaller bundle space.
 pub fn bundle_for_partition(partition: QueuePartition, bundle_count: u32) -> BundleId {
     assert!(bundle_count > 0, "bundle_count must be > 0");

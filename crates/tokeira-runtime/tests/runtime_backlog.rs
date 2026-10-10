@@ -6,7 +6,7 @@ use tokeira_kernel::StartRequest;
 use tokeira_runtime::{
     BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
-use tokeira_storage::InMemoryStore;
+use tokeira_storage::{InMemoryStore, RunRepository};
 use tokeira_types::{
     Memo, NamespaceId, Payloads, QueueKey, RequestContext, RequestId, RunId, RunKey,
     SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
@@ -76,21 +76,17 @@ fn sample_start_request(
     }
 }
 
-/// Full lifecycle: publish workflow task with no poller →
-/// grace window expires → grace scanner persists to
-/// backlog → drain loop retrieves → re-publishes to
-/// broker → poller arrives and receives the task.
+/// Workflow intent survives broker loss without grace or drain participation.
 #[tokio::test]
-async fn backlog_full_lifecycle_publish_grace_drain_poll() {
+async fn workflow_delivery_survives_broker_loss_without_legacy_backlog() {
     let store = Arc::new(InMemoryStore::default());
     let backlog_config = BacklogConfig {
-        workflow_grace_window: std::time::Duration::from_millis(10),
         activity_grace_window: std::time::Duration::from_millis(10),
         grace_scan_interval: std::time::Duration::from_millis(5),
         drain_interval: std::time::Duration::from_millis(5),
         drain_batch_limit: 100,
     };
-    let mut runtime = TokeiraRuntime::new(
+    let runtime = TokeiraRuntime::new(
         store.clone(),
         1,
         LaneConfig::default(),
@@ -104,13 +100,23 @@ async fn backlog_full_lifecycle_publish_grace_drain_poll() {
     let result = runtime.start_workflow(request.clone()).await;
     assert!(result.is_ok());
 
-    // No poller yet — the workflow task sits in
-    // live-ready. Wait for grace window + scanner cycle
-    // to persist it to backlog.
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-
-    // Now poll — the drain loop should have retrieved
-    // the task from backlog and re-published it.
+    // Reconstruct a new default runtime over the same authority; the original
+    // publication and the first broker's offers are unavailable to it.
+    runtime.shutdown_handle().begin_shutdown();
+    runtime
+        .shutdown_handle()
+        .wait(std::time::Instant::now() + std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    let mut runtime = TokeiraRuntime::new(
+        store.clone(),
+        1,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+    );
+    runtime.ready().await.unwrap();
     let queue = QueueKey {
         namespace_id: ns,
         task_queue: TaskQueueName("q".into()),
@@ -118,6 +124,13 @@ async fn backlog_full_lifecycle_publish_grace_drain_poll() {
         deployment: None,
         build_id: None,
     };
+    assert!(
+        store
+            .backlog_stats_by_priority(&queue)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let worker = WorkerIdentity("worker-1".into());
     let task = runtime
         .poll_workflow_task(queue, worker, std::time::Duration::from_millis(200))

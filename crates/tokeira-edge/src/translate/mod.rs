@@ -352,7 +352,7 @@ pub struct RespondWorkflowTaskCompletedRequest {
     pub messages: Vec<ProtocolMessageDto>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowQueryDto {
     pub query_type: String,
     pub query_args: Payloads,
@@ -374,7 +374,7 @@ pub enum QueryResultDto {
     ResultTooLarge,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProtocolMessageDto {
     pub id: String,
     pub protocol_instance_id: String,

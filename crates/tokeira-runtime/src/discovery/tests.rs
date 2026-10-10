@@ -363,3 +363,43 @@ async fn broker_retains_taken_identity_and_keeps_speculative_delivery_separate()
             .is_some()
     );
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+    // Feature: workflow-dispatch, Property 5: Ownership-scoped bounded offers
+    // Placement retirement cancels demand and offers before a replacement can serve.
+    #[test]
+    fn placement_provider_retires_every_old_generation(partitions in 1u32..65, bundles in 1u32..17) {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let owner = Arc::new(RwLock::new(crate::shard::ShardOwner::new(bundles)));
+            let homes = Arc::new(PlacementQueueHomes { owner: owner.clone(), counts: RwLock::new((partitions, bundles)) });
+            let queue = queue();
+            let id = tokeira_types::bundle_for_partition(tokeira_types::workflow_queue_partition(queue.namespace_id, &queue.task_queue.0, partitions), bundles);
+            assert!(homes.local_home(&queue).is_none());
+            owner.write().unwrap().record_acquired(id, tokeira_types::ShardEpoch(3));
+            assert!(homes.local_home(&queue).is_none());
+            owner.write().unwrap().mark_active(id);
+            let old = homes.local_home(&queue).unwrap();
+            let broker = InMemoryBroker::with_discovery(homes.clone());
+            let task = offer(&transition(&queue, 0));
+            let key = (task.run_key, task.logical_seq);
+            broker.publish_workflow_task(task.clone(), None).await;
+            assert!(broker.knows_offer(key).await);
+            let registry = DiscoveryRegistry::default();
+            let _demand = registry.register_poll(queue.clone(), old.clone(), Instant::now());
+            owner.write().unwrap().record_acquired(id, tokeira_types::ShardEpoch(3));
+            assert!(old.cancel.is_cancelled());
+            assert!(homes.local_home(&queue).is_none());
+            for (retired, queue) in registry.retire(Instant::now()) {
+                broker.retire_offers(&retired, &queue).await;
+            }
+            assert_eq!(registry.registered_ranges(), 0);
+            assert!(!broker.knows_offer(key).await);
+            owner.write().unwrap().mark_active(id);
+            let replacement = homes.local_home(&queue).unwrap();
+            assert!(replacement.generation > old.generation);
+            broker.publish_workflow_task(task, None).await;
+            assert!(broker.knows_offer(key).await);
+        });
+    }
+}

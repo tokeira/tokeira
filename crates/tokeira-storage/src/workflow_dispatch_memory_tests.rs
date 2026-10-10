@@ -1,10 +1,14 @@
 //! Memory-side adapters for the shared durable workflow dispatch contracts.
 
 use super::*;
-use crate::workflow_dispatch_tests::{
-    Backend, ordered_pages, reset_materialization, routing_and_home_pages, run_atomic_cases,
-    speculative_legacy_delivery,
+use crate::{
+    BacklogPayload,
+    workflow_dispatch_tests::{
+        Backend, ordered_pages, reset_materialization, routing_and_home_pages, run_atomic_cases,
+        speculative_legacy_delivery,
+    },
 };
+use tokeira_types::LogicalTaskSeq;
 
 #[async_trait]
 impl Backend for InMemoryStore {
@@ -244,4 +248,87 @@ fn dispatch_encoding_budget_rejects_column_and_row_overflow() {
     assert!(row.validate().is_ok());
     row.normal_queue_name.0.push('n');
     assert!(row.validate().is_err());
+}
+
+#[async_trait]
+impl crate::workflow_dispatch_tests::DisposalBackend for InMemoryStore {
+    async fn disposal_authority(&self, _keys: &[RunKey]) -> Result<Vec<u8>> {
+        let state = self.inner.lock().await;
+        Ok(format!(
+            "{:?}{:?}{:?}{:?}",
+            state.runs, state.history, state.transition_audit, state.projection_log
+        )
+        .into_bytes())
+    }
+    async fn backlog_bytes(&self, queue: &QueueKey) -> Result<Vec<Vec<u8>>> {
+        self.inner
+            .lock()
+            .await
+            .dispatch_backlog
+            .iter()
+            .filter(|entry| &entry.queue == queue)
+            .map(|entry| Ok(format!("{entry:?}").into_bytes()))
+            .collect()
+    }
+}
+
+#[test]
+fn workflow_dispatch_generated_legacy_disposal() {
+    crate::workflow_dispatch_tests::run_disposal_cases(
+        &InMemoryStore::default(),
+        &tokio::runtime::Runtime::new().unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn workflow_disposal_is_bounded_and_failure_leaves_the_entire_page_unchanged() {
+    let store = InMemoryStore::default();
+    let state = super::projection_accumulator_tests::fresh_transition(RunKey::new()).next_state;
+    let queue = QueueKey {
+        namespace_id: state.namespace_id,
+        task_queue: state.task_queue,
+        task_kind: TaskKind::Workflow,
+        deployment: None,
+        build_id: None,
+    };
+    let entries = (0..130)
+        .map(|_| BacklogEntry {
+            run_key: RunKey::new(),
+            queue: queue.clone(),
+            payload: BacklogPayload::Workflow {
+                logical_seq: LogicalTaskSeq::ONE,
+            },
+            priority: None,
+            order: DeliveryOrder::default(),
+            scheduled_at: state.started_at,
+        })
+        .collect();
+    store.persist_to_backlog(entries).await.unwrap();
+    let before = store.snapshot().await.unwrap();
+    store.fail_bulk_write_after(0).await;
+    assert!(store.dispose_workflow_backlog_page(None).await.is_err());
+    assert_eq!(store.snapshot().await.unwrap(), before);
+    let mut after = None;
+    let mut sizes = vec![];
+    loop {
+        let page = store.dispose_workflow_backlog_page(after).await.unwrap();
+        sizes.push(page.deleted);
+        if page.exhausted {
+            break;
+        }
+        after = page.last_examined;
+    }
+    assert_eq!(sizes, [64, 64, 2]);
+    assert!(
+        store
+            .inner
+            .lock()
+            .await
+            .modeled_transactions
+            .iter()
+            .all(
+                |cost| cost.rows <= crate::write_budget::MAX_ROWS_PER_TRANSACTION
+                    && cost.bytes <= crate::write_budget::MAX_BYTES_PER_TRANSACTION
+            )
+    );
 }

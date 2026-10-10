@@ -7,3 +7,5 @@ pub mod runtime_adapter;
 pub mod tracing_interceptor;
 pub mod translate;
 pub mod workflow_service;
+
+pub mod workflow_dispatch;

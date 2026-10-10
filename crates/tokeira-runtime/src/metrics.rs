@@ -14,6 +14,28 @@ use tokeira_types::{
 
 use crate::worker_compute::{ObserveResult, ScalerSuppression, WorkerComputeProviderTargetKind};
 
+/// Candidate rows returned by workflow discovery pages.
+pub const WORKFLOW_DISPATCH_READS_TOTAL: &str = "tokeira_runtime_workflow_dispatch_reads_total";
+/// Examined workflow candidates skipped, labelled only by a bounded reason.
+pub const WORKFLOW_DISPATCH_SKIPS_TOTAL: &str = "tokeira_runtime_workflow_dispatch_skips_total";
+/// Workflow offers admitted by durable discovery.
+pub const WORKFLOW_DISPATCH_ADMISSIONS_TOTAL: &str =
+    "tokeira_runtime_workflow_dispatch_admissions_total";
+/// Workflow discovery passes continued in another scheduler slice.
+pub const WORKFLOW_DISPATCH_SLICE_YIELDS_TOTAL: &str =
+    "tokeira_runtime_workflow_dispatch_slice_yields_total";
+/// Workflow discovery slices stopped by offer capacity.
+pub const WORKFLOW_DISPATCH_CAPACITY_BLOCKS_TOTAL: &str =
+    "tokeira_runtime_workflow_dispatch_capacity_blocks_total";
+/// Workflow discovery slices cancelled as their registration or home retires.
+pub const WORKFLOW_DISPATCH_OWNERSHIP_LOSS_TOTAL: &str =
+    "tokeira_runtime_workflow_dispatch_ownership_loss_total";
+/// Elapsed duration of a completed or retired discovery pass.
+pub const WORKFLOW_DISPATCH_PASS_DURATION_SECONDS: &str =
+    "tokeira_runtime_workflow_dispatch_pass_duration_seconds";
+/// Workflow dispatch repairs committed by acquisition recovery.
+pub const WORKFLOW_DISPATCH_REPAIRS_TOTAL: &str = "tokeira_runtime_workflow_dispatch_repairs_total";
+
 pub const BROKER_PUBLISH_TOTAL: &str = "tokeira_runtime_broker_publish_total";
 pub const BROKER_SYNC_MATCH_TOTAL: &str = "tokeira_runtime_broker_sync_match_total";
 pub const BROKER_NON_SYNC_MATCH_TOTAL: &str = "tokeira_runtime_broker_non_sync_match_total";
@@ -125,6 +147,17 @@ pub const NEXUS_OUTBOUND_REQUESTS_TOTAL: &str = "tokeira_runtime_nexus_outbound_
 pub const NEXUS_OUTBOUND_LATENCY_SECONDS: &str = "tokeira_runtime_nexus_outbound_latency_seconds";
 
 pub const METRIC_NAMES: &[(&str, MetricType)] = &[
+    (WORKFLOW_DISPATCH_READS_TOTAL, MetricType::Counter),
+    (WORKFLOW_DISPATCH_SKIPS_TOTAL, MetricType::Counter),
+    (WORKFLOW_DISPATCH_ADMISSIONS_TOTAL, MetricType::Counter),
+    (WORKFLOW_DISPATCH_SLICE_YIELDS_TOTAL, MetricType::Counter),
+    (WORKFLOW_DISPATCH_CAPACITY_BLOCKS_TOTAL, MetricType::Counter),
+    (WORKFLOW_DISPATCH_OWNERSHIP_LOSS_TOTAL, MetricType::Counter),
+    (
+        WORKFLOW_DISPATCH_PASS_DURATION_SECONDS,
+        MetricType::DurationHistogram,
+    ),
+    (WORKFLOW_DISPATCH_REPAIRS_TOTAL, MetricType::Counter),
     (BROKER_PUBLISH_TOTAL, MetricType::Counter),
     (BROKER_SYNC_MATCH_TOTAL, MetricType::Counter),
     (BROKER_NON_SYNC_MATCH_TOTAL, MetricType::Counter),

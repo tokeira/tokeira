@@ -1,46 +1,27 @@
-//! Durable backlog: the bridge between the in-memory brokers and storage.
+//! Activity backlog retention and demand-driven delivery.
 //!
-//! The brokers ([`InMemoryBroker`], [`InMemoryActivityBroker`]) are a derived
-//! delivery optimization; the durable backlog in storage is authoritative. This
-//! module owns the two background loops that keep those two views reconciled
-//! without making an idle system expensive:
-//!
-//! - The **grace scanner** (`scan_grace_once`) demotes tasks that have sat
-//!   unclaimed in a broker past their grace window into the durable backlog.
-//!   This caps how long delivery state lives only in memory: if no poller takes
-//!   a task promptly, it must not pin memory or be lost on process death, so it
-//!   moves to storage where it can be re-delivered later.
-//! - The **drain loop** (`drain_once`) re-hydrates the brokers from the
-//!   durable backlog, but only for queues that currently have waiting pollers.
-//!   Draining is demand-driven precisely so inactivity stays cheap — a backlog
-//!   with no listeners is never read.
-//!
-//! Because the durable backlog is the source of truth, a failed persist during
-//! grace scanning is recovered by re-publishing the tasks to the broker rather
-//! than dropping them: until storage accepts them, the in-memory copy is the
-//! only record that the work exists.
+//! Workflow delivery comes from durable dispatch discovery. These loops retain
+//! only activity spill/drain behavior; neither broker is an authority for work.
 
 use std::sync::Arc;
 
+#[cfg(test)]
 use time::OffsetDateTime;
 use tokeira_kernel::RetiredField;
-use tokeira_storage::{
-    BacklogEntry, BacklogPayload, DispatchableActivityTask, DispatchableWorkflowTask, RunRepository,
-};
+use tokeira_storage::{BacklogEntry, BacklogPayload, DispatchableActivityTask, RunRepository};
 use tokio_util::sync::CancellationToken;
 
 use crate::{DeliveryMetrics, FairnessState, InMemoryActivityBroker, InMemoryBroker};
 
 /// Timing and batching knobs for the backlog reconciliation loops.
 ///
-/// The grace windows decide how long a task may live only in a broker before it
+/// The activity grace window decides how long a ready copy remains in a broker before it
 /// is demoted to durable storage; longer windows favor low-latency re-delivery
 /// to a returning poller, shorter windows bound in-memory exposure to process
 /// loss. `drain_batch_limit` caps how much is re-hydrated per queue per pass so
 /// a deep backlog cannot starve other queues or flood a single drain tick.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BacklogConfig {
-    pub workflow_grace_window: tokio::time::Duration,
     pub activity_grace_window: tokio::time::Duration,
     pub grace_scan_interval: tokio::time::Duration,
     pub drain_interval: tokio::time::Duration,
@@ -50,7 +31,6 @@ pub struct BacklogConfig {
 impl Default for BacklogConfig {
     fn default() -> Self {
         Self {
-            workflow_grace_window: tokio::time::Duration::from_secs(5),
             activity_grace_window: tokio::time::Duration::from_secs(5),
             grace_scan_interval: tokio::time::Duration::from_secs(1),
             drain_interval: tokio::time::Duration::from_secs(2),
@@ -67,36 +47,28 @@ impl Default for BacklogConfig {
 /// to storage frees the in-memory copy and ensures the work survives process
 /// loss. The drain loop will bring it back when a poller reappears.
 pub(crate) async fn scan_grace_once<R>(
-    broker: &InMemoryBroker,
+    _broker: &InMemoryBroker,
     activity_broker: &InMemoryActivityBroker,
     repo: &R,
     config: &BacklogConfig,
 ) where
     R: RunRepository + ?Sized,
 {
-    let expired_workflow = broker.take_expired(config.workflow_grace_window).await;
     let expired_activity = activity_broker
         .take_expired(config.activity_grace_window)
         .await;
-
-    if expired_workflow.is_empty() && expired_activity.is_empty() {
+    if expired_activity.is_empty() {
         return;
     }
-    tracing::debug!(
-        workflow_tasks = expired_workflow.len(),
-        activity_tasks = expired_activity.len(),
-        "demoting grace-expired live-ready tasks to durable backlog"
-    );
-
-    let mut entries = Vec::with_capacity(expired_workflow.len() + expired_activity.len());
-    entries.extend(expired_workflow.iter().map(workflow_to_backlog_entry));
-    entries.extend(expired_activity.iter().map(activity_to_backlog_entry));
+    let entries = expired_activity
+        .iter()
+        .map(activity_to_backlog_entry)
+        .collect();
 
     if let Err(error) = repo.persist_to_backlog(entries).await {
         // The tasks were already removed from the brokers above. Until storage
-        // acknowledges them, the in-memory copy is the only record they exist,
-        // so re-publish rather than drop — losing them here would silently lose
-        // work the durable backlog never received. The spill writes the entries
+        // acknowledges them, retain the volatile copies to avoid delaying
+        // delivery until the independent activity-dispatch reconciliation pass. The spill writes the entries
         // in order, in transactions of their own, so the first `persisted` are
         // stored and stay out of the brokers (`runtime-durable-backlog` criterion 3.7).
         tracing::warn!(
@@ -104,12 +76,7 @@ pub(crate) async fn scan_grace_once<R>(
             persisted = error.persisted,
             "failed to persist expired live-ready tasks to backlog"
         );
-        let workflow_persisted = error.persisted.min(expired_workflow.len());
-        let activity_persisted = error.persisted - workflow_persisted;
-        for task in expired_workflow.into_iter().skip(workflow_persisted) {
-            broker.publish_workflow_task(task.task, None).await;
-        }
-        for task in expired_activity.into_iter().skip(activity_persisted) {
+        for task in expired_activity.into_iter().skip(error.persisted) {
             if let Err(republish_error) =
                 activity_broker.publish_activity_task(task.task, None).await
             {
@@ -149,95 +116,15 @@ pub(crate) async fn run_grace_scanner<R>(
 /// budget is what prevents one hot queue from monopolising re-delivery and
 /// starving others.
 pub(crate) async fn drain_once<R>(
-    broker: &InMemoryBroker,
+    _broker: &InMemoryBroker,
     activity_broker: &InMemoryActivityBroker,
     repo: &R,
     config: &BacklogConfig,
-    fairness: &FairnessState,
+    _fairness: &FairnessState,
     metrics: &DeliveryMetrics,
 ) where
     R: RunRepository + ?Sized,
 {
-    let waiting_queues = broker.workflow_waiter_counts().await;
-    if !waiting_queues.is_empty() {
-        tracing::trace!(
-            queue_count = waiting_queues.len(),
-            "drain tick: queues with parked workflow pollers"
-        );
-    }
-    for (queue, parked_pollers) in waiting_queues {
-        // The fairness budget is seeded from COMPLETED polls (`share ×
-        // recent_poll_count`), but a parked long-poll only counts once it
-        // completes — so a queue whose first poller arrived after its tasks
-        // aged into the backlog would re-seed to 0 forever: no drain → the
-        // poll never completes → no polls in the window → budget 0. Each
-        // PARKED poller is one unit of live, unmet demand, so it floors the
-        // effective budget; a hot queue's throughput is still capped by its
-        // fairness allotment.
-        let budget = fairness.remaining_budget(&queue).max(parked_pollers);
-        let limit = (budget as usize).min(config.drain_batch_limit);
-        match repo.drain_backlog(&queue, limit).await {
-            Ok(entries) => {
-                let mut max_age = std::time::Duration::ZERO;
-                let drained_count = entries.len();
-                for entry in entries {
-                    let age = (OffsetDateTime::now_utc() - entry.scheduled_at)
-                        .try_into()
-                        .unwrap_or(std::time::Duration::ZERO);
-                    max_age = max_age.max(age);
-                    match entry.payload {
-                        BacklogPayload::Workflow { logical_seq } => {
-                            // Re-delivered tasks drop their sticky hint: the
-                            // original worker affinity is stale by the time work
-                            // has aged into the backlog, so let any poller take
-                            // it rather than wait again for a specific worker.
-                            broker
-                                .publish_workflow_task(
-                                    DispatchableWorkflowTask {
-                                        run_key: entry.run_key,
-                                        queue: entry.queue,
-                                        logical_seq,
-                                        sticky_preferred: None,
-                                        normal_queue: None,
-                                        sticky_deadline: None,
-                                        priority: entry.priority,
-                                        order: Some(entry.order),
-                                    },
-                                    Some(metrics),
-                                )
-                                .await;
-                        }
-                        BacklogPayload::Activity { .. } => {
-                            tracing::warn!(
-                                ?queue,
-                                run_key = ?entry.run_key,
-                                "unexpected activity payload in workflow backlog drain"
-                            );
-                        }
-                    }
-                }
-                if drained_count > 0 {
-                    tracing::debug!(
-                        ?queue,
-                        drained_count,
-                        "re-hydrated workflow tasks from durable backlog"
-                    );
-                    fairness.consume_budget(&queue, drained_count as u32);
-                    metrics.set_backlog_age(&queue, max_age);
-                }
-                // A short read means the backlog is exhausted for this queue;
-                // reset the reported age to zero so fairness stops treating it
-                // as a pressured, aging backlog.
-                if drained_count < limit {
-                    metrics.set_backlog_age(&queue, std::time::Duration::ZERO);
-                }
-            }
-            Err(error) => {
-                tracing::warn!(?error, ?queue, "failed to drain workflow backlog");
-            }
-        }
-    }
-
     for queue in activity_broker.queues_with_waiters().await {
         match repo.drain_backlog(&queue, config.drain_batch_limit).await {
             Ok(entries) => {
@@ -317,22 +204,6 @@ pub(crate) async fn run_drain_loop<R>(
             &metrics,
         )
         .await;
-    }
-}
-
-fn workflow_to_backlog_entry(task: &crate::broker::TimestampedWorkflowTask) -> BacklogEntry {
-    BacklogEntry {
-        run_key: task.task.run_key,
-        queue: task.task.queue.clone(),
-        payload: BacklogPayload::Workflow {
-            logical_seq: task.task.logical_seq,
-        },
-        priority: task.task.priority.clone(),
-        scheduled_at: task.scheduled_at,
-        order: task
-            .task
-            .order
-            .expect("broker publication always assigns workflow delivery order"),
     }
 }
 
@@ -633,48 +504,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn grace_scan_persists_expired_tasks() {
-        let repo = MockBacklogRepo::default();
-        let broker = InMemoryBroker::default();
-        let activity_broker = InMemoryActivityBroker::default();
-        broker
-            .publish_workflow_task(
-                DispatchableWorkflowTask {
-                    run_key: RunKey::new(),
-                    queue: workflow_queue(),
-                    logical_seq: LogicalTaskSeq::ONE,
-                    sticky_preferred: None,
-                    normal_queue: None,
-                    sticky_deadline: None,
-                    priority: None,
-                    order: None,
-                },
-                None,
-            )
-            .await;
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-
-        let config = BacklogConfig {
-            workflow_grace_window: std::time::Duration::from_millis(1),
-            ..BacklogConfig::default()
-        };
-        scan_grace_once(&broker, &activity_broker, &repo, &config).await;
-
-        let persisted = repo
-            .persisted
-            .lock()
-            .expect("persisted lock poisoned")
-            .clone();
-        assert_eq!(persisted.len(), 1);
-        assert!(matches!(
-            persisted[0].payload,
-            BacklogPayload::Workflow {
-                logical_seq: LogicalTaskSeq::ONE
-            }
-        ));
-    }
-
     // A spill that fails at its second page keeps its first page stored and
     // re-publishes only the tasks after it, so no task is both stored and in a
     // broker (`bounded-bulk-writes` criterion 2.2).
@@ -732,573 +561,59 @@ mod tests {
         assert!(stored.is_disjoint(&republished));
     }
 
-    #[tokio::test]
-    async fn drain_targets_only_waiter_queues() {
-        let repo = MockBacklogRepo::default();
-        let broker = InMemoryBroker::default();
-        let activity_broker = InMemoryActivityBroker::default();
-        let fairness = FairnessState::new();
-        let metrics = DeliveryMetrics::new();
-        let queue = workflow_queue();
-        repo.drained.lock().expect("drained lock poisoned").insert(
-            queue.clone(),
-            VecDeque::from(vec![BacklogEntry {
-                run_key: RunKey::new(),
-                queue: queue.clone(),
-                payload: BacklogPayload::Workflow {
-                    logical_seq: LogicalTaskSeq::ONE,
-                },
-                priority: None,
-                scheduled_at: OffsetDateTime::now_utc(),
-                order: DeliveryOrder::default(),
-            }]),
-        );
-
-        let broker_clone = broker.clone();
-        let queue_clone = queue.clone();
-        let waiter = tokio::spawn(async move {
-            broker_clone
-                .poll_workflow_task(
-                    &queue_clone,
-                    &tokeira_types::WorkerIdentity("worker".into()),
-                    std::time::Duration::from_millis(50),
-                )
-                .await
-                .unwrap()
-        });
-        tokio::task::yield_now().await;
-
-        drain_once(
-            &broker,
-            &activity_broker,
-            &repo,
-            &BacklogConfig::default(),
-            &fairness,
-            &metrics,
-        )
-        .await;
-
-        let calls = repo
-            .drain_calls
-            .lock()
-            .expect("drain_calls lock poisoned")
-            .clone();
-        assert_eq!(calls, vec![queue.clone()]);
-        let delivered = waiter.await.unwrap();
-        assert!(delivered.is_some());
-    }
-
-    // The budget-livelock spine (TestGetWorkflowExecutionHistory_All): the
-    // control loop re-seeds budget from COMPLETED polls, so a queue whose
-    // first poller arrives after its task aged into the backlog sits at
-    // budget 0 with the poll parked — and the parked poll can never complete
-    // to earn budget. A parked poller must floor the effective drain budget.
-    #[tokio::test]
-    async fn drain_serves_parked_poller_despite_zero_fairness_budget() {
-        let repo = MockBacklogRepo::default();
-        let broker = InMemoryBroker::default();
-        let activity_broker = InMemoryActivityBroker::default();
-        let fairness = FairnessState::new();
-        let metrics = DeliveryMetrics::new();
-        let queue = workflow_queue();
-        // Simulate the control tick that seeded this queue's budget from an
-        // empty poll window (share × 0 completed polls = 0).
-        fairness.apply_adjustment(
-            std::collections::HashMap::from([(queue.clone(), 0.5)]),
-            &std::collections::HashMap::new(),
-            OffsetDateTime::now_utc(),
-        );
-        assert_eq!(fairness.remaining_budget(&queue), 0);
-        repo.drained.lock().expect("drained lock poisoned").insert(
-            queue.clone(),
-            VecDeque::from(vec![BacklogEntry {
-                run_key: RunKey::new(),
-                queue: queue.clone(),
-                payload: BacklogPayload::Workflow {
-                    logical_seq: LogicalTaskSeq::ONE,
-                },
-                priority: None,
-                scheduled_at: OffsetDateTime::now_utc(),
-                order: DeliveryOrder::default(),
-            }]),
-        );
-
-        let broker_clone = broker.clone();
-        let queue_clone = queue.clone();
-        let waiter = tokio::spawn(async move {
-            broker_clone
-                .poll_workflow_task(
-                    &queue_clone,
-                    &tokeira_types::WorkerIdentity("worker".into()),
-                    std::time::Duration::from_millis(50),
-                )
-                .await
-                .unwrap()
-        });
-        tokio::task::yield_now().await;
-
-        drain_once(
-            &broker,
-            &activity_broker,
-            &repo,
-            &BacklogConfig::default(),
-            &fairness,
-            &metrics,
-        )
-        .await;
-
-        let delivered = waiter.await.unwrap();
-        assert!(
-            delivered.is_some(),
-            "a parked poller is live demand and must not be starved by a zero budget"
-        );
-    }
-
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+        // Feature: workflow-dispatch, Property 10: Workflow-only backlog retirement
+        // Neither workflow spill nor drain runs; activity payload and ordering survive both.
         #[test]
-        fn property_grace_scanner_clears_dedup_keys(logical_seq in 1u64..8u64) {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async move {
+        fn workflow_backlog_is_untouched_by_activity_loops(seq in 1u64..100, attempt in 1u32..5, priority in 1i16..=5, fair_pass in 0i64..1000) {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
                 let repo = MockBacklogRepo::default();
                 let broker = InMemoryBroker::default();
-                let activity_broker = InMemoryActivityBroker::default();
-                let queue = workflow_queue();
-                let task = DispatchableWorkflowTask {
-                    run_key: RunKey::new(),
-                    queue: queue.clone(),
-                    logical_seq: LogicalTaskSeq(logical_seq),
-                    sticky_preferred: None,
-                    normal_queue: None,
-                    sticky_deadline: None,
-                    priority: None,
-                    order: None,
+                let activities = InMemoryActivityBroker::default();
+                let workflow = workflow_queue();
+                let activity = activity_queue();
+                let run_key = RunKey::new();
+                let wf = DispatchableWorkflowTask {
+                    run_key, logical_seq: LogicalTaskSeq(seq), queue: workflow.clone(), sticky_preferred: None,
+                    normal_queue: None, sticky_deadline: None, priority: None, order: None,
                 };
-
-                broker.publish_workflow_task(task.clone(), None).await;
-                tokio::time::sleep(std::time::Duration::from_millis(3)).await;
-
-                scan_grace_once(
-                    &broker,
-                    &activity_broker,
-                    &repo,
-                    &BacklogConfig {
-                        workflow_grace_window: std::time::Duration::from_millis(1),
-                        ..BacklogConfig::default()
-                    },
-                ).await;
-
-                broker.publish_workflow_task(task.clone(), None).await;
-                let delivered = broker
-                    .poll_workflow_task(
-                        &queue,
-                        &tokeira_types::WorkerIdentity("worker".into()),
-                        std::time::Duration::from_millis(5),
-                    )
-                    .await
-                    .unwrap();
-
-                prop_assert_eq!(delivered.and_then(|entry| entry.into_queued().map(|queued| queued.0)), Some(task));
-                Ok::<(), proptest::test_runner::TestCaseError>(())
-            })?;
-        }
-    }
-
-    proptest! {
-        #[test]
-        fn property_persist_failure_retains_tasks_in_live_ready(logical_seq in 1u64..8u64) {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async move {
-                let repo = MockBacklogRepo::default();
-                *repo.fail_persist.lock().expect("fail_persist lock poisoned") = true;
-                let broker = InMemoryBroker::default();
-                let activity_broker = InMemoryActivityBroker::default();
-                let queue = workflow_queue();
-                let task = DispatchableWorkflowTask {
-                    run_key: RunKey::new(),
-                    queue: queue.clone(),
-                    logical_seq: LogicalTaskSeq(logical_seq),
-                    sticky_preferred: None,
-                    normal_queue: None,
-                    sticky_deadline: None,
-                    priority: None,
-                    order: None,
+                broker.publish_workflow_task(wf.clone(), None).await;
+                let order = DeliveryOrder { priority_key: priority, fair_pass, insertion_tie: 17 };
+                let task = DispatchableActivityTask {
+                    run_key, queue: activity.clone(), activity_id: "activity".into(),
+                    schedule_event_id: 42, attempt, dispatch_revision: 7, stamp: 9, priority: None, order: Some(order),
                 };
-
-                broker.publish_workflow_task(task.clone(), None).await;
-                tokio::time::sleep(std::time::Duration::from_millis(3)).await;
-
-                scan_grace_once(
-                    &broker,
-                    &activity_broker,
-                    &repo,
-                    &BacklogConfig {
-                        workflow_grace_window: std::time::Duration::from_millis(1),
-                        ..BacklogConfig::default()
-                    },
-                ).await;
-
-                let delivered = broker
-                    .poll_workflow_task(
-                        &queue,
-                        &tokeira_types::WorkerIdentity("worker".into()),
-                        std::time::Duration::from_millis(5),
-                    )
-                    .await
-                    .unwrap();
-
-                prop_assert_eq!(delivered.and_then(|entry| entry.into_queued().map(|queued| queued.0)), Some(task));
-                prop_assert!(repo.persisted.lock().expect("persisted lock poisoned").is_empty());
-                Ok::<(), proptest::test_runner::TestCaseError>(())
-            })?;
-        }
-    }
-
-    proptest! {
-        #[test]
-        fn property_drain_routes_entries_to_the_correct_broker(logical_seq in 1u64..8u64, attempt in 1u32..4u32) {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async move {
-                // Registration synchronization must not lose a waiter to a
-                // short wall-clock deadline under workspace-test contention.
-                // Nextest terminates this test before these polls can expire.
-                let poll_timeout = std::time::Duration::from_secs(300);
-                let repo = MockBacklogRepo::default();
-                let broker = InMemoryBroker::default();
-                let activity_broker = InMemoryActivityBroker::default();
-                let fairness = FairnessState::new();
-                let metrics = DeliveryMetrics::new();
-                let workflow_queue = workflow_queue();
-                let activity_queue = activity_queue();
-
-                repo.drained.lock().expect("drained lock poisoned").insert(
-                    workflow_queue.clone(),
-                    VecDeque::from(vec![BacklogEntry {
-                        run_key: RunKey::new(),
-                        queue: workflow_queue.clone(),
-                        payload: BacklogPayload::Workflow {
-                            logical_seq: LogicalTaskSeq(logical_seq),
-                        },
-                        priority: None,
-                        scheduled_at: OffsetDateTime::now_utc(),
-                        order: DeliveryOrder::default(),
-                    }]),
-                );
-                repo.drained.lock().expect("drained lock poisoned").insert(
-                    activity_queue.clone(),
-                    VecDeque::from(vec![BacklogEntry {
-                        run_key: RunKey::new(),
-                        queue: activity_queue.clone(),
-                        payload: BacklogPayload::Activity {
-                            activity_id: "activity".into(),
-                            retired_input: Default::default(),
-                            schedule_event_id: 42,
-                            attempt,
-                            dispatch_revision: 0,
-                            stamp: 0,
-                        },
-                        priority: None,
-                        scheduled_at: OffsetDateTime::now_utc(),
-                        order: DeliveryOrder {
-                            priority_key: 3,
-                            fair_pass: 0,
-                            insertion_tie: 1,
-                        },
-                    }]),
-                );
-
-                let workflow_waiter = {
-                    let broker = broker.clone();
-                    let queue = workflow_queue.clone();
-                    tokio::spawn(async move {
-                        broker
-                            .poll_workflow_task(
-                                &queue,
-                                &tokeira_types::WorkerIdentity("worker".into()),
-                                poll_timeout,
-                            )
-                            .await
-                            .unwrap()
-                    })
+                activities.publish_activity_task(task.clone(), None).await.unwrap();
+                scan_grace_once(&broker, &activities, &repo, &BacklogConfig { activity_grace_window: std::time::Duration::ZERO, ..Default::default() }).await;
+                let stored = repo.persisted.lock().unwrap().clone();
+                assert_eq!(stored.len(), 1);
+                assert_eq!(stored[0].queue, activity);
+                assert_eq!(stored[0].order, order);
+                assert!(broker.try_claim_workflow_task(&workflow, run_key).await.is_some());
+                repo.drained.lock().unwrap().insert(activity.clone(), stored.into());
+                repo.drained.lock().unwrap().insert(workflow.clone(), VecDeque::from([BacklogEntry {
+                    run_key, queue: workflow.clone(), payload: BacklogPayload::Workflow { logical_seq: LogicalTaskSeq(seq) },
+                    priority: None, scheduled_at: OffsetDateTime::now_utc(), order,
+                }]));
+                let waiter = {
+                    let broker = broker.clone(); let queue = workflow.clone();
+                    tokio::spawn(async move { broker.poll_workflow_task(&queue, &tokeira_types::WorkerIdentity("worker".into()), std::time::Duration::from_secs(300)).await })
                 };
-
                 let activity_waiter = {
-                    let activity_broker = activity_broker.clone();
-                    let queue = activity_queue.clone();
-                    tokio::spawn(async move {
-                        activity_broker
-                            .poll_activity_task(&queue, poll_timeout)
-                            .await
-                            .unwrap()
-                    })
+                    let broker = activities.clone(); let queue = activity.clone();
+                    tokio::spawn(async move { broker.poll_activity_task(&queue, std::time::Duration::from_secs(300)).await.unwrap().unwrap().0 })
                 };
-
-                while !broker.queues_with_waiters().await.contains(&workflow_queue)
-                    || !activity_broker
-                        .queues_with_waiters()
-                        .await
-                        .contains(&activity_queue)
-                {
-                    tokio::task::yield_now().await;
-                }
-
-                drain_once(
-                    &broker,
-                    &activity_broker,
-                    &repo,
-                    &BacklogConfig::default(),
-                    &fairness,
-                    &metrics,
-                ).await;
-
-                let workflow = workflow_waiter.await.unwrap();
-                let activity = activity_waiter.await.unwrap();
-                let Some(workflow) = workflow else {
-                    prop_assert!(false, "workflow backlog entry was not delivered");
-                    return Ok::<(), proptest::test_runner::TestCaseError>(());
-                };
-                let Some(activity) = activity else {
-                    prop_assert!(false, "activity backlog entry was not delivered");
-                    return Ok::<(), proptest::test_runner::TestCaseError>(());
-                };
-                let Some((workflow, _)) = workflow.into_queued() else {
-                    prop_assert!(false, "expected queued workflow task");
-                    return Ok::<(), proptest::test_runner::TestCaseError>(());
-                };
-                prop_assert_eq!(workflow.logical_seq, LogicalTaskSeq(logical_seq));
-                prop_assert_eq!(activity.0.activity_id, "activity");
-                prop_assert_eq!(activity.0.attempt, attempt);
-                Ok::<(), proptest::test_runner::TestCaseError>(())
-            })?;
+                while broker.queues_with_waiters().await.is_empty() || activities.queues_with_waiters().await.is_empty() { tokio::task::yield_now().await; }
+                drain_once(&broker, &activities, &repo, &BacklogConfig::default(), &FairnessState::new(), &DeliveryMetrics::new()).await;
+                let delivered = activity_waiter.await.unwrap();
+                assert_eq!(delivered, task);
+                assert_eq!(*repo.drain_calls.lock().unwrap(), vec![activity]);
+                assert_eq!(repo.drained.lock().unwrap()[&workflow].len(), 1);
+                assert!(!waiter.is_finished());
+                waiter.abort();
+                let _ = waiter.await;
+            });
         }
-    }
-
-    proptest! {
-        // Feature: task-queue-priority-fairness, Property 8
-        #[test]
-        fn property_delivery_order_and_priority_are_preserved_through_drain(
-            task_specs in proptest::collection::vec(
-                (1u64..32, 1i16..=5, 0i64..10_000, 0i32..100, "[a-z]{0,8}", 0.0f32..10.0),
-                1..11,
-            ),
-        ) {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async move {
-                let repo = MockBacklogRepo::default();
-                let broker = InMemoryBroker::default();
-                let activity_broker = InMemoryActivityBroker::default();
-                let fairness = FairnessState::new();
-                let metrics = DeliveryMetrics::new();
-                let queue = workflow_queue();
-
-                let mut entries: Vec<_> = task_specs
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, (seq, priority_key, fair_pass, raw_key, fairness_key, weight))| BacklogEntry {
-                        run_key: RunKey::new(),
-                        queue: queue.clone(),
-                        payload: BacklogPayload::Workflow {
-                            logical_seq: LogicalTaskSeq(*seq),
-                        },
-                        priority: Some(tokeira_kernel::Priority {
-                            priority_key: *raw_key,
-                            fairness_key: fairness_key.clone(),
-                            fairness_weight: *weight,
-                        }),
-                        scheduled_at: OffsetDateTime::now_utc(),
-                        order: DeliveryOrder {
-                            priority_key: *priority_key,
-                            fair_pass: *fair_pass,
-                            insertion_tie: idx as u64,
-                        },
-                    })
-                    .collect();
-                entries.sort_by_key(|entry| entry.order);
-                let expected = entries
-                    .iter()
-                    .map(|entry| {
-                        let BacklogPayload::Workflow { logical_seq } = &entry.payload else {
-                            unreachable!("workflow fixture");
-                        };
-                        (*logical_seq, entry.priority.clone(), entry.order)
-                    })
-                    .collect::<Vec<_>>();
-                repo.drained
-                    .lock()
-                    .expect("drained lock poisoned")
-                    .insert(queue.clone(), VecDeque::from(entries));
-
-                let broker_clone = broker.clone();
-                let queue_clone = queue.clone();
-                let first_waiter = tokio::spawn(async move {
-                    broker_clone
-                        .poll_workflow_task(
-                            &queue_clone,
-                            &tokeira_types::WorkerIdentity("worker".into()),
-                            std::time::Duration::from_secs(5),
-                        )
-                        .await
-                        .unwrap()
-                });
-
-                while !broker.queues_with_waiters().await.contains(&queue) {
-                    tokio::task::yield_now().await;
-                }
-                drain_once(
-                    &broker,
-                    &activity_broker,
-                    &repo,
-                    &BacklogConfig::default(),
-                    &fairness,
-                    &metrics,
-                ).await;
-
-                let mut seen = Vec::new();
-                let Some(task) = first_waiter.await.unwrap() else {
-                    prop_assert!(false, "workflow backlog entry was not delivered");
-                    return Ok::<(), proptest::test_runner::TestCaseError>(());
-                };
-                let Some((task, _)) = task.into_queued() else {
-                    prop_assert!(false, "expected queued workflow task");
-                    return Ok::<(), proptest::test_runner::TestCaseError>(());
-                };
-                seen.push((task.logical_seq, task.priority.clone(), task.order.unwrap()));
-
-                for _ in 1..task_specs.len() {
-                    let Some(task) = broker
-                        .poll_workflow_task(
-                            &queue,
-                            &tokeira_types::WorkerIdentity("worker".into()),
-                            std::time::Duration::ZERO,
-                        )
-                        .await
-                        .unwrap()
-                    else {
-                        prop_assert!(false, "workflow backlog entry was not delivered");
-                        return Ok::<(), proptest::test_runner::TestCaseError>(());
-                    };
-                    let Some((task, _)) = task.into_queued() else {
-                        prop_assert!(false, "expected queued workflow task");
-                        return Ok::<(), proptest::test_runner::TestCaseError>(());
-                    };
-                    seen.push((task.logical_seq, task.priority.clone(), task.order.unwrap()));
-                }
-
-                prop_assert_eq!(seen, expected);
-                Ok::<(), proptest::test_runner::TestCaseError>(())
-            })?;
-        }
-    }
-
-    // ── Property 3: Grace scanner moves exactly expired ─
-    // Feature: runtime-durable-backlog
-    // Validates: Requirements 3.2, 3.3, 8.2
-    #[tokio::test]
-    async fn property_grace_scanner_moves_exactly_expired() {
-        let repo = MockBacklogRepo::default();
-        let broker = InMemoryBroker::default();
-        let activity_broker = InMemoryActivityBroker::default();
-        let queue = workflow_queue();
-
-        // Publish 3 tasks. task_a is published first and
-        // will be the oldest.
-        let task_a = DispatchableWorkflowTask {
-            run_key: RunKey::new(),
-            queue: queue.clone(),
-            logical_seq: LogicalTaskSeq(1),
-            sticky_preferred: None,
-            normal_queue: None,
-            sticky_deadline: None,
-            priority: None,
-            order: None,
-        };
-        broker.publish_workflow_task(task_a.clone(), None).await;
-
-        // Wait so task_a ages past the grace window.
-        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
-
-        // Publish task_b and task_c — they are fresh.
-        let task_b = DispatchableWorkflowTask {
-            run_key: RunKey::new(),
-            queue: queue.clone(),
-            logical_seq: LogicalTaskSeq(2),
-            sticky_preferred: None,
-            normal_queue: None,
-            sticky_deadline: None,
-            priority: None,
-            order: None,
-        };
-        broker.publish_workflow_task(task_b.clone(), None).await;
-
-        let task_c = DispatchableWorkflowTask {
-            run_key: RunKey::new(),
-            queue: queue.clone(),
-            logical_seq: LogicalTaskSeq(3),
-            sticky_preferred: None,
-            normal_queue: None,
-            sticky_deadline: None,
-            priority: None,
-            order: None,
-        };
-        broker.publish_workflow_task(task_c.clone(), None).await;
-
-        // Grace window = 10ms. task_a (age ~15ms) exceeds
-        // it. task_b and task_c (age ~0ms) do not.
-        let config = BacklogConfig {
-            workflow_grace_window: std::time::Duration::from_millis(10),
-            ..BacklogConfig::default()
-        };
-        scan_grace_once(&broker, &activity_broker, &repo, &config).await;
-
-        let persisted = repo
-            .persisted
-            .lock()
-            .expect("persisted lock poisoned")
-            .clone();
-        assert_eq!(persisted.len(), 1);
-        assert_eq!(persisted[0].run_key, task_a.run_key);
-
-        // task_b and task_c should still be in live-ready.
-        let delivered_b = broker
-            .poll_workflow_task(
-                &queue,
-                &tokeira_types::WorkerIdentity("w".into()),
-                std::time::Duration::from_millis(1),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            delivered_b
-                .as_ref()
-                .and_then(|task| task.queued_task())
-                .map(|task| task.run_key),
-            Some(task_b.run_key)
-        );
-
-        let delivered_c = broker
-            .poll_workflow_task(
-                &queue,
-                &tokeira_types::WorkerIdentity("w".into()),
-                std::time::Duration::from_millis(1),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            delivered_c
-                .as_ref()
-                .and_then(|task| task.queued_task())
-                .map(|task| task.run_key),
-            Some(task_c.run_key)
-        );
-
-        // No more tasks.
-        let delivered_none = broker
-            .poll_workflow_task(
-                &queue,
-                &tokeira_types::WorkerIdentity("w".into()),
-                std::time::Duration::from_millis(1),
-            )
-            .await
-            .unwrap();
-        assert_eq!(delivered_none, None);
     }
 }

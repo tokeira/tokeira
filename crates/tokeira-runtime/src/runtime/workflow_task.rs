@@ -46,6 +46,7 @@ pub(crate) struct ResolvedWorkflowTaskTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PolledWorkflowTaskTarget {
+    home: ShardId,
     resolved: ResolvedWorkflowTaskTarget,
     deployment_transition: Option<WorkerDeploymentVersionRef>,
     /// Current/Ramping target offered for SDK notification, distinct from a
@@ -781,6 +782,8 @@ where
         worker_identity: WorkerIdentity,
         timeout_after: tokio::time::Duration,
     ) -> Result<Option<StartedWorkflowTask>> {
+        self.ready().await?;
+        let _demand = self.register_workflow_poll(&queue);
         let polled = match self
             .broker
             .poll_workflow_task(&queue, &worker_identity, timeout_after)
@@ -851,18 +854,8 @@ where
     ) -> Result<Option<WorkflowActivation>> {
         // Polls create demand before the first take, even if no publication ever
         // reached matching. Sticky polls retain their notification/timer path.
-        let _demand = if !is_sticky {
-            self.discovery.as_ref().and_then(|(registry, homes)| {
-                homes
-                    .local_home(&queue)
-                    .filter(|home| !home.cancel.is_cancelled())
-                    .map(|home| {
-                        registry.register_poll(queue.clone(), home, tokio::time::Instant::now())
-                    })
-            })
-        } else {
-            None
-        };
+        self.ready().await?;
+        let _demand = (!is_sticky).then(|| self.register_workflow_poll(&queue));
         let deadline = tokio::time::Instant::now() + timeout_after;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -906,8 +899,7 @@ where
                         // speculative-wft R.2). A non-stale error propagates.
                         Err(error)
                             if is_stale_workflow_task_start(&error)
-                                || (self.discovery.is_some()
-                                    && is_withdrawn_workflow_task_start(&error)) =>
+                                || is_withdrawn_workflow_task_start(&error) =>
                         {
                             tracing::debug!(
                                 ?error,
@@ -926,6 +918,19 @@ where
                 }
             }
         }
+    }
+
+    fn register_workflow_poll(
+        &self,
+        queue: &QueueKey,
+    ) -> Option<crate::discovery::PollDemandGuard> {
+        crate::discovery::QueueHomeProvider::local_home(self.discovery.1.as_ref(), queue).map(
+            |home| {
+                self.discovery
+                    .0
+                    .register_poll(queue.clone(), home, tokio::time::Instant::now())
+            },
+        )
     }
 
     pub async fn try_claim_workflow_task(
@@ -963,22 +968,67 @@ where
     async fn resolve_polled_workflow_task_target(
         &self,
         offered: &DispatchableWorkflowTask,
+        forwarded: bool,
     ) -> Result<PolledWorkflowTaskTarget> {
         // One round trip returns the state and its History Size (Requirement 1.8);
         // the statistic read here is the one the start transition records.
         let (loaded, stats) = self.repo.load_run_with_stats(offered.run_key).await?;
         let LoadedRun::Existing(state) = loaded else {
-            return Ok(PolledWorkflowTaskTarget {
-                resolved: ResolvedWorkflowTaskTarget {
-                    deployment_version: None,
-                    revision_number: 0,
-                    pinned: false,
-                },
-                deployment_transition: None,
-                routing_target: None,
-                history_size_bytes: stats.history_size_bytes,
-            });
+            return Err(crate::lane::KernelRejected(tokeira_kernel::Reject::MissingRun).into());
         };
+        anyhow::ensure!(
+            state.namespace_id == offered.queue.namespace_id,
+            "offered workflow namespace differs from run identity"
+        );
+        if forwarded {
+            // The internal endpoint is reachable by authenticated workers too.
+            // An asserted offer cannot authorize another run's queue or version.
+            // Queue identity is immutable within a run; the start command fences
+            // a concurrent pending-task replacement by its incarnation.
+            let sticky_match = state.sticky.as_ref().is_some_and(|sticky| {
+                sticky.sticky_queue == offered.queue.task_queue
+                    && offered.sticky_preferred.as_ref() == Some(&sticky.worker_identity)
+            });
+            if offered.queue.task_kind != TaskKind::Workflow
+                || (state.task_queue != offered.queue.task_queue && !sticky_match)
+            {
+                return Err(crate::WorkflowOfferRejected.into());
+            }
+            let (deployment, build_id) = if state.deployment.is_some() {
+                (state.deployment.clone(), state.build_id.clone())
+            } else {
+                let registry = self
+                    .worker_deployment_registry
+                    .read()
+                    .expect("deployment registry lock poisoned")
+                    .clone();
+                let version = if let Some(registry) = registry {
+                    let preferred = state
+                        .effective_deployment()
+                        .map(|version| version.deployment_name.as_str())
+                        .or(state.worker_deployment_name.as_deref());
+                    let config = registry
+                        .workflow_task_routing_config(
+                            state.namespace_id,
+                            &state.task_queue.0,
+                            preferred,
+                        )
+                        .await?;
+                    resolve_workflow_task_target_version(&config, &state).deployment_version
+                } else {
+                    None
+                };
+                (
+                    version
+                        .as_ref()
+                        .map(|v| DeploymentId(v.deployment_name.clone())),
+                    version.map(|v| BuildId(v.build_id)),
+                )
+            };
+            if offered.queue.deployment != deployment || offered.queue.build_id != build_id {
+                return Err(crate::WorkflowOfferRejected.into());
+            }
+        }
         let routing_config = self
             .load_worker_deployment_routing_config(&state, &offered.queue)
             .await?;
@@ -991,6 +1041,7 @@ where
         let deployment_transition =
             transition_for_polled_workflow_task(&state, &resolved, &offered.queue, speculative);
         Ok(PolledWorkflowTaskTarget {
+            home: self.execution_home(&state),
             resolved,
             deployment_transition,
             routing_target,
@@ -1799,7 +1850,7 @@ where
         );
         let offer_key = (offered.run_key, offered.logical_seq);
         let result = self
-            .start_polled_workflow_task_inner(offered, entered_at, worker_identity)
+            .route_polled_workflow_task(offered, entered_at, worker_identity)
             .instrument(span.clone())
             .await;
         // Ambiguous failures and cancelled futures keep only the bounded lease.
@@ -1819,13 +1870,57 @@ where
         result
     }
 
+    async fn route_polled_workflow_task(
+        &self,
+        offered: DispatchableWorkflowTask,
+        entered_at: tokio::time::Instant,
+        worker: WorkerIdentity,
+    ) -> Result<StartedWorkflowTask> {
+        let target = self
+            .resolve_polled_workflow_task_target(&offered, false)
+            .await?;
+        let local = self
+            .shard_owner
+            .read()
+            .expect("shard owner lock poisoned")
+            .is_active(target.home);
+        if !local {
+            let starter = self
+                .task_starter
+                .read()
+                .expect("workflow starter lock poisoned")
+                .clone();
+            if let Some(starter) = starter {
+                return starter.start(target.home, offered, worker).await;
+            }
+        }
+        self.start_polled_workflow_task_inner(offered, entered_at, worker, target)
+            .await
+    }
+
+    /// Start an offer received from another queue home. The receiver authorizes
+    /// the poll first; this method validates run identity and admits only a local
+    /// serving home. It never forwards, even when its placement route is stale.
+    pub async fn start_forwarded_workflow_task(
+        &self,
+        offered: DispatchableWorkflowTask,
+        worker: WorkerIdentity,
+    ) -> Result<StartedWorkflowTask> {
+        self.ready().await?;
+        let target = self
+            .resolve_polled_workflow_task_target(&offered, true)
+            .await?;
+        self.start_polled_workflow_task_inner(offered, tokio::time::Instant::now(), worker, target)
+            .await
+    }
+
     async fn start_polled_workflow_task_inner(
         &self,
         offered: DispatchableWorkflowTask,
         entered_at: tokio::time::Instant,
         worker_identity: WorkerIdentity,
+        target: PolledWorkflowTaskTarget,
     ) -> Result<StartedWorkflowTask> {
-        let target = self.resolve_polled_workflow_task_target(&offered).await?;
         tracing::debug!(
             run_key = %offered.run_key.0,
             task_queue = %offered.queue.task_queue.0,
@@ -2108,17 +2203,18 @@ fn server_failure_payload(message: &str) -> Payload {
 /// the stamp check in `service/history/api/recordworkflowtaskstarted/api.go`, and
 /// `ObsoleteMatchingTask` handling in `service/matching/matching_engine.go`.
 fn is_stale_workflow_task_start(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<crate::lane::KernelRejected>()
-        .is_some_and(|rejected| {
-            matches!(
-                rejected.0,
-                tokeira_kernel::Reject::WorkflowTaskSeqMismatch { .. }
-                    | tokeira_kernel::Reject::WorkflowTaskAlreadyStarted { .. }
-                    | tokeira_kernel::Reject::NoPendingWorkflowTask
-                    | tokeira_kernel::Reject::WorkflowPaused
-            )
-        })
+    error.is::<crate::WorkflowOfferRejected>()
+        || error
+            .downcast_ref::<crate::lane::KernelRejected>()
+            .is_some_and(|rejected| {
+                matches!(
+                    rejected.0,
+                    tokeira_kernel::Reject::WorkflowTaskSeqMismatch { .. }
+                        | tokeira_kernel::Reject::WorkflowTaskAlreadyStarted { .. }
+                        | tokeira_kernel::Reject::NoPendingWorkflowTask
+                        | tokeira_kernel::Reject::WorkflowPaused
+                )
+            })
 }
 
 fn is_withdrawn_workflow_task_start(error: &anyhow::Error) -> bool {

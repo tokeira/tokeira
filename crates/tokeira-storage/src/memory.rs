@@ -1030,6 +1030,15 @@ impl SnapshotDoc {
 
 #[async_trait]
 impl RunRepository for InMemoryStore {
+    fn recovery_is_empty(&self) -> bool {
+        self.inner.try_lock().is_ok_and(|state| {
+            state.runs.is_empty()
+                && state.workflow_dispatch.is_empty()
+                && state.timer_bucket.is_empty()
+                && state.bulk_writes.is_empty()
+        })
+    }
+
     fn placement_ready(&self) -> bool {
         self.placement_ready.load(AtomicOrdering::Acquire)
     }
@@ -2476,6 +2485,62 @@ impl RunRepository for InMemoryStore {
         kept.extend(remaining);
         store.dispatch_backlog = kept;
         Ok(drained)
+    }
+
+    async fn dispose_workflow_backlog_page(
+        &self,
+        after: Option<uuid::Uuid>,
+    ) -> Result<crate::WorkflowBacklogDisposal> {
+        let mut store = self.inner.lock().await;
+        let mut entries = store
+            .dispatch_backlog
+            .iter()
+            .filter(|entry| entry.queue.task_kind == TaskKind::Workflow)
+            .map(|entry| {
+                // Memory has no SQL primary key; a stable identity digest gives
+                // its disposable cursor the same seek/deferral contract.
+                let queue = postcard::to_allocvec(&entry.queue)?;
+                let payload = crate::codec::encode_backlog_payload(&entry.payload, None)?;
+                let key = tokeira_types::dsql_spread_uuid(&[
+                    &queue,
+                    &payload,
+                    entry.run_key.0.as_bytes(),
+                ]);
+                Ok((key, entry.identity(), entry.run_key))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        entries.retain(|(key, _, _)| after.is_none_or(|after| *key > after));
+        entries.sort_by_key(|(key, _, _)| *key);
+        let exhausted = entries.len() <= crate::LEGACY_WORKFLOW_KEYS;
+        entries.truncate(crate::LEGACY_WORKFLOW_KEYS);
+        let mut removed = std::collections::HashSet::new();
+        for (_, identity, run_key) in &entries {
+            let expected = store.runs.get(run_key).and_then(|state| {
+                crate::derive_workflow_dispatch(
+                    state,
+                    tokeira_types::execution_home_bundle(
+                        state.namespace_id.0.as_bytes(),
+                        state.workflow_id.0.as_bytes(),
+                        store.shard_count.max(1),
+                    ),
+                )
+            });
+            if store.workflow_dispatch.get(run_key) == expected.as_ref() {
+                removed.insert(identity.clone());
+            }
+        }
+        let mut model = store.begin_bulk_transaction()?;
+        model.delete(removed.len());
+        store.commit_bulk_transaction(&model);
+        store
+            .dispatch_backlog
+            .retain(|entry| !removed.contains(&entry.identity()));
+        Ok(crate::WorkflowBacklogDisposal {
+            last_examined: entries.last().map(|(key, _, _)| *key),
+            examined: entries.len(),
+            deleted: removed.len(),
+            exhausted,
+        })
     }
 
     async fn backlog_stats_by_priority(

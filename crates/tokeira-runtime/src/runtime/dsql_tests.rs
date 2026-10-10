@@ -3,10 +3,7 @@
 use super::*;
 use crate::{
     activity_timeout::ActivityTrackingEntry,
-    discovery::{
-        QueueHomeProvider,
-        tests::{Homes, home, transition},
-    },
+    discovery::tests::transition,
     nexus::{CompletionCallbackTrackingEntry, NexusTimeoutEntry},
 };
 use std::path::Path;
@@ -59,9 +56,8 @@ async fn workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs(
         matches!(expected, CommitResult::Applied { .. }),
         "live fixture commit did not apply"
     );
-    let homes: Arc<dyn QueueHomeProvider> = Arc::new(Homes(Mutex::new(home(0))));
     tokeira_storage::prepare_execution_placement(repo.as_ref()).await?;
-    let runtime = Arc::new(TokeiraRuntime::new_with_delivery(
+    let runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
         repo.clone(),
         1,
         LaneConfig {
@@ -81,7 +77,6 @@ async fn workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs(
         "127.0.0.1:0".into(),
         false,
         None,
-        Some(homes),
     ));
     let (entered, resume) = runtime.wft_timeout_tracking.pause_next_recovery();
     let acquiring = runtime.clone();

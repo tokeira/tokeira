@@ -155,8 +155,7 @@ async fn read_from_paginates_projection_log_rows() -> Result<()> {
     let Some(context) = TestContext::connect().await? else {
         return Ok(());
     };
-    let fixture = ProjectionFixture::new(10, 1);
-    context.clear_projection_rows(&fixture.run_keys).await?;
+    let fixture = ProjectionFixture::new(1);
     context.insert_projection_rows(&fixture).await?;
 
     let first = context
@@ -186,6 +185,7 @@ async fn read_from_paginates_projection_log_rows() -> Result<()> {
         .await?;
     assert!(third.records.is_empty());
     assert_eq!(third.next_cursor, second.next_cursor);
+    context.clear_projection_rows(&fixture.run_keys).await?;
     Ok(())
 }
 
@@ -490,11 +490,13 @@ struct ProjectionFixture {
 }
 
 impl ProjectionFixture {
-    fn new(partition_id: u32, fanout: u16) -> Self {
-        let run_keys = [1_u128, 2, 3]
-            .into_iter()
-            .map(|value| RunKey(Uuid::from_u128(value)))
-            .collect();
+    fn new(fanout: u16) -> Self {
+        // Storage suites leave projection rows in ordinary execution partitions.
+        // A fresh positive-i32 partition keeps pagination assertions local to
+        // this fixture without deleting another suite's transition evidence.
+        let partition_id = ((Uuid::new_v4().as_u128() as u32) & 0x3fff_ffff) | 0x4000_0000;
+        let mut run_keys = (0..3).map(|_| RunKey(Uuid::new_v4())).collect::<Vec<_>>();
+        run_keys.sort_by_key(|key| key.0);
         Self {
             partition_id,
             fanout,

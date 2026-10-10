@@ -51,6 +51,7 @@ struct Repo {
     preparation_retries: AtomicUsize,
     preparation_attempts: AtomicUsize,
     pause: Mutex<Option<Pause>>,
+    dispatch_fixture: Mutex<Option<BTreeMap<RunKey, WorkflowDispatchRow>>>,
 }
 
 impl Repo {
@@ -107,7 +108,7 @@ impl Repo {
 }
 
 fn runtime(repo: Arc<Repo>) -> Arc<TokeiraRuntime<Repo>> {
-    let runtime = Arc::new(TokeiraRuntime::new(
+    Arc::new(TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
         repo,
         1,
         LaneConfig::default(),
@@ -117,9 +118,17 @@ fn runtime(repo: Arc<Repo>) -> Arc<TokeiraRuntime<Repo>> {
         },
         WorkflowTimeoutScannerConfig::default(),
         BacklogConfig::default(),
-    ));
-    runtime.shard_owner.write().unwrap().enable_reconciliation();
-    runtime
+        ActivityTimeoutScannerConfig::default(),
+        NexusTimeoutScannerConfig::default(),
+        NexusEndpointRegistry::default(),
+        Arc::new(NoopNexusHttpClient),
+        NexusCompletionDeps::default(),
+        1,
+        "repair-test".into(),
+        "127.0.0.1:0".into(),
+        false,
+        None,
+    ))
 }
 
 async fn seed(repo: &Repo) -> WorkflowState {
@@ -271,7 +280,6 @@ async fn acquisition_drains_an_admitted_lane_commit_before_reading_repair_pages(
     ));
     {
         let mut owner = runtime.shard_owner.write().unwrap();
-        owner.enable_reconciliation();
         owner.record_acquired(home, ShardEpoch::ZERO);
         owner.mark_active(home);
     }
@@ -341,6 +349,9 @@ async fn acquisition_drains_an_admitted_lane_commit_before_reading_repair_pages(
 
 #[async_trait]
 impl RunRepository for Repo {
+    fn recovery_is_empty(&self) -> bool {
+        self.inner.recovery_is_empty()
+    }
     fn placement_ready(&self) -> bool {
         self.inner.placement_ready()
     }
@@ -552,7 +563,19 @@ impl RunRepository for Repo {
         self.hit(Point::Repair).await?;
         self.inner
             .reconcile_workflow_dispatch_run(home, run_key)
-            .await
+            .await?;
+        let row = match self.inner.load_run(run_key).await? {
+            LoadedRun::Existing(state) => derive_workflow_dispatch(&state, home),
+            _ => None,
+        };
+        if let Some(rows) = self.dispatch_fixture.lock().unwrap().as_mut() {
+            if let Some(row) = row {
+                rows.insert(run_key, row);
+            } else {
+                rows.remove(&run_key);
+            }
+        }
+        Ok(())
     }
 
     async fn list_workflow_dispatch_page(
@@ -573,6 +596,16 @@ impl RunRepository for Repo {
         limit: std::num::NonZeroU32,
     ) -> Result<Vec<RunKey>> {
         self.hit(Point::Home).await?;
+        if let Some(rows) = self.dispatch_fixture.lock().unwrap().as_ref() {
+            return Ok(rows
+                .iter()
+                .filter(|(key, row)| {
+                    row.execution_home == home && after.is_none_or(|after| **key > after)
+                })
+                .take(limit.get() as usize)
+                .map(|(key, _)| *key)
+                .collect());
+        }
         self.inner
             .list_workflow_dispatch_for_home(home, after, limit)
             .await
@@ -686,7 +719,7 @@ fn timeout_runtime(repo: Arc<Repo>, home: ShardId) -> Arc<TokeiraRuntime<Repo>> 
 pub(super) fn home_runtime<R: RunRepository + 'static>(
     repo: Arc<R>,
     home: ShardId,
-    repair: bool,
+    _repair: bool,
 ) -> Arc<TokeiraRuntime<R>> {
     let runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
         repo,
@@ -714,9 +747,6 @@ pub(super) fn home_runtime<R: RunRepository + 'static>(
     ));
     {
         let mut owner = runtime.shard_owner.write().unwrap();
-        if repair {
-            owner.enable_reconciliation();
-        }
         owner.record_acquired(home, ShardEpoch::ZERO);
         owner.mark_active(home);
     }
@@ -1234,4 +1264,61 @@ async fn placement_preparation_retries_without_restart_and_backoff_is_cancellabl
     assert_eq!(repo.preparation_attempts.load(Ordering::SeqCst), 11);
     drop(waiting);
     assert_eq!(repo.preparation_retries.load(Ordering::SeqCst), 99);
+}
+
+#[tokio::test]
+async fn seeded_default_constructor_repairs_missing_and_stale_rows_before_activation() {
+    let original = Repo::default();
+    let state = seed(&original).await;
+    let restored = InMemoryStore::from_snapshot(&original.inner.snapshot().await.unwrap()).unwrap();
+    prepare_execution_placement(&restored).await.unwrap();
+    let mut stale = derive_workflow_dispatch(&state, ShardId(0)).unwrap();
+    stale.incarnation.run_key = RunKey::new();
+    let orphan = stale.incarnation.run_key;
+    let repo = Arc::new(Repo {
+        inner: restored,
+        dispatch_fixture: Mutex::new(Some(BTreeMap::from([(orphan, stale)]))),
+        ..Default::default()
+    });
+    let before = repo.inner.snapshot().await.unwrap();
+    let (candidates, continue_candidates) = repo.pause(Point::Candidates);
+    let runtime = TokeiraRuntime::new(
+        repo.clone(),
+        1,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+    );
+    assert!(runtime.active_shards().is_empty());
+    candidates.await.unwrap();
+    let (home, continue_home) = repo.pause(Point::Home);
+    continue_candidates.send(()).unwrap();
+    home.await.unwrap();
+    assert!(runtime.active_shards().is_empty());
+    {
+        let rows = repo.dispatch_fixture.lock().unwrap();
+        let rows = rows.as_ref().unwrap();
+        assert!(
+            rows.contains_key(&state.run_key),
+            "first walk establishes missing intent"
+        );
+        assert!(
+            rows.contains_key(&orphan),
+            "second walk must finish before serving"
+        );
+    }
+    continue_home.send(()).unwrap();
+    runtime.ready().await.unwrap();
+    assert_eq!(runtime.active_shards(), [ShardId(0)]);
+    let wanted = BTreeMap::from([(
+        state.run_key,
+        derive_workflow_dispatch(&state, ShardId(0)).unwrap(),
+    )]);
+    assert_eq!(
+        repo.dispatch_fixture.lock().unwrap().as_ref().unwrap(),
+        &wanted
+    );
+    assert_eq!(repo.inner.snapshot().await.unwrap(), before);
+    stop(&runtime).await;
 }

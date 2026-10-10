@@ -1398,6 +1398,19 @@ impl TokeiraConfig {
                 message: "must be positive".to_string(),
             });
         }
+        // Runtime storage and membership currently use these counts for the same
+        // execution-home hash. Accepting different values would route a request to
+        // a different owner from the one holding its durable state. Changing the
+        // hash of existing placements requires an explicit migration.
+        if placement.shard_count != placement.bundle_count {
+            errors.push(ValidationError::Field {
+                field: "infrastructure.placement".to_string(),
+                message: format!(
+                    "shard_count ({}) must equal bundle_count ({}) for workflow dispatch; preserve the existing durable placement count when configuring matching values; automatic repartitioning is not supported",
+                    placement.shard_count, placement.bundle_count,
+                ),
+            });
+        }
         if placement.partition_count == 0 {
             errors.push(ValidationError::Field {
                 field: "infrastructure.placement.partition_count".to_string(),
@@ -2029,6 +2042,55 @@ mod tests {
         let encoded = config.to_toml().unwrap();
         let decoded: TokeiraConfig = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn placement_counts_must_match_for_every_storage_and_membership_mode() {
+        for storage in [ConfigStorageKind::InMemory, ConfigStorageKind::Dsql] {
+            for controller_endpoint in [None, Some("http://127.0.0.1:7240".to_string())] {
+                let mut config = TokeiraConfig::default();
+                config.infrastructure.storage = storage.clone();
+                config.infrastructure.dsql.endpoint = Some("test.invalid".to_string());
+                config.infrastructure.placement.controller_endpoint = controller_endpoint;
+                for (shards, bundles) in [(8, 4), (4, 8)] {
+                    config.infrastructure.placement.shard_count = shards;
+                    config.infrastructure.placement.bundle_count = bundles;
+                    let error = config.validate().unwrap_err().to_string();
+                    assert!(error.contains("infrastructure.placement"), "{error}");
+                    assert!(
+                        error.contains(&format!("shard_count ({shards})")),
+                        "{error}"
+                    );
+                    assert!(
+                        error.contains(&format!("bundle_count ({bundles})")),
+                        "{error}"
+                    );
+                    assert!(
+                        error.contains("preserve the existing durable placement count"),
+                        "{error}"
+                    );
+                    assert!(
+                        error.contains("automatic repartitioning is not supported"),
+                        "{error}"
+                    );
+                }
+                config.infrastructure.placement.shard_count = 8;
+                config.infrastructure.placement.bundle_count = 8;
+                config.validate().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn dsql_defaults_require_an_explicit_matching_bundle_count() {
+        let mut config = TokeiraConfig::default();
+        config.infrastructure.storage = ConfigStorageKind::Dsql;
+        config.infrastructure.dsql.endpoint = Some("test.invalid".to_string());
+        config.apply_storage_defaults();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("shard_count (32) must equal bundle_count (1)"));
+        config.infrastructure.placement.bundle_count = 32;
+        config.validate().unwrap();
     }
 
     #[test]

@@ -35,6 +35,12 @@ pub enum RouteTarget {
 
 #[async_trait]
 pub trait EdgeRouter: Send + Sync + 'static {
+    /// Whether every execution route is local. This avoids an extra admission
+    /// and state read when a task reply cannot require transport forwarding.
+    fn routes_locally(&self) -> bool {
+        false
+    }
+
     async fn route_workflow(&self, namespace: &str, workflow_id: &str) -> EdgeResult<RouteTarget>;
 
     async fn route_task_queue(
@@ -50,6 +56,10 @@ pub struct LocalOnlyRouter;
 
 #[async_trait]
 impl EdgeRouter for LocalOnlyRouter {
+    fn routes_locally(&self) -> bool {
+        true
+    }
+
     async fn route_workflow(
         &self,
         _namespace: &str,
@@ -125,10 +135,18 @@ impl EdgeRouter for CacheBackedRouter {
     ) -> EdgeResult<RouteTarget> {
         let snapshot = self.cache.snapshot();
         let placement_key = format!("{namespace}\0{task_queue}\0{}", task_kind.to_db_smallint());
-        let partition = queue_partition_for(
-            placement_key.as_bytes(),
-            snapshot.placement_config.partition_count,
-        );
+        let partition = if task_kind == TaskKind::Workflow {
+            tokeira_types::workflow_queue_partition(
+                crate::translate::to_internal::namespace_id_for(namespace),
+                task_queue,
+                snapshot.placement_config.partition_count,
+            )
+        } else {
+            queue_partition_for(
+                placement_key.as_bytes(),
+                snapshot.placement_config.partition_count,
+            )
+        };
         drop(snapshot);
 
         let key = QueuePartitionKey {

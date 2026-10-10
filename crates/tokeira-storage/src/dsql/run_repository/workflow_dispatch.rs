@@ -12,7 +12,6 @@ use crate::workflow_dispatch::{
     derive_workflow_dispatch,
 };
 
-#[cfg(all(test, feature = "dsql-integration"))]
 pub(super) const SELECT_ROW: &str = "SELECT run_key, shard_id, queue_namespace, queue_name,
     normal_queue_name, sticky, routing_mode, deployment, build_id, logical_seq,
     scheduled_at, priority_key, priority_data, sticky_worker, schedule_to_start_deadline

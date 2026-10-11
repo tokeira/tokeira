@@ -389,12 +389,14 @@ where
 
 /// [`NexusNamespaceResolver`] backed by the edge namespace cache.
 ///
-/// The runtime publisher tags the External-endpoint outbound Nexus metric with the
-/// originator's namespace *name*, but holds only its [`NamespaceId`]. tokeira namespace ids
-/// are a non-invertible function of the name, so resolution scans the (small) registered set
-/// and matches `namespace_id_for(name)` — the inverse the runtime needs. Returns `None` when
-/// no registered namespace hashes to the id, leaving the metric unrecorded rather than
-/// mistagged.
+/// The runtime publisher needs a namespace's *name* where it holds only its
+/// [`NamespaceId`]: to tag the External-endpoint outbound Nexus metric with the
+/// originator's namespace, and to name the target namespace in the event that resolves an
+/// external signal or cancel request whose command named none. tokeira namespace ids are a
+/// non-invertible function of the name, so resolution scans the (small) registered set and
+/// matches `namespace_id_for(name)` — the inverse the runtime needs. Returns `None` when no
+/// registered namespace hashes to the id, leaving the metric unrecorded rather than
+/// mistagged, and the resolving event's name empty.
 struct CacheNexusNamespaceResolver {
     namespaces: Arc<dyn NamespaceCache>,
 }
@@ -3313,8 +3315,9 @@ where
         node_id.to_string(),
         node_endpoint.as_authority(),
         seed_default_shard,
-        // Tag the External-endpoint outbound Nexus metric with the originator's
-        // namespace name, resolved through the shared edge namespace cache.
+        // Namespace names for the publisher, resolved through the shared edge
+        // namespace cache: the External-endpoint outbound Nexus metric's tag, and
+        // the target namespace in external signal and cancel resolving events.
         Some(Arc::new(CacheNexusNamespaceResolver {
             namespaces: namespaces.clone(),
         }) as Arc<dyn NexusNamespaceResolver>),

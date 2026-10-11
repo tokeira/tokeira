@@ -10516,4 +10516,89 @@ mod tests {
 
         overrides.clear(FRONTEND_VISIBILITY_MAX_PAGE_SIZE_KEY);
     }
+
+    /// A child start that names no namespace takes the parent's name and id, as
+    /// v1.31.0 writes the parent's namespace into the command
+    /// (`workflow_task_completed_handler.go:1045-1058 @ v1.31.0`). A signal or
+    /// cancel request that names none keeps an empty namespace and the nil id,
+    /// which the kernel defaults to the workflow's own.
+    #[test]
+    fn an_empty_command_namespace_is_defaulted_as_v1_31_0_does() {
+        let child = command::Command {
+            attributes: Some(
+                command::command::Attributes::StartChildWorkflowExecutionCommandAttributes(
+                    command::StartChildWorkflowExecutionCommandAttributes {
+                        workflow_id: "child".to_string(),
+                        workflow_type: Some(proto_common::WorkflowType {
+                            name: "child-type".to_string(),
+                        }),
+                        ..Default::default()
+                    },
+                ),
+            ),
+            ..Default::default()
+        };
+        let WorkflowCommand::StartChildWorkflow {
+            namespace,
+            namespace_id,
+            ..
+        } = proto_command_to_workflow_command(child, "orders").unwrap()
+        else {
+            panic!("a child start");
+        };
+        assert_eq!(namespace.as_deref(), Some("orders"));
+        assert_eq!(namespace_id, namespace_id_for("orders"));
+
+        let signal = command::Command {
+            attributes: Some(
+                command::command::Attributes::SignalExternalWorkflowExecutionCommandAttributes(
+                    command::SignalExternalWorkflowExecutionCommandAttributes {
+                        execution: Some(proto_common::WorkflowExecution {
+                            workflow_id: "other".to_string(),
+                            run_id: String::new(),
+                        }),
+                        signal_name: "poke".to_string(),
+                        ..Default::default()
+                    },
+                ),
+            ),
+            ..Default::default()
+        };
+        let WorkflowCommand::SignalExternalWorkflowExecution {
+            target_namespace,
+            target_namespace_id,
+            ..
+        } = proto_command_to_workflow_command(signal, "orders").unwrap()
+        else {
+            panic!("a signal");
+        };
+        assert_eq!(
+            (target_namespace, target_namespace_id),
+            (None, NamespaceId(Uuid::nil()))
+        );
+
+        let cancel = command::Command {
+            attributes: Some(
+                command::command::Attributes::RequestCancelExternalWorkflowExecutionCommandAttributes(
+                    command::RequestCancelExternalWorkflowExecutionCommandAttributes {
+                        workflow_id: "other".to_string(),
+                        ..Default::default()
+                    },
+                ),
+            ),
+            ..Default::default()
+        };
+        let WorkflowCommand::RequestCancelExternalWorkflowExecution {
+            target_namespace,
+            target_namespace_id,
+            ..
+        } = proto_command_to_workflow_command(cancel, "orders").unwrap()
+        else {
+            panic!("a cancel request");
+        };
+        assert_eq!(
+            (target_namespace, target_namespace_id),
+            (None, NamespaceId(Uuid::nil()))
+        );
+    }
 }

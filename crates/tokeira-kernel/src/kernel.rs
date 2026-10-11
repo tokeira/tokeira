@@ -2710,12 +2710,18 @@ impl BasicKernel {
             .cloned()
             .ok_or(Reject::UnknownExternalSignal(req.initiated_event_id))?;
 
+        // The command's namespace name when it gave one; otherwise the name the
+        // runtime looked up for the target namespace id, as v1.31.0 records the
+        // name of the namespace it looks up from the initiated event's id
+        // (`processSignalExecution`, transfer_queue_active_task_executor.go:610-700
+        // @ v1.31.0).
+        let namespace = pending.target_namespace.clone().or(req.target_namespace);
         match req.result {
             ExternalSignalResult::Signaled => {
                 builder.append_external(HistoryEventKind::ExternalWorkflowExecutionSignaled {
                     initiated_event_id: pending.initiated_event_id,
                     namespace_id: pending.target_namespace_id,
-                    namespace: pending.target_namespace.clone(),
+                    namespace,
                     target_workflow_id: pending.target_workflow_id,
                     target_run_id: pending.target_run_id,
                 });
@@ -2724,7 +2730,7 @@ impl BasicKernel {
                 builder.append_external(HistoryEventKind::SignalExternalWorkflowExecutionFailed {
                     initiated_event_id: pending.initiated_event_id,
                     namespace_id: pending.target_namespace_id,
-                    namespace: pending.target_namespace.clone(),
+                    namespace,
                     target_workflow_id: pending.target_workflow_id,
                     target_run_id: pending.target_run_id,
                     cause,
@@ -2759,13 +2765,16 @@ impl BasicKernel {
             .cloned()
             .ok_or(Reject::UnknownExternalCancel(req.initiated_event_id))?;
 
+        // As for a signal (`processCancelExecution`,
+        // transfer_queue_active_task_executor.go:484-560 @ v1.31.0).
+        let namespace = pending.target_namespace.clone().or(req.target_namespace);
         match req.result {
             ExternalCancelResult::CancelRequested => {
                 builder.append_external(
                     HistoryEventKind::ExternalWorkflowExecutionCancelRequested {
                         initiated_event_id: pending.initiated_event_id,
                         namespace_id: pending.target_namespace_id,
-                        namespace: pending.target_namespace.clone(),
+                        namespace,
                         target_workflow_id: pending.target_workflow_id,
                         target_run_id: pending.target_run_id,
                     },
@@ -2776,7 +2785,7 @@ impl BasicKernel {
                     HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed {
                         initiated_event_id: pending.initiated_event_id,
                         namespace_id: pending.target_namespace_id,
-                        namespace: pending.target_namespace.clone(),
+                        namespace,
                         target_workflow_id: pending.target_workflow_id,
                         target_run_id: pending.target_run_id,
                         cause,
@@ -6154,6 +6163,16 @@ fn apply_workflow_command(
             header,
             control,
         } => {
+            // An empty namespace in the command (the edge's nil id) means the
+            // workflow's own, as for a cancel request or a child start
+            // (`handleCommandSignalExternalWorkflow`,
+            // workflow_task_completed_handler.go:1155-1168 @ v1.31.0). The
+            // initiated event still records the command's namespace as given.
+            let target_namespace_id = if target_namespace_id.0.is_nil() {
+                builder.state.namespace_id
+            } else {
+                target_namespace_id
+            };
             reject_if_pending_limit_reached(
                 limits.pending_signals,
                 builder.state.pending_external_signals.len(),

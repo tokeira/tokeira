@@ -1,5 +1,0 @@
-kind: fixed
-body: A distributed tokeirad now refuses to start on a DSQL schema its release can't run on, and `tkr schema setup` now migrates Compose and ECS deployments.
-time: 2026-10-11T16:11:58.000000+01:00
-custom:
-    Slice: 4476944c-ffd3-4610-8eba-d662cb3b33a0

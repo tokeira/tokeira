@@ -1,5 +1,0 @@
-kind: fixed
-body: A signal to another workflow that names no namespace now reaches it in the sender's namespace, and the events resolving such signals and cancel requests name that namespace.
-time: 2026-10-10T23:21:21.000000+01:00
-custom:
-    Slice: 5018b054-6cf6-4233-afc4-e271769471eb

@@ -400,9 +400,9 @@ Not all stages are required for every combination. The platform determines which
 
 #### Acceptance Criteria
 
-1. WHEN `schema setup` is invoked for a deployment with `storage = dsql`, THE TKR_CLI SHALL run the DSQL schema migration tooling against the cluster endpoint from the deployment's `tokeirad.toml`.
+1. WHEN `schema setup` is invoked for a deployment whose `tokeirad.toml` selects `infrastructure.storage = "dsql"`, THE TKR_CLI SHALL run the DSQL schema migration tooling against the cluster endpoint from that `tokeirad.toml`, whatever storage the deployment's metadata records.
 2. THE TKR_CLI SHALL NOT run schema setup automatically during any other lifecycle stage — schema management is an explicit operator action.
-3. IF the deployment does not use `dsql` storage, THEN THE TKR_CLI SHALL return an error indicating that schema management is only available for DSQL deployments.
+3. IF the deployment's `tokeirad.toml` does not select `dsql` storage, THEN THE TKR_CLI SHALL return an error indicating that schema management is only available for DSQL deployments.
 
 ### Requirement 7.2: Schema Status
 
@@ -410,8 +410,8 @@ Not all stages are required for every combination. The platform determines which
 
 #### Acceptance Criteria
 
-1. WHEN `schema status` is invoked for a deployment with `storage = dsql`, THE TKR_CLI SHALL query the migration tracking table and print the list of applied migrations with their versions and timestamps.
-2. IF the deployment does not use `dsql` storage, THEN THE TKR_CLI SHALL return an error indicating that schema management is only available for DSQL deployments.
+1. WHEN `schema status` is invoked for a deployment whose `tokeirad.toml` selects `infrastructure.storage = "dsql"`, THE TKR_CLI SHALL query the migration tracking table and print the list of applied migrations with their versions and timestamps.
+2. IF the deployment's `tokeirad.toml` does not select `dsql` storage, THEN THE TKR_CLI SHALL return an error indicating that schema management is only available for DSQL deployments.
 
 ---
 

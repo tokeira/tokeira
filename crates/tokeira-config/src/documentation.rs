@@ -164,7 +164,7 @@ pub const CONFIG_FIELD_CATALOG: &[ConfigFieldDocumentation] = &[
         "<unset>",
         false,
         None,
-        "Explicit automatic or validate-only schema policy required at DSQL startup."
+        "Distributed DSQL startup schema policy: unset or validate_only checks the schema; automatic is refused."
     ),
     field!(
         "infrastructure.placement.controller_endpoint",

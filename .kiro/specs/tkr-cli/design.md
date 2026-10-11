@@ -518,7 +518,7 @@ The `Ops` trait's `port_mappings(service, config) -> Vec<PortMapping>` returns a
 
 ### Property 6: Schema commands reject non-DSQL storage
 
-*For any* deployment with storage other than `dsql`, invoking `schema setup` or `schema status` SHALL return an error indicating that schema management is only available for DSQL deployments.
+*For any* deployment whose `tokeirad.toml` selects storage other than `dsql`, whatever its metadata records, invoking `schema setup` or `schema status` SHALL return an error indicating that schema management is only available for DSQL deployments.
 
 **Validates: Requirements 7.1.3, 7.2.2**
 

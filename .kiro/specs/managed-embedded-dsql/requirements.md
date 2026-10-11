@@ -106,10 +106,9 @@ change, work must stop and that conflict must be raised for a new product decisi
 8. [`DsqlInfraConfig`](../../../crates/tokeira-config/src/lib.rs) currently stores an
    endpoint and Region but has no embedded storage-mode choice, cluster descriptor,
    creation token, ownership configuration, or migration policy.
-9. [`tkr schema`](../../../apps/tkr/src/commands/schema.rs) currently makes schema setup
-   an explicit, confirmed operator action. This remains the baseline expectation for
-   operator-supplied and distributed DSQL unless an explicit migration policy says
-   otherwise.
+9. [`tkr schema`](../../../apps/tkr/src/commands/schema.rs) makes schema setup an
+   explicit, confirmed operator action. It is how distributed DSQL is migrated, and how
+   operator-supplied DSQL is migrated unless its migration policy is automatic.
 10. [`tokeira-observability`](../../../crates/tokeira-observability/src/lib.rs) is a
     process-level installer for binaries. It can install global tracing and metrics state
     and can bind a metrics listener, so embedded mode must not call it.
@@ -446,7 +445,7 @@ automatic migration policy.
 the configuration.
 
 5.3 WHEN distributed DSQL mode omits a migration policy, THE Tokeira process SHALL
-reject the configuration.
+apply the validate-only policy.
 
 5.4 WHEN validate-only policy observes `MIN <= C < TARGET`, THE compatibility checker
 SHALL return a migration-required failure without changing the schema.
@@ -472,12 +471,15 @@ release's applicable schema compatibility metadata.
 5.11 WHEN no schema tables exist in a newly created managed cluster, THE migration runner
 SHALL install the complete Tokeira schema automatically.
 
-5.12 WHEN an existing or distributed cluster explicitly selects automatic migration,
-THE migration runner SHALL apply the same compatibility and fencing checks as managed
-mode.
+5.12 WHEN an existing cluster explicitly selects automatic migration, THE migration
+runner SHALL apply the same compatibility and fencing checks as managed mode.
 
 5.13 WHEN an existing or distributed cluster selects validate-only migration, THE
 migration runner SHALL leave schema state unchanged.
+
+5.14 WHEN distributed DSQL mode selects automatic migration, THE Tokeira process SHALL
+refuse to start before it connects to DSQL
+([distributed-schema-startup-check](../distributed-schema-startup-check/bugfix.md)).
 
 ### Requirement 6: DynamoDB-free Embedded DSQL Admission Control
 

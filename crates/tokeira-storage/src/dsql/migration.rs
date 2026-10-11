@@ -762,7 +762,7 @@ fn post_claim_bootstrap_statements() -> &'static [&'static str] {
     APPLICATION_BOOTSTRAP
 }
 
-async fn read_schema_observation(
+pub(crate) async fn read_schema_observation(
     connection: &mut PgConnection,
 ) -> Result<SchemaObservation, SchemaCompatibilityError> {
     let applied_migrations = read_applied_migrations(connection).await?;

@@ -190,6 +190,31 @@ cargo nextest run -p tokeira-storage --features dsql-integration --locked --prof
   --test dsql_migration_runner --run-ignored only
 ```
 
+## Distributed startup schema check
+
+The three ignored `distributed_schema_live_tests` in `tokeira-engine` start a
+listener-backed distributed node, as `tokeirad` with `infrastructure.storage = "dsql"`
+starts, against an existing cluster and the two DynamoDB tables that coordinate its
+connections. Set `TOKEIRA_DSQL_DISTRIBUTED_ENDPOINT`, `TOKEIRA_DSQL_DISTRIBUTED_REGION`,
+`TOKEIRA_DSQL_DISTRIBUTED_RATE_LIMITER_TABLE` and `TOKEIRA_DSQL_DISTRIBUTED_CONN_LEASE_TABLE`;
+each test fails when one is unset. Each table needs only a string partition key named
+`pk`. The standard AWS credential chain must supply an identity authorized for the
+connector's `admin` connection and for both tables.
+
+```bash
+cargo nextest run -p tokeira-engine --features dsql-integration --lib --locked --profile dsql-live \
+  --run-ignored only -E 'test(/distributed_schema_live_tests::/)'
+```
+
+Each test first applies the embedded migrations and forgets any ledger version past what
+the release reads, so the tests run in any order and again on the same cluster. The first
+run on a new cluster applies the whole corpus.
+- One test forgets the target's ledger row, and one records a version past the maximum
+  readable one. Each start must be refused, and must leave as it found them the ledger,
+  the compatibility record, the shard leases, the connection-slot blocks and both
+  listener addresses. Each test then restores the ledger.
+- The third starts a node on the target schema and calls `GetSystemInfo`.
+
 ## Managed lifecycle
 
 The [managed embedded DSQL live-AWS runbook](managed-embedded-dsql-live-aws.md) covers the

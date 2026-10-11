@@ -286,6 +286,13 @@ setup --yes`, inspect them with `schema status`, and validate the migration set 
 `schema validate`. The storage contract is documented in
 [DSQL storage](../architecture/050-dsql-storage.md).
 
+`tkr schema` acts on any deployment whose `tokeirad.toml` selects
+`infrastructure.storage = "dsql"`. A distributed `tokeirad` checks the schema when it
+starts, without changing it. It refuses to start on a schema its release can't run on:
+one behind the release's target, which `tkr schema setup` brings forward, or one past
+what the release reads. Leave `infrastructure.dsql.migration_policy` unset or set it to
+`validate_only`; a distributed `tokeirad` refuses `automatic`.
+
 ## Operating and inspecting
 
 Use these read paths before mutation or when a gate refuses:

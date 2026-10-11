@@ -65,6 +65,8 @@ use chasm_extensions::{
 };
 
 pub mod correlation_format;
+#[cfg(all(test, feature = "dsql-integration"))]
+mod distributed_schema_live_tests;
 #[cfg(test)]
 mod embedded_dsql_tests;
 #[doc(hidden)]
@@ -279,7 +281,8 @@ use tokeira_storage::{
         DsqlConnectionDirector, DsqlCoordinationConfig, DsqlPoolConfig, DsqlStore,
         EmbeddedDsqlPoolConfig, MigrationRunner, OWNER_ADMISSION_MARGIN, OWNER_LEASE_DURATION,
         OWNER_RENEW_INTERVAL, OwnershipAdmissionGate, OwnershipAdmissionState,
-        SCHEMA_MIGRATION_ADMISSION_MARGIN, SCHEMA_MIGRATION_LEASE_DURATION, SchemaDecision,
+        SCHEMA_MIGRATION_ADMISSION_MARGIN, SCHEMA_MIGRATION_LEASE_DURATION,
+        SchemaCompatibilityError, SchemaDecision, SchemaIncompatibilityCategory,
         SchemaMigrationPolicy, WarmupDeadline,
     },
 };
@@ -2757,20 +2760,127 @@ impl std::fmt::Debug for EmbeddedStack {
     }
 }
 
-/// Build the full server stack and start serving on the given address.
-///
-/// Storage selection is driven only by `infrastructure.storage`: endpoint
-/// presence alone is not treated as intent. This keeps failed DSQL writeback
-/// and explicit in-memory deployments from being conflated.
-///
-/// Factored out so both the CLI entrypoint and the in-memory facade share one
-/// bootstrap path. Deliberately long and sequential: each block mirrors the
-/// startup dependency order.
 /// Default maximum identifier length for standalone-activity ids, mirroring
 /// Temporal's `MaxIDLengthLimit` default of `1000` (`common/dynamicconfig` @
 /// v1.31.0). Used to validate standalone-activity ids at the edge.
 const DEFAULT_MAX_ID_LENGTH: usize = 1000;
 
+/// Refuse a migration policy a listener-backed distributed node doesn't
+/// honour, before it connects to anything.
+///
+/// A distributed node never migrates the schema it shares with every other
+/// node: migrating stays the operator's explicit `tkr schema setup` (root
+/// `AGENTS.md` §4). So an absent or `validate_only` policy selects the startup
+/// check, and `automatic` is refused rather than quietly read as
+/// `validate_only`.
+fn refuse_distributed_migration_policy(config: &TokeiraConfig) -> Result<()> {
+    match config.infrastructure.dsql.migration_policy {
+        None | Some(DsqlMigrationPolicy::ValidateOnly) => Ok(()),
+        Some(DsqlMigrationPolicy::Automatic) => Err(anyhow!(
+            "infrastructure.dsql.migration_policy = \"automatic\" is not supported by \
+             listener-backed distributed DSQL: a distributed tokeirad never migrates the \
+             schema it shares with other nodes. Apply migrations with `tkr schema setup`, \
+             then set the policy to \"validate_only\" or remove it"
+        )),
+    }
+}
+
+/// Check a listener-backed distributed node's DSQL schema against its
+/// release's schema contract, without changing it, and refuse unless the
+/// release can run on it.
+///
+/// The assessment is the embedded engine's (`apply_embedded_schema`) under the
+/// validate-only policy. It uses the runner over the compiled-in migrations,
+/// from which the release's contract is computed; the store's own runner reads
+/// a migrations directory. Its one connection comes from the store's
+/// coordinated reservoir, so the check keeps to DSQL's connection limits like
+/// every other read.
+async fn check_distributed_schema(dsql_store: &DsqlStore) -> Result<()> {
+    let contract = MigrationRunner::compatibility_contract();
+    let decision = {
+        let mut permit = dsql_store
+            .connection_director()
+            .acquire(DbClass::Control)
+            .await?;
+        MigrationRunner::embedded()
+            .assess_connection(
+                permit.connection()?,
+                &contract,
+                SchemaMigrationPolicy::ValidateOnly,
+            )
+            .await
+            .context("failed to read the DSQL schema's migration ledger")?
+    };
+    let current = distributed_schema_admission(decision)?;
+    info!(
+        schema_version = current,
+        target_version = contract.target_version,
+        maximum_readable_version = contract.maximum_readable_version,
+        "DSQL schema check passed"
+    );
+    Ok(())
+}
+
+/// Admit a listener-backed distributed node only to a schema that a
+/// validate-only assessment found compatible, returning its version.
+/// Otherwise return the refusal the node exits with: what it found and what
+/// to do about it.
+fn distributed_schema_admission(decision: SchemaDecision) -> Result<u32> {
+    match decision {
+        SchemaDecision::Compatible { current, .. } => Ok(current),
+        SchemaDecision::MigrationRequired { current: 0, target } => Err(anyhow!(
+            "tokeirad refuses to start: the DSQL database has no Tokeira schema. Apply this \
+             release's migrations, through V{target}, with `tkr schema setup`, then start \
+             tokeirad"
+        )),
+        SchemaDecision::MigrationRequired { current, target } => Err(anyhow!(
+            "tokeirad refuses to start: the DSQL schema is at V{current}, behind this \
+             release's target V{target}. Apply the missing migrations with `tkr schema \
+             setup`, then start tokeirad"
+        )),
+        SchemaDecision::Reject(incompatibility) => {
+            let advice = match incompatibility.category {
+                SchemaIncompatibilityCategory::FutureSchema => {
+                    "a later release migrated it; run that release or a later one"
+                }
+                SchemaIncompatibilityCategory::BelowMinimum => {
+                    "it is older than this release migrates from; upgrade it through an \
+                     earlier release first"
+                }
+                _ => {
+                    "its migration ledger doesn't match this release's migrations; find out \
+                     what changed it before any node runs on it"
+                }
+            };
+            Err(
+                anyhow::Error::new(SchemaCompatibilityError::Incompatible(incompatibility))
+                    .context(format!(
+                        "tokeirad refuses to start: this release can't run on the DSQL \
+                         schema, because {advice}"
+                    )),
+            )
+        }
+        // An assessment under the validate-only policy never initializes or
+        // migrates; only the automatic policy decides either.
+        decision @ (SchemaDecision::Initialize { .. } | SchemaDecision::Migrate { .. }) => {
+            Err(anyhow!(
+                "tokeirad refuses to start: a validate-only schema assessment decided \
+                 {decision:?}"
+            ))
+        }
+    }
+}
+
+/// Build the full server stack and start serving on the given address.
+///
+/// Storage selection is driven only by `infrastructure.storage`: endpoint
+/// presence alone is not treated as intent. This keeps failed DSQL writeback
+/// and explicit in-memory deployments from being conflated. A DSQL node checks
+/// its schema before it builds anything ([`check_distributed_schema`]).
+///
+/// Factored out so both the CLI entrypoint and the in-memory facade share one
+/// bootstrap path. Deliberately long and sequential: each block mirrors the
+/// startup dependency order.
 async fn build_and_serve(
     addr: SocketAddr,
     effective_config: Arc<TokeiraConfig>,
@@ -2806,12 +2916,26 @@ async fn build_and_serve(
                      infrastructure.storage to \"memory\""
                 ));
             }
+            refuse_distributed_migration_policy(&effective_config)?;
             let auth = dsql_auth_config(&effective_config)?;
             let endpoint = auth.endpoint.clone();
             let (pool_config, ddb_client) = dsql_pool_config(&effective_config, &auth).await?;
             let dsql_store = DsqlStore::connect(auth, pool_config, ddb_client)
                 .await
                 .context("failed to connect DSQL storage backend")?;
+            // The check runs before anything is built, so a refusal leaves no
+            // listener, runtime or shard lease behind. Shutting the store down
+            // closes its connections and releases the DynamoDB connection-slot
+            // blocks its reservoir took, which dropping it would leave owned.
+            if let Err(refusal) = check_distributed_schema(&dsql_store).await {
+                if let Err(error) = dsql_store.shutdown().await {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "failed to shut DSQL storage down after refusing its schema"
+                    );
+                }
+                return Err(refusal);
+            }
             build_dsql_stack(
                 StackTransport::Network(addr),
                 effective_config,
@@ -5405,6 +5529,228 @@ mod tests {
         assert!(
             message.contains("in-memory store's persistence mechanism"),
             "the rejection must name the mechanism: {message}"
+        );
+    }
+
+    // Feature: distributed-schema-startup-check, Property 3: The policy
+    // setting selects the check
+    #[tokio::test]
+    async fn property_the_policy_setting_selects_the_check() {
+        for policy in [
+            None,
+            Some(DsqlMigrationPolicy::ValidateOnly),
+            Some(DsqlMigrationPolicy::Automatic),
+        ] {
+            let mut config = TokeiraConfig::default();
+            config.infrastructure.storage = ConfigStorageKind::Dsql;
+            config.infrastructure.dsql.migration_policy = policy;
+            let error = build_and_serve(
+                "127.0.0.1:0".parse().expect("loopback addr"),
+                Arc::new(config),
+            )
+            .await
+            .expect_err("no endpoint is configured");
+            let message = format!("{error:#}");
+            // A start the policy lets through goes on to configure its DSQL
+            // connection, which needs the endpoint this configuration lacks.
+            let refused_by_policy = message.contains("migration_policy");
+            assert_eq!(
+                refused_by_policy,
+                policy == Some(DsqlMigrationPolicy::Automatic),
+                "{policy:?}: {message}"
+            );
+            assert!(
+                refused_by_policy || message.contains("infrastructure.dsql.endpoint must be set"),
+                "{policy:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_schema_refusal_says_what_was_found_and_what_to_do() {
+        let refusal = |decision| {
+            format!(
+                "{:#}",
+                distributed_schema_admission(decision).expect_err("the node refuses")
+            )
+        };
+        let reject = |category| {
+            SchemaDecision::Reject(tokeira_storage::dsql::SchemaIncompatibility {
+                observed_version: Some(83),
+                minimum_supported_version: 1,
+                target_version: 82,
+                maximum_readable_version: 82,
+                category,
+            })
+        };
+        assert_eq!(
+            distributed_schema_admission(SchemaDecision::Compatible {
+                current: 82,
+                legacy_backfill: false,
+            })
+            .expect("a compatible schema starts"),
+            82
+        );
+        let message = refusal(SchemaDecision::MigrationRequired {
+            current: 0,
+            target: 82,
+        });
+        assert!(
+            message.contains("no Tokeira schema")
+                && message.contains("V82")
+                && message.contains("tkr schema setup"),
+            "{message}"
+        );
+        let message = refusal(SchemaDecision::MigrationRequired {
+            current: 81,
+            target: 82,
+        });
+        assert!(
+            message.contains("V81")
+                && message.contains("V82")
+                && message.contains("tkr schema setup"),
+            "{message}"
+        );
+        let message = refusal(reject(SchemaIncompatibilityCategory::FutureSchema));
+        assert!(
+            message.contains("a later release migrated it") && message.contains("FutureSchema"),
+            "{message}"
+        );
+        let message = refusal(reject(SchemaIncompatibilityCategory::BelowMinimum));
+        assert!(
+            message.contains("older than this release migrates from"),
+            "{message}"
+        );
+        let message = refusal(reject(SchemaIncompatibilityCategory::ChecksumMismatch {
+            version: 7,
+            expected: "expected".to_owned(),
+            observed: "observed".to_owned(),
+        }));
+        assert!(
+            message.contains("migration ledger doesn't match")
+                && message.contains("ChecksumMismatch"),
+            "{message}"
+        );
+        for decision in [
+            SchemaDecision::Initialize { target: 82 },
+            SchemaDecision::Migrate { from: 81, to: 82 },
+        ] {
+            let message = refusal(decision);
+            assert!(
+                message.contains("validate-only schema assessment decided"),
+                "{message}"
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        // Feature: distributed-schema-startup-check, Property 1: A node starts
+        // only on a schema its release can run on
+        #[test]
+        fn property_a_node_starts_only_on_a_schema_its_release_runs_on(
+            known in 2_u32..30,
+            maximum_back in 0_u32..3,
+            target_back in 0_u32..3,
+            minimum_seed in 1_u32..30,
+            current in 0_u32..34,
+            tampered in proptest::option::of(0_u32..30),
+        ) {
+            use tokeira_storage::{
+                dsql::{
+                    AppliedMigration, SchemaCompatibilityContract, SchemaObservation,
+                    assess_schema_compatibility,
+                },
+                schema_contract::{MigrationIdentity, migration_set_digest, sha256_hex},
+            };
+
+            let maximum = known.saturating_sub(maximum_back).max(1);
+            let target = maximum.saturating_sub(target_back).max(1);
+            let minimum = minimum_seed.clamp(1, target);
+            let recognized: Vec<MigrationIdentity> = (1..=known)
+                .map(|version| MigrationIdentity {
+                    version,
+                    name: format!("migration_{version}"),
+                    checksum: sha256_hex(format!("sql-{version}").as_bytes()),
+                })
+                .collect();
+            let contract = SchemaCompatibilityContract {
+                tokeira_release: "this".to_owned(),
+                minimum_supported_version: minimum,
+                target_version: target,
+                maximum_readable_version: maximum,
+                migration_set_digest: migration_set_digest(&recognized, maximum)
+                    .expect("the readable prefix exists"),
+            };
+            // The ledger holds versions 1 to `current`; those past `known` are
+            // a later release's, and `tampered` alters one of the release's.
+            let tampered = tampered.filter(|version| *version >= 1 && *version <= current.min(known));
+            let applied_migrations = (1..=current)
+                .map(|version| match recognized.get(version as usize - 1) {
+                    Some(identity) => AppliedMigration {
+                        version,
+                        name: identity.name.clone(),
+                        checksum: if tampered == Some(version) {
+                            sha256_hex(b"changed")
+                        } else {
+                            identity.checksum.clone()
+                        },
+                    },
+                    None => AppliedMigration {
+                        version,
+                        name: "later_release".to_owned(),
+                        checksum: sha256_hex(format!("later-{version}").as_bytes()),
+                    },
+                })
+                .collect();
+            let decision = assess_schema_compatibility(
+                &contract,
+                &recognized,
+                &SchemaObservation { applied_migrations, compatibility: None },
+                SchemaMigrationPolicy::ValidateOnly,
+            );
+
+            let runs = tampered.is_none() && target <= current && current <= maximum;
+            match distributed_schema_admission(decision) {
+                Ok(version) => {
+                    prop_assert!(runs, "admitted V{current}");
+                    prop_assert_eq!(version, current);
+                }
+                Err(error) => {
+                    prop_assert!(!runs, "refused V{current}");
+                    let message = format!("{error:#}");
+                    if tampered.is_none() && current < target && (current == 0 || current >= minimum) {
+                        prop_assert!(
+                            message.contains(&format!("V{target}")) && message.contains("tkr schema setup"),
+                            "{message}"
+                        );
+                    } else {
+                        prop_assert!(message.contains("schema is incompatible"), "{message}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A distributed node never migrates the schema it shares, so `automatic`
+    /// is refused before any I/O; nothing here names an endpoint, so a startup
+    /// that went on to connect would fail on that instead.
+    #[tokio::test]
+    async fn automatic_migration_policy_over_distributed_dsql_is_refused() {
+        let mut config = TokeiraConfig::default();
+        config.infrastructure.storage = ConfigStorageKind::Dsql;
+        config.infrastructure.dsql.migration_policy = Some(DsqlMigrationPolicy::Automatic);
+        let error = build_and_serve(
+            "127.0.0.1:0".parse().expect("loopback addr"),
+            Arc::new(config),
+        )
+        .await
+        .expect_err("automatic must be refused before any I/O");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("\"automatic\"") && message.contains("tkr schema setup"),
+            "the refusal must name the policy and the way to migrate: {message}"
         );
     }
 

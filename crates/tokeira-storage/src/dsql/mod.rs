@@ -29,6 +29,8 @@ pub mod projection_log;
 pub mod reservoir;
 pub mod run_repository;
 pub mod schema_compatibility;
+#[cfg(any(test, feature = "dsql-integration"))]
+pub mod schema_state_for_tests;
 pub mod slot_block_manager;
 pub mod task_queue_config;
 pub mod validation;

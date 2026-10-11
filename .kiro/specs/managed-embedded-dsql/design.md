@@ -256,9 +256,13 @@ point requires `Engine::start_with_embedded_config` and therefore cannot create 
 resources from an old call site.
 
 For listener-backed distributed DSQL, `DsqlInfraConfig` gains
-`migration_policy: Option<DsqlMigrationPolicy>`. Validation rejects DSQL startup when it
-is absent. Managed embedded defaulting to `Automatic` happens only after the explicit
-`ManagedDsql` mode and `CreateOrRecover` intent have been validated.
+`migration_policy: Option<DsqlMigrationPolicy>`. An absent or `ValidateOnly` policy
+selects the validate-only schema check that runs before the node builds its stack, and
+`Automatic` is refused before the node connects: a distributed node never migrates the
+schema it shares
+([distributed-schema-startup-check](../distributed-schema-startup-check/design.md)).
+Managed embedded defaulting to `Automatic` happens only after the explicit `ManagedDsql`
+mode and `CreateOrRecover` intent have been validated.
 
 ### 2. Managed DSQL control plane (`crates/tokeira-managed-dsql`)
 
@@ -932,7 +936,7 @@ sequences; they do not use wall-clock sleeps.
 
 *For any* serialized embedded configuration, decoding and validation SHALL select exactly
 one of the three declared modes, default an absent mode only to in-memory, default managed
-migration only after explicit `create_or_recover`, require existing/distributed migration
+migration only after explicit `create_or_recover`, require an existing-mode migration
 policy, reject unknown fields, and enforce the embedded resource envelope without
 changing modes.
 

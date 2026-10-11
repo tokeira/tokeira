@@ -141,7 +141,11 @@ pub struct DsqlInfraConfig {
     /// Written back by `tkr infra apply --module dsql`.
     #[serde(default)]
     pub conn_lease_table: Option<String>,
-    /// Explicit schema policy for listener-backed distributed DSQL startup.
+    /// Schema policy for listener-backed distributed DSQL startup. Absent or
+    /// `validate_only`, the node checks the schema without changing it and
+    /// refuses to start on one its release can't run on. `automatic` is
+    /// refused: a distributed node never migrates the schema it shares, which
+    /// `tkr schema setup` does.
     #[serde(default)]
     pub migration_policy: Option<DsqlMigrationPolicy>,
 }

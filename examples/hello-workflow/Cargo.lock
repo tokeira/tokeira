@@ -4799,9 +4799,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokeira-auth"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24d3495c54c7ae1fc16afedfff739497a009c14cf80e9b5cc0a073e5bc5e604f"
+checksum = "ae3456a91786901f2c2de43996ce0768527637313180998e913b1dc7aac78e92"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -4822,9 +4822,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-build-info"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13a461632fa78840b53f9003bd11f3949daa202a287f3ea1dece0762eebec7c9"
+checksum = "1743f6da500f922e32a7219670934829caa94054425a451a6c2789ee31226aa7"
 dependencies = [
  "regex",
  "toml 0.8.23",
@@ -4832,9 +4832,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-chasm"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0dc0ad13f5df08658e27b9410b920df4fe8e1d0dda058f09a39ad0147f67544"
+checksum = "93bbaf8e1fc33b5ced150aa32afdf32b182b875520b2e3bc91af1181904cc6cd"
 dependencies = [
  "prost",
  "serde",
@@ -4845,9 +4845,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-chasm-activity"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "094ea4db466f260a6d122917d4c30014f28be99a4e9375d7feaa0a4a74a72145"
+checksum = "634051022bb48bf3bea7eed018af4d92cd8ae89195231edf26e2774dbf7146ee"
 dependencies = [
  "postcard",
  "prost",
@@ -4861,9 +4861,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-chasm-derive"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdc0bf057b9906a5976a39227b80d1f59c7d71e4a1794be7f46853e375d9ac85"
+checksum = "d593b202fae42c7d5743546b47390c1b7563a5acfa6d41c517a17005d0fd2682"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4872,9 +4872,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-compatibility"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0b964c9468039a05592a48699fbcad2116104371979e178832c2581cd50dd51"
+checksum = "95cc70e902149493407ce592357a65beb4eb02c88a4e7e2d137ad55238c47d10"
 dependencies = [
  "serde",
  "serde_json",
@@ -4885,9 +4885,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-config"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "713b9858a987bdb592a5c29cf8277081eec0cca1395900066c9efab13cd44992"
+checksum = "78bad7f62aaa5df30982782e9d9aa151d0623798fca23de9729b41348e359574"
 dependencies = [
  "async-trait",
  "clap",
@@ -4902,9 +4902,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-edge"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b57f92a5540c1855d21f7f023e44eb575ef23a5081c0e652fab4c13453666c2"
+checksum = "f3bb412b14bfbf1a33c70d1c59cf5bc89555d54ac8a02037f96df951fcca8fa6"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4950,9 +4950,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-engine"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6975c67a99829e231fb439ad9b498775efdfe04b1c12f695866e5bd357a5f9c6"
+checksum = "dc9704c893bc196d9be5f1faec4c87bc047179a9b0a1f936564382971c7adb80"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5004,9 +5004,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-kernel"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64ca82a8eb2c33efb2edae707a76701f74e4b8310782744737f62bbeba29633c"
+checksum = "6362c794a908eca85872713dcfaa61ce3acb70e4b0e6a3cfa422ccadced0cfb4"
 dependencies = [
  "serde",
  "serde_json",
@@ -5019,9 +5019,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-managed-dsql"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6de363fea47c171732f1e8e3893cf0ca921d763f9086030a73acf35ab0a850c2"
+checksum = "bdb6a008a01bacec6e9f16d0a121975ae694806f101f69d2138badefa3b4b1d7"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -5037,9 +5037,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-observability"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d753f494a41a0f3555d1cfa60aee5673da16fa5fa1741362f9dae7f9831201c"
+checksum = "58dfe463f6bee56f202b102e1470f94f2597d8c5c7842bfe4bdc131b9c5c273a"
 dependencies = [
  "async-trait",
  "http-body-util",
@@ -5064,9 +5064,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-projection"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "708db8580343d48d18a8bedbde2aede2c33b2f662e8a7b137b57ee46700b77e8"
+checksum = "322b5af1d6929e06dc905d6ae7971235376c868cc6e040ad53a0295f2d2891d6"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -5090,9 +5090,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-proto"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4002f76451014293501d3b696f24e8d9e96c50de7803024fd1841201ad614c2"
+checksum = "6ffc838f0cafcb371c24e603d0061c3c4a573461a7b6d9947da211e7174fcf57"
 dependencies = [
  "buffa",
  "buffa-types",
@@ -5111,9 +5111,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-runtime"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e83fd0c0e6570dbbcbbd354db2194dd0d5372e6c5a9443c0f9180a23e6e3bb9c"
+checksum = "504af4ea98e2feef2cd86a1d369506bf8166c80fb967da3f2e78dadc007b0f54"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5155,9 +5155,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-storage"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9217534877b24bd933da5baf1331d67c39934e9607c943b649f03622b294da07"
+checksum = "7e7ac6ec47ca49ff8c520d243d2aa9c1b01140bf2fba05dcb3229f2c9bfbdae1"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -5186,9 +5186,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-types"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef1f084c05a8b507ef7d294775a4b151c2d55c251a702a9c189881b76a287076"
+checksum = "443444ebcb2aa0d3a5afd9fb172dbb185bdea9a0b2d1a632619e72fb9b16755f"
 dependencies = [
  "blake3",
  "serde",

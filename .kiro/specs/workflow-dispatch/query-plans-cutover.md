@@ -579,3 +579,26 @@ Limit  (cost=101.39..105.48 rows=11 width=105)
 
 Committed unchanged rows screened: 24778; elapsed seconds: 4.362; extrapolated seconds for one million runs plus one million timers: 352.1. This extrapolation excludes relocation and is not a million-row benchmark.
 ```
+
+## Legacy workflow backlog disposal
+
+The physical-key continuation uses the same SQL constant as the running adapter.
+The 64-key limit applies before selecting workflow rows, so an activity prefix
+cannot require scanning the full prefix within one page. The live regression
+also leaves a corrupt workflow key in place and deletes the following covered
+key. The fixture UUID is anonymized below.
+
+```sql
+SELECT key, run_key, task_kind FROM dispatch_backlog
+WHERE key > $1 ORDER BY key LIMIT $2;
+```
+
+```text
+Limit  (cost=41766.68..41769.78 rows=64 width=34)
+  ->  Index Only Scan using dispatch_backlog_pkey on dispatch_backlog  (cost=41766.68..57936.01 rows=333333 width=34)
+        Index Cond: (key > '<continuation-key>'::uuid)
+        -> Storage Scan on dispatch_backlog_pkey  (cost=41766.68..57936.01 rows=333333 width=34 loops=1)
+            Projections: key, task_kind, run_key
+            -> B-Tree Scan on dispatch_backlog_pkey  (cost=41766.68..57936.01 rows=333333 width=34 loops=1)
+                Index Cond: (key > '<continuation-key>'::uuid)
+```

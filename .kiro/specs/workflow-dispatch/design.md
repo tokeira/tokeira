@@ -269,16 +269,36 @@ in-flight lease for retry after expiry. This transport assumes every node runs t
 same release under the stopped-upgrade policy.
 
 The authenticated internal start exchange caps requests at 64 KiB and responses
-at 4 MiB. The execution owner selects the update messages and barrier-satisfied
-buffered queries and returns them with start metadata; query and update waiters
-stay on that owner. The polling edge attaches these returned values rather than
-consulting its own registries. An oversized envelope returns `ResourceExhausted`
-to the polling worker; Temporal v1.31.0 also propagates non-busy resource exhaustion
-from task starts to the poll caller (`service/matching/matching_engine.go`,
-`PollWorkflowTaskQueue` and `recordWorkflowTaskStarted`). An oversized response
-can fail after a committed start: it does not undo that start or make a new token,
-and the committed start-to-close timeout remains responsible for recovery. The
-cap covers the encoded internal envelope, including JSON overhead.
+at 128 MiB, matching Temporal v1.31.0's internode receive ceiling
+(`common/rpc/grpc.go`). Update messages and query arguments use their protobuf
+wire types rather than JSON byte arrays. Start metadata remains a small same-release
+JSON envelope, containing identifiers and scalar coordinates rather than history.
+
+Before committing a start, the execution owner freezes the update and query
+selection and checks its encoded size, reserving bounded metadata space. New
+admissions cannot enlarge that selection. A refusal occurs before the start and
+before marking updates sent. After the commit, the selected update messages carry
+the actual sequencing boundary; accepted or otherwise withdrawn updates can only
+shrink the selection. Query eligibility is checked against the committed history
+boundary. Buffered query payloads and waiters remain on the owner until answered;
+a lost response leaves them available for a replacement attempt. Completion binds
+the answer to the current task token and stable query identity.
+
+Channels are reused by endpoint. The configured authenticator explicitly selects
+the application headers needed for forwarding; gRPC framing and compression are
+rebuilt per hop. A typed stale-offer marker distinguishes withdrawn tasks from an
+owner's namespace-cache miss. Transient owner failures continue matching within
+the original long-poll deadline; authentication and resource-exhaustion statuses
+retain their protocol meaning (`service/matching/matching_engine.go` @ v1.31.0).
+
+A controller's initial placement snapshot must match all node counts and its hash
+version before runtime construction and membership acquisition. A later incompatible
+snapshot stops the node. Unequal local shard and bundle counts remain rejected;
+the default DSQL profile supplies matching values without a placement migration.
+
+Queue statistics are approximate and inspect at most four dispatch pages per
+observation across all homes and routing classes. They may undercount a backlog
+beyond that bounded observation; they never determine delivery or correctness.
 
 Workflow-task completion and failure responses received by the queue owner are
 forwarded through the existing public `RespondWorkflowTaskCompleted` and
@@ -786,9 +806,9 @@ all activity branches, including
 `reconcile_due_activity_dispatches_once`, for the activity successor spec.
 
 Legacy workflow rows are discarded, not replayed as a second authority. A bounded
-maintenance pass enumerates backlog keys in primary-key order, filtering workflow
-kind. In the delete transaction, read each entry's run state and its current
-dispatch representation. An existing run is covered only when its row equals
+maintenance pass enumerates a bounded page of physical backlog keys in primary-key
+order, then selects workflow keys from that page. In the delete transaction, read
+each entry's run state and its current dispatch representation. An existing run is covered only when its row equals
 `Derive(state)`; otherwise defer that entry until acquisition has repaired it.
 An absent run is covered by `Derive(absent) = None` after stale dispatch removal.
 No run-key hash is used to guess an orphan's execution home.
@@ -809,6 +829,18 @@ progress until a complete traversal finds no legacy workflow entries. This
 maintenance path has no delivery or regular workflow backlog-drain behavior.
 Activity bytes remain untouched. Cleanup completion is not a prerequisite for
 serving: the new runtime never delivers these legacy workflow entries.
+
+The disposal cursor walks physical primary keys, including activity keys, before
+filtering workflow copies. Each transaction examines at most 64 keys, so a long
+activity prefix cannot turn a page into an unbounded filtered scan. Activity keys
+advance the cursor but are neither deleted nor counted as deferred workflow work.
+The serving owner of execution home zero coordinates the global pass. This is a
+load-control rule, not a new correctness fence: every delete still checks current
+state and dispatch equality transactionally. Deferred work wakes after acquisition
+progress or a thirty-second retry interval. An undecodable state or dispatch row
+is logged with its key and left in place while the cursor advances; transaction
+and connection failures still abort the page. Placement preparation and acquisition
+retain their fail-stop corruption checks.
 
 Do not rewrite historical migrations. A rollback/re-upgrade must again stop every
 node and reconstruct before serving; this design supplies no mixed-release writer

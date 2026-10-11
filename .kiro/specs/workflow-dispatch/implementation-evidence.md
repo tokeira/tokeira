@@ -16,7 +16,9 @@ starts reach the execution owner through an authenticated internal RPC, which
 rechecks worker authorization, namespace, queue, version and incarnation before
 its serving gate. Update messages and eligible buffered queries travel back with
 the committed start; their waiters remain on the execution owner. Requests are
-bounded at 64 KiB and responses at 4 MiB, including JSON encoding overhead.
+bounded at 64 KiB and responses at 128 MiB; attachments use protobuf bytes.
+The owner freezes and size-checks the selection before committing the start, and
+retains buffered query payloads and waiters until answered.
 
 Public workflow-task completion and failure RPCs forward their original fields
 to the execution owner after authorization, preserving its update/query waiters.
@@ -31,6 +33,40 @@ or embedded DSQL lifecycle work; there is no placement-count migration. Activity
 follow-up commands pass their already-known execution home to avoid another lane
 identity request. Normal backlog accounting derives from durable dispatch without
 counting retained offers twice; speculative and activity sources remain separate.
+
+### Review fixes
+
+The internal start response uses protobuf update/query attachments within the
+128 MiB envelope, matching `common/rpc/grpc.go @ v1.31.0`. Selection and size
+checks precede the commit; later admissions cannot enlarge the response. Query
+payloads remain buffered across a lost reply, with only the current task attempt
+bound to the waiter. Regressions cover a nearly 2 MiB admitted update over the
+authenticated wire, ten near-limit updates plus a query in one protobuf envelope,
+pre-commit capacity rejection, and retained query redelivery. Authentication
+headers are explicitly selected and compression metadata is rebuilt per hop.
+Peer channels are reused by endpoint. Transient owner failures retry within the
+original poll deadline; authorization, cancellation and capacity statuses survive
+the public adapter, while namespace-cache misses cannot discard valid offers.
+
+Default DSQL shard/bundle counts are promoted together; explicit unequal counts
+remain rejected without a placement migration. Initial controller placement is
+validated before runtime construction, and later incompatible snapshots stop
+serving. Queue statistics inspect at most four dispatch pages per observation
+and may undercount large backlogs. The late-poller regression advances paused time
+beyond the actual offer lifetime and confirms its expiry before rediscovery.
+Zero-duration polls may finish already-matched work but cannot retry an unavailable owner after
+that attempt, even when its expired offer has already been republished.
+
+The active owner of home zero coordinates legacy disposal. Each page examines at
+most 64 physical keys before selecting workflow copies, advances past corrupt
+rows with diagnostics, and retries deferred work after acquisition progress or a
+thirty-second interval. Activity keys are preserved. The repair metric documents
+successful calls, including no-ops. Maintenance key limits share one constant.
+
+Generated configuration documentation matches its sources and retains own-namespace
+scoped-worker admission. Two bounded changelog fragments cover the cutover and
+matching-count guidance. Generated bindings, dependency policy, offline Markdown
+links and whitespace checks passed. No dependency or lockfile changed.
 
 ### Model verification
 
@@ -52,11 +88,9 @@ tla "$MODEL" --config "$CONFIG" --max-states 20000000 --max-depth 10000
 
 ### Workspace verification
 
-Implementation revision: `1d8bfa1e5b90ba5157e058a90904fd522edd2caf`.
-The final full bar ran after rebasing onto the base above, which includes the
-distributed startup schema check,
-the 0.6.0 release and the example update. Both cutover commits replayed without
-patch changes. Schema validation precedes placement preparation and runtime
+Implementation revision: `c6087044d36ed47a8bf2b88c86e017b2b877ca50`.
+The full bar covers the review fixes on the base above, including the distributed
+startup schema check. Schema validation precedes placement preparation and runtime
 activation; the durable upgrade-note assertion survives changelog consumption.
 
 | Check | Outcome |
@@ -64,13 +98,18 @@ activation; the durable upgrade-note assertion survives changelog consumption.
 | `cargo +nightly fmt --all` | Passed |
 | `cargo lint --locked` | Passed |
 | `cargo check --workspace --locked` | Passed |
-| `cargo nextest run --workspace --locked --no-fail-fast --test-threads 4` | 3,855 passed; 2 existing SDK integration tests skipped |
+| `cargo nextest run --workspace --locked --no-fail-fast --test-threads 4` | 3,863 passed; 2 existing SDK integration tests skipped |
 | `cargo test --workspace --doc --locked` | Passed; existing ignored examples remain ignored |
 | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked` | Passed |
 | All-target Clippy for storage, runtime, projection, edge and engine with DSQL integration features and `-D warnings` | Passed |
 
-No completion-bar command was omitted. The initial workspace run exposed six
-integration failures in restored-engine repair delegation, the protobuf binding
+No completion-bar command was omitted. Initial review runs found the old internal
+attachment field name in the binding-inventory fixture and a zero-duration poll
+race introduced by the new deadline wrapper. The fixture now matches the descriptor,
+retaining its field number and byte wire type. Zero-duration polls still start
+already-matched tasks; ordinary long polls retain their original deadline. A
+redundant rustdoc link was also corrected. The complete rerun passed. The earlier
+workspace run exposed six integration failures in restored-engine repair delegation, the protobuf binding
 inventory and a configuration fixture; the complete reruns passed after fixes.
 An earlier pre-publication workspace run passed 3,847 tests and timed out two
 unchanged history-pagination properties during concurrent compilation. The complete suite
@@ -111,14 +150,32 @@ this excludes relocation and is not a million-row benchmark.
 
 ### Live verification and boundaries
 
-The live results below precede this rebase. The final passing fixture versions
-are retained in implementation revision
-`1bc447522233322647b4d52bf94bba3894c10395`. The rebase changed release metadata and integrated distributed startup schema validation; the cutover's
-dispatch SQL, runtime delivery implementation and selected live fixtures are
-unchanged. Live suites were not rerun for this rebase. The newly inherited
-distributed-schema engine live tests were compiled by the feature check but not
-executed; they require a separate coordinated DSQL/DynamoDB fixture. Their local
-schema-admission tests ran in the workspace bar.
+The review validation used a fresh Aurora DSQL cluster and two temporary
+DynamoDB tables. All three distributed-schema engine checks ran on the combined
+implementation: a target schema starts and serves; an older or unsupported future
+schema is refused without starting listeners or ownership resources. The affected
+disposal suites then ran serially on the same cluster, with shard-zero counts
+after each suite. All owned resources were deleted; cluster absence was confirmed.
+
+| Review suite | Outcome | Test duration | Shard-zero candidates / dispatch after |
+|---|---|---:|---|
+| Distributed startup, three checks | Passed | 670.177 s | 0 / 0 |
+| Physical-page bounds, corrupt-row deferral and continuation plan | Passed | 6.967 s | 1 / 1 |
+| Cancelled-page rollback and transaction bounds | Passed | 15.071 s | 1 / 1 |
+| Generated legacy disposal, 100 cases | Passed | 131.693 s | 1 / 1 |
+
+The [recorded disposal continuation plan](query-plans-cutover.md#legacy-workflow-backlog-disposal)
+uses the primary-key index with a scalar continuation bound and no task-kind
+filter. The fixture proves that 64 activity keys consume exactly one page and
+that a corrupt workflow row does not hide a later covered row.
+
+These live runs precede the final zero-duration poll retry guard, which changes
+neither startup nor disposal. The final workspace bar covers that refinement.
+
+Earlier full-suite results below are retained from implementation revision
+`1bc447522233322647b4d52bf94bba3894c10395`. Unchanged live paths were not repeated
+for the review fixes; the additional runs above cover the inherited startup
+integration and changed disposal adapter.
 
 Suites ran serially with the URL and endpoint gates set against real Aurora
 DSQL. The resumed sequence used this common invocation, selecting one suite
@@ -225,8 +282,8 @@ Competing-owner acquisition-repair integration and verification remain deferred
 in Tasks 17–18 and Requirements 8.4–8.6; the landed lease fence does not complete
 those checks. Stopping every older node remains an operational precondition;
 the raw live-lease check is an additional guard, not complete enforcement.
-An oversized internal response can fail after a committed start, which retains
-its normal start-to-close recovery. No dependency, lockfile, state-format or
+Internal attachment size checks now precede the committed start and retain
+buffered query payloads across lost replies. No dependency, lockfile, state-format or
 migration change is introduced. The durable upgrade-line assertion reads
 `design.md`, so changelog consumption cannot remove its subject.
 

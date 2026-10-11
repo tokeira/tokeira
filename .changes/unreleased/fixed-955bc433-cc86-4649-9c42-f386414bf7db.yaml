@@ -1,5 +1,0 @@
-kind: fixed
-body: Activity inputs and headers now live only in history, so a workflow with many large pending inputs keeps committing, and each start reads them from history.
-time: 2026-10-10T14:34:16.507811+01:00
-custom:
-    Slice: 955bc433-cc86-4649-9c42-f386414bf7db

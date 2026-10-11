@@ -12,7 +12,7 @@ The embedded engine checks the schema against that range before it serves (`appl
 
 The node's configuration also documents `infrastructure.dsql.migration_policy` as its schema policy at startup (`crates/tokeira-config/src/lib.rs`, `crates/tokeira-config/src/documentation.rs`). Managed-embedded-dsql criteria 5.3, 5.12 and 5.13 give that setting rules, but nothing reads it.
 
-An operator migrates a distributed node's schema with `tkr schema setup`, and no platform does it for them. But `tkr schema` decides whether a deployment uses DSQL from the deployment's metadata (`apps/tkr/src/commands/schema.rs`), while `tkr deployment create` records in-memory storage for every Compose or ECS deployment (`apps/tkr/src/commands/deployment.rs`). So the command refuses those deployments even once their `tokeirad.toml` selects DSQL, as an ECS deployment's always does.
+An operator migrates a distributed node's schema with `tkr schema setup`, and no platform does it for them. But `tkr schema` decides whether a deployment uses DSQL from the deployment's metadata (`apps/tkr/src/commands/schema.rs`), and every Compose or ECS deployment's metadata records in-memory storage. So the command refuses those deployments even once their `tokeirad.toml` selects DSQL, as an ECS deployment's always does.
 
 ## Bug Analysis
 

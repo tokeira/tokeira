@@ -45,7 +45,7 @@ The bug condition holds when a listener-backed distributed node starts and eithe
 
 - **No check.** `build_and_serve`'s DSQL branch goes from `DsqlStore::connect` straight to `build_dsql_stack`, and `build_dsql_stack` drops the store's migration runner unused. Only `apply_embedded_schema`, on the embedded path, runs the assessment.
 - **An unread setting.** Managed-embedded-dsql added `DsqlInfraConfig.migration_policy` for this startup, but nothing wired it.
-- **A gate on the wrong record.** `tkr schema` decides whether a deployment uses DSQL from the deployment's metadata (`apps/tkr/src/commands/schema.rs`). `tkr deployment create` records in-memory storage for every discovered platform (`apps/tkr/src/commands/deployment.rs`). An infrastructure apply then writes `infrastructure.storage = "dsql"` into the deployment's `tokeirad.toml` (`platforms/ecs/deployment.tkd`), and the metadata keeps saying in-memory. The command already reads the endpoint from `tokeirad.toml`, which its module documentation calls authoritative.
+- **A gate on the wrong record.** `tkr schema` decides whether a deployment uses DSQL from the deployment's metadata (`apps/tkr/src/commands/schema.rs`). Every Compose and ECS deployment's metadata records in-memory storage. An infrastructure apply then writes `infrastructure.storage = "dsql"` into the deployment's `tokeirad.toml` (`platforms/ecs/deployment.tkd`), and the metadata keeps saying in-memory. The command already reads the endpoint from `tokeirad.toml`, which its module documentation calls authoritative.
 
 ## Correctness Properties
 
@@ -107,7 +107,7 @@ No path applies migrations before it starts `tokeirad`. Only an operator running
 | Local with DSQL | The operator runs `tkr schema setup` ([deployment configuration](../../../docs/provisioning/deployment-configuration.md)); `tkr deploy apply` then starts `tokeirad` | A node started first refuses |
 | Compose with DSQL | No step in the platform's lifecycle; `tkr schema setup` refused the deployment | `tkr schema setup` runs |
 | ECS (always DSQL) | No step; `tkr schema setup` refused the deployment | `tkr schema setup` runs |
-| EKS | `tkr deployment create` refuses the platform | None |
+| EKS | The platform accepts no new deployments | None |
 | Embedded managed or existing DSQL | The engine migrates under its own policy | None |
 
 These gaps stay, recorded here rather than fixed:
@@ -116,7 +116,7 @@ These gaps stay, recorded here rather than fixed:
 - ECS `tkr admin schema setup` has no command to run: it runs `schema setup` in the admin task's container, whose image holds only `tokeirad`, which has no subcommands. The admin task is itself a DSQL-configured `tokeirad`, so it now refuses on a schema it can't run on.
 - `tkr schema setup` connects with the operator's own credentials; the written-back admin role is never assumed.
 - The placement controller and the autoscaler connect to DSQL without a schema check.
-- [The platforms guide](../../../docs/platforms/README.md) offers `--storage dsql` for Compose and ECS, which `tkr deployment create` refuses for discovered platforms.
+- [The platforms guide](../../../docs/platforms/README.md) offers `--storage dsql` for Compose and ECS deployments, which those platforms refuse when a deployment is created.
 
 ### Specs this changes
 

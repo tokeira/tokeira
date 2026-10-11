@@ -16,9 +16,9 @@ use crate::{
 
 pub(crate) async fn run(action: SchemaAction, ctx: DeploymentRecordContext) -> Result<()> {
     // The deployment's `tokeirad.toml` decides, as it decides for tokeirad
-    // itself. Its metadata can't: `tkr deployment create` records in-memory
-    // storage for every discovered platform, and an infrastructure apply then
-    // selects DSQL in this file alone.
+    // itself. Its metadata can't: every Compose and ECS deployment's metadata
+    // records in-memory storage, and an infrastructure apply then selects DSQL
+    // in this file alone.
     let server_config_path = ctx.path.join(TOKEIRAD_TOML);
     let server_config = crate::commands::infra::read_tokeirad_config(&server_config_path)
         .with_context(|| format!("failed to read {}", server_config_path.display()))?;

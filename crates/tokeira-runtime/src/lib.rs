@@ -105,3 +105,10 @@ pub use worker_registry::*;
 
 #[cfg(test)]
 mod projection_accumulator_tests;
+
+mod legacy_workflow_backlog;
+
+mod workflow_task_start;
+pub use workflow_task_start::{
+    RetryableWorkflowTaskStart, WorkflowOfferRejected, WorkflowTaskStarter,
+};

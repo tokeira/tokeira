@@ -822,6 +822,19 @@ impl Action {
 /// Edge authentication and authorization pipeline.
 #[async_trait]
 pub trait Authenticator: Send + Sync + 'static {
+    /// Application metadata needed to re-authenticate a forwarded worker call.
+    /// Custom authenticators must explicitly include their additional headers;
+    /// transport and compression metadata never belongs in this allowlist.
+    fn forwarding_headers(&self, headers: &HeaderMap) -> HeaderMap {
+        let mut forwarded = HeaderMap::new();
+        for name in ["authorization", "authorization-extras"] {
+            for value in headers.get_all(name) {
+                forwarded.append(name, value.clone());
+            }
+        }
+        forwarded
+    }
+
     /// Authenticate raw request metadata into role claims.
     async fn authenticate(&self, headers: &HeaderMap) -> EdgeResult<Option<Claims>>;
 
@@ -1107,6 +1120,11 @@ impl std::fmt::Debug for EdgeInterceptors {
 }
 
 impl EdgeInterceptors {
+    /// Select only metadata required by the configured authenticator.
+    pub(crate) fn forwarding_headers(&self, headers: &HeaderMap) -> HeaderMap {
+        self.authenticator.forwarding_headers(headers)
+    }
+
     pub fn new(
         request_ids: Arc<dyn RequestIdGenerator>,
         authenticator: Arc<dyn Authenticator>,

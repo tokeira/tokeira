@@ -59,3 +59,6 @@ pub use placement_upgrade::*;
 pub use recovery_index::*;
 pub use worker_compute::*;
 pub use workflow_dispatch::*;
+
+mod legacy_workflow_backlog;
+pub use legacy_workflow_backlog::{LEGACY_WORKFLOW_KEYS, WorkflowBacklogDisposal};

@@ -891,6 +891,13 @@ pub trait RunRepository: Send + Sync {
         true
     }
 
+    /// Whether an empty repository can activate a seeded home without any
+    /// reconstruction. False is the conservative answer for persistent stores
+    /// and wrappers; true requires checking all recovery and dispatch state.
+    fn recovery_is_empty(&self) -> bool {
+        false
+    }
+
     /// Commit one bounded placement-upgrade page before runtime construction.
     /// Wrappers must forward this method. The default represents an already
     /// prepared test double and performs no persistence.
@@ -1409,6 +1416,19 @@ pub trait RunRepository: Send + Sync {
     /// Remove and return up to `limit` backlog entries for the given queue in
     /// ascending [`DeliveryOrder`].
     async fn drain_backlog(&self, queue: &QueueKey, limit: usize) -> Result<Vec<BacklogEntry>>;
+
+    /// Dispose a page of legacy workflow copies only when dispatch equals the
+    /// current state's derivation in the same transaction. Advance past deferred
+    /// entries; restart at the head after errors. Activity entries are untouched.
+    async fn dispose_workflow_backlog_page(
+        &self,
+        _after: Option<Uuid>,
+    ) -> Result<crate::WorkflowBacklogDisposal> {
+        Ok(crate::WorkflowBacklogDisposal {
+            exhausted: true,
+            ..Default::default()
+        })
+    }
 
     /// Snapshot durable backlog counts and oldest schedule time by priority band.
     async fn backlog_stats_by_priority(
@@ -2730,6 +2750,9 @@ where
     fn placement_ready(&self) -> bool {
         (**self).placement_ready()
     }
+    fn recovery_is_empty(&self) -> bool {
+        (**self).recovery_is_empty()
+    }
     async fn prepare_placement_page(&self) -> Result<crate::PlacementPage> {
         (**self).prepare_placement_page().await
     }
@@ -2988,6 +3011,13 @@ where
 
     async fn drain_backlog(&self, queue: &QueueKey, limit: usize) -> Result<Vec<BacklogEntry>> {
         (**self).drain_backlog(queue, limit).await
+    }
+
+    async fn dispose_workflow_backlog_page(
+        &self,
+        after: Option<Uuid>,
+    ) -> Result<crate::WorkflowBacklogDisposal> {
+        (**self).dispose_workflow_backlog_page(after).await
     }
 
     async fn backlog_stats_by_priority(

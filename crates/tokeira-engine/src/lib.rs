@@ -3333,6 +3333,25 @@ where
         .hydrate()
         .await
         .context("failed to hydrate task-queue policy")?;
+    // Agreement is a startup prerequisite, before runtime construction or
+    // membership can acquire a home. A later incompatible snapshot terminates
+    // serving instead of silently changing the durable placement function.
+    let initial_routing_cache = if let Some(endpoint) = &effective_config
+        .infrastructure
+        .placement
+        .controller_endpoint
+    {
+        let cache = Arc::new(RoutingCache::new(placement_config(&effective_config)));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokeira_edge::subscribe_routing_once(cache.clone(), endpoint.clone()),
+        )
+        .await
+        .context("timed out waiting for controller placement snapshot")??;
+        Some(cache)
+    } else {
+        None
+    };
     let mut runtime_config = RuntimeConfig::default();
     runtime_config.lane.controller_managed_placement = effective_config
         .infrastructure
@@ -3449,6 +3468,10 @@ where
     // The edge always exposes Worker Deployment v2 RPCs. Wiring the
     // repository here keeps their registry durable for both in-memory and
     // DSQL backends instead of falling back to a detached test registry.
+    .with_queue_placement(
+        effective_config.infrastructure.placement.partition_count,
+        effective_config.infrastructure.placement.bundle_count,
+    )
     .with_worker_deployment_repository(worker_deployment_repository)
     .with_task_queue_config_store(task_queue_config_store.clone())
     .with_delivery_mode_provider(Arc::new(
@@ -3458,6 +3481,7 @@ where
             },
         ),
     ));
+    runtime.ready().await?;
     let runtime = Arc::new(runtime);
     let runtime_tasks = runtime.shutdown_handle();
     let engine_tasks = RuntimeShutdownHandle::new();
@@ -3646,7 +3670,8 @@ where
             .controller_endpoint
             .clone()
     {
-        let routing_cache = Arc::new(RoutingCache::new(placement_config(&effective_config)));
+        let routing_cache = initial_routing_cache
+            .expect("controller snapshot validated before runtime construction");
         let routing_config = EdgeRoutingConfig {
             controller_endpoint,
             max_retries: effective_config
@@ -3656,14 +3681,26 @@ where
         };
         let subscription_cache = routing_cache.clone();
         let subscription_cancel = background_cancel.clone();
+        let routing_shutdown = runtime.shutdown_handle();
+        let routing_cancel = background_cancel.clone();
         let _routing_subscription = engine_tasks.spawn(async move {
             if let Err(error) =
                 run_routing_subscription(subscription_cache, routing_config, subscription_cancel)
                     .await
             {
-                tracing::warn!(?error, "routing subscription exited");
+                tracing::error!(
+                    ?error,
+                    "routing placement became incompatible; stopping node"
+                );
+                routing_shutdown.begin_shutdown();
+                routing_cancel.cancel();
             }
         });
+        runtime.set_workflow_task_starter(Arc::new(
+            tokeira_edge::grpc::workflow_dispatch::RemoteWorkflowTaskStarter::new(
+                routing_cache.clone(),
+            ),
+        ));
         Arc::new(CacheBackedRouter::new(routing_cache, node_id))
     } else {
         Arc::new(LocalOnlyRouter)
@@ -3770,6 +3807,11 @@ where
         )),
         nexus_endpoint_limits,
     ));
+    let dispatch_grpc = tokeira_edge::grpc::workflow_dispatch::WorkflowTaskDispatchGrpc::new(
+        runtime.clone(),
+        interceptors.clone(),
+        workflow_service.clone(),
+    );
     let operator_service = OperatorService::new(operator_api, interceptors)
         .with_nexus_endpoints(nexus_endpoint_admin)
         .with_namespace_deletion(namespaces.clone(), Arc::new(workflow_service.clone()));
@@ -4060,9 +4102,13 @@ where
     });
     let server_recorder = wire_coverage_recorder.clone();
 
+    let server_cancel = background_cancel.clone();
     let server_task = tokio::spawn(async move {
         let shutdown_signal = async move {
-            let _ = shutdown_rx.await;
+            tokio::select! {
+                _ = shutdown_rx => {},
+                _ = server_cancel.cancelled() => {},
+            }
         };
 
         // The conformance layer changes the server's tower-stack type, so the flagged and
@@ -4080,6 +4126,7 @@ where
                     .add_service(workflow_grpc.into_service())
                     .add_service(operator_grpc.into_service())
                     .add_service(admin_grpc.into_service())
+                    .add_service(dispatch_grpc.into_service())
                     .add_service(reflection_v1)
                     .add_service(reflection_v1alpha)
                     .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal)
@@ -4095,6 +4142,7 @@ where
                     .add_service(workflow_grpc.into_service())
                     .add_service(operator_grpc.into_service())
                     .add_service(admin_grpc.into_service())
+                    .add_service(dispatch_grpc.into_service())
                     .add_service(reflection_v1)
                     .add_service(reflection_v1alpha)
                     .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal)
@@ -5461,6 +5509,45 @@ mod tests {
             Engine::start_with_embedded_config(config).await,
             Err(EmbeddedEngineStartError::InvalidConfiguration(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn unequal_home_counts_fail_before_descriptor_or_listener_work() {
+        let descriptor_path = std::env::temp_dir().join(format!(
+            "tokeira-home-count-preflight-{}.json",
+            IncarnationId::new()
+        ));
+        let mut config = EmbeddedEngineConfig::default();
+        config.server.infrastructure.placement.shard_count = 8;
+        config.server.infrastructure.placement.bundle_count = 4;
+        config.storage =
+            EmbeddedStorageConfig::ManagedDsql(tokeira_config::ManagedEmbeddedDsqlConfig {
+                intent: tokeira_config::ManagedClusterIntent::CreateOrRecover,
+                descriptor_path: descriptor_path.clone(),
+                region: "test-region".to_owned(),
+                migration_policy: None,
+                limits: tokeira_config::EmbeddedDsqlLimits::default(),
+                tags: std::collections::BTreeMap::new(),
+            });
+        let error = Engine::start_with_embedded_config(config.clone())
+            .await
+            .expect_err("unequal counts must fail before any AWS work");
+        assert!(matches!(
+            error,
+            EmbeddedEngineStartError::InvalidConfiguration(_)
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("shard_count (8) must equal bundle_count (4)")
+        );
+        assert!(!descriptor_path.exists());
+
+        let address = "127.0.0.1:0".parse().expect("test address");
+        let error = TokeiradHandle::start_in_memory_with_config(address, config.server)
+            .await
+            .expect_err("unequal counts must fail before binding a listener");
+        assert!(format!("{error:#}").contains("shard_count (8) must equal bundle_count (4)"));
     }
 
     #[tokio::test]

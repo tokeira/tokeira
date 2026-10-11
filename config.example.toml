@@ -19,6 +19,7 @@
 # @field infrastructure.dsql.admin_role_arn | infrastructure | default=<unset> | Provisioning identity for DSQL administrative operations.
 # @field infrastructure.dsql.conn_lease_table | infrastructure | default=<unset> | Provisioned DynamoDB table for distributed connection-slot leases.
 # @field infrastructure.dsql.endpoint | infrastructure | default=<unset> | Required when storage is dsql; normally written by the provisioner.
+# @field infrastructure.dsql.migration_policy | infrastructure | default=<unset> | Distributed DSQL startup schema policy: unset or validate_only checks the schema; automatic is refused.
 # @field infrastructure.dsql.rate_limiter_table | infrastructure | default=<unset> | Provisioned DynamoDB table for distributed rate limiting.
 # @field infrastructure.dsql.readonly_role_arn | infrastructure | default=<unset> | Read-only identity for inspection tooling.
 # @field infrastructure.dsql.region | infrastructure | default=<unset> | Optional DSQL signing region; defaults to infrastructure.region.
@@ -43,7 +44,7 @@
 # @field infrastructure.observability.otlp_protocol | infrastructure | default="grpc" | OTLP trace transport protocol.
 # @field infrastructure.observability.smoke_test_timeout_ms | infrastructure | default=30000 | Observability smoke-test timeout.
 # @field infrastructure.observability.trace_sample_rate | infrastructure | default=1.0 | Base trace sampling ratio from zero through one.
-# @field infrastructure.placement.bundle_count | infrastructure | default=1 | Placement bundle count.
+# @field infrastructure.placement.bundle_count | infrastructure | default=1 | Placement bundle count; must equal shard_count. Unequal counts fail startup; automatic repartitioning is not supported.
 # @field infrastructure.placement.controller_endpoint | infrastructure | default=<unset> | Placement-controller endpoint; absence selects the single-node path.
 # @field infrastructure.placement.hash_version | infrastructure | default=1 | Pinned placement hash algorithm version.
 # @field infrastructure.placement.heartbeat_interval_ms | infrastructure | default=5000 | Node membership heartbeat interval.
@@ -53,7 +54,7 @@
 # @field infrastructure.placement.reconnect_base_delay_ms | infrastructure | default=1000 | Initial controller reconnection delay.
 # @field infrastructure.placement.reconnect_max_delay_ms | infrastructure | default=30000 | Maximum controller reconnection delay.
 # @field infrastructure.placement.routing_max_retries | infrastructure | default=3 | Maximum retries after a stale placement route.
-# @field infrastructure.placement.shard_count | infrastructure | default=1 | Logical shard count; the DSQL profile promotes the legacy default to 32.
+# @field infrastructure.placement.shard_count | infrastructure | default=1 | Logical shard count; must equal bundle_count. The DSQL profile promotes both legacy defaults to 32 together; preserve the existing durable placement count when configuring explicit values.
 # @field infrastructure.region | infrastructure | default="us-east-1" | AWS region used by regional infrastructure integrations.
 # @field infrastructure.storage | infrastructure | default="in-memory" | Select in-memory development storage or Aurora DSQL.
 # @field policy.authorization.aws_iam.grants[].grant | Tokeira native | default=[] | Temporal namespace:role grants for matching AWS identities.
@@ -79,6 +80,7 @@
 # @field policy.authorization.jwt.issuers[].worker_scopes[].task_queues | Tokeira native | default=[] | Non-empty exact normal task-queue allowlist; sticky aliases are not configured.
 # @field policy.authorization.principal_attribution | configured parity | default=false | Write the authenticated principal to server-authored history metadata.
 # @field policy.compatibility.enable_standalone_activities | configured parity | default=false | Enable the v1.31.0 preview standalone-activity surface.
+# @field policy.compatibility.enable_standalone_activity_callbacks | configured parity | default=false | Enable standalone-activity callbacks; requires standalone activities.
 # @field policy.default_retention_days | stock parity | default=30 | Default workflow-history retention for newly created namespaces.
 # @field policy.http_api.additional_forwarded_headers | configured parity | default=[] | Additional exact or trailing-star header rules forwarded to gRPC.
 # @field policy.http_api.allowed_hosts | stock parity | default=["*"] | Case-sensitive host patterns admitted by the HTTP/JSON gateway.
@@ -97,6 +99,8 @@
 # @field policy.nexus_endpoint_limits.task_queue_max_length | stock parity | default=1000 | Maximum Nexus worker task-queue name length.
 # @field policy.quotas.max_signal_payload_bytes | configured parity | default=4194304 | Maximum admitted signal payload size.
 # @field policy.quotas.max_workflow_timeout_seconds | configured parity | default=315360000 | Maximum admitted workflow execution timeout.
+# @field policy.snapshot.interval_ms | Tokeira native | default=<unset> | Positive cadence for refreshing the embedded-engine snapshot file.
+# @field policy.snapshot.location | Tokeira native | default=<unset> | Embedded-engine snapshot file; the optional section is disabled when absent.
 # @field policy.task_queues.enable_fairness | configured parity | default=false | Opt in to weighted User Fairness; priority remains enabled.
 # @field policy.worker_compute.enabled | Tokeira native | default=false | Enable the experimental remote Worker Compute Controller; configured providers may create billable capacity.
 
@@ -155,6 +159,7 @@ max_signal_payload_bytes = 4194304
 
 [policy.compatibility]
 enable_standalone_activities = false
+enable_standalone_activity_callbacks = false
 
 [policy.task_queues]
 enable_fairness = false

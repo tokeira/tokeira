@@ -635,6 +635,8 @@ fn process_configs_resolve_applied_dsql_and_in_cluster_controller_coordinates() 
     let temp = tempfile::tempdir().expect("deployment dir");
     let mut config = tokeira_config::TokeiraConfig::default();
     config.infrastructure.storage = tokeira_config::ConfigStorageKind::Dsql;
+    config.infrastructure.placement.shard_count = 32;
+    config.infrastructure.placement.bundle_count = 32;
     config.infrastructure.dsql.endpoint = Some("vpce.demo.dsql".to_string());
     config.infrastructure.dsql.region = Some("eu-west-2".to_string());
     std::fs::write(

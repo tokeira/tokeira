@@ -126,6 +126,8 @@ pub(crate) mod pause_point {
         Acquisition(ShardId),
         /// A copy page of this materialized run, before its transaction.
         Page(RunKey),
+        /// Legacy workflow backlog deletes before the page commits.
+        Disposal,
     }
 
     struct Armed {
@@ -789,6 +791,13 @@ impl RunRepository for DsqlRunRepository {
 
     async fn drain_backlog(&self, queue: &QueueKey, limit: usize) -> Result<Vec<BacklogEntry>> {
         self.do_drain_backlog(queue, limit).await
+    }
+
+    async fn dispose_workflow_backlog_page(
+        &self,
+        after: Option<Uuid>,
+    ) -> Result<crate::WorkflowBacklogDisposal> {
+        self.do_dispose_workflow_backlog_page(after).await
     }
 
     async fn backlog_stats_by_priority(

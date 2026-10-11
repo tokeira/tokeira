@@ -407,6 +407,7 @@ All accepted production leaves are listed below. Fields are startup-static; chan
 | `infrastructure.dsql.admin_role_arn` | infrastructure | `<unset>` | no | yes | — | Provisioning identity for DSQL administrative operations. |
 | `infrastructure.dsql.conn_lease_table` | infrastructure | `<unset>` | no | yes | — | Provisioned DynamoDB table for distributed connection-slot leases. |
 | `infrastructure.dsql.endpoint` | infrastructure | `<unset>` | yes | yes | — | Required when storage is dsql; normally written by the provisioner. |
+| `infrastructure.dsql.migration_policy` | infrastructure | `<unset>` | no | yes | — | Distributed DSQL startup schema policy: unset or validate_only checks the schema; automatic is refused. |
 | `infrastructure.dsql.rate_limiter_table` | infrastructure | `<unset>` | no | yes | — | Provisioned DynamoDB table for distributed rate limiting. |
 | `infrastructure.dsql.readonly_role_arn` | infrastructure | `<unset>` | no | yes | — | Read-only identity for inspection tooling. |
 | `infrastructure.dsql.region` | infrastructure | `<unset>` | no | yes | — | Optional DSQL signing region; defaults to infrastructure.region. |
@@ -431,7 +432,7 @@ All accepted production leaves are listed below. Fields are startup-static; chan
 | `infrastructure.observability.otlp_protocol` | infrastructure | `"grpc"` | no | yes | — | OTLP trace transport protocol. |
 | `infrastructure.observability.smoke_test_timeout_ms` | infrastructure | `30000` | no | yes | — | Observability smoke-test timeout. |
 | `infrastructure.observability.trace_sample_rate` | infrastructure | `1.0` | no | yes | — | Base trace sampling ratio from zero through one. |
-| `infrastructure.placement.bundle_count` | infrastructure | `1` | no | yes | — | Placement bundle count. |
+| `infrastructure.placement.bundle_count` | infrastructure | `1` | no | yes | — | Placement bundle count; must equal shard_count. Unequal counts fail startup; automatic repartitioning is not supported. |
 | `infrastructure.placement.controller_endpoint` | infrastructure | `<unset>` | no | yes | — | Placement-controller endpoint; absence selects the single-node path. |
 | `infrastructure.placement.hash_version` | infrastructure | `1` | no | yes | — | Pinned placement hash algorithm version. |
 | `infrastructure.placement.heartbeat_interval_ms` | infrastructure | `5000` | no | yes | — | Node membership heartbeat interval. |
@@ -441,7 +442,7 @@ All accepted production leaves are listed below. Fields are startup-static; chan
 | `infrastructure.placement.reconnect_base_delay_ms` | infrastructure | `1000` | no | yes | — | Initial controller reconnection delay. |
 | `infrastructure.placement.reconnect_max_delay_ms` | infrastructure | `30000` | no | yes | — | Maximum controller reconnection delay. |
 | `infrastructure.placement.routing_max_retries` | infrastructure | `3` | no | yes | — | Maximum retries after a stale placement route. |
-| `infrastructure.placement.shard_count` | infrastructure | `1` | no | yes | — | Logical shard count; the DSQL profile promotes the legacy default to 32. |
+| `infrastructure.placement.shard_count` | infrastructure | `1` | no | yes | — | Logical shard count; must equal bundle_count. The DSQL profile promotes both legacy defaults to 32 together; preserve the existing durable placement count when configuring explicit values. |
 | `infrastructure.region` | infrastructure | `"us-east-1"` | no | yes | — | AWS region used by regional infrastructure integrations. |
 | `infrastructure.storage` | infrastructure | `"in-memory"` | no | yes | — | Select in-memory development storage or Aurora DSQL. |
 | `policy.authorization.aws_iam.grants[].grant` | Tokeira native | `[]` | yes | yes | `aws-iam-bearer-authorization` | Temporal namespace:role grants for matching AWS identities. |
@@ -467,6 +468,7 @@ All accepted production leaves are listed below. Fields are startup-static; chan
 | `policy.authorization.jwt.issuers[].worker_scopes[].task_queues` | Tokeira native | `[]` | yes | yes | `scoped-worker-authorization` | Non-empty exact normal task-queue allowlist; sticky aliases are not configured. |
 | `policy.authorization.principal_attribution` | configured parity | `false` | no | yes | `authorization` | Write the authenticated principal to server-authored history metadata. |
 | `policy.compatibility.enable_standalone_activities` | configured parity | `false` | no | yes | `activity-executions` | Enable the v1.31.0 preview standalone-activity surface. |
+| `policy.compatibility.enable_standalone_activity_callbacks` | configured parity | `false` | no | yes | `activity-executions` | Enable standalone-activity callbacks; requires standalone activities. |
 | `policy.default_retention_days` | stock parity | `30` | no | yes | `namespace-management` | Default workflow-history retention for newly created namespaces. |
 | `policy.http_api.additional_forwarded_headers` | configured parity | `[]` | no | yes | `http-json-api` | Additional exact or trailing-star header rules forwarded to gRPC. |
 | `policy.http_api.allowed_hosts` | stock parity | `["*"]` | no | yes | `http-json-api` | Case-sensitive host patterns admitted by the HTTP/JSON gateway. |
@@ -485,6 +487,8 @@ All accepted production leaves are listed below. Fields are startup-static; chan
 | `policy.nexus_endpoint_limits.task_queue_max_length` | stock parity | `1000` | no | yes | `nexus-admin` | Maximum Nexus worker task-queue name length. |
 | `policy.quotas.max_signal_payload_bytes` | configured parity | `4194304` | no | yes | `workflow-signal` | Maximum admitted signal payload size. |
 | `policy.quotas.max_workflow_timeout_seconds` | configured parity | `315360000` | no | yes | `workflow-start` | Maximum admitted workflow execution timeout. |
+| `policy.snapshot.interval_ms` | Tokeira native | `<unset>` | yes | yes | — | Positive cadence for refreshing the embedded-engine snapshot file. |
+| `policy.snapshot.location` | Tokeira native | `<unset>` | yes | yes | — | Embedded-engine snapshot file; the optional section is disabled when absent. |
 | `policy.task_queues.enable_fairness` | configured parity | `false` | no | yes | `user-fairness` | Opt in to weighted User Fairness; priority remains enabled. |
 | `policy.worker_compute.enabled` | Tokeira native | `false` | no | yes | `worker-compute-controller` | Enable the experimental remote Worker Compute Controller; configured providers may create billable capacity. |
 
@@ -522,9 +526,9 @@ deployment_name = "payments"
 build_id = "2026-07-28.1"
 ```
 
-Every resource comparison is exact and case-sensitive. Polls must use VERSIONED Worker Deployment mode with both the configured deployment name and build ID. The fixed Worker RPC surface is `PollWorkflowTaskQueue`, `PollActivityTaskQueue`, `PollNexusTaskQueue`, `RespondWorkflowTaskCompleted`, `RespondWorkflowTaskFailed`, `RespondQueryTaskCompleted`, `RespondActivityTaskCompleted`, `RespondActivityTaskFailed`, `RespondActivityTaskCanceled`, `RecordActivityTaskHeartbeat`, `RespondNexusTaskCompleted`, `RespondNexusTaskFailed`, `RecordWorkerHeartbeat`, `ShutdownWorker`, queue-scoped `DescribeTaskQueue`, and `DescribeNamespace` for the scope's own namespace by exact name (the start-up check every Core-based SDK Worker makes before it polls; a request by ID is denied). Universal `Health/Check` and `GetSystemInfo` remain available independently of Worker scope.
+Every resource comparison is exact and case-sensitive. Polls must use VERSIONED Worker Deployment mode with both the configured deployment name and build ID. The fixed Worker RPC surface is `PollWorkflowTaskQueue`, `PollActivityTaskQueue`, `PollNexusTaskQueue`, `RespondWorkflowTaskCompleted`, `RespondWorkflowTaskFailed`, `RespondQueryTaskCompleted`, `RespondActivityTaskCompleted`, `RespondActivityTaskFailed`, `RespondActivityTaskCanceled`, `RecordActivityTaskHeartbeat`, `RespondNexusTaskCompleted`, `RespondNexusTaskFailed`, `RecordWorkerHeartbeat`, `ShutdownWorker`, and queue-scoped `DescribeTaskQueue`. Universal `Health/Check` and `GetSystemInfo` remain available independently of Worker scope. A scoped worker may call `DescribeNamespace` for its own namespace by exact name.
 
-Activity By-ID aliases, standalone Activities, unversioned or deprecated Worker Versioning, Worker inventory, visibility/history reads, Workflow starts, namespace description by ID, namespace listing, namespace mutation, and every other namespace-wide API are denied for a scoped identity. Sticky Workflow polls authorize the request's stable `normal_name`; sticky aliases are never configured as resources.
+Activity By-ID aliases, standalone Activities, unversioned or deprecated Worker Versioning, Worker inventory, visibility/history reads, Workflow starts, `DescribeNamespace` by ID or for another namespace, and other namespace-wide APIs are denied for a scoped identity. Sticky Workflow polls authorize the request's stable `normal_name`; sticky aliases are never configured as resources.
 
 The Go SDK can refresh an externally issued bearer through its standard credentials callback; return the token without a `Bearer ` prefix because the SDK adds it:
 

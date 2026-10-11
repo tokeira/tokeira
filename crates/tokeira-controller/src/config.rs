@@ -50,6 +50,14 @@ impl ControllerConfig {
         if self.shard_count == 0 {
             return Err(ControllerConfigError::ZeroShardCount);
         }
+        // Nodes and durable state use one execution-home hash until an
+        // explicit placement migration supports different cardinalities.
+        if self.shard_count != self.bundle_count {
+            return Err(ControllerConfigError::UnequalHomeCounts {
+                shard_count: self.shard_count,
+                bundle_count: self.bundle_count,
+            });
+        }
         if self.heartbeat_interval <= Duration::ZERO {
             return Err(ControllerConfigError::NonPositiveHeartbeatInterval);
         }
@@ -75,6 +83,16 @@ pub enum ControllerConfigError {
     ZeroPartitionCount,
     #[error("shard_count must be greater than zero")]
     ZeroShardCount,
+    /// Different execution-home cardinalities cannot be served without migration.
+    #[error(
+        "placement.shard_count ({shard_count}) must equal placement.bundle_count ({bundle_count}) for workflow dispatch; preserve the existing durable placement count; automatic repartitioning is not supported"
+    )]
+    UnequalHomeCounts {
+        /// Cardinality already used by durable execution placement.
+        shard_count: u32,
+        /// Cardinality advertised for acquired placement bundles.
+        bundle_count: u32,
+    },
     #[error("heartbeat_interval must be positive")]
     NonPositiveHeartbeatInterval,
     #[error("grace_interval must be at least heartbeat_interval")]
@@ -83,4 +101,39 @@ pub enum ControllerConfigError {
     InvalidRateBudget,
     #[error("dsql_connection_capacity_budget must be greater than zero")]
     ZeroCapacityBudget,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unequal_execution_home_counts_are_rejected() {
+        for (shard_count, bundle_count) in [(8, 4), (4, 8)] {
+            let config = ControllerConfig {
+                shard_count,
+                bundle_count,
+                ..Default::default()
+            };
+            assert_eq!(
+                config.validate(),
+                Err(ControllerConfigError::UnequalHomeCounts {
+                    shard_count,
+                    bundle_count
+                })
+            );
+            let message = config.validate().unwrap_err().to_string();
+            assert!(message.contains(&format!("placement.shard_count ({shard_count})")));
+            assert!(message.contains(&format!("placement.bundle_count ({bundle_count})")));
+            assert!(message.contains("automatic repartitioning is not supported"));
+        }
+        ControllerConfig::default().validate().unwrap();
+        ControllerConfig {
+            shard_count: 8,
+            bundle_count: 8,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+    }
 }

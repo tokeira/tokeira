@@ -19,6 +19,7 @@ use tokeira_proto::{
     enums::{IndexedValueType, TaskQueueType},
     workflowservice::{
         self,
+        workflow_service_client::WorkflowServiceClient,
         workflow_service_server::{
             WorkflowService as WorkflowServiceGrpcApi, WorkflowServiceServer,
         },
@@ -34,7 +35,7 @@ use tokeira_chasm_activity::ActivityStatus;
 use tokeira_proto::public::temporal::api::{activity::v1 as activity_v1, worker::v1 as worker_v1};
 
 use crate::{
-    Action,
+    Action, RouteTarget,
     chasm_activity::{defaulted_retry_policy, retry_policy_fields},
     grpc::{
         errors::{
@@ -134,6 +135,7 @@ pub struct WorkflowServiceGrpc {
     /// When absent, the `*ActivityExecution` RPCs answer `UNIMPLEMENTED` (deferred),
     /// distinct from the per-namespace enable gate the bridge itself enforces.
     chasm_activity: Option<Arc<crate::chasm_activity::ActivityBridge>>,
+    peer_channels: Arc<super::peer_transport::PeerChannels>,
 }
 
 impl WorkflowServiceGrpc {
@@ -141,6 +143,7 @@ impl WorkflowServiceGrpc {
         Self {
             inner,
             chasm_activity: None,
+            peer_channels: Arc::default(),
         }
     }
 
@@ -152,6 +155,73 @@ impl WorkflowServiceGrpc {
     ) -> Self {
         self.chasm_activity = Some(bridge);
         self
+    }
+
+    async fn workflow_reply_client(
+        &self,
+        headers: &http::HeaderMap,
+        namespace: &str,
+        task_token: &[u8],
+        action: Action,
+    ) -> Result<Option<WorkflowServiceClient<tonic::transport::Channel>>, Status> {
+        let RouteTarget::Remote { target } = self
+            .inner
+            .workflow_task_reply_route(headers, namespace, task_token, action)
+            .await?
+        else {
+            return Ok(None);
+        };
+        // A changing routing snapshot may point back to the forwarding node.
+        // One hop is enough; a stale route must fail and let the caller retry.
+        if headers.contains_key("x-tokeira-workflow-reply-forwarded") {
+            return Err(Status::unavailable("workflow-task owner route changed"));
+        }
+        let channel = self.peer_channels.get(&target)?;
+        Ok(Some(
+            WorkflowServiceClient::new(channel)
+                // Match the public server's response encoding limit. A local
+                // completion can return inline history; forwarding must not
+                // impose the unrelated internal-start envelope's size cap.
+                .max_decoding_message_size(usize::MAX)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .send_compressed(CompressionEncoding::Gzip),
+        ))
+    }
+
+    fn clear_workflow_reply_framing(metadata: &mut tonic::metadata::MetadataMap) {
+        // Tonic rebuilds framing for each socket but retains grpc-encoding in
+        // metadata. Neither request nor response may inherit the other hop's
+        // compression: the worker and the owner can negotiate different codecs.
+        for name in [
+            "host",
+            "content-length",
+            "content-type",
+            "connection",
+            "te",
+            "grpc-encoding",
+            "grpc-accept-encoding",
+        ] {
+            metadata.remove(name);
+        }
+    }
+
+    fn forwarded_workflow_reply_response<T>(mut response: Response<T>) -> Response<T> {
+        Self::clear_workflow_reply_framing(response.metadata_mut());
+        response
+    }
+
+    fn forwarded_workflow_reply_error(mut status: Status) -> Status {
+        Self::clear_workflow_reply_framing(status.metadata_mut());
+        status
+    }
+
+    fn forwarded_workflow_reply<T>(mut request: Request<T>) -> Request<T> {
+        Self::clear_workflow_reply_framing(request.metadata_mut());
+        request.metadata_mut().insert(
+            "x-tokeira-workflow-reply-forwarded",
+            tonic::metadata::MetadataValue::from_static("1"),
+        );
+        request
     }
 
     pub fn into_service(self) -> WorkflowServiceServer<Self> {
@@ -1119,6 +1189,24 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::RespondWorkflowTaskCompletedRequest>,
     ) -> Result<Response<workflowservice::RespondWorkflowTaskCompletedResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
+        // Temporal forwards the original completion/failure to its history
+        // owner (service/frontend/workflow_handler.go @ v1.31.0). Keep this
+        // transport decision before owner-local queries and update hydration.
+        if let Some(mut client) = self
+            .workflow_reply_client(
+                &headers,
+                &request.get_ref().namespace,
+                &request.get_ref().task_token,
+                Action::RespondWorkflowTaskCompleted,
+            )
+            .await?
+        {
+            return client
+                .respond_workflow_task_completed(Self::forwarded_workflow_reply(request))
+                .await
+                .map(Self::forwarded_workflow_reply_response)
+                .map_err(Self::forwarded_workflow_reply_error);
+        }
         let edge_req = translate::respond_completed_request_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
         debug!(
@@ -1707,6 +1795,24 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::RespondWorkflowTaskFailedRequest>,
     ) -> Result<Response<workflowservice::RespondWorkflowTaskFailedResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
+        // Temporal forwards the original completion/failure to its history
+        // owner (service/frontend/workflow_handler.go @ v1.31.0). Keep this
+        // transport decision before owner-local queries and update hydration.
+        if let Some(mut client) = self
+            .workflow_reply_client(
+                &headers,
+                &request.get_ref().namespace,
+                &request.get_ref().task_token,
+                Action::RespondWorkflowTaskFailed,
+            )
+            .await?
+        {
+            return client
+                .respond_workflow_task_failed(Self::forwarded_workflow_reply(request))
+                .await
+                .map(Self::forwarded_workflow_reply_response)
+                .map_err(Self::forwarded_workflow_reply_error);
+        }
         let mut req = request.into_inner();
         // `payload-admission-limits` criterion 2.6.
         if let Some(replacement) =

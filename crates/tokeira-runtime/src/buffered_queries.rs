@@ -48,6 +48,19 @@ pub struct BufferedQuery {
     pub response_tx: oneshot::Sender<QueryResult>,
 }
 
+/// Immutable query transport; the sender stays buffered until a worker answers.
+#[derive(Clone, Debug)]
+pub struct BufferedQueryTransport {
+    /// Stable query identity, shared across task delivery attempts.
+    pub query_id: String,
+    /// Worker query handler name.
+    pub query_type: String,
+    /// Original query arguments.
+    pub query_args: Payloads,
+    /// Minimum history boundary the worker must observe.
+    pub required_barrier: i64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct BufferedQueryRegistry {
     inner: Arc<Mutex<HashMap<RunKey, VecDeque<BufferedQuery>>>>,
@@ -79,6 +92,26 @@ impl BufferedQueryRegistry {
             .entry(run_key)
             .or_default()
             .push_back(query);
+    }
+
+    /// Snapshot queries without moving their waiters. Lost responses and failed
+    /// starts leave them available to the next delivery attempt (Temporal
+    /// recordworkflowtaskstarted/api.go, GetBufferedIDs @ v1.31.0).
+    pub fn snapshot(&self, run_key: RunKey) -> Vec<BufferedQueryTransport> {
+        self.inner
+            .lock()
+            .expect("buffered query registry poisoned")
+            .get(&run_key)
+            .into_iter()
+            .flatten()
+            .filter(|query| !query.response_tx.is_closed())
+            .map(|query| BufferedQueryTransport {
+                query_id: query.query_id.clone(),
+                query_type: query.query_type.clone(),
+                query_args: query.query_args.clone(),
+                required_barrier: query.required_barrier,
+            })
+            .collect()
     }
 
     pub fn drain_satisfied(&self, run_key: RunKey, observable_barrier: i64) -> Vec<BufferedQuery> {

@@ -78,6 +78,10 @@ impl<R> RunRepository for HistoryNotifyingRepository<R>
 where
     R: RunRepository + Send + Sync + 'static,
 {
+    fn recovery_is_empty(&self) -> bool {
+        self.inner.recovery_is_empty()
+    }
+
     fn placement_ready(&self) -> bool {
         self.inner.placement_ready()
     }
@@ -296,6 +300,14 @@ where
         Ok(())
     }
 
+    async fn reconcile_workflow_dispatch_run(&self, home: ShardId, run_key: RunKey) -> Result<()> {
+        // Repair changes derived intent only, so it must reach storage without
+        // waking history readers or falling back to the trait's test-double stub.
+        self.inner
+            .reconcile_workflow_dispatch_run(home, run_key)
+            .await
+    }
+
     async fn list_workflow_dispatch_page(
         &self,
         range: &tokeira_storage::WorkflowDiscoveryRange,
@@ -384,6 +396,13 @@ where
         self.inner
             .list_run_bulk_writes(shard_id, after, limit)
             .await
+    }
+
+    async fn dispose_workflow_backlog_page(
+        &self,
+        after: Option<uuid::Uuid>,
+    ) -> Result<tokeira_storage::WorkflowBacklogDisposal> {
+        self.inner.dispose_workflow_backlog_page(after).await
     }
 
     async fn drain_backlog(&self, queue: &QueueKey, limit: usize) -> Result<Vec<BacklogEntry>> {

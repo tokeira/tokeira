@@ -1,6 +1,6 @@
 # Workflow dispatch reconciliation: continuation plans
 
-Recorded on real Aurora DSQL on 2026-10-08, through SQLx and the repository's
+Recorded on real Aurora DSQL through SQLx and the repository's
 `workflow_dispatch_live_query_plans` contract. Each after-plan uses the exact
 `queue_page_query` builder used by the storage read path. The before-plan uses
 the prior tuple-comparison query as a negative control. Fixture UUIDs and digests

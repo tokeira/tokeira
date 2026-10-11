@@ -20,6 +20,8 @@ use crate::{
 pub(super) struct Fixture {
     pub(super) pool: PgPool,
     pub(super) store: DsqlStore,
+    repair_home: ShardId,
+    shard_count: u32,
 }
 
 #[tokio::test]
@@ -171,11 +173,14 @@ async fn workflow_dispatch_live_query_plans() -> Result<()> {
         }
         let mut cursor = None;
         let mut traversed = Vec::new();
+        let started = std::time::Instant::now();
+        let mut statements = 0;
         loop {
             let page = fixture
                 .repo()
                 .list_workflow_dispatch_page(&range, cursor, std::num::NonZeroU32::new(64).unwrap())
                 .await?;
+            statements += 1;
             traversed.extend(page.candidates.iter().map(WorkflowDispatchRow::position));
             cursor = page.last_examined;
             if page.exhausted {
@@ -186,6 +191,11 @@ async fn workflow_dispatch_live_query_plans() -> Result<()> {
             traversed, positions[index],
             "all ties survive complete traversal"
         );
+        report.push_str(&format!(
+            "\nQueue mode {index} complete pass: {} returned rows, {statements} page SQL statements, {:.3} seconds. Storage-engine rows examined are not measured by EXPLAIN.\n",
+            traversed.len(),
+            started.elapsed().as_secs_f64(),
+        ));
     }
     let home = ShardId(0);
     let home_count: i64 =
@@ -301,7 +311,12 @@ impl Fixture {
                 anyhow::ensure!(status == "completed", "index build failed: {status}");
             }
         }
-        Ok(Self { pool, store })
+        Ok(Self {
+            pool,
+            store,
+            repair_home: ShardId(0),
+            shard_count,
+        })
     }
 }
 
@@ -325,7 +340,7 @@ impl Backend for Fixture {
 
     async fn seed_stale_row(&self, state: &WorkflowState) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        super::workflow_dispatch::maintain(&mut tx, state, ShardId(0)).await?;
+        super::workflow_dispatch::maintain(&mut tx, state, self.repair_home).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -554,6 +569,12 @@ fn workflow_dispatch_live_generated_sticky_recovery() {
 
 #[async_trait]
 impl crate::workflow_dispatch_tests::RepairBackend for Fixture {
+    fn repair_home(&self) -> ShardId {
+        self.repair_home
+    }
+    fn repair_shard_count(&self) -> u32 {
+        self.shard_count
+    }
     async fn remove_row(&self, key: RunKey) -> Result<()> {
         sqlx::query("DELETE FROM workflow_dispatch WHERE run_key=$1")
             .bind(key.0)
@@ -604,7 +625,10 @@ fn workflow_dispatch_live_generated_complete_repair() {
         return;
     }
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let fixture = runtime.block_on(Fixture::connect(1)).unwrap();
+    // Other shared-cluster fixtures use homes below 256, including the
+    // lease-fence corpus. Keep complete unfiltered walks on a reserved home.
+    let mut fixture = runtime.block_on(Fixture::connect(1024)).unwrap();
+    fixture.repair_home = ShardId(1023);
     crate::workflow_dispatch_tests::run_repair_cases(&fixture, &runtime);
     runtime.block_on(fixture.store.shutdown()).unwrap();
     runtime.block_on(fixture.pool.close());
@@ -663,6 +687,213 @@ async fn workflow_dispatch_live_repair_decode_and_encoding_failures_preserve_aut
         .execute(&fixture.pool)
         .await?;
     crate::workflow_dispatch_tests::RepairBackend::finish_repair_case(&fixture, &[key]).await?;
+    fixture.store.shutdown().await?;
+    fixture.pool.close().await;
+    Ok(())
+}
+
+#[async_trait]
+impl crate::workflow_dispatch_tests::DisposalBackend for Fixture {
+    async fn disposal_authority(&self, keys: &[RunKey]) -> Result<Vec<u8>> {
+        crate::workflow_dispatch_tests::RepairBackend::authority(self, keys).await
+    }
+    async fn backlog_bytes(&self, queue: &QueueKey) -> Result<Vec<Vec<u8>>> {
+        // All persisted columns are compared, not merely decoded payloads.
+        let rows = sqlx::query_as::<_, (Uuid, i32, i16, Option<String>, Option<String>, i16, i64, i64, Uuid, Vec<u8>, OffsetDateTime)>(
+            "SELECT key, partition_id, task_kind, deployment, build_id, priority_key, fair_pass, insertion_tie, run_key, payload_data, scheduled_at FROM dispatch_backlog WHERE queue_namespace=$1 AND queue_name=$2 AND task_kind=$3 ORDER BY key")
+            .bind(queue.namespace_id.0).bind(&queue.task_queue.0).bind(queue.task_kind.to_db_smallint()).fetch_all(&self.pool).await?;
+        Ok(rows
+            .iter()
+            .map(|row| format!("{row:?}").into_bytes())
+            .collect())
+    }
+}
+
+#[test]
+fn workflow_dispatch_live_generated_legacy_disposal() {
+    if std::env::var_os("TOKEIRA_DSQL_TEST_DATABASE_URL").is_none() {
+        return;
+    }
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let fixture = runtime.block_on(Fixture::connect(1)).unwrap();
+    crate::workflow_dispatch_tests::run_disposal_cases(&fixture, &runtime);
+    runtime.block_on(fixture.store.shutdown()).unwrap();
+    runtime.block_on(fixture.pool.close());
+}
+
+#[tokio::test]
+async fn workflow_dispatch_live_disposal_rolls_back_cancelled_page_and_keeps_bounds() -> Result<()>
+{
+    if std::env::var_os("TOKEIRA_DSQL_TEST_DATABASE_URL").is_none() {
+        return Ok(());
+    }
+    let fixture = Arc::new(Fixture::connect(1).await?);
+    let state =
+        crate::memory::projection_accumulator_tests::fresh_transition(RunKey::new()).next_state;
+    let queue = QueueKey {
+        namespace_id: tokeira_types::NamespaceId::new(),
+        task_queue: state.task_queue,
+        task_kind: TaskKind::Workflow,
+        deployment: None,
+        build_id: None,
+    };
+    let entries = (0..130)
+        .map(|_| BacklogEntry {
+            run_key: RunKey::new(),
+            queue: queue.clone(),
+            payload: BacklogPayload::Workflow {
+                logical_seq: LogicalTaskSeq::ONE,
+            },
+            priority: None,
+            order: DeliveryOrder::default(),
+            scheduled_at: state.started_at,
+        })
+        .collect();
+    fixture.repo().persist_to_backlog(entries).await?;
+    let before =
+        crate::workflow_dispatch_tests::DisposalBackend::backlog_bytes(fixture.as_ref(), &queue)
+            .await?;
+    // Start immediately before our first key, so the cancelled page necessarily
+    // issued a delete for this fixture even after another suite left backlog.
+    let first: Uuid = sqlx::query_scalar("SELECT key FROM dispatch_backlog WHERE queue_namespace=$1 AND queue_name=$2 AND task_kind=$3 ORDER BY key LIMIT 1")
+        .bind(queue.namespace_id.0).bind(&queue.task_queue.0)
+        .bind(TaskKind::Workflow.to_db_smallint()).fetch_one(&fixture.pool).await?;
+    let after_first = first.as_u128().checked_sub(1).map(Uuid::from_u128);
+    let (entered, resume) = super::pause_point::arm(super::pause_point::PauseKey::Disposal);
+    let writing = fixture.clone();
+    let page = tokio::spawn(async move {
+        writing
+            .repo()
+            .dispose_workflow_backlog_page(after_first)
+            .await
+    });
+    entered.await?;
+    page.abort();
+    assert!(page.await.unwrap_err().is_cancelled());
+    drop(resume);
+    assert_eq!(
+        crate::workflow_dispatch_tests::DisposalBackend::backlog_bytes(fixture.as_ref(), &queue)
+            .await?,
+        before
+    );
+    let mut after = None;
+    loop {
+        let page = fixture.repo().dispose_workflow_backlog_page(after).await?;
+        assert!(page.examined <= crate::LEGACY_WORKFLOW_KEYS && page.deleted <= page.examined);
+        if page.exhausted {
+            break;
+        }
+        assert!(page.last_examined > after);
+        after = page.last_examined;
+    }
+    assert!(
+        crate::workflow_dispatch_tests::DisposalBackend::backlog_bytes(fixture.as_ref(), &queue)
+            .await?
+            .is_empty()
+    );
+    fixture.store.shutdown().await?;
+    fixture.pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn workflow_dispatch_live_disposal_bounds_activity_prefix_and_passes_corruption() -> Result<()>
+{
+    if std::env::var_os("TOKEIRA_DSQL_TEST_DATABASE_URL").is_none() {
+        return Ok(());
+    }
+    let fixture = Fixture::connect(1).await?;
+    let transition = crate::memory::projection_accumulator_tests::fresh_transition(RunKey::new());
+    let corrupt_run = transition.next_state.run_key;
+    crate::workflow_dispatch_tests::commit(&fixture, transition).await?;
+    let original: Vec<u8> =
+        sqlx::query_scalar("SELECT state_data FROM workflow_hot WHERE run_key=$1")
+            .bind(corrupt_run.0)
+            .fetch_one(&fixture.pool)
+            .await?;
+    sqlx::query("UPDATE workflow_hot SET state_data=$2 WHERE run_key=$1")
+        .bind(corrupt_run.0)
+        .bind(vec![1u8, 2, 3])
+        .execute(&fixture.pool)
+        .await?;
+    let base = Uuid::new_v4().as_u128() & !0xffff;
+    let namespace = Uuid::new_v4();
+    let mut tx = fixture.pool.begin().await?;
+    for index in 0..66u128 {
+        let kind = if index < 64 {
+            TaskKind::Activity
+        } else {
+            TaskKind::Workflow
+        };
+        let run = if index == 64 {
+            corrupt_run.0
+        } else {
+            Uuid::new_v4()
+        };
+        sqlx::query("INSERT INTO dispatch_backlog (key,partition_id,queue_namespace,queue_name,task_kind,priority_key,fair_pass,insertion_tie,run_key,payload_data,scheduled_at) VALUES ($1,0,$2,'disposal-bounds',$3,0,0,0,$4,$5,$6)")
+            .bind(Uuid::from_u128(base + index)).bind(namespace).bind(kind.to_db_smallint())
+            .bind(run).bind(Vec::<u8>::new()).bind(OffsetDateTime::now_utc()).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    let page = fixture
+        .repo()
+        .dispose_workflow_backlog_page(Some(Uuid::from_u128(base - 1)))
+        .await?;
+    assert_eq!(page.examined, 64);
+    assert_eq!((page.deleted, page.deferred), (0, 0));
+    assert_eq!(page.last_examined, Some(Uuid::from_u128(base + 63)));
+    let next = fixture
+        .repo()
+        .dispose_workflow_backlog_page(page.last_examined)
+        .await?;
+    assert!(next.examined <= 64 && next.deferred >= 1);
+    let remaining: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT key FROM dispatch_backlog WHERE queue_namespace=$1 ORDER BY key",
+    )
+    .bind(namespace)
+    .fetch_all(&fixture.pool)
+    .await?;
+    assert!(remaining.contains(&Uuid::from_u128(base + 64)));
+    assert!(
+        !remaining.contains(&Uuid::from_u128(base + 65)),
+        "corruption must not stop the following covered key"
+    );
+    let mut explain = sqlx::QueryBuilder::<sqlx::Postgres>::new("EXPLAIN ");
+    explain.push(super::dispatch::DISPOSAL_NEXT_KEYS_SQL);
+    let plan = explain
+        .build_query_as::<(String,)>()
+        .bind(Uuid::from_u128(base + 63))
+        .bind(64i64)
+        .fetch_all(&fixture.pool)
+        .await?;
+    assert!(
+        plan.iter()
+            .any(|(line,)| line.contains("Index Cond:") && line.contains("key >")),
+        "continuation must seek: {plan:?}"
+    );
+    assert!(
+        !plan
+            .iter()
+            .any(|(line,)| line.contains("Filter:") && line.contains("task_kind"))
+    );
+    if let Some(path) = std::env::var_os("TOKEIRA_WORKFLOW_DISPOSAL_PLAN_OUTPUT") {
+        std::fs::write(
+            path,
+            plan.into_iter()
+                .map(|(line,)| line)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )?;
+    }
+    sqlx::query("UPDATE workflow_hot SET state_data=$2 WHERE run_key=$1")
+        .bind(corrupt_run.0)
+        .bind(original)
+        .execute(&fixture.pool)
+        .await?;
+    sqlx::query("DELETE FROM dispatch_backlog WHERE queue_namespace=$1")
+        .bind(namespace)
+        .execute(&fixture.pool)
+        .await?;
     fixture.store.shutdown().await?;
     fixture.pool.close().await;
     Ok(())

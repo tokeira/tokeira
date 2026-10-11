@@ -117,6 +117,8 @@ pub struct LaneHandle {
     lane_id: usize,
     tx: mpsc::Sender<LaneMessage>,
     identity_tx: mpsc::Sender<IdentityRequest>,
+    #[cfg(test)]
+    pub(crate) identity_requests: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Debug)]
@@ -146,6 +148,9 @@ impl LaneHandle {
         &self,
         run_key: RunKey,
     ) -> Result<(NamespaceId, WorkflowId)> {
+        #[cfg(test)]
+        self.identity_requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (reply, received) = oneshot::channel();
         self.identity_tx
             .send(IdentityRequest { run_key, reply })
@@ -428,6 +433,8 @@ where
         lane_id,
         tx,
         identity_tx,
+        #[cfg(test)]
+        identity_requests: Arc::default(),
     }
 }
 
@@ -3588,6 +3595,7 @@ mod tests {
             lane_id: 0,
             tx,
             identity_tx,
+            identity_requests: Arc::default(),
         };
         assert_eq!(handle.queued_depth(), 0);
 

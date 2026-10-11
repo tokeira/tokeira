@@ -419,6 +419,7 @@ pub(crate) fn run_sticky_recovery_cases(backend: &impl Backend, runtime: &tokio:
         .unwrap();
 }
 
+// Feature: workflow-dispatch, Property 11: Routing, state, and delivery preservation
 // Feature: workflow-dispatch, Property 1: Atomic derived equality
 // Rejection, deduplication, and rollback leave both state and dispatch at the preceding commit.
 async fn atomic_case(
@@ -506,7 +507,9 @@ async fn atomic_case(
         let mut stale = original.clone();
         stale.task_queue = TaskQueueName("stale-destination".into());
         backend.seed_stale_row(&stale).await.unwrap();
+        let accumulator = state.used_worker_deployment_versions.clone();
         state = applied(commit(backend, transition.clone()).await.unwrap());
+        prop_assert_eq!(&state.used_worker_deployment_versions, &accumulator);
         prop_assert_eq!(backend.row(state.run_key).await.unwrap(), reference(&state));
 
         let mut duplicate = transition.clone();
@@ -817,6 +820,12 @@ pub(crate) async fn routing_and_home_pages(backend: &impl Backend) {
 /// Test-only corruption and observation around the shared repair algorithm.
 #[async_trait]
 pub(crate) trait RepairBackend: Backend {
+    fn repair_home(&self) -> ShardId {
+        ShardId(0)
+    }
+    fn repair_shard_count(&self) -> u32 {
+        1
+    }
     async fn remove_row(&self, key: RunKey) -> Result<()>;
     async fn legacy_recovery_flag(&self, key: RunKey) -> Result<()>;
     async fn authority(&self, keys: &[RunKey]) -> Result<Vec<u8>>;
@@ -846,8 +855,18 @@ pub(crate) fn run_repair_cases(backend: &impl RepairBackend, runtime: &tokio::ru
                     let mut expected = Vec::new();
                     for kind in 0..7 {
                         let mut transition = fresh_transition(RunKey::new());
-                        transition.next_state.workflow_id.0 =
-                            format!("repair-{}", transition.next_state.run_key.0);
+                        let base = format!("repair-{}", transition.next_state.run_key.0);
+                        for suffix in 0u64.. {
+                            transition.next_state.workflow_id.0 = format!("{base}-{suffix}");
+                            if tokeira_types::execution_home_bundle(
+                                transition.next_state.namespace_id.0.as_bytes(),
+                                transition.next_state.workflow_id.0.as_bytes(),
+                                backend.repair_shard_count(),
+                            ) == backend.repair_home()
+                            {
+                                break;
+                            }
+                        }
                         transition
                             .next_state
                             .pending_workflow_task
@@ -908,7 +927,11 @@ pub(crate) fn run_repair_cases(backend: &impl RepairBackend, runtime: &tokio::ru
                             if legacy {
                                 backend.legacy_recovery_flag(key).await.unwrap();
                             }
-                            expected.push((key, reference(&state)));
+                            let row = reference(&state).map(|mut row| {
+                                row.execution_home = backend.repair_home();
+                                row
+                            });
+                            expected.push((key, row));
                         } else {
                             expected.push((key, None));
                         }
@@ -927,13 +950,17 @@ pub(crate) fn run_repair_cases(backend: &impl RepairBackend, runtime: &tokio::ru
                             let page = backend
                                 .repo()
                                 .list_recovery_candidates_for_shard(
-                                    ShardId(0),
+                                    backend.repair_home(),
                                     cursor.as_ref(),
                                     page_size,
                                 )
                                 .await
                                 .unwrap();
                             for state in page.states {
+                                prop_assert!(
+                                    keys.contains(&state.run_key),
+                                    "repair home contains another fixture's recovery candidate"
+                                );
                                 if remaining == 0 {
                                     break;
                                 }
@@ -950,7 +977,7 @@ pub(crate) fn run_repair_cases(backend: &impl RepairBackend, runtime: &tokio::ru
                             let page = backend
                                 .repo()
                                 .list_workflow_dispatch_for_home(
-                                    ShardId(0),
+                                    backend.repair_home(),
                                     cursor,
                                     NonZeroU32::new(page_size as u32).unwrap(),
                                 )
@@ -961,6 +988,10 @@ pub(crate) fn run_repair_cases(backend: &impl RepairBackend, runtime: &tokio::ru
                             }
                             cursor = page.last().copied();
                             for key in page {
+                                prop_assert!(
+                                    keys.contains(&key),
+                                    "repair home contains another fixture's dispatch row"
+                                );
                                 if remaining == 0 {
                                     break;
                                 }
@@ -986,11 +1017,11 @@ pub(crate) fn run_repair_cases(backend: &impl RepairBackend, runtime: &tokio::ru
         .unwrap();
 }
 
-async fn repair_retry(backend: &impl Backend, key: RunKey) -> Result<()> {
+async fn repair_retry(backend: &impl RepairBackend, key: RunKey) -> Result<()> {
     for attempt in 0..10 {
         match backend
             .repo()
-            .reconcile_workflow_dispatch_run(ShardId(0), key)
+            .reconcile_workflow_dispatch_run(backend.repair_home(), key)
             .await
         {
             Err(error) if error.is::<crate::WorkflowDispatchRepairConflict>() && attempt < 9 => {
@@ -1000,4 +1031,157 @@ async fn repair_retry(backend: &impl Backend, key: RunKey) -> Result<()> {
         }
     }
     unreachable!("last attempt returns")
+}
+
+#[async_trait]
+pub(crate) trait DisposalBackend: RepairBackend {
+    async fn disposal_authority(&self, keys: &[RunKey]) -> Result<Vec<u8>>;
+    async fn backlog_bytes(&self, queue: &tokeira_types::QueueKey) -> Result<Vec<Vec<u8>>>;
+}
+
+pub(crate) fn run_disposal_cases(
+    backend: &impl DisposalBackend,
+    runtime: &tokio::runtime::Runtime,
+) {
+    let mut runner = TestRunner::new(ProptestConfig {
+        cases: 100,
+        failure_persistence: None,
+        ..Default::default()
+    });
+    runner
+        .run(
+            &(any::<bool>(), any::<bool>(), 1u32..20),
+            |(interrupt, concurrent, attempt)| {
+                runtime.block_on(async {
+                    // Feature: workflow-dispatch, Property 10: Workflow-only backlog retirement
+                    // Coverage controls disposal, never authority; activity bytes survive every restart and page.
+                    let mut initial = fresh_transition(RunKey::new());
+                    initial.next_state.namespace_id = tokeira_types::NamespaceId::new();
+                    let covered = applied(commit(backend, initial).await.unwrap());
+                    let mut initial = fresh_transition(RunKey::new());
+                    initial.next_state.namespace_id = covered.namespace_id;
+                    initial.next_state.workflow_id.0 = "uncovered".into();
+                    let uncovered = applied(commit(backend, initial).await.unwrap());
+                    backend.remove_row(uncovered.run_key).await.unwrap();
+                    let queue = tokeira_types::QueueKey {
+                        namespace_id: covered.namespace_id,
+                        task_queue: covered.task_queue.clone(),
+                        task_kind: tokeira_types::TaskKind::Workflow,
+                        deployment: None,
+                        build_id: None,
+                    };
+                    let activity_queue = tokeira_types::QueueKey {
+                        task_kind: tokeira_types::TaskKind::Activity,
+                        ..queue.clone()
+                    };
+                    let absent = RunKey::new();
+                    let entry = |key| crate::BacklogEntry {
+                        run_key: key,
+                        queue: queue.clone(),
+                        payload: crate::BacklogPayload::Workflow {
+                            logical_seq: LogicalTaskSeq::ONE,
+                        },
+                        priority: None,
+                        scheduled_at: covered.started_at,
+                        order: crate::DeliveryOrder::default(),
+                    };
+                    let activity = crate::BacklogEntry {
+                        queue: activity_queue.clone(),
+                        payload: crate::BacklogPayload::Activity {
+                            activity_id: "preserved".into(),
+                            retired_input: tokeira_kernel::RetiredField::default(),
+                            schedule_event_id: 42,
+                            attempt,
+                            dispatch_revision: 3,
+                            stamp: 7,
+                        },
+                        ..entry(uncovered.run_key)
+                    };
+                    backend
+                        .repo()
+                        .persist_to_backlog(vec![
+                            entry(covered.run_key),
+                            entry(uncovered.run_key),
+                            entry(absent),
+                            activity.clone(),
+                        ])
+                        .await
+                        .unwrap();
+                    let activity_bytes = backend.backlog_bytes(&activity_queue).await.unwrap();
+                    let mut after = None;
+                    if interrupt {
+                        let page = backend
+                            .repo()
+                            .dispose_workflow_backlog_page(after)
+                            .await
+                            .unwrap();
+                        prop_assert!(
+                            page.examined <= crate::LEGACY_WORKFLOW_KEYS
+                                && page.deleted <= page.examined
+                        );
+                        // The uncommitted cursor is deliberately lost. A new pass must be idempotent.
+                    }
+                    if concurrent {
+                        let mut next = following(&covered);
+                        next.next_state.pending_workflow_task = None;
+                        commit(backend, next).await.unwrap();
+                    }
+                    let keys = [covered.run_key, uncovered.run_key];
+                    let authority = backend.disposal_authority(&keys).await.unwrap();
+                    loop {
+                        let page = backend
+                            .repo()
+                            .dispose_workflow_backlog_page(after)
+                            .await
+                            .unwrap();
+                        prop_assert!(
+                            page.examined <= crate::LEGACY_WORKFLOW_KEYS
+                                && page.deleted <= page.examined
+                        );
+                        if page.exhausted {
+                            break;
+                        }
+                        prop_assert!(page.last_examined > after);
+                        after = page.last_examined;
+                    }
+                    prop_assert_eq!(backend.backlog_bytes(&queue).await.unwrap().len(), 1);
+                    prop_assert_eq!(
+                        &backend.backlog_bytes(&activity_queue).await.unwrap(),
+                        &activity_bytes
+                    );
+                    prop_assert_eq!(backend.disposal_authority(&keys).await.unwrap(), authority);
+                    backend
+                        .repo()
+                        .reconcile_workflow_dispatch_run(ShardId(0), uncovered.run_key)
+                        .await
+                        .unwrap();
+                    after = None;
+                    loop {
+                        let page = backend
+                            .repo()
+                            .dispose_workflow_backlog_page(after)
+                            .await
+                            .unwrap();
+                        if page.exhausted {
+                            break;
+                        }
+                        after = page.last_examined;
+                    }
+                    prop_assert!(backend.backlog_bytes(&queue).await.unwrap().is_empty());
+                    prop_assert_eq!(
+                        backend.backlog_bytes(&activity_queue).await.unwrap(),
+                        activity_bytes
+                    );
+                    let delivered = backend
+                        .repo()
+                        .drain_backlog(&activity_queue, 64)
+                        .await
+                        .unwrap();
+                    prop_assert_eq!(delivered, vec![activity]);
+                    backend.finish_repair_case(&keys).await.unwrap();
+                    Ok(())
+                })
+            },
+        )
+        .unwrap();
 }

@@ -7,7 +7,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex, TryLockError},
+    sync::{Arc, Mutex, RwLock, TryLockError},
 };
 
 use anyhow::Result;
@@ -112,6 +112,7 @@ pub struct WorkerComputeQueueSampler<R> {
     nexus_registry: NexusEndpointRegistry,
     queue_metrics: WorkerComputeQueueMetrics,
     writer_id: IncarnationId,
+    deployment_registry: Arc<RwLock<Option<crate::deployment_registry::DeploymentRegistry>>>,
     state: Arc<Mutex<QueueSamplerState>>,
 }
 
@@ -147,8 +148,17 @@ where
             nexus_registry,
             queue_metrics,
             writer_id,
+            deployment_registry: Arc::new(RwLock::new(None)),
             state: Arc::new(Mutex::new(QueueSamplerState::default())),
         }
+    }
+
+    pub(crate) fn with_deployment_registry(
+        mut self,
+        registry: Arc<RwLock<Option<crate::deployment_registry::DeploymentRegistry>>>,
+    ) -> Self {
+        self.deployment_registry = registry;
+        self
     }
 
     /// Produce and persist one bounded-write sample pass at explicit time.
@@ -171,6 +181,9 @@ where
             .list_versioned_backlog_queue_keys()
             .await?
         {
+            if queue.task_kind == TaskKind::Workflow {
+                continue;
+            }
             let Some(key) = sample_key_from_queue(&queue) else {
                 continue;
             };
@@ -201,6 +214,21 @@ where
                     .run_repository
                     .list_recovery_candidates_for_shard(*shard_id, cursor.as_ref(), SAMPLE_PAGE)
                     .await?;
+                // Count normal intent once on its execution owner. Retained
+                // offers on another queue owner are excluded from broker counts.
+                let source = crate::discovery::WorkflowSource {
+                    repo: self.run_repository.clone(),
+                    registry: self.deployment_registry.clone(),
+                };
+                for state in &page.states {
+                    if let Some(row) = tokeira_storage::derive_workflow_dispatch(state, *shard_id)
+                        && !row.sticky
+                        && let Some(task) = source.resolve(&row).await?
+                        && let Some(key) = sample_key_from_queue(&task.queue)
+                    {
+                        *backlog.entry(key).or_default() += 1;
+                    }
+                }
                 for delivery in page
                     .states
                     .iter()

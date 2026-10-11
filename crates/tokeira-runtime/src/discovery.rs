@@ -47,11 +47,40 @@ pub(crate) struct QueueHome {
 }
 
 /// Supplies the queue partition's home, independently of execution placement.
-///
-/// Kept internal until the cutover wires placement and reconstruction together.
-/// Default runtime construction supplies no provider and retains legacy delivery.
 pub(crate) trait QueueHomeProvider: Debug + Send + Sync {
     fn local_home(&self, queue: &QueueKey) -> Option<QueueHome>;
+}
+
+/// Queue homes use the same acquired bundles as execution placement. The
+/// acquisition token retires registrations and offers before a replacement can
+/// serve, even when the durable epoch did not change.
+#[derive(Debug)]
+pub(crate) struct PlacementQueueHomes {
+    pub(crate) owner: Arc<RwLock<crate::shard::ShardOwner>>,
+    pub(crate) counts: RwLock<(u32, u32)>,
+}
+
+impl QueueHomeProvider for PlacementQueueHomes {
+    fn local_home(&self, queue: &QueueKey) -> Option<QueueHome> {
+        let (partitions, bundles) = *self.counts.read().expect("queue placement lock poisoned");
+        let home = tokeira_types::bundle_for_partition(
+            tokeira_types::workflow_queue_partition(
+                queue.namespace_id,
+                &queue.task_queue.0,
+                partitions,
+            ),
+            bundles,
+        );
+        let owner = self.owner.read().expect("shard owner lock poisoned");
+        let acquisition = owner
+            .acquisition(home)
+            .filter(|a| owner.acquisition_active(a))?;
+        Some(QueueHome {
+            id: home,
+            generation: acquisition.generation,
+            cancel: acquisition.cancel,
+        })
+    }
 }
 
 /// The reusable page boundary has no workflow-specific admission semantics.
@@ -106,7 +135,10 @@ impl<R: RunRepository + 'static> DiscoverySource for WorkflowSource<R> {
 }
 
 impl<R: RunRepository + 'static> WorkflowSource<R> {
-    async fn resolve(&self, row: &WorkflowDispatchRow) -> Result<Option<DispatchableWorkflowTask>> {
+    pub(crate) async fn resolve(
+        &self,
+        row: &WorkflowDispatchRow,
+    ) -> Result<Option<DispatchableWorkflowTask>> {
         let mut queue = QueueKey {
             namespace_id: row.namespace_id,
             task_queue: row.queue_name.clone(),
@@ -202,6 +234,7 @@ impl RangeKey {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WorkflowPass {
     registration: u64,
+    started: Option<Instant>,
     cancel: CancellationToken,
     pub(crate) after: Option<WorkflowDispatchPosition>,
     pub(crate) admissions: usize,
@@ -363,6 +396,7 @@ impl DiscoveryRegistry {
         entry.turn = turn;
         let pass = entry.pass.take().unwrap_or_else(|| WorkflowPass {
             registration: entry.id,
+            started: Some(now),
             cancel: entry.cancel.clone(),
             ..WorkflowPass::default()
         });
@@ -370,6 +404,28 @@ impl DiscoveryRegistry {
     }
 
     fn complete(&self, key: &RangeKey, outcome: SliceOutcome, pass: WorkflowPass, now: Instant) {
+        match outcome {
+            SliceOutcome::Yield => {
+                metrics::counter!(crate::metrics::WORKFLOW_DISPATCH_SLICE_YIELDS_TOTAL).increment(1)
+            }
+            SliceOutcome::Capacity => {
+                metrics::counter!(crate::metrics::WORKFLOW_DISPATCH_CAPACITY_BLOCKS_TOTAL)
+                    .increment(1)
+            }
+            SliceOutcome::Cancelled => {
+                metrics::counter!(crate::metrics::WORKFLOW_DISPATCH_OWNERSHIP_LOSS_TOTAL)
+                    .increment(1)
+            }
+            _ => {}
+        }
+        if matches!(
+            outcome,
+            SliceOutcome::Complete | SliceOutcome::Capacity | SliceOutcome::Cancelled
+        ) && let Some(started) = pass.started
+        {
+            metrics::histogram!(crate::metrics::WORKFLOW_DISPATCH_PASS_DURATION_SECONDS)
+                .record(now.duration_since(started).as_secs_f64());
+        }
         let mut state = self.state.lock().expect("discovery registry lock poisoned");
         if let Some(entry) = state.ranges.get_mut(key)
             && entry.id == pass.registration
@@ -465,6 +521,8 @@ async fn run_slice<R: RunRepository + 'static>(
             NonZeroU32::new(PAGE_SIZE).expect("nonzero page size"),
         )
         .await?;
+    metrics::counter!(crate::metrics::WORKFLOW_DISPATCH_READS_TOTAL)
+        .increment(page.candidates.len() as u64);
     pass.pages += 1;
     for row in page.candidates {
         if home.cancel.is_cancelled() || pass.cancel.is_cancelled() {
@@ -484,21 +542,40 @@ async fn run_slice<R: RunRepository + 'static>(
         }
         pass.examined += 1;
         let position = row.position();
-        if range.matches(&row)
-            && !broker
-                .knows_offer((row.incarnation.run_key, row.incarnation.logical_seq))
-                .await
-            && let Some(task) = source.resolve(&row).await?
-            && registry.compatible(key, pass.registration, &task.queue)
+        // The finite skip reason set is diagnostic only: no queue, run,
+        // worker, or deployment identity can become a metric label.
+        if !range.matches(&row) {
+            metrics::counter!(crate::metrics::WORKFLOW_DISPATCH_SKIPS_TOTAL, "reason" => "incompatible")
+                .increment(1);
+        } else if broker
+            .knows_offer((row.incarnation.run_key, row.incarnation.logical_seq))
+            .await
         {
-            match broker
-                .publish_discovered(task, row.scheduled_at, &mut reservation)
-                .await
-            {
-                OfferAdmission::Admitted => pass.admissions += 1,
-                OfferAdmission::Known => {}
-                OfferAdmission::Full => return Ok(SliceOutcome::Capacity),
+            metrics::counter!(crate::metrics::WORKFLOW_DISPATCH_SKIPS_TOTAL, "reason" => "known")
+                .increment(1);
+        } else if let Some(task) = source.resolve(&row).await? {
+            if registry.compatible(key, pass.registration, &task.queue) {
+                match broker
+                    .publish_discovered(task, row.scheduled_at, &mut reservation)
+                    .await
+                {
+                    OfferAdmission::Admitted => {
+                        pass.admissions += 1;
+                        metrics::counter!(crate::metrics::WORKFLOW_DISPATCH_ADMISSIONS_TOTAL).increment(1);
+                    }
+                    OfferAdmission::Known => {
+                        metrics::counter!(crate::metrics::WORKFLOW_DISPATCH_SKIPS_TOTAL, "reason" => "known")
+                            .increment(1)
+                    }
+                    OfferAdmission::Full => return Ok(SliceOutcome::Capacity),
+                }
+            } else {
+                metrics::counter!(crate::metrics::WORKFLOW_DISPATCH_SKIPS_TOTAL, "reason" => "incompatible")
+                    .increment(1);
             }
+        } else {
+            metrics::counter!(crate::metrics::WORKFLOW_DISPATCH_SKIPS_TOTAL, "reason" => "stale")
+                .increment(1);
         }
         pass.after = Some(position);
         if pass.admissions == PASS_ADMISSIONS {

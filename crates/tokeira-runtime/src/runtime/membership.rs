@@ -9,7 +9,7 @@
 //! The ordering in [`acquire_shard`](TokeiraRuntime::acquire_shard) is the
 //! correctness-critical part and is enforced deliberately: a freshly acquired
 //! shard is recorded in `Sweeping`, its volatile delivery state is rebuilt by
-//! `sweep_shard`, and only *then* is it marked `Active`. This guarantees no
+//! `sweep_shard_inner`, and only *then* is it marked `Active`. This guarantees no
 //! command is admitted against a shard whose in-memory dispatch/timeout state
 //! has not yet been reconstructed from durable history.
 use super::*;
@@ -59,41 +59,100 @@ where
             acquisition: recovery.acquisition.clone(),
             max_retries: self.config.max_occ_retries,
         };
-        let (reconciliation, fence) = {
-            let owner = self.shard_owner.read().expect("shard owner lock poisoned");
-            (
-                owner.reconciliation_enabled(),
-                owner.fence_at(shard_id, epoch),
-            )
-        };
+        let fence = self
+            .shard_owner
+            .read()
+            .expect("shard owner lock poisoned")
+            .fence_at(shard_id, epoch);
         let shutdown = self.runtime_shutdown.cancellation_token();
         let _exclusive = tokio::select! {
             biased;
             _ = shutdown.cancelled() => return Err(anyhow!("runtime stopped while draining recovery writers")),
             result = crate::serving_gate::quiesce(&self.shard_owner, &recovery.acquisition) => result?,
         };
-        let mut retry = self.activity_retry_deps();
-        retry.tracking = activity_tracking.clone();
         let shutdown = self.runtime_shutdown.cancellation_token();
         let result = tokio::select! {
             biased;
             _ = shutdown.cancelled() => return Err(anyhow!("runtime stopped during shard recovery")),
             _ = recovery.acquisition.cancel.cancelled() => return Err(anyhow!("shard recovery acquisition cancelled")),
             result = async {
-                let swept = crate::recovery::sweep_shard_inner(shard_id, self.repo.as_ref(), &self.broker, &self.lanes, self.lanes.len(),
+                let swept = crate::recovery::sweep_shard_inner(shard_id, self.repo.as_ref(), &self.broker,
                     &workflow_tracking, &tracking,
                     &activity_tracking,
                     &nexus_tracking,
-                    &callback_tracking, &retry, reconciliation.then_some(&repair)).await?;
-                // Before activation, on both of the sweep's paths: switch the
+                    &callback_tracking, &repair).await?;
+                // Before activation, finish the
                 // materializations recorded on the shard and hand its records
                 // to the purger, checking the acquisition as the repair does.
                 crate::purge::recover_bulk_writes(shard_id, self.repo.as_ref(), &self.purger,
-                    reconciliation.then_some(&repair), &fence).await?;
+                    Some(&repair), &fence).await?;
                 anyhow::Ok(swept)
             } => result?,
         };
-        Self::settle_self_assigned_recovery(&mut recovery, Ok(result))
+        let result = Self::settle_self_assigned_recovery(&mut recovery, Ok(result))?;
+        self.disposal_wake.notify_one();
+        Ok(result)
+    }
+
+    /// Reconstruct a populated self-assigned repository without allowing its
+    /// synchronous constructor to activate before the two repair walks finish.
+    pub(super) fn start_seeded_recovery(
+        &self,
+        completed: tokio::sync::watch::Sender<Option<Result<(), String>>>,
+    ) {
+        let mut recovery = self.begin_acquisition(ShardId(0), ShardEpoch::ZERO);
+        let repair = crate::recovery::RepairAcquisition {
+            owner: self.shard_owner.clone(),
+            acquisition: recovery.acquisition.clone(),
+            max_retries: self.config.max_occ_retries,
+        };
+        let repo = self.repo.clone();
+        let broker = self.broker.clone();
+        let workflow = self
+            .workflow_timeout_tracking
+            .for_acquisition(recovery.acquisition.clone());
+        let wft = self
+            .wft_timeout_tracking
+            .for_acquisition(recovery.acquisition.clone());
+        let activity = self
+            .activity_tracking
+            .for_acquisition(recovery.acquisition.clone());
+        let nexus = self
+            .nexus_timeout_tracking
+            .for_acquisition(recovery.acquisition.clone());
+        let callbacks = self
+            .completion_callback_tracking
+            .for_acquisition(recovery.acquisition.clone());
+        let purger = self.purger.clone();
+        let shutdown = self.runtime_shutdown.cancellation_token();
+        let fence = self
+            .shard_owner
+            .read()
+            .expect("shard owner lock poisoned")
+            .fence_at(ShardId(0), ShardEpoch::ZERO);
+        let wake = self.disposal_wake.clone();
+        let cancel = recovery.acquisition.cancel.clone();
+        let _startup = self.runtime_shutdown.spawn(async move {
+            let result = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => Err(anyhow!("runtime stopped during seeded recovery")),
+                _ = cancel.cancelled() => Err(anyhow!("seeded recovery superseded")),
+                result = async {
+                    let _exclusive = crate::serving_gate::quiesce(&repair.owner, &repair.acquisition).await?;
+                    crate::recovery::sweep_shard_inner(ShardId(0), repo.as_ref(), &broker,
+                        &workflow, &wft, &activity, &nexus, &callbacks, &repair).await?;
+                    crate::purge::recover_bulk_writes(ShardId(0), repo.as_ref(), &purger, Some(&repair), &fence).await?;
+                    recovery.activate()?;
+                    recovery.disarm();
+                    wake.notify_one();
+                    anyhow::Ok(())
+                } => result,
+            };
+            if let Err(error) = &result {
+                tracing::error!(?error, "seeded workflow recovery failed; home remains non-serving");
+            }
+            let _ = completed.send(Some(result.map_err(|error| format!("{error:#}"))));
+        });
     }
 
     fn settle_self_assigned_recovery(
@@ -144,7 +203,7 @@ where
     ///    means another node owns it, surfaced as an error.
     /// 2. Record the shard locally in `Sweeping` and spawn the lease renewer,
     ///    which signals `lost_rx` if the lease is ever fenced.
-    /// 3. Run `sweep_shard` to rebuild in-memory dispatch and timeout state
+    /// 3. Run `sweep_shard_inner` to rebuild in-memory dispatch and timeout state
     ///    from durable history.
     /// 4. Only then `mark_active`, so admission begins against fully
     ///    reconstructed state.
@@ -189,19 +248,15 @@ where
         }
 
         let recovery = self.begin_acquisition(shard_id, epoch);
-        // The local deadline: under controller-managed placement the owner
-        // stops admitting writes once its lease has expired by its own clock,
-        // whether or not dispatch reconciliation is on, so a takeover isn't
-        // starved by fenced writes that keep landing first
+        // Stop admitting writes when the local lease deadline expires so a
+        // takeover cannot be starved by fenced writes that keep landing first
         // (`bundle-lease-fence`).
-        let (deadline_tracked, fence) = {
-            let owner = self.shard_owner.read().expect("shard owner lock poisoned");
-            (
-                owner.reconciliation_enabled() || owner.fences_writes(),
-                owner.fence_at(shard_id, epoch),
-            )
-        };
-        if deadline_tracked && let Some(duration) = self.repo.bundle_lease_duration() {
+        let fence = self
+            .shard_owner
+            .read()
+            .expect("shard owner lock poisoned")
+            .fence_at(shard_id, epoch);
+        if let Some(duration) = self.repo.bundle_lease_duration() {
             *recovery
                 .acquisition
                 .deadline
@@ -223,7 +278,7 @@ where
                 3,
                 cancel.clone(),
                 lost_tx,
-                deadline_tracked.then(|| recovery.acquisition.clone()),
+                Some(recovery.acquisition.clone()),
             ));
         let tracking = self
             .wft_timeout_tracking
@@ -245,19 +300,12 @@ where
             acquisition: recovery.acquisition.clone(),
             max_retries: self.config.max_occ_retries,
         };
-        let reconciliation = self
-            .shard_owner
-            .read()
-            .expect("shard owner lock poisoned")
-            .reconciliation_enabled();
         let shutdown = self.runtime_shutdown.cancellation_token();
         let _exclusive = tokio::select! {
             biased;
             _ = shutdown.cancelled() => return Err(anyhow!("runtime stopped while draining recovery writers")),
             result = crate::serving_gate::quiesce(&self.shard_owner, &recovery.acquisition) => result?,
         };
-        let mut retry = self.activity_retry_deps();
-        retry.tracking = activity_tracking.clone();
         let shutdown = self.runtime_shutdown.cancellation_token();
         tokio::select! {
             biased;
@@ -265,16 +313,16 @@ where
             _ = cancel.cancelled() => return Err(anyhow!("shard acquisition cancelled during recovery")),
             _ = &mut lost_rx => return Err(anyhow!("shard lease lost during recovery")),
             result = async {
-                crate::recovery::sweep_shard_inner(shard_id, self.repo.as_ref(), &self.broker, &self.lanes, self.lanes.len(),
+                crate::recovery::sweep_shard_inner(shard_id, self.repo.as_ref(), &self.broker,
                     &workflow_tracking, &tracking,
                     &activity_tracking,
                     &nexus_tracking,
-                    &callback_tracking, &retry, reconciliation.then_some(&repair)).await?;
-                // Before activation, on both of the sweep's paths: switch the
+                    &callback_tracking, &repair).await?;
+                // Before activation, finish the
                 // materializations recorded on the shard and hand its records
                 // to the purger, checking the acquisition as the repair does.
                 crate::purge::recover_bulk_writes(shard_id, self.repo.as_ref(), &self.purger,
-                    reconciliation.then_some(&repair), &fence).await?;
+                    Some(&repair), &fence).await?;
                 anyhow::Ok(())
             } => { result?; }
         }
@@ -287,6 +335,7 @@ where
             return Err(anyhow!("shard lease lost before activation"));
         }
         recovery.activate()?;
+        self.disposal_wake.notify_one();
         let _watcher = self.runtime_shutdown.spawn(async move {
             tokio::select! {
                 _ = shutdown.cancelled() => {},
@@ -642,7 +691,7 @@ mod tests {
         let swept = restarted
             .recover_self_assigned_shard(ShardId(0), ShardEpoch::ZERO)
             .await?;
-        assert_eq!(swept.workflow_tasks_republished, 1);
+        assert_eq!(swept.workflow_tasks_republished, 0);
         assert_eq!(restarted.active_shards(), vec![ShardId(0)]);
         let task = restarted
             .poll_workflow_task(

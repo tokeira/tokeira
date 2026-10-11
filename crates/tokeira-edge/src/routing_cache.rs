@@ -42,18 +42,43 @@ pub struct EdgeRoutingConfig {
     pub max_retries: usize,
 }
 
+/// Controller placement cannot change a running node's durable hash geometry.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "controller placement {controller:?} disagrees with node placement {node:?}; configure identical counts and hash version before starting; automatic repartitioning is not supported"
+)]
+pub struct PlacementConfigurationMismatch {
+    /// Placement used by the node's runtime and durable state.
+    pub node: PlacementConfig,
+    /// Placement published by the controller.
+    pub controller: PlacementConfig,
+}
+
 /// Edge-local cache of controller-published routing state.
 #[derive(Debug)]
 pub struct RoutingCache {
     snapshot: ArcSwap<RoutingSnapshot>,
+    expected_placement: PlacementConfig,
 }
 
 impl RoutingCache {
     /// Build a cache with an empty snapshot for the supplied placement config.
     pub fn new(placement_config: PlacementConfig) -> Self {
         Self {
+            expected_placement: placement_config,
             snapshot: ArcSwap::from_pointee(RoutingSnapshot::new(placement_config)),
         }
+    }
+
+    fn validate_placement(&self, controller: PlacementConfig) -> Result<()> {
+        if controller != self.expected_placement {
+            return Err(PlacementConfigurationMismatch {
+                node: self.expected_placement,
+                controller,
+            }
+            .into());
+        }
+        Ok(())
     }
 
     /// Replace the full routing snapshot atomically.
@@ -177,11 +202,15 @@ pub async fn subscribe_routing_once(
         .subscribe_routing(SubscribeRoutingRequest::default())
         .await
         .map_err(|e| anyhow!("subscribe_routing failed: {e}"))?;
-    if let Some(update) = stream.message().await.map_err(|e| anyhow!("{e}"))? {
-        // Work directly with the zero-copy view — no .to_owned_message().
-        apply_routing_update_view(&cache, update.view())?;
-    }
-    Ok(())
+    let update = stream
+        .message()
+        .await
+        .map_err(|e| anyhow!("{e}"))?
+        .ok_or_else(|| anyhow!("controller ended routing subscription before initial snapshot"))?;
+    anyhow::ensure!(matches!(&update.view().update,
+        Some(tokeira_proto::connect::tokeira::internal::controller::v1::__buffa::view::oneof::routing_update::Update::Full(_))),
+        "controller must send a full initial routing snapshot");
+    apply_routing_update_view(&cache, update.view())
 }
 
 /// Long-running subscription loop with reconnect backoff.
@@ -203,6 +232,7 @@ pub async fn run_routing_subscription(
         .await
         {
             Ok(()) => return Ok(()),
+            Err(error) if error.is::<PlacementConfigurationMismatch>() => return Err(error),
             Err(error) => {
                 tracing::warn!(%error, "routing subscription disconnected; serving stale cache");
             }
@@ -383,6 +413,7 @@ fn apply_routing_update_view(cache: &RoutingCache, update: &RoutingUpdateView<'_
                 },
                 generation: GenerationCounter(full.generation),
             };
+            cache.validate_placement(snapshot.placement_config)?;
             for entry in full.bundles.iter() {
                 if let Some(BundleState::Owner(owner)) = &entry.state {
                     snapshot.execution_bundle_owners.insert(
@@ -548,6 +579,30 @@ mod tests {
             bundle_count: 4,
             partition_count: 16,
             hash_version: 1,
+        }
+    }
+
+    #[test]
+    fn controller_placement_mismatch_leaves_the_routing_snapshot_unchanged() {
+        let expected = placement_config();
+        let cache = RoutingCache::new(expected);
+        cache.validate_placement(expected).unwrap();
+        for field in 0..4 {
+            let mut changed = expected;
+            match field {
+                0 => changed.shard_count += 1,
+                1 => changed.bundle_count += 1,
+                2 => changed.partition_count += 1,
+                _ => changed.hash_version += 1,
+            }
+            let error = cache.validate_placement(changed).unwrap_err();
+            assert!(error.is::<PlacementConfigurationMismatch>());
+            assert!(
+                error
+                    .to_string()
+                    .contains("automatic repartitioning is not supported")
+            );
+            assert_eq!(cache.snapshot().placement_config, expected);
         }
     }
 

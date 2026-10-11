@@ -250,6 +250,7 @@ where
         worker_identity: WorkerIdentity,
         timeout_after: tokio::time::Duration,
     ) -> Result<Option<ActivityTaskOffer>> {
+        self.ready().await?;
         match self
             .activity_broker
             .poll_activity_task_for_worker(&queue, &worker_identity, timeout_after)
@@ -363,13 +364,16 @@ where
         request: RequestContext,
     ) -> Result<CommitResult> {
         let activity_id = token.activity_id.clone();
-        if let Err(error) = self.validate_activity_token(&token).await {
-            runtime_metrics::record_activity_task_completed(OutcomeLabel::Rejected);
-            return Err(error);
-        }
+        let (_, _, home) = self
+            .validate_activity_token(&token)
+            .await
+            .inspect_err(|_| {
+                runtime_metrics::record_activity_task_completed(OutcomeLabel::Rejected);
+            })?;
         let result = self
-            .submit_for_owned_shard(
+            .submit_for_owned_home(
                 token.run_key,
+                home,
                 Command::ActivityResolved(ActivityResolvedRequest {
                     activity_id,
                     resolution: ActivityResolution::Completed { result },
@@ -417,13 +421,14 @@ where
         worker_identity: Option<WorkerIdentity>,
         request: RequestContext,
     ) -> Result<()> {
-        let (activity, workflow_retry_policy) = match self.validate_activity_token(&token).await {
-            Ok(validated) => validated,
-            Err(error) => {
-                runtime_metrics::record_activity_task_failed(OutcomeLabel::Rejected);
-                return Err(error);
-            }
-        };
+        let (activity, workflow_retry_policy, home) =
+            match self.validate_activity_token(&token).await {
+                Ok(validated) => validated,
+                Err(error) => {
+                    runtime_metrics::record_activity_task_failed(OutcomeLabel::Rejected);
+                    return Err(error);
+                }
+            };
         let activity_id = token.activity_id.clone();
         let retry_policy = activity.retry_policy.clone().or(workflow_retry_policy);
 
@@ -481,8 +486,9 @@ where
             Some(RetryDecision::Retry { .. }) => unreachable!("retry path returns early"),
         };
         let result = self
-            .submit_for_owned_shard(
+            .submit_for_owned_home(
                 token.run_key,
+                home,
                 Command::ActivityResolved(ActivityResolvedRequest {
                     activity_id,
                     resolution: ActivityResolution::Failed {
@@ -525,10 +531,11 @@ where
         request: RequestContext,
     ) -> Result<CommitResult> {
         let activity_id = token.activity_id.clone();
-        self.validate_activity_token(&token).await?;
+        let (_, _, home) = self.validate_activity_token(&token).await?;
         let result = self
-            .submit_for_owned_shard(
+            .submit_for_owned_home(
                 token.run_key,
+                home,
                 Command::ActivityResolved(ActivityResolvedRequest {
                     activity_id,
                     resolution: ActivityResolution::Canceled { details },
@@ -563,6 +570,7 @@ where
         details: Option<Payloads>,
         identity: Option<WorkerIdentity>,
     ) -> Result<ActivityHeartbeatOutcome> {
+        self.ready().await?;
         let mut attempts = 0u32;
         loop {
             // Identity failures are the typed [`ActivityTaskNotFound`] —
@@ -780,6 +788,7 @@ where
         identity: WorkerIdentity,
         request: RequestContext,
     ) -> Result<ActivityTaskToken> {
+        self.ready().await?;
         let mut attempts = 0u32;
         loop {
             let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
@@ -986,6 +995,7 @@ where
         worker_identity: &WorkerIdentity,
         mut scheduled: Option<ScheduledInput>,
     ) -> Result<Option<StartedActivityTask>> {
+        self.ready().await?;
         let mut attempts = 0u32;
         loop {
             let LoadedRun::Existing(state) = self.repo.load_run(task.run_key).await? else {
@@ -1088,8 +1098,9 @@ where
                 // requests `CreateWorkflowTask`; this kernel command applies
                 // the same transition and schedules a WFT when needed.
                 let result = self
-                    .submit_for_owned_shard(
+                    .submit_for_owned_home(
                         task.run_key,
+                        self.execution_home(&state),
                         Command::StartDeploymentTransition(
                             tokeira_kernel::StartDeploymentTransitionRequest {
                                 target,
@@ -1356,7 +1367,8 @@ where
     async fn validate_activity_token(
         &self,
         token: &ActivityTaskToken,
-    ) -> Result<(tokeira_kernel::ActivityState, Option<RetryPolicy>)> {
+    ) -> Result<(tokeira_kernel::ActivityState, Option<RetryPolicy>, ShardId)> {
+        self.ready().await?;
         let LoadedRun::Existing(state) = self.repo.load_run(token.run_key).await? else {
             return Err(ActivityTaskNotFound {
                 reason: "run not found for activity token",
@@ -1385,7 +1397,11 @@ where
         if token.shard_epoch != self.shard_epoch_for_completion(&state).await? {
             return Err(anyhow!("activity shard epoch mismatch"));
         }
-        Ok((activity, state.retry_policy.clone()))
+        Ok((
+            activity,
+            state.retry_policy.clone(),
+            self.execution_home(&state),
+        ))
     }
 
     /// Re-dispatch an activity at its next attempt after a retryable failure.
@@ -2863,7 +2879,6 @@ mod tests {
                 WorkflowTimeoutScannerConfig::default(),
                 BacklogConfig::default(),
             ));
-            runtime.shard_owner.write().unwrap().enable_reconciliation();
             let (state, _, task) = seed_scheduled_activity(&runtime, &repo).await;
             runtime.activity_broker.remove_run(state.run_key).await;
             repo.create_workflow_rule(
@@ -3537,6 +3552,7 @@ mod tests {
             assert!(recovered.states.iter().any(
                 |state| state.run_key == key && state.used_worker_deployment_versions.is_none()
             ));
+            runtime.ready().await.unwrap();
             match path {
                 0 => {
                     runtime
@@ -4391,9 +4407,6 @@ mod tests {
             {
                 let mut owner = runtime.shard_owner.write().unwrap();
                 *owner = ShardOwner::new(8);
-                if repair {
-                    owner.enable_reconciliation();
-                }
                 owner.record_acquired(home, ShardEpoch(17));
                 owner.mark_active(home);
             }
@@ -4442,6 +4455,10 @@ mod tests {
                 assert_eq!(error.to_string(), "activity heartbeat shard epoch mismatch");
                 assert_eq!(repo.snapshot().await.unwrap(), before);
             } else {
+                let identity_requests = runtime
+                    .pick_lane(token.run_key)
+                    .identity_requests
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 assert!(matches!(
                     runtime
                         .complete_activity_task(
@@ -4454,6 +4471,13 @@ mod tests {
                         .unwrap(),
                     CommitResult::Applied { .. }
                 ));
+                assert_eq!(
+                    runtime.lanes[0]
+                        .identity_requests
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    identity_requests,
+                    "completion already holds the execution home"
+                );
             }
             runtime.runtime_shutdown.begin_shutdown();
             runtime
@@ -4727,5 +4751,38 @@ mod tests {
                 Ok(())
             })?;
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_activity_scanner_recovers_a_lost_publication() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        );
+        let (state, queue, _) = seed_scheduled_activity(&runtime, &repo).await;
+        runtime.activity_broker.remove_run(state.run_key).await;
+        // The actual background scanner must wake and reconstruct from activity
+        // dispatch. Paused time advances to its tick while this poll is parked.
+        let task = runtime
+            .poll_activity_task(
+                queue,
+                WorkerIdentity("recovered-activity".into()),
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.run_key, state.run_key);
+        runtime.runtime_shutdown.begin_shutdown();
+        runtime
+            .runtime_shutdown
+            .wait(std::time::Instant::now() + std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
     }
 }

@@ -19,7 +19,7 @@ use crate::RunRepository;
 /// Maximum metadata rows screened in a page with no relocation.
 pub const SCREEN_KEYS: usize = 1_000;
 /// Maximum source keys processed by a page that relocates data.
-pub const MOVE_KEYS: usize = 64;
+pub const MOVE_KEYS: usize = crate::write_budget::MAX_MAINTENANCE_KEYS;
 /// Stable identity of this one-time placement algorithm.
 pub const PLACEMENT_UPGRADE: &str = "execution-home-placement-v1";
 

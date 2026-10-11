@@ -33,7 +33,106 @@ const DRAIN_BACKLOG_SQL: &str = "
     ORDER BY priority_key ASC, fair_pass ASC, insertion_tie ASC
     LIMIT $6";
 
+pub(super) const DISPOSAL_FIRST_KEYS_SQL: &str =
+    "SELECT key, run_key, task_kind FROM dispatch_backlog ORDER BY key LIMIT $1";
+pub(super) const DISPOSAL_NEXT_KEYS_SQL: &str =
+    "SELECT key, run_key, task_kind FROM dispatch_backlog WHERE key>$1 ORDER BY key LIMIT $2";
+
 impl DsqlRunRepository {
+    pub(super) async fn do_dispose_workflow_backlog_page(
+        &self,
+        after: Option<Uuid>,
+    ) -> Result<crate::WorkflowBacklogDisposal> {
+        let mut permit = self.director.acquire(DbClass::Maintenance).await?;
+        let mut tx = permit.connection()?.begin().await?;
+        let sql = if after.is_some() {
+            DISPOSAL_NEXT_KEYS_SQL
+        } else {
+            DISPOSAL_FIRST_KEYS_SQL
+        };
+        // LIMIT bounds physical keys, including activities. Filtering first
+        // would scan an arbitrarily long activity prefix to find 64 workflows.
+        let mut query = sqlx::query_as::<_, (Uuid, Uuid, i16)>(sql);
+        if let Some(after) = after {
+            query = query.bind(after);
+        }
+        let keys = query
+            .bind(crate::LEGACY_WORKFLOW_KEYS as i64)
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut deleted = 0;
+        let mut workflows = 0;
+        for (key, run, kind) in &keys {
+            if *kind != TaskKind::Workflow.to_db_smallint() {
+                continue;
+            }
+            workflows += 1;
+            let state = sqlx::query_scalar::<_, Vec<u8>>(
+                "SELECT state_data FROM workflow_hot WHERE run_key=$1",
+            )
+            .bind(run)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|bytes| codec::decode_workflow_state(RunKey(*run), &bytes))
+            .transpose();
+            let state = match state {
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::warn!(%key, run_key=%run, ?error, "legacy workflow copy deferred: invalid state");
+                    continue;
+                }
+            };
+            let expected = state.as_ref().and_then(|state| {
+                crate::derive_workflow_dispatch(
+                    state,
+                    tokeira_types::execution_home_bundle(
+                        state.namespace_id.0.as_bytes(),
+                        state.workflow_id.0.as_bytes(),
+                        self.shard_count,
+                    ),
+                )
+            });
+            let mut current =
+                sqlx::QueryBuilder::<sqlx::Postgres>::new(super::workflow_dispatch::SELECT_ROW);
+            current.push(" WHERE run_key=").push_bind(*run);
+            let current = current
+                .build()
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(super::workflow_dispatch::decode)
+                .transpose();
+            let current = match current {
+                Ok(current) => current,
+                Err(error) => {
+                    tracing::warn!(%key, run_key=%run, ?error, "legacy workflow copy deferred: invalid dispatch row");
+                    continue;
+                }
+            };
+            // Old writers are stopped. Every new transition preserves equality
+            // atomically and never relies on this copy, even after this snapshot.
+            if expected == current {
+                deleted += sqlx::query("DELETE FROM dispatch_backlog WHERE key=$1 AND task_kind=$2")
+                    .bind(key)
+                    .bind(TaskKind::Workflow.to_db_smallint())
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected() as usize;
+            }
+        }
+        // Deletion changes no value bytes, and the physical page is below
+        // the shared transaction row ceiling. No payload is rewritten.
+        #[cfg(all(test, feature = "dsql-integration"))]
+        super::pause_point::reached(super::pause_point::PauseKey::Disposal).await;
+        tx.commit().await?;
+        Ok(crate::WorkflowBacklogDisposal {
+            last_examined: keys.last().map(|(key, _, _)| *key),
+            examined: keys.len(),
+            deleted,
+            deferred: workflows - deleted,
+            exhausted: keys.len() < crate::LEGACY_WORKFLOW_KEYS,
+        })
+    }
+
     pub(super) async fn do_list_versioned_backlog_queue_keys(&self) -> Result<Vec<QueueKey>> {
         record_dsql_operation!(self, "list_versioned_backlog_queue_keys", None, {
             let mut permit = self.director.acquire(DbClass::Read).await?;
@@ -308,9 +407,9 @@ pub(super) fn collect_dispatchable_workflow_tasks(
     }
     let mut tasks = Vec::new();
     for (run_key, state_data) in rows {
-        // Workflow task dispatch is derived from the hot state snapshot. There
-        // is no separate workflow-task queue table to repair; replaying history
-        // can rebuild this materialization.
+        // Administrative republishing includes speculative tasks, which have
+        // no workflow_dispatch row. Derive these hints from authoritative state;
+        // normal polling uses the bounded workflow_dispatch discovery path.
         let state = codec::decode_workflow_state(RunKey(run_key), &state_data)?;
         let Some(task) = dispatchable_workflow_task(&state) else {
             continue;

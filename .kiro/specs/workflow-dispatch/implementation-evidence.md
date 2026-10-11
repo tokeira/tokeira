@@ -1,5 +1,292 @@
 # Workflow dispatch implementation evidence
 
+## Default delivery cutover
+
+Base: `1ebc763f56a50db20c450f12bacaf7459ba054f7`; the PR records its final base
+and head. Discovery, poll registration, bounded offers, acquisition repair and
+serving admission now form the default runtime path. The temporary construction
+switch and workflow backlog grace/drain/spill paths are removed. Activity backlog
+and activity-dispatch reconciliation remain wired. Legacy workflow copies are
+removed only when current state and dispatch reconstruction agree, with at most
+64 examined keys under the shared write budgets and a volatile restartable cursor.
+
+Placement-backed queue homes share edge routing's namespace-UUID/task-queue hash.
+Retirement cancels the acquisition generation's discovery and offers. Cross-home
+starts reach the execution owner through an authenticated internal RPC, which
+rechecks worker authorization, namespace, queue, version and incarnation before
+its serving gate. Update messages and eligible buffered queries travel back with
+the committed start; their waiters remain on the execution owner. Requests are
+bounded at 64 KiB and responses at 128 MiB; attachments use protobuf bytes.
+The owner freezes and size-checks the selection before committing the start, and
+retains buffered query payloads and waiters until answered.
+
+Public workflow-task completion and failure RPCs forward their original fields
+to the execution owner after authorization, preserving its update/query waiters.
+The owner repeats admission; a second forwarding hop is rejected. Per-connection
+framing is rebuilt, and the public payload limits remain unchanged. Local and
+forwarded stale completions return the same `NotFound` status and message.
+
+Restored or populated seeded runtimes await both complete repair walks before
+becoming Active. Only an empty memory repository can take the immediate path.
+Unequal shard and bundle counts fail configuration validation before listeners
+or embedded DSQL lifecycle work; there is no placement-count migration. Activity
+follow-up commands pass their already-known execution home to avoid another lane
+identity request. Normal backlog accounting derives from durable dispatch without
+counting retained offers twice; speculative and activity sources remain separate.
+
+### Review fixes
+
+The internal start response uses protobuf update/query attachments within the
+128 MiB envelope, matching `common/rpc/grpc.go @ v1.31.0`. Selection and size
+checks precede the commit; later admissions cannot enlarge the response. Query
+payloads remain buffered across a lost reply, with only the current task attempt
+bound to the waiter. Regressions cover a nearly 2 MiB admitted update over the
+authenticated wire, ten near-limit updates plus a query in one protobuf envelope,
+pre-commit capacity rejection, and retained query redelivery. Authentication
+headers are explicitly selected and compression metadata is rebuilt per hop.
+Peer channels are reused by endpoint. Transient owner failures retry within the
+original poll deadline; authorization, cancellation and capacity statuses survive
+the public adapter, while namespace-cache misses cannot discard valid offers.
+
+Default DSQL shard/bundle counts are promoted together; explicit unequal counts
+remain rejected without a placement migration. Initial controller placement is
+validated before runtime construction, and later incompatible snapshots stop
+serving. Queue statistics inspect at most four dispatch pages per observation
+and may undercount large backlogs. The late-poller regression advances paused time
+beyond the actual offer lifetime and confirms its expiry before rediscovery.
+Zero-duration polls may finish already-matched work but cannot retry an unavailable owner after
+that attempt, even when its expired offer has already been republished.
+
+The active owner of home zero coordinates legacy disposal. Each page examines at
+most 64 physical keys before selecting workflow copies, advances past corrupt
+rows with diagnostics, and retries deferred work after acquisition progress or a
+thirty-second interval. Activity keys are preserved. The repair metric documents
+successful calls, including no-ops. Maintenance key limits share one constant.
+
+Generated configuration documentation matches its sources and retains own-namespace
+scoped-worker admission. Two bounded changelog fragments cover the cutover and
+matching-count guidance. Generated bindings, dependency policy, offline Markdown
+links and whitespace checks passed. No dependency or lockfile changed.
+
+### Model verification
+
+TLC 1.7.4 and tla-rs 0.21.2 were both run for every `40_dispatch_handoff` and
+`41_dispatch_repair` configuration: six positive configurations passed with each
+checker, and nine negative controls failed with each checker on their intended
+property (30 expected outcomes). Positive configurations cover handoff, migration,
+ordering, the explicitly weaker stale-row variant, repair and concrete pages.
+Negative targets cover bare-limit and durable-cursor liveness, stale incarnation,
+sticky timeout conversion, missing inserts/deletes, restarting every slice,
+retained retry identity and omitted stale-row deletion. No model source changed.
+
+Commands ran from `spec/tla`, with each matching configuration substituted:
+
+```bash
+java -cp "$TLA_TOOLS_JAR" tlc2.TLC -workers 2 -metadir "$MODEL_OUTPUT" -config "$CONFIG" "$MODEL"
+tla "$MODEL" --config "$CONFIG" --max-states 20000000 --max-depth 10000
+```
+
+### Workspace verification
+
+Implementation revision: `c6087044d36ed47a8bf2b88c86e017b2b877ca50`.
+The full bar covers the review fixes on the base above, including the distributed
+startup schema check. Schema validation precedes placement preparation and runtime
+activation; the durable upgrade-note assertion survives changelog consumption.
+
+| Check | Outcome |
+|---|---|
+| `cargo +nightly fmt --all` | Passed |
+| `cargo lint --locked` | Passed |
+| `cargo check --workspace --locked` | Passed |
+| `cargo nextest run --workspace --locked --no-fail-fast --test-threads 4` | 3,863 passed; 2 existing SDK integration tests skipped |
+| `cargo test --workspace --doc --locked` | Passed; existing ignored examples remain ignored |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked` | Passed |
+| All-target Clippy for storage, runtime, projection, edge and engine with DSQL integration features and `-D warnings` | Passed |
+
+No completion-bar command was omitted. Initial review runs found the old internal
+attachment field name in the binding-inventory fixture and a zero-duration poll
+race introduced by the new deadline wrapper. The fixture now matches the descriptor,
+retaining its field number and byte wire type. Zero-duration polls still start
+already-matched tasks; ordinary long polls retain their original deadline. A
+redundant rustdoc link was also corrected. The complete rerun passed. The earlier
+workspace run exposed six integration failures in restored-engine repair delegation, the protobuf binding
+inventory and a configuration fixture; the complete reruns passed after fixes.
+An earlier pre-publication workspace run passed 3,847 tests and timed out two
+unchanged history-pagination properties during concurrent compilation. The complete suite
+then passed with four test threads and the same timeout limits; no source fix
+or test retry policy was introduced for those timeouts.
+
+The authenticated wire regression verifies owner-held update and query waiters
+through real forwarded public completion/failure calls, owner-side update
+hydration, authorization and loop refusal before mutation, matching local and
+forwarded stale-task status, per-hop framing, query barriers, stale offers, both
+encoded start-envelope limits and public `ResourceExhausted` mapping.
+
+### Query and placement measurements
+
+The first completed measurements are retained below; the final live sequence
+repeated the dispatch-plan checks with unchanged SQL.
+
+[Recorded cutover plans](query-plans-cutover.md) preserve the complete queue,
+home and placement reports with fixture literals anonymized. The dispatch
+fixture added 16,384 rows to reach 17,806 rows. Both target ranges contained
+4,096 positions, including long equal-time groups. The current continuation
+plans used three disjoint scalar index bounds, followed by at most 64 primary-key
+payload lookups; the legacy tuple comparison remained a residual filter.
+
+| Complete traversal | Rows returned | Page SQL statements | Duration |
+|---|---:|---:|---:|
+| Live | 4,096 | 65 | 5.279 s |
+| Exact | 4,096 | 65 | 5.490 s |
+
+The statement counts include the final empty page. They measure returned rows
+and page API queries, not storage-engine rows examined. The selected home had
+487 dispatch rows when its first/continuation plans were captured.
+
+The placement fixture's bounded timer-page join preserved scalar continuation
+bounds. Screening examined 24,778 committed unchanged hot/timer keys in 4.362 s.
+A linear extrapolation gives 352.1 s for one million runs plus one million timers;
+this excludes relocation and is not a million-row benchmark.
+
+### Live verification and boundaries
+
+The review validation used a fresh Aurora DSQL cluster and two temporary
+DynamoDB tables. All three distributed-schema engine checks ran on the combined
+implementation: a target schema starts and serves; an older or unsupported future
+schema is refused without starting listeners or ownership resources. The affected
+disposal suites then ran serially on the same cluster, with shard-zero counts
+after each suite. All owned resources were deleted; cluster absence was confirmed.
+
+| Review suite | Outcome | Test duration | Shard-zero candidates / dispatch after |
+|---|---|---:|---|
+| Distributed startup, three checks | Passed | 670.177 s | 0 / 0 |
+| Physical-page bounds, corrupt-row deferral and continuation plan | Passed | 6.967 s | 1 / 1 |
+| Cancelled-page rollback and transaction bounds | Passed | 15.071 s | 1 / 1 |
+| Generated legacy disposal, 100 cases | Passed | 131.693 s | 1 / 1 |
+
+The [recorded disposal continuation plan](query-plans-cutover.md#legacy-workflow-backlog-disposal)
+uses the primary-key index with a scalar continuation bound and no task-kind
+filter. The fixture proves that 64 activity keys consume exactly one page and
+that a corrupt workflow row does not hide a later covered row.
+
+These live runs precede the final zero-duration poll retry guard, which changes
+neither startup nor disposal. The final workspace bar covers that refinement.
+
+Earlier full-suite results below are retained from implementation revision
+`1bc447522233322647b4d52bf94bba3894c10395`. Unchanged live paths were not repeated
+for the review fixes; the additional runs above cover the inherited startup
+integration and changed disposal adapter.
+
+Suites ran serially with the URL and endpoint gates set against real Aurora
+DSQL. The resumed sequence used this common invocation, selecting one suite
+filter per command as listed in the [live runbook](../../../docs/testing/dsql-live-suites.md):
+
+```bash
+cargo nextest run -p tokeira-storage -p tokeira-runtime -p tokeira-projection \
+  --features tokeira-storage/dsql-integration,tokeira-runtime/dsql-integration,tokeira-projection/dsql-integration \
+  --locked --profile dsql-live --test-threads 1 -E "$SUITE_FILTER"
+```
+
+The seven accumulator contracts additionally used `--run-ignored only`.
+
+The first shared-cluster sequence exposed a projection pagination
+fixture that assumed exclusive use of partition 10. Its fix selects a fresh
+positive partition and fresh run keys, then removes only its own rows.
+
+| Suite | Outcome | Test duration | Shard-zero candidates / dispatch, before → after |
+|---|---|---:|---|
+| complete-repair | Passed | 1016.469 s | schema absent → 0 / 0 |
+| placement | Passed | 111.271 s | 0 / 0 → 12 / 12 |
+| runtime-acquisition | Passed | 7.064 s | 12 / 12 → 12 / 12 |
+| bulk-writes | Passed | 405.381 s | 12 / 12 → 17 / 13 |
+| workflow-dispatch | Passed | 1184.100 s | 17 / 13 → 300 / 488 |
+| complete-repair-after-dispatch | Passed | 431.755 s | 300 / 488 → 300 / 488 |
+| transaction-limits | Passed | 11.850 s | 300 / 488 → 300 / 488 |
+| shard-leasing | Passed | 22.132 s | 300 / 488 → 301 / 489 |
+| conflict-counts | Passed | 30.329 s | 301 / 489 → 301 / 489 |
+| embedded-ownership | Passed | 1.822 s | 301 / 489 → 301 / 489 |
+| lease-conflict-rules | Passed | 2.807 s | 301 / 489 → 301 / 489 |
+| repository-lease-fence | Passed | 239.477 s | 301 / 489 → 301 / 489 |
+| projection-persistence | Four passed; one failed; one not run | 25.084 s | 301 / 489 → 301 / 489 |
+
+A fresh continuation verified the corrected projection fixture, placement,
+activity inputs, acquisition, history reads and bulk writes. It was explicitly
+interrupted during dispatch verification; the test process received `SIGTERM`,
+and cleanup completed. That interrupted case is not counted as a passing check.
+
+| Suite | Outcome | Test duration | Shard-zero candidates / dispatch, before → after |
+|---|---|---:|---|
+| projection-persistence | Passed | 602.061 s | schema absent → 0 / 0 |
+| placement | Passed | 98.105 s | 0 / 0 → 14 / 14 |
+| activity-inputs | Passed | 63.708 s | 14 / 14 → 14 / 14 |
+| runtime-acquisition | Passed | 3.418 s | 14 / 14 → 14 / 14 |
+| history-event-reads | Passed | 26.485 s | 14 / 14 → 16 / 15 |
+| bulk-writes | Passed | 386.807 s | 16 / 15 → 21 / 16 |
+| workflow-dispatch | Interrupted after two tests passed | 418.338 s | 21 / 16 → 104 / 42 |
+
+The resumed shared-cluster sequence completed every selected suite, including
+projection pagination after bulk/dispatch leftovers and the seven ignored
+projection-accumulator contracts. Preparation-sensitive fixtures had already
+passed in the preceding continuation and were unchanged.
+
+| Suite | Outcome | Test duration | Shard-zero candidates / dispatch, before → after |
+|---|---|---:|---|
+| projection-persistence | Passed | 580.545 s | schema absent → 0 / 0 |
+| bulk-writes | Passed | 430.772 s | 0 / 0 → 5 / 1 |
+| workflow-dispatch | Passed | 1211.738 s | 5 / 1 → 286 / 481 |
+| complete-repair-after-dispatch | Passed | 439.285 s | 286 / 481 → 286 / 481 |
+| transaction-limits | Passed | 16.434 s | 286 / 481 → 286 / 481 |
+| shard-leasing | Passed | 22.969 s | 286 / 481 → 287 / 482 |
+| conflict-counts | Passed | 31.077 s | 287 / 482 → 287 / 482 |
+| embedded-ownership | Passed | 1.474 s | 287 / 482 → 287 / 482 |
+| lease-conflict-rules | Passed | 2.833 s | 287 / 482 → 287 / 482 |
+| repository-lease-fence | Passed | 254.006 s | 287 / 482 → 287 / 482 |
+| projection-persistence-after-dispatch | Passed | 30.254 s | 287 / 482 → 287 / 482 |
+| projection-version | Passed | 16.957 s | 287 / 482 → 287 / 482 |
+| chasm | Passed | 118.460 s | 287 / 482 → 287 / 482 |
+| task-queue-and-deployment | Passed | 8.396 s | 287 / 482 → 287 / 482 |
+| projection-accumulators | Passed | 2774.782 s | 287 / 482 → 287 / 900 |
+| iam-connector | Passed | 0.977 s | 287 / 900 → 287 / 900 |
+
+Durations are nextest test durations, excluding compilation and count probes.
+The first test on each fresh database includes the full schema bootstrap and
+ASYNC index readiness. Counts are taken between serial suites through the
+read-only SQLx probe, so the table identifies their actual shard-zero leftovers.
+
+The complete-repair contract reserves home 1023 and cleans each generated case.
+Its first 100 cases passed in 1,016.469 s including schema bootstrap. The same
+100-case contract passed after bulk writes and dispatch in both recorded
+repetitions, leaving their shard-zero counts unchanged. The original twenty-minute
+test limit is unchanged. Placement, activity-input and runtime acquisition checks
+preceded the other lease-taking suites.
+
+All six independent service-limit probes passed: 3,000 modified rows committed,
+with deletes included; 9 MiB of values committed while 10 MiB of values exceeded
+the transaction budget once overhead was included; a 1 MiB value committed and
+one extra byte was rejected; deleted bytes and `FOR UPDATE` reads were excluded
+from their respective limits. Every rejected multi-statement transaction was
+checked for absence of partial writes. The ten bulk-write tests separately
+passed paged reset, deletion, recovery and application-budget checks.
+
+All test clusters were deleted with absence confirmed. An initial attempt ran
+no suites because its local SQL client could not execute; subsequent count
+probes use the repository's SQLx integration binary. No PostgreSQL substitute
+was used. Dedicated interrupted-bootstrap, historical-schema upgrade, plain
+migration-runner and managed-engine lifecycle opt-ins were not run: they require
+separate empty or historical databases and exercise lifecycle paths unchanged
+by this cutover. Ordinary schema bootstrap and ASYNC readiness were exercised
+by the live contracts above. The endpoint-gated IAM test also passed using the
+repository's connection factory.
+
+Competing-owner acquisition-repair integration and verification remain deferred
+in Tasks 17–18 and Requirements 8.4–8.6; the landed lease fence does not complete
+those checks. Stopping every older node remains an operational precondition;
+the raw live-lease check is an additional guard, not complete enforcement.
+Internal attachment size checks now precede the committed start and retain
+buffered query payloads across lost replies. No dependency, lockfile, state-format or
+migration change is introduced. The durable upgrade-line assertion reads
+`design.md`, so changelog consumption cannot remove its subject.
+
 ## Fourth implementation PR: placement and execution-home prerequisites
 
 Base: `2a4474057aff90e46468afdc3bdde51b8f5c6065`; the PR records its final base
@@ -209,18 +496,16 @@ explicitly weaker claim; it does not prove complete repair.
 
 ### Live DSQL validation
 
-Runs use temporary Aurora DSQL clusters in `eu-west-1`, AWS profile `default`,
+Runs use temporary Aurora DSQL clusters under the authorized profile,
 without deletion protection and with `purpose=tokeira-test` and
 `task=workflow-dispatch-3`. Each runner deletes its own cluster in cleanup.
 
-The first cluster was created **2026-10-08 21:33:20 UTC**; deletion was accepted
-**2026-10-08 21:54:22 UTC** and subsequent lookup confirmed absence. The generated
+The first cluster was deleted and subsequent lookup confirmed absence. The generated
 100-case repair contract passed, including schema bootstrap. The continuation-plan
 run then exposed a nested-ordering SQL syntax error. The corrected query gives the
 outer ordering its own subquery boundary; its rerun is recorded below.
 
-The second cluster was created **2026-10-08 22:02:08 UTC**; deletion was accepted
-**2026-10-08 22:15:55 UTC**. Its bootstrap run returned DSQL schema-change conflict
+The second cluster was deleted. Its bootstrap run returned DSQL schema-change conflict
 `OC001`; the corruption contract passed on the migrated database (7.235 s).
 The real acquisition check passed (2.825 s), as did the ordered-page contract
 (15.637 s) and complete 16,384-row plan/traversal fixture (287.795 s). The two
@@ -233,8 +518,7 @@ bounded page of index-covered keys, then looks up its payloads. The live test no
 asserts complete scalar index bounds for every disjoint continuation interval;
 returned rows alone cannot satisfy the seek check.
 
-The final cluster was created **2026-10-08 22:18:54 UTC**; deletion was accepted
-**2026-10-08 22:33:32 UTC**. All four suites ran serially with the `dsql-live`
+The final cluster was deleted. All four suites ran serially with the `dsql-live`
 profile and passed:
 
 | Contract | Result |
@@ -244,7 +528,7 @@ profile and passed:
 | Ordered pages, routing, reset and speculative legacy delivery | Passed, 12.332 s |
 | First/deep continuation plans and full traversal | Passed, 293.465 s |
 
-[The final before/after plans](query-plans-reconciliation-20261008.md) record the
+[The final before/after plans](query-plans-reconciliation.md) record the
 16,384 seeded rows, 16,413 total rows, 24.9558% target-range selectivity and deep
 positions inside one priority band, including equal-time ties. Every continuation
 uses all three scalar ordering bounds as index conditions. The bounded key page
@@ -282,7 +566,7 @@ the existing scanner properties. No new tests sleep.
 
 The restart-slices negative configuration now lists only `EventuallyResolved`.
 TLC 1.7.4 reports its expected temporal violation (exit 13), and tla-rs 0.21.2 names
-`EventuallyResolved` (exit 1). Both were rerun on 2026-10-09; the other unchanged
+`EventuallyResolved` (exit 1). Both were rerun; the other unchanged
 model configurations retain the full results above.
 
 Two cutover gaps are recorded explicitly in the design and remain unchecked in
@@ -297,7 +581,7 @@ No live cluster was created for these runtime and test changes. The storage SQL,
 migrations and repository transactions are unchanged; prior real DSQL results
 remain the evidence for them.
 
-The full AGENTS.md §10.4 bar passed after these fixes on 2026-10-09: nightly
+The full AGENTS.md §10.4 bar passed after these fixes: nightly
 formatting, locked workspace lint and check, all 3,757 nextest tests (2 existing
 ignored SDK integration tests), doctests (1 passed, 21 existing ignored examples),
 and documentation with warnings denied. DSQL-feature all-target Clippy also
@@ -435,14 +719,13 @@ the requested §10.4 bar.
 
 ### Live validation and query plans
 
-Live checks use ephemeral Aurora DSQL clusters in `eu-west-1`, profile `default`,
+Live checks use ephemeral Aurora DSQL clusters under the authorized profile,
 with deletion protection disabled and tags `purpose=tokeira-test` and
 `task=workflow-dispatch-2`. The lifecycle runner deletes its cluster after success
 or failure. The migration runner owns schema-conflict retries and ASYNC index
 readiness; the fixture no longer has a separate migration retry loop.
 
-The first cluster was created at **2026-10-08 18:56:16 UTC** and deletion was
-confirmed at **2026-10-08 19:27:25 UTC**. Five of six tests passed:
+Deletion of the first cluster was confirmed. Five of six tests passed:
 
 | Live contract | Result | Duration |
 | --- | --- | ---: |
@@ -459,8 +742,7 @@ contract walks the complete other-home range and rejects only this fixture's run
 keys, preserving the exclusion check without assuming an empty shared database.
 The memory counterpart passes with the corrected assertion.
 
-The second cluster was created at **2026-10-08 19:29:50 UTC** and deletion was
-confirmed at **2026-10-08 19:49:07 UTC**. All three selected checks passed:
+Deletion of the second cluster was confirmed. All three selected checks passed:
 
 | Live contract | Result | Duration |
 | --- | --- | ---: |
@@ -490,7 +772,7 @@ and selectivity remain inputs to Task 15's tuning and read-cost work.
 The second plan fixture again added **8,192 rows**, producing **9,517 total rows**.
 Its queue range selectivity was **32 / 9,517 = 0.3362%**; the selected home had
 **448 / 9,517 = 4.7074%**. The index choices and continuation treatment were the
-same as in the first run. [Recorded plans](query-plans-20261008.md) preserve the
+same as in the first run. [Recorded plans](query-plans-discovery.md) preserve the
 complete final `EXPLAIN` output apart from fixture UUID/digest placeholders.
 
 ## First implementation PR
@@ -549,7 +831,7 @@ reconciliation, and complete end-to-end loss tests remain in their later tasks.
 
 ## Real Aurora DSQL
 
-Runs use profile `default`, Region `eu-west-1`, newly created ephemeral clusters
+Runs use the authorized profile and newly created ephemeral clusters
 with deletion protection disabled and tags `purpose=tokeira-test` and
 `task=workflow-dispatch-1`. Cleanup is installed before running tests. The suites
 use SQLx through the repository's dedicated URL gate and embedded migration
@@ -557,13 +839,13 @@ runner, await ASYNC index readiness, and run serially. The separate IAM connecto
 test exercises the production connection factory. No PostgreSQL substitute is
 used. Resource identities and credentials are omitted.
 
-| Run | Created (UTC, 2026-10-07) | Deleted (UTC) | Executed results |
-|---|---|---|---|
-| Development contracts | 21:02:49 | 21:11:04 | Ordered pages/reset/collisions passed (41.430 s); 100 atomic traces passed (322.377 s); IAM connector passed (0.473 s). |
-| Expanded final contracts | 21:13:08 | 21:26:29 | Ordered pages/routing/home/reset/collisions passed (45.742 s); 100 atomic traces with generated reset cases and both commit entry points passed (342.968 s); IAM connector passed (0.554 s). |
-| Review regressions | 22:13:48 | 22:22:09 | Eight-shard reset placement passed (38.676 s); ordered pages including speculative legacy delivery passed (11.965 s); 100 atomic traces passed (347.510 s); IAM connector passed (0.833 s). |
+| Run | Executed results |
+|---|---|
+| Development contracts | Ordered pages/reset/collisions passed (41.430 s); 100 atomic traces passed (322.377 s); IAM connector passed (0.473 s). |
+| Expanded final contracts | Ordered pages/routing/home/reset/collisions passed (45.742 s); 100 atomic traces with generated reset cases and both commit entry points passed (342.968 s); IAM connector passed (0.554 s). |
+| Review regressions | Eight-shard reset placement passed (38.676 s); ordered pages including speculative legacy delivery passed (11.965 s); 100 atomic traces passed (347.510 s); IAM connector passed (0.833 s). |
 
-The first run preceded the expanded reset/routing regressions. The second run
+All three clusters were deleted. The first run preceded the expanded reset/routing regressions. The second run
 establishes those additions; the third adds the review regressions and reruns
 the existing contracts. A temporary nextest profile extends the live
 suite timeout to 20 minutes; repository nextest configuration is unchanged.
@@ -577,7 +859,7 @@ cargo nextest run -p tokeira-storage --features dsql-integration --locked --test
 
 ## Workspace validation
 
-All AGENTS.md §10.4 commands passed on 2026-10-07:
+All AGENTS.md §10.4 commands passed:
 
 | Command | Result |
 |---|---|

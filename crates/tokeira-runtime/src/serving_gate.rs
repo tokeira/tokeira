@@ -24,9 +24,6 @@ pub(crate) async fn admit(
 ) -> Result<Option<WritePermit>> {
     let (barrier, acquisition) = {
         let owner = owner.read().expect("shard owner lock poisoned");
-        if !owner.reconciliation_enabled() {
-            return Ok(None);
-        }
         let acquisition = owner
             .acquisition(home)
             .filter(|a| owner.acquisition_active(a))
@@ -58,9 +55,6 @@ pub(crate) async fn quiesce(
 ) -> Result<Option<OwnedRwLockWriteGuard<()>>> {
     let barrier = {
         let owner = owner.read().expect("shard owner lock poisoned");
-        if !owner.reconciliation_enabled() {
-            return Ok(None);
-        }
         owner.write_barrier(acquisition.shard_id)
     };
     tokio::select! {
@@ -97,7 +91,6 @@ mod tests {
     async fn acquisition_drains_writes_and_rejects_waiting_old_generation() {
         let owner = Arc::new(RwLock::new(ShardOwner::new(8)));
         let home = ShardId(3);
-        owner.write().unwrap().enable_reconciliation();
         owner.write().unwrap().record_acquired(home, ShardEpoch(1));
         owner.write().unwrap().mark_active(home);
         let writer = admit(&owner, home).await.unwrap();
@@ -119,7 +112,6 @@ mod tests {
     async fn local_expiry_blocks_activation_and_all_admission_views() {
         let owner = Arc::new(RwLock::new(ShardOwner::new(8)));
         let home = ShardId(3);
-        owner.write().unwrap().enable_reconciliation();
         owner.write().unwrap().record_acquired(home, ShardEpoch(7));
         let acquisition = owner.read().unwrap().acquisition(home).unwrap();
         *acquisition.deadline.lock().unwrap() = Some(tokio::time::Instant::now());

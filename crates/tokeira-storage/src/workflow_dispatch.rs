@@ -353,6 +353,19 @@ mod tests {
         let table = include_str!("../migrations/V074__workflow_dispatch.sql");
         let queue = include_str!("../migrations/V075__workflow_dispatch_queue_index.sql");
         let home = include_str!("../migrations/V076__workflow_dispatch_home_index.sql");
+        // Merged migrations remain immutable across the delivery cutover.
+        assert_eq!(
+            format!("{:x}", Sha256::digest(table.as_bytes())),
+            "f699ec74ff9d3e7c2a5005c5446ac58fd22b9da163bce5c8761400fa23680ee2"
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(queue.as_bytes())),
+            "a0bb13bef60241a162bb4e3a1b1483af77c9a327ed72622f56118b5d4d2b21e4"
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(home.as_bytes())),
+            "13c934645e7180598b4ba98111aac5ff67099b441cfa41daccdf5a471c9b2158"
+        );
         assert!(table.contains("run_key UUID PRIMARY KEY"));
         assert!(!table.contains("CHECK"));
         assert!(queue.contains("CREATE INDEX ASYNC"));

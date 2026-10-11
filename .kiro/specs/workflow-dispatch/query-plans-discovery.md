@@ -1,4 +1,4 @@
-# Workflow dispatch query plans — 2026-10-08
+# Workflow dispatch query plans
 
 Captured by `workflow_dispatch_live_query_plans` on the second ephemeral Aurora
 DSQL cluster. These are `EXPLAIN` plans for the repository query builders, with
@@ -6,8 +6,7 @@ fixture UUIDs and digest values replaced by placeholders. Costs, row estimates,
 predicates and index names are unchanged. The query-plan test does not use
 `ANALYZE`; these plans do not measure rows read or elapsed query time.
 
-See [implementation evidence](implementation-evidence.md) for lifecycle times,
-validation outcomes and the deferred Task 15 work.
+See [implementation evidence](implementation-evidence.md) for validation outcomes and the deferred Task 15 work.
 
 ```text
 Seeded rows: 8192; table rows after seeding: 9517.

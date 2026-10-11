@@ -17,6 +17,11 @@ use tokeira_types::{BundleId, IncarnationId, ShardEpoch};
 /// stable contract even if the internal implementation changes.
 #[derive(Debug, Error)]
 pub enum EdgeError {
+    /// Preserve the execution owner's protocol status, including authentication
+    /// and cancellation, through the poll adapter without reclassifying it.
+    #[error("{0}")]
+    ForwardedStatus(Box<tonic::Status>),
+
     #[error("bad request: {0}")]
     BadRequest(String),
 
@@ -235,6 +240,16 @@ impl EdgeError {
             EdgeError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             EdgeError::NotShardOwner { .. } => StatusCode::CONFLICT,
             EdgeError::FailedPrecondition(_) => StatusCode::PRECONDITION_FAILED,
+            EdgeError::ForwardedStatus(status) => match status.code() {
+                tonic::Code::Unauthenticated => StatusCode::UNAUTHORIZED,
+                tonic::Code::PermissionDenied => StatusCode::FORBIDDEN,
+                tonic::Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
+                tonic::Code::Cancelled | tonic::Code::DeadlineExceeded => {
+                    StatusCode::REQUEST_TIMEOUT
+                }
+                tonic::Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            },
             EdgeError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -274,6 +289,7 @@ impl EdgeError {
             EdgeError::ServiceUnavailable(_) => "service_unavailable",
             EdgeError::NotShardOwner { .. } => "not_shard_owner",
             EdgeError::FailedPrecondition(_) => "failed_precondition",
+            EdgeError::ForwardedStatus(_) => "forwarded_status",
             EdgeError::Internal(_) => "internal",
         }
     }
@@ -281,6 +297,12 @@ impl EdgeError {
 
 impl From<anyhow::Error> for EdgeError {
     fn from(value: anyhow::Error) -> Self {
+        if let Some(status) = value.downcast_ref::<tonic::Status>() {
+            return Self::ForwardedStatus(Box::new(status.clone()));
+        }
+        if let Some(error) = value.downcast_ref::<tokeira_runtime::RetryableWorkflowTaskStart>() {
+            return Self::ServiceUnavailable(error.to_string());
+        }
         // A failed activity-token revalidation surfaces as v1.31.0's
         // `ErrActivityTaskNotFound`: code NotFound with this exact message,
         // asserted verbatim by clients (`service/history/consts/const.go:44-45
@@ -453,15 +475,18 @@ impl From<anyhow::Error> for EdgeError {
         // A workflow-task mutation whose token no longer matches the run's
         // current task — the task was completed, timed out, or superseded — is
         // v1.31.0's `ErrWorkflowTaskNotFound`: NOT_FOUND "Workflow task not
-        // found." (consts/const.go @ v1.31.0). Asserted verbatim by the
-        // speculative start-to-close timeout leaf, whose late completion races
-        // the in-memory timeout (`TestSpeculativeWorkflowTask_StartToCloseTimeout`).
+        // found." (consts/const.go @ v1.31.0). A missing pending task has the
+        // same response (service/history/api/respondworkflowtaskcompleted/api.go
+        // @ v1.31.0). The speculative start-to-close timeout leaf asserts this
+        // verbatim when its late completion races the in-memory timeout
+        // (`TestSpeculativeWorkflowTask_StartToCloseTimeout`).
         if value
             .downcast_ref::<tokeira_runtime::KernelRejected>()
             .is_some_and(|rejected| {
                 matches!(
                     rejected.0,
-                    tokeira_kernel::Reject::WorkflowTaskSeqMismatch { .. }
+                    tokeira_kernel::Reject::NoPendingWorkflowTask
+                        | tokeira_kernel::Reject::WorkflowTaskSeqMismatch { .. }
                         | tokeira_kernel::Reject::WorkflowTaskTokenMismatch
                         | tokeira_kernel::Reject::WorkflowTaskNotStarted { .. }
                 )

@@ -36,6 +36,9 @@ pub const MAX_ROWS_PER_TRANSACTION: usize = 1_000;
 /// so a delete costs rows only.
 pub const MAX_BYTES_PER_TRANSACTION: usize = 4 * 1024 * 1024;
 
+/// Source keys examined by a relocation or legacy-disposal write page.
+pub const MAX_MAINTENANCE_KEYS: usize = 64;
+
 /// Encoded events, and separately encoded principals, that one history batch of
 /// a reset's copied history may hold, unless it holds a single event: half of
 /// DSQL's value limit.

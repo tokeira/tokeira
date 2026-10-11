@@ -4,15 +4,14 @@
 //! delivery and timeout state that lives only in memory — republished workflow
 //! and activity tasks, due timers, and the workflow/WFT/activity/Nexus timeout
 //! tracking sets — from the durable transition log, which is the sole authority.
-//! `sweep_shard` performs that rebuild; [`run_lease_renewer`] keeps the shard's
+//! `sweep_shard_inner` performs that rebuild; [`run_lease_renewer`] keeps the shard's
 //! durable lease alive for as long as this node owns it.
 //!
 //! Crash-safety and idempotency. Recovery reconstructs volatile indexes from
-//! authoritative state. With dispatch reconciliation enabled, one-run repair
-//! transactions also replace derived rows; both walks finish behind the local
-//! writer barrier before activation. Due timer firing and activity preparation
-//! then belong to Active-only scanners. Legacy construction retains its sweep
-//! effects until the coordinated cutover. Duplicate delivery remains harmless
+//! authoritative state. One-run repair transactions replace derived rows; both
+//! walks finish behind the local writer barrier before activation. Due timer
+//! firing and activity preparation then belong to Active-only scanners.
+//! Duplicate delivery remains harmless
 //! because the start transition checks the task incarnation.
 //!
 //! Ordering. The sweep must complete before the shard is marked `Active` and
@@ -31,10 +30,10 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
+#[cfg(test)]
 use time::OffsetDateTime;
 use tokeira_storage::{
-    DueActivityDispatch, DueTimer, LeaseOutcome, LeaseRepository, RecoveryCursor, RunRepository,
-    recovery_entries,
+    LeaseOutcome, LeaseRepository, RecoveryCursor, RunRepository, recovery_entries,
 };
 use tokeira_types::{ShardEpoch, ShardId};
 use tokio::sync::oneshot;
@@ -43,16 +42,22 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     activity_timeout::{ActivityTrackingEntry, ActivityTrackingState},
     broker::InMemoryBroker,
-    lane::LaneHandle,
     nexus::{
         CompletionCallbackTrackingEntry, CompletionCallbackTrackingState, NexusTimeoutEntry,
         NexusTimeoutTrackingState,
     },
-    runtime::{ActivityRetryDeps, reconcile_activity_dispatch_candidates},
-    scanner::{command_for_due_timer, pick_lane_for_run_key, settle_failed_due_timer},
     timeout::{WorkflowTimeoutEntry, WorkflowTimeoutTrackingState},
     wft_timeout::{WftTimeoutEntry, WftTimeoutKind, WftTimeoutTrackingState},
 };
+
+#[cfg(test)]
+use crate::{
+    lane::LaneHandle,
+    runtime::{ActivityRetryDeps, activity::reconcile_activity_dispatch_candidates},
+    scanner::{command_for_due_timer, pick_lane_for_run_key, settle_failed_due_timer},
+};
+#[cfg(test)]
+use tokeira_storage::{DueActivityDispatch, DueTimer};
 
 /// Observability summary produced by a shard sweep.
 ///
@@ -78,25 +83,17 @@ const RECOVERY_PAGE: usize = 100;
 
 /// Rows the sweep reads per page of due timers. A timer row is a few dozen
 /// bytes.
+#[cfg(test)]
 const DUE_TIMER_PAGE: usize = 500;
 
 /// Rows the sweep reads per page of due activity dispatches.
+#[cfg(test)]
 const DUE_ACTIVITY_DISPATCH_PAGE: usize = 100;
 
-/// Reconstruct volatile delivery and timeout state for a newly-owned shard.
-///
-/// Reads the durable transition log for `shard_id` and rebuilds the in-memory
-/// derived state the runtime needs to dispatch: republishes dispatchable workflow
-/// and activity tasks to the brokers, injects timers that are already due, and
-/// repopulates the workflow/WFT/activity/Nexus timeout tracking sets. Returns a
-/// [`SweepResult`] tallying the work.
-///
-/// Legacy sweep entry point retained for tests of existing construction. Its
-/// derived publications are repeatable; due timer and activity preparation may
-/// submit authoritative transitions. Enabled reconciliation uses the two-walk
-/// entry point below and defers those effects until activation.
+/// Test lifecycle driver: reconstruct while non-serving, activate, then give
+/// the ordinary activity and timer processing paths their first opportunity.
 #[cfg(test)]
-pub(crate) async fn sweep_shard<R, S>(
+async fn recover_fixture<R, S>(
     shard_id: ShardId,
     repo: &R,
     broker: &InMemoryBroker,
@@ -113,21 +110,44 @@ where
     R: RunRepository + ?Sized,
     S: RunRepository + 'static,
 {
-    sweep_shard_inner(
+    let owner = retry_deps.shard_owner.clone();
+    let acquisition = {
+        let mut owner = owner.write().unwrap();
+        let epoch = owner.epoch_of(shard_id).unwrap_or(ShardEpoch::ZERO);
+        owner.record_acquired(shard_id, epoch);
+        owner.acquisition(shard_id).unwrap()
+    };
+    let repair = RepairAcquisition {
+        owner: owner.clone(),
+        acquisition: acquisition.clone(),
+        max_retries: 3,
+    };
+    let mut result = sweep_shard_inner(
         shard_id,
         repo,
         broker,
-        lanes,
-        lane_count,
         workflow_timeout_tracking,
         wft_timeout_tracking,
         activity_tracking,
         nexus_timeout_tracking,
         completion_callback_tracking,
-        retry_deps,
-        None,
+        &repair,
     )
-    .await
+    .await?;
+    assert!(owner.write().unwrap().activate_acquisition(&acquisition));
+    let now = OffsetDateTime::now_utc();
+    result.activity_tasks_republished = republish_due_activity_dispatches(
+        shard_id,
+        repo,
+        retry_deps,
+        now,
+        DUE_ACTIVITY_DISPATCH_PAGE,
+    )
+    .await?;
+    let timers = fire_due_timers(shard_id, repo, lanes, lane_count, now, DUE_TIMER_PAGE).await?;
+    result.due_timers_injected = timers.submitted;
+    result.stale_timer_rows_deleted = timers.deleted;
+    Ok(result)
 }
 
 /// Local acquisition identity carried through every repair attempt and page.
@@ -164,50 +184,42 @@ impl RepairAcquisition {
                     result.with_context(|| format!("repair workflow dispatch for {run_key:?}"))?
                 }
             }
+            metrics::counter!(crate::metrics::WORKFLOW_DISPATCH_REPAIRS_TOTAL).increment(1);
             return self.validate();
         }
         unreachable!("last repair attempt returns")
     }
 }
 
-pub(crate) async fn sweep_shard_inner<R, S>(
+pub(crate) async fn sweep_shard_inner<R>(
     shard_id: ShardId,
     repo: &R,
     broker: &InMemoryBroker,
-    lanes: &[LaneHandle],
-    lane_count: usize,
     workflow_timeout_tracking: &WorkflowTimeoutTrackingState,
     wft_timeout_tracking: &WftTimeoutTrackingState,
     activity_tracking: &ActivityTrackingState,
     nexus_timeout_tracking: &NexusTimeoutTrackingState,
     completion_callback_tracking: &CompletionCallbackTrackingState,
-    retry_deps: &ActivityRetryDeps<S>,
-    repair: Option<&RepairAcquisition>,
+    repair: &RepairAcquisition,
 ) -> Result<SweepResult>
 where
     R: RunRepository + ?Sized,
-    S: RunRepository + 'static,
 {
     let mut result = SweepResult::default();
-    let now = OffsetDateTime::now_utc();
 
     // Every run whose stored state holds work to rebuild, a page at a time:
-    // its scheduled workflow task is republished, and its timeouts and
+    // its speculative task is republished, and its normal intent, timeouts and
     // callbacks are tracked again, all from one decode of its state
     // (recovery-index Requirement 4). Runs with nothing to rebuild are never
     // read.
     let mut cursor: Option<RecoveryCursor> = None;
     loop {
-        if let Some(repair) = repair {
-            repair.validate()?;
-        }
+        repair.validate()?;
         let page = repo
             .list_recovery_candidates_for_shard(shard_id, cursor.as_ref(), RECOVERY_PAGE)
             .await?;
         for state in &page.states {
-            if let Some(repair) = repair {
-                repair.repair(repo, state.run_key).await?;
-            }
+            repair.repair(repo, state.run_key).await?;
             let entries = recovery_entries(state);
             if let Some(task) = entries.dispatchable_workflow_task {
                 // Recovery republishes the same derived envelope as the hot
@@ -218,10 +230,8 @@ where
                     pending.task_type == tokeira_kernel::WorkflowTaskType::Speculative
                 }) {
                     broker.publish_speculative_workflow_task(task, None).await;
-                } else {
-                    broker.publish_workflow_task(task, None).await;
+                    result.workflow_tasks_republished += 1;
                 }
-                result.workflow_tasks_republished += 1;
             }
             if let Some(entry) = entries.workflow_timeout {
                 workflow_timeout_tracking.insert(WorkflowTimeoutEntry {
@@ -314,7 +324,7 @@ where
         }
     }
 
-    if let Some(repair) = repair {
+    {
         // Recovery flags establish missing wanted rows. The complete home index
         // supplies the complementary walk: closed/excluded runs and orphans can
         // still own stale rows, including sticky rows outside the queue index.
@@ -335,33 +345,7 @@ where
             }
         }
         repair.validate()?;
-        // Active-only scanners already own timer firing and activity preparation.
-        // They resume at the first processing opportunity after activation. The
-        // legacy sweep below remains unchanged while discovery is disabled.
-        return Ok(result);
     }
-
-    // Only rows due at the sweep's `now` republish — a retry inside its
-    // backoff window stays durable and is picked up by the scanner's
-    // continuous reconciliation once due (v1.31.0 dispatches retries when
-    // their durable retry timer fires, never early). Each due row passes the
-    // same authoritative preparation/rule/routing gate as every other
-    // publication path (via `retry_deps`: the runtime's activity broker,
-    // deployment registry, and tracking), and permanently stale rows are
-    // conditionally pruned while transient failures stay retriable.
-    result.activity_tasks_republished += republish_due_activity_dispatches(
-        shard_id,
-        repo,
-        retry_deps,
-        now,
-        DUE_ACTIVITY_DISPATCH_PAGE,
-    )
-    .await?;
-
-    let timers = fire_due_timers(shard_id, repo, lanes, lane_count, now, DUE_TIMER_PAGE).await?;
-    result.due_timers_injected += timers.submitted;
-    result.stale_timer_rows_deleted += timers.deleted;
-
     Ok(result)
 }
 
@@ -370,6 +354,7 @@ where
 ///
 /// The cursor advances past every row it reads, so the pass ends even though
 /// reconciliation prunes rows and leaves others for a later pass.
+#[cfg(test)]
 async fn republish_due_activity_dispatches<R, S>(
     shard_id: ShardId,
     repo: &R,
@@ -403,6 +388,7 @@ where
 }
 
 /// What firing a shard's due timers did.
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct DueTimerPass {
     /// Timers handed to their run's lane and committed.
@@ -420,6 +406,7 @@ struct DueTimerPass {
 /// left for the scanner, so one stale or failing row never aborts the sweep
 /// (the kernel rejects a stale `TimerDue` as a harmless no-op). The cursor
 /// advances past every row it reads, so the pass ends even when rows stay.
+#[cfg(test)]
 async fn fire_due_timers<R>(
     shard_id: ShardId,
     repo: &R,
@@ -631,10 +618,11 @@ mod tests {
     fn sweep_retry_deps(
         store: &InMemoryStore,
         activity_broker: &InMemoryActivityBroker,
+        shard_count: u32,
     ) -> ActivityRetryDeps<InMemoryStore> {
         ActivityRetryDeps {
             repo: Arc::new(store.clone()),
-            shard_owner: Arc::new(RwLock::new(ShardOwner::new(4))),
+            shard_owner: Arc::new(RwLock::new(ShardOwner::new(shard_count))),
             controller_managed_placement: false,
             max_occ_retries: 3,
             broker: activity_broker.clone(),
@@ -820,7 +808,7 @@ mod tests {
         let broker = InMemoryBroker::default();
         let activity_broker = InMemoryActivityBroker::default();
         let (lanes, lane_count) = make_lanes(&store);
-        let result = sweep_shard(
+        let result = recover_fixture(
             ShardId(0),
             &store,
             &broker,
@@ -831,7 +819,7 @@ mod tests {
             &ActivityTrackingState::default(),
             &NexusTimeoutTrackingState::default(),
             &CompletionCallbackTrackingState::default(),
-            &sweep_retry_deps(&store, &activity_broker),
+            &sweep_retry_deps(&store, &activity_broker, 1),
         )
         .await
         .unwrap();
@@ -905,7 +893,7 @@ mod tests {
         let ats = ActivityTrackingState::default();
         let nts = NexusTimeoutTrackingState::default();
 
-        let result = sweep_shard(
+        let result = recover_fixture(
             shard_id,
             &store,
             &broker,
@@ -916,7 +904,7 @@ mod tests {
             &ats,
             &nts,
             &CompletionCallbackTrackingState::default(),
-            &sweep_retry_deps(&store, &activity_broker),
+            &sweep_retry_deps(&store, &activity_broker, shard_count),
         )
         .await
         .unwrap();
@@ -990,7 +978,7 @@ mod tests {
                 let nts =
                     NexusTimeoutTrackingState::default();
 
-                let result = sweep_shard(
+                let result = recover_fixture(
                     shard_id,
                     &store,
                     &broker,
@@ -1001,36 +989,13 @@ mod tests {
                     &ats,
                     &nts,
                     &CompletionCallbackTrackingState::default(),
-                    &sweep_retry_deps(&store, &activity_broker),
+                    &sweep_retry_deps(&store, &activity_broker, shard_count),
                 )
                 .await
                 .unwrap();
 
-                prop_assert_eq!(
-                    result.workflow_tasks_republished,
-                    expected_runs.len(),
-                );
-
-                let queue = QueueKey {
-                    namespace_id: ns,
-                    task_queue: TaskQueueName("q".into()),
-                    task_kind: TaskKind::Workflow,
-                    deployment: None,
-                    build_id: None,
-                };
-                let worker =
-                    WorkerIdentity("w".into());
-                let mut polled = Vec::new();
-                while let Some(polled_task) = broker
-                    .poll_workflow_task(&queue, &worker, std::time::Duration::from_millis(1))
-                    .await
-                    .unwrap()
-                {
-                    let Some((task, _)) = polled_task.into_queued() else {
-                        continue;
-                    };
-                    polled.push(task.run_key)
-                }
+                prop_assert_eq!(result.workflow_tasks_republished, 0);
+                let mut polled = store.list_workflow_dispatch_for_home(shard_id, None, std::num::NonZeroU32::new(64).unwrap()).await.unwrap();
                 polled.sort_by_key(|rk| rk.0);
                 let mut expected_sorted =
                     expected_runs.clone();
@@ -1165,7 +1130,7 @@ mod tests {
                 let nts =
                     NexusTimeoutTrackingState::default();
 
-                let result = sweep_shard(
+                let result = recover_fixture(
                     shard_id,
                     &store,
                     &broker,
@@ -1176,7 +1141,7 @@ mod tests {
                     &ats,
                     &nts,
                     &CompletionCallbackTrackingState::default(),
-                    &sweep_retry_deps(&store, &activity_broker),
+                    &sweep_retry_deps(&store, &activity_broker, shard_count),
                 )
                 .await
                 .unwrap();
@@ -1325,7 +1290,7 @@ mod tests {
                     let workflow_broker = InMemoryBroker::default();
                     let activity_broker = InMemoryActivityBroker::default();
                     let (lanes, lane_count) = make_lanes(&store);
-                    sweep_shard(
+                    recover_fixture(
                         shard_id,
                         &store,
                         &workflow_broker,
@@ -1336,26 +1301,15 @@ mod tests {
                         &ActivityTrackingState::default(),
                         &NexusTimeoutTrackingState::default(),
                         &CompletionCallbackTrackingState::default(),
-                        &sweep_retry_deps(&store, &activity_broker),
+                        &sweep_retry_deps(&store, &activity_broker, 1),
                     )
                     .await
                     .unwrap();
-                    let workflow = workflow_broker
-                        .poll_workflow_task(
-                            &QueueKey {
-                                namespace_id,
-                                task_queue: TaskQueueName("q".into()),
-                                task_kind: TaskKind::Workflow,
-                                deployment: None,
-                                build_id: None,
-                            },
-                            &WorkerIdentity("worker".into()),
-                            std::time::Duration::ZERO,
-                        )
-                        .await
-                        .unwrap()
-                        .and_then(|result| result.into_queued().map(|queued| queued.0))
-                        .expect("recovered workflow task");
+                    let page = store.list_workflow_dispatch_page(&tokeira_storage::WorkflowDiscoveryRange {
+                        namespace_id, queue_name: TaskQueueName("q".into()), routing: tokeira_storage::WorkflowDispatchRouting::Live,
+                    }, None, std::num::NonZeroU32::new(64).unwrap()).await.unwrap();
+                    let source = crate::discovery::WorkflowSource { repo: Arc::new(store.clone()), registry: Arc::new(RwLock::new(None)) };
+                    let workflow = source.resolve(&page.candidates[0]).await.unwrap().unwrap();
                     let activity = activity_broker
                         .poll_activity_task(
                             &QueueKey {
@@ -1458,7 +1412,7 @@ mod tests {
                 let nts =
                     NexusTimeoutTrackingState::default();
 
-                let result = sweep_shard(
+                let result = recover_fixture(
                     shard_id,
                     &store,
                     &broker,
@@ -1469,7 +1423,7 @@ mod tests {
                     &ats,
                     &nts,
                     &CompletionCallbackTrackingState::default(),
-                    &sweep_retry_deps(&store, &activity_broker),
+                    &sweep_retry_deps(&store, &activity_broker, shard_count),
                 )
                 .await
                 .unwrap();
@@ -1491,7 +1445,7 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(100))]
 
         #[test]
-        fn cold_recovery_republishes_sticky_work_on_normal_queue(
+        fn cold_recovery_retains_overdue_sticky_intent_until_timeout(
             _seed in 0u32..100,
         ) {
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1547,7 +1501,7 @@ mod tests {
                 let nts =
                     NexusTimeoutTrackingState::default();
 
-                let result = sweep_shard(
+                let result = recover_fixture(
                     shard_id,
                     &store,
                     &broker,
@@ -1558,48 +1512,17 @@ mod tests {
                     &ats,
                     &nts,
                     &CompletionCallbackTrackingState::default(),
-                    &sweep_retry_deps(&store, &activity_broker),
+                    &sweep_retry_deps(&store, &activity_broker, shard_count),
                 )
                 .await
                 .unwrap();
 
-                // The task was republished (1 workflow task
-                // in the shard).
-                prop_assert_eq!(
-                    result.workflow_tasks_republished,
-                    1,
-                );
-
-                // A new broker has no recent/active sticky poller, so
-                // publication atomically selects the normal fallback.
-                let queue = QueueKey {
-                    namespace_id: ns,
-                    task_queue: TaskQueueName("q".into()),
-                    task_kind: TaskKind::Workflow,
-                    deployment: None,
-                    build_id: None,
-                };
-                let worker =
-                    WorkerIdentity("any-worker".into());
-                let polled = broker
-                    .poll_workflow_task(
-                        &queue,
-                        &worker,
-                        std::time::Duration::from_millis(
-                            10,
-                        ),
-                    )
-                    .await
-                    .unwrap();
-                prop_assert!(polled.is_some());
-                let (task, _) = polled
-                    .unwrap()
-                    .into_queued()
-                    .expect("queued workflow task");
-                prop_assert_eq!(
-                    task.sticky_preferred,
-                    None,
-                );
+                prop_assert_eq!(result.workflow_tasks_republished, 0);
+                let entries = wfts.snapshot();
+                prop_assert_eq!(entries.len(), 1);
+                prop_assert_eq!(entries[0].started_at, far_past);
+                prop_assert_eq!(entries[0].kind, WftTimeoutKind::ScheduleToStart);
+                prop_assert_eq!(store.list_workflow_dispatch_for_home(shard_id, None, std::num::NonZeroU32::new(64).unwrap()).await.unwrap(), vec![run_key]);
                 let LoadedRun::Existing(stored) = store.load_run(run_key).await.unwrap() else {
                     unreachable!("committed run exists");
                 };
@@ -1709,7 +1632,7 @@ mod tests {
                 let nts =
                     NexusTimeoutTrackingState::default();
 
-                let _ = sweep_shard(
+                let _ = recover_fixture(
                     shard_id,
                     &store,
                     &broker,
@@ -1720,7 +1643,7 @@ mod tests {
                     &ats,
                     &nts,
                     &CompletionCallbackTrackingState::default(),
-                    &sweep_retry_deps(&store, &activity_broker),
+                    &sweep_retry_deps(&store, &activity_broker, shard_count),
                 )
                 .await
                 .unwrap();
@@ -1828,8 +1751,8 @@ mod tests {
         let broker = InMemoryBroker::default();
         let activity_broker = InMemoryActivityBroker::default();
         let (lanes, lane_count) = make_lanes(&store);
-        let deps = sweep_retry_deps(&store, &activity_broker);
-        sweep_shard(
+        let deps = sweep_retry_deps(&store, &activity_broker, 1);
+        recover_fixture(
             shard_id,
             &store,
             &broker,
@@ -1919,7 +1842,7 @@ mod tests {
         let activity_broker = InMemoryActivityBroker::default();
         let (lanes, lane_count) = make_lanes(&store);
         let ats = ActivityTrackingState::default();
-        let _ = sweep_shard(
+        let _ = recover_fixture(
             shard_id,
             &store,
             &broker,
@@ -1930,7 +1853,7 @@ mod tests {
             &ats,
             &NexusTimeoutTrackingState::default(),
             &CompletionCallbackTrackingState::default(),
-            &sweep_retry_deps(&store, &activity_broker),
+            &sweep_retry_deps(&store, &activity_broker, 1),
         )
         .await
         .unwrap();
@@ -1997,7 +1920,7 @@ mod tests {
                 let nts =
                     NexusTimeoutTrackingState::default();
 
-                let _ = sweep_shard(
+                let _ = recover_fixture(
                     shard_id,
                     &store,
                     &broker,
@@ -2008,7 +1931,7 @@ mod tests {
                     &ats,
                     &nts,
                     &CompletionCallbackTrackingState::default(),
-                    &sweep_retry_deps(&store, &activity_broker),
+                    &sweep_retry_deps(&store, &activity_broker, shard_count),
                 )
                 .await
                 .unwrap();
@@ -2117,7 +2040,7 @@ mod tests {
                 let nts =
                     NexusTimeoutTrackingState::default();
 
-                let _ = sweep_shard(
+                let _ = recover_fixture(
                     shard_id,
                     &store,
                     &broker,
@@ -2128,7 +2051,7 @@ mod tests {
                     &ats,
                     &nts,
                     &CompletionCallbackTrackingState::default(),
-                    &sweep_retry_deps(&store, &activity_broker),
+                    &sweep_retry_deps(&store, &activity_broker, shard_count),
                 )
                 .await
                 .unwrap();
@@ -2433,7 +2356,7 @@ mod tests {
         let broker = InMemoryBroker::default();
         let activity_broker = InMemoryActivityBroker::default();
         let (lanes, lane_count) = make_lanes(&store);
-        let result = sweep_shard(
+        let result = recover_fixture(
             ShardId(0),
             &store,
             &broker,
@@ -2444,7 +2367,7 @@ mod tests {
             &ActivityTrackingState::default(),
             &NexusTimeoutTrackingState::default(),
             &CompletionCallbackTrackingState::default(),
-            &sweep_retry_deps(&store, &activity_broker),
+            &sweep_retry_deps(&store, &activity_broker, 1),
         )
         .await
         .unwrap();
@@ -2501,7 +2424,7 @@ mod tests {
         let published = republish_due_activity_dispatches(
             ShardId(0),
             &store,
-            &sweep_retry_deps(&store, &activity_broker),
+            &sweep_retry_deps(&store, &activity_broker, 1),
             fixed_now(),
             2,
         )

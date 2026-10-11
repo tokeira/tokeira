@@ -78,6 +78,7 @@ impl Probe {
     /// Run `steps` in one transaction, and say whether DSQL committed it or
     /// refused it as over a limit.
     async fn transaction(&self, steps: &[Step<'_>]) -> Result<Outcome> {
+        let before = self.rows().await?;
         let mut attempt = 1;
         loop {
             let error = match self.attempt(steps).await {
@@ -93,11 +94,26 @@ impl Probe {
                     _ => None,
                 });
             match sqlstate.as_deref() {
-                Some(LIMIT_EXCEEDED) => return Ok(Outcome::Refused),
+                Some(LIMIT_EXCEEDED) => {
+                    ensure!(
+                        self.rows().await? == before,
+                        "refused multi-statement transaction left partial writes"
+                    );
+                    return Ok(Outcome::Refused);
+                }
                 Some(SERIALIZATION_FAILURE) if attempt < ATTEMPTS => attempt += 1,
                 _ => return Err(error),
             }
         }
+    }
+
+    async fn rows(&self) -> Result<Vec<(i32, Vec<u8>)>> {
+        Ok(
+            sqlx::query_as("SELECT seq, data FROM dsql_limits_probe WHERE batch=$1 ORDER BY seq")
+                .bind(self.batch)
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 
     async fn attempt(&self, steps: &[Step<'_>]) -> Result<()> {
@@ -212,7 +228,20 @@ async fn dsql_three_thousand_rows_commit_and_one_more_is_refused() -> Result<()>
         batch: Uuid::new_v4(),
         ..probe
     };
-    assert_eq!(more.insert(0, &rows).await?, Outcome::Refused);
+    assert_eq!(
+        more.transaction(&[
+            Step::Insert {
+                first: 0,
+                values: &rows[..1]
+            },
+            Step::Insert {
+                first: 1,
+                values: &rows[1..]
+            },
+        ])
+        .await?,
+        Outcome::Refused
+    );
     Ok(())
 }
 
@@ -224,7 +253,20 @@ async fn dsql_deleted_rows_count_toward_the_rows() -> Result<()> {
     let (first, second) = rows.split_at(rows.len() / 2);
     assert_eq!(probe.insert(0, first).await?, Outcome::Committed);
     assert_eq!(probe.insert(first.len(), second).await?, Outcome::Committed);
-    assert_eq!(probe.delete_below(rows.len()).await?, Outcome::Refused);
+    assert_eq!(
+        probe
+            .transaction(&[
+                Step::Insert {
+                    first: 10_000,
+                    values: &values(1, 16)
+                },
+                Step::Delete {
+                    below: i32::try_from(rows.len())?
+                },
+            ])
+            .await?,
+        Outcome::Refused
+    );
     assert_eq!(
         probe.delete_below(DSQL_MAX_ROWS_PER_TRANSACTION).await?,
         Outcome::Committed
@@ -284,7 +326,16 @@ async fn dsql_a_value_over_one_mib_is_refused() -> Result<()> {
     );
     assert_eq!(
         probe
-            .insert(1, &values(1, DSQL_MAX_VALUE_BYTES + 1))
+            .transaction(&[
+                Step::Insert {
+                    first: 1,
+                    values: &values(1, 16)
+                },
+                Step::Insert {
+                    first: 2,
+                    values: &values(1, DSQL_MAX_VALUE_BYTES + 1)
+                },
+            ])
             .await?,
         Outcome::Refused
     );

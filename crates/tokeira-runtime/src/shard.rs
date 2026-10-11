@@ -79,7 +79,6 @@ pub struct ShardOwner {
     shards: HashMap<ShardId, OwnedShard>,
     shard_count: u32,
     next_generation: u64,
-    reconciliation: bool,
     write_barriers: HashMap<ShardId, Arc<tokio::sync::RwLock<()>>>,
     /// The lease owner this node's writes are fenced with, under
     /// controller-managed placement (`bundle-lease-fence`).
@@ -109,24 +108,12 @@ impl ShardAcquisition {
 }
 
 impl ShardOwner {
-    pub(crate) fn enable_reconciliation(&mut self) {
-        self.reconciliation = true;
-    }
-    pub(crate) fn reconciliation_enabled(&self) -> bool {
-        self.reconciliation
-    }
-
     /// Fence this node's writes with its leases, which name it as
     /// `owner_identity`: for controller-managed placement
     /// (`bundle-lease-fence`). A node that assigns itself every home writes
     /// unfenced.
     pub(crate) fn fence_writes(&mut self, owner_identity: String) {
         self.lease_owner = Some(owner_identity);
-    }
-
-    /// Whether this node's writes are fenced with its leases.
-    pub(crate) fn fences_writes(&self) -> bool {
-        self.lease_owner.is_some()
     }
 
     /// The fence of a write at `home` under the acquisition at `epoch`: the
@@ -180,7 +167,6 @@ impl ShardOwner {
             shards: HashMap::new(),
             shard_count,
             next_generation: 0,
-            reconciliation: false,
             write_barriers: HashMap::new(),
             lease_owner: None,
         }
@@ -442,7 +428,7 @@ mod tests {
         assert_eq!(owner.write_fence(ShardId(2)), Some(WriteFence::Unfenced));
 
         owner.fence_writes("node-a".to_owned());
-        assert!(owner.fences_writes());
+        assert!(owner.lease_owner.is_some());
         assert_eq!(
             owner.write_fence(ShardId(1)),
             Some(WriteFence::Lease(ExecutionHomeFence {

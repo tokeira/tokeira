@@ -44,24 +44,21 @@ allocation, SQL layout, and scan scheduling are Tokeira mechanisms.
 | Lease fencing | Supply the transaction-local ownership contract below before enabling repair under competing execution-home owners. |
 | Subsequent activity-discovery spec | Reuse range/page/scheduler contracts; move activity discovery and retire activity backlog there. No dependency in the reverse direction. |
 
-The lease prerequisite is substantive. Current
-[commit.rs](../../../crates/tokeira-storage/src/dsql/run_repository/commit.rs)
-has a plain epoch read and a controller-mode separate check. Those do not establish
-the conflict relationship in
-[30_bundle_lease.tla](../../../spec/tla/30_bundle_lease.tla). Its passing protocol
-requires a transaction-local `FOR KEY SHARE` read of owner/epoch, epoch membership
-in a unique non-partial non-expression index, takeover/release that changes that
-key, compatible renewal, and local expiry self-fencing. A separate successful
-precheck cannot substitute for this contract.
+The lease prerequisite has landed in
+[commit.rs](../../../crates/tokeira-storage/src/dsql/run_repository/commit.rs),
+delete and materialization paths. Its transaction-local `FOR KEY SHARE` read of
+owner/epoch, unique non-partial non-expression epoch index, takeover/release key
+change, compatible renewal and local expiry self-fencing implement the conflict
+relationship in [30_bundle_lease.tla](../../../spec/tla/30_bundle_lease.tla).
+A separate successful precheck cannot substitute for this contract.
 
-The complete competing-owner design consumes that fence for run commits,
-deletion, materialization, and repair; it does not redesign lease acquisition or
-renewal. The initial implementation is explicitly single-owner: reconciliation
-and backlog retirement can proceed with cancellation, failure handling, and the
-non-serving gate intact. The lease protocol must land and pass its concurrency
-tests before competing-owner repair is enabled. Requirements 8.4–8.6 and Property
-9 remain deferred; single-owner results cannot discharge them. Verified SQLx
-affected-row behavior is independent of this ownership dependency.
+Acquisition repair does not yet consume that fence. The cutover remains explicitly
+single-owner for reconciliation: cancellation, failure handling and the non-serving
+gate do not establish safety under competing durable owners. Tasks 17–18 integrate
+the landed protocol into repair and verify its competing-owner behavior without
+redesigning lease acquisition or renewal. Requirements 8.4–8.6 and Property 9 remain
+deferred; single-owner results cannot discharge them. Verified SQLx affected-row
+behavior is independent of this ownership dependency.
 
 Operation rows, close intents, atomic successor creation, projection discovery,
 admitted-update recovery, and speculative-task redesign are excluded. Preserve
@@ -253,6 +250,84 @@ Avoiding unchanged writes is a later measured optimization that must retain the
 same invariant without making old dispatch state authoritative.
 
 ### Queue-home discovery and broker integration
+
+Workflow queue partitions are derived from the namespace UUID, task-queue name and
+workflow task kind, then mapped to the placement bundle. Edge routing and runtime
+use the same helper. The queue-home provider exposes only an Active acquisition's
+generation and cancellation token; retiring that acquisition cancels its discovery
+and offer work. The engine supplies the placement partition/bundle counts before
+traffic starts.
+
+When a matched task belongs to another execution owner, the queue owner uses the
+controller routing snapshot to call the internal `WorkflowTaskDispatch.StartWorkflowTask`
+RPC. It forwards the admitted poll's credentials and worker target. The receiving
+edge re-authenticates and re-authorizes the poll, validates the run namespace, and
+starts only through its local runtime's serving gate and fenced lane commit. It
+returns the committed start envelope and token; it accepts no arbitrary command or
+history. Stale offers are discarded, whereas transport failures retain the bounded
+in-flight lease for retry after expiry. This transport assumes every node runs the
+same release under the stopped-upgrade policy.
+
+The authenticated internal start exchange caps requests at 64 KiB and responses
+at 128 MiB, matching Temporal v1.31.0's internode receive ceiling
+(`common/rpc/grpc.go`). Update messages and query arguments use their protobuf
+wire types rather than JSON byte arrays. Start metadata remains a small same-release
+JSON envelope, containing identifiers and scalar coordinates rather than history.
+
+Before committing a start, the execution owner freezes the update and query
+selection and checks its encoded size, reserving bounded metadata space. New
+admissions cannot enlarge that selection. A refusal occurs before the start and
+before marking updates sent. After the commit, the selected update messages carry
+the actual sequencing boundary; accepted or otherwise withdrawn updates can only
+shrink the selection. Query eligibility is checked against the committed history
+boundary. Buffered query payloads and waiters remain on the owner until answered;
+a lost response leaves them available for a replacement attempt. Completion binds
+the answer to the current task token and stable query identity.
+
+Channels are reused by endpoint. The configured authenticator explicitly selects
+the application headers needed for forwarding; gRPC framing and compression are
+rebuilt per hop. A typed stale-offer marker distinguishes withdrawn tasks from an
+owner's namespace-cache miss. Transient owner failures continue matching within
+the original long-poll deadline; authentication and resource-exhaustion statuses
+retain their protocol meaning (`service/matching/matching_engine.go` @ v1.31.0).
+
+A controller's initial placement snapshot must match all node counts and its hash
+version before runtime construction and membership acquisition. A later incompatible
+snapshot stops the node. Unequal local shard and bundle counts remain rejected;
+the default DSQL profile supplies matching values without a placement migration.
+
+Queue statistics are approximate and inspect at most four dispatch pages per
+observation across all homes and routing classes. They may undercount a backlog
+beyond that bounded observation; they never determine delivery or correctness.
+
+Workflow-task completion and failure responses received by the queue owner are
+forwarded through the existing public `RespondWorkflowTaskCompleted` and
+`RespondWorkflowTaskFailed` RPCs to the execution owner. The forwarding edge
+authenticates and authorizes the token namespace before resolving the run's
+execution route; the receiving owner repeats ordinary admission and processes
+the original request fields against its own update and query registries. This
+mirrors the request forwarding in `service/frontend/workflow_handler.go`
+(`RespondWorkflowTaskCompleted` and `RespondWorkflowTaskFailed`) at Temporal
+v1.31.0. Transport framing is rebuilt while credentials and deadline metadata
+are preserved. A second forwarding hop returns `Unavailable` so a stale routing
+snapshot cannot produce a loop. These replies retain the existing public RPC
+payload limits; the internal start-envelope limits do not redefine them.
+
+### Execution-home count validation
+
+Startup requires `infrastructure.placement.shard_count` and
+`infrastructure.placement.bundle_count` to be equal. Runtime storage and
+membership use these coordinates for the same execution-home hash; accepting
+unequal values could admit requests on a different home from their durable
+state. Server and controller configuration validation reject a mismatch before runtime construction,
+listener binding, or embedded DSQL lifecycle work. The diagnostic names both
+fields and values and tells the operator to preserve existing durable placement.
+The DSQL profile's legacy default promotion makes the shard count 32; its bundle
+count must be explicitly configured to match. This cutover does not migrate the
+placement marker or repartition existing rows. Equal counts remain subject to
+the placement marker's existing count check.
+
+### Discovery scheduling
 
 Add `crates/tokeira-runtime/src/discovery.rs`, owned by runtime startup/shutdown,
 with a demand registry and a fair scheduler. The activity successor can implement
@@ -552,9 +627,12 @@ expiry checks, transactional authoritative reads, and the non-serving gate.
 Transaction-local takeover/renewal fencing and its concurrency claims remain
 deferred to Tasks 17–18; this does not block single-owner repair or backlog retirement.
 
-The current repair and admission barrier are enabled by the temporary private
-queue-home construction choice. Default acquisition retains its previous delivery
-and due-work behavior until cutover. Tracker scoping is active in both modes.
+Repair and the admission barrier apply to every construction path. A seeded
+constructor may activate synchronously only when the repository proves its recovery
+state empty. Populated or restored repositories remain Sweeping while a tracked
+startup task completes both repair walks and bulk-write recovery; `ready()` reports
+its result, and the engine awaits it before serving. Workflow polls and submissions
+also await this boundary. All recovery trackers retain acquisition scoping.
 
 Legacy reset placement is repaired by a bounded storage upgrade before runtime
 construction, as specified in the approved [placement recovery note](placement-recovery-note.md).
@@ -728,9 +806,9 @@ all activity branches, including
 `reconcile_due_activity_dispatches_once`, for the activity successor spec.
 
 Legacy workflow rows are discarded, not replayed as a second authority. A bounded
-maintenance pass enumerates backlog keys in primary-key order, filtering workflow
-kind. In the delete transaction, read each entry's run state and its current
-dispatch representation. An existing run is covered only when its row equals
+maintenance pass enumerates a bounded page of physical backlog keys in primary-key
+order, then selects workflow keys from that page. In the delete transaction, read
+each entry's run state and its current dispatch representation. An existing run is covered only when its row equals
 `Derive(state)`; otherwise defer that entry until acquisition has repaired it.
 An absent run is covered by `Derive(absent) = None` after stale dispatch removal.
 No run-key hash is used to guess an orphan's execution home.
@@ -751,6 +829,18 @@ progress until a complete traversal finds no legacy workflow entries. This
 maintenance path has no delivery or regular workflow backlog-drain behavior.
 Activity bytes remain untouched. Cleanup completion is not a prerequisite for
 serving: the new runtime never delivers these legacy workflow entries.
+
+The disposal cursor walks physical primary keys, including activity keys, before
+filtering workflow copies. Each transaction examines at most 64 keys, so a long
+activity prefix cannot turn a page into an unbounded filtered scan. Activity keys
+advance the cursor but are neither deleted nor counted as deferred workflow work.
+The serving owner of execution home zero coordinates the global pass. This is a
+load-control rule, not a new correctness fence: every delete still checks current
+state and dispatch equality transactionally. Deferred work wakes after acquisition
+progress or a thirty-second retry interval. An undecodable state or dispatch row
+is logged with its key and left in place while the cursor advances; transaction
+and connection failures still abort the page. Placement preparation and acquisition
+retain their fail-stop corruption checks.
 
 Do not rewrite historical migrations. A rollback/re-upgrade must again stop every
 node and reconstruct before serving; this design supplies no mixed-release writer
@@ -807,7 +897,7 @@ from fairness of notifications. The `_stale_rows.cfg` scenario deliberately omit
 evidence that stale dispatch can be harmless to safety, not proof of Requirement
 8.11. The complete repair configuration and additional tests must assert both row
 invariants. Both model checkers passed every positive and failed every targeted
-negative configuration on 2026-10-08; commands and mappings are recorded in
+negative configuration; commands and mappings are recorded in
 [the model documentation](../../../spec/README.md#tla41_dispatch_repairtla).
 
 ## Correctness Properties
@@ -1009,8 +1099,8 @@ limits, whole-transaction abort on statement refusal, `FOR KEY SHARE`, and writa
 CTE support. SQLx checks on real DSQL verified correct affected-row counts for
 `ON CONFLICT DO NOTHING` and a skipping `DO UPDATE ... WHERE`. A statement may use
 `RETURNING` when its returned values are useful. Feature-specific live evidence
-must record the revision, executed checks, and ephemeral cluster lifecycle times;
-these prior observations do not replace those checks.
+must record the revision, executed checks and outcomes; lifecycle times stay
+out of public artifacts. These prior observations do not replace those checks.
 See the [implementation evidence](implementation-evidence.md) for checks actually
 executed by each implementation increment and those still outstanding.
 

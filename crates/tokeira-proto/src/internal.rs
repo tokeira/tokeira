@@ -15,7 +15,9 @@ pub use crate::public::temporal;
 pub mod tokeira {
     pub mod internal {
         pub mod runtime {
-            pub mod v1 {}
+            pub mod v1 {
+                include!("generated/tokeira/tokeira.internal.runtime.v1.rs");
+            }
         }
 
         pub mod controller {

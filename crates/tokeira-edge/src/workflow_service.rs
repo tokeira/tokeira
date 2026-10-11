@@ -2435,6 +2435,35 @@ impl WorkflowService {
         }
     }
 
+    /// Authenticate a workflow-task reply before choosing its execution owner.
+    /// This performs no waiter or workflow mutation: the owner must process the
+    /// original request so update hydration and buffered query replies use the
+    /// same registries that supplied the task's attachments.
+    pub(crate) async fn workflow_task_reply_route(
+        &self,
+        headers: &HeaderMap,
+        namespace: &str,
+        task_token: &[u8],
+        action: Action,
+    ) -> EdgeResult<crate::RouteTarget> {
+        if self.router.routes_locally() {
+            return Ok(crate::RouteTarget::Local);
+        }
+        let (token, _, _, namespace, _) = self
+            .admit_json_task_token::<tokeira_types::WorkflowTaskToken>(
+                headers, namespace, task_token, action,
+            )
+            .await?;
+        let LoadedRun::Existing(state) = self.repo.load_run(token.run_key).await? else {
+            // Leave the existing handler responsible for its missing-task reply.
+            return Ok(crate::RouteTarget::Local);
+        };
+        validate_authoritative_task_namespace(&namespace, state.namespace_id)?;
+        self.router
+            .route_workflow(&namespace, &state.workflow_id.0)
+            .await
+    }
+
     async fn validate_legacy_task_namespace(
         &self,
         effective_namespace: &str,
@@ -4279,6 +4308,39 @@ impl WorkflowService {
         }
     }
 
+    /// Bind a preflighted query selection to a committed task without consuming
+    /// buffered payloads. A lost reply can be retried by the next task attempt.
+    pub(crate) async fn bind_prepared_queries(
+        &self,
+        run: RunKey,
+        barrier: i64,
+        token: &[u8],
+        queries: Vec<tokeira_runtime::BufferedQueryTransport>,
+    ) -> std::collections::HashMap<String, WorkflowQueryDto> {
+        let mut result = std::collections::HashMap::new();
+        for query in queries
+            .into_iter()
+            .filter(|query| query.required_barrier <= barrier)
+        {
+            self.pending_queries
+                .insert_buffered(
+                    token,
+                    query.query_id.clone(),
+                    self.buffered_queries.clone(),
+                    run,
+                )
+                .await;
+            result.insert(
+                query.query_id,
+                WorkflowQueryDto {
+                    query_type: query.query_type,
+                    query_args: query.query_args,
+                },
+            );
+        }
+        result
+    }
+
     /// Dispatch barrier-satisfied queries directly through the broker for
     /// runs that are currently quiescent (no pending WFT).
     ///
@@ -4819,6 +4881,15 @@ impl WorkflowService {
                         })
                         .await?;
                 }
+                let forwarded_decorations = Arc::new(std::sync::Mutex::new(None));
+                let forwarding = crate::grpc::workflow_dispatch::ForwardedPoll {
+                    headers: self.interceptors.forwarding_headers(headers),
+                    namespace: req.namespace.clone(),
+                    sticky: req.is_sticky,
+                    normal_task_queue: req.normal_task_queue.clone(),
+                    scoped_versioned: req.scoped_versioned,
+                    decorations: forwarded_decorations.clone(),
+                };
                 let is_sticky = req.is_sticky;
                 let internal = to_internal::poll_request(req);
                 let scaling_queue = internal.queue.clone();
@@ -4833,14 +4904,16 @@ impl WorkflowService {
                         .absorb_unversioned_backlog(&internal.queue)
                         .await;
                 }
-                let activation = self
-                    .runtime
-                    .poll_workflow_activation_with_kind(
-                        internal.queue,
-                        internal.normal_queue,
-                        is_sticky,
-                        internal.worker_identity.clone(),
-                        internal.timeout,
+                let activation = crate::grpc::workflow_dispatch::FORWARDED_POLL
+                    .scope(
+                        forwarding,
+                        self.runtime.poll_workflow_activation_with_kind(
+                            internal.queue,
+                            internal.normal_queue,
+                            is_sticky,
+                            internal.worker_identity.clone(),
+                            internal.timeout,
+                        ),
                     )
                     .await;
                 // Reaching this point distinguishes a matched task, long-poll
@@ -4875,8 +4948,17 @@ impl WorkflowService {
                         )
                         .await
                         .map_err(EdgeError::from)?;
-                        self.decorate_workflow_task_response(&started, &mut response)
-                            .await?;
+                        let decorations = forwarded_decorations
+                            .lock()
+                            .expect("forwarded decorations lock poisoned")
+                            .take();
+                        if let Some(decorations) = decorations {
+                            response.queries.extend(decorations.queries);
+                            response.messages.extend(decorations.messages);
+                        } else {
+                            self.decorate_workflow_task_response(&started, &mut response)
+                                .await?;
+                        }
                         response.poller_scaling_decision = scaling_decision;
                         if is_scoped_worker(&ctx) {
                             let expires_at = started
@@ -4934,11 +5016,28 @@ impl WorkflowService {
             .last()
             .map(|event| event.event_id)
             .unwrap_or(response.started_event_id);
+        let decorations = self
+            .workflow_task_decorations(started, observable_barrier, &task_token)
+            .await?;
+        response.queries.extend(decorations.queries);
+        response.messages.extend(decorations.messages);
+        Ok(())
+    }
+
+    /// Collect owner-local attachments at the committed start boundary. Their
+    /// waiters remain here so a forwarded start has the same completion path.
+    pub(crate) async fn workflow_task_decorations(
+        &self,
+        started: &StartedWorkflowTask,
+        observable_barrier: i64,
+        task_token: &[u8],
+    ) -> EdgeResult<crate::grpc::workflow_dispatch::WorkflowTaskDecorations> {
+        let mut decorations = crate::grpc::workflow_dispatch::WorkflowTaskDecorations::default();
         self.attach_buffered_queries(
             started.run_key,
             observable_barrier,
-            &task_token,
-            &mut response.queries,
+            task_token,
+            &mut decorations.queries,
         )
         .await;
 
@@ -4947,7 +5046,7 @@ impl WorkflowService {
         // includeAlreadySent = attempt > 1, update.go:404-540 @ v1.31.0).
         for update in self
             .runtime
-            .pending_update_transports(started.run_key, response.attempt > 1)
+            .pending_update_transports(started.run_key, started.token.attempt > 1)
             .await
             .map_err(EdgeError::from)?
         {
@@ -4972,7 +5071,7 @@ impl WorkflowService {
             // history replay the update should be processed. Temporal sets
             // this to workflowTaskStartedEventID - 1.
             let sequencing_event_id = started.token.started_event_id - 1;
-            response.messages.push(ProtocolMessageDto {
+            decorations.messages.push(ProtocolMessageDto {
                 id: format!("{}/request", update.update_id),
                 protocol_instance_id: update.update_id,
                 body: body.encode_to_vec(),
@@ -4980,7 +5079,7 @@ impl WorkflowService {
             });
         }
 
-        Ok(())
+        Ok(decorations)
     }
 
     /// Process a WFT completion from the SDK.
@@ -8825,7 +8924,7 @@ fn validate_authoritative_task_namespace(
     Ok(())
 }
 
-fn resolved_namespace_id(
+pub(crate) fn resolved_namespace_id(
     context: &EdgeContext,
     request_namespace: &str,
 ) -> EdgeResult<tokeira_types::NamespaceId> {
@@ -8906,6 +9005,7 @@ fn scoped_worker_allows_completion_targets(
 fn optional_task_provenance_error_kind(error: &EdgeError) -> &'static str {
     match error {
         EdgeError::ServiceUnavailable(_) => "unavailable",
+        EdgeError::ForwardedStatus(_) => "forwarded_status",
         EdgeError::Internal(_) => "internal",
         EdgeError::PermissionDenied { .. } => "denied",
         _ => "other",
@@ -9103,6 +9203,7 @@ fn grpc_error_code(error: &EdgeError) -> &'static str {
         EdgeError::ServiceUnavailable(_) => "unavailable",
         EdgeError::NotShardOwner { .. } => "aborted",
         EdgeError::FailedPrecondition(_) => "failed_precondition",
+        EdgeError::ForwardedStatus(_) => "forwarded_status",
         EdgeError::Internal(_) => "internal",
     }
 }

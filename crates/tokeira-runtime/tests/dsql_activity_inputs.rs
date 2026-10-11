@@ -16,8 +16,8 @@ use tokeira_kernel::{
     HistoryEventKind, ResetRequest, StartRequest, WorkflowCommand, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, StartedActivityTask, StartedWorkflowTask, TimerScannerConfig,
-    TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    BacklogConfig, LaneConfig, NoopNexusHttpClient, StartedActivityTask, StartedWorkflowTask,
+    TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{
     CommitResult, RunRepository, codec,
@@ -29,9 +29,12 @@ use tokeira_storage::{
 };
 use tokeira_types::{
     ExecutionRef, Headers, Memo, NamespaceId, Payload, Payloads, QueueKey, RequestContext,
-    RequestId, RunId, RunKey, SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity,
-    WorkflowId, WorkflowType,
+    RequestId, RunId, RunKey, SearchAttributes, ShardEpoch, ShardId, TaskKind, TaskQueueName,
+    WorkerIdentity, WorkflowId, WorkflowType,
 };
+
+// Preparation-sensitive live suites share the durable marker's home count.
+const SHARD_COUNT: u32 = 8;
 
 const WORKFLOW_QUEUE: &str = "workflow-q";
 const ACTIVITY_QUEUE: &str = "activity-q";
@@ -55,7 +58,7 @@ async fn dsql_runtime()
                 inflight_limit: 2,
                 ..ReservoirConfig::default()
             },
-            shard_count: 1,
+            shard_count: SHARD_COUNT,
             ..DsqlPoolConfig::default()
         },
     )
@@ -63,17 +66,31 @@ async fn dsql_runtime()
     let (_, repo, _, _, _) = store.into_parts();
     let repo = Arc::new(repo);
     tokeira_storage::prepare_execution_placement(repo.as_ref()).await?;
-    Ok(Some((
-        TokeiraRuntime::new(
-            repo.clone(),
-            2,
-            LaneConfig::default(),
-            TimerScannerConfig::default(),
-            WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
-        ),
-        repo,
-    )))
+    let runtime = TokeiraRuntime::new_with_nexus_and_shards(
+        repo.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Arc::new(NoopNexusHttpClient),
+        Default::default(),
+        SHARD_COUNT,
+        "live-activity-inputs".into(),
+        false,
+    );
+    // The fixture is the sole writer while it runs. Complete ordinary recovery
+    // for every home before polls, without leaving durable leases that would
+    // prevent the next preparation-sensitive suite from starting.
+    for home in 0..SHARD_COUNT {
+        runtime
+            .recover_self_assigned_shard(ShardId(home), ShardEpoch::ZERO)
+            .await?;
+    }
+    Ok(Some((runtime, repo)))
 }
 
 fn context(request_id: &str) -> RequestContext {

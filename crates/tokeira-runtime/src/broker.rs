@@ -778,7 +778,7 @@ impl InMemoryBroker {
         aggregate_priority_stats(&self.backlog_stats_by_priority(queue).await)
     }
 
-    /// Snapshot non-sticky workflow backlog by effective priority band.
+    /// Snapshot volatile workflow backlog by priority, excluding retained durable offers.
     pub async fn backlog_stats_by_priority(&self, queue: &QueueKey) -> PriorityBacklogStats {
         let inner = self.inner.lock().await;
         let Some(ready) = inner.general_ready.get(queue) else {
@@ -794,27 +794,47 @@ impl InMemoryBroker {
             .seen_priority_keys()
             .map(|priority_key| (priority_key, BrokerBacklogStats::default()))
             .collect();
-        for task in ready.iter() {
+        for task in ready.iter().filter(|entry| {
+            !inner
+                .offers
+                .contains((entry.task.run_key, entry.task.logical_seq))
+        }) {
             add_priority_stat(
                 &mut stats,
                 task.task
                     .order
                     .map_or(3, |order| i32::from(order.priority_key)),
-                task.entered_at.elapsed(),
+                (OffsetDateTime::now_utc() - task.scheduled_at)
+                    .try_into()
+                    .unwrap_or_default(),
             );
         }
         stats
     }
 
-    /// Snapshot normal ready backlog for every exact-version workflow queue.
+    /// Snapshot volatile ready backlog for every exact-version workflow queue.
     pub async fn versioned_backlog_counts(&self) -> BTreeMap<WorkerComputeQueueKey, u64> {
         let inner = self.inner.lock().await;
         inner
             .general_ready
             .iter()
             .filter_map(|(queue, ready)| {
-                queue_metrics_key(queue, WorkerComputeTaskType::Workflow)
-                    .map(|key| (key, u64::try_from(ready.len()).unwrap_or(u64::MAX)))
+                queue_metrics_key(queue, WorkerComputeTaskType::Workflow).map(|key| {
+                    (
+                        key,
+                        u64::try_from(
+                            ready
+                                .iter()
+                                .filter(|entry| {
+                                    !inner
+                                        .offers
+                                        .contains((entry.task.run_key, entry.task.logical_seq))
+                                })
+                                .count(),
+                        )
+                        .unwrap_or(u64::MAX),
+                    )
+                })
             })
             .collect()
     }
@@ -834,13 +854,19 @@ impl InMemoryBroker {
             .seen_priority_keys()
             .map(|priority_key| (priority_key, BrokerBacklogStats::default()))
             .collect();
-        for task in ready.iter() {
+        for task in ready.iter().filter(|entry| {
+            !inner
+                .offers
+                .contains((entry.task.run_key, entry.task.logical_seq))
+        }) {
             add_priority_stat(
                 &mut stats,
                 task.task
                     .order
                     .map_or(3, |order| i32::from(order.priority_key)),
-                task.entered_at.elapsed(),
+                (OffsetDateTime::now_utc() - task.scheduled_at)
+                    .try_into()
+                    .unwrap_or_default(),
             );
         }
         stats
@@ -1623,10 +1649,9 @@ impl InMemoryBroker {
     /// Remove and return tasks that have sat in either tier longer than
     /// `grace_window`, clearing their dedup keys.
     ///
-    /// This is the grace scanner's hook: expired tasks leave the in-memory
-    /// broker here and are then persisted to the durable backlog. Clearing the
-    /// dedup keys is what lets the same logical task be re-published later
-    /// (e.g. when drained back from storage) without being suppressed.
+    /// Retained only to exercise legacy retirement regressions. Runtime delivery
+    /// never demotes workflow tasks into the durable backlog.
+    #[cfg(test)]
     pub(crate) async fn take_expired(
         &self,
         grace_window: Duration,
@@ -1866,6 +1891,7 @@ impl InMemoryBroker {
         }
     }
 
+    #[cfg(test)]
     fn drain_expired_workflow_queue(
         queues: &mut HashMap<QueueKey, OrderedReady<TimestampedWorkflowTask>>,
         protected: &HashSet<OfferKey>,

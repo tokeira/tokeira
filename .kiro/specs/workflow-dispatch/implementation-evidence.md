@@ -2,7 +2,7 @@
 
 ## Default delivery cutover
 
-Base: `51def4bdce749bcd2b6badaf7bd161d026d9b4af`; the PR records its final base
+Base: `1ebc763f56a50db20c450f12bacaf7459ba054f7`; the PR records its final base
 and head. Discovery, poll registration, bounded offers, acquisition repair and
 serving admission now form the default runtime path. The temporary construction
 switch and workflow backlog grace/drain/spill paths are removed. Activity backlog
@@ -52,26 +52,28 @@ tla "$MODEL" --config "$CONFIG" --max-states 20000000 --max-depth 10000
 
 ### Workspace verification
 
-Implementation revision: `1bc447522233322647b4d52bf94bba3894c10395`. The final full bar ran after
-rebasing onto the base above. The rebase included the external-command namespace
-default and a changelog classification change; storage, live fixtures and model
-files were unchanged by that rebase.
+Implementation revision: `1d8bfa1e5b90ba5157e058a90904fd522edd2caf`.
+The final full bar ran after rebasing onto the base above, which includes the
+distributed startup schema check,
+the 0.6.0 release and the example update. Both cutover commits replayed without
+patch changes. Schema validation precedes placement preparation and runtime
+activation; the durable upgrade-note assertion survives changelog consumption.
 
 | Check | Outcome |
 |---|---|
 | `cargo +nightly fmt --all` | Passed |
 | `cargo lint --locked` | Passed |
 | `cargo check --workspace --locked` | Passed |
-| `cargo nextest run --workspace --locked --no-fail-fast --test-threads 4` | 3,849 passed; 2 existing SDK integration tests skipped |
+| `cargo nextest run --workspace --locked --no-fail-fast --test-threads 4` | 3,855 passed; 2 existing SDK integration tests skipped |
 | `cargo test --workspace --doc --locked` | Passed; existing ignored examples remain ignored |
 | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked` | Passed |
-| All-target Clippy for storage, runtime, projection and edge with their DSQL integration features and `-D warnings` | Passed |
+| All-target Clippy for storage, runtime, projection, edge and engine with DSQL integration features and `-D warnings` | Passed |
 
 No completion-bar command was omitted. The initial workspace run exposed six
 integration failures in restored-engine repair delegation, the protobuf binding
 inventory and a configuration fixture; the complete reruns passed after fixes.
-The first rebased workspace run passed 3,847 tests and timed out two unchanged
-history-pagination properties during concurrent compilation. The complete suite
+An earlier pre-publication workspace run passed 3,847 tests and timed out two
+unchanged history-pagination properties during concurrent compilation. The complete suite
 then passed with four test threads and the same timeout limits; no source fix
 or test retry policy was introduced for those timeouts.
 
@@ -108,6 +110,15 @@ A linear extrapolation gives 352.1 s for one million runs plus one million timer
 this excludes relocation and is not a million-row benchmark.
 
 ### Live verification and boundaries
+
+The live results below precede this rebase. The final passing fixture versions
+are retained in implementation revision
+`1bc447522233322647b4d52bf94bba3894c10395`. The rebase changed release metadata and integrated distributed startup schema validation; the cutover's
+dispatch SQL, runtime delivery implementation and selected live fixtures are
+unchanged. Live suites were not rerun for this rebase. The newly inherited
+distributed-schema engine live tests were compiled by the feature check but not
+executed; they require a separate coordinated DSQL/DynamoDB fixture. Their local
+schema-admission tests ran in the workspace bar.
 
 Suites ran serially with the URL and endpoint gates set against real Aurora
 DSQL. The resumed sequence used this common invocation, selecting one suite

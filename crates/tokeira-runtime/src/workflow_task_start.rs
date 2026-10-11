@@ -31,3 +31,9 @@ pub trait WorkflowTaskStarter: Debug + Send + Sync {
 #[derive(Debug, thiserror::Error)]
 #[error("remote workflow offer is no longer startable")]
 pub struct WorkflowOfferRejected;
+
+/// An owner or transport is temporarily unavailable. Matching retains the
+/// durable intent and continues the caller's existing long-poll deadline.
+#[derive(Debug, thiserror::Error)]
+#[error("workflow execution owner is temporarily unavailable: {0}")]
+pub struct RetryableWorkflowTaskStart(pub String);

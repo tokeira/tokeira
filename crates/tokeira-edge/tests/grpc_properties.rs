@@ -589,6 +589,7 @@ fn expected_code(err: &EdgeError) -> Code {
         EdgeError::ServiceUnavailable(_) => Code::Unavailable,
         EdgeError::NotShardOwner { .. } => Code::Aborted,
         EdgeError::FailedPrecondition(_) => Code::FailedPrecondition,
+        EdgeError::ForwardedStatus(status) => status.code(),
         EdgeError::Internal(_) => Code::Internal,
     }
 }

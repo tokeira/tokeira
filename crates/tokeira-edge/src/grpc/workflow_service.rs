@@ -135,6 +135,7 @@ pub struct WorkflowServiceGrpc {
     /// When absent, the `*ActivityExecution` RPCs answer `UNIMPLEMENTED` (deferred),
     /// distinct from the per-namespace enable gate the bridge itself enforces.
     chasm_activity: Option<Arc<crate::chasm_activity::ActivityBridge>>,
+    peer_channels: Arc<super::peer_transport::PeerChannels>,
 }
 
 impl WorkflowServiceGrpc {
@@ -142,6 +143,7 @@ impl WorkflowServiceGrpc {
         Self {
             inner,
             chasm_activity: None,
+            peer_channels: Arc::default(),
         }
     }
 
@@ -174,13 +176,7 @@ impl WorkflowServiceGrpc {
         if headers.contains_key("x-tokeira-workflow-reply-forwarded") {
             return Err(Status::unavailable("workflow-task owner route changed"));
         }
-        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{target}"))
-            .map_err(|_| Status::unavailable("workflow-task owner endpoint is invalid"))?
-            .connect_timeout(std::time::Duration::from_secs(5));
-        let channel = endpoint
-            .connect()
-            .await
-            .map_err(|_| Status::unavailable("workflow-task owner could not be reached"))?;
+        let channel = self.peer_channels.get(&target)?;
         Ok(Some(
             WorkflowServiceClient::new(channel)
                 // Match the public server's response encoding limit. A local

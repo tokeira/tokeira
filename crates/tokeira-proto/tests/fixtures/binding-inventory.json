@@ -1536,7 +1536,7 @@
       },
       {
         "message": "tokeira.internal.runtime.v1.StartWorkflowTaskResponse",
-        "field": "decorations_json",
+        "field": "decorations_proto",
         "number": 2,
         "type": "TYPE_BYTES",
         "type_name": "",

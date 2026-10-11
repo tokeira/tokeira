@@ -1,0 +1,4 @@
+kind: fixed
+body: DSQL defaults now use matching shard and bundle counts; configure both to the existing placement count because unequal values are rejected.
+custom:
+  Slice: 08cd13a9-0e12-45bc-a292-b84895cf0ca1

@@ -445,3 +445,85 @@ fn upgrade_contract_survives_changelog_consumption() {
         1
     );
 }
+
+#[derive(Debug, Default)]
+struct UnavailableOwner {
+    retry_offer: Option<crate::broker::InMemoryBroker>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::WorkflowTaskStarter for UnavailableOwner {
+    async fn start(
+        &self,
+        _home: ShardId,
+        offered: DispatchableWorkflowTask,
+        _worker: WorkerIdentity,
+    ) -> Result<StartedWorkflowTask> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(broker) = &self.retry_offer {
+            assert_eq!(call, 0, "an expired poll must not retry ready owner work");
+            tokio::time::advance(std::time::Duration::from_secs(6)).await;
+            broker.expire_offers(tokio::time::Instant::now()).await;
+            broker.publish_workflow_task(offered, None).await;
+        }
+        Err(crate::RetryableWorkflowTaskStart("owner unavailable".into()).into())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unavailable_owner_keeps_polling_until_the_original_deadline() {
+    for timeout in [
+        std::time::Duration::ZERO,
+        std::time::Duration::from_secs(12),
+    ] {
+        let store = Arc::new(InMemoryStore::with_shard_count(8));
+        let queue = queue();
+        let queue_home = tokeira_types::bundle_for_partition(
+            tokeira_types::workflow_queue_partition(queue.namespace_id, &queue.task_queue.0, 8),
+            8,
+        );
+        let item = (0..100)
+            .map(|n| transition(&queue, n))
+            .find(|item| {
+                execution_home_bundle(
+                    queue.namespace_id.0.as_bytes(),
+                    item.next_state.workflow_id.0.as_bytes(),
+                    8,
+                ) != queue_home
+            })
+            .unwrap();
+        let initial_offer = offer(&item);
+        store
+            .commit_transition(item.next_state.run_key, item, WriteFence::Unfenced)
+            .await
+            .unwrap();
+        let node = runtime(store.clone(), home(queue_home.0));
+        for id in 0..8 {
+            if id != queue_home.0 {
+                node.shard_owner.write().unwrap().remove(ShardId(id));
+            }
+        }
+        let owner = Arc::new(UnavailableOwner {
+            retry_offer: timeout.is_zero().then(|| node.broker()),
+            ..Default::default()
+        });
+        node.set_workflow_task_starter(owner.clone());
+        node.broker.publish_workflow_task(initial_offer, None).await;
+        let before = store.snapshot().await.unwrap();
+        let start = tokio::time::Instant::now();
+        let result = node
+            .poll_workflow_activation(queue, None, WorkerIdentity("worker".into()), timeout)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        if timeout.is_zero() {
+            assert_eq!(owner.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(start.elapsed(), std::time::Duration::from_secs(6));
+        } else {
+            assert_eq!(start.elapsed(), timeout);
+        }
+        assert_eq!(store.snapshot().await.unwrap(), before);
+        stop(&node).await;
+    }
+}

@@ -4308,6 +4308,39 @@ impl WorkflowService {
         }
     }
 
+    /// Bind a preflighted query selection to a committed task without consuming
+    /// buffered payloads. A lost reply can be retried by the next task attempt.
+    pub(crate) async fn bind_prepared_queries(
+        &self,
+        run: RunKey,
+        barrier: i64,
+        token: &[u8],
+        queries: Vec<tokeira_runtime::BufferedQueryTransport>,
+    ) -> std::collections::HashMap<String, WorkflowQueryDto> {
+        let mut result = std::collections::HashMap::new();
+        for query in queries
+            .into_iter()
+            .filter(|query| query.required_barrier <= barrier)
+        {
+            self.pending_queries
+                .insert_buffered(
+                    token,
+                    query.query_id.clone(),
+                    self.buffered_queries.clone(),
+                    run,
+                )
+                .await;
+            result.insert(
+                query.query_id,
+                WorkflowQueryDto {
+                    query_type: query.query_type,
+                    query_args: query.query_args,
+                },
+            );
+        }
+        result
+    }
+
     /// Dispatch barrier-satisfied queries directly through the broker for
     /// runs that are currently quiescent (no pending WFT).
     ///
@@ -4850,7 +4883,7 @@ impl WorkflowService {
                 }
                 let forwarded_decorations = Arc::new(std::sync::Mutex::new(None));
                 let forwarding = crate::grpc::workflow_dispatch::ForwardedPoll {
-                    headers: headers.clone(),
+                    headers: self.interceptors.forwarding_headers(headers),
                     namespace: req.namespace.clone(),
                     sticky: req.is_sticky,
                     normal_task_queue: req.normal_task_queue.clone(),
@@ -8972,6 +9005,7 @@ fn scoped_worker_allows_completion_targets(
 fn optional_task_provenance_error_kind(error: &EdgeError) -> &'static str {
     match error {
         EdgeError::ServiceUnavailable(_) => "unavailable",
+        EdgeError::ForwardedStatus(_) => "forwarded_status",
         EdgeError::Internal(_) => "internal",
         EdgeError::PermissionDenied { .. } => "denied",
         _ => "other",
@@ -9169,6 +9203,7 @@ fn grpc_error_code(error: &EdgeError) -> &'static str {
         EdgeError::ServiceUnavailable(_) => "unavailable",
         EdgeError::NotShardOwner { .. } => "aborted",
         EdgeError::FailedPrecondition(_) => "failed_precondition",
+        EdgeError::ForwardedStatus(_) => "forwarded_status",
         EdgeError::Internal(_) => "internal",
     }
 }

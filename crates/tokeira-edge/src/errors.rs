@@ -17,6 +17,11 @@ use tokeira_types::{BundleId, IncarnationId, ShardEpoch};
 /// stable contract even if the internal implementation changes.
 #[derive(Debug, Error)]
 pub enum EdgeError {
+    /// Preserve the execution owner's protocol status, including authentication
+    /// and cancellation, through the poll adapter without reclassifying it.
+    #[error("{0}")]
+    ForwardedStatus(Box<tonic::Status>),
+
     #[error("bad request: {0}")]
     BadRequest(String),
 
@@ -235,6 +240,16 @@ impl EdgeError {
             EdgeError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             EdgeError::NotShardOwner { .. } => StatusCode::CONFLICT,
             EdgeError::FailedPrecondition(_) => StatusCode::PRECONDITION_FAILED,
+            EdgeError::ForwardedStatus(status) => match status.code() {
+                tonic::Code::Unauthenticated => StatusCode::UNAUTHORIZED,
+                tonic::Code::PermissionDenied => StatusCode::FORBIDDEN,
+                tonic::Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
+                tonic::Code::Cancelled | tonic::Code::DeadlineExceeded => {
+                    StatusCode::REQUEST_TIMEOUT
+                }
+                tonic::Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            },
             EdgeError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -274,6 +289,7 @@ impl EdgeError {
             EdgeError::ServiceUnavailable(_) => "service_unavailable",
             EdgeError::NotShardOwner { .. } => "not_shard_owner",
             EdgeError::FailedPrecondition(_) => "failed_precondition",
+            EdgeError::ForwardedStatus(_) => "forwarded_status",
             EdgeError::Internal(_) => "internal",
         }
     }
@@ -281,14 +297,11 @@ impl EdgeError {
 
 impl From<anyhow::Error> for EdgeError {
     fn from(value: anyhow::Error) -> Self {
-        // Preserve an internal start's envelope refusal through the public
-        // poll boundary. Matching returns non-busy ResourceExhausted to the
-        // worker so it backs off (service/matching/matching_engine.go,
-        // PollWorkflowTaskQueue @ v1.31.0).
-        if let Some(status) = value.downcast_ref::<tonic::Status>()
-            && status.code() == tonic::Code::ResourceExhausted
-        {
-            return Self::ResourceExhausted(status.message().to_owned());
+        if let Some(status) = value.downcast_ref::<tonic::Status>() {
+            return Self::ForwardedStatus(Box::new(status.clone()));
+        }
+        if let Some(error) = value.downcast_ref::<tokeira_runtime::RetryableWorkflowTaskStart>() {
+            return Self::ServiceUnavailable(error.to_string());
         }
         // A failed activity-token revalidation surfaces as v1.31.0's
         // `ErrActivityTaskNotFound`: code NotFound with this exact message,

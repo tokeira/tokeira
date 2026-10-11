@@ -795,3 +795,106 @@ async fn workflow_dispatch_live_disposal_rolls_back_cancelled_page_and_keeps_bou
     fixture.pool.close().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn workflow_dispatch_live_disposal_bounds_activity_prefix_and_passes_corruption() -> Result<()>
+{
+    if std::env::var_os("TOKEIRA_DSQL_TEST_DATABASE_URL").is_none() {
+        return Ok(());
+    }
+    let fixture = Fixture::connect(1).await?;
+    let transition = crate::memory::projection_accumulator_tests::fresh_transition(RunKey::new());
+    let corrupt_run = transition.next_state.run_key;
+    crate::workflow_dispatch_tests::commit(&fixture, transition).await?;
+    let original: Vec<u8> =
+        sqlx::query_scalar("SELECT state_data FROM workflow_hot WHERE run_key=$1")
+            .bind(corrupt_run.0)
+            .fetch_one(&fixture.pool)
+            .await?;
+    sqlx::query("UPDATE workflow_hot SET state_data=$2 WHERE run_key=$1")
+        .bind(corrupt_run.0)
+        .bind(vec![1u8, 2, 3])
+        .execute(&fixture.pool)
+        .await?;
+    let base = Uuid::new_v4().as_u128() & !0xffff;
+    let namespace = Uuid::new_v4();
+    let mut tx = fixture.pool.begin().await?;
+    for index in 0..66u128 {
+        let kind = if index < 64 {
+            TaskKind::Activity
+        } else {
+            TaskKind::Workflow
+        };
+        let run = if index == 64 {
+            corrupt_run.0
+        } else {
+            Uuid::new_v4()
+        };
+        sqlx::query("INSERT INTO dispatch_backlog (key,partition_id,queue_namespace,queue_name,task_kind,priority_key,fair_pass,insertion_tie,run_key,payload_data,scheduled_at) VALUES ($1,0,$2,'disposal-bounds',$3,0,0,0,$4,$5,$6)")
+            .bind(Uuid::from_u128(base + index)).bind(namespace).bind(kind.to_db_smallint())
+            .bind(run).bind(Vec::<u8>::new()).bind(OffsetDateTime::now_utc()).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    let page = fixture
+        .repo()
+        .dispose_workflow_backlog_page(Some(Uuid::from_u128(base - 1)))
+        .await?;
+    assert_eq!(page.examined, 64);
+    assert_eq!((page.deleted, page.deferred), (0, 0));
+    assert_eq!(page.last_examined, Some(Uuid::from_u128(base + 63)));
+    let next = fixture
+        .repo()
+        .dispose_workflow_backlog_page(page.last_examined)
+        .await?;
+    assert!(next.examined <= 64 && next.deferred >= 1);
+    let remaining: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT key FROM dispatch_backlog WHERE queue_namespace=$1 ORDER BY key",
+    )
+    .bind(namespace)
+    .fetch_all(&fixture.pool)
+    .await?;
+    assert!(remaining.contains(&Uuid::from_u128(base + 64)));
+    assert!(
+        !remaining.contains(&Uuid::from_u128(base + 65)),
+        "corruption must not stop the following covered key"
+    );
+    let mut explain = sqlx::QueryBuilder::<sqlx::Postgres>::new("EXPLAIN ");
+    explain.push(super::dispatch::DISPOSAL_NEXT_KEYS_SQL);
+    let plan = explain
+        .build_query_as::<(String,)>()
+        .bind(Uuid::from_u128(base + 63))
+        .bind(64i64)
+        .fetch_all(&fixture.pool)
+        .await?;
+    assert!(
+        plan.iter()
+            .any(|(line,)| line.contains("Index Cond:") && line.contains("key >")),
+        "continuation must seek: {plan:?}"
+    );
+    assert!(
+        !plan
+            .iter()
+            .any(|(line,)| line.contains("Filter:") && line.contains("task_kind"))
+    );
+    if let Some(path) = std::env::var_os("TOKEIRA_WORKFLOW_DISPOSAL_PLAN_OUTPUT") {
+        std::fs::write(
+            path,
+            plan.into_iter()
+                .map(|(line,)| line)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )?;
+    }
+    sqlx::query("UPDATE workflow_hot SET state_data=$2 WHERE run_key=$1")
+        .bind(corrupt_run.0)
+        .bind(original)
+        .execute(&fixture.pool)
+        .await?;
+    sqlx::query("DELETE FROM dispatch_backlog WHERE queue_namespace=$1")
+        .bind(namespace)
+        .execute(&fixture.pool)
+        .await?;
+    fixture.store.shutdown().await?;
+    fixture.pool.close().await;
+    Ok(())
+}

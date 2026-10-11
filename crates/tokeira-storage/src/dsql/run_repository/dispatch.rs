@@ -33,6 +33,11 @@ const DRAIN_BACKLOG_SQL: &str = "
     ORDER BY priority_key ASC, fair_pass ASC, insertion_tie ASC
     LIMIT $6";
 
+pub(super) const DISPOSAL_FIRST_KEYS_SQL: &str =
+    "SELECT key, run_key, task_kind FROM dispatch_backlog ORDER BY key LIMIT $1";
+pub(super) const DISPOSAL_NEXT_KEYS_SQL: &str =
+    "SELECT key, run_key, task_kind FROM dispatch_backlog WHERE key>$1 ORDER BY key LIMIT $2";
+
 impl DsqlRunRepository {
     pub(super) async fn do_dispose_workflow_backlog_page(
         &self,
@@ -41,12 +46,13 @@ impl DsqlRunRepository {
         let mut permit = self.director.acquire(DbClass::Maintenance).await?;
         let mut tx = permit.connection()?.begin().await?;
         let sql = if after.is_some() {
-            "SELECT key, run_key FROM dispatch_backlog WHERE task_kind=$1 AND key>$2 ORDER BY key LIMIT $3"
+            DISPOSAL_NEXT_KEYS_SQL
         } else {
-            "SELECT key, run_key FROM dispatch_backlog WHERE task_kind=$1 ORDER BY key LIMIT $2"
+            DISPOSAL_FIRST_KEYS_SQL
         };
-        let mut query =
-            sqlx::query_as::<_, (Uuid, Uuid)>(sql).bind(TaskKind::Workflow.to_db_smallint());
+        // LIMIT bounds physical keys, including activities. Filtering first
+        // would scan an arbitrarily long activity prefix to find 64 workflows.
+        let mut query = sqlx::query_as::<_, (Uuid, Uuid, i16)>(sql);
         if let Some(after) = after {
             query = query.bind(after);
         }
@@ -55,7 +61,12 @@ impl DsqlRunRepository {
             .fetch_all(&mut *tx)
             .await?;
         let mut deleted = 0;
-        for (key, run) in &keys {
+        let mut workflows = 0;
+        for (key, run, kind) in &keys {
+            if *kind != TaskKind::Workflow.to_db_smallint() {
+                continue;
+            }
+            workflows += 1;
             let state = sqlx::query_scalar::<_, Vec<u8>>(
                 "SELECT state_data FROM workflow_hot WHERE run_key=$1",
             )
@@ -63,7 +74,14 @@ impl DsqlRunRepository {
             .fetch_optional(&mut *tx)
             .await?
             .map(|bytes| codec::decode_workflow_state(RunKey(*run), &bytes))
-            .transpose()?;
+            .transpose();
+            let state = match state {
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::warn!(%key, run_key=%run, ?error, "legacy workflow copy deferred: invalid state");
+                    continue;
+                }
+            };
             let expected = state.as_ref().and_then(|state| {
                 crate::derive_workflow_dispatch(
                     state,
@@ -82,7 +100,14 @@ impl DsqlRunRepository {
                 .fetch_optional(&mut *tx)
                 .await?
                 .map(super::workflow_dispatch::decode)
-                .transpose()?;
+                .transpose();
+            let current = match current {
+                Ok(current) => current,
+                Err(error) => {
+                    tracing::warn!(%key, run_key=%run, ?error, "legacy workflow copy deferred: invalid dispatch row");
+                    continue;
+                }
+            };
             // Old writers are stopped. Every new transition preserves equality
             // atomically and never relies on this copy, even after this snapshot.
             if expected == current {
@@ -94,24 +119,16 @@ impl DsqlRunRepository {
                     .rows_affected() as usize;
             }
         }
-        // Deletes change no value bytes. The row cap and the common byte budget
-        // are independent bounds, not attempts to hit the DSQL service ceilings.
-        let cost = crate::write_budget::WriteCost {
-            rows: deleted,
-            bytes: 0,
-        };
-        anyhow::ensure!(
-            cost.rows <= crate::write_budget::MAX_ROWS_PER_TRANSACTION
-                && cost.bytes <= crate::write_budget::MAX_BYTES_PER_TRANSACTION,
-            "legacy disposal exceeds transaction budget"
-        );
+        // Deletion changes no value bytes, and the physical page is below
+        // the shared transaction row ceiling. No payload is rewritten.
         #[cfg(all(test, feature = "dsql-integration"))]
         super::pause_point::reached(super::pause_point::PauseKey::Disposal).await;
         tx.commit().await?;
         Ok(crate::WorkflowBacklogDisposal {
-            last_examined: keys.last().map(|(key, _)| *key),
+            last_examined: keys.last().map(|(key, _, _)| *key),
             examined: keys.len(),
             deleted,
+            deferred: workflows - deleted,
             exhausted: keys.len() < crate::LEGACY_WORKFLOW_KEYS,
         })
     }

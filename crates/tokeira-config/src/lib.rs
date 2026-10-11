@@ -1131,8 +1131,11 @@ impl TokeiraConfig {
 
     pub fn apply_storage_defaults(&mut self) {
         if self.infrastructure.storage == ConfigStorageKind::Dsql {
-            if self.infrastructure.placement.shard_count == default_placement_shard_count() {
+            if self.infrastructure.placement.shard_count == default_placement_shard_count()
+                && self.infrastructure.placement.bundle_count == default_placement_bundle_count()
+            {
                 self.infrastructure.placement.shard_count = 32;
+                self.infrastructure.placement.bundle_count = 32;
             }
             if self.infrastructure.placement.partition_count == default_placement_partition_count()
             {
@@ -2082,15 +2085,33 @@ mod tests {
     }
 
     #[test]
-    fn dsql_defaults_require_an_explicit_matching_bundle_count() {
+    fn dsql_defaults_have_matching_counts_and_preserve_explicit_mismatches() {
         let mut config = TokeiraConfig::default();
         config.infrastructure.storage = ConfigStorageKind::Dsql;
         config.infrastructure.dsql.endpoint = Some("test.invalid".to_string());
         config.apply_storage_defaults();
-        let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("shard_count (32) must equal bundle_count (1)"));
-        config.infrastructure.placement.bundle_count = 32;
+        assert_eq!(config.infrastructure.placement.shard_count, 32);
+        assert_eq!(config.infrastructure.placement.bundle_count, 32);
         config.validate().unwrap();
+        for (shards, bundles) in [(32, 1), (1, 32), (8, 4)] {
+            config.infrastructure.placement.shard_count = shards;
+            config.infrastructure.placement.bundle_count = bundles;
+            config.apply_storage_defaults();
+            assert_eq!(
+                (
+                    config.infrastructure.placement.shard_count,
+                    config.infrastructure.placement.bundle_count
+                ),
+                (shards, bundles)
+            );
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("must equal")
+            );
+        }
     }
 
     #[test]

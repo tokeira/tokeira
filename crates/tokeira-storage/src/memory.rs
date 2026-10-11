@@ -2495,7 +2495,6 @@ impl RunRepository for InMemoryStore {
         let mut entries = store
             .dispatch_backlog
             .iter()
-            .filter(|entry| entry.queue.task_kind == TaskKind::Workflow)
             .map(|entry| {
                 // Memory has no SQL primary key; a stable identity digest gives
                 // its disposable cursor the same seek/deferral contract.
@@ -2506,15 +2505,20 @@ impl RunRepository for InMemoryStore {
                     &payload,
                     entry.run_key.0.as_bytes(),
                 ]);
-                Ok((key, entry.identity(), entry.run_key))
+                Ok((key, entry.identity(), entry.run_key, entry.queue.task_kind))
             })
             .collect::<Result<Vec<_>>>()?;
-        entries.retain(|(key, _, _)| after.is_none_or(|after| *key > after));
-        entries.sort_by_key(|(key, _, _)| *key);
+        entries.retain(|(key, _, _, _)| after.is_none_or(|after| *key > after));
+        entries.sort_by_key(|(key, _, _, _)| *key);
         let exhausted = entries.len() <= crate::LEGACY_WORKFLOW_KEYS;
         entries.truncate(crate::LEGACY_WORKFLOW_KEYS);
         let mut removed = std::collections::HashSet::new();
-        for (_, identity, run_key) in &entries {
+        let mut workflows = 0;
+        for (_, identity, run_key, kind) in &entries {
+            if *kind != TaskKind::Workflow {
+                continue;
+            }
+            workflows += 1;
             let expected = store.runs.get(run_key).and_then(|state| {
                 crate::derive_workflow_dispatch(
                     state,
@@ -2536,9 +2540,10 @@ impl RunRepository for InMemoryStore {
             .dispatch_backlog
             .retain(|entry| !removed.contains(&entry.identity()));
         Ok(crate::WorkflowBacklogDisposal {
-            last_examined: entries.last().map(|(key, _, _)| *key),
+            last_examined: entries.last().map(|(key, _, _, _)| *key),
             examined: entries.len(),
             deleted: removed.len(),
+            deferred: workflows - removed.len(),
             exhausted,
         })
     }

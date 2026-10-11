@@ -295,10 +295,11 @@ surface is `PollWorkflowTaskQueue`, `PollActivityTaskQueue`, `PollNexusTaskQueue
 `RespondActivityTaskCompleted`, `RespondActivityTaskFailed`, `RespondActivityTaskCanceled`, \
 `RecordActivityTaskHeartbeat`, `RespondNexusTaskCompleted`, `RespondNexusTaskFailed`, \
 `RecordWorkerHeartbeat`, `ShutdownWorker`, and queue-scoped `DescribeTaskQueue`. Universal \
-`Health/Check` and `GetSystemInfo` remain available independently of Worker scope.\n\n\
+`Health/Check` and `GetSystemInfo` remain available independently of Worker scope. A scoped \
+worker may call `DescribeNamespace` for its own namespace by exact name.\n\n\
 Activity By-ID aliases, standalone Activities, unversioned or deprecated Worker Versioning, \
-Worker inventory, visibility/history reads, Workflow starts, and every other namespace-wide \
-API are denied for a scoped identity. Sticky Workflow polls authorize the request's stable \
+Worker inventory, visibility/history reads, Workflow starts, `DescribeNamespace` by ID or for another namespace, and other namespace-wide \
+APIs are denied for a scoped identity. Sticky Workflow polls authorize the request's stable \
 `normal_name`; sticky aliases are never configured as resources.\n\n\
 The Go SDK can refresh an externally issued bearer through its standard credentials callback; \
 return the token without a `Bearer ` prefix because the SDK adds it:\n\n\

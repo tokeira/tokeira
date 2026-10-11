@@ -394,6 +394,54 @@ impl UpdateRegistry {
             .collect()
     }
 
+    /// Snapshot sendable payloads without consuming delivery state. A transport
+    /// can validate its complete envelope before committing a task start.
+    pub fn snapshot_pending_updates(&self, run_key: RunKey) -> Vec<PendingUpdateTransport> {
+        let inner = self.inner.lock().expect("inner lock poisoned");
+        let mut entries: Vec<_> = inner
+            .iter()
+            .filter(|((run, _), entry)| *run == run_key && !entry.accepted)
+            .collect();
+        entries.sort_by_key(|(_, entry)| entry.admitted_seq);
+        entries
+            .into_iter()
+            .map(|((_, id), entry)| PendingUpdateTransport {
+                update_id: id.clone(),
+                update_name: entry.update_name.clone(),
+                input: entry.input.clone(),
+                identity: entry.identity.clone(),
+            })
+            .collect()
+    }
+
+    /// Mark only the preflighted selection as sent. Concurrent admissions stay
+    /// unsent for a later task; accepting/closing a selected update can only
+    /// shrink the response. Payloads for an existing update ID are immutable.
+    pub fn mark_prepared_updates_sent(
+        &self,
+        run_key: RunKey,
+        selected: &[PendingUpdateTransport],
+        include_sent: bool,
+    ) -> Vec<String> {
+        let mut inner = self.inner.lock().expect("inner lock poisoned");
+        selected
+            .iter()
+            .filter_map(|selected| {
+                let entry = inner.get_mut(&(run_key, selected.update_id.clone()))?;
+                if entry.accepted
+                    || (entry.sent && !include_sent)
+                    || entry.update_name != selected.update_name
+                    || entry.input != selected.input
+                    || entry.identity != selected.identity
+                {
+                    return None;
+                }
+                entry.sent = true;
+                Some(selected.update_id.clone())
+            })
+            .collect()
+    }
+
     /// Re-arm delivery after an attempt-1 workflow task failed or timed out:
     /// the replacement task must carry the still-unaccepted updates again.
     pub(crate) fn reset_sent_for_run(&self, run_key: RunKey) {
@@ -696,6 +744,49 @@ mod tests {
     }
 
     // ── Existing unit tests ─────────────────────────
+
+    #[test]
+    fn prepared_updates_do_not_consume_concurrent_admissions_or_changed_payloads() {
+        let registry = UpdateRegistry::new();
+        let run = RunKey::new();
+        let (tx, _rx) = oneshot::channel();
+        registry.register(
+            run,
+            "first".into(),
+            "handler".into(),
+            Payloads::default(),
+            "worker".into(),
+            0,
+            UpdateWaitPolicy::Admitted,
+            tx,
+        );
+        let prepared = registry.snapshot_pending_updates(run);
+        let (tx, _rx) = oneshot::channel();
+        registry.register(
+            run,
+            "second".into(),
+            "handler".into(),
+            Payloads::default(),
+            "worker".into(),
+            0,
+            UpdateWaitPolicy::Admitted,
+            tx,
+        );
+        let mut wrong = prepared.clone();
+        wrong[0].update_name = "changed".into();
+        assert!(
+            registry
+                .mark_prepared_updates_sent(run, &wrong, false)
+                .is_empty()
+        );
+        assert_eq!(
+            registry.mark_prepared_updates_sent(run, &prepared, false),
+            vec!["first"]
+        );
+        let remaining = registry.drain_pending_updates(run, false);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, "second");
+    }
 
     #[tokio::test]
     async fn register_and_notify_delivers_resolution() {

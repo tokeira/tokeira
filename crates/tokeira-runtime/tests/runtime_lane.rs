@@ -863,8 +863,8 @@ async fn restart_preserves_wft_completion_routing_metadata() -> Result<()> {
 
 // A late poll still receives work whose initial publication preceded demand;
 // durable discovery also recovers it after its bounded offer expires.
-#[tokio::test]
-async fn late_poller_receives_workflow_task_from_backlog() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn late_poller_rediscovers_workflow_task_after_offer_expiry() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
     let runtime = TokeiraRuntime::new(
         store.clone(),
@@ -887,9 +887,20 @@ async fn late_poller_receives_workflow_task_from_backlog() -> Result<()> {
         .await?;
     let started_state = applied_state(&start);
 
-    // Let the unclaimed task expire out of the in-memory broker into the
-    // durable backlog before the first poller ever shows up.
-    tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+    let polled_queue = queue(namespace_id, "queue-a");
+    runtime.republish_queue(polled_queue.clone(), 64).await?;
+    assert!(runtime.broker().has_runnable_backlog(&polled_queue).await);
+    // Publication predates demand. Move beyond the five-second offer lifetime;
+    // polling must reconstruct the task from its durable dispatch row.
+    tokio::time::advance(tokio::time::Duration::from_secs(6)).await;
+    assert!(
+        runtime
+            .broker()
+            .try_claim_workflow_task(&polled_queue, started_state.run_key)
+            .await
+            .is_none(),
+        "the initial volatile offer must have expired before registering demand"
+    );
 
     let task = runtime
         .poll_workflow_task(
@@ -898,7 +909,7 @@ async fn late_poller_receives_workflow_task_from_backlog() -> Result<()> {
             tokio::time::Duration::from_secs(5),
         )
         .await?
-        .expect("late poller must receive the backlogged workflow task");
+        .expect("late poller must rediscover the workflow task");
     assert_eq!(task.run_key, started_state.run_key);
     assert_eq!(task.token.logical_seq, LogicalTaskSeq::ONE);
 

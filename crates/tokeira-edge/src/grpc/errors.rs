@@ -133,6 +133,7 @@ impl From<EdgeError> for Status {
                 start_request_id,
             } => activity_already_started_status(message, run_id, start_request_id),
             EdgeError::FailedPrecondition(message) => Status::failed_precondition(message),
+            EdgeError::ForwardedStatus(status) => *status,
             EdgeError::Internal(message) => Status::internal(message),
         }
     }

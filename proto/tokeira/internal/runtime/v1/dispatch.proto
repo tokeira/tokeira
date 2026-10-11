@@ -26,5 +26,7 @@ message StartWorkflowTaskResponse {
   bytes started_task_json = 1;
   // Update messages and buffered queries selected by the execution owner.
   // Their response waiters remain on that owner. The entire response is capped.
-  bytes decorations_json = 2;
+  // Encoded temporal.api.workflowservice.v1.PollWorkflowTaskQueueResponse,
+  // carrying only queries and messages with native protobuf byte fields.
+  bytes decorations_proto = 2;
 }

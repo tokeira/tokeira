@@ -135,8 +135,13 @@ embedded migrations, and await ASYNC index readiness. Run them serially on an
 ephemeral cluster. The generated transaction suite also runs for several minutes.
 
 ```bash
-cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_) & !test(workflow_dispatch_live_generated_complete_repair)'
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_) & !test(workflow_dispatch_live_generated_complete_repair) & !test(workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs)'
 ```
+
+The disposal continuation probe `workflow_dispatch_live_disposal_bounds_activity_prefix_and_passes_corruption`
+checks the SQL used by the running adapter. Set `TOKEIRA_WORKFLOW_DISPOSAL_PLAN_OUTPUT`
+to retain its plan locally. It verifies a 64-key activity prefix, corrupt-row deferral,
+and an indexed continuation bound without a filtered workflow-only table scan.
 
 The placement suite uses the same gate and migrated database. Its screening
 fixture inserts 12,288 hot rows and timers, explains the exact first/deep joined
@@ -248,13 +253,14 @@ listener-backed distributed node, as `tokeirad` with `infrastructure.storage = "
 starts, against an existing cluster and the two DynamoDB tables that coordinate its
 connections. Set `TOKEIRA_DSQL_DISTRIBUTED_ENDPOINT`, `TOKEIRA_DSQL_DISTRIBUTED_REGION`,
 `TOKEIRA_DSQL_DISTRIBUTED_RATE_LIMITER_TABLE` and `TOKEIRA_DSQL_DISTRIBUTED_CONN_LEASE_TABLE`;
-each test fails when one is unset. Each table needs only a string partition key named
-`pk`. The standard AWS credential chain must supply an identity authorized for the
+each test fails when one is unset. Run these tests serially (`--test-threads 1`). Use a
+separate fixture from placement suites that deliberately use a different home count.
+Each table needs only a string partition key named `pk`. The standard AWS credential chain must supply an identity authorized for the
 connector's `admin` connection and for both tables.
 
 ```bash
 cargo nextest run -p tokeira-engine --features dsql-integration --lib --locked --profile dsql-live \
-  --run-ignored only -E 'test(/distributed_schema_live_tests::/)'
+  --test-threads 1 --run-ignored only -E 'test(/distributed_schema_live_tests::/)'
 ```
 
 Each test first applies the embedded migrations and forgets any ledger version past what

@@ -6,7 +6,7 @@
 use uuid::Uuid;
 
 /// Maximum legacy keys inspected by one disposal transaction.
-pub const LEGACY_WORKFLOW_KEYS: usize = 64;
+pub const LEGACY_WORKFLOW_KEYS: usize = crate::write_budget::MAX_MAINTENANCE_KEYS;
 
 /// One committed page, including deferred entries passed by its volatile cursor.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -15,6 +15,9 @@ pub struct WorkflowBacklogDisposal {
     pub last_examined: Option<Uuid>,
     /// Entries inspected, whether covered or deferred.
     pub examined: usize,
+    /// Workflow entries whose coverage could not be established. Activity keys
+    /// advance the cursor but never count as deferred workflow work.
+    pub deferred: usize,
     /// Covered workflow entries deleted atomically.
     pub deleted: usize,
     /// Whether the traversal reached its end.

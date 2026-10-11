@@ -3333,6 +3333,25 @@ where
         .hydrate()
         .await
         .context("failed to hydrate task-queue policy")?;
+    // Agreement is a startup prerequisite, before runtime construction or
+    // membership can acquire a home. A later incompatible snapshot terminates
+    // serving instead of silently changing the durable placement function.
+    let initial_routing_cache = if let Some(endpoint) = &effective_config
+        .infrastructure
+        .placement
+        .controller_endpoint
+    {
+        let cache = Arc::new(RoutingCache::new(placement_config(&effective_config)));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokeira_edge::subscribe_routing_once(cache.clone(), endpoint.clone()),
+        )
+        .await
+        .context("timed out waiting for controller placement snapshot")??;
+        Some(cache)
+    } else {
+        None
+    };
     let mut runtime_config = RuntimeConfig::default();
     runtime_config.lane.controller_managed_placement = effective_config
         .infrastructure
@@ -3651,7 +3670,8 @@ where
             .controller_endpoint
             .clone()
     {
-        let routing_cache = Arc::new(RoutingCache::new(placement_config(&effective_config)));
+        let routing_cache = initial_routing_cache
+            .expect("controller snapshot validated before runtime construction");
         let routing_config = EdgeRoutingConfig {
             controller_endpoint,
             max_retries: effective_config
@@ -3661,12 +3681,19 @@ where
         };
         let subscription_cache = routing_cache.clone();
         let subscription_cancel = background_cancel.clone();
+        let routing_shutdown = runtime.shutdown_handle();
+        let routing_cancel = background_cancel.clone();
         let _routing_subscription = engine_tasks.spawn(async move {
             if let Err(error) =
                 run_routing_subscription(subscription_cache, routing_config, subscription_cancel)
                     .await
             {
-                tracing::warn!(?error, "routing subscription exited");
+                tracing::error!(
+                    ?error,
+                    "routing placement became incompatible; stopping node"
+                );
+                routing_shutdown.begin_shutdown();
+                routing_cancel.cancel();
             }
         });
         runtime.set_workflow_task_starter(Arc::new(
@@ -4075,9 +4102,13 @@ where
     });
     let server_recorder = wire_coverage_recorder.clone();
 
+    let server_cancel = background_cancel.clone();
     let server_task = tokio::spawn(async move {
         let shutdown_signal = async move {
-            let _ = shutdown_rx.await;
+            tokio::select! {
+                _ = shutdown_rx => {},
+                _ = server_cancel.cancelled() => {},
+            }
         };
 
         // The conformance layer changes the server's tower-stack type, so the flagged and

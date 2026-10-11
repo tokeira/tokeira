@@ -1010,6 +1010,7 @@ where
         let disposal_wake = Arc::new(tokio::sync::Notify::new());
         let _disposal = runtime_shutdown.spawn(crate::legacy_workflow_backlog::run_disposal(
             repo.clone(),
+            shard_owner.clone(),
             disposal_wake.clone(),
             runtime_shutdown.cancellation_token(),
         ));
@@ -1104,6 +1105,11 @@ where
     /// Wait for seeded startup reconstruction. A failure leaves the home
     /// non-serving and returns its diagnostic; no partially repaired state serves.
     pub async fn ready(&self) -> Result<()> {
+        if self.runtime_shutdown.cancellation_token().is_cancelled() {
+            return Err(
+                crate::RetryableWorkflowTaskStart("runtime is shutting down".into()).into(),
+            );
+        }
         let mut startup = self.startup.clone();
         loop {
             if let Some(result) = startup.borrow_and_update().clone() {
@@ -1256,7 +1262,11 @@ where
             repo: self.repo.clone(),
             registry: self.worker_deployment_registry.clone(),
         };
+        // DescribeTaskQueue exposes approximate matching statistics. Bound the
+        // observation to four index pages across all homes/routes; never make
+        // a public diagnostic scan every run in a large backlog.
         let result: Result<()> = async {
+            let mut pages_left = 4usize;
             let limit =
                 std::num::NonZeroU32::new(crate::discovery::PAGE_SIZE).expect("nonzero page");
             if sticky {
@@ -1271,6 +1281,10 @@ where
                 for id in 0..count {
                     let mut after = None;
                     loop {
+                        if pages_left == 0 {
+                            return Ok(());
+                        }
+                        pages_left -= 1;
                         let keys = self
                             .repo
                             .list_workflow_dispatch_for_home(ShardId(id), after, limit)
@@ -1312,6 +1326,10 @@ where
                     };
                     let mut after = None;
                     loop {
+                        if pages_left == 0 {
+                            return Ok(());
+                        }
+                        pages_left -= 1;
                         let page = self
                             .repo
                             .list_workflow_dispatch_page(&range, after, limit)

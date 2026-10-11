@@ -19,7 +19,7 @@
 # @field infrastructure.dsql.admin_role_arn | infrastructure | default=<unset> | Provisioning identity for DSQL administrative operations.
 # @field infrastructure.dsql.conn_lease_table | infrastructure | default=<unset> | Provisioned DynamoDB table for distributed connection-slot leases.
 # @field infrastructure.dsql.endpoint | infrastructure | default=<unset> | Required when storage is dsql; normally written by the provisioner.
-# @field infrastructure.dsql.migration_policy | infrastructure | default=<unset> | Explicit automatic or validate-only schema policy required at DSQL startup.
+# @field infrastructure.dsql.migration_policy | infrastructure | default=<unset> | Distributed DSQL startup schema policy: unset or validate_only checks the schema; automatic is refused.
 # @field infrastructure.dsql.rate_limiter_table | infrastructure | default=<unset> | Provisioned DynamoDB table for distributed rate limiting.
 # @field infrastructure.dsql.readonly_role_arn | infrastructure | default=<unset> | Read-only identity for inspection tooling.
 # @field infrastructure.dsql.region | infrastructure | default=<unset> | Optional DSQL signing region; defaults to infrastructure.region.
@@ -54,7 +54,7 @@
 # @field infrastructure.placement.reconnect_base_delay_ms | infrastructure | default=1000 | Initial controller reconnection delay.
 # @field infrastructure.placement.reconnect_max_delay_ms | infrastructure | default=30000 | Maximum controller reconnection delay.
 # @field infrastructure.placement.routing_max_retries | infrastructure | default=3 | Maximum retries after a stale placement route.
-# @field infrastructure.placement.shard_count | infrastructure | default=1 | Logical shard count; must equal bundle_count. The DSQL profile promotes the legacy default to 32; configure bundle_count explicitly to match without changing existing durable placement.
+# @field infrastructure.placement.shard_count | infrastructure | default=1 | Logical shard count; must equal bundle_count. The DSQL profile promotes both legacy defaults to 32 together; preserve the existing durable placement count when configuring explicit values.
 # @field infrastructure.region | infrastructure | default="us-east-1" | AWS region used by regional infrastructure integrations.
 # @field infrastructure.storage | infrastructure | default="in-memory" | Select in-memory development storage or Aurora DSQL.
 # @field policy.authorization.aws_iam.grants[].grant | Tokeira native | default=[] | Temporal namespace:role grants for matching AWS identities.

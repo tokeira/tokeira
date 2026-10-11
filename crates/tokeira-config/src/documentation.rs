@@ -220,7 +220,7 @@ pub const CONFIG_FIELD_CATALOG: &[ConfigFieldDocumentation] = &[
         "1",
         false,
         None,
-        "Logical shard count; must equal bundle_count. The DSQL profile promotes the legacy default to 32; configure bundle_count explicitly to match without changing existing durable placement."
+        "Logical shard count; must equal bundle_count. The DSQL profile promotes both legacy defaults to 32 together; preserve the existing durable placement count when configuring explicit values."
     ),
     field!(
         "infrastructure.placement.bundle_count",

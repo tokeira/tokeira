@@ -15,10 +15,16 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use http::HeaderMap;
 use prost::Message as _;
-use tokeira_proto::internal::runtime::{
-    StartWorkflowTaskRequest, StartWorkflowTaskResponse,
-    workflow_task_dispatch_client::WorkflowTaskDispatchClient,
-    workflow_task_dispatch_server::{WorkflowTaskDispatch, WorkflowTaskDispatchServer},
+use tokeira_proto::{
+    internal::runtime::{
+        StartWorkflowTaskRequest, StartWorkflowTaskResponse,
+        workflow_task_dispatch_client::WorkflowTaskDispatchClient,
+        workflow_task_dispatch_server::{WorkflowTaskDispatch, WorkflowTaskDispatchServer},
+    },
+    public::temporal::api::{
+        protocol::v1::{Message as WireProtocolMessage, message::SequencingId},
+        query::v1::WorkflowQuery,
+    },
 };
 use tokeira_runtime::{
     StartedWorkflowTask, TokeiraRuntime, WorkflowOfferRejected, WorkflowTaskStarter,
@@ -37,7 +43,11 @@ use crate::{
 };
 
 const MAX_START_REQUEST_BYTES: usize = 64 * 1024;
-const MAX_START_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+// common/rpc/grpc.go @ v1.31.0 uses 128 MiB for internode receives.
+const MAX_START_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
+// Start metadata contains bounded identifiers and scalar coordinates, never
+// history or payloads. Reserve ample room beyond the 64 KiB admitted request.
+const START_METADATA_RESERVE: usize = 4 * 1024 * 1024;
 
 /// Only transport payloads cross homes; completion channels remain on the
 /// execution owner, where public workflow-task reply forwarding returns the
@@ -46,6 +56,114 @@ const MAX_START_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) struct WorkflowTaskDecorations {
     pub(crate) queries: HashMap<String, WorkflowQueryDto>,
     pub(crate) messages: Vec<ProtocolMessageDto>,
+}
+
+impl WorkflowTaskDecorations {
+    fn encode_proto(&self) -> Vec<u8> {
+        tokeira_proto::workflowservice::PollWorkflowTaskQueueResponse {
+            queries: self
+                .queries
+                .iter()
+                .map(|(id, query)| {
+                    (
+                        id.clone(),
+                        WorkflowQuery {
+                            query_type: query.query_type.clone(),
+                            query_args: Some(
+                                tokeira_proto::conversions::common::payloads_from_domain(
+                                    &query.query_args,
+                                ),
+                            ),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+            messages: self
+                .messages
+                .iter()
+                .map(|message| WireProtocolMessage {
+                    id: message.id.clone(),
+                    protocol_instance_id: message.protocol_instance_id.clone(),
+                    body: Some(
+                        prost_types::Any::decode(message.body.as_slice())
+                            .expect("server-authored update Any"),
+                    ),
+                    sequencing_id: message.sequencing_event_id.map(SequencingId::EventId),
+                })
+                .collect(),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    fn decode_proto(bytes: &[u8]) -> Result<Self> {
+        let wire = tokeira_proto::workflowservice::PollWorkflowTaskQueueResponse::decode(bytes)?;
+        Ok(Self {
+            queries: wire
+                .queries
+                .into_iter()
+                .map(|(id, query)| {
+                    (
+                        id,
+                        WorkflowQueryDto {
+                            query_type: query.query_type,
+                            query_args: query
+                                .query_args
+                                .as_ref()
+                                .map(tokeira_proto::conversions::common::payloads_to_domain)
+                                .unwrap_or_default(),
+                        },
+                    )
+                })
+                .collect(),
+            messages: wire
+                .messages
+                .into_iter()
+                .map(|message| ProtocolMessageDto {
+                    id: message.id,
+                    protocol_instance_id: message.protocol_instance_id,
+                    body: message
+                        .body
+                        .map(|body| body.encode_to_vec())
+                        .unwrap_or_default(),
+                    sequencing_event_id: match message.sequencing_id {
+                        Some(SequencingId::EventId(id)) => Some(id),
+                        _ => None,
+                    },
+                })
+                .collect(),
+        })
+    }
+}
+
+fn update_message(
+    update: &tokeira_runtime::PendingUpdateTransport,
+    event_id: i64,
+) -> ProtocolMessageDto {
+    let request = tokeira_proto::public::temporal::api::update::v1::Request {
+        meta: Some(tokeira_proto::public::temporal::api::update::v1::Meta {
+            update_id: update.update_id.clone(),
+            identity: update.identity.clone(),
+        }),
+        input: Some(tokeira_proto::public::temporal::api::update::v1::Input {
+            header: None,
+            name: update.update_name.clone(),
+            args: Some(tokeira_proto::conversions::common::payloads_from_domain(
+                &update.input,
+            )),
+        }),
+    };
+    ProtocolMessageDto {
+        id: format!("{}/request", update.update_id),
+        protocol_instance_id: update.update_id.clone(),
+        body: prost_types::Any {
+            type_url: "type.googleapis.com/temporal.api.update.v1.Request".into(),
+            value: request.encode_to_vec(),
+        }
+        .encode_to_vec(),
+        sequencing_event_id: Some(event_id),
+    }
 }
 
 /// Request-local authorization material; never stored with offers or run state.
@@ -64,16 +182,21 @@ tokio::task_local! {
 }
 
 /// Uses the same controller snapshot as edge routing to locate the execution
-/// owner. A stale route fails the poll; a later poll obtains a fresh route.
+/// owner. A stale route retries within the original poll deadline while the
+/// shared subscription obtains a fresh route.
 #[derive(Debug)]
 pub struct RemoteWorkflowTaskStarter {
     cache: Arc<RoutingCache>,
+    channels: super::peer_transport::PeerChannels,
 }
 
 impl RemoteWorkflowTaskStarter {
     /// Construct from the engine's shared, continuously refreshed routing cache.
     pub fn new(cache: Arc<RoutingCache>) -> Self {
-        Self { cache }
+        Self {
+            cache,
+            channels: Default::default(),
+        }
     }
 }
 
@@ -89,17 +212,20 @@ impl WorkflowTaskStarter for RemoteWorkflowTaskStarter {
             .try_with(Clone::clone)
             .map_err(|_| anyhow!("remote workflow start requires an authorized poll context"))?;
         let snapshot = self.cache.snapshot();
-        let owner = snapshot
-            .lookup_bundle_owner(home)
-            .ok_or_else(|| anyhow!("workflow execution home has no route"))?;
+        let owner = snapshot.lookup_bundle_owner(home).ok_or_else(|| {
+            tokeira_runtime::RetryableWorkflowTaskStart(
+                "workflow execution home has no route".into(),
+            )
+        })?;
         let endpoint = snapshot
             .lookup_node_endpoint(owner.node_id)
-            .ok_or_else(|| anyhow!("workflow execution owner has no endpoint"))?;
-        let endpoint =
-            tonic::transport::Endpoint::from_shared(format!("http://{}", endpoint.as_authority()))?
-                .connect_timeout(Duration::from_secs(5))
-                .timeout(Duration::from_secs(10));
-        let mut client = WorkflowTaskDispatchClient::new(endpoint.connect().await?)
+            .ok_or_else(|| {
+                tokeira_runtime::RetryableWorkflowTaskStart(
+                    "workflow execution owner has no endpoint".into(),
+                )
+            })?;
+        let channel = self.channels.get(&endpoint.as_authority())?;
+        let mut client = WorkflowTaskDispatchClient::new(channel)
             .max_decoding_message_size(MAX_START_RESPONSE_BYTES)
             .max_encoding_message_size(MAX_START_REQUEST_BYTES);
         let mut request = Request::new(StartWorkflowTaskRequest {
@@ -120,29 +246,10 @@ impl WorkflowTaskStarter for RemoteWorkflowTaskStarter {
             )
             .into());
         }
-        // Preserve configured authentication headers without forwarding HTTP
-        // framing or routing headers from the public socket.
-        let mut headers = context.headers;
-        for name in [
-            "host",
-            "content-length",
-            "content-type",
-            "connection",
-            "te",
-            "grpc-timeout",
-        ] {
-            headers.remove(name);
-        }
-        *request.metadata_mut() = tonic::metadata::MetadataMap::from_headers(headers);
-        let response = match client.start_workflow_task(request).await {
-            Ok(response) => response.into_inner(),
-            Err(status) if status.code() == Code::NotFound => {
-                return Err(WorkflowOfferRejected.into());
-            }
-            Err(status) => return Err(status.into()),
-        };
+        *request.metadata_mut() = super::peer_transport::start_metadata(context.headers);
+        let response = receive_start_response(client.start_workflow_task(request)).await?;
         let started = serde_json::from_slice(&response.started_task_json)?;
-        let decorations = serde_json::from_slice(&response.decorations_json)?;
+        let decorations = WorkflowTaskDecorations::decode_proto(&response.decorations_proto)?;
         *context
             .decorations
             .lock()
@@ -151,12 +258,62 @@ impl WorkflowTaskStarter for RemoteWorkflowTaskStarter {
     }
 }
 
+async fn receive_start_response(
+    call: impl std::future::Future<
+        Output = std::result::Result<Response<StartWorkflowTaskResponse>, Status>,
+    >,
+) -> Result<StartWorkflowTaskResponse> {
+    // Keep the peer-attempt timeout distinct from a caller's cancellation.
+    // Forwarding grpc-timeout can collapse both to Cancelled in tonic. The
+    // runtime owns the original long-poll deadline around all attempts.
+    let result = tokio::time::timeout(Duration::from_secs(10), call)
+        .await
+        .map_err(|_| {
+            tokeira_runtime::RetryableWorkflowTaskStart("owner attempt timed out".into())
+        })?;
+    match result {
+        Ok(response) => Ok(response.into_inner()),
+        Err(status)
+            if status.code() == Code::NotFound
+                && status
+                    .metadata()
+                    .contains_key("x-tokeira-stale-workflow-offer") =>
+        {
+            Err(WorkflowOfferRejected.into())
+        }
+        Err(status)
+            if matches!(
+                status.code(),
+                Code::Unavailable
+                    | Code::DeadlineExceeded
+                    | Code::NotFound
+                    | Code::Internal
+                    | Code::Unknown
+                    | Code::DataLoss
+            ) =>
+        {
+            Err(tokeira_runtime::RetryableWorkflowTaskStart(status.to_string()).into())
+        }
+        Err(status) => Err(status.into()),
+    }
+}
+
+fn stale_offer_status() -> Status {
+    let mut status = Status::not_found("workflow offer is no longer startable");
+    status.metadata_mut().insert(
+        "x-tokeira-stale-workflow-offer",
+        "1".parse().expect("static metadata"),
+    );
+    status
+}
+
 /// The internal service retains the public poll's authorization contract while
 /// committing only on a locally serving execution home.
 pub struct WorkflowTaskDispatchGrpc<R> {
     runtime: Arc<TokeiraRuntime<R>>,
     interceptors: Arc<EdgeInterceptors>,
     workflow_service: WorkflowService,
+    attachment_limit: usize,
 }
 
 impl<R> fmt::Debug for WorkflowTaskDispatchGrpc<R> {
@@ -171,6 +328,7 @@ impl<R> Clone for WorkflowTaskDispatchGrpc<R> {
             runtime: self.runtime.clone(),
             interceptors: self.interceptors.clone(),
             workflow_service: self.workflow_service.clone(),
+            attachment_limit: self.attachment_limit,
         }
     }
 }
@@ -187,6 +345,7 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatchGrpc<R> {
             runtime,
             interceptors,
             workflow_service,
+            attachment_limit: MAX_START_RESPONSE_BYTES - START_METADATA_RESERVE,
         }
     }
     /// Bound the input envelope before protobuf decoding; no history is accepted.
@@ -242,7 +401,7 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
                 .await
                 .map_err(|_| Status::unavailable("workflow state could not be loaded"))?
             else {
-                return Err(Status::not_found("workflow offer is no longer startable"));
+                return Err(stale_offer_status());
             };
             // Sticky policy uses the supplied normal queue. Bind that coordinate
             // to authority before trusting the authorization decision above.
@@ -252,7 +411,7 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
                     .as_deref()
                     .is_some_and(|normal| normal != state.task_queue.0)
             {
-                return Err(Status::not_found("workflow offer is no longer startable"));
+                return Err(stale_offer_status());
             }
             self.interceptors
                 .authorize_worker_target(
@@ -269,6 +428,62 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
                     ),
                 )
                 .await?;
+        }
+        // Freeze transport payloads before the commit. New admissions cannot
+        // enlarge this response; they remain unsent for a later task. Queries
+        // retain their sender and payload until a worker actually answers.
+        let updates = self
+            .runtime
+            .update_registry()
+            .snapshot_pending_updates(run_key);
+        let queries = self.runtime.buffered_queries().snapshot(run_key);
+        // The only variable metadata comes from immutable run coordinates and
+        // this request. Six bytes per source byte bounds JSON escaping, with
+        // repeated queue fields included. Refuse even malformed restored state
+        // before starting, rather than trusting only public admission limits.
+        let tokeira_kernel::LoadedRun::Existing(state) = self
+            .runtime
+            .repo()
+            .load_run(run_key)
+            .await
+            .map_err(|_| Status::unavailable("workflow metadata unavailable"))?
+        else {
+            return Err(stale_offer_status());
+        };
+        let metadata_bound = request
+            .encoded_len()
+            .saturating_mul(6)
+            .saturating_add(state.workflow_id.0.len().saturating_mul(6))
+            .saturating_add(state.task_queue.0.len().saturating_mul(12))
+            .saturating_add(16 * 1024);
+        if metadata_bound > START_METADATA_RESERVE {
+            return Err(Status::resource_exhausted(
+                "internal workflow-start metadata exceeds reserved envelope space",
+            ));
+        }
+        drop(state);
+        let mut decorations = WorkflowTaskDecorations {
+            queries: queries
+                .iter()
+                .map(|query| {
+                    (
+                        query.query_id.clone(),
+                        WorkflowQueryDto {
+                            query_type: query.query_type.clone(),
+                            query_args: query.query_args.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            messages: updates
+                .iter()
+                .map(|update| update_message(update, i64::MAX))
+                .collect(),
+        };
+        if decorations.encode_proto().len() > self.attachment_limit {
+            return Err(Status::resource_exhausted(
+                "internal workflow-start attachments exceed the 128 MiB envelope",
+            ));
         }
         let worker = WorkerIdentity(request.worker_identity);
         let task = DispatchableWorkflowTask {
@@ -293,7 +508,7 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
             .await
             .map_err(|error| {
                 if error.is::<WorkflowOfferRejected>() {
-                    return Status::not_found("workflow offer is no longer startable");
+                    return stale_offer_status();
                 }
                 if let Some(rejected) = error.downcast_ref::<tokeira_runtime::KernelRejected>() {
                     match rejected.0 {
@@ -303,7 +518,7 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
                         | tokeira_kernel::Reject::WorkflowPaused
                         | tokeira_kernel::Reject::WorkflowTaskSeqMismatch { .. }
                         | tokeira_kernel::Reject::WorkflowTaskAlreadyStarted { .. } => {
-                            return Status::not_found("workflow offer is no longer startable");
+                            return stale_offer_status();
                         }
                         _ => {}
                     }
@@ -317,25 +532,26 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
         let barrier = started
             .last_event_id_at_start
             .max(started.token.started_event_id);
-        let decorations = self
+        let delivered = self.runtime.update_registry().mark_prepared_updates_sent(
+            run_key,
+            &updates,
+            started.token.attempt > 1,
+        );
+        decorations
+            .messages
+            .retain(|message| delivered.contains(&message.protocol_instance_id));
+        for message in &mut decorations.messages {
+            message.sequencing_event_id = Some(started.token.started_event_id - 1);
+        }
+        decorations.queries = self
             .workflow_service
-            .workflow_task_decorations(&started, barrier, &task_token)
-            .await
-            .map_err(Status::from)?;
+            .bind_prepared_queries(run_key, barrier, &task_token, queries)
+            .await;
         let response = StartWorkflowTaskResponse {
             started_task_json: serde_json::to_vec(&started)
                 .map_err(|_| Status::internal("failed to encode workflow start"))?,
-            decorations_json: serde_json::to_vec(&decorations)
-                .map_err(|_| Status::internal("failed to encode workflow attachments"))?,
+            decorations_proto: decorations.encode_proto(),
         };
-        // An encoder-side refusal can otherwise reset the HTTP/2 stream and
-        // hide the reason. Keep the transport cap as defense in depth while
-        // returning a stable explicit error for this known oversized envelope.
-        if response.encoded_len() > MAX_START_RESPONSE_BYTES {
-            return Err(Status::resource_exhausted(
-                "internal workflow-start response exceeds 4 MiB",
-            ));
-        }
         Ok(Response::new(response))
     }
 }
@@ -406,6 +622,84 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn owner_attempt_timeout_and_namespace_miss_are_retryable_but_stale_offer_is_not() {
+        let timeout = receive_start_response(std::future::pending())
+            .await
+            .unwrap_err();
+        assert!(timeout.is::<tokeira_runtime::RetryableWorkflowTaskStart>());
+        let missing_namespace = receive_start_response(std::future::ready(Err(Status::not_found(
+            "namespace unavailable",
+        ))))
+        .await
+        .unwrap_err();
+        assert!(missing_namespace.is::<tokeira_runtime::RetryableWorkflowTaskStart>());
+        let stale = receive_start_response(std::future::ready(Err(stale_offer_status())))
+            .await
+            .unwrap_err();
+        assert!(stale.is::<WorkflowOfferRejected>());
+        let cancelled = receive_start_response(std::future::ready(Err(Status::cancelled(
+            "caller cancelled",
+        ))))
+        .await
+        .unwrap_err();
+        assert_eq!(
+            cancelled.downcast_ref::<Status>().unwrap().code(),
+            Code::Cancelled
+        );
+    }
+
+    #[test]
+    fn forwarded_poll_preserves_authentication_cancellation_and_capacity_statuses() {
+        for code in [
+            Code::Unauthenticated,
+            Code::PermissionDenied,
+            Code::Cancelled,
+            Code::ResourceExhausted,
+        ] {
+            let original = Status::new(code, "owner decision");
+            let public: Status = crate::EdgeError::from(anyhow::Error::from(original)).into();
+            assert_eq!(public.code(), code);
+            assert_eq!(public.message(), "owner decision");
+        }
+    }
+
+    #[test]
+    fn protobuf_attachments_carry_the_default_inflight_update_budget_and_query() {
+        let updates: Vec<_> =
+            (0..10)
+                .map(|index| tokeira_runtime::PendingUpdateTransport {
+                    update_id: format!("update-{index}"),
+                    update_name: "handler".into(),
+                    identity: "worker".into(),
+                    input: tokeira_types::Payloads(vec![tokeira_types::Payload::new(
+                        vec![255; 2 * 1024 * 1024 - 1024],
+                    )]),
+                })
+                .collect();
+        let decorations = WorkflowTaskDecorations {
+            messages: updates
+                .iter()
+                .map(|update| update_message(update, i64::MAX))
+                .collect(),
+            queries: HashMap::from([(
+                "query".into(),
+                WorkflowQueryDto {
+                    query_type: "read".into(),
+                    query_args: tokeira_types::Payloads(vec![tokeira_types::Payload::new(
+                        vec![255; 2 * 1024 * 1024 - 1024],
+                    )]),
+                },
+            )]),
+        };
+        let wire = decorations.encode_proto();
+        assert!(wire.len() > 20 * 1024 * 1024);
+        assert!(wire.len() < MAX_START_RESPONSE_BYTES - START_METADATA_RESERVE);
+        let decoded = WorkflowTaskDecorations::decode_proto(&wire).unwrap();
+        assert_eq!(decoded.messages, decorations.messages);
+        assert_eq!(decoded.queries, decorations.queries);
+    }
+
     #[tokio::test]
     async fn forwarded_start_and_replies_use_owner_waiters_and_reauthenticate() {
         let store = Arc::new(InMemoryStore::default());
@@ -445,9 +739,11 @@ mod tests {
                 execution.clone(),
                 "owner-update".into(),
                 "update-handler".into(),
-                tokeira_types::Payloads(vec![tokeira_types::Payload::new(
-                    b"update-input".to_vec(),
-                )]),
+                tokeira_types::Payloads(vec![tokeira_types::Payload::new(vec![
+                    255;
+                    2 * 1024 * 1024
+                        - 1024
+                ])]),
                 tokeira_types::RequestContext::unattributed(time::OffsetDateTime::now_utc()),
                 time::Duration::seconds(30),
                 tokeira_runtime::UpdateWaitPolicy::Admitted,
@@ -503,6 +799,8 @@ mod tests {
         let owner_reply_service = public_service.clone();
         let service =
             WorkflowTaskDispatchGrpc::new(runtime.clone(), interceptors.clone(), workflow_service);
+        let mut small_envelope_service = service.clone();
+        small_envelope_service.attachment_limit = 1024;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let stop = CancellationToken::new();
@@ -585,6 +883,12 @@ mod tests {
             "authorization",
             http::HeaderValue::from_static("Bearer synthetic-worker"),
         );
+        forwarding
+            .headers
+            .insert("grpc-encoding", "gzip".parse().unwrap());
+        forwarding
+            .headers
+            .insert("grpc-accept-encoding", "gzip".parse().unwrap());
         let oversized_request = FORWARDED_POLL
             .scope(
                 forwarding.clone(),
@@ -635,6 +939,15 @@ mod tests {
         let decorations = forwarding.decorations.lock().unwrap().take().unwrap();
         assert_eq!(decorations.messages.len(), 1);
         assert_eq!(decorations.messages[0].protocol_instance_id, "owner-update");
+        let update_any = prost_types::Any::decode(decorations.messages[0].body.as_slice()).unwrap();
+        let update_wire = tokeira_proto::public::temporal::api::update::v1::Request::decode(
+            update_any.value.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            update_wire.input.unwrap().args.unwrap().payloads[0].data,
+            vec![255; 2 * 1024 * 1024 - 1024]
+        );
         assert!(runtime.pending_update_transports(key, false).is_empty());
         assert!(
             runtime
@@ -644,7 +957,10 @@ mod tests {
         assert_eq!(decorations.queries.len(), 1);
         let (query_id, query) = decorations.queries.into_iter().next().unwrap();
         assert_eq!(query.query_args.0[0].data, b"query-input");
-        assert!(!runtime.buffered_queries().has_buffered(key));
+        assert!(
+            runtime.buffered_queries().has_buffered(key),
+            "delivery must retain the query until answered"
+        );
         let token =
             crate::task_token::encode(started.token.clone(), offer.queue.namespace_id).unwrap();
         let committed = store.snapshot().await.unwrap();
@@ -806,26 +1122,48 @@ mod tests {
         let _large_reply = buffer_query(&runtime, large_key, 0, vec![255; 1_100_000]);
         let mut large_offer = offer;
         large_offer.run_key = large_key;
-        let too_large = FORWARDED_POLL
+        let before_refusal = store.snapshot().await.unwrap();
+        let refused = small_envelope_service
+            .start_workflow_task(authorized_reply(StartWorkflowTaskRequest {
+                run_key: large_key.0.as_bytes().to_vec(),
+                logical_seq: 1,
+                namespace: "default".into(),
+                task_queue: large_offer.queue.task_queue.0.clone(),
+                worker_identity: "worker".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), Code::ResourceExhausted);
+        assert_eq!(
+            before_refusal,
+            store.snapshot().await.unwrap(),
+            "size rejection must precede durable start"
+        );
+        assert!(runtime.buffered_queries().has_buffered(large_key));
+        let large_started = FORWARDED_POLL
             .scope(
                 forwarding.clone(),
                 starter.start(ShardId(0), large_offer, WorkerIdentity("worker".into())),
             )
             .await
-            .unwrap_err();
-        let oversized_status = too_large.downcast_ref::<Status>().unwrap();
-        assert_eq!(oversized_status.code(), Code::ResourceExhausted);
-        let public_status: Status = crate::EdgeError::from(too_large).into();
-        assert_eq!(public_status.code(), Code::ResourceExhausted);
-        assert!(public_status.message().contains("4 MiB"));
-        assert!(forwarding.decorations.lock().unwrap().is_none());
-        let tokeira_kernel::LoadedRun::Existing(state) = store.load_run(large_key).await.unwrap()
-        else {
-            panic!("started run missing")
-        };
+            .unwrap();
+        assert_eq!(large_started.run_key, large_key);
+        let large_decorations = forwarding.decorations.lock().unwrap().take().unwrap();
+        assert_eq!(
+            large_decorations
+                .queries
+                .values()
+                .next()
+                .unwrap()
+                .query_args
+                .0[0]
+                .data,
+            vec![255; 1_100_000]
+        );
         assert!(
-            state.pending_workflow_task.unwrap().started_at.is_some(),
-            "response refusal must not undo a committed start"
+            runtime.buffered_queries().has_buffered(large_key),
+            "a dropped start reply must not consume the query"
         );
         queue_runtime.shutdown_handle().begin_shutdown();
         queue_runtime

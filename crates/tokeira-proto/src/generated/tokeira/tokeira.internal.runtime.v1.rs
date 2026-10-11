@@ -30,8 +30,10 @@ pub struct StartWorkflowTaskResponse {
     pub started_task_json: ::prost::alloc::vec::Vec<u8>,
     /// Update messages and buffered queries selected by the execution owner.
     /// Their response waiters remain on that owner. The entire response is capped.
+    /// Encoded temporal.api.workflowservice.v1.PollWorkflowTaskQueueResponse,
+    /// carrying only queries and messages with native protobuf byte fields.
     #[prost(bytes = "vec", tag = "2")]
-    pub decorations_json: ::prost::alloc::vec::Vec<u8>,
+    pub decorations_proto: ::prost::alloc::vec::Vec<u8>,
 }
 /// Generated client implementations.
 pub mod workflow_task_dispatch_client {

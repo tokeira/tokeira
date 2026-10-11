@@ -881,10 +881,24 @@ where
 
             match polled {
                 WorkflowPollResult::Queued(offered, entered_at) => {
-                    match self
-                        .start_polled_workflow_task(offered, entered_at, worker_identity.clone())
-                        .await
-                    {
+                    let start = self.start_polled_workflow_task(
+                        offered,
+                        entered_at,
+                        worker_identity.clone(),
+                    );
+                    // A zero-duration poll forbids waiting for new queue work;
+                    // it still starts a task already matched by the broker.
+                    // Applying an expired timer here races that start's first
+                    // lane yield and can consume a ready task without returning it.
+                    let start = if timeout_after.is_zero() {
+                        start.await
+                    } else {
+                        let Ok(result) = tokio::time::timeout_at(deadline, start).await else {
+                            return Ok(None);
+                        };
+                        result
+                    };
+                    match start {
                         Ok(started) => {
                             return Ok(Some(WorkflowActivation::WorkflowTask(started)));
                         }
@@ -904,6 +918,19 @@ where
                             tracing::debug!(
                                 ?error,
                                 "discarded superseded workflow task from broker; re-polling"
+                            );
+                            continue;
+                        }
+                        Err(error) if error.is::<crate::RetryableWorkflowTaskStart>() => {
+                            // An immediate poll may finish a matched start, but
+                            // it must not begin another owner attempt after its
+                            // queue-wait budget is exhausted.
+                            if tokio::time::Instant::now() >= deadline {
+                                return Ok(None);
+                            }
+                            tracing::debug!(
+                                ?error,
+                                "workflow owner unavailable; re-polling within caller deadline"
                             );
                             continue;
                         }

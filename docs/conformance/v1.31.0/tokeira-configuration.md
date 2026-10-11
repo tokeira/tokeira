@@ -407,7 +407,7 @@ All accepted production leaves are listed below. Fields are startup-static; chan
 | `infrastructure.dsql.admin_role_arn` | infrastructure | `<unset>` | no | yes | — | Provisioning identity for DSQL administrative operations. |
 | `infrastructure.dsql.conn_lease_table` | infrastructure | `<unset>` | no | yes | — | Provisioned DynamoDB table for distributed connection-slot leases. |
 | `infrastructure.dsql.endpoint` | infrastructure | `<unset>` | yes | yes | — | Required when storage is dsql; normally written by the provisioner. |
-| `infrastructure.dsql.migration_policy` | infrastructure | `<unset>` | no | yes | — | Explicit automatic or validate-only schema policy required at DSQL startup. |
+| `infrastructure.dsql.migration_policy` | infrastructure | `<unset>` | no | yes | — | Distributed DSQL startup schema policy: unset or validate_only checks the schema; automatic is refused. |
 | `infrastructure.dsql.rate_limiter_table` | infrastructure | `<unset>` | no | yes | — | Provisioned DynamoDB table for distributed rate limiting. |
 | `infrastructure.dsql.readonly_role_arn` | infrastructure | `<unset>` | no | yes | — | Read-only identity for inspection tooling. |
 | `infrastructure.dsql.region` | infrastructure | `<unset>` | no | yes | — | Optional DSQL signing region; defaults to infrastructure.region. |
@@ -442,7 +442,7 @@ All accepted production leaves are listed below. Fields are startup-static; chan
 | `infrastructure.placement.reconnect_base_delay_ms` | infrastructure | `1000` | no | yes | — | Initial controller reconnection delay. |
 | `infrastructure.placement.reconnect_max_delay_ms` | infrastructure | `30000` | no | yes | — | Maximum controller reconnection delay. |
 | `infrastructure.placement.routing_max_retries` | infrastructure | `3` | no | yes | — | Maximum retries after a stale placement route. |
-| `infrastructure.placement.shard_count` | infrastructure | `1` | no | yes | — | Logical shard count; must equal bundle_count. The DSQL profile promotes the legacy default to 32; configure bundle_count explicitly to match without changing existing durable placement. |
+| `infrastructure.placement.shard_count` | infrastructure | `1` | no | yes | — | Logical shard count; must equal bundle_count. The DSQL profile promotes both legacy defaults to 32 together; preserve the existing durable placement count when configuring explicit values. |
 | `infrastructure.region` | infrastructure | `"us-east-1"` | no | yes | — | AWS region used by regional infrastructure integrations. |
 | `infrastructure.storage` | infrastructure | `"in-memory"` | no | yes | — | Select in-memory development storage or Aurora DSQL. |
 | `policy.authorization.aws_iam.grants[].grant` | Tokeira native | `[]` | yes | yes | `aws-iam-bearer-authorization` | Temporal namespace:role grants for matching AWS identities. |
@@ -526,9 +526,9 @@ deployment_name = "payments"
 build_id = "2026-07-28.1"
 ```
 
-Every resource comparison is exact and case-sensitive. Polls must use VERSIONED Worker Deployment mode with both the configured deployment name and build ID. The fixed Worker RPC surface is `PollWorkflowTaskQueue`, `PollActivityTaskQueue`, `PollNexusTaskQueue`, `RespondWorkflowTaskCompleted`, `RespondWorkflowTaskFailed`, `RespondQueryTaskCompleted`, `RespondActivityTaskCompleted`, `RespondActivityTaskFailed`, `RespondActivityTaskCanceled`, `RecordActivityTaskHeartbeat`, `RespondNexusTaskCompleted`, `RespondNexusTaskFailed`, `RecordWorkerHeartbeat`, `ShutdownWorker`, and queue-scoped `DescribeTaskQueue`. Universal `Health/Check` and `GetSystemInfo` remain available independently of Worker scope.
+Every resource comparison is exact and case-sensitive. Polls must use VERSIONED Worker Deployment mode with both the configured deployment name and build ID. The fixed Worker RPC surface is `PollWorkflowTaskQueue`, `PollActivityTaskQueue`, `PollNexusTaskQueue`, `RespondWorkflowTaskCompleted`, `RespondWorkflowTaskFailed`, `RespondQueryTaskCompleted`, `RespondActivityTaskCompleted`, `RespondActivityTaskFailed`, `RespondActivityTaskCanceled`, `RecordActivityTaskHeartbeat`, `RespondNexusTaskCompleted`, `RespondNexusTaskFailed`, `RecordWorkerHeartbeat`, `ShutdownWorker`, and queue-scoped `DescribeTaskQueue`. Universal `Health/Check` and `GetSystemInfo` remain available independently of Worker scope. A scoped worker may call `DescribeNamespace` for its own namespace by exact name.
 
-Activity By-ID aliases, standalone Activities, unversioned or deprecated Worker Versioning, Worker inventory, visibility/history reads, Workflow starts, and every other namespace-wide API are denied for a scoped identity. Sticky Workflow polls authorize the request's stable `normal_name`; sticky aliases are never configured as resources.
+Activity By-ID aliases, standalone Activities, unversioned or deprecated Worker Versioning, Worker inventory, visibility/history reads, Workflow starts, `DescribeNamespace` by ID or for another namespace, and other namespace-wide APIs are denied for a scoped identity. Sticky Workflow polls authorize the request's stable `normal_name`; sticky aliases are never configured as resources.
 
 The Go SDK can refresh an externally issued bearer through its standard credentials callback; return the token without a `Bearer ` prefix because the SDK adds it:
 

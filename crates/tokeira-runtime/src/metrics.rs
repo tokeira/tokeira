@@ -33,7 +33,8 @@ pub const WORKFLOW_DISPATCH_OWNERSHIP_LOSS_TOTAL: &str =
 /// Elapsed duration of a completed or retired discovery pass.
 pub const WORKFLOW_DISPATCH_PASS_DURATION_SECONDS: &str =
     "tokeira_runtime_workflow_dispatch_pass_duration_seconds";
-/// Workflow dispatch repairs committed by acquisition recovery.
+/// Successful acquisition reconciliation calls, including already-correct rows.
+/// Failed attempts and retries are excluded.
 pub const WORKFLOW_DISPATCH_REPAIRS_TOTAL: &str = "tokeira_runtime_workflow_dispatch_repairs_total";
 
 pub const BROKER_PUBLISH_TOTAL: &str = "tokeira_runtime_broker_publish_total";

@@ -79,7 +79,7 @@ where:
 
 - `workflow_hot` contains the latest transition sequence, last event ID, status, wait bits, sticky hints, and small summary fields,
 - `history_batches` are immutable append-only event batches,
-- `activity_dispatch` holds a row for each activity that can be offered to a worker, while the activity itself lives in the run's state (`activity_state` is no longer written; see the `activity-state-writes` spec),
+- `activity_dispatch` holds a row for each activity that can be offered to a worker, while the activity itself lives in the run's state,
 - `timer_rows` hold outstanding due-time obligations,
 - `request_dedupe` prevents duplicate state transitions on retry.
 
@@ -123,7 +123,7 @@ A transition typically does all of the following atomically:
 
 1. append a batch of history events,
 2. update `workflow_hot`,
-3. upsert/delete affected activity rows,
+3. upsert/delete affected activity dispatch rows,
 4. upsert/delete affected timer rows,
 5. record request dedupe,
 6. emit dispatch intents,

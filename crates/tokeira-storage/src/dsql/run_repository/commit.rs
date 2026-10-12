@@ -341,8 +341,8 @@ async fn write_transition(
         .await?;
     }
     // The activity itself lives only in the run's state above; an activity op
-    // maintains its dispatch row and writes nothing to `activity_state`
-    // (`activity-state-writes` criterion 2.1).
+    // maintains its dispatch row and nothing else (`activity-state-writes`
+    // criterion 2.1).
     for op in &transition.activity_ops {
         match op {
             ActivityOp::Upsert(activity) => {

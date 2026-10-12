@@ -4,7 +4,7 @@
 
 This design covers the 10 read-only query methods on `DsqlRunRepository` that replace the current `bail!("Feature 3: dsql-side-tables")` stubs, plus a new `activity_dispatch` table with its write-path integration and a runtime guard against duplicate activity starts.
 
-> The `activity_state` sweep described below, `list_open_activities_for_shard` (Requirement 9), is withdrawn. `recovery-index` takes a shard's activities from run state, and since [activity-state-writes](../activity-state-writes/bugfix.md) nothing writes `activity_state`. The passages about it record what the method did.
+> The `activity_state` sweep described below, `list_open_activities_for_shard` (Requirement 9), is withdrawn. `recovery-index` takes a shard's activities from run state, since [activity-state-writes](../activity-state-writes/bugfix.md) nothing writes `activity_state`, and [activity-state-drop](../activity-state-drop/bugfix.md) drops it. The passages about it record what the method did.
 
 Most methods share a common pattern:
 

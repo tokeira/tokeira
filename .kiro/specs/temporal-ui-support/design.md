@@ -384,8 +384,8 @@ mutex or DSQL transaction that performs the deletion. A successful operation:
    in-memory store.
 
 The DSQL implementation performs all five steps in one transaction. `purge_run` then
-removes the run's `request_dedupe`, `activity_state`, `timer_bucket`,
-`activity_dispatch`, `dispatch_backlog` and `history_batch` rows in pages, history
+removes the run's `request_dedupe`, `timer_bucket`, `activity_dispatch`,
+`dispatch_backlog` and `history_batch` rows in pages, history
 last, and the record with the last of them
 ([bounded-bulk-writes](../bounded-bulk-writes/design.md)). The in-memory store
 also gains an explicit current-execution map: `find_latest_run` reads that pointer rather

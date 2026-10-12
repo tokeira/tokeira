@@ -121,7 +121,7 @@ Written and run on the code before the fix, each failing there:
 ### Unit Tests
 
 - The runner proves `DROP TABLE IF EXISTS` idempotent. It still refuses a `DROP TABLE` without `IF EXISTS`, and a file with another statement beside the drop.
-- The schema contract's target and maximum readable versions equal the newest embedded migration's version, so a contract left behind the migrations fails offline.
+- The schema contract's target and maximum readable versions equal the newest embedded migration's version, so a contract left behind the migrations fails offline. A release that embeds a migration it only reads, past its target (the `TARGET < C <= MAX` row of managed-embedded-dsql's decision table), relaxes this to target ≤ maximum readable ≤ newest.
 - The baseline lock names the drop.
 
 ### Live Test

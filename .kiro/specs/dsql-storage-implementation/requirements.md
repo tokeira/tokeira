@@ -4,6 +4,8 @@
 
 This document captures the full requirements for implementing the Aurora DSQL storage layer — the production persistence backend for Tokeira. Currently all storage is served by `InMemoryStore` in `tokeira-storage/src/memory.rs`. This spec covers the complete DSQL implementation: schema design, `RunRepository` implementation, connection management integration, shard leasing, and projection persistence.
 
+> The `activity_state` table and its indexes, which this spec describes, are dropped by V083 ([activity-state-drop](../activity-state-drop/bugfix.md)).
+
 The authoritative architecture documents are [050-dsql-storage](../../../docs/architecture/050-dsql-storage.md), [060-connection-management](../../../docs/architecture/060-connection-management.md), [070-projection-plane](../../../docs/architecture/070-projection-plane.md), [080-sql-visibility](../../../docs/architecture/080-sql-visibility.md), and [090-failover-and-recovery](../../../docs/architecture/090-failover-and-recovery.md).
 
 The schema is designed from scratch for Tokeira's architecture and DSQL constraints. It is NOT a port of the temporal-dsql compatibility schema. Key architectural principles:

@@ -530,7 +530,6 @@ All BYTEA columns use postcard via the `dsql::codec` module:
 |--------|---------------|-----------|
 | `workflow_hot.state_data` | `encode_workflow_state` / `decode_workflow_state` | `WorkflowState` |
 | `history_batch.events_data` | `encode_history_events` / `decode_history_events` | `Vec<HistoryEvent>` |
-| `activity_state.state_data` | `encode_activity_state` / `decode_activity_state` | `ActivityState` |
 | `timer_bucket.timer_data` | `encode_timer_state` / `decode_timer_state` | `TimerState` |
 | `projection_log.context_data` | `encode_projection_context` / `decode_projection_context` | `ProjectionContext` |
 | `projection_log.ops_data` | `encode_projection_ops` / `decode_projection_ops` | `Vec<ProjectionOp>` |

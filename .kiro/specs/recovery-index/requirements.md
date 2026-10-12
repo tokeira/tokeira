@@ -45,7 +45,7 @@ Depends on: runtime-sweeper-recovery (the sweep, its tracking structures and its
 
 - Every write of a `workflow_hot` row sets the Recovery_Flag from the state written, in the same statement. No statement is added to a commit.
 - The Sweep and the Sampler read Candidates only, a bounded page at a time in run-key order, and decode each state once.
-- Recovery_Entries are derived from the run's state by one shared function. Activity entries come from the run's state, not from the `activity_state` side table, and only for open runs.
+- Recovery_Entries are derived from the run's state by one shared function. Activity entries come from the run's state, and only for open runs.
 - The six per-kind shard listings the Sweep uses, and the reconstructible-delivery listing the Sampler uses, are replaced by the paged Candidate listing.
 - Out of scope: volatile state the Sweep does not rebuild today (speculative workflow-task timers, the update registry, buffered queries); timers and activity dispatch rows, which are durable rows with their own paged listings and scanners; persisting the last heartbeat time; a backfill of Legacy_Rows.
 

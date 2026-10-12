@@ -59,7 +59,6 @@ core/
   workflow_hot
   history_batch
   request_dedupe
-  activity_state
   timer_bucket
 
 delivery/
@@ -98,7 +97,7 @@ Idempotency and duplicate suppression.
 
 ### `core.activity_state`
 
-No longer written or read: activities live in the run's state in `workflow_hot`. The table keeps the rows that earlier releases wrote until run deletion removes them (the `activity-state-writes` spec).
+Dropped by V083 (the `activity-state-drop` spec): activities live in the run's state in `workflow_hot`.
 
 ### `core.timer_bucket`
 
@@ -122,7 +121,6 @@ Tokeira should follow that directly.
 
 - `workflow_hot.run_key = UUID`
 - `history_batch(run_key, first_event_id)`
-- `activity_state(run_key, schedule_event_id)`
 
 These keys cluster by run, which is helpful because the run already has single-writer behavior.
 
@@ -200,7 +198,7 @@ Transaction:
 3. apply kernel transition,
 4. append history batch,
 5. patch `workflow_hot`,
-6. upsert/delete activity state,
+6. upsert/delete activity dispatch rows,
 7. upsert/delete timer rows,
 8. emit dispatch ops,
 9. emit projection ops.

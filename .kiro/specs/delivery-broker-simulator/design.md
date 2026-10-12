@@ -336,8 +336,8 @@ struct Delivery { delivery_id: DeliveryId, worker: WorkerIdentity, lease_until_m
 #### AuthoritativePendingState — the truth the broker is an optimiser over (Requirement 8.4, 16)
 
 ```rust
-/// Per-run authoritative pending work — the analog of workflow_hot.pending_wft /
-/// activity_state. Held SEPARATELY from BrokerState so discarding broker state
+/// Per-run authoritative pending work — the analog of workflow_hot's pending
+/// workflow task and activities. Held SEPARATELY from BrokerState so discarding broker state
 /// (a crash) never loses authoritative tasks. This is the heart of the central
 /// correctness claim the simulator falsifies.
 struct AuthoritativePendingState {

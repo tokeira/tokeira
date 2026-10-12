@@ -71,7 +71,7 @@ The budgets are fixed: a third of DSQL's row limit, two-fifths of its transactio
 
 From that commit on, every lookup of the run SHALL find no run. v1.31.0's run is likewise unreachable once its current pointer and mutable state are gone (`context_impl.go:941-963 @ v1.31.0`).
 
-2.4 WHEN a run is recorded for purging THEN the system SHALL remove its remaining rows in transactions within the budgets: its request records, timers, activity dispatch rows, backlog entries and legacy activity rows, and then its history batches. History is last. The system SHALL remove the record in the transaction that removes the run's last rows. Each purge transaction SHALL be safe to repeat, and to run alongside another purge of the same run.
+2.4 WHEN a run is recorded for purging THEN the system SHALL remove its remaining rows in transactions within the budgets: its request records, timers, activity dispatch rows and backlog entries, and then its history batches. History is last. The system SHALL remove the record in the transaction that removes the run's last rows. Each purge transaction SHALL be safe to repeat, and to run alongside another purge of the same run.
 
 2.5 IF a purge stops before it finishes THEN the system SHALL finish it:
 - the node that started it SHALL retry it until it finishes;

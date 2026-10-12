@@ -166,7 +166,7 @@ The spec adds four migrations, V077 to V080.
 
 ### Indexes for the purge
 
-- `V079__idx_request_dedupe_run_key.sql` and `V080__idx_dispatch_backlog_run_key.sql` index those tables by `(run_key, key)`, `ASYNC`, so a purge reads each page of a run's keys in key order from the index. Today's deletion scans both tables in full, once per deleted run. A paged purge would scan them once per page, so a namespace's reclaim would scan them once per page of every run. The other run-owned tables already have a run-key index or key prefix: V021, V022, V028 and the primary keys of `workflow_dispatch` and `history_batch`.
+- `V079__idx_request_dedupe_run_key.sql` and `V080__idx_dispatch_backlog_run_key.sql` index those tables by `(run_key, key)`, `ASYNC`, so a purge reads each page of a run's keys in key order from the index. Today's deletion scans both tables in full, once per deleted run. A paged purge would scan them once per page, so a namespace's reclaim would scan them once per page of every run. The other run-owned tables already have a run-key index or key prefix: V022, V028 and the primary keys of `workflow_dispatch` and `history_batch`.
 - The migration bookkeeping follows V074-V076:
   - the schema contracts in `crates/tokeira-storage` and `crates/tokeira-build-info`;
   - the baseline lock and the build information;
@@ -206,7 +206,6 @@ The memory store mirrors this under its lock: it removes the run, its pointers a
 - If the record says `materializing`, it first switches it to `purging` in a transaction of its own, through `abandon_materialization(run_key)`, which does nothing to a record already `purging` or to none. Through the checks of the materialization's transactions, the switch fences any of them still running. A caller must pass a `materializing` record only when its materialization will never finish (see *Runtime*).
 - It then removes the run's rows table by table, one table per transaction, at most 1,000 rows per transaction:
   - `request_dedupe`;
-  - `activity_state`, the rows older releases wrote;
   - `timer_bucket`;
   - `activity_dispatch`;
   - `dispatch_backlog`;

@@ -46,19 +46,11 @@ pub(super) struct PurgeTable {
 /// the deletion's first transaction. Each page is selected in its table's key
 /// order and deleted by its last key, so a page is exactly the rows selected:
 /// nothing writes a row of a recorded run.
-pub(super) const PURGE_TABLES: [PurgeTable; 6] = [
+pub(super) const PURGE_TABLES: [PurgeTable; 5] = [
     PurgeTable {
         table: "request_dedupe",
         select_page: "SELECT key::text FROM request_dedupe WHERE run_key = $1 ORDER BY key LIMIT $2",
         delete_page: "DELETE FROM request_dedupe WHERE run_key = $1 AND key <= $2::uuid",
-    },
-    // Nothing writes `activity_state` any more; this clears the rows that
-    // earlier releases wrote (`activity-state-writes` criterion 3.2).
-    PurgeTable {
-        table: "activity_state",
-        select_page: "SELECT schedule_event_id::text FROM activity_state WHERE run_key = $1 \
-                      ORDER BY schedule_event_id LIMIT $2",
-        delete_page: "DELETE FROM activity_state WHERE run_key = $1 AND schedule_event_id <= $2::bigint",
     },
     PurgeTable {
         table: "timer_bucket",
@@ -676,7 +668,6 @@ mod tests {
             tables,
             [
                 "request_dedupe",
-                "activity_state",
                 "timer_bucket",
                 "activity_dispatch",
                 "dispatch_backlog",

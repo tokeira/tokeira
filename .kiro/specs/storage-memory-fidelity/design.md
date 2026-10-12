@@ -9,7 +9,7 @@ The changes are scoped entirely to `tokeira-storage` (with minor trait additions
 ### Design Principles
 
 - Respect the authoritative-transition model (010-history-as-authority): no semantically visible state change without a committed kernel transition.
-- Respect the delivery broker's three-tier model (040-delivery-broker): the durable fact is pending work in `workflow_hot` and `activity_state`, not a queue row. Backlog is Tier C, explicitly persisted by the broker, not automatically on every enqueue.
+- Respect the delivery broker's three-tier model (040-delivery-broker): the durable fact is pending work in the run's state in `workflow_hot`, not a queue row. Backlog is Tier C, explicitly persisted by the broker, not automatically on every enqueue.
 
 ### Design Goals
 

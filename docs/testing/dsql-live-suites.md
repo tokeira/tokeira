@@ -246,6 +246,30 @@ cargo nextest run -p tokeira-storage --features dsql-integration --locked --prof
   --test dsql_migration_runner --run-ignored only
 ```
 
+## The activity state drop
+
+The ignored `dsql_activity_state_drop` test requires
+`TOKEIRA_DSQL_ACTIVITY_STATE_DROP_TEST_DATABASE_URL` and
+`TOKEIRA_DSQL_ACTIVITY_STATE_DROP_TEST_ACK=MUTATE_DISPOSABLE_EMPTY_DATABASE`, and refuses a
+database whose current schema already contains relations. It runs these steps:
+1. Migrates the database to the target of the release before the drop, and writes 4,000
+   `activity_state` rows in transactions of 1,000.
+2. Migrates it with `MigrationRunner::apply_connection`, which `tkr schema setup` uses, and
+   checks that no `activity_state` table or index remains and that a validate-only
+   assessment finds the schema compatible.
+3. Forgets the drop's ledger row and applies the drop again under the automatic policy,
+   as the embedded engine does after a crash.
+4. Rebuilds an earlier release's table, with rows and indexes, for the automatic policy to
+   drop.
+
+Use a new empty database for each run. The first migration and the rebuilt indexes take
+several minutes.
+
+```bash
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live \
+  --test dsql_activity_state_drop --run-ignored only
+```
+
 ## Distributed startup schema check
 
 The three ignored `distributed_schema_live_tests` in `tokeira-engine` start a

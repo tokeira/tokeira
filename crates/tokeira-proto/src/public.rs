@@ -224,8 +224,8 @@ mod tests {
             serde_json::from_slice(OPENAPI_V2_JSON).expect("valid official OpenAPI v2 JSON");
         assert_eq!(v2["swagger"], "2.0");
 
-        let v3: serde_yaml::Value =
-            serde_yaml::from_slice(OPENAPI_V3_YAML).expect("valid official OpenAPI v3 YAML");
+        let v3: serde_json::Value =
+            serde_saphyr::from_slice(OPENAPI_V3_YAML).expect("valid official OpenAPI v3 YAML");
         assert_eq!(v3["openapi"], "3.0.3");
     }
 }

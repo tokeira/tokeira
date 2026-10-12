@@ -385,7 +385,11 @@ mod tests {
 
     #[async_trait]
     impl crate::sink::ProjectionSink for FailingSink {
-        async fn apply(&self, record: &ProjectionRecord, _partition_id: u32) -> Result<()> {
+        async fn apply(
+            &self,
+            record: &ProjectionRecord,
+            _partition_id: u32,
+        ) -> Result<crate::sink::ApplyOutcome> {
             let mut failures_left = self.failures_left.lock().await;
             if *failures_left > 0 {
                 *failures_left -= 1;
@@ -430,7 +434,7 @@ mod tests {
                 })
                 .await?;
             *self.applied.lock().await += 1;
-            Ok(())
+            Ok(crate::sink::ApplyOutcome::Advanced)
         }
     }
 

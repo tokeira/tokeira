@@ -71,7 +71,7 @@ impl VisibilitySink for ProjectionVisibilitySink {
     ) -> anyhow::Result<()> {
         let record = build_record(key, archetype_id, version, snapshot, self.partition_count)?;
         let partition_id = record.partition_id;
-        self.sink.apply(&record, partition_id).await
+        self.sink.apply(&record, partition_id).await.map(|_| ())
     }
 }
 

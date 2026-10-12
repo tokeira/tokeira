@@ -30,7 +30,7 @@ The copy is paid on every activity change: one more statement, the activity's pa
 
 3.1 WHEN `commit_transition` applies an activity op THEN both repositories SHALL CONTINUE TO maintain the activity's dispatch row or entry, as `dsql-side-tables` Requirements 16 and 19 require
 
-3.2 WHEN a run is deleted THEN the DSQL repository SHALL CONTINUE TO delete the run's `activity_state` rows, which removes those that earlier releases wrote
+3.2 WHEN a run is deleted THEN the DSQL repository SHALL CONTINUE TO purge every table the run owns. `activity_state` is no longer one: [activity-state-drop](../activity-state-drop/bugfix.md) drops it
 
 3.3 WHEN the recovery sweep lists a shard's activities THEN it SHALL CONTINUE TO take them from run state (`recovery-index`)
 

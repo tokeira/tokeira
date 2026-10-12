@@ -16,7 +16,7 @@ The delivery broker is built first because it is the highest-scale hot path, is 
 
 ### The central correctness claim
 
-Doc 040 ("Why this is safe" + "Sweeper contract") states that authoritative pending-task state lives **with the run** (`workflow_hot.pending_wft`, `activity_state`), never in any broker or queue row. If the broker process dies before durable backlog is written, a sweeper reconstructs delivery candidates from authoritative state. The broker is therefore a **delivery optimiser, not an authority**: it may duplicate, delay, expire, or redeliver tasks, but it must never make workflow state true by itself. The simulator exists to falsify that claim under adversarial scheduling.
+Doc 040 ("Why this is safe" + "Sweeper contract") states that authoritative pending-task state lives **with the run** (`workflow_hot`: its pending workflow task and its activities), never in any broker or queue row. If the broker process dies before durable backlog is written, a sweeper reconstructs delivery candidates from authoritative state. The broker is therefore a **delivery optimiser, not an authority**: it may duplicate, delay, expire, or redeliver tasks, but it must never make workflow state true by itself. The simulator exists to falsify that claim under adversarial scheduling.
 
 ### What this spec is NOT
 
@@ -75,7 +75,7 @@ The requirements use this mapping explicitly so the model is unambiguous:
 - **Delivery_Lease**: The bounded ownership a worker holds over a delivered task between start and completion. On expiry the task may be redelivered, and a later completion under the old lease is stale.
 - **Logical_Task_Identity**: The dedup key for a task: `(RunKey, LogicalTaskSeq)` for workflow tasks, `(RunKey, activity_id, attempt)` for activity tasks.
 - **Denied_Workers**: The set `(NamespaceId, TaskQueueName, WorkerIdentity)` of workers that may not currently receive a task on a queue (version/build compatibility, shutdown).
-- **Authoritative_Pending_State**: The per-run truth (`workflow_hot.pending_wft`, `activity_state`) that the broker is an optimiser over. The model holds this separately from broker queue state.
+- **Authoritative_Pending_State**: The per-run truth (`workflow_hot`: the pending workflow task and the activities) that the broker is an optimiser over. The model holds this separately from broker queue state.
 - **Healthy_Run**: A run configured with sufficient pollers and bounded faults under which liveness invariants are expected to hold, used to validate the "what a healthy run looks like" signal counts.
 - **Injectable_Bug**: A deliberately incorrect Broker_Model variant, selectable by CLI flag, that violates a named safety invariant so the verification modes can demonstrate real falsifying power.
 

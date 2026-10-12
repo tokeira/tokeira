@@ -1927,8 +1927,8 @@ pub(crate) mod tests {
     #[test]
     fn legacy_activity_state_postcard_documents_pre_baseline_decode_failure() {
         // Same pre-baseline posture as the buffered-event test above, pinned
-        // for `last_attempt_complete_time`: an `activity_state.state_data` row
-        // written before the field is exactly today's encoding minus the
+        // for `last_attempt_complete_time`: an `ActivityState` encoded
+        // before the field is exactly today's encoding minus the
         // trailing one-byte `None` tag, and positional postcard rejects that
         // prefix rather than defaulting it. A fresh database is the stated
         // requirement; no migration guarantee is claimed.

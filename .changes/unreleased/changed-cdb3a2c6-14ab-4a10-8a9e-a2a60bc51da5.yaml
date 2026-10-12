@@ -1,0 +1,5 @@
+kind: changed
+body: The DSQL schema drops the unused activity_state table and its three indexes; apply the migration with tkr schema setup.
+time: 2026-10-12T22:00:34.070148+01:00
+custom:
+    Slice: cdb3a2c6-14ab-4a10-8a9e-a2a60bc51da5

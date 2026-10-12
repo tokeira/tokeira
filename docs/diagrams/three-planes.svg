@@ -98,7 +98,7 @@
     <!-- footnotes row -->
     <rect x="76" y="612" width="460" height="58" rx="8" fill="#F6F3EE" stroke="#8A8378" stroke-opacity=".5" stroke-dasharray="4 4"/>
     <text x="96" y="636" font-size="11.5" font-weight="600" fill="#5C564E">Durable backstops — all in DSQL</text>
-    <text x="96" y="654" font-size="10.5" fill="#5C564E">dispatch backlog · timer buckets · activity state · dedupe · shard leases</text>
+    <text x="96" y="654" font-size="10.5" fill="#5C564E">dispatch backlog · timer buckets · activity dispatch · dedupe · shard leases</text>
     <rect x="556" y="612" width="328" height="58" rx="8" fill="#F6F3EE" stroke="#8A8378" stroke-opacity=".5" stroke-dasharray="4 4"/>
     <text x="576" y="636" font-size="11.5" font-weight="600" fill="#5C564E">DynamoDB — connection budget only</text>
     <text x="576" y="654" font-size="10.5" fill="#5C564E">rate limits and slot envelopes; never workflow state</text>

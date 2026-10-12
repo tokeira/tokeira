@@ -1174,6 +1174,26 @@ fn migration_is_idempotent(sql: &str) -> bool {
         || (normalized.contains("INSERT INTO")
             && normalized.contains("ON CONFLICT")
             && normalized.contains("DO NOTHING"))
+        || is_whole_table_drop(&normalized)
+}
+
+/// Whether a migration's whole statement is `DROP TABLE IF EXISTS` and one
+/// table name. A drop that finds no table does nothing, so replaying one after
+/// a crash between it and its ledger row is safe; a file with another statement
+/// beside the drop would not replay as nothing, so it doesn't count.
+fn is_whole_table_drop(normalized: &str) -> bool {
+    normalized
+        .trim()
+        .trim_end_matches(';')
+        .trim_end()
+        .strip_prefix("DROP TABLE IF EXISTS ")
+        .map(str::trim)
+        .is_some_and(|table| {
+            !table.is_empty()
+                && table
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        })
 }
 
 fn is_occ_error(error: &sqlx::Error) -> bool {
@@ -1757,7 +1777,7 @@ mod tests {
         let plans = MigrationRunner::embedded()
             .dry_run()
             .expect("embedded migrations are valid");
-        assert_eq!(plans.len(), 82);
+        assert_eq!(plans.len(), 83);
         assert!(plans.iter().all(|plan| migration_is_idempotent(&plan.sql)));
     }
 
@@ -1772,6 +1792,39 @@ mod tests {
         assert!(!migration_is_idempotent(
             "ALTER TABLE workflow_hot DROP COLUMN IF EXISTS history_size_bytes;"
         ));
+    }
+
+    #[test]
+    fn a_table_drop_is_idempotent_only_with_if_exists_and_alone() {
+        assert!(migration_is_idempotent(
+            "DROP TABLE IF EXISTS activity_state;\n"
+        ));
+        assert!(migration_is_idempotent(
+            "drop table if exists activity_state"
+        ));
+        assert!(!migration_is_idempotent("DROP TABLE activity_state;"));
+        assert!(!migration_is_idempotent(
+            "DROP TABLE IF EXISTS activity_state; DELETE FROM workflow_hot;"
+        ));
+    }
+
+    /// A release migrates to the newest migration it embeds and reads no
+    /// further, so a contract left behind its migrations fails here rather
+    /// than on a cluster. A release that embeds a migration it only reads,
+    /// past its target, relaxes this to target <= maximum readable <= newest.
+    #[test]
+    fn the_contract_reaches_the_newest_embedded_migration() {
+        let newest = MigrationRunner::embedded()
+            .dry_run()
+            .expect("embedded migrations are valid")
+            .last()
+            .expect("the release embeds migrations")
+            .version;
+        let contract = MigrationRunner::compatibility_contract();
+        assert_eq!(
+            (contract.target_version, contract.maximum_readable_version),
+            (newest, newest)
+        );
     }
 
     #[test]

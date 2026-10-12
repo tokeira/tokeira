@@ -61,7 +61,7 @@
   <rect x="528" y="366" width="440" height="150" rx="10" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".6" stroke-width="1.6"/>
   <text x="550" y="394" class="boxtitle">5 · One fenced transaction</text>
   <text x="550" y="420" class="small">Seven tables in one txn: hot state, history batch, dedupe,</text>
-  <text x="550" y="438" class="small">activity state + dispatch, timers, current-execution, the</text>
+  <text x="550" y="438" class="small">activity dispatch, timers, current-execution, the</text>
   <text x="550" y="456" class="small">visibility snapshot. Fences first; a Commit-class permit gates entry.</text>
   <text x="550" y="482" class="metric">tokeira_storage_commit_transition_duration_seconds</text>
   <text x="550" y="500" class="metric">tokeira_storage_dsql_statement_duration_seconds{statement=…}</text>

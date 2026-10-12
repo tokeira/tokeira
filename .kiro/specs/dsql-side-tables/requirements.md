@@ -8,7 +8,7 @@ These 10 methods are currently `bail!("Feature 3: dsql-side-tables")` stubs. Thi
 
 The key insight: `activity_state` is a materialized open-activity table for timeout/sweep reconstruction — it is not a dispatch queue. Activities that are started, paused, or otherwise not ready for dispatch remain in `activity_state`. Dispatch should come from a dedicated table derived from `DispatchOp::EnqueueActivityTask`, matching the in-memory store's `activity_dispatch` HashMap.
 
-Since [activity-state-writes](../activity-state-writes/bugfix.md), no release writes `activity_state` and none reads it. `recovery-index` replaced the open-activity listing with run state, where every activity already lives (Requirement 9).
+Since [activity-state-writes](../activity-state-writes/bugfix.md), no release writes `activity_state` and none reads it, and [activity-state-drop](../activity-state-drop/bugfix.md) drops it. `recovery-index` replaced the open-activity listing with run state, where every activity already lives (Requirement 9).
 
 ### Scope
 
@@ -44,7 +44,7 @@ Since [activity-state-writes](../activity-state-writes/bugfix.md), no release wr
 - All queries use `DbClass::Read` connections — no transactions, no writes.
 - `shard_id` is bound as UUID via `DsqlRunRepository::shard_id_to_uuid(shard_id)`.
 - `workflow_hot.state_data` stores the full `WorkflowState` as postcard-serialized BYTEA. The dispatch and sweep methods deserialize it to extract specific fields (`pending_workflow_task`, `workflow_execution_timeout`, `workflow_run_timeout`, `pending_nexus_operations`, etc.).
-- `activity_state.state_data` stores `ActivityState` as postcard-serialized BYTEA in rows that earlier releases wrote. Nothing reads it, and nothing writes it since [activity-state-writes](../activity-state-writes/bugfix.md). Activity dispatch queries read from the dedicated `activity_dispatch` table.
+- `activity_state` is dropped ([activity-state-drop](../activity-state-drop/bugfix.md)). Activity dispatch queries read from the dedicated `activity_dispatch` table.
 - `activity_dispatch` stores dispatch-ready activity tasks with denormalized queue identity columns. Dispatch queries do not deserialize `ActivityState`, and they don't select `input_data`, which every row holds as an empty payload list: an activity's input lives only in its ActivityTaskScheduled event ([activity-inputs-from-history](../activity-inputs-from-history/bugfix.md)).
 - `timer_bucket.timer_data` stores `TimerState` as postcard-serialized BYTEA.
 - The `limit` parameter bounds the result set size for all methods.
@@ -52,7 +52,7 @@ Since [activity-state-writes](../activity-state-writes/bugfix.md), no release wr
 
 ### Schema Reference
 
-**activity_state** — PK: `(run_key, schedule_event_id)`, indexes: `(shard_id)`, `(queue_namespace, queue_name)`, `(run_key, activity_id)`. Neither read nor written since [activity-state-writes](../activity-state-writes/bugfix.md); run deletion removes the rows that earlier releases wrote.
+**activity_state** — dropped, with its indexes on `(shard_id)`, `(queue_namespace, queue_name)` and `(run_key, activity_id)` ([activity-state-drop](../activity-state-drop/bugfix.md)).
 
 **activity_dispatch** — PK: `(key)` spread UUID, indexes: `(shard_id)`, `(queue_namespace, queue_name, task_kind, deployment, build_id)`, `(run_key)`. Added by this spec. Used by dispatch queries (`list_dispatchable_activity_tasks`, `list_dispatchable_activity_tasks_for_shard`) and run-scoped dispatch cleanup on workflow pause.
 
@@ -235,7 +235,7 @@ Since [activity-state-writes](../activity-state-writes/bugfix.md), no release wr
 #### Acceptance Criteria
 
 1. THE DsqlRunRepository SHALL deserialize `workflow_hot.state_data` using `codec::decode_workflow_state`.
-2. Withdrawn with Requirement 9: no query reads `activity_state.state_data`. Rows that earlier releases wrote keep the `codec::decode_activity_state` layout.
+2. Withdrawn with Requirement 9: no query reads `activity_state.state_data`, and the table is dropped.
 3. IF deserialization fails, THEN THE DsqlRunRepository SHALL return an error with context identifying the table and row key.
 
 ### Requirement 14: Tracing Instrumentation

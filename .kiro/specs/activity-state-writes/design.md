@@ -27,7 +27,7 @@ Every transition with an activity op (1.1, 1.2), every reset with activities in 
 ### Preservation Requirements
 
 - Dispatch rows keep their lifecycle: created by `DispatchOp::EnqueueActivityTask`, deleted when the activity starts, pauses or goes, updated in place otherwise, and cleared when the workflow pauses (3.1).
-- Run deletion keeps deleting the run's `activity_state` rows, so rows that earlier releases wrote go with their run (3.2).
+- Run deletion keeps purging every table the run owns, which since [activity-state-drop](../activity-state-drop/design.md) leave out `activity_state` (3.2).
 - The recovery sweep keeps reading activities from run state (3.3).
 - The `workflow_hot` encoding and the snapshot document's layout are unchanged (3.4).
 
@@ -57,9 +57,9 @@ _For any_ store, restoring a snapshot whose activity state table holds entries S
 
 - `commit_transition` stops calling `upsert_activity` for `ActivityOp::Upsert` and drops the `DELETE FROM activity_state` for `ActivityOp::Delete`. The `activity_dispatch` delete and update that follow each op stay as they are.
 - `materialize_reset_successor` stops inserting an `activity_state` row for each activity of the successor.
-- `upsert_activity` and its SQL go. The activity state codec stays: `activity-heartbeat-time` Requirement 3.6 pins its layout, and rows that earlier releases wrote still have it.
-- Run deletion keeps `DELETE FROM activity_state WHERE run_key = $1` in `RUN_OWNED_DELETE_STATEMENTS`.
-- No migration. The table and its indexes (V007, V014, V015, V021) stay until no node runs an earlier release; dropping them is a later change.
+- `upsert_activity` and its SQL go. activity-state-drop removes the activity state codec with the table.
+- Run deletion purges the tables the run owns (`PURGE_TABLES`), from which activity-state-drop removes `activity_state`.
+- No migration here. Once a stopped upgrade keeps every earlier node off, activity-state-drop drops the table and its indexes (V007, V014, V015, V021).
 
 ### In-memory store (`crates/tokeira-storage/src/memory.rs`)
 
@@ -91,7 +91,7 @@ _For any_ store, restoring a snapshot whose activity state table holds entries S
 
 ### Unit Tests
 
-- The existing run-deletion statement test (`authoritative_delete_covers_every_run_owned_table_and_history_is_last`) still asserts the `activity_state` delete.
+- The purge's table inventory test (`the_purge_covers_every_run_owned_table_and_history_is_last`) covers the tables a run owns, which leave out `activity_state` since activity-state-drop.
 
 ### Preservation Checking
 

@@ -56,7 +56,6 @@ Amends:
 - Out of scope:
   - **Blob-size limits on heartbeat details.** v1.31.0 drops oversize failure details and returns a server failure to the worker (`frontend/workflow_handler.go:1804-1822`). Tokeira enforces no blob-size limit on heartbeat details today. [payload-admission-limits](../payload-admission-limits/bugfix.md) adds it (criteria 2.7 and 2.8).
   - **Standalone (CHASM) activities.** They already persist their heartbeat time (`crates/tokeira-chasm-activity/src/state.rs:339`).
-  - **The `activity_state` side-table blob.** It keeps its layout and carries no time. No reader has used it since recovery-index.
   - **History batch blobs.**
 
 ## Evidence From Current Code
@@ -150,7 +149,7 @@ No request gains a new validation error.
 3. WHEN decoding a Heartbeat_Section, THE storage codec SHALL set the Last_Heartbeat_Time of each listed activity that the state holds.
 4. IF a Heartbeat_Section lists an activity id that the state does not hold, THEN THE storage codec SHALL ignore that entry.
 5. IF a Heartbeat_Section lists an activity id twice, THEN THE storage codec SHALL return the error of criterion 1.7.
-6. THE `activity_state` side-table blob SHALL keep its layout and SHALL NOT carry the Last_Heartbeat_Time.
+6. Withdrawn. It fixed the layout of the `activity_state` side-table blob, which [activity-state-drop](../activity-state-drop/bugfix.md) drops with its table.
 
 ### Requirement 4: Recording the time
 

@@ -88,7 +88,7 @@
   <rect x="1480" y="418" width="460" height="188" rx="10" fill="#F6F3EE" stroke="#C88D6F" stroke-opacity=".6" stroke-width="1.5" stroke-dasharray="8 5"/>
   <text x="1504" y="450" class="boxtitle">No tables of its own</text>
   <text x="1504" y="478" class="small">Nexus state rides the activity machinery —</text>
-  <text x="1504" y="498" class="mono">activity_state · activity_dispatch · dispatch_backlog</text>
+  <text x="1504" y="498" class="mono">activity_dispatch · dispatch_backlog</text>
   <text x="1504" y="526" class="small">Async tokens and live queues are preserved across</text>
   <text x="1504" y="546" class="small">restart: reconstruction is a read, not a guess. History</text>
   <text x="1504" y="566" class="small">remains the only authority on outcomes.</text>

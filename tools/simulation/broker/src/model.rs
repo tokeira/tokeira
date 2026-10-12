@@ -252,8 +252,8 @@ pub struct BrokerState {
 /// The authoritative per-run truth the broker optimises over.
 ///
 /// Held separately from [`BrokerState`] so a broker crash can drop the latter
-/// without losing any of this. Analogous to `workflow_hot.pending_wft` and
-/// `activity_state` in the real runtime.
+/// without losing any of this. Analogous to the pending workflow task and the
+/// activities in a run's `workflow_hot` state in the real runtime.
 #[derive(Clone, Debug, Default)]
 pub struct AuthoritativePendingState {
     /// At most one pending workflow task per run (invariant S1). Value is the

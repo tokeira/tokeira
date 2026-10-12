@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, bail, ensure};
 use serde::{Serialize, de::DeserializeOwned};
-use tokeira_kernel::{ActivityState, state::Priority};
+use tokeira_kernel::state::Priority;
 use tokeira_types::{Payloads, ProjectionCursor, WorkflowRuleRecord};
 
 // The hot-state and history-batch envelopes, and the encodings of the rows the
@@ -79,18 +79,6 @@ pub fn encode_worker_compute_controller(record: &WorkerComputeControllerRecord) 
 
 /// Deserialize one versioned Worker Compute Controller record.
 pub fn decode_worker_compute_controller(bytes: &[u8]) -> Result<WorkerComputeControllerRecord> {
-    decode(bytes)
-}
-
-/// Serialize an `activity_state` row. Nothing writes these rows any more, and
-/// sweeps read activities from run state; the layout stays for rows that
-/// earlier releases wrote (`activity-state-writes`).
-pub fn encode_activity_state(state: &ActivityState) -> Result<Vec<u8>> {
-    encode(state)
-}
-
-/// Deserialize one activity side-table row.
-pub fn decode_activity_state(bytes: &[u8]) -> Result<ActivityState> {
     decode(bytes)
 }
 

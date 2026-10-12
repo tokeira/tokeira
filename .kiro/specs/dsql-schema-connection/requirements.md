@@ -4,6 +4,8 @@
 
 This spec covers Feature 1 (Schema and Connection Foundation) from the umbrella `dsql-storage-implementation` spec. It is the foundational feature — all other DSQL features depend on it.
 
+> The `activity_state` table and its indexes, which this spec describes, are dropped by V083 ([activity-state-drop](../activity-state-drop/bugfix.md)).
+
 The scope is:
 
 1. **DSQL Schema DDL** — complete table definitions for all 11 tables across core, delivery, and projection domains, designed from scratch for Tokeira's architecture and DSQL constraints.

@@ -18,7 +18,6 @@ Behaviour follows Temporal v1.31.0: `UpdateActivityProgress` (`service/history/w
 - **Non-goals:**
   - blob-size limits on heartbeat details;
   - standalone activities;
-  - the `activity_state` side-table blob;
   - history batch blobs;
   - removing the volatile heartbeat time from activity tracking.
 
@@ -140,7 +139,7 @@ pub struct StateExtensionError {
   - activity listed twice.
 - `apply_state_extension` sets `last_heartbeat_at` for each listed activity the state holds, skips ids it does not hold, and ignores unknown tags.
 
-`history_batch` blobs and `history_batch_encoded_len` do not change. `dsql/codec.rs` re-exports the new names next to the envelope functions. `encode_activity_state` encodes the side-table blob without the time, because the field is skipped. Since [activity-state-writes](../activity-state-writes/bugfix.md), no commit writes that blob.
+`history_batch` blobs and `history_batch_encoded_len` do not change. `dsql/codec.rs` re-exports the new names next to the envelope functions.
 
 ### Snapshot (`crates/tokeira-storage/src/memory.rs`)
 
@@ -198,7 +197,7 @@ The in-memory `runs` map holds `WorkflowState` values, so committed times are re
 | `ActivitySweepEntry.last_heartbeat_at` | `Option<OffsetDateTime>` | `recovery_entries` | the time the Sweep restores |
 | `PendingActivityDescription.last_heartbeat_at` | `Option<OffsetDateTime>` | engine Describe | source of `last_heartbeat_time` |
 
-No schema migration. The `activity_state` blob and the history batch blob keep their layouts.
+No schema migration. The history batch blob keeps its layout.
 
 ## Correctness Properties
 
@@ -305,7 +304,6 @@ Unknown tags SHALL be ignored.
   - Property 8 extends the Sweep's activity-tracking reconstruction property (runtime-sweeper-recovery Property 9) to cover the time.
 - **Unit tests:**
   - A frozen-layout fixture: a deterministic `WorkflowState` with every activity field set encodes to committed bytes (Requirement 1.11).
-  - `encode_activity_state` gives the same bytes with and without a time (Requirement 3.6).
   - Each kernel Heartbeat_Reset clears the time.
   - The heartbeat commit's persisted time equals the tracking time (Requirement 4.2).
   - A by-id failure with details changes neither details nor time (Requirement 4.4).

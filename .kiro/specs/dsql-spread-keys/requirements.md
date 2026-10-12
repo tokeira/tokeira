@@ -4,6 +4,8 @@
 
 This document captures the requirements for introducing hash-derived UUIDv8 primary keys to eliminate hot-key concentration in Tokeira's DSQL tables. DSQL distributes data by hashing the leading primary key column. When that column has low cardinality or is namespace-prefixed, all writes for a single tenant cluster on the same storage partition, creating a hot spot that limits throughput.
 
+> The `activity_state` table and its indexes, which this spec describes, are dropped by V083 ([activity-state-drop](../activity-state-drop/bugfix.md)).
+
 The solution is a general-purpose utility function, `dsql_spread_uuid`, that deterministically derives a uniformly-distributed UUIDv8 from arbitrary logical inputs using BLAKE3. Tables whose composite primary keys suffer from leading-column clustering are revised to use a spread UUID as the sole primary key, with the original logical key preserved as a unique index for lookups. Additionally, `RunKey` is changed from a random UUID v4 to a deterministic derivation from `(namespace_id, workflow_id, run_id)`, eliminating a class of lookup-table queries.
 
 This spec depends on Feature 1 (`dsql-schema-connection`) for the current schema DDL and Feature 2 (`dsql-core-persistence`) for `DsqlRunRepository` and `RunKey` usage. Tokeira is pre-production — all development targets schema version 1. There are no migrations; the existing DDL files in `migrations/` are updated in-place to reflect the revised table definitions.

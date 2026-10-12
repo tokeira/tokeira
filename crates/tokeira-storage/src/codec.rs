@@ -1463,20 +1463,6 @@ mod tests {
         assert_eq!(&extended[plain.len()..], extension.as_slice());
     }
 
-    #[cfg(feature = "dsql")]
-    #[test]
-    fn activity_side_table_blob_carries_no_heartbeat_time() {
-        // `activity_state.state_data` keeps its layout: the skipped field adds
-        // nothing (activity-heartbeat-time, Requirement 3.6).
-        let plain = activity("activity-a");
-        let mut timed = plain.clone();
-        timed.last_heartbeat_at = Some(at(9));
-        assert_eq!(
-            crate::dsql::codec::encode_activity_state(&timed).expect("encodes"),
-            crate::dsql::codec::encode_activity_state(&plain).expect("encodes"),
-        );
-    }
-
     #[test]
     fn signal_count_follows_the_heartbeat_section() {
         let mut state = layout_state();

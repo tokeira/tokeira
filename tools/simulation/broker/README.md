@@ -25,8 +25,8 @@ two aligned when the broker changes.
 ## The central correctness claim being falsified
 
 Doc 040 ("Why this is safe" + "Sweeper contract") states that authoritative
-pending-task state lives **with the run** (`workflow_hot.pending_wft`,
-`activity_state`), never in a broker/queue row. If the broker process dies before
+pending-task state lives **with the run** (`workflow_hot`: its pending workflow
+task and its activities), never in a broker/queue row. If the broker process dies before
 durable backlog is written, a sweeper reconstructs delivery candidates from
 authoritative state. The broker is therefore a **disposable delivery optimiser**:
 it may duplicate, delay, expire, or redeliver, but it must never make workflow

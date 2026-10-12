@@ -961,8 +961,7 @@ mod tests {
     use proptest::prelude::*;
     use time::{Duration, OffsetDateTime};
     use tokeira_kernel::{
-        ActivityState, HistoryEvent, HistoryEventKind, PendingWorkflowTask, TimerState, Transition,
-        WorkflowState,
+        HistoryEvent, HistoryEventKind, PendingWorkflowTask, TimerState, Transition, WorkflowState,
     };
     use tokeira_types::{
         ArchetypeId, BuildId, DeploymentId, ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo,
@@ -1183,7 +1182,6 @@ mod tests {
             let run_key = RunKey(uuid::Uuid::from_u128(seed as u128));
             let workflow_state = sample_state(run_key);
             let history_events = vec![sample_history_event(seed as i64)];
-            let activity_state = sample_activity_state(seed);
             let timer_state = sample_timer_state(seed);
             let projection_context = sample_projection_context(&workflow_state);
 
@@ -1203,10 +1201,6 @@ mod tests {
                 )
                 .unwrap(),
                 history_events
-            );
-            prop_assert_eq!(
-                codec::decode_activity_state(&codec::encode_activity_state(&activity_state).unwrap()).unwrap(),
-                activity_state
             );
             prop_assert_eq!(
                 codec::decode_timer_state(&codec::encode_timer_state(&timer_state).unwrap()).unwrap(),
@@ -1882,41 +1876,6 @@ mod tests {
                 request_id: format!("request-{event_id}"),
                 identity: Some("tester".to_owned()),
             },
-        }
-    }
-
-    fn sample_activity_state(seed: u64) -> ActivityState {
-        ActivityState {
-            last_attempt_complete_time: None,
-            cancel_requested: false,
-            activity_reset: false,
-            reset_heartbeats: false,
-            started_identity: None,
-            retry_last_worker_identity: None,
-            activity_id: format!("activity-{seed}"),
-            activity_type: "activity-type".to_owned(),
-            schedule_event_id: i64::try_from(seed).unwrap(),
-            task_queue: TaskQueueName("activity-queue".to_owned()),
-            deployment: None,
-            build_id: None,
-            priority: None,
-            retired_input: Default::default(),
-            retired_header: Default::default(),
-            last_failure: None,
-            heartbeat_details: None,
-            attempt: 1,
-            retry_policy: None,
-            schedule_to_close_timeout: Some(Duration::seconds(30)),
-            schedule_to_start_timeout: Some(Duration::seconds(10)),
-            start_to_close_timeout: Some(Duration::seconds(20)),
-            heartbeat_timeout: Some(Duration::seconds(5)),
-            scheduled_at: fixed_now(),
-            current_attempt_scheduled_at: None,
-            started_at: None,
-            started_event_id: None,
-            pause_info: None,
-            stamp: seed,
-            last_heartbeat_at: None,
         }
     }
 

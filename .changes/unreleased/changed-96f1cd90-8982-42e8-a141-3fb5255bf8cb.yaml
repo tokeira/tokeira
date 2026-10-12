@@ -1,4 +1,4 @@
 kind: changed
-body: Compose state and observability YAML now use serde-saphyr in place of the deprecated serde_yaml dependency.
+body: YAML parsing now uses serde-saphyr, and Kubernetes clients use kube 4.2 while retaining the Kubernetes 1.33 API types.
 custom:
   Slice: 96f1cd90-8982-42e8-a141-3fb5255bf8cb

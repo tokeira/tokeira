@@ -10,7 +10,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use kube::Client;
+use kube::{Client, Config};
 use tokio::sync::OnceCell;
 
 use crate::{
@@ -56,8 +56,15 @@ impl KubePlatform {
     async fn client(&self) -> Result<Client, K8sError> {
         self.client
             .get_or_try_init(|| async {
-                let client = Client::try_default()
+                let mut config = Config::infer()
                     .await
+                    .map_err(|error| K8sError::Unreachable(error.to_string()))?;
+                // Preserve kube 1's transport policy: kube 4 otherwise removes
+                // the read timeout and enables retries of API requests.
+                // Readiness additionally bounds the entire polling operation.
+                config.read_timeout = Some(Duration::from_secs(295));
+                config.default_retry = false;
+                let client = Client::try_from(config)
                     .map_err(|error| K8sError::Unreachable(error.to_string()))?;
                 // Reachability is part of lazy initialization, not merely
                 // kubeconfig construction. That keeps an offline read-only

@@ -46,7 +46,20 @@ pub(crate) async fn wait_for_deployment_ready(
             );
         }
 
-        match check_deployment_ready(&api, deployment_name).await? {
+        // The caller's deadline covers an in-flight request, including any
+        // retries configured on a supplied client, not just the poll interval.
+        let readiness = tokio::time::timeout_at(
+            deadline,
+            check_deployment_ready(&api, deployment_name),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timeout waiting for deployment {deployment_name} to become ready after {}s",
+                timeout.as_secs()
+            )
+        })??;
+        match readiness {
             ReadinessState::Ready { replicas } => {
                 info!(deployment = deployment_name, replicas, "deployment ready");
                 return Ok(());
@@ -69,7 +82,7 @@ pub(crate) async fn wait_for_deployment_ready(
 
         // Cap each sleep at the remaining budget so the deadline is honored
         // even when it is closer than the poll interval.
-        let remaining = deadline - tokio::time::Instant::now();
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         tokio::time::sleep(Duration::from_secs(2).min(remaining)).await;
     }
 }
@@ -120,4 +133,148 @@ pub enum ReadinessState {
     },
     /// The Deployment does not exist yet.
     NotFound,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::pending,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use http::{Request, Response, StatusCode};
+    use kube::{
+        Client,
+        client::{Body, retry::RetryPolicy},
+    };
+    use tokio::time::Instant;
+    use tower::{BoxError, ServiceBuilder, retry::RetryLayer, service_fn};
+
+    use super::wait_for_deployment_ready;
+
+    #[tokio::test(start_paused = true)]
+    async fn readiness_deadline_bounds_a_stalled_request() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let client = Client::new(
+            service_fn(move |_: Request<Body>| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                pending::<Result<Response<Body>, BoxError>>()
+            }),
+            "default",
+        );
+        let started = Instant::now();
+        let error =
+            wait_for_deployment_ready(&client, "default", "worker", Some(Duration::from_secs(5)))
+                .await
+                .expect_err("a stalled API request must respect the readiness deadline");
+        assert_eq!(
+            error.to_string(),
+            "timeout waiting for deployment worker to become ready after 5s"
+        );
+        assert_eq!(Instant::now() - started, Duration::from_secs(5));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn readiness_deadline_bounds_server_retry_backoff() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let service = service_fn(move |_: Request<Body>| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async {
+                Ok::<_, BoxError>(
+                    Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .header("Retry-After", "60")
+                        .body(Body::empty())
+                        .expect("valid retry response"),
+                )
+            }
+        });
+        let client = Client::new(
+            ServiceBuilder::new()
+                .layer(RetryLayer::new(RetryPolicy::server_retry()))
+                .service(service),
+            "default",
+        );
+        let started = Instant::now();
+        let error =
+            wait_for_deployment_ready(&client, "default", "worker", Some(Duration::from_secs(5)))
+                .await
+                .expect_err("server backoff must not extend the readiness deadline");
+        assert!(error.to_string().contains("after 5s"));
+        assert_eq!(Instant::now() - started, Duration::from_secs(5));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn readiness_waits_for_updated_replicas() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let client = Client::new(
+            service_fn(move |request: Request<Body>| {
+                assert_eq!(
+                    request.uri().path(),
+                    "/apis/apps/v1/namespaces/default/deployments/worker"
+                );
+                let updated = observed.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let deployment = serde_json::json!({
+                        "apiVersion": "apps/v1",
+                        "kind": "Deployment",
+                        "metadata": {"name": "worker"},
+                        "spec": {"replicas": 1, "selector": {}, "template": {}},
+                        "status": {"readyReplicas": 1, "updatedReplicas": updated},
+                    });
+                    Ok::<_, BoxError>(Response::new(Body::from(
+                        deployment.to_string().into_bytes(),
+                    )))
+                }
+            }),
+            "default",
+        );
+        let started = Instant::now();
+        wait_for_deployment_ready(&client, "default", "worker", Some(Duration::from_secs(5)))
+            .await
+            .expect("the second response completes the rollout");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(Instant::now() - started, Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn readiness_preserves_api_errors() {
+        let client = Client::new(
+            service_fn(|_: Request<Body>| async {
+                let status = serde_json::json!({
+                    "kind": "Status",
+                    "apiVersion": "v1",
+                    "status": "Failure",
+                    "message": "access denied",
+                    "reason": "Forbidden",
+                    "code": 403,
+                });
+                Ok::<_, BoxError>(
+                    Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .body(Body::from(status.to_string().into_bytes()))
+                        .expect("valid error response"),
+                )
+            }),
+            "default",
+        );
+        let started = Instant::now();
+        let error =
+            wait_for_deployment_ready(&client, "default", "worker", Some(Duration::from_secs(5)))
+                .await
+                .expect_err("API authorization errors must remain distinguishable from timeouts");
+        assert!(
+            matches!(error.downcast_ref::<kube::Error>(), Some(kube::Error::Api(status)) if status.code == 403)
+        );
+        assert_eq!(Instant::now(), started);
+    }
 }

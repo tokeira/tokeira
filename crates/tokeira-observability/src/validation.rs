@@ -295,17 +295,23 @@ impl AlertRuleValidator {
         contents: &str,
         _repo_root: &Path,
     ) -> Result<(), ArtifactValidationError> {
-        let yaml: serde_yaml::Value = serde_yaml::from_str(contents).map_err(|error| {
+        // Keep YAML 1.2 scalar resolution: labels such as `on` are strings,
+        // while actual booleans must still fail the string metadata checks.
+        let yaml: serde_json::Value = serde_saphyr::from_str_with_options(
+            contents,
+            serde_saphyr::options! { strict_booleans: true },
+        )
+        .map_err(|error| {
             ArtifactValidationError::new(path, "yaml", format!("invalid alert YAML: {error}"))
         })?;
         let groups = yaml
             .get("groups")
-            .and_then(serde_yaml::Value::as_sequence)
+            .and_then(serde_json::Value::as_array)
             .ok_or_else(|| ArtifactValidationError::new(path, "groups", "missing alert groups"))?;
         for group in groups {
             let rules = group
                 .get("rules")
-                .and_then(serde_yaml::Value::as_sequence)
+                .and_then(serde_json::Value::as_array)
                 .ok_or_else(|| {
                     ArtifactValidationError::new(path, "groups.rules", "missing alert rules")
                 })?;
@@ -316,10 +322,10 @@ impl AlertRuleValidator {
         Ok(())
     }
 
-    fn validate_rule(path: &Path, rule: &serde_yaml::Value) -> Result<(), ArtifactValidationError> {
+    fn validate_rule(path: &Path, rule: &serde_json::Value) -> Result<(), ArtifactValidationError> {
         let alert = rule
             .get("alert")
-            .and_then(serde_yaml::Value::as_str)
+            .and_then(serde_json::Value::as_str)
             .unwrap_or("<unnamed>");
         let labels = rule.get("labels");
         let annotations = rule.get("annotations");
@@ -343,10 +349,10 @@ impl AlertRuleValidator {
     }
 }
 
-fn yaml_string<'a>(value: Option<&'a serde_yaml::Value>, key: &str) -> Option<&'a str> {
+fn yaml_string<'a>(value: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
     value?
         .get(key)
-        .and_then(serde_yaml::Value::as_str)
+        .and_then(serde_json::Value::as_str)
         .filter(|value| !value.is_empty())
 }
 
@@ -410,6 +416,33 @@ mod tests {
             .unwrap_err();
 
         assert!(error.field.contains("lineInterpolation"));
+    }
+
+    #[test]
+    fn alert_validator_preserves_yaml_string_metadata() {
+        for (scalar, valid) in [("on", true), ("no", true), ("true", false), ("42", false)] {
+            let alert = format!(
+                r#"
+groups:
+  - name: tokeira
+    rules:
+      - alert: Example
+        expr: vector(1)
+        labels:
+          severity: page
+          service: {scalar}
+        annotations:
+          summary: Example alert
+"#
+            );
+            let result =
+                AlertRuleValidator::validate_str(Path::new("alerts.yaml"), &alert, Path::new("."));
+            if valid {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().field, "alert[Example].service");
+            }
+        }
     }
 
     #[test]

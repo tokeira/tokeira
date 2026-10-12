@@ -96,8 +96,12 @@ pub enum ComposeError {
         #[source]
         source: anyhow::Error,
     },
+    /// A stored Compose document could not be decoded.
     #[error("compose file operation failed: {0}")]
-    YamlError(#[from] serde_yaml::Error),
+    YamlError(#[from] serde_saphyr::DeserializeError),
+    /// A Compose document could not be encoded.
+    #[error("compose file serialization failed: {0}")]
+    YamlSerializeError(#[from] serde_saphyr::SerializeError),
     #[error("compose file I/O failed at {path}: {source}")]
     Io {
         path: String,
@@ -1136,7 +1140,7 @@ impl ComposePlatform {
                 path: self.compose_file.display().to_string(),
                 source,
             })?;
-        serde_yaml::from_str(&contents).map_err(ComposeError::YamlError)
+        serde_saphyr::from_str(&contents).map_err(ComposeError::YamlError)
     }
 
     fn save_compose_state(&self, state: &ComposeFile) -> Result<(), ComposeError> {
@@ -1146,7 +1150,7 @@ impl ComposePlatform {
                 source,
             })?;
         }
-        let yaml = serde_yaml::to_string(state)?;
+        let yaml = serde_saphyr::to_string(state)?;
         std::fs::write(&self.compose_file, yaml).map_err(|source| ComposeError::Io {
             path: self.compose_file.display().to_string(),
             source,
@@ -1664,7 +1668,7 @@ fn lift_from_inspect(
 pub fn compose_yaml_fragment(service: &ComposeService) -> Result<String, ComposeError> {
     let mut file = ComposeFile::default();
     file.services.insert(service.name.clone(), service.clone());
-    serde_yaml::to_string(&file).map_err(ComposeError::YamlError)
+    serde_saphyr::to_string(&file).map_err(ComposeError::YamlSerializeError)
 }
 
 pub fn service_from_manifest(value: serde_json::Value) -> Result<ComposeService, ComposeError> {
@@ -2053,6 +2057,58 @@ mod tests {
         assert!(yaml.contains("3000"));
         assert!(yaml.contains("GF_SECURITY_ADMIN_PASSWORD"));
         assert!(yaml.contains("/var/lib/grafana"));
+        let restored: ComposeFile = serde_saphyr::from_str(&yaml).unwrap();
+        assert_eq!(restored.services["grafana"], service);
+    }
+
+    #[test]
+    fn reads_legacy_compose_yaml_with_tagged_volumes() {
+        let yaml = r#"
+version: '3.9'
+services:
+  example:
+    name: example
+    image: example/server:latest
+    pull_policy: if_not_present
+    volumes:
+    - !State
+      sub: data
+      at: /data
+    - !Config
+      sub: config
+      at: /etc/example
+    - DockerSocket
+    environment:
+    - name: MODE
+      value: 'on'
+    command:
+    - run
+    - 'null'
+"#;
+        let restored: ComposeFile = serde_saphyr::from_str(yaml).unwrap();
+        let service = &restored.services["example"];
+        assert_eq!(restored.version, "3.9");
+        assert_eq!(service.pull_policy, PullPolicy::Missing);
+        assert_eq!(service.replicas, 1);
+        assert_eq!(
+            service.volumes,
+            vec![
+                Volume::State(StateVolume {
+                    sub: "data".into(),
+                    at: "/data".into()
+                }),
+                Volume::Config(ConfigVolume {
+                    sub: "config".into(),
+                    at: "/etc/example".into()
+                }),
+                Volume::DockerSocket,
+            ]
+        );
+        assert_eq!(service.environment[0].value, "on");
+        assert_eq!(service.command, ["run", "null"]);
+        let encoded = serde_saphyr::to_string(&restored).unwrap();
+        let reread: ComposeFile = serde_saphyr::from_str(&encoded).unwrap();
+        assert_eq!(reread.services, restored.services);
     }
 
     #[test]

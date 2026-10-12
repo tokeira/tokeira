@@ -152,7 +152,7 @@ tonic-web = "0.14"
 tower-http = { version = "0.6", features = ["cors"] }
 url = "2"
 uuid = { version = "1.10", features = ["serde", "v4"] }
-serde_yaml = "0.9"
+serde-saphyr = "1.3"
 # Monty from the tokeira fork: one patch atop the exact upstream revision the
 # workspace previously pinned (69f8a613), adding embedder-registered source
 # modules — the language-level `import` support .tkdp definition parts stand

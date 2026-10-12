@@ -30,7 +30,7 @@ tokeira-deployment = { workspace = true }
 tokeira-config = { workspace = true }
 # K8s object types for the manifest builders (Block 3). Pinned to the same
 # single API feature as `tokeira-k8s` so the two agree under feature unification.
-k8s-openapi = { version = "0.25", features = ["v1_33"] }
+k8s-openapi = { version = "0.28", features = ["v1_33"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

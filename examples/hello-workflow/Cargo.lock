@@ -33,6 +33,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "annotate-snippets"
+version = "0.12.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f211a51805bc641f3ad5b7664c77d2547af685cc33b4cd8d31964027a46f13f1"
+dependencies = [
+ "anstyle",
+ "memchr",
+ "unicode-width 0.2.2",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -96,6 +107,12 @@ checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
 dependencies = [
  "rustversion",
 ]
+
+[[package]]
+name = "arraydeque"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
 
 [[package]]
 name = "arrayvec"
@@ -1555,6 +1572,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "encoding_rs_io"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fba3fe847045ecff794b9c138293a80db914678c453ad63fbf0c6a9eb6e00b22"
+dependencies = [
+ "encoding_rs",
+]
+
+[[package]]
 name = "enum-iterator"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1903,6 +1929,16 @@ dependencies = [
  "r-efi 6.0.0",
  "rand_core 0.10.1",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "granit-parser"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e20f99e46474f56bd905c56e817ebddcf377a611f94c53ac4649e4d3fa3c0cd0"
+dependencies = [
+ "arraydeque",
+ "smallvec",
 ]
 
 [[package]]
@@ -2659,7 +2695,7 @@ checksum = "5f98efec8807c63c752b5bd61f862c165c115b0a35685bdcfd9238c7aeb592b7"
 dependencies = [
  "cfg-if",
  "miette-derive",
- "unicode-width",
+ "unicode-width 0.1.14",
 ]
 
 [[package]]
@@ -2737,6 +2773,12 @@ name = "multiversion_no_op"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
+
+[[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "ntapi"
@@ -3903,6 +3945,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-saphyr"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8050abb251097357e24aff63ba2c52a6309ecb7d23a5474023df960a02694d8"
+dependencies = [
+ "annotate-snippets",
+ "base64 0.23.1",
+ "encoding_rs_io",
+ "granit-parser",
+ "nohash-hasher",
+ "num-traits",
+ "serde_core",
+ "smallvec",
+ "zmij",
+]
+
+[[package]]
 name = "serde-value"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3973,19 +4032,6 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
-]
-
-[[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
 ]
 
 [[package]]
@@ -4799,9 +4845,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokeira-auth"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae3456a91786901f2c2de43996ce0768527637313180998e913b1dc7aac78e92"
+checksum = "a6b9dbb05938f8de82f6599e1e6e0ac8e73a3874c06d207daa3690a39ffd9a6f"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -4822,9 +4868,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-build-info"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1743f6da500f922e32a7219670934829caa94054425a451a6c2789ee31226aa7"
+checksum = "343ed68da919e1e58a5c43d24b8423d9d1d4867623cefcfac0ff6ade57b89e24"
 dependencies = [
  "regex",
  "toml 0.8.23",
@@ -4832,9 +4878,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-chasm"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93bbaf8e1fc33b5ced150aa32afdf32b182b875520b2e3bc91af1181904cc6cd"
+checksum = "bd24c5eece5842abc05e33eb489de62b2fd1b410d5837776a3a07da121fd1ea6"
 dependencies = [
  "prost",
  "serde",
@@ -4845,9 +4891,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-chasm-activity"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "634051022bb48bf3bea7eed018af4d92cd8ae89195231edf26e2774dbf7146ee"
+checksum = "9a4dc205094be14411139b38c54b83894785287cb03efc8dab282556614e299b"
 dependencies = [
  "postcard",
  "prost",
@@ -4861,9 +4907,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-chasm-derive"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d593b202fae42c7d5743546b47390c1b7563a5acfa6d41c517a17005d0fd2682"
+checksum = "61064fca852e002c88c36c86594b12a9f987c551cce9e9d8978d0c91e16bd9d1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4872,9 +4918,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-compatibility"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95cc70e902149493407ce592357a65beb4eb02c88a4e7e2d137ad55238c47d10"
+checksum = "6b98dbfa9e20ceb6a4b69f4cb31b8b7b47fe9b9728d73752bf6ebd00f94c8ead"
 dependencies = [
  "serde",
  "serde_json",
@@ -4885,9 +4931,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-config"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78bad7f62aaa5df30982782e9d9aa151d0623798fca23de9729b41348e359574"
+checksum = "a800312d7bbe52e583dd58ffb98ff5942d8eec020af407d7ac2ee34c7228d061"
 dependencies = [
  "async-trait",
  "clap",
@@ -4902,9 +4948,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-edge"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3bb412b14bfbf1a33c70d1c59cf5bc89555d54ac8a02037f96df951fcca8fa6"
+checksum = "c9878029626b01b681debd4d8efa0e012fd28a243cdfa6e79baed25299e9b39a"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4950,9 +4996,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-engine"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc9704c893bc196d9be5f1faec4c87bc047179a9b0a1f936564382971c7adb80"
+checksum = "85ad1dc839e84e714568dffb9644724d391b5f6b89617ad6aa7578dc388b30a3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5004,9 +5050,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-kernel"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6362c794a908eca85872713dcfaa61ce3acb70e4b0e6a3cfa422ccadced0cfb4"
+checksum = "8a2c702102e5a66609e30712006beeb2e3da298d01a49a1e4c72276302736049"
 dependencies = [
  "serde",
  "serde_json",
@@ -5019,9 +5065,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-managed-dsql"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdb6a008a01bacec6e9f16d0a121975ae694806f101f69d2138badefa3b4b1d7"
+checksum = "a2d3b4f1f54b635157f286d354aaad6a88f13a8a52c69da73d2ffb789d292596"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -5037,9 +5083,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-observability"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58dfe463f6bee56f202b102e1470f94f2597d8c5c7842bfe4bdc131b9c5c273a"
+checksum = "c03a6b4afb3ff11c3ed5a244728b667fdfb3d985de069a190619dda0c357d1e4"
 dependencies = [
  "async-trait",
  "http-body-util",
@@ -5051,8 +5097,8 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "serde",
+ "serde-saphyr",
  "serde_json",
- "serde_yaml",
  "thiserror 2.0.21",
  "tokeira-types",
  "tokio",
@@ -5064,9 +5110,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-projection"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "322b5af1d6929e06dc905d6ae7971235376c868cc6e040ad53a0295f2d2891d6"
+checksum = "bcf814d6ef90c849fd05d6a7ea0b1803612f7535e9c4b1b476bce44f765ebde0"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -5090,9 +5136,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-proto"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ffc838f0cafcb371c24e603d0061c3c4a573461a7b6d9947da211e7174fcf57"
+checksum = "82e3ed04a51be9413f6eb6e4a4792dbbbb5600c664f588309c4ce7760594c76e"
 dependencies = [
  "buffa",
  "buffa-types",
@@ -5111,9 +5157,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-runtime"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "504af4ea98e2feef2cd86a1d369506bf8166c80fb967da3f2e78dadc007b0f54"
+checksum = "a01154e173f631499f8b6fcd8f26bffb603aa071cbd16ba5dbf27830211904b7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5155,9 +5201,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-storage"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e7ac6ec47ca49ff8c520d243d2aa9c1b01140bf2fba05dcb3229f2c9bfbdae1"
+checksum = "35744aba1d45c94a33a4be2b93dd05250d134413cc177958addd0a8c92f74abf"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -5186,9 +5232,9 @@ dependencies = [
 
 [[package]]
 name = "tokeira-types"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "443444ebcb2aa0d3a5afd9fb172dbb185bdea9a0b2d1a632619e72fb9b16755f"
+checksum = "653e799406c64b9f3390682ab4e69b6e27b9d61c9106fee0d0e444e1a3335222"
 dependencies = [
  "blake3",
  "serde",
@@ -5673,16 +5719,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
+name = "unicode-width"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
+
+[[package]]
 name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
-
-[[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"

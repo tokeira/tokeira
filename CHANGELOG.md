@@ -2,6 +2,17 @@
 
 All notable user-facing changes to this project are documented here.
 
+## 0.6.1 on 2026-10-12
+
+### Changed
+
+* YAML parsing now uses serde-saphyr, and Kubernetes clients use kube 4.2 while retaining the Kubernetes 1.33 API types.
+* Workflow tasks now use durable discovery by default, with cross-node starts and replies replacing legacy workflow backlog delivery.
+
+### Fixed
+
+* DSQL defaults now use matching shard and bundle counts; configure both to the existing placement count because unequal values are rejected.
+
 ## 0.6.0 on 2026-10-11
 
 ### Added

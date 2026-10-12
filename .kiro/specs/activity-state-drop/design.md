@@ -51,7 +51,7 @@ The bug condition holds wherever the code or the schema still keeps `activity_st
 ## Root Cause
 
 - **The table stayed for older nodes.** activity-state-writes stopped writing the table but kept it, and kept the purge's step for it, while a node of an earlier release might still write it. The stopped upgrade removes that reason.
-- **The runner can't replay a drop.** `migration_is_idempotent` recognizes only `CREATE ... IF NOT EXISTS` forms and `ADD COLUMN IF NOT EXISTS`, so the automatic path refuses any drop, even one written to replay safely.
+- **The runner can't replay a drop.** `migration_is_idempotent` recognizes only `CREATE ... IF NOT EXISTS` forms, `ADD COLUMN IF NOT EXISTS` and `INSERT ... ON CONFLICT ... DO NOTHING`. So the automatic path refuses any drop, even one written to replay safely.
 
 ## Correctness Properties
 
@@ -78,9 +78,9 @@ _For any_ run, deleting it SHALL purge every table it owns, history last, and SH
 ### Storage
 
 - **The migration.** `V083__drop_activity_state.sql` holds `DROP TABLE IF EXISTS activity_state;`. V083 is the next free number now; a migration that lands first moves the drop up. The DDL validator admits the statement.
-- **Idempotency.** `migration_is_idempotent` accepts `DROP TABLE IF EXISTS`. A drop that finds no table does nothing, so replaying it after a crash is safe. `every_embedded_migration_is_proven_idempotent` then covers the drop.
+- **Idempotency.** `migration_is_idempotent` accepts a migration whose whole statement is `DROP TABLE IF EXISTS` and one table name, so a file with another statement beside the drop isn't proven idempotent. A drop that finds no table does nothing, so replaying it after a crash is safe. `every_embedded_migration_is_proven_idempotent` then covers the drop.
 - **The purge.** `PURGE_TABLES` loses its `activity_state` entry, and the purge's table inventory test follows.
-- **The codec.** `encode_activity_state`, `decode_activity_state` and their tests go. The comments that cite the row's layout follow, in `commit.rs` and in the kernel's `state.rs`.
+- **The codec.** `encode_activity_state` and `decode_activity_state` go, with the tests that use them in `dsql/codec.rs`, in storage's `codec.rs` and in `dsql/run_repository/mod.rs`. The comments that cite the row's layout follow, in `commit.rs` and in the kernel's `state.rs`.
 - **Bookkeeping**, as for every migration:
   - storage's `schema-contract.toml` and build-info's packaged copy: target and maximum readable version 83, the new digest, immutable through 83;
   - `schema-baseline.lock`: version 83 and its checksum;
@@ -120,14 +120,15 @@ Written and run on the code before the fix, each failing there:
 
 ### Unit Tests
 
-- The runner proves `DROP TABLE IF EXISTS` idempotent, and still refuses a `DROP TABLE` without `IF EXISTS`.
-- The schema contract and the baseline lock name the drop.
+- The runner proves `DROP TABLE IF EXISTS` idempotent. It still refuses a `DROP TABLE` without `IF EXISTS`, and a file with another statement beside the drop.
+- The schema contract's target and maximum readable versions equal the newest embedded migration's version, so a contract left behind the migrations fails offline.
+- The baseline lock names the drop.
 
 ### Live Test
 
 On an ephemeral cluster:
-1. Migrate a schema to the previous target and write `activity_state` rows.
-2. Migrate it to the target with `tkr schema setup`'s path.
+1. Migrate a schema to the previous target. Write more than 3,000 `activity_state` rows, in batches under DSQL's limit on the rows a transaction modifies, so the drop is shown free of that limit on a table an earlier release filled.
+2. Migrate it to the target with `tkr schema setup`'s path, and check that a validate-only assessment then finds it compatible.
 3. Forget the drop's ledger row and apply it again under the automatic path.
 4. Delete a run.
 
@@ -139,7 +140,7 @@ Each control is patched in alone, then run, then reversed so that the tree is by
 - the drop without `IF EXISTS`, whose replay fails;
 - the idempotency check without `DROP TABLE IF EXISTS`, which the automatic path then refuses;
 - the purge still deleting `activity_state` rows, which fails once the table is gone;
-- the schema contract left at the previous target.
+- the schema contract left at the previous target, which the offline check of the contract catches, and which the validate-only assessment after setup finds a future schema.
 
 ### Preservation Checking
 

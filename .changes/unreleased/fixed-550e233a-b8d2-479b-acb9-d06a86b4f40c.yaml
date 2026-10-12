@@ -1,0 +1,5 @@
+kind: fixed
+body: Visibility counts stay exact when an apply fails partway, and grouped counts no longer fail on DSQL.
+time: 2026-10-12T22:41:14.820839+01:00
+custom:
+    Slice: 550e233a-b8d2-479b-acb9-d06a86b4f40c

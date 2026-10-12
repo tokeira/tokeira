@@ -255,6 +255,9 @@ run or stripe, every rollup counter SHALL equal the count over the rows once the
 - **The DSQL apply** (`dsql_store.rs`). `apply` and `apply_deletion` take the shape in [The apply](#the-apply), with
   the read by full key inside the transaction and the counters in it. `accumulate_rollup_striped`'s autocommit
   upserts become statements of the apply's transaction.
+- **Grouped counts** (`dsql_store.rs`). The exploration tests found that `count_from_rollup` failed on DSQL whenever
+  counter rows existed: `SUM` over the BIGINT `counter` is NUMERIC, which doesn't decode as `i64`. It casts the sum back
+  to BIGINT, so an unfiltered Count grouped by status, type or queue answers again.
 - **The projector** (`worker.rs`, renamed `projector.rs`). `Projector` replaces `ProjectionWorker`: passes, newest
   images, the deletion rule, concurrency by stripe, backoff and pacing.
 - **Checkpoints.** `load_checkpoint` and `save_checkpoint` leave `VisibilityStore` and both stores, with the cursor

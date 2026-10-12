@@ -27,7 +27,7 @@ use tracing::{instrument, warn};
 use uuid::Uuid;
 
 use crate::{
-    ProjectionSink, VisibilityStore, metrics as projection_metrics,
+    ApplyOutcome, ProjectionSink, VisibilityStore, metrics as projection_metrics,
     rollup::compute_rollup_deltas,
     types::{
         AttrDescriptor, AttrId, CompareOp, CompiledFilter, CountResult, ExecutionRow, FieldRef,
@@ -37,6 +37,39 @@ use crate::{
         visibility_version_is_newer, workflow_status_from_keyword,
     },
 };
+
+/// Faults the live tests inject into an apply. Each is armed for one namespace or
+/// run, and fires once.
+#[cfg(all(test, feature = "dsql-integration"))]
+mod apply_faults {
+    use std::sync::Mutex;
+
+    use anyhow::{Result, bail};
+    use tokeira_types::{NamespaceId, RunKey};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Fault {
+        /// A rollup counter upsert fails, as when its write conflicts outlast the retries.
+        RollupUpsert(NamespaceId),
+        /// The read of a run's stored visibility row fails.
+        StoredRowRead(RunKey),
+    }
+
+    static ARMED: Mutex<Vec<Fault>> = Mutex::new(Vec::new());
+
+    pub(super) fn arm(fault: Fault) {
+        ARMED.lock().expect("fault lock poisoned").push(fault);
+    }
+
+    pub(super) fn fire(fault: Fault) -> Result<()> {
+        let mut armed = ARMED.lock().expect("fault lock poisoned");
+        if let Some(index) = armed.iter().position(|candidate| *candidate == fault) {
+            armed.remove(index);
+            bail!("injected fault: {fault:?}");
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct DsqlVisibilityStore {
@@ -71,31 +104,10 @@ impl DsqlVisibilityStore {
             let mut attempts = 0u32;
             loop {
                 let mut permit = self.director.acquire(DbClass::Projection).await?;
-                let started = Instant::now();
-                let result = sqlx::query(
-                    r#"
-                    INSERT INTO execution_visibility_rollup
-                        (namespace_id, archetype_id, dimension, value, stripe, counter)
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                    ON CONFLICT (namespace_id, archetype_id, dimension, value, stripe) DO UPDATE
-                    SET counter = execution_visibility_rollup.counter + EXCLUDED.counter
-                    "#,
-                )
-                .bind(entry.namespace_id.0)
-                .bind(i64::from(entry.archetype_id.0))
-                .bind(entry.dimension.to_db_smallint())
-                .bind(&entry.value)
-                .bind(entry.stripe)
-                .bind(entry.delta)
-                .execute(permit.connection()?)
-                .await
-                .map(|_| ())
-                .map_err(anyhow::Error::from);
-                storage_metrics::record_dsql_statement_duration(
-                    "projection_apply",
-                    "upsert_rollup",
-                    started.elapsed(),
-                );
+                let result = match permit.connection() {
+                    Ok(connection) => upsert_rollup_row(connection, entry).await,
+                    Err(error) => Err(error),
+                };
                 drop(permit);
 
                 match result {
@@ -128,6 +140,142 @@ impl DsqlVisibilityStore {
         }
         Ok(())
     }
+
+    /// Apply a deletion tombstone. It keeps only its version fence: the deleted
+    /// context carries no search attributes, so the apply clears the run's index rows,
+    /// and filtered queries stop seeing the deleted execution.
+    async fn apply_tombstone(
+        &self,
+        tombstone: &ProjectionRecord,
+        partition_id: u32,
+    ) -> Result<ApplyOutcome> {
+        if tombstone.context.lifecycle_state != VisibilityLifecycleState::Deleted {
+            bail!("visibility deletion requires a Deleted projection record");
+        }
+        let row = ExecutionRow::from_projection_record(tombstone);
+        self.apply_row(tombstone, &row, &[], partition_id).await
+    }
+
+    /// Apply one image as a single transaction (`projection-passes` criterion 2.8):
+    /// read the run's stored row by its whole primary key, write the image under the
+    /// version guard, replace the run's search-attribute rows, and add its rollup
+    /// deltas. The read and the writes commit together, so the deltas start from the
+    /// row this transaction replaced: an apply of the same run that commits first
+    /// fails this one with a write conflict, and the retry reads again. A failed
+    /// read fails the apply rather than reading as no row.
+    async fn apply_row(
+        &self,
+        record: &ProjectionRecord,
+        row: &ExecutionRow,
+        search_attrs: &[(AttrDescriptor, SearchAttrValue)],
+        partition_id: u32,
+    ) -> Result<ApplyOutcome> {
+        let memo = codec::encode(&row.memo)?;
+        let mut attempts = 0u32;
+        let outcome = loop {
+            let mut permit = self.director.acquire(DbClass::Projection).await?;
+            let result = async {
+                let mut tx = permit.connection()?.begin().await?;
+
+                let started = Instant::now();
+                let previous =
+                    read_execution_row(&mut tx, row.namespace_id, row.archetype_id, row.run_key)
+                        .await?;
+                storage_metrics::record_dsql_statement_duration(
+                    "projection_apply",
+                    "read_execution",
+                    started.elapsed(),
+                );
+                if !visibility_version_is_newer(
+                    previous.as_ref(),
+                    record.context.authority_epoch,
+                    record.transition_seq,
+                ) {
+                    tx.rollback().await?;
+                    return Ok(ApplyOutcome::Current);
+                }
+
+                let started = Instant::now();
+                let applied = upsert_execution_row(&mut tx, row, Some(memo.clone())).await?;
+                storage_metrics::record_dsql_statement_duration(
+                    "projection_apply",
+                    "upsert_execution",
+                    started.elapsed(),
+                );
+                // The guard sees the snapshot the read saw. Only an apply that wrote
+                // the row may replace its index rows or move its counters; otherwise a
+                // stale image could erase attributes belonging to a newer version.
+                if !applied {
+                    tx.rollback().await?;
+                    return Ok(ApplyOutcome::Current);
+                }
+
+                clear_search_attr_index_rows(&mut tx, row.run_key, row.namespace_id).await?;
+                for (attr, value) in search_attrs {
+                    let started = Instant::now();
+                    upsert_search_attr_index_row(
+                        &mut tx,
+                        row.run_key,
+                        row.namespace_id,
+                        attr.attr_id,
+                        attr.attr_type,
+                        value,
+                        row.archetype_id != ArchetypeId::WORKFLOW,
+                    )
+                    .await?;
+                    storage_metrics::record_dsql_statement_duration(
+                        "projection_apply",
+                        "upsert_search_attr",
+                        started.elapsed(),
+                    );
+                }
+                for delta in compute_rollup_deltas(previous.as_ref(), row) {
+                    upsert_rollup_row(&mut tx, &delta).await?;
+                }
+
+                tx.commit().await?;
+                Ok::<ApplyOutcome, anyhow::Error>(ApplyOutcome::Advanced)
+            }
+            .await;
+            drop(permit);
+
+            match result {
+                Ok(outcome) => break outcome,
+                Err(error) if Self::is_occ_conflict(&error) && attempts < 5 => {
+                    attempts += 1;
+                    storage_metrics::record_dsql_occ_conflict(
+                        tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
+                    );
+                    tokio::time::sleep(Self::retry_delay(attempts)).await;
+                }
+                Err(error) if Self::is_occ_conflict(&error) => {
+                    storage_metrics::record_dsql_retry(
+                        tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
+                        tokeira_observability::RetryOutcomeLabel::Exhausted,
+                    );
+                    projection_metrics::record_sink_error_with_kind(
+                        partition_id,
+                        tokeira_observability::ProjectionErrorKindLabel::Storage,
+                    );
+                    return Err(error);
+                }
+                Err(error) => {
+                    projection_metrics::record_sink_error_with_kind(
+                        partition_id,
+                        tokeira_observability::ProjectionErrorKindLabel::Storage,
+                    );
+                    return Err(error);
+                }
+            }
+        };
+        if attempts > 0 {
+            storage_metrics::record_dsql_retry(
+                tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
+                tokeira_observability::RetryOutcomeLabel::Success,
+            );
+        }
+        Ok(outcome)
+    }
 }
 
 #[async_trait]
@@ -143,76 +291,9 @@ impl VisibilityStore for DsqlVisibilityStore {
 
     #[instrument(skip_all, fields(run_key = %tombstone.run_key.0))]
     async fn apply_deletion(&self, tombstone: &ProjectionRecord) -> Result<()> {
-        if tombstone.context.lifecycle_state != VisibilityLifecycleState::Deleted {
-            bail!("visibility deletion requires a Deleted projection record");
-        }
-        let previous = self.get_row(tombstone.run_key).await;
-        if !visibility_version_is_newer(
-            previous.as_ref(),
-            tombstone.context.authority_epoch,
-            tombstone.transition_seq,
-        ) {
-            return Ok(());
-        }
-
-        let row = ExecutionRow::from_projection_record(tombstone);
-        let memo = codec::encode(&row.memo)?;
-        let mut attempts = 0u32;
-        let applied = loop {
-            let mut permit = self.director.acquire(DbClass::Projection).await?;
-            let result = async {
-                let mut tx = permit.connection()?.begin().await?;
-                let applied = upsert_execution_row(&mut tx, &row, Some(memo.clone())).await?;
-                // Tombstones retain only their version fence. User-provided search
-                // attributes are deliberately absent from the deleted context, and
-                // clearing the index in the same transaction prevents filtered
-                // queries from observing the deleted execution.
-                if applied {
-                    clear_search_attr_index_rows(
-                        &mut tx,
-                        tombstone.run_key,
-                        tombstone.context.namespace_id,
-                    )
-                    .await?;
-                }
-                tx.commit().await?;
-                Ok::<bool, anyhow::Error>(applied)
-            }
-            .await;
-            drop(permit);
-
-            match result {
-                Ok(applied) => break applied,
-                Err(error) if Self::is_occ_conflict(&error) && attempts < 5 => {
-                    attempts += 1;
-                    storage_metrics::record_dsql_occ_conflict(
-                        tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
-                    );
-                    tokio::time::sleep(Self::retry_delay(attempts)).await;
-                }
-                Err(error) if Self::is_occ_conflict(&error) => {
-                    storage_metrics::record_dsql_retry(
-                        tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
-                        tokeira_observability::RetryOutcomeLabel::Exhausted,
-                    );
-                    return Err(error);
-                }
-                Err(error) => return Err(error),
-            }
-        };
-        if attempts > 0 {
-            storage_metrics::record_dsql_retry(
-                tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
-                tokeira_observability::RetryOutcomeLabel::Success,
-            );
-        }
-        if !applied {
-            return Ok(());
-        }
-
-        self.accumulate_rollup_striped(&compute_rollup_deltas(previous.as_ref(), &row))
-            .await?;
-        Ok(())
+        self.apply_tombstone(tombstone, tombstone.partition_id)
+            .await
+            .map(|_| ())
     }
 
     async fn upsert_search_attr_index(
@@ -334,10 +415,11 @@ impl VisibilityStore for DsqlVisibilityStore {
         dimension: RollupDimension,
     ) -> Result<CountResult> {
         let mut permit = self.director.acquire(DbClass::Projection).await?;
-        // Fan in the stripes for each value (`stripe = hash(run_key) % 16`).
+        // Fan in the stripes for each value (`stripe = hash(run_key) % 16`). `SUM`
+        // over a BIGINT column is NUMERIC, so cast it back to decode as `i64`.
         let rows = sqlx::query(
             r#"
-            SELECT value, SUM(counter) AS counter
+            SELECT value, SUM(counter)::BIGINT AS counter
             FROM execution_visibility_rollup
             WHERE namespace_id = $1 AND archetype_id = $2 AND dimension = $3
             GROUP BY value
@@ -511,29 +593,22 @@ impl VisibilityStore for DsqlVisibilityStore {
 #[async_trait]
 impl ProjectionSink for DsqlVisibilityStore {
     #[instrument(skip_all, fields(run_key = %record.run_key.0, transition_seq = record.transition_seq.0))]
-    async fn apply(&self, record: &ProjectionRecord, partition_id: u32) -> Result<()> {
+    async fn apply(&self, record: &ProjectionRecord, partition_id: u32) -> Result<ApplyOutcome> {
         let sink_started = Instant::now();
         if record.context.lifecycle_state == VisibilityLifecycleState::Deleted {
-            VisibilityStore::apply_deletion(self, record).await?;
+            let outcome = self.apply_tombstone(record, partition_id).await?;
             projection_metrics::record_sink_write_duration(partition_id, sink_started.elapsed());
-            return Ok(());
-        }
-        let previous = self.get_row(record.run_key).await;
-        if !visibility_version_is_newer(
-            previous.as_ref(),
-            record.context.authority_epoch,
-            record.transition_seq,
-        ) {
-            return Ok(());
+            return Ok(outcome);
         }
         // Visibility rows are full post-transition snapshots, not deltas: every
         // column is taken from the context image, so the row is built directly
-        // from `record.context` rather than cloned from `previous` and patched
+        // from `record.context` rather than cloned from the stored row and patched
         // field-by-field. Constructing from context makes it structurally
         // impossible to leave a column (e.g. the typed `status`, `close_time`)
         // frozen at its prior value across a superseding transition — the omission
-        // failure mode Property 12 exercises. `previous` is still used below to
-        // retire dropped search-attribute index rows and to compute rollup deltas.
+        // failure mode Property 12 exercises. The stored row, read inside the
+        // apply's transaction, decides only whether the image is newer and what the
+        // rollup deltas are.
         let mut row = ExecutionRow::from_projection_record(record);
         let search_patch = record.context.search_attributes.clone();
 
@@ -561,108 +636,11 @@ impl ProjectionSink for DsqlVisibilityStore {
             row.search_attr_version += 1;
         }
 
-        let memo = codec::encode(&row.memo)?;
-        let mut attempts = 0u32;
-        let applied = loop {
-            let mut permit = self.director.acquire(DbClass::Projection).await?;
-            let result = async {
-                let mut tx = permit.connection()?.begin().await?;
-
-                let started = Instant::now();
-                let applied = upsert_execution_row(&mut tx, &row, Some(memo.clone())).await?;
-                storage_metrics::record_dsql_statement_duration(
-                    "projection_apply",
-                    "upsert_execution",
-                    started.elapsed(),
-                );
-
-                // The SQL version guard can lose a race after the optimistic
-                // pre-read. Only the transaction that actually advanced the row
-                // may replace its indexes; otherwise a stale record could erase
-                // attributes belonging to a newer visible version.
-                if applied {
-                    clear_search_attr_index_rows(
-                        &mut tx,
-                        record.run_key,
-                        record.context.namespace_id,
-                    )
-                    .await?;
-                    for (attr, value) in &resolved_search_attrs {
-                        let started = Instant::now();
-                        upsert_search_attr_index_row(
-                            &mut tx,
-                            record.run_key,
-                            record.context.namespace_id,
-                            attr.attr_id,
-                            attr.attr_type,
-                            value,
-                            row.archetype_id != ArchetypeId::WORKFLOW,
-                        )
-                        .await?;
-                        storage_metrics::record_dsql_statement_duration(
-                            "projection_apply",
-                            "upsert_search_attr",
-                            started.elapsed(),
-                        );
-                    }
-                }
-
-                tx.commit().await?;
-                Ok::<bool, anyhow::Error>(applied)
-            }
-            .await;
-            drop(permit);
-
-            match result {
-                Ok(applied) => break applied,
-                Err(error) if Self::is_occ_conflict(&error) && attempts < 5 => {
-                    attempts += 1;
-                    storage_metrics::record_dsql_occ_conflict(
-                        tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
-                    );
-                    tokio::time::sleep(Self::retry_delay(attempts)).await;
-                }
-                Err(error) if Self::is_occ_conflict(&error) => {
-                    storage_metrics::record_dsql_retry(
-                        tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
-                        tokeira_observability::RetryOutcomeLabel::Exhausted,
-                    );
-                    projection_metrics::record_sink_error_with_kind(
-                        partition_id,
-                        tokeira_observability::ProjectionErrorKindLabel::Storage,
-                    );
-                    return Err(error);
-                }
-                Err(error) => {
-                    projection_metrics::record_sink_error_with_kind(
-                        partition_id,
-                        tokeira_observability::ProjectionErrorKindLabel::Storage,
-                    );
-                    return Err(error);
-                }
-            }
-        };
-        if attempts > 0 {
-            storage_metrics::record_dsql_retry(
-                tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
-                tokeira_observability::RetryOutcomeLabel::Success,
-            );
-        }
-        if !applied {
-            projection_metrics::record_sink_write_duration(partition_id, sink_started.elapsed());
-            return Ok(());
-        }
-
-        let deltas = compute_rollup_deltas(previous.as_ref(), &row);
-        if let Err(error) = self.accumulate_rollup_striped(&deltas).await {
-            projection_metrics::record_sink_error_with_kind(
-                partition_id,
-                tokeira_observability::ProjectionErrorKindLabel::Storage,
-            );
-            return Err(error);
-        }
+        let outcome = self
+            .apply_row(record, &row, &resolved_search_attrs, partition_id)
+            .await?;
         projection_metrics::record_sink_write_duration(partition_id, sink_started.elapsed());
-        Ok(())
+        Ok(outcome)
     }
 }
 
@@ -1861,46 +1839,84 @@ fn rows_to_count_result(rows: Vec<PgRow>) -> Result<CountResult> {
     })
 }
 
+/// Selects a stored visibility row, filtered by `$filter`.
+macro_rules! execution_row_select {
+    ($filter:literal) => {
+        concat!(
+            "SELECT run_key, namespace_id, archetype_id, business_id, run_id, authority_epoch, ",
+            "source_transition_seq, status_keyword, lifecycle_state, start_time, update_time, ",
+            "close_time, execution_type, task_queue, transition_count, memo_blob, ",
+            "execution_time, execution_duration, history_length, history_size_bytes, ",
+            "parent_workflow_id, parent_run_id, root_workflow_id, root_run_id ",
+            "FROM execution_visibility_current WHERE ",
+            $filter
+        )
+    };
+}
+
+/// The apply's read of a run's stored row, by the table's whole primary key (V050).
+const READ_EXECUTION_ROW_SQL: &str =
+    execution_row_select!("namespace_id = $1 AND archetype_id = $2 AND run_key = $3");
+
 async fn get_execution_row(
     connection: &mut PgConnection,
     run_key: RunKey,
 ) -> Result<Option<ExecutionRow>> {
-    let row = sqlx::query(
-        r#"
-        SELECT
-            run_key,
-            namespace_id,
-            archetype_id,
-            business_id,
-            run_id,
-            authority_epoch,
-            source_transition_seq,
-            status_keyword,
-            lifecycle_state,
-            start_time,
-            update_time,
-            close_time,
-            execution_type,
-            task_queue,
-            transition_count,
-            memo_blob,
-            execution_time,
-            execution_duration,
-            history_length,
-            history_size_bytes,
-            parent_workflow_id,
-            parent_run_id,
-            root_workflow_id,
-            root_run_id
-        FROM execution_visibility_current
-        WHERE run_key = $1
-        "#,
-    )
-    .bind(run_key.0)
-    .fetch_optional(connection)
-    .await?;
+    let row = sqlx::query(execution_row_select!("run_key = $1"))
+        .bind(run_key.0)
+        .fetch_optional(connection)
+        .await?;
 
     row.map(row_to_execution).transpose()
+}
+
+async fn read_execution_row(
+    connection: &mut PgConnection,
+    namespace_id: NamespaceId,
+    archetype_id: ArchetypeId,
+    run_key: RunKey,
+) -> Result<Option<ExecutionRow>> {
+    #[cfg(all(test, feature = "dsql-integration"))]
+    apply_faults::fire(apply_faults::Fault::StoredRowRead(run_key))?;
+    let row = sqlx::query(READ_EXECUTION_ROW_SQL)
+        .bind(namespace_id.0)
+        .bind(i64::from(archetype_id.0))
+        .bind(run_key.0)
+        .fetch_optional(connection)
+        .await?;
+
+    row.map(row_to_execution).transpose()
+}
+
+/// Add one rollup delta to its striped counter row.
+async fn upsert_rollup_row(connection: &mut PgConnection, entry: &RollupDelta) -> Result<()> {
+    #[cfg(all(test, feature = "dsql-integration"))]
+    apply_faults::fire(apply_faults::Fault::RollupUpsert(entry.namespace_id))?;
+    let started = Instant::now();
+    let result = sqlx::query(
+        r#"
+        INSERT INTO execution_visibility_rollup
+            (namespace_id, archetype_id, dimension, value, stripe, counter)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (namespace_id, archetype_id, dimension, value, stripe) DO UPDATE
+        SET counter = execution_visibility_rollup.counter + EXCLUDED.counter
+        "#,
+    )
+    .bind(entry.namespace_id.0)
+    .bind(i64::from(entry.archetype_id.0))
+    .bind(entry.dimension.to_db_smallint())
+    .bind(&entry.value)
+    .bind(entry.stripe)
+    .bind(entry.delta)
+    .execute(connection)
+    .await;
+    storage_metrics::record_dsql_statement_duration(
+        "projection_apply",
+        "upsert_rollup",
+        started.elapsed(),
+    );
+    result?;
+    Ok(())
 }
 
 fn row_to_execution(row: sqlx::postgres::PgRow) -> Result<ExecutionRow> {
@@ -2519,5 +2535,163 @@ mod tests {
             pool.close().await;
             store.shutdown().await
         })
+    }
+
+    /// The live store over a migrated cluster, or none when no cluster is configured.
+    #[cfg(feature = "dsql-integration")]
+    async fn live_store() -> Result<Option<(DsqlStore, DsqlVisibilityStore)>> {
+        let Ok(url) = std::env::var("TOKEIRA_DSQL_TEST_DATABASE_URL") else {
+            return Ok(None);
+        };
+        let pool = sqlx::PgPool::connect(&url).await?;
+        let config = DsqlPoolConfig {
+            // nextest starts this test in its crate directory, not the workspace root.
+            migration: MigrationConfig {
+                migrations_dir: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../tokeira-storage/migrations"),
+            },
+            ..DsqlPoolConfig::default()
+        };
+        let store = DsqlStore::from_database_url_for_tests(url, config).await?;
+        store.migration_runner().apply(&pool).await?;
+        pool.close().await;
+        let visibility = DsqlVisibilityStore::new(store.connection_director_arc());
+        Ok(Some((store, visibility)))
+    }
+
+    #[cfg(feature = "dsql-integration")]
+    fn live_image(
+        run_key: RunKey,
+        namespace_id: NamespaceId,
+        transition_seq: u64,
+        status: ExecutionStatus,
+    ) -> ProjectionRecord {
+        let mut context = test_projection_context(status);
+        context.namespace_id = namespace_id;
+        ProjectionRecord {
+            partition_id: 0,
+            fanout: 1,
+            run_key,
+            transition_seq: TransitionSeq(transition_seq),
+            context,
+        }
+    }
+
+    #[cfg(feature = "dsql-integration")]
+    async fn status_counts(
+        store: &DsqlVisibilityStore,
+        namespace_id: NamespaceId,
+    ) -> Result<BTreeMap<String, i64>> {
+        Ok(store
+            .count_from_rollup(
+                namespace_id,
+                ArchetypeId::WORKFLOW,
+                RollupDimension::ExecutionStatus,
+            )
+            .await?
+            .groups
+            .into_iter()
+            .map(|group| (group.value, group.count))
+            .collect())
+    }
+
+    // `projection-passes` criterion 2.8: an apply's counters commit with its row, so a
+    // counter that fails leaves nothing applied, and the retry counts the run.
+    #[cfg(feature = "dsql-integration")]
+    #[tokio::test]
+    async fn dsql_counts_stay_exact_when_a_counter_upsert_fails() -> Result<()> {
+        let Some((dsql, store)) = live_store().await? else {
+            return Ok(());
+        };
+        let namespace_id = NamespaceId(uuid::Uuid::new_v4());
+        let run_key = RunKey(uuid::Uuid::new_v4());
+        let completed = live_image(run_key, namespace_id, 2, ExecutionStatus::Completed);
+        store
+            .apply(
+                &live_image(run_key, namespace_id, 1, ExecutionStatus::Running),
+                0,
+            )
+            .await?;
+        apply_faults::arm(apply_faults::Fault::RollupUpsert(namespace_id));
+        let failed = store.apply(&completed, 0).await.is_err();
+        store.apply(&completed, 0).await?;
+        let counts = status_counts(&store, namespace_id).await?;
+        dsql.shutdown().await?;
+        assert!(failed, "the injected counter failure fails the apply");
+        assert_eq!(
+            counts,
+            BTreeMap::from([(workflow_status_keyword(ExecutionStatus::Completed), 1)]),
+            "the retried apply counts the run in its new status only"
+        );
+        Ok(())
+    }
+
+    // `projection-passes` criterion 2.8: a failed read of the stored row fails the
+    // apply, instead of reading as no row and counting the run twice.
+    #[cfg(feature = "dsql-integration")]
+    #[tokio::test]
+    async fn dsql_a_failed_stored_row_read_fails_the_apply() -> Result<()> {
+        let Some((dsql, store)) = live_store().await? else {
+            return Ok(());
+        };
+        let namespace_id = NamespaceId(uuid::Uuid::new_v4());
+        let run_key = RunKey(uuid::Uuid::new_v4());
+        let completed = live_image(run_key, namespace_id, 2, ExecutionStatus::Completed);
+        store
+            .apply(
+                &live_image(run_key, namespace_id, 1, ExecutionStatus::Running),
+                0,
+            )
+            .await?;
+        apply_faults::arm(apply_faults::Fault::StoredRowRead(run_key));
+        let failed = store.apply(&completed, 0).await.is_err();
+        store.apply(&completed, 0).await?;
+        let counts = status_counts(&store, namespace_id).await?;
+        dsql.shutdown().await?;
+        assert_eq!(
+            counts,
+            BTreeMap::from([(workflow_status_keyword(ExecutionStatus::Completed), 1)]),
+            "the run is counted once, in its new status"
+        );
+        assert!(failed, "the failed read fails the apply");
+        Ok(())
+    }
+
+    // `projection-passes` criterion 2.8: the apply reads the stored row by the whole
+    // primary key of `execution_visibility_current`, not by its run key alone.
+    #[cfg(feature = "dsql-integration")]
+    #[tokio::test]
+    async fn dsql_the_apply_reads_its_row_by_the_primary_key() -> Result<()> {
+        let Some((dsql, _store)) = live_store().await? else {
+            return Ok(());
+        };
+        let url = std::env::var("TOKEIRA_DSQL_TEST_DATABASE_URL")?;
+        let pool = sqlx::PgPool::connect(&url).await?;
+        let mut explain = sqlx::QueryBuilder::<sqlx::Postgres>::new("EXPLAIN ");
+        explain.push(READ_EXECUTION_ROW_SQL);
+        let plan = explain
+            .build_query_as::<(String,)>()
+            .bind(uuid::Uuid::new_v4())
+            .bind(i64::from(ArchetypeId::WORKFLOW.0))
+            .bind(uuid::Uuid::new_v4())
+            .fetch_all(&pool)
+            .await?;
+        pool.close().await;
+        dsql.shutdown().await?;
+        let lines = plan.iter().map(|(line,)| line.as_str()).collect::<Vec<_>>();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("using execution_visibility_current_pkey")),
+            "a lookup through the primary key: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("Index Cond:")
+                && line.contains("namespace_id =")
+                && line.contains("archetype_id =")
+                && line.contains("run_key =")),
+            "every key column in the index condition: {lines:#?}"
+        );
+        Ok(())
     }
 }

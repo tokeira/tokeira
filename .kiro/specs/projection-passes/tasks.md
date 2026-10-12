@@ -17,15 +17,15 @@ First show the defects, with tests that fail on the current code. Then:
     predicts
     - _Requirements: 1.1-1.3, 1.5, 1.6_
 
-- [ ] 2. The exact apply
-  - [ ] 2.1 Read the stored row by its full primary key inside the apply's transaction, and fail the apply when the read
+- [x] 2. The exact apply
+  - [x] 2.1 Read the stored row by its full primary key inside the apply's transaction, and fail the apply when the read
     fails
     - _Requirements: 2.8, 1.6-1.8_
-  - [ ] 2.2 Upsert the rollup deltas in the same transaction, and retry the whole transaction on a write conflict
+  - [x] 2.2 Upsert the rollup deltas in the same transaction, and retry the whole transaction on a write conflict
     - _Requirements: 2.8, 1.5_
-  - [ ] 2.3 Apply deletion tombstones the same way
+  - [x] 2.3 Apply deletion tombstones the same way
     - _Requirements: 2.8_
-  - [ ] 2.4 Return `ApplyOutcome` from `ProjectionSink::apply`, on both sinks, and ignore it in the CHASM adapter and
+  - [x] 2.4 Return `ApplyOutcome` from `ProjectionSink::apply`, on both sinks, and ignore it in the CHASM adapter and
     the CHASM visibility repair
     - _Requirements: 2.9, 3.4_
 

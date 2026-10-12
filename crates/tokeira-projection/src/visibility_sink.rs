@@ -16,7 +16,7 @@ use tokeira_storage::ProjectionRecord;
 use crate::{
     metrics as projection_metrics,
     rollup::compute_rollup_deltas,
-    sink::ProjectionSink,
+    sink::{ApplyOutcome, ProjectionSink},
     store::VisibilityStore,
     types::{
         AttrDescriptor, AttrId, CompiledFilter, CountResult, ExecutionRow, GroupByField,
@@ -155,20 +155,20 @@ impl<S> ProjectionSink for VisibilitySink<S>
 where
     S: VisibilityStore,
 {
-    async fn apply(&self, record: &ProjectionRecord, _partition_id: u32) -> Result<()> {
+    async fn apply(&self, record: &ProjectionRecord, _partition_id: u32) -> Result<ApplyOutcome> {
         let started = std::time::Instant::now();
-        if record.context.lifecycle_state == tokeira_types::VisibilityLifecycleState::Deleted {
-            self.store.apply_deletion(record).await?;
-            projection_metrics::record_sink_write_duration(record.partition_id, started.elapsed());
-            return Ok(());
-        }
         let previous = self.store.get_row(record.run_key).await;
         if !visibility_version_is_newer(
             previous.as_ref(),
             record.context.authority_epoch,
             record.transition_seq,
         ) {
-            return Ok(());
+            return Ok(ApplyOutcome::Current);
+        }
+        if record.context.lifecycle_state == tokeira_types::VisibilityLifecycleState::Deleted {
+            self.store.apply_deletion(record).await?;
+            projection_metrics::record_sink_write_duration(record.partition_id, started.elapsed());
+            return Ok(ApplyOutcome::Advanced);
         }
         // Visibility rows are full post-transition snapshots, not deltas: every
         // column is taken from the context image, so the row is constructed
@@ -256,7 +256,7 @@ where
         let deltas = compute_rollup_deltas(previous.as_ref(), &row);
         self.store.accumulate_rollup(&deltas).await?;
         projection_metrics::record_sink_write_duration(record.partition_id, started.elapsed());
-        Ok(())
+        Ok(ApplyOutcome::Advanced)
     }
 }
 

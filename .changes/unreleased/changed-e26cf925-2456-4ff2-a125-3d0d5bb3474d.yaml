@@ -1,4 +1,0 @@
-kind: changed
-body: Workflow tasks now use durable discovery by default, with cross-node starts and replies replacing legacy workflow backlog delivery.
-custom:
-  Slice: e26cf925-2456-4ff2-a125-3d0d5bb3474d

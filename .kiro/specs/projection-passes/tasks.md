@@ -38,10 +38,10 @@ First show the defects, with tests that fail on the current code. Then:
   - [ ] 3.3 Keep the latest image of an unseeded run in the in-memory `delete_images`
     - _Requirements: 2.4_
 
-- [ ] 4. Seeding from the newer
-  - [ ] 4.1 Read the run's applied value with its image in the DSQL load's snapshot, and seed from the newer
+- [x] 4. Seeding from the newer
+  - [x] 4.1 Read the run's applied value with its image in the DSQL load's snapshot, and seed from the newer
     - _Requirements: 2.4, 3.3_
-  - [ ] 4.2 Validate the applied value as criterion 2.11 validates an image
+  - [x] 4.2 Validate the applied value as criterion 2.11 validates an image
     - _Requirements: 2.4_
 
 - [ ] 5. The projector

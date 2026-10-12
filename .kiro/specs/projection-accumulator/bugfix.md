@@ -162,7 +162,11 @@ accumulator as ready and empty, regardless of versions in its replayed prefix.
 
 2.7 WHEN `load_run` or `load_run_with_stats` loads an unseeded existing run, THE
 repository SHALL return it ready using the accumulator from its latest committed
-projection image visible in the same storage snapshot as the loaded state.
+projection image visible in the same storage snapshot as the loaded state. On DSQL,
+where [projection-passes](../projection-passes/bugfix.md) deletes applied images, it
+SHALL read the run's applied value from its visibility row in the same snapshot, and
+use whichever of the image and the applied value is newer (projection-passes
+criterion 2.4).
 
 2.8 WHEN a legacy seed is read, THE repository SHALL locate it independently of the
 current projection partition count; a miss in the currently computed partition is
@@ -253,12 +257,24 @@ history accounting and growth thresholds.
 SHALL retain the latest projection image of every extant run.
 
 4.2 WHILE an extant run is not durably ready, THE deleting system SHALL retain its
-latest projection image even after all legacy writers have been excluded.
+latest projection image, or on DSQL the applied visibility row of that image, even
+after all legacy writers have been excluded.
+
+The applied row is an equivalent seed source on DSQL. projection-passes deletes an
+image only once its run's visibility row is at least as new as the image, so the
+row became the newest image before that image went. The visibility store keeps a
+keyword list verbatim, as the whole encoded value on each of its attribute index
+rows. An image naming an attribute its namespace hasn't registered fails to apply,
+so it is never deleted, and registered attributes are never removed. Criterion 2.7
+takes the newer of the latest image and the applied row, in the load's own
+snapshot.
 
 These are independent conditions. Neither a minimum writer version nor a ready
-in-memory copy is sufficient by itself. This spec adds no deleter, rollout control,
-backfill or readiness scanner. It does not recover images lost before migration;
-criterion 2.9 preserves the existing missing-image behaviour.
+in-memory copy is sufficient by itself, and neither is the applied row while a legacy
+writer, which reads only images, may run. This spec adds no deleter, rollout
+control, backfill or readiness scanner; projection-passes is the deleter. It does
+not recover images lost before migration; criterion 2.9 preserves the existing
+missing-image behaviour.
 
 ## Required verification
 

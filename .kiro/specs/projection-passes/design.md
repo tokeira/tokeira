@@ -255,6 +255,11 @@ run or stripe, every rollup counter SHALL equal the count over the rows once the
 - **The DSQL apply** (`dsql_store.rs`). `apply` and `apply_deletion` take the shape in [The apply](#the-apply), with
   the read by full key inside the transaction and the counters in it. `accumulate_rollup_striped`'s autocommit
   upserts become statements of the apply's transaction.
+- **Stripe locks** (`dsql_store.rs`). A counter conflict now aborts the whole apply under one retry budget, so the
+  store holds one lock per rollup stripe, shared by its clones, and an apply holds its run's stripe for its whole
+  transaction. Applies in one process, the projector's and CHASM's direct ones alike, never conflict on a counter row,
+  and the projector's one run per stripe at a time (2.10) follows. Applies on different nodes can still conflict, and
+  retry.
 - **Grouped counts** (`dsql_store.rs`). The exploration tests found that `count_from_rollup` failed on DSQL whenever
   counter rows existed: `SUM` over the BIGINT `counter` is NUMERIC, which doesn't decode as `i64`. It casts the sum back
   to BIGINT, so an unfiltered Count grouped by status, type or queue answers again.

@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use crate::{
     ApplyOutcome, ProjectionSink, VisibilityStore, metrics as projection_metrics,
-    rollup::compute_rollup_deltas,
+    rollup::{ROLLUP_STRIPES, compute_rollup_deltas, stripe_for},
     types::{
         AttrDescriptor, AttrId, CompareOp, CompiledFilter, CountResult, ExecutionRow, FieldRef,
         FilterExpr, FilterValue, GroupByField, ListResult, PageBounds, PageToken, RollupCounter,
@@ -74,11 +74,19 @@ mod apply_faults {
 #[derive(Clone, Debug)]
 pub struct DsqlVisibilityStore {
     director: Arc<DsqlConnectionDirector>,
+    /// One lock per rollup stripe, shared by every clone. An apply holds its run's
+    /// stripe for its whole transaction, retries included, so no two applies in this
+    /// process write the same counter row at once: the projector's and CHASM's direct
+    /// applies never fail each other with a write conflict on a counter.
+    stripes: Arc<[tokio::sync::Mutex<()>; ROLLUP_STRIPES as usize]>,
 }
 
 impl DsqlVisibilityStore {
     pub fn new(director: Arc<DsqlConnectionDirector>) -> Self {
-        Self { director }
+        Self {
+            director,
+            stripes: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
+        }
     }
 
     fn is_occ_conflict(error: &anyhow::Error) -> bool {
@@ -171,6 +179,8 @@ impl DsqlVisibilityStore {
         partition_id: u32,
     ) -> Result<ApplyOutcome> {
         let memo = codec::encode(&row.memo)?;
+        let stripe = usize::try_from(stripe_for(row.run_key))?;
+        let _stripe = self.stripes[stripe].lock().await;
         let mut attempts = 0u32;
         let outcome = loop {
             let mut permit = self.director.acquire(DbClass::Projection).await?;
@@ -330,6 +340,10 @@ impl VisibilityStore for DsqlVisibilityStore {
         remove_search_attr_index_row(connection, run_key, namespace_id, attr_id, attr_type).await
     }
 
+    /// Autocommit, one counter row at a time, so not atomic with any row's apply.
+    /// DSQL applies go through `ProjectionSink::apply`, which commits the counters
+    /// with the row (`projection-passes` criterion 2.8), and nothing on DSQL calls
+    /// this. A sink composed from it would bring back counters after the commit.
     async fn accumulate_rollup(&self, entries: &[RollupDelta]) -> Result<()> {
         self.accumulate_rollup_striped(entries).await
     }
@@ -2691,6 +2705,67 @@ mod tests {
                 && line.contains("archetype_id =")
                 && line.contains("run_key =")),
             "every key column in the index condition: {lines:#?}"
+        );
+        Ok(())
+    }
+
+    // The store holds one lock per rollup stripe, so concurrent applies of runs in one
+    // stripe never fail each other with a write conflict on a counter row, and each run
+    // is counted once.
+    #[cfg(feature = "dsql-integration")]
+    #[tokio::test]
+    async fn dsql_concurrent_applies_in_one_stripe_never_conflict() -> Result<()> {
+        let Some((dsql, store)) = live_store().await? else {
+            return Ok(());
+        };
+        let namespace_id = NamespaceId(uuid::Uuid::new_v4());
+        let mut images = Vec::new();
+        while images.len() < 24 {
+            let run_key = RunKey(uuid::Uuid::new_v4());
+            if stripe_for(run_key) == 0 {
+                images.push(live_image(
+                    run_key,
+                    namespace_id,
+                    1,
+                    ExecutionStatus::Running,
+                ));
+            }
+        }
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let results = {
+            // This runtime has one thread, so the applies all record to `recorder`.
+            let _recorder = metrics::set_default_local_recorder(&recorder);
+            let mut applies = tokio::task::JoinSet::new();
+            for image in images {
+                let store = store.clone();
+                applies.spawn(async move { store.apply(&image, 0).await });
+            }
+            applies.join_all().await
+        };
+        let counts = status_counts(&store, namespace_id).await?;
+        dsql.shutdown().await?;
+        for result in results {
+            result?;
+        }
+        let conflicts: u64 = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| key.key().name() == storage_metrics::DSQL_OCC_CONFLICT_TOTAL)
+            .map(|(_, _, _, value)| match value {
+                metrics_util::debugging::DebugValue::Counter(count) => count,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(
+            counts,
+            BTreeMap::from([(workflow_status_keyword(ExecutionStatus::Running), 24)]),
+            "every run is counted once"
+        );
+        assert_eq!(
+            conflicts, 0,
+            "no apply failed another with a write conflict"
         );
         Ok(())
     }

@@ -326,64 +326,17 @@ fn apply_start(&self, loaded: LoadedRun, req: StartRequest) -> Result<Transition
 
 The kernel stays pure: it only receives `reserved_poller_identity` and produces history/state. Because `schedule_workflow_task()` still produces `DispatchOp::EnqueueWorkflowTask`, the lane's post-commit dispatch processing must strip the matching workflow-task dispatch op when the committed command is a Start with `reserved_poller_identity.is_some()`. That dispatch op must not reach `publisher.publish(...)`; direct delivery owns the already-started WFT.
 
-#### Component: `tokeira-runtime/src/runtime.rs`
+#### Component: the start's lane
 
-Before submitting the Start command, reserve a poller:
+Amended by `reserved-poll-handoff`: the start's lane, not its caller, reserves the poller. A start with no eager worker
+and no start delay asks its lane for a parked poller. When the lane takes the start, it reserves one through its
+`DispatchPublisher` and sets `reserved_poller_identity` before the command is applied, so a poller is held only through
+the start's commit, never while the start waits in its lane's queue. A start that doesn't commit hands the reservation
+back.
 
-```rust
-pub async fn start_workflow(&self, mut request: StartRequest) -> Result<CommitResult> {
-    let queue = QueueKey {
-        namespace_id: request.namespace_id,
-        task_queue: request.task_queue.clone(),
-        task_kind: TaskKind::Workflow,
-        deployment: request.deployment.clone(),
-        build_id: request.build_id.clone(),
-    };
-    let reserved = self.broker.try_reserve_poller(&queue).await;
-    request.reserved_poller_identity = reserved
-        .as_ref()
-        .map(|poller| poller.worker_identity.clone());
+When the commit succeeds with a reservation, the lane constructs `StartedWorkflowTask` from the committed `new_state` and sends it on the reserved poller's response channel, whether or not the start's caller still waits. It must not call `start_polled_workflow_task` and must not publish the same WFT through the normal ready queue. The reserved-start path must filter the scheduled WFT's `DispatchOp::EnqueueWorkflowTask` from the transition dispatch ops in lane post-commit processing before the lane's generic publisher sees them.
 
-    let result = match self
-        .submit(request.run_key, Command::Start(request.clone()))
-        .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            if let Some(poller) = reserved {
-                self.broker.return_reserved_poller(poller).await;
-            }
-            return Err(error);
-        }
-    };
-
-    match (&result, reserved) {
-        (CommitResult::Applied { new_state }, Some(poller)) => {
-            self.register_reserved_wft_timeout(new_state).await?;
-            if let Err(error) = self
-                .deliver_started_workflow_task_to_reserved_poller(new_state, poller)
-                .await
-            {
-                tracing::warn!(
-                    ?error,
-                    run_key = ?request.run_key,
-                    "reserved poller disappeared after committed sync-match start"
-                );
-            }
-        }
-        (_, Some(poller)) => {
-            self.broker.return_reserved_poller(poller).await;
-        }
-        _ => {}
-    }
-
-    Ok(result)
-}
-```
-
-When the commit succeeds with a reservation, the runtime constructs `StartedWorkflowTask` from the committed `new_state` and sends it on the reserved poller's response channel. It must not call `start_polled_workflow_task` and must not publish the same WFT through the normal ready queue. The reserved-start path must filter the scheduled WFT's `DispatchOp::EnqueueWorkflowTask` from the transition dispatch ops in lane post-commit processing before the lane's generic publisher sees them.
-
-The reserved-start path must also insert `WftTimeoutEntry` from `new_state.pending_workflow_task` immediately after the successful commit and before direct delivery. If the response channel is closed after the commit succeeds, the task is already durably started and already tracked for timeout. The runtime records the delivery failure and returns the successful Start result; it relies on the existing WFT timeout scanner to time out and reschedule rather than attempting a second start or surfacing the delivery failure as a failed StartWorkflow response.
+The reserved-start path must also insert `WftTimeoutEntry` from `new_state.pending_workflow_task` immediately after the successful commit and before direct delivery. If the response channel is closed after the commit succeeds, the task is already durably started and already tracked for timeout. The lane records the delivery failure and returns the successful Start result; it relies on the existing WFT timeout scanner to time out and reschedule rather than attempting a second start or surfacing the delivery failure as a failed StartWorkflow response.
 
 **Impact:** Echo workflow drops from 3 commits to 2 commits when a poller is waiting.
 
@@ -741,9 +694,9 @@ The cache is never a correctness boundary. If the cache holds a stale `WorkflowS
 
 ### Sync-Match Reservation Failure
 
-The runtime reserves a specific poller before submitting the Start command. This creates two safe outcomes:
-- If the Start commit succeeds, the runtime sends the already-started WFT directly to the reserved poller's response channel.
-- If the Start commit fails, the runtime returns the reservation to the broker so the poller can continue waiting.
+The start's lane reserves a specific poller as it takes the Start command (amended by `reserved-poll-handoff`). This creates two safe outcomes:
+- If the Start commit succeeds, the lane sends the already-started WFT directly to the reserved poller's response channel, whether or not the start's caller still waits.
+- If the Start commit fails, the lane returns the reservation to the broker so the poller can continue waiting.
 
 The normal broker-ready path is bypassed for the combined transition, because the WFT is already started and must not pass through `start_polled_workflow_task` a second time.
 

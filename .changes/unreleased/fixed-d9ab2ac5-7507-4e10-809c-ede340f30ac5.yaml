@@ -1,0 +1,5 @@
+kind: fixed
+body: A workflow start no longer strands its first workflow task when its reserved poll meets other work or its deadline, or when the start's caller gives up.
+time: 2026-10-14T21:15:52.748952+01:00
+custom:
+    Slice: d9ab2ac5-7507-4e10-809c-ede340f30ac5

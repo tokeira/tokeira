@@ -741,41 +741,6 @@ impl<R> TokeiraRuntime<R>
 where
     R: RunRepository + 'static,
 {
-    pub(super) async fn try_reserve_start_poller(
-        &self,
-        request: &StartRequest,
-    ) -> Option<ReservedPoller> {
-        let queue = QueueKey {
-            namespace_id: request.namespace_id,
-            task_queue: request.task_queue.clone(),
-            task_kind: TaskKind::Workflow,
-            deployment: request.deployment.clone(),
-            build_id: request.build_id.clone(),
-        };
-        self.broker.try_reserve_poller(&queue).await
-    }
-
-    pub(super) async fn deliver_reserved_start_workflow_task(
-        &self,
-        new_state: &WorkflowState,
-        reserved: ReservedPoller,
-    ) -> Result<()> {
-        let worker_identity = reserved.worker_identity().clone();
-        // A start sync-match delivers on the run's NORMAL queue: not a sticky
-        // match (the flag licenses partial-history attach, moot here anyway
-        // since a fresh run has previous_started_event_id == 0).
-        let task = self
-            .started_workflow_task_from_state(new_state, false, worker_identity)
-            .await?;
-        if !reserved.deliver(task) {
-            tracing::warn!(
-                run_key = %new_state.run_key.0,
-                "reserved workflow task poller disappeared after durable start commit; timeout scanner will recover"
-            );
-        }
-        Ok(())
-    }
-
     pub async fn poll_workflow_task(
         &self,
         queue: QueueKey,
@@ -2092,53 +2057,65 @@ where
         is_sticky_match: bool,
         worker_identity: WorkerIdentity,
     ) -> Result<StartedWorkflowTask> {
-        let pending = state
-            .pending_workflow_task
-            .clone()
-            .ok_or_else(|| anyhow!("workflow task missing after direct start"))?;
-        let started_event_id = pending
-            .started_event_id
-            .ok_or_else(|| anyhow!("direct-start workflow task missing started_event_id"))?;
-        let started_at = pending
-            .started_at
-            .ok_or_else(|| anyhow!("direct-start workflow task missing started_at"))?;
-        let token = WorkflowTaskToken {
-            run_key: state.run_key,
-            logical_seq: pending.logical_seq,
-            started_event_id,
-            attempt: pending.attempt,
-            shard_epoch: self.current_shard_epoch(state).await?,
-        };
-        let queue = QueueKey {
-            namespace_id: state.namespace_id,
-            task_queue: state.task_queue.clone(),
-            task_kind: TaskKind::Workflow,
-            deployment: state.deployment.clone(),
-            build_id: state.build_id.clone(),
-        };
-        Ok(StartedWorkflowTask {
-            advice: pending.advice.clone(),
-            run_key: state.run_key,
-            run_id: state.run_id,
-            workflow_id: state.workflow_id.clone(),
-            task_queue: state.task_queue.clone(),
-            previous_started_event_id: state.previous_started_event_id,
-            last_event_id_at_start: state.last_event_id,
-            is_sticky_match,
-            scheduled_time: pending.scheduled_at,
-            started_time: started_at,
-            workflow_task_timeout: state.workflow_task_timeout,
-            worker_identity: worker_identity.clone(),
-            target_worker_deployment_version_changed: pending
-                .target_worker_deployment_version_changed,
-            token,
-            origin: WorkerTaskOrigin::from_queue_key(
-                &queue,
-                state.task_queue.clone(),
-                WorkerTaskClass::Workflow,
-            ),
-        })
+        let shard_epoch = self.current_shard_epoch(state).await?;
+        started_workflow_task(state, is_sticky_match, worker_identity, shard_epoch)
     }
+}
+
+/// The workflow task `state` holds, started for `worker_identity`, as the poll it was started for
+/// receives it. `shard_epoch` is the epoch of the run's execution home: a start's first task handed to
+/// the poll its lane reserved, and an eager start's task returned inline, both carry it in their token.
+pub(crate) fn started_workflow_task(
+    state: &WorkflowState,
+    is_sticky_match: bool,
+    worker_identity: WorkerIdentity,
+    shard_epoch: ShardEpoch,
+) -> Result<StartedWorkflowTask> {
+    let pending = state
+        .pending_workflow_task
+        .clone()
+        .ok_or_else(|| anyhow!("workflow task missing after direct start"))?;
+    let started_event_id = pending
+        .started_event_id
+        .ok_or_else(|| anyhow!("direct-start workflow task missing started_event_id"))?;
+    let started_at = pending
+        .started_at
+        .ok_or_else(|| anyhow!("direct-start workflow task missing started_at"))?;
+    let token = WorkflowTaskToken {
+        run_key: state.run_key,
+        logical_seq: pending.logical_seq,
+        started_event_id,
+        attempt: pending.attempt,
+        shard_epoch,
+    };
+    let queue = QueueKey {
+        namespace_id: state.namespace_id,
+        task_queue: state.task_queue.clone(),
+        task_kind: TaskKind::Workflow,
+        deployment: state.deployment.clone(),
+        build_id: state.build_id.clone(),
+    };
+    Ok(StartedWorkflowTask {
+        advice: pending.advice.clone(),
+        run_key: state.run_key,
+        run_id: state.run_id,
+        workflow_id: state.workflow_id.clone(),
+        task_queue: state.task_queue.clone(),
+        previous_started_event_id: state.previous_started_event_id,
+        last_event_id_at_start: state.last_event_id,
+        is_sticky_match,
+        scheduled_time: pending.scheduled_at,
+        started_time: started_at,
+        workflow_task_timeout: state.workflow_task_timeout,
+        worker_identity: worker_identity.clone(),
+        target_worker_deployment_version_changed: pending.target_worker_deployment_version_changed,
+        token,
+        origin: WorkerTaskOrigin::from_queue_key(
+            &queue,
+            state.task_queue.clone(),
+            WorkerTaskClass::Workflow,
+        ),
+    })
 }
 
 /// Workflow-retry failure classification, mirroring `isRetryable`

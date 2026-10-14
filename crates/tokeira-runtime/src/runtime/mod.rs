@@ -44,7 +44,7 @@ use crate::{
         ActivityTimeoutScannerConfig, ActivityTrackingState, run_activity_timeout_scanner,
     },
     backlog::{BacklogConfig, run_drain_loop, run_grace_scanner},
-    broker::{InMemoryActivityBroker, InMemoryBroker, ReservedPoller, WorkflowPollResult},
+    broker::{InMemoryActivityBroker, InMemoryBroker, WorkflowPollResult},
     buffered_queries::{BufferedQuery, BufferedQueryRegistry},
     deployment_registry::DeploymentRegistry,
     drain::RuntimeDrain,

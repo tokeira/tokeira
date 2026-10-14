@@ -88,11 +88,8 @@ where
         update_fold: Option<String>,
     ) -> Result<StartCommitOutcome> {
         // A delayed start (client start-delay or cron initial backoff) arms
-        // the start-delay timer instead of scheduling a first WFT — there is
-        // nothing to hand a reserved poller, so do not reserve one (the
-        // sync-match delivery path requires a pending WFT and would
-        // otherwise fail the whole Start RPC with "workflow task missing
-        // after reserved start").
+        // the start-delay timer instead of scheduling a first WFT, so there
+        // is no task to hand a reserved poller.
         let has_positive_backoff = request
             .workflow_start_delay
             .is_some_and(|delay| delay > Duration::ZERO);
@@ -105,14 +102,11 @@ where
         // Runtime admission owns this direct-delivery identity; never trust a
         // pre-populated value from an internal caller.
         request.reserved_poller_identity = eager_worker_identity.clone();
-        let reserved_poller = if eager_worker_identity.is_none() && !has_positive_backoff {
-            self.try_reserve_start_poller(&request).await
-        } else {
-            None
-        };
-        if let Some(reserved) = &reserved_poller {
-            request.reserved_poller_identity = Some(reserved.worker_identity().clone());
-        }
+        // Any other start asks its lane for a parked poll: the lane reserves
+        // one when it takes the start, commits the first WFT as started for
+        // it, and hands it the task after the commit, whether or not this
+        // call still waits. A start waiting behind a busy lane holds no poll.
+        let reserve_poller = eager_worker_identity.is_none() && !has_positive_backoff;
 
         let command = match update_fold {
             Some(update_id) => Command::StartAndUpdate(tokeira_kernel::StartAndUpdateRequest {
@@ -121,44 +115,15 @@ where
             }),
             None => Command::Start(request.clone()),
         };
-        let result = match self.submit(request.run_key, command).await {
-            Ok(result) => result,
-            Err(error) => {
-                if let Some(reserved) = reserved_poller {
-                    self.broker.return_reserved_poller(reserved).await;
-                }
-                return Err(error);
-            }
-        };
-        let eager_workflow_task = match (&result, eager_worker_identity, reserved_poller) {
-            (CommitResult::Applied { new_state }, Some(worker_identity), None) => Some(
+        let result = self
+            .submit_start(request.run_key, command, reserve_poller)
+            .await?;
+        let eager_workflow_task = match (&result, eager_worker_identity) {
+            (CommitResult::Applied { new_state }, Some(worker_identity)) => Some(
                 self.started_workflow_task_from_state(new_state, false, worker_identity)
                     .await?,
             ),
-            (CommitResult::Applied { new_state }, None, Some(reserved)) => {
-                // The run is durably started; a failed sync-match delivery
-                // must not fail the Start RPC. The broker-enqueue op was
-                // suppressed for a reserved start, so recovery is the WFT
-                // start-to-close timeout scanner (the tracking entry is
-                // inserted before delivery) or, on a shard handover, the new
-                // owner's sweep reconstructing it from committed state.
-                if let Err(error) = self
-                    .deliver_reserved_start_workflow_task(new_state, reserved)
-                    .await
-                {
-                    tracing::warn!(
-                        ?error,
-                        run_key = ?request.run_key,
-                        "reserved-start sync-match delivery failed; WFT timeout scanner will recover"
-                    );
-                }
-                None
-            }
-            (_, _, Some(reserved)) => {
-                self.broker.return_reserved_poller(reserved).await;
-                None
-            }
-            (_, _, None) => None,
+            _ => None,
         };
         Ok(StartCommitOutcome {
             commit_result: result,

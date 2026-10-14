@@ -35,13 +35,17 @@ use tokeira_proto::{
 };
 use tokeira_storage::{CommitResult, RunRepository, metrics as storage_metrics};
 use tokeira_types::{
-    ExecutionStatus, NamespaceId, RunKey, ShardEpoch, ShardId, WorkflowId, execution_home_bundle,
+    ExecutionStatus, NamespaceId, QueueKey, RunKey, ShardEpoch, ShardId, TaskKind, WorkflowId,
+    execution_home_bundle,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::{UpdateRegistry, UpdateResolution, metrics as runtime_metrics, shard::ShardOwner};
+use crate::{
+    UpdateRegistry, UpdateResolution, broker::ReservedPoller, metrics as runtime_metrics,
+    shard::ShardOwner,
+};
 
 /// Configuration knobs for a single lane executor.
 ///
@@ -104,6 +108,20 @@ pub trait DispatchPublisher: Send + Sync {
     /// orchestration follow-up paths such as child
     /// resolution delivery.
     async fn submit_to_run(&self, run_key: RunKey, command: Command) -> Result<CommitResult>;
+
+    /// Reserve a poll parked at `queue` for a start's first workflow task. The
+    /// reserved poll takes no other work until the lane hands it the task or
+    /// returns it. The default reserves none.
+    async fn reserve_start_poller(&self, _queue: &QueueKey) -> Option<ReservedPoller> {
+        None
+    }
+
+    /// Return a poll reserved for a start that didn't commit its first
+    /// workflow task, so the poll carries on. The default drops it, and the
+    /// poll ends empty.
+    async fn return_start_poller(&self, reserved: ReservedPoller) {
+        drop(reserved);
+    }
 }
 
 /// A lane is a single serial command processor.
@@ -135,10 +153,31 @@ impl LaneHandle {
     /// single-threaded executor, so callers never need
     /// external locking on the run.
     pub async fn submit(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
+        self.submit_message(run_key, command, false).await
+    }
+
+    /// Submit a workflow start whose lane reserves a poll parked at the start's
+    /// queue when it takes the start, commits the run's first workflow task as
+    /// started for that poll, and hands it the task after the commit, whether
+    /// or not this call still waits for the reply.
+    pub async fn submit_reserving_poller(
+        &self,
+        run_key: RunKey,
+        command: Command,
+    ) -> Result<CommitResult> {
+        self.submit_message(run_key, command, true).await
+    }
+
+    async fn submit_message(
+        &self,
+        run_key: RunKey,
+        command: Command,
+        reserve_poller: bool,
+    ) -> Result<CommitResult> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(LaneMessage::new(self.lane_id, run_key, command, reply_tx))
-            .await?;
+        let mut message = LaneMessage::new(self.lane_id, run_key, command, reply_tx);
+        message.reserve_poller = reserve_poller;
+        self.tx.send(message).await?;
         reply_rx.await?
     }
 
@@ -171,6 +210,8 @@ struct LaneMessage {
     reply_tx: oneshot::Sender<Result<CommitResult>>,
     enqueued_at: std::time::Instant,
     trace_context: Option<ChannelTraceContext>,
+    /// A start asking its lane for a parked poll (`reserved-poll-handoff`).
+    reserve_poller: bool,
 }
 
 impl LaneMessage {
@@ -191,6 +232,7 @@ impl LaneMessage {
             // the origin ids are carried explicitly to relink the processing
             // span back to the caller.
             trace_context: ChannelTraceContext::capture_current(),
+            reserve_poller: false,
         }
     }
 }
@@ -516,7 +558,15 @@ where
     let mut drained = 0usize;
     let drain_limit = config.max_drain_per_activation.max(1) as usize;
 
-    while let Some(message) = current.take() {
+    while let Some(mut message) = current.take() {
+        // A start asking for a parked poll reserves it now, as its lane takes
+        // it: until then the poll takes other work, so a start waiting behind
+        // a busy lane holds none.
+        let reserved_poller = if message.reserve_poller {
+            reserve_start_poller(publisher, &mut message.command).await
+        } else {
+            None
+        };
         let committed_command = message.command.clone();
         let command_type = command_type_name(&message.command);
         runtime_metrics::record_lane_queue_wait(message.enqueued_at.elapsed());
@@ -1593,6 +1643,9 @@ where
             Some(breach) => Err(anyhow::Error::new(breach)),
             None => reply,
         };
+        if let Some(reserved) = reserved_poller {
+            hand_over_start_poller(publisher, shard_owner, &reply, reserved).await;
+        }
         runtime_metrics::record_lane_processing_duration(command_type, processing_start.elapsed());
         let _ = message.reply_tx.send(reply);
         drained += 1;
@@ -2016,6 +2069,90 @@ fn reserved_start_has_direct_delivery(command: &Command) -> bool {
             ..
         })
     )
+}
+
+/// Reserve a poll parked at a start's queue as its lane takes the start, and
+/// start the run's first workflow task for that poll in the start's own commit
+/// (`reserved-poll-handoff`). A start with an eager worker carries its own
+/// identity and reserves none.
+async fn reserve_start_poller<P>(publisher: &P, command: &mut Command) -> Option<ReservedPoller>
+where
+    P: DispatchPublisher + ?Sized,
+{
+    let request = match command {
+        Command::Start(request) => request,
+        Command::StartAndUpdate(request) => &mut request.start,
+        _ => return None,
+    };
+    if request.reserved_poller_identity.is_some() {
+        return None;
+    }
+    let queue = QueueKey {
+        namespace_id: request.namespace_id,
+        task_queue: request.task_queue.clone(),
+        task_kind: TaskKind::Workflow,
+        deployment: request.deployment.clone(),
+        build_id: request.build_id.clone(),
+    };
+    let reserved = publisher.reserve_start_poller(&queue).await?;
+    request.reserved_poller_identity = Some(reserved.worker_identity().clone());
+    Some(reserved)
+}
+
+/// Hand a start's first workflow task to the poll its lane reserved, once the
+/// start has committed, whether or not the start's caller still waits. A start
+/// that didn't commit returns the poll, which carries on.
+async fn hand_over_start_poller<P>(
+    publisher: &P,
+    shard_owner: &Arc<RwLock<ShardOwner>>,
+    reply: &Result<CommitResult>,
+    reserved: ReservedPoller,
+) where
+    P: DispatchPublisher + ?Sized,
+{
+    let Ok(CommitResult::Applied { new_state }) = reply else {
+        publisher.return_start_poller(reserved).await;
+        return;
+    };
+    let shard_epoch = {
+        let owner = shard_owner.read().expect("shard_owner lock poisoned");
+        owner.owns(execution_home_bundle(
+            new_state.namespace_id.0.as_bytes(),
+            new_state.workflow_id.0.as_bytes(),
+            owner.shard_count(),
+        ))
+    };
+    let task = shard_epoch
+        .ok_or_else(|| anyhow!("execution home not owned after the start committed"))
+        .and_then(|shard_epoch| {
+            crate::runtime::workflow_task::started_workflow_task(
+                new_state,
+                false,
+                reserved.worker_identity().clone(),
+                shard_epoch,
+            )
+        });
+    match task {
+        // The run is durably started, and its first task's start-to-close
+        // timeout is tracked, or rebuilt from committed state by a new
+        // owner's sweep, so a poll gone by now costs that timeout.
+        Ok(task) => {
+            if !reserved.deliver(task) {
+                tracing::warn!(
+                    run_key = %new_state.run_key.0,
+                    "reserved workflow task poller disappeared after durable start commit; timeout scanner will recover"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                run_key = %new_state.run_key.0,
+                "reserved start could not hand over its workflow task; timeout scanner will recover"
+            );
+            publisher.return_start_poller(reserved).await;
+        }
+    }
 }
 
 fn history_event_type_name(event: &HistoryEvent) -> &'static str {
@@ -2888,6 +3025,8 @@ mod tests {
     struct MockPublisher {
         state: Arc<AsyncMutex<MockPublisherState>>,
         wake: Arc<Notify>,
+        /// The broker whose parked polls starts reserve, when a test gives one.
+        broker: Option<crate::broker::InMemoryBroker>,
     }
 
     #[derive(Default)]
@@ -2903,7 +3042,13 @@ mod tests {
             Self {
                 state: Arc::new(AsyncMutex::new(MockPublisherState::default())),
                 wake: Arc::new(Notify::new()),
+                broker: None,
             }
+        }
+
+        fn with_broker(mut self, broker: crate::broker::InMemoryBroker) -> Self {
+            self.broker = Some(broker);
+            self
         }
 
         async fn with_failure(self) -> Self {
@@ -2981,6 +3126,17 @@ mod tests {
                 .submit_result
                 .clone()
                 .unwrap_or(CommitResult::Duplicate))
+        }
+
+        async fn reserve_start_poller(&self, queue: &QueueKey) -> Option<ReservedPoller> {
+            self.broker.as_ref()?.try_reserve_poller(queue).await
+        }
+
+        async fn return_start_poller(&self, reserved: ReservedPoller) {
+            match &self.broker {
+                Some(broker) => broker.return_reserved_poller(reserved).await,
+                None => drop(reserved),
+            }
         }
     }
 
@@ -4682,5 +4838,298 @@ mod tests {
 
         let observed = observed.lock().expect("observed lock poisoned");
         assert!(observed.iter().any(|name| name == "kernel.transition"));
+    }
+
+    /// Applies a start as a new run with the real kernel, whatever the mock
+    /// repository loaded, and any other command as [`MockKernel`] does: the
+    /// mock repository holds one run.
+    #[derive(Clone)]
+    struct StartingKernel(MockKernel);
+
+    impl Kernel for StartingKernel {
+        fn apply(&self, loaded: LoadedRun, command: Command) -> Result<Transition, Reject> {
+            match command {
+                Command::Start(_) => tokeira_kernel::BasicKernel.apply(LoadedRun::Absent, command),
+                other => self.0.apply(loaded, other),
+            }
+        }
+    }
+
+    fn start_queue(request: &StartRequest) -> QueueKey {
+        QueueKey {
+            namespace_id: request.namespace_id,
+            task_queue: request.task_queue.clone(),
+            task_kind: TaskKind::Workflow,
+            deployment: None,
+            build_id: None,
+        }
+    }
+
+    /// A start asking its lane for a parked poll, as `submit_reserving_poller`
+    /// sends it.
+    fn reserving_start_message(
+        request: &StartRequest,
+    ) -> (LaneMessage, oneshot::Receiver<Result<CommitResult>>) {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut message = LaneMessage::new(
+            0,
+            request.run_key,
+            Command::Start(request.clone()),
+            reply_tx,
+        );
+        message.reserve_poller = true;
+        (message, reply_rx)
+    }
+
+    /// A poll parked at `queue`, returned once the broker lists its waiter.
+    async fn parked_workflow_poll(
+        broker: &crate::broker::InMemoryBroker,
+        queue: &QueueKey,
+        worker: &WorkerIdentity,
+    ) -> tokio::task::JoinHandle<Result<Option<crate::broker::WorkflowPollResult>>> {
+        let poll = {
+            let broker = broker.clone();
+            let queue = queue.clone();
+            let worker = worker.clone();
+            tokio::spawn(async move {
+                broker
+                    .poll_workflow_activation(&queue, None, &worker, StdDuration::from_secs(30))
+                    .await
+            })
+        };
+        while !broker.queues_with_waiters().await.contains(queue) {
+            tokio::task::yield_now().await;
+        }
+        poll
+    }
+
+    fn other_workflow_task(queue: &QueueKey) -> DispatchableWorkflowTask {
+        DispatchableWorkflowTask {
+            run_key: RunKey::new(),
+            queue: queue.clone(),
+            logical_seq: LogicalTaskSeq::ONE,
+            sticky_preferred: None,
+            normal_queue: None,
+            sticky_deadline: None,
+            priority: None,
+            order: None,
+        }
+    }
+
+    fn publishes_workflow_task(publishes: &[(RunKey, Vec<DispatchOp>)]) -> bool {
+        publishes.iter().any(|(_, ops)| {
+            ops.iter()
+                .any(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. }))
+        })
+    }
+
+    /// One activation of a start's lane, with the real kernel.
+    async fn run_start_activation(
+        publisher: &MockPublisher,
+        repo: &MockRepo,
+        message: LaneMessage,
+    ) {
+        let (_tx, mut rx) = mpsc::channel(8);
+        let carry_over = run_activation(
+            &tokeira_kernel::BasicKernel,
+            repo,
+            publisher,
+            &test_shard_owner(),
+            &crate::activity_timeout::ActivityTrackingState::default(),
+            &crate::timeout::WorkflowTimeoutTrackingState::default(),
+            &crate::wft_timeout::WftTimeoutTrackingState::default(),
+            &crate::nexus::NexusTimeoutTrackingState::default(),
+            &crate::UpdateRegistry::new(),
+            &mut rx,
+            message,
+            &LaneConfig {
+                max_occ_retries: 0,
+                ..LaneConfig::default()
+            },
+        )
+        .await;
+        assert!(carry_over.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_start_lane_reserves_a_parked_poll_and_hands_it_the_first_workflow_task() {
+        let broker = crate::broker::InMemoryBroker::default();
+        let request = crate::runtime::tests::sample_start_request(None, None);
+        let queue = start_queue(&request);
+        let worker = WorkerIdentity("parked-poller".to_string());
+        let poll = parked_workflow_poll(&broker, &queue, &worker).await;
+        let publisher = MockPublisher::new().with_broker(broker.clone());
+        let (message, reply) = reserving_start_message(&request);
+
+        let repo = MockRepo::new(LoadedRun::Absent, vec![CommitBehavior::Applied]);
+        run_start_activation(&publisher, &repo, message).await;
+
+        let Ok(CommitResult::Applied { new_state }) = reply.await.unwrap() else {
+            panic!("the start should commit");
+        };
+        let started_event_id = new_state
+            .pending_workflow_task
+            .as_ref()
+            .and_then(|task| task.started_event_id)
+            .expect("the start's commit starts its first workflow task");
+        match poll.await.unwrap().unwrap() {
+            Some(crate::broker::WorkflowPollResult::Started(task)) => {
+                assert_eq!(task.run_key, request.run_key);
+                assert_eq!(task.worker_identity, worker);
+                assert_eq!(task.token.started_event_id, started_event_id);
+            }
+            other => panic!("expected the start's first workflow task, got {other:?}"),
+        }
+        // The task went to the poll, not to the queue.
+        assert!(!publishes_workflow_task(
+            &publisher.snapshot().await.publishes
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_start_lane_hands_over_the_first_workflow_task_after_the_caller_has_gone() {
+        let broker = crate::broker::InMemoryBroker::default();
+        let request = crate::runtime::tests::sample_start_request(None, None);
+        let queue = start_queue(&request);
+        let worker = WorkerIdentity("parked-poller".to_string());
+        let poll = parked_workflow_poll(&broker, &queue, &worker).await;
+        let publisher = MockPublisher::new().with_broker(broker.clone());
+        let (message, reply) = reserving_start_message(&request);
+        // The start's caller gives up before its lane takes the start.
+        drop(reply);
+
+        let repo = MockRepo::new(LoadedRun::Absent, vec![CommitBehavior::Applied]);
+        run_start_activation(&publisher, &repo, message).await;
+
+        match poll.await.unwrap().unwrap() {
+            Some(crate::broker::WorkflowPollResult::Started(task)) => {
+                assert_eq!(task.run_key, request.run_key);
+                assert_eq!(task.worker_identity, worker);
+            }
+            other => panic!("expected the start's first workflow task, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_start_that_does_not_commit_returns_its_poll() {
+        let broker = crate::broker::InMemoryBroker::default();
+        let request = crate::runtime::tests::sample_start_request(None, None);
+        let queue = start_queue(&request);
+        let worker = WorkerIdentity("parked-poller".to_string());
+        let poll = parked_workflow_poll(&broker, &queue, &worker).await;
+        let publisher = MockPublisher::new().with_broker(broker.clone());
+        let (message, reply) = reserving_start_message(&request);
+
+        let repo = MockRepo::new(LoadedRun::Absent, vec![CommitBehavior::Error]);
+        run_start_activation(&publisher, &repo, message).await;
+
+        assert!(reply.await.unwrap().is_err());
+        // The poll is parked again, and takes the queue's next task.
+        assert!(broker.queues_with_waiters().await.contains(&queue));
+        let next = other_workflow_task(&queue);
+        broker.publish_workflow_task(next.clone(), None).await;
+        match poll.await.unwrap().unwrap() {
+            Some(crate::broker::WorkflowPollResult::Queued(task, _)) => assert_eq!(task, next),
+            other => panic!("expected the queue's next task, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_start_lane_without_a_parked_poll_commits_a_plain_start() {
+        let broker = crate::broker::InMemoryBroker::default();
+        let request = crate::runtime::tests::sample_start_request(None, None);
+        let publisher = MockPublisher::new().with_broker(broker.clone());
+        let (message, reply) = reserving_start_message(&request);
+
+        let repo = MockRepo::new(LoadedRun::Absent, vec![CommitBehavior::Applied]);
+        run_start_activation(&publisher, &repo, message).await;
+
+        let Ok(CommitResult::Applied { new_state }) = reply.await.unwrap() else {
+            panic!("the start should commit");
+        };
+        let pending = new_state
+            .pending_workflow_task
+            .expect("the start schedules its first workflow task");
+        assert_eq!(pending.started_event_id, None);
+        // The task is published to its queue, for the next poll.
+        assert!(publishes_workflow_task(
+            &publisher.snapshot().await.publishes
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_parked_poll_stays_free_while_its_start_waits_in_the_lane_queue() {
+        let broker = crate::broker::InMemoryBroker::default();
+        let busy_run = RunKey::new();
+        let repo = MockRepo::new(LoadedRun::Existing(sample_state(busy_run)), Vec::new());
+        let (commit_held, release_commit) = repo.hold_next_commit().await;
+        let publisher = MockPublisher::new().with_broker(broker.clone());
+        let lane = spawn_lane(
+            StartingKernel(MockKernel::new(SmallVec::new())),
+            repo,
+            publisher.clone(),
+            test_shard_owner(),
+            crate::activity_timeout::ActivityTrackingState::default(),
+            crate::timeout::WorkflowTimeoutTrackingState::default(),
+            crate::wft_timeout::WftTimeoutTrackingState::default(),
+            crate::nexus::NexusTimeoutTrackingState::default(),
+            crate::UpdateRegistry::new(),
+            LaneConfig::default(),
+        );
+        // The lane is busy with another run's command.
+        let (reply_tx, busy_reply) = oneshot::channel();
+        lane.tx
+            .try_send(LaneMessage::new(
+                0,
+                busy_run,
+                sample_command("busy"),
+                reply_tx,
+            ))
+            .unwrap();
+        commit_held.await.unwrap();
+
+        let request = crate::runtime::tests::sample_start_request(None, None);
+        let queue = start_queue(&request);
+        let worker = WorkerIdentity("parked-poller".to_string());
+        let poll = parked_workflow_poll(&broker, &queue, &worker).await;
+        let start = {
+            let lane = lane.clone();
+            let command = Command::Start(request.clone());
+            tokio::spawn(
+                async move { lane.submit_reserving_poller(request.run_key, command).await },
+            )
+        };
+        while lane.queued_depth() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        // Another workflow task reaches the queue while the start waits, and
+        // the parked poll, which nothing has reserved, takes it.
+        let other = other_workflow_task(&queue);
+        broker.publish_workflow_task(other.clone(), None).await;
+        match poll.await.unwrap().unwrap() {
+            Some(crate::broker::WorkflowPollResult::Queued(task, _)) => assert_eq!(task, other),
+            other => panic!("expected the other task, got {other:?}"),
+        }
+
+        // The lane then takes the start with no poll parked and commits a
+        // plain start: its first task goes to its queue, not stranded.
+        release_commit.send(()).unwrap();
+        assert!(matches!(
+            busy_reply.await.unwrap().unwrap(),
+            CommitResult::Applied { .. }
+        ));
+        let CommitResult::Applied { new_state } = start.await.unwrap().unwrap() else {
+            panic!("the start should commit");
+        };
+        assert_eq!(
+            new_state
+                .pending_workflow_task
+                .and_then(|task| task.started_event_id),
+            None
+        );
+        assert!(publishes_workflow_task(
+            &publisher.snapshot().await.publishes
+        ));
     }
 }

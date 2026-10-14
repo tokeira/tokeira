@@ -44,6 +44,28 @@ where
     /// the edge maps to the retryable not-owner status. Routing is by run key,
     /// so the same run always serializes on the same lane.
     pub async fn submit(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
+        self.submit_admitted(run_key, command, false).await
+    }
+
+    /// Submit a workflow start as [`submit`](Self::submit) does. With
+    /// `reserve_poller`, the start's lane reserves a poll parked at the start's
+    /// queue when it takes the start, and hands it the first workflow task
+    /// once the start has committed (`reserved-poll-handoff`).
+    pub(super) async fn submit_start(
+        &self,
+        run_key: RunKey,
+        command: Command,
+        reserve_poller: bool,
+    ) -> Result<CommitResult> {
+        self.submit_admitted(run_key, command, reserve_poller).await
+    }
+
+    async fn submit_admitted(
+        &self,
+        run_key: RunKey,
+        command: Command,
+        reserve_poller: bool,
+    ) -> Result<CommitResult> {
         self.ready().await?;
         let shard_id = self.command_home(run_key, &command).await?;
         // Drain check precedes the active check on purpose: a draining shard is
@@ -74,7 +96,11 @@ where
         let lane = self.pick_lane(run_key);
         let lane_id = lane_index_for_run_key(run_key, self.lanes.len());
         let started = std::time::Instant::now();
-        let result = lane.submit(run_key, command).await?;
+        let result = if reserve_poller {
+            lane.submit_reserving_poller(run_key, command).await?
+        } else {
+            lane.submit(run_key, command).await?
+        };
         runtime_metrics::record_lane_submit_duration(lane_id, started.elapsed());
         self.handle_post_commit(run_key, &result);
         Ok(result)

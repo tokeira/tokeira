@@ -16,3 +16,14 @@
 - [x] 4. Checkpoint: the four tests pass, the broker's and runtime's suites pass, and the full bar of root
   `AGENTS.md` §10.4 passes
   - _Requirements: 3.1-3.3_
+
+- [x] 5. Move the reservation and the hand-off into the start's lane: the lane reserves a parked poll as it takes a
+  start that asks for one, hands it the first workflow task after the commit whether or not the caller still waits,
+  and returns it when the start doesn't commit
+  - _Requirements: 1.5, 2.5, 3.2, 3.4, 3.5_
+
+- [x] 6. Lane tests for Property 3, each failing under its negative control
+  - _Requirements: 2.5, 3.2, 3.4_
+
+- [x] 7. Checkpoint: the broker's, lane's and runtime's suites pass, and the full bar of root `AGENTS.md` §10.4 passes
+  - _Requirements: 3.1-3.5_

@@ -44,7 +44,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     activity_timeout::ActivityTrackingState,
-    broker::{InMemoryActivityBroker, InMemoryBroker},
+    broker::{InMemoryActivityBroker, InMemoryBroker, ReservedPoller},
     child_start::{self, ChildStartIo, ChildStartOutcome, Submitted},
     deployment_registry::DeploymentRegistry,
     fairness::DeliveryMetrics,
@@ -2643,6 +2643,14 @@ where
 
     async fn submit_to_run(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
         self.pick_lane(run_key).submit(run_key, command).await
+    }
+
+    async fn reserve_start_poller(&self, queue: &QueueKey) -> Option<ReservedPoller> {
+        self.broker.try_reserve_poller(queue).await
+    }
+
+    async fn return_start_poller(&self, reserved: ReservedPoller) {
+        self.broker.return_reserved_poller(reserved).await;
     }
 }
 

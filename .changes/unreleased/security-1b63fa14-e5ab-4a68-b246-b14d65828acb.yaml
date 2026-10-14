@@ -1,0 +1,5 @@
+kind: security
+body: rustls 0.23.46 closes RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348 and RUSTSEC-2026-0349.
+time: 2026-10-14T22:42:29.573519+01:00
+custom:
+    Slice: 1b63fa14-e5ab-4a68-b246-b14d65828acb

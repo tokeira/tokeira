@@ -2316,6 +2316,113 @@ pub(crate) mod tests {
         assert_eq!(repo.read_history(run_key, 0, 16).await.unwrap(), history);
     }
 
+    /// A test runtime with one lane, and a poll parked at `request`'s queue on
+    /// its broker, returned once the broker lists the poll's waiter.
+    async fn runtime_with_parked_poll(
+        request: &StartRequest,
+    ) -> (
+        TokeiraRuntime<InMemoryStore>,
+        QueueKey,
+        tokio::task::JoinHandle<Result<Option<WorkflowPollResult>>>,
+    ) {
+        let runtime = TokeiraRuntime::new(
+            Arc::new(InMemoryStore::default()),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        );
+        let queue = QueueKey {
+            namespace_id: request.namespace_id,
+            task_queue: request.task_queue.clone(),
+            task_kind: TaskKind::Workflow,
+            deployment: None,
+            build_id: None,
+        };
+        let poll = tokio::spawn({
+            let (broker, queue) = (runtime.broker.clone(), queue.clone());
+            async move {
+                broker
+                    .poll_workflow_activation(
+                        &queue,
+                        None,
+                        &WorkerIdentity("parked-poller".to_string()),
+                        tokio::time::Duration::from_secs(30),
+                    )
+                    .await
+            }
+        });
+        while !runtime.broker.queues_with_waiters().await.contains(&queue) {
+            tokio::task::yield_now().await;
+        }
+        (runtime, queue, poll)
+    }
+
+    /// The poll is still parked, unreserved, and takes the next task published
+    /// on its queue.
+    async fn assert_poll_left_free(
+        runtime: &TokeiraRuntime<InMemoryStore>,
+        queue: &QueueKey,
+        poll: tokio::task::JoinHandle<Result<Option<WorkflowPollResult>>>,
+    ) {
+        assert!(
+            runtime.broker.queues_with_waiters().await.contains(queue),
+            "the start reserved no poll"
+        );
+        let next = DispatchableWorkflowTask {
+            run_key: RunKey::new(),
+            queue: queue.clone(),
+            logical_seq: LogicalTaskSeq::ONE,
+            sticky_preferred: None,
+            normal_queue: None,
+            sticky_deadline: None,
+            priority: None,
+            order: None,
+        };
+        runtime
+            .broker
+            .publish_workflow_task(next.clone(), None)
+            .await;
+        match poll.await.unwrap().unwrap() {
+            Some(WorkflowPollResult::Queued(task, _)) => assert_eq!(task, next),
+            other => panic!("expected the next task, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delayed_start_leaves_a_parked_poll_free() {
+        // Feature: reserved-poll-handoff, Property 3. A start with a start
+        // delay has no first workflow task to hand over, so it reserves no poll.
+        let mut request = sample_start_request(None, None);
+        request.workflow_start_delay = Some(Duration::seconds(30));
+        let (runtime, queue, poll) = runtime_with_parked_poll(&request).await;
+
+        let result = runtime.start_workflow(request).await.unwrap();
+        assert!(matches!(result, CommitResult::Applied { .. }));
+        assert_poll_left_free(&runtime, &queue, poll).await;
+    }
+
+    #[tokio::test]
+    async fn an_eager_start_leaves_a_parked_poll_free() {
+        // Feature: reserved-poll-handoff, Property 3. An eager start's first
+        // workflow task goes inline to its own worker, so it reserves no poll.
+        let mut request = sample_start_request(None, None);
+        request.request.caller_identity = Some("eager-worker".to_string());
+        request.eager_execution_accepted = true;
+        let (runtime, queue, poll) = runtime_with_parked_poll(&request).await;
+
+        let result = runtime.start_workflow_with_policy(request).await.unwrap();
+        assert!(matches!(
+            result,
+            StartWorkflowResult::Started {
+                eager_workflow_task: Some(_),
+                ..
+            }
+        ));
+        assert_poll_left_free(&runtime, &queue, poll).await;
+    }
+
     #[tokio::test]
     async fn eager_start_with_positive_backoff_commits_without_inline_task() {
         // Feature: edge-eager-dispatch, Properties 2/5. A positive first-WFT

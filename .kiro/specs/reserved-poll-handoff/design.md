@@ -65,9 +65,9 @@ Property 3: A start's lane decides its poll
 _For any_ start that may reserve, its lane SHALL reserve a parked poll only as it takes the start, SHALL hand that poll
 the start's first workflow task once the start has committed, whether or not the start's caller still waits, and SHALL
 hand the reservation back when the start doesn't commit. With no poll parked, the start SHALL commit its first task
-unstarted and publish it.
+unstarted and publish it. An eager start, and a start with a start delay, SHALL ask for no poll.
 
-**Validates: Requirements 1.5, 2.5, 3.2, 3.4**
+**Validates: Requirements 2.5, 3.2, 3.4, 3.5**
 
 ## Fix Implementation
 
@@ -102,6 +102,9 @@ Written and run on the code before the fix, each failing there:
 - a reserved poll returns empty at its deadline;
 - a poll whose reservation is handed back has already taken the other task while reserved.
 
+A property test of Property 1, over generated interleavings of tasks and queries published on the reserved poll's
+queue and waits past its deadline, fails on the broker before the fix and passes after it.
+
 ### Unit Tests
 
 The same four, with paused time, pass after the fix:
@@ -118,13 +121,21 @@ Lane tests, each against the real kernel:
 - a start that doesn't commit returns its poll, which then takes the queue's next task;
 - with no poll parked, the start commits its first task unstarted and publishes it;
 - a poll parked while its start waits behind a busy lane takes other work, and the start then commits its first task
-  unstarted and publishes it.
+  unstarted and publishes it;
+- a start whose execution home is lost between its commit and the hand-off returns its poll, which then takes the
+  queue's next task.
+
+For Requirement 3.5, a unit test checks that only a start with no worker of its own and no start delay asks its lane for
+a poll, and runtime tests check that an eager start and a delayed start leave a parked poll free to take the next task.
+The unit test is the one that fails if either asks: the lane would return a reservation it couldn't use, and the poll
+would carry on.
 
 These use the lane's new interface, so they can't run before the change. Negative controls stand in: each part of the
 lane change, removed alone, fails its tests. Without the reservation, the two hand-off tests fail; without a hand-off
 once the caller has gone, that test fails; without the return, the return test fails; and with the reservation made
 after the command is cloned for the post-commit steps, the task is also published to the queue, and the first test
-fails.
+fails. Without the return on a lost home, the lost-home test fails, and with every start asking for a poll, the unit
+test of Requirement 3.5 fails.
 
 ### Preservation Checking
 

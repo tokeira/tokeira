@@ -53,11 +53,12 @@ where
     /// Start a new workflow execution.
     ///
     /// This low-level entry point cannot return an eager task, so it disables
-    /// public eager admission. It may still reserve a parked broker poller for
-    /// the independent synchronous-match optimisation. That reservation is
-    /// returned on every non-`Applied` outcome and submit error, so a failed
-    /// start never leaks a poller. Execution/run timeout tracking begins only
-    /// after the start is durably `Applied`.
+    /// public eager admission. Its lane may still reserve a parked broker poller
+    /// for the independent synchronous-match optimisation, and returns that
+    /// reservation on every non-`Applied` outcome, so a failed start never
+    /// leaks a poller; a start refused before its lane reserves none.
+    /// Execution/run timeout tracking begins only after the start is durably
+    /// `Applied`.
     pub async fn start_workflow(&self, request: StartRequest) -> Result<CommitResult> {
         Ok(self
             .start_workflow_inner(request, None, false)
@@ -87,12 +88,6 @@ where
         mut request: StartRequest,
         update_fold: Option<String>,
     ) -> Result<StartCommitOutcome> {
-        // A delayed start (client start-delay or cron initial backoff) arms
-        // the start-delay timer instead of scheduling a first WFT, so there
-        // is no task to hand a reserved poller.
-        let has_positive_backoff = request
-            .workflow_start_delay
-            .is_some_and(|delay| delay > Duration::ZERO);
         let eager_worker_identity = request.eager_execution_accepted.then(|| {
             // Temporal passes the request identity straight into the eager
             // WorkflowTaskStarted event; the proto string may be empty
@@ -102,11 +97,11 @@ where
         // Runtime admission owns this direct-delivery identity; never trust a
         // pre-populated value from an internal caller.
         request.reserved_poller_identity = eager_worker_identity.clone();
-        // Any other start asks its lane for a parked poll: the lane reserves
-        // one when it takes the start, commits the first WFT as started for
-        // it, and hands it the task after the commit, whether or not this
-        // call still waits. A start waiting behind a busy lane holds no poll.
-        let reserve_poller = eager_worker_identity.is_none() && !has_positive_backoff;
+        // A start may ask its lane for a parked poll: the lane reserves one
+        // when it takes the start, commits the first WFT as started for it,
+        // and hands it the task after the commit, whether or not this call
+        // still waits. A start waiting behind a busy lane holds no poll.
+        let reserve_poller = asks_lane_for_poller(&request);
 
         let command = match update_fold {
             Some(update_id) => Command::StartAndUpdate(tokeira_kernel::StartAndUpdateRequest {
@@ -1778,6 +1773,18 @@ where
     }
 }
 
+/// Whether a start asks its lane for a parked poll (`reserved-poll-handoff`).
+/// An eager start carries its own worker's identity, and its first workflow
+/// task goes inline to that worker. A delayed start (client start-delay or
+/// cron initial backoff) arms its start-delay timer instead of scheduling a
+/// first task, so there is nothing to hand a poll. Every other start asks.
+fn asks_lane_for_poller(request: &StartRequest) -> bool {
+    request.reserved_poller_identity.is_none()
+        && !request
+            .workflow_start_delay
+            .is_some_and(|delay| delay > Duration::ZERO)
+}
+
 fn prepare_start_request(request: &mut StartRequest, allow_eager_response: bool) -> Result<()> {
     apply_client_cron_start_backoff(request)?;
     request.eager_execution_accepted = eager_workflow_start_is_accepted(
@@ -1867,6 +1874,25 @@ mod tests {
         ExecutionRef, Memo, NamespaceId, Payloads, RequestContext, RequestId, RunId, RunKey,
         SearchAttributes, TaskQueueName, WorkflowId, WorkflowType,
     };
+
+    // Feature: reserved-poll-handoff, Property 3. Only a start with a first
+    // workflow task to hand over, and no worker of its own, asks for a poll.
+    #[test]
+    fn only_a_plain_start_asks_its_lane_for_a_poller() {
+        assert!(asks_lane_for_poller(&deletion_start_request()));
+
+        let mut eager = deletion_start_request();
+        eager.reserved_poller_identity = Some(WorkerIdentity("eager-worker".to_string()));
+        assert!(!asks_lane_for_poller(&eager));
+
+        let mut delayed = deletion_start_request();
+        delayed.workflow_start_delay = Some(Duration::seconds(5));
+        assert!(!asks_lane_for_poller(&delayed));
+
+        let mut undelayed = deletion_start_request();
+        undelayed.workflow_start_delay = Some(Duration::ZERO);
+        assert!(asks_lane_for_poller(&undelayed));
+    }
 
     fn deletion_start_request() -> StartRequest {
         let now = OffsetDateTime::UNIX_EPOCH;

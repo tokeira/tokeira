@@ -221,6 +221,12 @@ struct BrokerState {
     normal_alias_wakes: HashMap<QueueKey, HashSet<QueueKey>>,
     /// Parked sticky polls counted as demand on their declared normal queue.
     normal_alias_waiter_counts: HashMap<QueueKey, usize>,
+    /// Parked workflow polls per queue, the targets of a start's reservation.
+    /// A waiter leaves only through its own poll, which deregisters it as it
+    /// takes work or exits, or through `try_reserve_poller`, whose
+    /// `ReservedPoller` then delivers to it, returns it or drops it. A poll
+    /// whose waiter is gone waits on its channel for one of those, so removing
+    /// a waiter any other way would hang that poll past its deadline.
     workflow_waiters: HashMap<QueueKey, VecDeque<WorkflowWaiter>>,
     next_workflow_waiter_id: u64,
     query_ready: HashMap<QueueKey, VecDeque<QueryTask>>,
@@ -545,8 +551,9 @@ impl ReservedPoller {
     }
 
     /// Deliver a started task to the reserved poller. Returns `false` if the
-    /// poller already went away (timed out or cancelled), so the caller can
-    /// re-route the task instead of losing it.
+    /// poll went away, its client having cancelled it: a reserved poll doesn't
+    /// time out. The task, already started for this poll, then waits for its
+    /// workflow-task timeout.
     pub fn deliver(self, task: StartedWorkflowTask) -> bool {
         self.response_tx.send(Ok(Some(task))).is_ok()
     }
@@ -1141,8 +1148,10 @@ impl InMemoryBroker {
 
     /// Shared workflow-task long-poll loop (see the module's per-queue wake
     /// pattern). Holds until a task for `queue` is available or `wait_for`
-    /// elapses; a wake on this queue is a hint to re-derive readiness, never a
-    /// reason to return empty early. `include_query` mirrors the Temporal
+    /// elapses, except while a start holds the poll's reservation: a reserved
+    /// poll waits for its start's task, or for the reservation to come back,
+    /// past `wait_for` (`reserved-poll-handoff`). A wake on this queue is a
+    /// hint to re-derive readiness, never a reason to return empty early. `include_query` mirrors the Temporal
     /// contract that `PollWorkflowTaskQueue` also satisfies a ready direct query
     /// (`service/matching/matching_engine.go:1084 @ v1.31.0`); the workflow-only
     /// internal path passes `false`.
@@ -1166,9 +1175,10 @@ impl InMemoryBroker {
             return Ok(Some(WorkflowPollResult::Query(task)));
         }
 
-        // The waiter is the sync-match target (reserved-poller / eager hand-off
-        // via `response_rx`); it stays registered for the whole call and is
-        // removed once on exit.
+        // The waiter is the sync-match target of a start's reservation (via
+        // `response_rx`). The poll deregisters it as it takes work or exits,
+        // under the lock that checks it is still parked; a reservation removes
+        // it instead, and the poll then waits on `response_rx`.
         let deadline = Instant::now() + wait_for;
         let (response_tx, mut response_rx) = oneshot::channel();
         let waiter_id = self
@@ -1495,7 +1505,8 @@ impl InMemoryBroker {
     /// Long-poll for a workflow task on `queue`.
     ///
     /// Returns immediately if a task is available, otherwise
-    /// blocks up to `wait_for`. Sticky tasks on this queue are delivered only
+    /// blocks up to `wait_for`, or past it while a start holds the poll's
+    /// reservation. Sticky tasks on this queue are delivered only
     /// to their preferred worker; unavailable affinity was already redirected
     /// atomically when the task was published.
     pub async fn poll_workflow_task(
@@ -1510,8 +1521,8 @@ impl InMemoryBroker {
 
     /// Pull one waiting poller off `queue`'s wait list for synchronous delivery.
     ///
-    /// Skips waiters whose response channel has already closed (the poll timed
-    /// out or was cancelled) so a producer never reserves a dead poller. Returns
+    /// Skips waiters whose response channel has already closed (the poll's
+    /// client cancelled it) so a producer never reserves a dead poller. Returns
     /// `None` when no live waiter is parked.
     pub async fn try_reserve_poller(&self, queue: &QueueKey) -> Option<ReservedPoller> {
         let mut inner = self.inner.lock().await;
@@ -5134,9 +5145,10 @@ mod tests {
         poll
     }
 
-    // A start that reserves a parked poll has started its run's first workflow task
-    // for that poll; another task published meanwhile must wait for another poll,
-    // or the first task waits out its workflow-task timeout.
+    // Feature: reserved-poll-handoff, Property 1. A start that reserves a parked
+    // poll has started its run's first workflow task for that poll; another task
+    // published meanwhile must wait for another poll, or the first task waits out
+    // its workflow-task timeout.
     #[tokio::test(start_paused = true)]
     async fn a_reserved_poll_takes_only_its_start_task() {
         let broker = Arc::new(InMemoryBroker::default());
@@ -5169,6 +5181,8 @@ mod tests {
         );
     }
 
+    // Feature: reserved-poll-handoff, Property 1. A reserved poll takes no direct
+    // query: it waits for its start's task.
     #[tokio::test(start_paused = true)]
     async fn a_reserved_poll_takes_no_query() {
         let broker = Arc::new(InMemoryBroker::default());
@@ -5203,7 +5217,8 @@ mod tests {
         assert!(matches!(polled, Some(WorkflowPollResult::Started(_))));
     }
 
-    // A start's commit can outlast the poll's deadline; the poll waits for its task.
+    // Feature: reserved-poll-handoff, Property 1. A start's commit can outlast the
+    // poll's deadline; the poll waits for its task.
     #[tokio::test(start_paused = true)]
     async fn a_reserved_poll_outlasts_its_deadline_for_its_start_task() {
         let broker = Arc::new(InMemoryBroker::default());
@@ -5226,8 +5241,9 @@ mod tests {
         assert!(matches!(polled, Some(WorkflowPollResult::Started(_))));
     }
 
-    // A start that doesn't commit hands its reservation back, and the poll carries on
-    // as if it had never been reserved: it takes ready work, and keeps its deadline.
+    // Feature: reserved-poll-handoff, Property 2. A start that doesn't commit hands
+    // its reservation back, and the poll carries on as if it had never been
+    // reserved: it takes ready work, and keeps its deadline.
     #[tokio::test(start_paused = true)]
     async fn a_returned_reservation_resumes_the_poll() {
         let broker = Arc::new(InMemoryBroker::default());
@@ -5266,5 +5282,100 @@ mod tests {
             !broker.queues_with_waiters().await.contains(&queue),
             "and leaves the wait list"
         );
+    }
+
+    #[derive(Clone, Debug)]
+    enum Meanwhile {
+        Task,
+        Query,
+        Wait(u64),
+    }
+
+    fn meanwhile() -> impl Strategy<Value = Meanwhile> {
+        prop_oneof![
+            Just(Meanwhile::Task),
+            Just(Meanwhile::Query),
+            (1u64..=30).prop_map(Meanwhile::Wait),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        // Feature: reserved-poll-handoff, Property 1. Whatever reaches its queue,
+        // and however long its start takes, a reserved poll returns its start's
+        // task and takes nothing else first.
+        #[test]
+        fn a_reserved_poll_returns_its_start_task_whatever_happens_meanwhile(
+            events in prop::collection::vec(meanwhile(), 0..6)
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let broker = Arc::new(InMemoryBroker::default());
+                let queue = workflow_queue("reserved-property", None, None);
+                let worker = WorkerIdentity("reserved".into());
+                let poll = parked_poll(&broker, &queue, &worker, Duration::from_secs(10)).await;
+                let reserved = broker
+                    .try_reserve_poller(&queue)
+                    .await
+                    .expect("the parked poll is reserved");
+                let mut published = 0;
+                let mut queries = Vec::new();
+                for event in &events {
+                    match event {
+                        Meanwhile::Task => {
+                            broker.publish_workflow_task(workflow_task(queue.clone()), None).await;
+                            published += 1;
+                        }
+                        Meanwhile::Query => {
+                            let (query_tx, query_rx) = oneshot::channel();
+                            queries.push(query_rx);
+                            broker
+                                .publish_query_task(QueryTask {
+                                    run_key: RunKey::new(),
+                                    query_type: "status".into(),
+                                    query_args: Payloads::default(),
+                                    queue: queue.clone(),
+                                    origin: query_origin(&queue),
+                                    sticky_preferred: None,
+                                    sticky_queue: None,
+                                    sticky_deadline: None,
+                                    deadline: OffsetDateTime::now_utc() + TimeDuration::minutes(5),
+                                    response_tx: query_tx,
+                                })
+                                .await;
+                        }
+                        Meanwhile::Wait(seconds) => {
+                            tokio::time::sleep(Duration::from_secs(*seconds)).await;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    prop_assert!(!poll.is_finished(), "the reserved poll took nothing after {event:?}");
+                }
+
+                let start = reserved_start_task(&queue, &worker);
+                let run_key = start.run_key;
+                prop_assert!(reserved.deliver(start));
+                let polled = poll.await.expect("poll task").expect("poll");
+                prop_assert!(
+                    matches!(polled, Some(WorkflowPollResult::Started(task)) if task.run_key == run_key),
+                    "the reserved poll returns its start's task"
+                );
+                let mut left = 0;
+                while let Some(WorkflowPollResult::Queued(..)) = broker
+                    .poll_workflow_task(&queue, &WorkerIdentity("next".into()), Duration::ZERO)
+                    .await
+                    .expect("poll")
+                {
+                    left += 1;
+                }
+                prop_assert_eq!(left, published, "every task published meanwhile waits for another poll");
+                Ok(())
+            })?;
+        }
     }
 }

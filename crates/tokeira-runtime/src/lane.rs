@@ -28,7 +28,8 @@ use tokeira_kernel::{
     Command, DispatchOp, HistoryEvent, HistoryEventKind, Kernel, LoadedRun, StartRequest,
 };
 use tokeira_observability::{
-    ChannelTraceContext, ErrorBiasedSamplingReason, RetryOutcomeLabel, mark_error_biased_sample,
+    ChannelTraceContext, ErrorBiasedSamplingReason, NotShardOwnerOperationLabel, RetryOutcomeLabel,
+    mark_error_biased_sample,
 };
 use tokeira_proto::{
     conversions::common::failure_to_payload, public::temporal::api::failure::v1 as failure_proto,
@@ -2122,16 +2123,23 @@ async fn hand_over_start_poller<P>(
             owner.shard_count(),
         ))
     };
-    let task = shard_epoch
-        .ok_or_else(|| anyhow!("execution home not owned after the start committed"))
-        .and_then(|shard_epoch| {
-            crate::runtime::workflow_task::started_workflow_task(
-                new_state,
-                false,
-                reserved.worker_identity().clone(),
-                shard_epoch,
-            )
-        });
+    let task = match shard_epoch {
+        Some(shard_epoch) => crate::runtime::workflow_task::started_workflow_task(
+            new_state,
+            false,
+            reserved.worker_identity().clone(),
+            shard_epoch,
+        ),
+        // The home was lost between the commit and the hand-off; recorded as
+        // the runtime's `current_shard_epoch` records it.
+        None => {
+            runtime_metrics::record_not_shard_owner(NotShardOwnerOperationLabel::CurrentShardEpoch);
+            mark_error_biased_sample(ErrorBiasedSamplingReason::NotShardOwner);
+            Err(anyhow!(
+                "execution home not owned after the start committed"
+            ))
+        }
+    };
     match task {
         // The run is durably started, and its first task's start-to-close
         // timeout is tracked, or rebuilt from committed state by a new
@@ -4927,6 +4935,7 @@ mod tests {
     async fn run_start_activation(
         publisher: &MockPublisher,
         repo: &MockRepo,
+        shard_owner: &Arc<RwLock<ShardOwner>>,
         message: LaneMessage,
     ) {
         let (_tx, mut rx) = mpsc::channel(8);
@@ -4934,7 +4943,7 @@ mod tests {
             &tokeira_kernel::BasicKernel,
             repo,
             publisher,
-            &test_shard_owner(),
+            shard_owner,
             &crate::activity_timeout::ActivityTrackingState::default(),
             &crate::timeout::WorkflowTimeoutTrackingState::default(),
             &crate::wft_timeout::WftTimeoutTrackingState::default(),
@@ -4951,6 +4960,8 @@ mod tests {
         assert!(carry_over.is_none());
     }
 
+    // Feature: reserved-poll-handoff, Property 3. A start's lane reserves a
+    // parked poll as it takes the start, and hands it the start's first task.
     #[tokio::test]
     async fn a_start_lane_reserves_a_parked_poll_and_hands_it_the_first_workflow_task() {
         let broker = crate::broker::InMemoryBroker::default();
@@ -4962,7 +4973,7 @@ mod tests {
         let (message, reply) = reserving_start_message(&request);
 
         let repo = MockRepo::new(LoadedRun::Absent, vec![CommitBehavior::Applied]);
-        run_start_activation(&publisher, &repo, message).await;
+        run_start_activation(&publisher, &repo, &test_shard_owner(), message).await;
 
         let Ok(CommitResult::Applied { new_state }) = reply.await.unwrap() else {
             panic!("the start should commit");
@@ -4986,6 +4997,8 @@ mod tests {
         ));
     }
 
+    // Feature: reserved-poll-handoff, Property 3. The lane hands the task over
+    // whether or not the start's caller still waits.
     #[tokio::test]
     async fn a_start_lane_hands_over_the_first_workflow_task_after_the_caller_has_gone() {
         let broker = crate::broker::InMemoryBroker::default();
@@ -4999,7 +5012,7 @@ mod tests {
         drop(reply);
 
         let repo = MockRepo::new(LoadedRun::Absent, vec![CommitBehavior::Applied]);
-        run_start_activation(&publisher, &repo, message).await;
+        run_start_activation(&publisher, &repo, &test_shard_owner(), message).await;
 
         match poll.await.unwrap().unwrap() {
             Some(crate::broker::WorkflowPollResult::Started(task)) => {
@@ -5010,6 +5023,8 @@ mod tests {
         }
     }
 
+    // Feature: reserved-poll-handoff, Property 3. A start that doesn't commit
+    // returns its poll, which carries on.
     #[tokio::test]
     async fn a_start_that_does_not_commit_returns_its_poll() {
         let broker = crate::broker::InMemoryBroker::default();
@@ -5021,7 +5036,7 @@ mod tests {
         let (message, reply) = reserving_start_message(&request);
 
         let repo = MockRepo::new(LoadedRun::Absent, vec![CommitBehavior::Error]);
-        run_start_activation(&publisher, &repo, message).await;
+        run_start_activation(&publisher, &repo, &test_shard_owner(), message).await;
 
         assert!(reply.await.unwrap().is_err());
         // The poll is parked again, and takes the queue's next task.
@@ -5034,6 +5049,8 @@ mod tests {
         }
     }
 
+    // Feature: reserved-poll-handoff, Property 3. With no poll parked, the start
+    // commits its first task unstarted and publishes it.
     #[tokio::test]
     async fn a_start_lane_without_a_parked_poll_commits_a_plain_start() {
         let broker = crate::broker::InMemoryBroker::default();
@@ -5042,7 +5059,7 @@ mod tests {
         let (message, reply) = reserving_start_message(&request);
 
         let repo = MockRepo::new(LoadedRun::Absent, vec![CommitBehavior::Applied]);
-        run_start_activation(&publisher, &repo, message).await;
+        run_start_activation(&publisher, &repo, &test_shard_owner(), message).await;
 
         let Ok(CommitResult::Applied { new_state }) = reply.await.unwrap() else {
             panic!("the start should commit");
@@ -5057,6 +5074,8 @@ mod tests {
         ));
     }
 
+    // Feature: reserved-poll-handoff, Property 3. A start reserves nothing while
+    // it waits in its lane's queue, so a parked poll stays free for other work.
     #[tokio::test]
     async fn a_parked_poll_stays_free_while_its_start_waits_in_the_lane_queue() {
         let broker = crate::broker::InMemoryBroker::default();
@@ -5131,5 +5150,47 @@ mod tests {
         assert!(publishes_workflow_task(
             &publisher.snapshot().await.publishes
         ));
+    }
+
+    // Feature: reserved-poll-handoff, Property 3. A home lost between the commit
+    // and the hand-off returns the poll, which carries on; the started task is
+    // left to its timeout, as a new owner's sweep would find it.
+    #[tokio::test]
+    async fn a_start_whose_home_is_lost_after_its_commit_returns_its_poll() {
+        let broker = crate::broker::InMemoryBroker::default();
+        let request = crate::runtime::tests::sample_start_request(None, None);
+        let queue = start_queue(&request);
+        let worker = WorkerIdentity("parked-poller".to_string());
+        let poll = parked_workflow_poll(&broker, &queue, &worker).await;
+        let publisher = MockPublisher::new().with_broker(broker.clone());
+        let (message, reply) = reserving_start_message(&request);
+        let repo = MockRepo::new(LoadedRun::Absent, vec![CommitBehavior::Applied]);
+        let (commit_held, release_commit) = repo.hold_next_commit().await;
+        let shard_owner = test_shard_owner();
+        let activation = tokio::spawn({
+            let (publisher, repo, shard_owner) =
+                (publisher.clone(), repo.clone(), shard_owner.clone());
+            async move { run_start_activation(&publisher, &repo, &shard_owner, message).await }
+        });
+
+        commit_held.await.unwrap();
+        shard_owner
+            .write()
+            .expect("owner lock poisoned")
+            .mark_draining(ShardId(0));
+        release_commit.send(()).unwrap();
+        activation.await.unwrap();
+
+        assert!(matches!(
+            reply.await.unwrap().unwrap(),
+            CommitResult::Applied { .. }
+        ));
+        assert!(broker.queues_with_waiters().await.contains(&queue));
+        let next = other_workflow_task(&queue);
+        broker.publish_workflow_task(next.clone(), None).await;
+        match poll.await.unwrap().unwrap() {
+            Some(crate::broker::WorkflowPollResult::Queued(task, _)) => assert_eq!(task, next),
+            other => panic!("expected the queue's next task, got {other:?}"),
+        }
     }
 }

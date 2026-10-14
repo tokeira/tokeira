@@ -3,15 +3,15 @@
 ## Introduction
 
 When a workflow starts and a poll is already parked on its task queue, the start hands the run's first workflow task
-straight to that poll, a synchronous match:
+straight to that poll, a synchronous match. Before this fix:
 - the start reserves the poll: `try_reserve_poller` takes the poll's waiter off the queue's wait list
-  (`crates/tokeira-runtime/src/broker.rs:1473-1490`);
+  (`crates/tokeira-runtime/src/broker.rs`);
 - the start's commit records the first workflow task as started, for the reserved poll's worker identity;
-- after the commit, the start delivers the task on the poll's channel (`deliver_reserved_start_workflow_task`,
-  `crates/tokeira-runtime/src/runtime/workflow_task.rs:758-777`, called from `start_workflow_prepared`,
-  `crates/tokeira-runtime/src/runtime/lifecycle.rs:85-165`).
+- after the commit, the start delivers the task on the poll's channel (`deliver_reserved_start_workflow_task` in
+  `crates/tokeira-runtime/src/runtime/workflow_task.rs`, called from `start_workflow_prepared` in
+  `crates/tokeira-runtime/src/runtime/lifecycle.rs`; the fix removes it).
 
-The reserved poll doesn't know it was reserved. Its loop keeps running (`broker.rs:1171-1215`): every wake of its
+The reserved poll doesn't know it was reserved. Its loop, `poll_workflow_inner`, keeps running: every wake of its
 queue, such as another workflow task published there, has it look for ready work again, and at its deadline it
 returns empty. If it takes another workflow task or a direct query, or reaches its deadline, before the start
 delivers, its channel closes. The start then finds no poll to deliver to, and the run's first workflow task, already

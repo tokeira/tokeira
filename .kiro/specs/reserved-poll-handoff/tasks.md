@@ -20,10 +20,17 @@
 - [x] 5. Move the reservation and the hand-off into the start's lane: the lane reserves a parked poll as it takes a
   start that asks for one, hands it the first workflow task after the commit whether or not the caller still waits,
   and returns it when the start doesn't commit
-  - _Requirements: 1.5, 2.5, 3.2, 3.4, 3.5_
+  - _Requirements: 2.5, 3.2, 3.4, 3.5_
 
-- [x] 6. Lane tests for Property 3, each failing under its negative control
+- [x] 6. Lane tests for Property 3, including a home lost after the commit, each failing under its negative control
   - _Requirements: 2.5, 3.2, 3.4_
 
-- [x] 7. Checkpoint: the broker's, lane's and runtime's suites pass, and the full bar of root `AGENTS.md` §10.4 passes
+- [x] 7. Tests for Requirement 3.5: the start's decision to ask for a poll, and runtime tests that an eager and a
+  delayed start leave a parked poll free
+  - _Requirements: 3.5_
+
+- [x] 8. A property test of Property 1 over generated interleavings, failing on the broker before the fix
+  - _Requirements: 2.1, 2.2_
+
+- [x] 9. Checkpoint: the broker's, lane's and runtime's suites pass, and the full bar of root `AGENTS.md` §10.4 passes
   - _Requirements: 3.1-3.5_

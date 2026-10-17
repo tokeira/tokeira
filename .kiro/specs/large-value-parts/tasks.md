@@ -26,18 +26,20 @@ worker invocation requests. Each step first shows the defect, with live tests th
     - _Requirements: 2.1_
   - [ ] 2.3 Make the commit write a split state and split batches, and remove the parts a state no longer uses
     - _Requirements: 2.1, 2.2, 3.1_
-  - [ ] 2.4 Make `load_run`, the other readers of a run's state and the history reads join split values
-    - _Requirements: 2.3, 2.4, 3.4_
+  - [ ] 2.4 Make `load_run`, the other readers of a run's state and the history reads join split values, each in the
+    transaction that reads the value's row
+    - _Requirements: 2.3, 2.4, 3.4, 3.6_
   - [ ] 2.5 Make a reset read, copy and write split values
     - _Requirements: 2.5, 3.3_
-  - [ ] 2.6 Add `run_value_part` to the purge's tables, before history
-    - _Requirements: 2.6_
+  - [ ] 2.6 Add `run_value_part` to the purge's tables after history, as the last, and remove the record with its last
+    page
+    - _Requirements: 2.6, 3.6_
   - [ ] 2.7 Write the tests of Properties 3–6 for a run's values, on both stores, and the live tests of the design
     - **Property 3: A stored value reads back whole**
     - **Property 4: A replaced value leaves only its own parts**
     - **Property 5: A reset copies values over the part size**
     - **Property 6: Removing a value removes its parts**
-    - **Validates: Requirements 2.1-2.7, 3.1, 3.3**
+    - **Validates: Requirements 2.1-2.7, 3.1, 3.3, 3.6**
   - [ ] 2.8 Add the release note
     - _Requirements: 2.8_
   - [ ] 2.9 Align the specs and documentation the design lists for step 1

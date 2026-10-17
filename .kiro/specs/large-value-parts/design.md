@@ -8,8 +8,8 @@ A value too large for one DSQL column is stored in parts, in DSQL itself:
   parts table, and a count column beside the value says how many there are.
 - **The writes.** A value's parts are written in the transaction that writes its row, under the same fence. Replacing
   a value replaces its parts, and removing a value removes them.
-- **The reads.** A reader joins a value's parts with its row, in the transaction that reads the row when a later write
-  can replace the value, and refuses parts that don't fit together.
+- **The reads.** A reader joins a split value's parts in the transaction that reads its row, and refuses parts that
+  don't fit together.
 - **Old rows.** A row written before this change has no count, and its column holds the whole value.
 - **The in-memory store** keeps storing values whole.
 
@@ -41,8 +41,9 @@ The live suite `dsql_transaction_limits` pins these, and the parts rely on them:
 These also bear on the parts:
 - **A row's limit.** Measured live, a row whose values come to 2,000,000 bytes commits, but one holding two values of
   1 MiB doesn't. Step 1's live tests pin the row the parts need.
-- **A statement's limit.** DSQL drops the connection for a message over 10 MiB, so the suite keeps each statement to
-  1 MiB of values.
+- **A statement's limit.** DSQL drops the connection for a message over 10 MiB. The suite's own probes keep each
+  statement to 1 MiB of values; that is their practice, not a limit. A statement that writes parts carries at most two,
+  about 1.9 MiB, well under 10 MiB.
 
 The part size leaves room for both:
 - **Rows.** A row may hold two first parts, as a history batch's events and principals do. Two parts come to 1,966,080
@@ -90,6 +91,7 @@ one of these:
 - The paged writes keep within their budgets, counting parts (3.3).
 - History reads fetch only the batches they return, plus those batches' parts (3.4).
 - The in-memory store applies none of DSQL's limits (3.5).
+- A history read that meets a purge returns the batches the purge hasn't removed, each whole (3.6).
 
 ## Root Cause
 
@@ -139,10 +141,11 @@ budgets, counting parts.
 
 Property 6: Removing a value removes its parts
 
-_For any_ run with split values, once its purge succeeds, no part of the run SHALL remain. Deleting a visibility image,
-or a CHASM execution, SHALL leave none of its parts.
+_For any_ run with split values, once its purge succeeds, no part of the run SHALL remain. A history read at any point
+of the purge SHALL return each batch it returns whole. Deleting a visibility image, or a CHASM execution, SHALL leave
+none of its parts.
 
-**Validates: Requirements 2.6**
+**Validates: Requirements 2.6, 3.6**
 
 ## Fix Implementation
 
@@ -157,9 +160,10 @@ or a CHASM execution, SHALL leave none of its parts.
     holds exactly `PART_BYTES`, while the last holds between 1 and `PART_BYTES`.
 - A count of zero, one or less than zero is refused as corrupt.
 - Joining refuses with an error naming the value's table, key and kind, as a decode failure does today.
-- Each writer writes a value's row and all its parts in one transaction. A reader of a value that a later write can
-  replace joins its parts in the transaction that reads its row, so it never mixes the parts of two versions of the
-  value. A value that never changes once written can have its parts read apart from its row.
+- Each writer writes a value's row and all its parts in one transaction. A reader joins a split value's parts in the
+  transaction that reads its row. A reader whose fast read, outside a transaction, finds a count reads the row and its
+  parts again in one read-only transaction. So a reader never sees a count without its parts, nor mixes the parts of
+  two versions of a value.
 
 ### Step 1: a run's values
 
@@ -186,6 +190,9 @@ Each statement is one the runner proves idempotent, so the embedded engine's aut
 - **The state.** `WORKFLOW_HOT_UPSERT_SQL` binds the first part and the count. The commit then upserts each other part,
   one statement each. When the stored count is greater than the new one, it deletes the parts from the new count on,
   in one statement. A whole value counts as one part.
+- **Every part, every write.** A split state rewrites all its parts on each commit, as the whole state is rewritten
+  today: a run whose state is 8 MiB issues eight part upserts per write. That writes no more bytes than the whole
+  value. Writing only the parts that changed would cut it, and is the design this spec leaves out of scope.
 - **A history batch.** Its events and its principals are split apart. The `history_batch` insert binds each one's
   first part and count, and the commit then inserts each other part, one statement each.
 - Nothing else changes. A commit whose values are within the part size issues exactly today's statements.
@@ -202,8 +209,9 @@ Each statement is one the runner proves idempotent, so the embedded engine's aut
     outside one: `list_dispatchable_workflow_tasks`, `has_open_pinned_workflows` and the recovery sweep's candidate
     pages.
 - **History.** `READ_HISTORY_BATCHES_SQL`, `READ_HISTORY_EVENT_BATCH_SQL` and the transition audit's read also read the
-  two counts. When a page holds split batches, one statement fetches their parts, by value key. A batch never changes
-  once written, so these reads need no transaction of their own.
+  two counts. A page with no split batch is read as today. When a page holds split batches, the read reads the page
+  again in one read-only transaction, with one more statement fetching their parts by value key. A purge removes a
+  batch's parts only after every batch row of the run, so a page read in one snapshot holds each of its batches whole.
 
 **A reset** (`do_materialize_reset_successor`, `crates/tokeira-storage/src/dsql/run_repository/bulk_write.rs`):
 - `read_reset_base` reads the base's state and batches with their parts, in its one read transaction, and joins them.
@@ -217,8 +225,12 @@ Each statement is one the runner proves idempotent, so the embedded engine's aut
   before the row exists. An abandoned materialization's parts are purged with its other rows.
 
 **The purge:**
-- `run_value_part` joins `PURGE_TABLES`, before `history_batch`. Its pages select `(value_kind, value_key, part_no)`
-  in key order and delete what they selected, so each part counts as one of a page's 1,000 rows.
+- `run_value_part` joins `PURGE_TABLES` after `history_batch`, as the last table. The purge removes the record with
+  its last page, instead of with history's. Its pages select `(value_kind, value_key, part_no)` in key order and
+  delete what they selected, so each part counts as one of a page's 1,000 rows.
+- So a batch's parts outlast every batch row of the run, and a reader that sees a batch row in its snapshot also sees
+  the batch's parts. Parts left without their row, the state's once its row is gone or those of batches already
+  purged, are invisible to every reader, and a resumed purge removes them.
 - The deletion's first transaction leaves the state's parts to the purge, so it stays at most five rows.
 - A later value that a run owns takes a kind of its own in `run_value_part`, and the purge removes it with the run.
 
@@ -231,8 +243,9 @@ Each statement is one the runner proves idempotent, so the embedded engine's aut
   - `ALTER TABLE projection_log ADD COLUMN IF NOT EXISTS context_parts INTEGER`;
   - `visibility_memo_part`, keyed by the visibility row's key and the part number;
   - `ALTER TABLE execution_visibility_current ADD COLUMN IF NOT EXISTS memo_parts INTEGER`.
-- **An image** is written once and never changes. The commit writes its parts with it. The projector reads them with
-  it, as does `load_run`'s accumulator seed. Deleting an image deletes its parts in the same transaction.
+- **An image** is written once and never changes. The commit writes its parts with it. The projector joins them in
+  the transaction that reads the image, and `load_run`'s accumulator seed in its snapshot. Deleting an image deletes
+  its parts in the same transaction.
 - **A visibility row's memo** is replaced when an apply writes a memo: the apply replaces its parts and deletes any the
   new memo doesn't use, in its transaction. An apply that keeps the stored memo keeps its parts. List reads join the
   memos of a page's split rows in one read-only transaction.
@@ -255,8 +268,8 @@ Each statement is one the runner proves idempotent, so the embedded engine's aut
 - **Migrations:**
   - `worker_compute_action_part`, keyed by the action's id and the part number;
   - `ALTER TABLE worker_compute_action ADD COLUMN IF NOT EXISTS request_parts INTEGER`.
-- A request is written once, with its action, and never changes. Its parts are written in the insert's transaction
-  and read with the action.
+- A request is written once, with its action, and never changes. Its parts are written in the insert's transaction,
+  and joined in the transaction that reads the action, or in a read-only one of their own.
 
 ### Release
 
@@ -273,7 +286,9 @@ Each says what holds once values are stored in parts:
   - its Out of Scope entry on a value over 1 MiB points here;
   - the reset section's "A history DSQL accepted holds no event over 1 MiB" becomes: an event over the part size is
     copied in a batch of its own, in parts;
-  - a copied batch's cost counts its parts.
+  - a copied batch's cost counts its parts;
+  - the purge removes history, then the run's parts, last, and the record with the last parts (Property 4 and the
+    purge's description).
 - [dsql-core-persistence](../dsql-core-persistence/requirements.md) and
   [dsql-side-tables](../dsql-side-tables/requirements.md): the parts tables and count columns in the schema.
 - [projection-passes](../projection-passes/design.md): an image's parts are read and deleted with it (step 2).
@@ -304,7 +319,8 @@ The in-memory store accepts all of these, so no offline test shows the bug.
   size and at the largest each writer allows.
 - Property 4 runs live, over generated sequences of state sizes, memo sizes and node data sizes.
 - Property 5 runs on both stores, live on DSQL, with base histories that hold single events of up to 4 MiB.
-- Property 6 runs live: a run's purge, an image's deletion and a CHASM execution's deletion.
+- Property 6 runs live: a run's purge, with history reads during it, an image's deletion and a CHASM execution's
+  deletion.
 
 ### Live Tests
 
@@ -313,7 +329,10 @@ On an ephemeral cluster:
 - a history batch over 1 MiB;
 - a reset of a history over 1 MiB, with an event over the part size;
 - a state that grows over the part size and shrinks below it, checking the parts table after each write;
-- a purge of a run with split values;
+- a purge of a run with split values, paused after each of its transactions for a history read, which must return each
+  batch it returns whole;
+- a history read paused between its read of a page and its read of the page's parts, while the purge runs to its end.
+  The read must still return each batch it returns whole;
 - a row holding two parts of the part size, which DSQL must commit;
 - a load paused between its read of a split state's row and its read of the parts, while a commit replaces the state.
   The load must still return one version of the state whole.
@@ -326,6 +345,9 @@ that covers it:
 - a shrinking state that keeps its old parts, which Property 4 finds;
 - `load_run` joining a split state outside a transaction, which fails the paused load;
 - the purge without `run_value_part`, which leaves parts that Property 6 finds;
+- the purge removing parts before history, which fails a read at one of the purge's pauses;
+- a history page's parts read outside the transaction that reads its batches, which fails the read paused between the
+  two;
 - the reset's copy without parts, whose successor's history then fails to read;
 - a part size of 1 MiB, whose row of two parts DSQL refuses.
 

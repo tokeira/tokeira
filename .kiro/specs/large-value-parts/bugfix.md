@@ -64,10 +64,10 @@ visibility row's memo, a CHASM node's data, and a worker invocation request.
 2.2 A value's parts SHALL be written in the transaction that writes its row, under the same fence. A write that
 replaces a value SHALL replace its parts in that transaction, and SHALL remove any part the new value doesn't use.
 
-2.3 Every reader SHALL return a value whole. It SHALL read a value that a later write can replace, such as a run's
-state, in one transaction with its parts. A value that never changes once written, such as a history batch, needs no
-such transaction. A reader SHALL refuse a value whose parts don't fit together, with an error that names the value: a
-part missing, extra, out of place or of the wrong size.
+2.3 Every reader SHALL return a value whole. It SHALL read a split value's row and its parts in one transaction, so that
+it never sees a count without its parts, nor the parts of two versions of a value. A reader SHALL refuse a value whose
+parts don't fit together, with an error that names the value: a part missing, extra, out of place or of the wrong
+size.
 
 2.4 A row written before this change has no count and holds its value whole, and SHALL be read as today.
 
@@ -76,7 +76,7 @@ the part size, and the successor's state when it is over the part size, in parts
 writes ([bounded-bulk-writes](../bounded-bulk-writes/design.md)).
 
 2.6 Parts SHALL be removed with their value:
-- a purge SHALL remove a run's parts with its other rows, before its history;
+- a purge SHALL remove a run's parts after its history, so that while a history batch remains, so do its parts;
 - deleting a visibility image SHALL delete its parts;
 - removing a CHASM node or a worker invocation action SHALL remove its parts.
 
@@ -105,6 +105,9 @@ criterion 2.3). Each SHALL also fetch the parts of those batches.
 
 3.5 THE in-memory store SHALL CONTINUE TO apply none of DSQL's limits.
 
+3.6 WHEN a history read meets a run's purge THEN it SHALL CONTINUE TO return the batches the purge hasn't removed, each
+whole.
+
 ### Out of Scope
 
 - **A write over DSQL's transaction limit.** Parts don't change how much a write stores. A write whose values come to
@@ -114,5 +117,3 @@ criterion 2.3). Each SHALL also fetch the parts of those batches.
 - **A worker deployment's record.** `worker_deployments.record_data` holds all of a deployment's versions, up to 100,
   with metadata payloads that nothing bounds, so parts can't keep its write within one transaction. v1.31.0 keeps each
   version in a workflow of its own (`service/worker/workerdeployment/version_workflow.go @ v1.31.0`).
-- **A history read racing a purge.** A read of a deleted run's history that meets its purge can fail on a missing
-  part, where today it can return part of the history.

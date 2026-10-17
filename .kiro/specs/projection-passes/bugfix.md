@@ -134,9 +134,10 @@ table SHALL stay until a later migration drops it.
 2.12 For each partition, the projector SHALL report each pass's images read, applied, found current, deleted and
 failed, its duration, and the age of the oldest image it read. The checkpoint metrics SHALL go.
 
-2.13 The release that first deletes images SHALL be one whose schema every node of an earlier release refuses, as
-[distributed-schema-startup-check](../distributed-schema-startup-check/bugfix.md) provides, because those nodes seed
-from images alone. It SHALL say "Upgrade with every node stopped."
+2.13 The release that first deletes images SHALL carry a migration past the previous release's maximum readable
+version, so that the nodes of every release that checks its schema at startup refuse its schema, as
+[distributed-schema-startup-check](../distributed-schema-startup-check/bugfix.md) provides: those nodes seed from
+images alone. A release before that check refuses nothing, so it SHALL say "Upgrade with every node stopped."
 
 ### Unchanged Behavior (Regression Prevention)
 

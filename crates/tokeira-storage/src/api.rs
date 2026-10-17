@@ -2294,24 +2294,7 @@ pub(crate) fn seed_workflow_projection_accumulator(
     }
     let mut versions = Vec::new();
     if let Some(record) = previous {
-        let defect = if record.run_key != state.run_key
-            || record.context.namespace_id != state.namespace_id
-            || record.context.workflow_id != state.workflow_id
-            || record.context.run_id != state.run_id
-        {
-            Some("image belongs to another run")
-        } else if record.transition_seq > state.transition_seq {
-            Some("image sequence is newer than the loaded state")
-        } else {
-            None
-        };
-        if let Some(defect) = defect {
-            return Err(ProjectionAccumulatorError::InvalidSeed {
-                run_key: state.run_key,
-                defect,
-            }
-            .into());
-        }
+        reject_seed_defect(state, seed_image_defect(state, record))?;
         if let Some(SearchAttrValue::KeywordList(values)) = record
             .context
             .search_attributes
@@ -2323,6 +2306,89 @@ pub(crate) fn seed_workflow_projection_accumulator(
     }
     state.used_worker_deployment_versions = Some(versions);
     Ok(())
+}
+
+/// A run's applied `TemporalUsedWorkerDeploymentVersions` value, from its visibility
+/// row, read in the same snapshot as its state.
+#[cfg(any(feature = "dsql", test))]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AppliedProjectionSeed {
+    pub(crate) workflow_id: WorkflowId,
+    pub(crate) run_id: RunId,
+    pub(crate) authority_epoch: i64,
+    pub(crate) transition_seq: TransitionSeq,
+    /// The applied attribute, or `None` when the row carries none.
+    pub(crate) versions: Option<SearchAttrValue>,
+}
+
+/// Seed only an unseeded local copy from the newer of its latest image and its
+/// applied value (`projection-passes` criterion 2.4).
+///
+/// Once the projector deletes a run's applied images, its visibility row is the
+/// durable copy of the newest one's list: an image goes only after the row is at
+/// least as new as it, and the visibility store keeps keyword lists verbatim. An
+/// image left under an earlier partition count is never deleted, so taking the
+/// newer of the two stops it seeding once the run's newest image is gone. Both are
+/// validated as an image always was.
+#[cfg(any(feature = "dsql", test))]
+pub(crate) fn seed_workflow_projection_accumulator_from_newer(
+    state: &mut WorkflowState,
+    image: Option<&ProjectionRecord>,
+    applied: Option<&AppliedProjectionSeed>,
+) -> Result<()> {
+    if state.used_worker_deployment_versions.is_some() {
+        return Ok(());
+    }
+    let Some(applied) = applied else {
+        return seed_workflow_projection_accumulator(state, image);
+    };
+    let defect = if applied.workflow_id != state.workflow_id || applied.run_id != state.run_id {
+        Some("visibility row belongs to another run")
+    } else if applied.transition_seq > state.transition_seq {
+        Some("visibility row sequence is newer than the loaded state")
+    } else {
+        None
+    };
+    reject_seed_defect(state, defect)?;
+    if let Some(record) = image {
+        reject_seed_defect(state, seed_image_defect(state, record))?;
+        if (record.context.authority_epoch, record.transition_seq)
+            >= (applied.authority_epoch, applied.transition_seq)
+        {
+            return seed_workflow_projection_accumulator(state, image);
+        }
+    }
+    let versions = match &applied.versions {
+        Some(SearchAttrValue::KeywordList(values)) => values.clone(),
+        _ => Vec::new(),
+    };
+    state.used_worker_deployment_versions = Some(versions);
+    Ok(())
+}
+
+fn seed_image_defect(state: &WorkflowState, record: &ProjectionRecord) -> Option<&'static str> {
+    if record.run_key != state.run_key
+        || record.context.namespace_id != state.namespace_id
+        || record.context.workflow_id != state.workflow_id
+        || record.context.run_id != state.run_id
+    {
+        Some("image belongs to another run")
+    } else if record.transition_seq > state.transition_seq {
+        Some("image sequence is newer than the loaded state")
+    } else {
+        None
+    }
+}
+
+fn reject_seed_defect(state: &WorkflowState, defect: Option<&'static str>) -> Result<()> {
+    match defect {
+        Some(defect) => Err(ProjectionAccumulatorError::InvalidSeed {
+            run_key: state.run_key,
+            defect,
+        }
+        .into()),
+        None => Ok(()),
+    }
 }
 
 /// Build the non-queryable high-water visibility image for a deleted run.

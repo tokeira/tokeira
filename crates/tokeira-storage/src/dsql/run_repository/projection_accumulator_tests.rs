@@ -1138,3 +1138,218 @@ fn dsql_projection_accumulator_mixed_writers_and_pruning() {
         },
     );
 }
+
+impl Fixture {
+    /// Leave the visibility row that applying an image at `seq` leaves, with
+    /// `versions` as its applied `TemporalUsedWorkerDeploymentVersions` value, as the
+    /// projector's apply writes it: the whole encoded list on each element's row.
+    async fn applied_row(
+        &self,
+        state: &WorkflowState,
+        run_id: RunId,
+        seq: i64,
+        versions: Option<&[&str]>,
+    ) {
+        let attr = "TemporalUsedWorkerDeploymentVersions";
+        let registered = sqlx::query_scalar::<_, i64>(
+            "SELECT attr_id FROM sa_registry WHERE namespace_id = $1 AND attr_name = $2",
+        )
+        .bind(state.namespace_id.0)
+        .bind(attr)
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap();
+        let attr_id = match registered {
+            Some(attr_id) => attr_id,
+            None => {
+                let attr_id = ((uuid::Uuid::new_v4().as_u128() as i64) & i64::MAX).max(1);
+                sqlx::query(
+                    "INSERT INTO sa_registry (attr_id, namespace_id, attr_name, attr_type) \
+                     VALUES ($1, $2, $3, 1)",
+                )
+                .bind(attr_id)
+                .bind(state.namespace_id.0)
+                .bind(attr)
+                .execute(&self.pool)
+                .await
+                .unwrap();
+                attr_id
+            }
+        };
+        self.forget_applied_row(state).await;
+        sqlx::query(
+            "INSERT INTO execution_visibility_current (namespace_id, archetype_id, run_key, \
+             business_id, run_id, authority_epoch, source_transition_seq, status_keyword, \
+             lifecycle_state, start_time, update_time) \
+             VALUES ($1, 0, $2, $3, $4, 0, $5, 'Running', 0, now(), now())",
+        )
+        .bind(state.namespace_id.0)
+        .bind(state.run_key.0)
+        .bind(&state.workflow_id.0)
+        .bind(run_id.0)
+        .bind(seq)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+        let Some(versions) = versions else {
+            return;
+        };
+        let value = codec::encode(&SearchAttrValue::KeywordList(
+            versions.iter().map(|&version| version.to_owned()).collect(),
+        ))
+        .unwrap();
+        let mut elements = versions.to_vec();
+        elements.sort_unstable();
+        elements.dedup();
+        for element in elements {
+            sqlx::query(
+                "INSERT INTO execution_visibility_attr_index (namespace_id, run_key, attr_id, \
+                 attr_type, value_discriminator, keyword_value, value_data) \
+                 VALUES ($1, $2, $3, 1, $4, $4, $5)",
+            )
+            .bind(state.namespace_id.0)
+            .bind(state.run_key.0)
+            .bind(attr_id)
+            .bind(element)
+            .bind(&value)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn forget_applied_row(&self, state: &WorkflowState) {
+        for statement in [
+            "DELETE FROM execution_visibility_attr_index WHERE namespace_id = $1 AND run_key = $2",
+            "DELETE FROM execution_visibility_current \
+             WHERE namespace_id = $1 AND archetype_id = 0 AND run_key = $2",
+        ] {
+            sqlx::query(statement)
+                .bind(state.namespace_id.0)
+                .bind(state.run_key.0)
+                .execute(&self.pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// A run left unseeded at sequence 5, as an earlier release wrote it, with its
+    /// latest image at `image`'s sequence and versions, if any.
+    async fn unseeded(&self, image: Option<(i64, &[&str])>) -> WorkflowState {
+        let mut state = applied(
+            commit(self.repo(), self.fresh(), false, WriteFence::Unfenced)
+                .await
+                .unwrap(),
+        );
+        self.prune(state.run_key).await;
+        state.used_worker_deployment_versions = None;
+        state.transition_seq = TransitionSeq(5);
+        let image = image.map(|(seq, versions)| {
+            let mut context = baseline_image(&state, None, 50).unwrap();
+            context.search_attributes.0.insert(
+                "TemporalUsedWorkerDeploymentVersions".into(),
+                SearchAttrValue::KeywordList(versions.iter().map(|&v| v.to_owned()).collect()),
+            );
+            (65, seq, codec::encode_projection_context(&context).unwrap())
+        });
+        self.replace(&state, 50, image).await;
+        state
+    }
+
+    async fn seed(&self, state: &WorkflowState) -> Result<Vec<String>> {
+        let LoadedRun::Existing(loaded) = self.recreated().load_run(state.run_key).await? else {
+            panic!("the run exists")
+        };
+        Ok(loaded
+            .used_worker_deployment_versions
+            .expect("the load seeds the run"))
+    }
+}
+
+// Feature: projection-passes, criterion 2.4: once the projector deletes a run's
+// applied images, its load seeds from the newer of its latest image and its applied
+// value, both read in the load's own snapshot.
+#[tokio::test]
+#[ignore = "requires an ephemeral Aurora DSQL cluster"]
+async fn dsql_projection_accumulator_seeds_from_the_newer_of_image_and_applied_value() {
+    let fixture = Fixture::connect().await.unwrap();
+    let mut states = Vec::new();
+
+    // The image was applied, then deleted: the applied value seeds.
+    let state = fixture.unseeded(None).await;
+    fixture
+        .applied_row(&state, state.run_id, 5, Some(&["a", "b", "a"]))
+        .await;
+    assert_eq!(fixture.seed(&state).await.unwrap(), ["a", "b", "a"]);
+    states.push(state);
+
+    // An older image is left behind, as under an earlier partition count.
+    let state = fixture.unseeded(Some((3, &["a"]))).await;
+    fixture
+        .applied_row(&state, state.run_id, 5, Some(&["a", "b"]))
+        .await;
+    assert_eq!(fixture.seed(&state).await.unwrap(), ["a", "b"]);
+    states.push(state);
+
+    // The image is newer than the row: it seeds, as before.
+    let state = fixture.unseeded(Some((5, &["x"]))).await;
+    fixture
+        .applied_row(&state, state.run_id, 4, Some(&["a"]))
+        .await;
+    assert_eq!(fixture.seed(&state).await.unwrap(), ["x"]);
+    states.push(state);
+
+    // A row without the value seeds an empty list.
+    let state = fixture.unseeded(None).await;
+    fixture.applied_row(&state, state.run_id, 5, None).await;
+    assert_eq!(fixture.seed(&state).await.unwrap(), Vec::<String>::new());
+    states.push(state);
+
+    // A row newer than the state, or of another run, fails the load.
+    let state = fixture.unseeded(Some((5, &["x"]))).await;
+    fixture
+        .applied_row(&state, state.run_id, 6, Some(&["a"]))
+        .await;
+    let error = format!("{:#}", fixture.seed(&state).await.unwrap_err());
+    assert!(
+        error.contains("visibility row sequence is newer than the loaded state"),
+        "{error}"
+    );
+    states.push(state);
+    let state = fixture.unseeded(None).await;
+    fixture
+        .applied_row(&state, RunId::new(), 5, Some(&["a"]))
+        .await;
+    let error = format!("{:#}", fixture.seed(&state).await.unwrap_err());
+    assert!(
+        error.contains("visibility row belongs to another run"),
+        "{error}"
+    );
+    states.push(state);
+
+    // The row is read in the load's snapshot: a row written after its first read,
+    // newer than the state it read, stays out of the seed instead of failing it.
+    let state = fixture.unseeded(Some((5, &["before"]))).await;
+    let key = state.run_key;
+    let (reached, resume) = pause_at(key, LoadStage::AfterHotRead);
+    let reader = fixture.recreated();
+    let read = tokio::spawn(async move { reader.load_run(key).await });
+    reached.await.unwrap();
+    fixture
+        .applied_row(&state, state.run_id, 6, Some(&["after"]))
+        .await;
+    resume.send(()).unwrap();
+    let LoadedRun::Existing(loaded) = read.await.unwrap().unwrap() else {
+        panic!("the run exists")
+    };
+    assert_eq!(
+        loaded.used_worker_deployment_versions,
+        Some(vec!["before".to_owned()])
+    );
+    states.push(state);
+
+    for state in &states {
+        fixture.forget_applied_row(state).await;
+    }
+    fixture.cleanup().await;
+}

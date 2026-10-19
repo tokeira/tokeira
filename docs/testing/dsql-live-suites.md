@@ -80,7 +80,7 @@ point them at a database holding application data.
 | Storage `dsql_on_conflict_counts` | 6 | The row count DSQL returns for an `ON CONFLICT` statement that leaves its row unwritten, and the answers of the slot, action, provenance, configuration and backlog operations built on one |
 | Storage `dsql_embedded_ownership` | 1 | Embedded ownership lifecycle |
 | Storage `dsql_lease_fence` | 1 | The conflict rules the lease-fence model assumes, through SQLx: ten interleavings of fenced run commits, renewals and takeovers on the suite's own probe tables, including the weaker fences the model rejects; no migrations; `dsql-integration`, URL gate only |
-| Projection `dsql_projection_persistence` | 6 | Visibility persistence and queries |
+| Projection `dsql_projection_persistence` | 7 | Visibility persistence and queries, and the attribute-index rows the projection-accumulator seed reads |
 | Storage `dsql_archetype_scoped_business_ids` | 1 | CHASM Property 8: scoped pointers and backfill; `--features dsql`, URL gate only |
 | Storage `dsql_chasm_node_store_round_trips_and_fences` | 1 | CHASM nodes, atomic pointers and fencing; `--features dsql`, URL gate only |
 | Storage `dsql_concurrent_starts_fence_pointer_and_roll_back_losing_nodes` | 1 | Concurrent CHASM creates and superseding pointers reject stale admission without orphaned nodes; `--features dsql`, URL gate only |
@@ -89,7 +89,7 @@ point them at a database holding application data.
 | Projection `dsql_a_visibility_row_applies_only_a_newer_version` | 1 | A visibility row is replaced only by a newer version; `--features dsql-integration`, URL gate only |
 | Storage `dsql_task_queue_policy_survives_repository_recreation` | 1 | A task queue's stored policy survives recreating the repository; `--features dsql`, URL gate only |
 | Storage `dsql_worker_deployment_repository_cas_and_pagination_match_contract` | 1 | Worker-deployment compare-and-set and pagination follow the repository contract; `--features dsql`, URL gate only |
-| Storage `dsql_projection_accumulator_*` | 7 | Projection-accumulator contracts: commit images, legacy seeds, failure isolation, growth accounting, reset boundaries, mixed writers and pruning, and snapshot races; `dsql-integration`, ignored by default |
+| Storage `dsql_projection_accumulator_*` | 8 | Projection-accumulator contracts: commit images, legacy seeds, the seed from the newer of image and applied value, failure isolation, growth accounting, reset boundaries, mixed writers and pruning, and snapshot races; `dsql-integration`, ignored by default |
 | Storage `workflow_dispatch_live_atomic_reference_traces` | 1 | 100 generated atomic state/dispatch cases, reset materialization, duplicate/CAS rejection, rollback, and deletion; `dsql-integration`, URL gate only |
 | Storage `workflow_dispatch_live_ordered_pages` | 1 | Normal/Exact paging, home scans including sticky rows, reset boundaries, speculative legacy delivery, and forced digest collisions; `dsql-integration`, URL gate only |
 | Storage `workflow_dispatch_live_reset_uses_execution_home` | 1 | Eight-shard reset placement of hot state, timers and dispatch before any follow-up commit, with execution home distinct from the successor run-hash shard; `dsql-integration`, URL gate only |

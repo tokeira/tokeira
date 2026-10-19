@@ -101,8 +101,9 @@ The newer of the two is exactly the newest image's list:
 - **Only an image's apply writes a workflow row.** On DSQL, `upsert_execution_row` is the only writer of
   `execution_visibility_current`, called by the apply and by `VisibilityStore::upsert_execution`, which nothing on
   DSQL calls outside tests. CHASM writes rows of its own archetypes. A deletion's tombstone goes through the same
-  apply (`apply_tombstone`), but only after `delete_workflow` has returned, when the run no longer loads, so a load
-  never seeds from one.
+  apply (`apply_tombstone`), from the log or from `apply_deletion`. But the transaction that logs it also deletes the
+  run's hot row, and the apply commits after that transaction, so a snapshot that holds an applied tombstone no longer
+  loads the run, and a load never seeds from one.
 - **The registry holds the attribute for good.** `TemporalUsedWorkerDeploymentVersions` is a predefined attribute,
   registered in every namespace (`seed_predefined_search_attributes`, `crates/tokeira-projection/src/system_attrs.rs`),
   and nothing removes a registered attribute: `RemoveSearchAttributes` is unimplemented

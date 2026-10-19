@@ -94,7 +94,11 @@ after the write when that list isn't empty, and SHALL be absent when it is.
   the repository refuses a commit from an unseeded run before it writes anything (projection-accumulator criterion
   2.4).
 - **The live completion.** `apply_workflow_task_completed` calls it with the request's `deployment_version` and
-  `Some(limits.search_attribute_value_size_limit)`, before it handles the commands. The edge derives that version as
+  `Some(limits.search_attribute_value_size_limit)` where it records the `WorkflowTaskCompleted` event: after the
+  branch that drops a speculative, rejection-only completion without recording it (K3 of
+  [speculative-wft](../speculative-wft/design.md); v1.31.0's `skipWorkflowTaskCompletedEvent`,
+  `service/history/workflow/workflow_task_state_machine.go:763-765 @ v1.31.0`), and before the commands. So a
+  dropped completion adds nothing, as 2.2 requires. The edge derives that version as
   v1.31.0's completed event records it: from versioned deployment options, or else the deprecated deployment
   (`respond_completed_request_to_edge` in `crates/tokeira-edge/src/grpc/translate.rs`). So a completion that closes the
   run, or continues it as new, lists its version on the closing run, as in v1.31.0. A completion whose command fails
@@ -105,7 +109,9 @@ after the write when that list isn't empty, and SHALL be absent when it is.
   Go's `json.Marshal` of the list: 2 for an empty list, and otherwise 1 + 3n plus the escaped lengths of the n entries.
   An entry's escaped length is its UTF-8 length, plus 1 for each `"` or `\`, plus 1 for each `\b`, `\f`, `\n`, `\r` or
   `\t`, plus 5 for each other control character below U+0020, plus 5 for each `<`, `>` or `&`, and plus 3 for each
-  U+2028 or U+2029. That is `serde_json`'s length with Go's extra escapes added.
+  U+2028 or U+2029. That is `serde_json`'s length with Go's extra escapes added. The short escapes for `\b` and `\f`
+  date from Go 1.22's `encoding/json`, before which they were `\u0008` and `\u000c`; v1.31.0 builds with Go 1.26.2
+  (`go.mod @ v1.31.0`).
 
 ### Storage (`crates/tokeira-storage/src/api.rs`)
 
@@ -145,7 +151,8 @@ unspecified-behaviour completion adds nothing, and the long list isn't trimmed.
   behaviour appends its version; an unversioned completion appends nothing.
 - A completion that closes the run, and one that continues it as new, list the version in the closing image; the
   successor's first image has no list.
-- A completion whose command fails its task leaves the list unchanged.
+- A completion whose command fails its task leaves the list unchanged, and so does a speculative, rejection-only
+  completion that is dropped, even when it reports a version the list doesn't hold.
 - A start with inherited versioning info, an override and a transition leave the list unchanged.
 - The image carries the list, and omits the attribute while it is empty.
 

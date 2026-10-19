@@ -55,4 +55,5 @@ kernel's completion, make storage copy the list into images, and align the speci
 - The code lands in one PR after this specification merges.
 - Property tests use `proptest`, tagged `// Feature: used-deployment-versions, Property N: <title>`.
 - Negative controls: append without trimming (Property 2 fails); trim on replay (Property 3 fails); keep the
-  stored-version observation in `projection_context` (the inherited-version test fails).
+  stored-version observation in `projection_context` (the inherited-version test fails); add the version before the
+  drop of a speculative, rejection-only completion (the dropped-completion test fails).

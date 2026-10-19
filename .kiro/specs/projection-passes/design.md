@@ -100,13 +100,17 @@ The newer of the two is exactly the newest image's list:
   list. A value of another type fails the apply (`dsql_store.rs:549-557`), so its image stays and seeds as before.
 - **Only an image's apply writes a workflow row.** On DSQL, `upsert_execution_row` is the only writer of
   `execution_visibility_current`, called by the apply and by `VisibilityStore::upsert_execution`, which nothing on
-  DSQL calls outside tests. CHASM writes rows of its own archetypes.
+  DSQL calls outside tests. CHASM writes rows of its own archetypes. A deletion's tombstone goes through the same
+  apply (`apply_tombstone`), but only after `delete_workflow` has returned, when the run no longer loads, so a load
+  never seeds from one.
 - **The registry holds the attribute for good.** `TemporalUsedWorkerDeploymentVersions` is a predefined attribute,
   registered in every namespace (`seed_predefined_search_attributes`, `crates/tokeira-projection/src/system_attrs.rs`),
   and nothing removes a registered attribute: `RemoveSearchAttributes` is unimplemented
   (`crates/tokeira-edge/src/grpc/operator_service.rs`), and v1.31.0 refuses to remove a predefined one. A namespace
   without the registry row seeds an empty list, which is right: an image carrying the attribute couldn't have been
-  applied there, so it is still in the log.
+  applied there, so it is still in the log. The attribute's id is `deterministic_attr_id(namespace, name)`,
+  registration inserts it `ON CONFLICT (namespace_id, attr_name) DO NOTHING`, and V030 makes that pair unique, so the
+  join finds at most one registry row, and an index row's `attr_id` always matches it.
 
 The applied value validates as criterion 2.11 validates an image. A row naming another workflow id or run id, or newer
 than the loaded state, fails the load. A run with neither an image nor a visibility row seeds an empty list, as a run

@@ -21,7 +21,7 @@ const READ_APPLIED_PROJECTION_SEED: &str = "SELECT v.authority_epoch, v.source_t
         AND r.attr_name = 'TemporalUsedWorkerDeploymentVersions' \
     LEFT JOIN execution_visibility_attr_index a ON a.namespace_id = v.namespace_id \
         AND a.run_key = v.run_key AND a.attr_id = r.attr_id \
-    WHERE v.namespace_id = $1 AND v.archetype_id = 0 AND v.run_key = $2 \
+    WHERE v.namespace_id = $1 AND v.archetype_id = $3 AND v.run_key = $2 \
     LIMIT 1";
 
 fn decode_hot_state(
@@ -240,6 +240,7 @@ impl DsqlRunRepository {
                 )
                 .bind(state.namespace_id.0)
                 .bind(run_key.0)
+                .bind(i64::from(tokeira_types::ArchetypeId::WORKFLOW.0))
                 .fetch_optional(&mut *tx)
                 .await
                 .with_context(|| {

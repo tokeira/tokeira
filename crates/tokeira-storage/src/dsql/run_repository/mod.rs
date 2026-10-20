@@ -90,12 +90,15 @@ mod dispatch;
 #[cfg(all(test, feature = "dsql-integration"))]
 mod history_event_tests;
 #[cfg(all(test, feature = "dsql-integration"))]
+mod large_value_tests;
+#[cfg(all(test, feature = "dsql-integration"))]
 mod lease_fence_tests;
 mod leases;
 mod load;
 mod placement;
 #[cfg(all(test, feature = "dsql-integration"))]
 mod placement_tests;
+mod run_value_parts;
 mod timers;
 mod visibility;
 mod workflow_dispatch;
@@ -131,6 +134,14 @@ pub(crate) mod pause_point {
         Page(RunKey),
         /// Legacy workflow backlog deletes before the page commits.
         Disposal,
+        /// A load of this run's split state, after its first read and before it
+        /// reads the state again with its parts (`large-value-parts`).
+        StateParts(RunKey),
+        /// A history read of this run that met a split batch, after its first read
+        /// of the page and before it reads the page again with its parts.
+        HistoryParts(RunKey),
+        /// A purge of this run, after each of its transactions.
+        Purge(RunKey),
     }
 
     struct Armed {
@@ -1519,6 +1530,17 @@ mod tests {
         assert!(insert.contains("$8"));
         assert!(update.contains("recovery_needed = EXCLUDED.recovery_needed"));
         assert_eq!(sql.matches(';').count(), 0);
+    }
+
+    /// The hot-state upsert writes the state's count on insert and on update, so a
+    /// state that shrinks to the part size clears it (`large-value-parts`).
+    #[test]
+    fn workflow_hot_upsert_writes_the_state_count() {
+        let sql = super::commit::WORKFLOW_HOT_UPSERT_SQL;
+        let (insert, update) = sql.split_once("ON CONFLICT").expect("upsert");
+        assert!(insert.contains("state_parts"));
+        assert!(insert.contains("$9"));
+        assert!(update.contains("state_parts = EXCLUDED.state_parts"));
     }
 
     #[test]

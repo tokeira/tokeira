@@ -2235,9 +2235,11 @@ impl RunRepository for InMemoryStore {
             if !store.bulk_writes.contains_key(&run_key) {
                 return Ok(());
             }
-            // One table per transaction, in DSQL's order, history last. Nothing
-            // recreates a row of a recorded run, so a table once empty stays
-            // empty, and the record goes only with the last history rows.
+            // One table per transaction, in DSQL's order. History is last here:
+            // DSQL removes the parts of a run's values after it, and this store
+            // holds none. Nothing recreates a row of a recorded run, so a table
+            // once empty stays empty, and the record goes only with the last
+            // history rows.
             let dedupe = store
                 .request_dedupe
                 .iter()

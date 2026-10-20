@@ -2,10 +2,16 @@
 //! Migration loads reread state and statistics with the seed in one DSQL snapshot;
 //! readiness stays local until a later fenced transition persists it.
 
-use super::*;
+use sqlx::PgConnection;
 
+use super::{
+    run_value_parts::{self, StoredBatchRow, WholeBatch},
+    *,
+};
+
+/// A run's state, whole or as its first part with its count (`large-value-parts`).
 const READ_HOT_STATE: &str =
-    "SELECT state_data, history_size_bytes FROM workflow_hot WHERE run_key = $1";
+    "SELECT state_data, history_size_bytes, state_parts FROM workflow_hot WHERE run_key = $1";
 
 const READ_LEGACY_PROJECTION: &str =
     "SELECT partition_id, fanout, run_key, transition_seq, context_data
@@ -41,8 +47,10 @@ fn decode_hot_state(
 
 /// History batches after a cursor, in order, a page at a time, so a history
 /// read fetches only the batches it returns (`history-pagination` criterion 2.3).
+/// Each row is a [`StoredBatchRow`].
 pub(super) const READ_HISTORY_BATCHES_SQL: &str = "
-    SELECT first_event_id, last_event_id, events_data, principals_data
+    SELECT first_event_id, last_event_id, transition_seq, events_data, events_parts,
+        principals_data, principals_parts
     FROM history_batch
     WHERE run_key = $1 AND last_event_id > $2
     ORDER BY first_event_id ASC
@@ -62,11 +70,97 @@ const HISTORY_BATCH_PAGE: usize = 64;
 /// 2.3). [`READ_HISTORY_BATCHES_SQL`] can't stand in: no index covers its
 /// `last_event_id` filter, so it walks the run's batches from the first.
 pub(super) const READ_HISTORY_EVENT_BATCH_SQL: &str = "
-    SELECT first_event_id, last_event_id, events_data
+    SELECT first_event_id, last_event_id, transition_seq, events_data, events_parts,
+        principals_data, principals_parts
     FROM history_batch
     WHERE run_key = $1 AND first_event_id <= $2
     ORDER BY first_event_id DESC
     LIMIT 1";
+
+/// Every history batch of a run, in order, each a [`StoredBatchRow`].
+pub(super) const READ_ALL_HISTORY_BATCHES_SQL: &str = "
+    SELECT first_event_id, last_event_id, transition_seq, events_data, events_parts,
+        principals_data, principals_parts
+    FROM history_batch
+    WHERE run_key = $1
+    ORDER BY first_event_id ASC";
+
+/// One of the reads of a run's history batches.
+#[derive(Clone, Copy, Debug)]
+enum BatchRead {
+    /// [`READ_HISTORY_BATCHES_SQL`]: the batches after a cursor, a page at a time.
+    Page { after_event_id: i64, limit: i64 },
+    /// [`READ_HISTORY_EVENT_BATCH_SQL`]: the one batch that can hold an event.
+    Event(i64),
+    /// [`READ_ALL_HISTORY_BATCHES_SQL`]: every batch.
+    All,
+}
+
+impl BatchRead {
+    async fn rows(
+        self,
+        connection: &mut PgConnection,
+        run_key: RunKey,
+    ) -> Result<Vec<StoredBatchRow>> {
+        Ok(match self {
+            Self::Page {
+                after_event_id,
+                limit,
+            } => {
+                sqlx::query_as(READ_HISTORY_BATCHES_SQL)
+                    .bind(run_key.0)
+                    .bind(after_event_id)
+                    .bind(limit)
+                    .fetch_all(connection)
+                    .await?
+            }
+            Self::Event(event_id) => {
+                sqlx::query_as(READ_HISTORY_EVENT_BATCH_SQL)
+                    .bind(run_key.0)
+                    .bind(event_id)
+                    .fetch_all(connection)
+                    .await?
+            }
+            Self::All => {
+                sqlx::query_as(READ_ALL_HISTORY_BATCHES_SQL)
+                    .bind(run_key.0)
+                    .fetch_all(connection)
+                    .await?
+            }
+        })
+    }
+
+    /// The batches this read finds, whole, with the number of rows it read.
+    ///
+    /// Batches are read outside a transaction, and a read that finds a split one
+    /// reads again with the parts in one read-only snapshot
+    /// (`large-value-parts`). A purge removes a batch's parts only after every
+    /// batch row of the run, so a batch in the snapshot has its parts there too.
+    async fn whole(
+        self,
+        connection: &mut PgConnection,
+        run_key: RunKey,
+    ) -> Result<(usize, Vec<WholeBatch>)> {
+        let rows = self.rows(connection, run_key).await?;
+        if !run_value_parts::any_split(&rows) {
+            let read = rows.len();
+            return Ok((
+                read,
+                run_value_parts::join_batches(connection, run_key, rows).await?,
+            ));
+        }
+        #[cfg(all(test, feature = "dsql-integration"))]
+        super::pause_point::reached(super::pause_point::PauseKey::HistoryParts(run_key)).await;
+        let mut tx = connection
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await?;
+        let rows = self.rows(&mut tx, run_key).await?;
+        let read = rows.len();
+        let batches = run_value_parts::join_batches(&mut tx, run_key, rows).await?;
+        tx.commit().await?;
+        Ok((read, batches))
+    }
+}
 
 impl DsqlRunRepository {
     #[instrument(name = "dsql.resolve_execution", skip(self), fields(namespace_id = %execution.namespace_id.0, workflow_id = %execution.workflow_id.0))]
@@ -165,18 +259,31 @@ impl DsqlRunRepository {
         record_dsql_operation!(self, "load_run", Some(self.shard_for_run_key(run_key)), {
             let mut permit = self.director.acquire(DbClass::Read).await?;
             let connection = permit.connection()?;
-            let row = sqlx::query_as::<_, (Vec<u8>, Option<i64>)>(READ_HOT_STATE)
+            let row = sqlx::query_as::<_, (Vec<u8>, Option<i64>, Option<i32>)>(READ_HOT_STATE)
                 .bind(run_key.0)
                 .fetch_optional(&mut *connection)
                 .await?;
-            let (loaded, stats) = decode_hot_state(run_key, row)?;
-            if !matches!(&loaded, LoadedRun::Existing(state) if state.used_worker_deployment_versions.is_none())
-            {
-                return Ok((loaded, stats));
+            // A split state's parts must come from the snapshot that read its first
+            // part, so the fast read can't join them (`large-value-parts`).
+            let split = row.as_ref().is_some_and(|(_, _, parts)| parts.is_some());
+            if split {
+                #[cfg(all(test, feature = "dsql-integration"))]
+                super::pause_point::reached(super::pause_point::PauseKey::StateParts(run_key))
+                    .await;
+            } else {
+                let (loaded, stats) = decode_hot_state(
+                    run_key,
+                    row.map(|(state_data, history_size_bytes, _)| (state_data, history_size_bytes)),
+                )?;
+                if !matches!(&loaded, LoadedRun::Existing(state) if state.used_worker_deployment_versions.is_none())
+                {
+                    return Ok((loaded, stats));
+                }
             }
 
             // Discard the fast read: beginning a transaction only for the image
-            // would combine snapshots if a concurrent writer committed meanwhile.
+            // would combine snapshots if a concurrent writer committed meanwhile,
+            // and a split state's first part could join another version's parts.
             // Reuse the read permit and never persist readiness from this path.
             #[cfg(all(test, feature = "dsql-integration"))]
             super::projection_accumulator_tests::pause(
@@ -187,10 +294,17 @@ impl DsqlRunRepository {
             let mut tx = connection
                 .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 .await?;
-            let row = sqlx::query_as::<_, (Vec<u8>, Option<i64>)>(READ_HOT_STATE)
+            let row = sqlx::query_as::<_, (Vec<u8>, Option<i64>, Option<i32>)>(READ_HOT_STATE)
                 .bind(run_key.0)
                 .fetch_optional(&mut *tx)
                 .await?;
+            let row = match row {
+                Some((state_data, history_size_bytes, parts)) => Some((
+                    run_value_parts::join_state(&mut tx, run_key, state_data, parts).await?,
+                    history_size_bytes,
+                )),
+                None => None,
+            };
             let (mut loaded, stats) = decode_hot_state(run_key, row)?;
             #[cfg(all(test, feature = "dsql-integration"))]
             super::projection_accumulator_tests::pause(
@@ -305,20 +419,18 @@ impl DsqlRunRepository {
             Some(self.shard_for_run_key(run_key)),
             {
                 let mut permit = self.director.acquire(DbClass::Read).await?;
-                let row = sqlx::query_as::<_, (i64, i64, Vec<u8>)>(READ_HISTORY_EVENT_BATCH_SQL)
-                    .bind(run_key.0)
-                    .bind(event_id)
-                    .fetch_optional(permit.connection()?)
+                let (read, batches) = BatchRead::Event(event_id)
+                    .whole(permit.connection()?, run_key)
                     .await?;
-                metrics::record_dsql_rows_read("read_history_event", usize::from(row.is_some()));
-                let Some((_first_event_id, last_event_id, events_data)) = row else {
+                metrics::record_dsql_rows_read("read_history_event", read);
+                let Some(batch) = batches.into_iter().next() else {
                     return Ok(None);
                 };
                 // An id past the end of the history finds the last batch.
-                if event_id > last_event_id {
+                if event_id > batch.last_event_id {
                     return Ok(None);
                 }
-                Ok(codec::decode_history_events(run_key, &events_data)?
+                Ok(codec::decode_history_events(run_key, &batch.events_data)?
                     .into_iter()
                     .find(|event| event.event_id == event_id))
             }
@@ -353,22 +465,20 @@ impl DsqlRunRepository {
                 let mut batch_cursor = after_event_id;
                 let mut rows_read = 0;
                 loop {
-                    let rows = sqlx::query_as::<_, (i64, i64, Vec<u8>, Option<Vec<u8>>)>(
-                        READ_HISTORY_BATCHES_SQL,
-                    )
-                    .bind(run_key.0)
-                    .bind(batch_cursor)
-                    .bind(batch_page)
-                    .fetch_all(permit.connection()?)
+                    let (read, batches) = BatchRead::Page {
+                        after_event_id: batch_cursor,
+                        limit: batch_page,
+                    }
+                    .whole(permit.connection()?, run_key)
                     .await?;
-                    rows_read += rows.len();
-                    let more_batches = rows.len() == HISTORY_BATCH_PAGE;
-                    for (_first_event_id, last_event_id, events_data, principals_data) in rows {
-                        batch_cursor = last_event_id;
+                    rows_read += read;
+                    let more_batches = read == HISTORY_BATCH_PAGE;
+                    for batch in batches {
+                        batch_cursor = batch.last_event_id;
                         for attributed in decode_attributed_history_batch(
                             run_key,
-                            &events_data,
-                            principals_data.as_deref(),
+                            &batch.events_data,
+                            batch.principals_data.as_deref(),
                         )? {
                             if attributed.event.event_id <= after_event_id {
                                 continue;
@@ -455,23 +565,21 @@ impl DsqlRunRepository {
             Some(self.shard_for_run_key(run_key)),
             {
                 let mut permit = self.director.acquire(DbClass::Read).await?;
-                let rows = sqlx::query_as::<_, (i64, Vec<u8>)>(
-                    "SELECT transition_seq, events_data FROM history_batch
-             WHERE run_key = $1 ORDER BY first_event_id ASC",
-                )
-                .bind(run_key.0)
-                .fetch_all(permit.connection()?)
-                .await?;
+                let (_, batches) = BatchRead::All.whole(permit.connection()?, run_key).await?;
 
-                rows.into_iter()
-                    .map(|(transition_seq, events_data)| {
+                batches
+                    .into_iter()
+                    .map(|batch| {
                         Ok(TransitionAuditRecord {
                             run_key,
                             transition_seq: TransitionSeq(convert::u64_from_i64(
-                                transition_seq,
+                                batch.transition_seq,
                                 "history_batch.transition_seq",
                             )?),
-                            history_events: codec::decode_history_events(run_key, &events_data)?,
+                            history_events: codec::decode_history_events(
+                                run_key,
+                                &batch.events_data,
+                            )?,
                             activity_ops: Vec::new(),
                             timer_ops: Vec::new(),
                             dispatch_ops: Vec::new(),

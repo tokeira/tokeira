@@ -19,11 +19,21 @@
 //!   switch of its record, reads the execution home's lease first, as a
 //!   transition commit does (`bundle-lease-fence`).
 //!
+//! A value over the part size is copied and purged with its parts
+//! (`large-value-parts`): each part is a row of a page, and a run's parts go
+//! after its history, last.
+//!
 //! [`purge_run`]: crate::RunRepository::purge_run
 
-use super::*;
+use sqlx::Row;
+
+use super::{
+    run_value_parts::{self, OnConflict, RunValueKind, STATE_VALUE_KEY},
+    *,
+};
 use crate::{
     BulkWritePhase, RunBulkWrite,
+    dsql::value_parts::{self, Split},
     write_budget::{
         MAX_RESET_BATCH_BYTES, MAX_ROWS_PER_TRANSACTION, WriteBudget, WriteCost, pages,
     },
@@ -34,19 +44,25 @@ use crate::{
 const TRANSACTION_ATTEMPTS: usize = 5;
 
 /// One run-owned table a purge pages through, with the statements that select a
-/// page's keys in order and delete the page by its last key.
+/// page's keys in order and delete the page by its last key. A key's columns are
+/// selected as text, and the delete binds them in order and casts them back.
 pub(super) struct PurgeTable {
     pub(super) table: &'static str,
     select_page: &'static str,
     delete_page: &'static str,
 }
 
-/// The tables a purge empties, in order, history last: the run's authority goes
-/// after every row derived from it. `workflow_dispatch` and `workflow_hot` go in
-/// the deletion's first transaction. Each page is selected in its table's key
-/// order and deleted by its last key, so a page is exactly the rows selected:
-/// nothing writes a row of a recorded run.
-pub(super) const PURGE_TABLES: [PurgeTable; 5] = [
+/// The tables a purge empties, in order: history after every row derived from
+/// it, then the parts of the run's values, last. `workflow_dispatch` and
+/// `workflow_hot` go in the deletion's first transaction. Each page is selected in
+/// its table's key order and deleted by its last key, so a page is exactly the
+/// rows selected: nothing writes a row of a recorded run.
+///
+/// A batch's parts outlast every batch row of the run, so a history read that
+/// finds a batch in its snapshot finds the batch's parts there too
+/// (`large-value-parts`). The parts left without their row meanwhile, the
+/// state's and those of batches already purged, are read by no one.
+pub(super) const PURGE_TABLES: [PurgeTable; 6] = [
     PurgeTable {
         table: "request_dedupe",
         select_page: "SELECT key::text FROM request_dedupe WHERE run_key = $1 ORDER BY key LIMIT $2",
@@ -73,7 +89,30 @@ pub(super) const PURGE_TABLES: [PurgeTable; 5] = [
                       ORDER BY first_event_id LIMIT $2",
         delete_page: "DELETE FROM history_batch WHERE run_key = $1 AND first_event_id <= $2::bigint",
     },
+    PurgeTable {
+        table: "run_value_part",
+        select_page: "SELECT value_kind::text, value_key::text, part_no::text FROM run_value_part \
+                      WHERE run_key = $1 ORDER BY value_kind, value_key, part_no LIMIT $2",
+        delete_page: "DELETE FROM run_value_part WHERE run_key = $1 \
+                      AND (value_kind, value_key, part_no) <= ($2::smallint, $3::bigint, $4::integer)",
+    },
 ];
+
+/// Delete the run's rows of `table` up to and including the key `last`, a row of
+/// its select statement.
+async fn delete_through(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_key: RunKey,
+    table: &PurgeTable,
+    last: &sqlx::postgres::PgRow,
+) -> Result<()> {
+    let mut delete = sqlx::query(table.delete_page).bind(run_key.0);
+    for column in 0..last.len() {
+        delete = delete.bind(last.try_get::<String, _>(column)?);
+    }
+    delete.execute(&mut **tx).await?;
+    Ok(())
+}
 
 pub(super) const SELECT_RECORD_FOR_UPDATE: &str =
     "SELECT phase FROM run_bulk_write WHERE run_key = $1 FOR UPDATE";
@@ -101,7 +140,8 @@ where
 /// One item a materialization copies before its final transaction.
 pub(super) enum CopyItem<'a> {
     /// A history batch: its first and last event ids, encoded events and
-    /// principals (NULL when no event has one, as `insert_history_batch` writes).
+    /// principals (NULL when no event has one, as `insert_history_batch` writes),
+    /// each written in parts when it is over the part size.
     Batch {
         first_event_id: i64,
         last_event_id: i64,
@@ -110,17 +150,30 @@ pub(super) enum CopyItem<'a> {
     },
     /// A timer row.
     Timer(&'a tokeira_kernel::TimerState),
+    /// A part after the first of the successor's state. The final transaction
+    /// writes the state's row, with the first part and the count; until then no
+    /// reader reads the part.
+    StatePart { part_no: i32, data: &'a [u8] },
 }
 
 impl CopyItem<'_> {
     fn cost(&self) -> Result<WriteCost> {
         Ok(match self {
+            // The batch's row, and a row for each part after the first of its
+            // two values.
             Self::Batch {
                 events_data,
                 principals_data,
                 ..
-            } => WriteCost::write(events_data.len() + principals_data.as_ref().map_or(0, Vec::len)),
+            } => WriteCost {
+                rows: value_parts::parts_of(events_data.len())
+                    + principals_data
+                        .as_ref()
+                        .map_or(0, |data| value_parts::parts_of(data.len()) - 1),
+                bytes: events_data.len() + principals_data.as_ref().map_or(0, Vec::len),
+            },
             Self::Timer(timer) => WriteCost::write(codec::encode_timer_state(timer)?.len()),
+            Self::StatePart { data, .. } => WriteCost::write(data.len()),
         })
     }
 }
@@ -174,10 +227,10 @@ impl DsqlRunRepository {
             if record.is_none() {
                 return Ok(());
             }
-            let (history, derived) = PURGE_TABLES
+            let (parts, tables) = PURGE_TABLES
                 .split_last()
-                .expect("the purge has a history table");
-            for table in derived {
+                .expect("the purge has a last table");
+            for table in tables {
                 while retry_on_conflict(|| {
                     self.purge_page(run_key, table, MAX_ROWS_PER_TRANSACTION)
                 })
@@ -185,10 +238,10 @@ impl DsqlRunRepository {
                     == MAX_ROWS_PER_TRANSACTION
                 {}
             }
-            // History last, and the record with its last page: the record goes
-            // only when every table is empty, so a purge that stops early leaves
-            // it for the next attempt.
-            while !retry_on_conflict(|| self.purge_history_page(run_key, history)).await? {}
+            // The parts last, and the record with their last page: the record
+            // goes only when every table is empty, so a purge that stops early
+            // leaves it for the next attempt.
+            while !retry_on_conflict(|| self.purge_last_page(run_key, parts)).await? {}
             Ok(())
         })
     }
@@ -203,20 +256,16 @@ impl DsqlRunRepository {
     ) -> Result<usize> {
         let mut permit = self.director.acquire(DbClass::Commit).await?;
         let mut tx = permit.connection()?.begin().await?;
-        let keys = sqlx::query_as::<_, (String,)>(table.select_page)
+        let keys = sqlx::query(table.select_page)
             .bind(run_key.0)
             .bind(i64::try_from(limit)?)
             .fetch_all(&mut *tx)
             .await?;
-        let Some((last,)) = keys.last() else {
+        let Some(last) = keys.last() else {
             tx.rollback().await?;
             return Ok(0);
         };
-        sqlx::query(table.delete_page)
-            .bind(run_key.0)
-            .bind(last)
-            .execute(&mut *tx)
-            .await?;
+        delete_through(&mut tx, run_key, table, last).await?;
         tx.commit().await?;
         tracing::debug!(
             table = table.table,
@@ -224,17 +273,19 @@ impl DsqlRunRepository {
             "purged a page of a run's rows"
         );
         metrics::record_dsql_rows_written("purge_run", keys.len() as u64);
+        #[cfg(all(test, feature = "dsql-integration"))]
+        super::pause_point::reached(super::pause_point::PauseKey::Purge(run_key)).await;
         Ok(keys.len())
     }
 
-    /// Delete one page of the run's history, with the record when it is the
-    /// last. Returns whether it was.
-    async fn purge_history_page(&self, run_key: RunKey, history: &PurgeTable) -> Result<bool> {
+    /// Delete one page of the purge's last table, with the record when it is the
+    /// last page. Returns whether it was.
+    async fn purge_last_page(&self, run_key: RunKey, table: &PurgeTable) -> Result<bool> {
         // A page leaves one row of the budget for the record.
         let page = MAX_ROWS_PER_TRANSACTION - 1;
         let mut permit = self.director.acquire(DbClass::Commit).await?;
         let mut tx = permit.connection()?.begin().await?;
-        let keys = sqlx::query_as::<_, (String,)>(history.select_page)
+        let keys = sqlx::query(table.select_page)
             .bind(run_key.0)
             .bind(i64::try_from(page + 1)?)
             .fetch_all(&mut *tx)
@@ -242,11 +293,7 @@ impl DsqlRunRepository {
         let last = keys.len() <= page;
         let deleted = keys.len().min(page);
         if deleted > 0 {
-            sqlx::query(history.delete_page)
-                .bind(run_key.0)
-                .bind(&keys[deleted - 1].0)
-                .execute(&mut *tx)
-                .await?;
+            delete_through(&mut tx, run_key, table, &keys[deleted - 1]).await?;
         }
         if last {
             sqlx::query("DELETE FROM run_bulk_write WHERE run_key = $1")
@@ -256,6 +303,8 @@ impl DsqlRunRepository {
         }
         tx.commit().await?;
         metrics::record_dsql_rows_written("purge_run", (deleted + usize::from(last)) as u64);
+        #[cfg(all(test, feature = "dsql-integration"))]
+        super::pause_point::reached(super::pause_point::PauseKey::Purge(run_key)).await;
         Ok(last)
     }
 
@@ -388,6 +437,16 @@ impl DsqlRunRepository {
                     });
                 }
                 items.extend(successor_state.timers.values().map(CopyItem::Timer));
+                // A state over the part size has its other parts copied ahead of
+                // its row, which the final transaction writes, so that one stays
+                // as small as a whole state's.
+                let state_data = codec::encode_workflow_state(&successor_state)?;
+                let state = value_parts::split(&state_data);
+                items.extend(
+                    state
+                        .numbered()
+                        .map(|(part_no, data)| CopyItem::StatePart { part_no, data }),
+                );
                 let costs = items
                     .iter()
                     .map(CopyItem::cost)
@@ -410,13 +469,12 @@ impl DsqlRunRepository {
                     })
                     .await?;
                 }
-                let state_data = codec::encode_workflow_state(&successor_state)?;
                 retry_on_conflict(|| {
                     self.finish_materialization(
                         successor_run_key,
                         successor_shard,
                         &successor_state,
-                        &state_data,
+                        &state,
                         history_size,
                         expected_current,
                         &fence,
@@ -428,7 +486,8 @@ impl DsqlRunRepository {
     }
 
     /// The base's state and its history before `fork_event_id`, with
-    /// principals, read in one read transaction.
+    /// principals, read in one read transaction, which joins the values stored
+    /// in parts.
     async fn read_reset_base(
         &self,
         base_run_key: RunKey,
@@ -441,24 +500,25 @@ impl DsqlRunRepository {
         // The commit class, as for every step of this write operation.
         let mut permit = self.director.acquire(DbClass::Commit).await?;
         let mut tx = permit.connection()?.begin().await?;
-        let base_row = sqlx::query_as::<_, (Vec<u8>,)>(
-            "SELECT state_data FROM workflow_hot WHERE run_key = $1",
+        let base_row = sqlx::query_as::<_, (Vec<u8>, Option<i32>)>(
+            "SELECT state_data, state_parts FROM workflow_hot WHERE run_key = $1",
         )
         .bind(base_run_key.0)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((base_state_data,)) = base_row else {
+        let Some((first, parts)) = base_row else {
             tx.rollback().await?;
             bail!("base run not found: {:?}", base_run_key);
         };
+        let base_state_data =
+            run_value_parts::join_state(&mut tx, base_run_key, first, parts).await?;
         let base_state = codec::decode_workflow_state(base_run_key, &base_state_data)?;
-        let history_rows = sqlx::query_as::<_, (Vec<u8>, Option<Vec<u8>>)>(
-            "SELECT events_data, principals_data FROM history_batch
-             WHERE run_key = $1 ORDER BY first_event_id ASC",
-        )
-        .bind(base_run_key.0)
-        .fetch_all(&mut *tx)
-        .await?;
+        let history_rows = sqlx::query_as(super::load::READ_ALL_HISTORY_BATCHES_SQL)
+            .bind(base_run_key.0)
+            .fetch_all(&mut *tx)
+            .await?;
+        let history_rows =
+            run_value_parts::join_batches(&mut tx, base_run_key, history_rows).await?;
         tx.commit().await?;
 
         // Reset materialization copies only the committed prefix BEFORE the
@@ -470,11 +530,11 @@ impl DsqlRunRepository {
         // source of truth for reset snapshots.
         let mut events = Vec::new();
         let mut principals = Vec::new();
-        for (events_data, principals_data) in history_rows {
+        for batch in history_rows {
             for attributed in super::load::decode_attributed_history_batch(
                 base_run_key,
-                &events_data,
-                principals_data.as_deref(),
+                &batch.events_data,
+                batch.principals_data.as_deref(),
             )? {
                 if attributed.event.event_id == fork_event_id {
                     codec::ensure_contiguous_prefix(base_run_key, &events)?;
@@ -573,26 +633,37 @@ impl DsqlRunRepository {
                     events_data,
                     principals_data,
                 } => {
-                    // `DO NOTHING` makes a repeated page a no-op: a batch's
-                    // bytes are a function of the copied events alone.
-                    sqlx::query(
-                        "INSERT INTO history_batch
-                         (run_key, first_event_id, last_event_id, transition_seq, events_data,
-                          principals_data, created_at)
-                         VALUES ($1, $2, $3, $4, $5, $6, now())
-                         ON CONFLICT (run_key, first_event_id) DO NOTHING",
+                    // Keeping what is there makes a repeated page a no-op: a
+                    // batch's bytes, and so its parts, are a function of the
+                    // copied events alone.
+                    commit::write_history_batch(
+                        &mut tx,
+                        run_key,
+                        *first_event_id,
+                        *last_event_id,
+                        transition_seq,
+                        events_data,
+                        principals_data.as_deref(),
+                        OnConflict::Keep,
                     )
-                    .bind(run_key.0)
-                    .bind(first_event_id)
-                    .bind(last_event_id)
-                    .bind(convert::i64_from_u64(transition_seq.0, "transition_seq")?)
-                    .bind(events_data)
-                    .bind(principals_data)
-                    .execute(&mut *tx)
                     .await?;
                 }
                 CopyItem::Timer(timer) => {
                     commit::upsert_timer(&mut tx, run_key, shard_id, timer).await?;
+                }
+                // The state is encoded once per materialization, so a repeated
+                // page writes the same part.
+                CopyItem::StatePart { part_no, data } => {
+                    run_value_parts::write_part(
+                        &mut tx,
+                        run_key,
+                        RunValueKind::State,
+                        STATE_VALUE_KEY,
+                        *part_no,
+                        data,
+                        OnConflict::Keep,
+                    )
+                    .await?;
                 }
             }
         }
@@ -605,7 +676,7 @@ impl DsqlRunRepository {
         run_key: RunKey,
         shard_id: ShardId,
         state: &WorkflowState,
-        state_data: &[u8],
+        state_data: &Split<'_>,
         history_size: i64,
         expected_current: Option<RunKey>,
         fence: &WriteFence,
@@ -656,10 +727,43 @@ impl DsqlRunRepository {
 
 #[cfg(test)]
 mod tests {
-    use super::PURGE_TABLES;
+    use super::{CopyItem, PURGE_TABLES};
+    use crate::{dsql::value_parts::PART_BYTES, write_budget::WriteCost};
 
     #[test]
-    fn the_purge_covers_every_run_owned_table_and_history_is_last() {
+    fn a_copied_value_costs_a_row_for_each_of_its_parts() {
+        let batch = CopyItem::Batch {
+            first_event_id: 1,
+            last_event_id: 1,
+            events_data: vec![0; 2 * PART_BYTES + 1],
+            principals_data: Some(vec![0; PART_BYTES + 1]),
+        };
+        assert_eq!(
+            batch.cost().expect("cost"),
+            WriteCost {
+                rows: 3 + 1,
+                bytes: 3 * PART_BYTES + 2,
+            }
+        );
+        let whole = CopyItem::Batch {
+            first_event_id: 1,
+            last_event_id: 1,
+            events_data: vec![0; PART_BYTES],
+            principals_data: Some(vec![0; 16]),
+        };
+        assert_eq!(
+            whole.cost().expect("cost"),
+            WriteCost::write(PART_BYTES + 16)
+        );
+        let part = CopyItem::StatePart {
+            part_no: 1,
+            data: &[0; 16],
+        };
+        assert_eq!(part.cost().expect("cost"), WriteCost::write(16));
+    }
+
+    #[test]
+    fn the_purge_covers_every_run_owned_table_with_history_then_the_parts_last() {
         let tables = PURGE_TABLES
             .iter()
             .map(|table| table.table)
@@ -672,6 +776,7 @@ mod tests {
                 "activity_dispatch",
                 "dispatch_backlog",
                 "history_batch",
+                "run_value_part",
             ]
         );
         for table in &PURGE_TABLES {

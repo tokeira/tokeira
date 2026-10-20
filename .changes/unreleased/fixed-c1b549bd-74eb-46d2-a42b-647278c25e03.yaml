@@ -1,0 +1,5 @@
+kind: fixed
+body: On DSQL, a run's state or history batch that encodes to more than 1 MiB is now stored in parts, so its commit, reads, reset and deletion succeed.
+time: 2026-10-19T23:14:50.470720+01:00
+custom:
+    Slice: c1b549bd-74eb-46d2-a42b-647278c25e03

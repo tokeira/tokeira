@@ -34,6 +34,7 @@ pub mod schema_state_for_tests;
 pub mod slot_block_manager;
 pub mod task_queue_config;
 pub mod validation;
+pub(crate) mod value_parts;
 pub mod worker_compute_repository;
 pub mod worker_deployment_repository;
 pub mod worker_task_provenance;

@@ -1,4 +1,4 @@
-use super::*;
+use super::{run_value_parts::whole_states, *};
 
 impl DsqlRunRepository {
     #[instrument(name = "dsql.has_open_pinned_workflows", skip(self), fields(namespace_id = %namespace_id.0, deployment_name = %version.deployment_name.0, build_id = %version.build_id.0))]
@@ -9,8 +9,8 @@ impl DsqlRunRepository {
     ) -> Result<bool> {
         record_dsql_operation!(self, "has_open_pinned_workflows", None, {
             let mut permit = self.director.acquire(DbClass::Read).await?;
-            let rows = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
-                "SELECT run_key, state_data
+            let rows = sqlx::query_as::<_, (Uuid, Vec<u8>, Option<i32>)>(
+                "SELECT run_key, state_data, state_parts
              FROM workflow_hot
              WHERE namespace_id = $1",
             )
@@ -19,7 +19,11 @@ impl DsqlRunRepository {
             .await?;
             metrics::record_dsql_rows_read("has_open_pinned_workflows", rows.len());
 
-            for (run_key, state_data) in rows {
+            for (run_key, state_data) in whole_states(permit.connection()?, rows).await? {
+                // A run deleted since the scan read it pins nothing.
+                let Some(state_data) = state_data else {
+                    continue;
+                };
                 let state = codec::decode_workflow_state(RunKey(run_key), &state_data)?;
                 if workflow_is_open_and_pinned_to_version(&state, namespace_id, version) {
                     return Ok(true);
@@ -50,8 +54,8 @@ impl DsqlRunRepository {
                         // `idx_workflow_hot_recovery (shard_id, recovery_needed, run_key)`.
                         let rows = match (phase, after) {
                             (RecoveryPhase::Legacy, None) => {
-                                sqlx::query_as::<_, (Uuid, Vec<u8>)>(
-                                    "SELECT run_key, state_data FROM workflow_hot
+                                sqlx::query_as::<_, (Uuid, Vec<u8>, Option<i32>)>(
+                                    "SELECT run_key, state_data, state_parts FROM workflow_hot
                                  WHERE shard_id = $1 AND recovery_needed IS NULL
                                  ORDER BY run_key ASC LIMIT $2",
                                 )
@@ -61,8 +65,8 @@ impl DsqlRunRepository {
                                 .await?
                             }
                             (RecoveryPhase::Legacy, Some(after)) => {
-                                sqlx::query_as::<_, (Uuid, Vec<u8>)>(
-                                    "SELECT run_key, state_data FROM workflow_hot
+                                sqlx::query_as::<_, (Uuid, Vec<u8>, Option<i32>)>(
+                                    "SELECT run_key, state_data, state_parts FROM workflow_hot
                                      WHERE shard_id = $1 AND recovery_needed IS NULL
                                        AND run_key > $2
                                      ORDER BY run_key ASC LIMIT $3",
@@ -74,8 +78,8 @@ impl DsqlRunRepository {
                                 .await?
                             }
                             (RecoveryPhase::Flagged, None) => {
-                                sqlx::query_as::<_, (Uuid, Vec<u8>)>(
-                                    "SELECT run_key, state_data FROM workflow_hot
+                                sqlx::query_as::<_, (Uuid, Vec<u8>, Option<i32>)>(
+                                    "SELECT run_key, state_data, state_parts FROM workflow_hot
                                  WHERE shard_id = $1 AND recovery_needed = true
                                  ORDER BY run_key ASC LIMIT $2",
                                 )
@@ -85,8 +89,8 @@ impl DsqlRunRepository {
                                 .await?
                             }
                             (RecoveryPhase::Flagged, Some(after)) => {
-                                sqlx::query_as::<_, (Uuid, Vec<u8>)>(
-                                    "SELECT run_key, state_data FROM workflow_hot
+                                sqlx::query_as::<_, (Uuid, Vec<u8>, Option<i32>)>(
+                                    "SELECT run_key, state_data, state_parts FROM workflow_hot
                                      WHERE shard_id = $1 AND recovery_needed = true
                                        AND run_key > $2
                                      ORDER BY run_key ASC LIMIT $3",
@@ -102,17 +106,26 @@ impl DsqlRunRepository {
                             "list_recovery_candidates_for_shard",
                             rows.len(),
                         );
-                        rows.into_iter()
+                        // Every row read stays in the page, a run deleted since as
+                        // `None`, because the page's count of rows decides whether
+                        // its phase has more.
+                        whole_states(permit.connection()?, rows)
+                            .await?
+                            .into_iter()
                             .map(|(run_key, state_data)| {
                                 let run_key = RunKey(run_key);
-                                codec::decode_workflow_state(run_key, &state_data)
+                                state_data
+                                    .map(|state_data| {
+                                        codec::decode_workflow_state(run_key, &state_data)
+                                    })
+                                    .transpose()
                                     .map(|state| (run_key, state))
                             })
                             .collect::<Result<Vec<_>>>()
                     })
                     .await?;
                 Ok(RecoveryPage {
-                    states: rows.into_iter().map(|(_, state)| state).collect(),
+                    states: rows.into_iter().filter_map(|(_, state)| state).collect(),
                     next,
                 })
             }

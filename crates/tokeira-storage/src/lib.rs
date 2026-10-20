@@ -33,6 +33,8 @@ mod growth;
 #[cfg(test)]
 mod history_event_tests;
 #[cfg(test)]
+mod large_value_tests;
+#[cfg(test)]
 mod lease_fence_tests;
 pub mod memory;
 pub mod metrics;

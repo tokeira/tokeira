@@ -1,0 +1,1 @@
+ALTER TABLE workflow_hot ADD COLUMN IF NOT EXISTS state_parts INTEGER;

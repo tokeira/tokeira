@@ -260,7 +260,9 @@ DSQL supports CHECK constraints in CREATE TABLE, but Tokeira uses application-le
 
 ### Serialization format
 
-All BYTEA columns use `postcard` (compact binary serde encoding). Domain types derive `Serialize, Deserialize`; no separate schema definitions or mapping code is needed. Postcard's varint encoding produces smaller payloads for typical workflow data (small integers, short strings) while staying within DSQL's 1 MiB BYTEA limit.
+All BYTEA columns use `postcard` (compact binary serde encoding). Domain types derive `Serialize, Deserialize`; no separate schema definitions or mapping code is needed. Postcard's varint encoding produces smaller payloads for typical workflow data (small integers, short strings).
+
+DSQL refuses a value over 1 MiB. A run's state, or a history batch's events or principals, that encodes to more than the part size (960 KiB) is stored in parts: its first part stays in its own column, a count column beside it holds the number of parts, and the other parts go to `run_value_part`. The row and its parts are written in one transaction, and a reader joins the parts in the transaction that reads the row, so it never mixes the parts of two versions of a value. A value within the part size is stored whole, with no count, as before parts existed (`.kiro/specs/large-value-parts/`).
 
 Workflow-state and history-batch blobs are wrapped in a versioned envelope (a magic version prefix ahead of the postcard body). A decoder that meets any other version fails with `BlobFormatError` naming the blob kind, the run, and the observed version, so a layout change to the enveloped types can never be misread as data. The `workflow_hot.history_size_bytes` column accumulates the encoded length of every committed batch under the same `FOR UPDATE` read that fences the commit; it is the single history-size statistic that Describe, visibility, and the continue-as-new advice consult.
 

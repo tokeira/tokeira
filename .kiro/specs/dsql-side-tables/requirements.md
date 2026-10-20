@@ -41,9 +41,9 @@ Since [activity-state-writes](../activity-state-writes/bugfix.md), no release wr
 
 ### Key Design Constraints
 
-- All queries use `DbClass::Read` connections — no transactions, no writes.
+- All queries use `DbClass::Read` connections — no writes, and no transactions but the read-only snapshot in which a state over the part size is read again with its parts ([large-value-parts](../large-value-parts/design.md)).
 - `shard_id` is bound as UUID via `DsqlRunRepository::shard_id_to_uuid(shard_id)`.
-- `workflow_hot.state_data` stores the full `WorkflowState` as postcard-serialized BYTEA. The dispatch and sweep methods deserialize it to extract specific fields (`pending_workflow_task`, `workflow_execution_timeout`, `workflow_run_timeout`, `pending_nexus_operations`, etc.).
+- `workflow_hot.state_data` stores the full `WorkflowState` as postcard-serialized BYTEA, or its first part when `workflow_hot.state_parts` holds a count, with the other parts in `run_value_part`. The dispatch and sweep methods deserialize it to extract specific fields (`pending_workflow_task`, `workflow_execution_timeout`, `workflow_run_timeout`, `pending_nexus_operations`, etc.).
 - `activity_state` is dropped ([activity-state-drop](../activity-state-drop/bugfix.md)). Activity dispatch queries read from the dedicated `activity_dispatch` table.
 - `activity_dispatch` stores dispatch-ready activity tasks with denormalized queue identity columns. Dispatch queries do not deserialize `ActivityState`, and they don't select `input_data`, which every row holds as an empty payload list: an activity's input lives only in its ActivityTaskScheduled event ([activity-inputs-from-history](../activity-inputs-from-history/bugfix.md)).
 - `timer_bucket.timer_data` stores `TimerState` as postcard-serialized BYTEA.
@@ -234,7 +234,7 @@ Since [activity-state-writes](../activity-state-writes/bugfix.md), no release wr
 
 #### Acceptance Criteria
 
-1. THE DsqlRunRepository SHALL deserialize `workflow_hot.state_data` using `codec::decode_workflow_state`.
+1. THE DsqlRunRepository SHALL deserialize `workflow_hot.state_data`, joined with its parts when `state_parts` holds a count, using `codec::decode_workflow_state`.
 2. Withdrawn with Requirement 9: no query reads `activity_state.state_data`, and the table is dropped.
 3. IF deserialization fails, THEN THE DsqlRunRepository SHALL return an error with context identifying the table and row key.
 

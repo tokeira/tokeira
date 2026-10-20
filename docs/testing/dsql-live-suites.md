@@ -110,6 +110,7 @@ point them at a database holding application data.
 | Storage `workflow_dispatch_live_disposal_rolls_back_cancelled_page_and_keeps_bounds` | 1 | Cancellation before page commit leaves legacy rows intact; resumed pages inspect at most 64 keys; `dsql-integration`, URL gate only |
 | Storage `dsql_transaction_limits` | 6 | DSQL's transaction limits, apart from the bulk writes' budgets: 3,000 rows, deleted rows included and rows read `FOR UPDATE` not; 9 MiB of values but not 10, deleted rows not counted; 1 MiB a value; `dsql-integration`, URL gate only |
 | Storage `history_event_tests` | 4 | The one-lookup read of a history event: each event of batches of one and of several events and of a reset successor's copied batches; the lookup's plan on a run of 5,000 batches, for an event near the end and one near the start: a backward scan of the primary key with both key columns in its index condition, no sort, and the limit pushed down to storage, which returns one row; and dispatch rows and backlog entries an earlier release wrote with an activity's input; set `TOKEIRA_HISTORY_EVENT_PLAN_OUTPUT` to save the plans; `dsql-integration`, URL gate only |
+| Storage `large_value_tests` | 9 | A run's values over the part size, stored in parts: a 2 MiB payload and a batch of nearly 4 MiB, read back by each read of history; a state that grows over the part size and shrinks below it, up to 7.5 MiB; a reset of a base whose history and state are over the part size; a deletion whose purge leaves no part; 8 generated sequences of state sizes, each write leaving exactly its state's parts; a purge held after each of its transactions, a history read held before it reads its parts while a purge runs, and a load held before it reads its parts while a commit replaces the state, each reading whole values; and a row of two parts of the part size, which DSQL commits; `dsql-integration`, URL gate only |
 | Runtime `dsql_activity_inputs` | 3 | Activity inputs read from history: six pending activities with inputs of about 200 KB each, three activities scheduled in one batch, and a reset successor's activities delivered from its copied batches; runtime `dsql-integration`, URL gate only; run after storage schema bootstrap |
 
 Run the suites and their test cases serially against the selected database. The shard
@@ -216,6 +217,14 @@ commands run serially in the same cluster lifecycle:
 ```bash
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(/^dsql::run_repository::history_event_tests::/)'
 cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --test dsql_activity_inputs --test-threads 1
+```
+
+The large-value tests also use only `TOKEIRA_DSQL_TEST_DATABASE_URL` and apply the
+embedded migrations. They hold purges, history reads and loads at test-only pause
+points. Run them serially:
+
+```bash
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(/^dsql::run_repository::large_value_tests::/)'
 ```
 
 ## Endpoint-gated IAM connector

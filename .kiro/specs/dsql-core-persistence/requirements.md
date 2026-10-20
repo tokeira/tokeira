@@ -69,6 +69,7 @@ The `RunRepository` trait methods assigned to Feature 2 in the umbrella spec aud
 - **OCC**: Optimistic Concurrency Control — DSQL's conflict detection model where transactions proceed optimistically and conflicts are detected at commit time.
 - **Workflow_Hot**: Small current summary row per open run, containing the compact `WorkflowState` needed for the runtime to process the next command.
 - **History_Batch**: Immutable append-only event batch table. Each row contains a contiguous range of history events from one transition.
+- **Run_Value_Part**: The parts after the first of a run's values over the part size: its state, and each history batch's events and principals. The value's own column holds its first part, and a count column beside it (`workflow_hot.state_parts`, `history_batch.events_parts`, `history_batch.principals_parts`) holds its number of parts, NULL for a value stored whole ([large-value-parts](../large-value-parts/design.md)).
 - **Current_Execution**: Mapping table from `(namespace_id, workflow_id)` to the current run identity and open/closed status.
 - **Request_Dedupe**: Idempotency record table for external command deduplication, keyed by `(namespace_id, workflow_id, request_id)`.
 - **Shard_Lease**: Table tracking shard ownership with epoch fencing for single-writer guarantees. Read (not written) by this spec during commit fencing.
@@ -110,8 +111,8 @@ The `RunRepository` trait methods assigned to Feature 2 in the umbrella spec aud
 
 #### Acceptance Criteria
 
-1. WHEN `commit_transition` succeeds, THE DsqlRunRepository SHALL have upserted the `workflow_hot` row with the new `WorkflowState` serialized via the codec module, updating `transition_seq`, `state_data`, `shard_id`, and `updated_at`.
-2. WHEN `commit_transition` succeeds and the transition contains history events, THE DsqlRunRepository SHALL have inserted a `history_batch` row containing the serialized events with `first_event_id`, `last_event_id`, and `transition_seq`.
+1. WHEN `commit_transition` succeeds, THE DsqlRunRepository SHALL have upserted the `workflow_hot` row with the new `WorkflowState` serialized via the codec module, updating `transition_seq`, `state_data`, `state_parts`, `shard_id`, and `updated_at`, with a state over the part size stored in parts (Run_Value_Part).
+2. WHEN `commit_transition` succeeds and the transition contains history events, THE DsqlRunRepository SHALL have inserted a `history_batch` row containing the serialized events with `first_event_id`, `last_event_id`, and `transition_seq`, with events or principals over the part size stored in parts (Run_Value_Part).
 3. WHEN `commit_transition` succeeds and the transition contains `ActivityOp::Upsert` entries, THE DsqlRunRepository SHALL NOT have written `activity_state`: the run's state in `workflow_hot` (criterion 1) is the only record of an activity, and the op maintains the activity's dispatch row (`dsql-side-tables` Requirement 16) ([activity-state-writes](../activity-state-writes/bugfix.md), criterion 2.1).
 4. WHEN `commit_transition` succeeds and the transition contains `ActivityOp::Delete` entries, THE DsqlRunRepository SHALL NOT have written `activity_state`. ([activity-state-writes](../activity-state-writes/bugfix.md), criterion 2.1). [activity-state-drop](../activity-state-drop/bugfix.md) drops the table.
 5. WHEN `commit_transition` succeeds and the transition contains `TimerOp::Upsert` entries, THE DsqlRunRepository SHALL have upserted corresponding rows in `timer_bucket`.
@@ -148,7 +149,7 @@ The `RunRepository` trait methods assigned to Feature 2 in the umbrella spec aud
 
 #### Acceptance Criteria
 
-1. WHEN `load_run` is called with a known `RunKey`, THE DsqlRunRepository SHALL return `LoadedRun::Existing` with the `WorkflowState` deserialized from the `workflow_hot.state_data` column using the codec module.
+1. WHEN `load_run` is called with a known `RunKey`, THE DsqlRunRepository SHALL return `LoadedRun::Existing` with the `WorkflowState` deserialized from the `workflow_hot.state_data` column using the codec module, joined with its parts (Run_Value_Part) in the transaction that reads it.
 2. WHEN `load_run` is called with an unknown `RunKey`, THE DsqlRunRepository SHALL return `LoadedRun::Absent`.
 3. FOR ALL `WorkflowState` values, serializing to `state_data` via the codec and then deserializing SHALL produce a value equal to the original (round-trip property).
 
@@ -176,7 +177,7 @@ The `RunRepository` trait methods assigned to Feature 2 in the umbrella spec aud
 #### Acceptance Criteria
 
 1. WHEN `read_history` is called, THE DsqlRunRepository SHALL query `history_batch` rows for the given `RunKey` where the batch contains events with `event_id > after_event_id`, ordered by `first_event_id` ascending.
-2. THE DsqlRunRepository SHALL deserialize the `events_data` column using the codec module and reconstruct individual `HistoryEvent` values from the batch storage format.
+2. THE DsqlRunRepository SHALL deserialize the `events_data` column, joined with its parts (Run_Value_Part) in the transaction that reads it, using the codec module and reconstruct individual `HistoryEvent` values from the batch storage format.
 3. THE DsqlRunRepository SHALL return at most `limit` events, filtering out events with `event_id <= after_event_id` from partially overlapping batches.
 4. WHEN no events exist after `after_event_id`, THE DsqlRunRepository SHALL return an empty vector.
 5. FOR ALL `Vec<HistoryEvent>` values, serializing to `events_data` via the codec and then deserializing SHALL produce a value equal to the original (round-trip property).

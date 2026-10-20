@@ -52,7 +52,7 @@ Show the four defects first, on both stores, with tests that fail on the current
     - _Requirements: 2.4, 2.5, 2.9_
   - [x] 4.3 Write property tests for Properties 3 and 4
     - **Property 3: A run has mutable state or a bulk-write record, never both**
-    - **Property 4: A purge finishes, removes only its run's rows, and removes history last**
+    - **Property 4: A purge finishes, removes only its run's rows, and removes history after the rows derived from it**
     - **Validates: Requirements 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9**
 
 - [x] 5. Materialization and the timer scanner

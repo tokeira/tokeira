@@ -10,41 +10,50 @@ worker invocation requests. Each step first shows the defect, with live tests th
 
 ## Tasks
 
-- [ ] 1. The format
-  - [ ] 1.1 Add `crates/tokeira-storage/src/dsql/value_parts.rs`: the part size, splitting and joining
+- [x] 1. The format
+  - [x] 1.1 Add `crates/tokeira-storage/src/dsql/value_parts.rs`: the part size, splitting and joining
     - _Requirements: 2.1, 2.3_
-  - [ ] 1.2 Write property tests for Properties 1 and 2
+  - [x] 1.2 Write property tests for Properties 1 and 2
     - **Property 1: Splitting and joining a value gives the value back**
     - **Property 2: A join refuses parts that don't fit together**
     - **Validates: Requirements 2.1, 2.3**
 
-- [ ] 2. Step 1: a run's values
-  - [ ] 2.1 Exploration: write step 1's live tests of the design's Exploratory Bug Condition Checking, run them on an
+- [x] 2. Step 1: a run's values
+  - [x] 2.1 Exploration: write step 1's live tests of the design's Exploratory Bug Condition Checking, run them on an
     ephemeral cluster on the code before the step, and confirm each fails with SQLSTATE 54000
     - _Requirements: 1.1, 1.2_
-  - [ ] 2.2 Add `run_value_part` and the three count columns, with the migrations' bookkeeping
+    - DONE. On the code before the step, on an ephemeral cluster, both tests failed: DSQL refused the commit of a
+      history batch over 1 MiB, and the commit of a state over 1 MiB, each with its value limit ("datatype limit
+      greater than 1048576 bytes not supported for bytea", SQLSTATE 54000).
+  - [x] 2.2 Add `run_value_part` and the three count columns, with the migrations' bookkeeping
     - _Requirements: 2.1_
-  - [ ] 2.3 Make the commit write a split state and split batches, and remove the parts a state no longer uses
+  - [x] 2.3 Make the commit write a split state and split batches, and remove the parts a state no longer uses
     - _Requirements: 2.1, 2.2, 3.1_
-  - [ ] 2.4 Make `load_run`, the other readers of a run's state and the history reads join split values, each in the
+  - [x] 2.4 Make `load_run`, the other readers of a run's state and the history reads join split values, each in the
     transaction that reads the value's row
     - _Requirements: 2.3, 2.4, 3.4, 3.6_
-  - [ ] 2.5 Make a reset read, copy and write split values
+  - [x] 2.5 Make a reset read, copy and write split values
     - _Requirements: 2.5, 3.3_
-  - [ ] 2.6 Add `run_value_part` to the purge's tables after history, as the last, and remove the record with its last
+  - [x] 2.6 Add `run_value_part` to the purge's tables after history, as the last, and remove the record with its last
     page
     - _Requirements: 2.6, 3.6_
-  - [ ] 2.7 Write the tests of Properties 3–6 for a run's values, on both stores, and the live tests of the design
+  - [x] 2.7 Write the tests of Properties 3–6 for a run's values, on both stores, and the live tests of the design
     - **Property 3: A stored value reads back whole**
     - **Property 4: A replaced value leaves only its own parts**
     - **Property 5: A reset copies values over the part size**
     - **Property 6: Removing a value removes its parts**
     - **Validates: Requirements 2.1-2.7, 3.1, 3.3, 3.6**
-  - [ ] 2.8 Add the release note
+  - [x] 2.8 Add the release note
     - _Requirements: 2.8_
-  - [ ] 2.9 Align the specs and documentation the design lists for step 1
-  - [ ] 2.10 Checkpoint: the exploration tests pass, each negative control fails its test, the live tests pass on an
+  - [x] 2.9 Align the specs and documentation the design lists for step 1
+  - [x] 2.10 Checkpoint: the exploration tests pass, each negative control fails its test, the live tests pass on an
     ephemeral cluster, and the full bar of root `AGENTS.md` §10.4 passes
+    - DONE at `b8c3752c`. Properties 1 and 2 pass offline, and the contracts of Properties 3, 5 and 6 pass on the
+      in-memory store. On ephemeral clusters, the nine large-value tests pass, the exploration tests among them, and so
+      do the complete-repair and fenced-repair suites. On the same change before the latest merges to main, the
+      bulk-write, history-event, projection-accumulator, placement, activity-input, transaction-limit,
+      workflow-dispatch and lease-fence suites passed, and each of the eight negative controls failed its test. The
+      bar passed (3,914 tests passed, 2 skipped).
 
 - [ ] 3. Step 2: visibility, built on [projection-passes](../projection-passes/design.md)'s projector
   - [ ] 3.1 Exploration: write step 2's live tests and confirm each fails on the code before the step

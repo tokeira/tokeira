@@ -1,0 +1,5 @@
+kind: security
+body: rustls-webpki 0.103.16, webpki-roots 1.0.10 and webpki-root-certs 1.0.10 close RUSTSEC-2026-0381, RUSTSEC-2026-0382 and RUSTSEC-2026-0383.
+time: 2026-10-23T00:38:10.664232+01:00
+custom:
+    Slice: f5808de5-a5ad-4258-a235-e39128983599

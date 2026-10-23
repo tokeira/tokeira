@@ -2,14 +2,14 @@
 
 //! Live projection persistence checks using the storage crate's canonical migrations.
 
-use std::{path::Path, sync::Arc};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use anyhow::Result;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use time::OffsetDateTime;
 use tokeira_projection::{
-    ComponentQuery, ComponentQueryError, ComponentVisibility, DsqlVisibilityStore, ProjectionSink,
-    VisibilityStore, workflow_status_keyword,
+    ApplyOutcome, ComponentQuery, ComponentQueryError, ComponentVisibility, DsqlVisibilityStore,
+    ProjectionSink, VisibilityStore, seed_predefined_search_attributes, workflow_status_keyword,
 };
 use tokeira_storage::{
     ProjectionContext, ProjectionLog, ProjectionRecord,
@@ -21,6 +21,8 @@ use tokeira_types::{
     WorkflowId, WorkflowType,
 };
 use uuid::Uuid;
+
+const USED_VERSIONS: &str = "TemporalUsedWorkerDeploymentVersions";
 
 #[tokio::test]
 async fn component_visibility_hydrates_typed_images_and_scopes_pages() -> Result<()> {
@@ -364,6 +366,71 @@ async fn memo_merge_persists_across_visibility_updates() -> Result<()> {
     Ok(())
 }
 
+// Feature: projection-passes, criterion 2.4: the storage load seeds a workflow's
+// used-versions list from any one of the attribute's index rows, so each apply must leave
+// every row of the list carrying the whole list of the image it applied.
+#[tokio::test]
+async fn used_versions_index_rows_each_carry_the_applied_list() -> Result<()> {
+    let Some(context) = TestContext::connect().await? else {
+        return Ok(());
+    };
+    let store = context.visibility_store().await?;
+    let run_key = RunKey(Uuid::new_v4());
+    let mut base = sample_context(run_key);
+    // A namespace of its own keeps the registry and rollup rows this test writes apart.
+    base.namespace_id = NamespaceId(Uuid::new_v4());
+    seed_predefined_search_attributes(&store, base.namespace_id).await?;
+
+    let lists: [&[&str]; 3] = [&["a", "b", "a"], &["c"], &[]];
+    for (seq, versions) in (1..).zip(lists) {
+        let list: Vec<String> = versions
+            .iter()
+            .map(|version| (*version).to_owned())
+            .collect();
+        let mut image = base.clone();
+        image.search_attributes = SearchAttributes(BTreeMap::from([(
+            USED_VERSIONS.to_owned(),
+            SearchAttrValue::KeywordList(list.clone()),
+        )]));
+        let outcome = store
+            .apply(
+                &ProjectionRecord {
+                    partition_id: 0,
+                    fanout: 1,
+                    run_key,
+                    transition_seq: TransitionSeq(seq),
+                    context: image,
+                },
+                0,
+            )
+            .await?;
+        assert_eq!(outcome, ApplyOutcome::Advanced);
+
+        let rows = context
+            .read_used_versions_rows(base.namespace_id, run_key)
+            .await?;
+        let mut keywords: Vec<&str> = rows.iter().map(|(keyword, _)| keyword.as_str()).collect();
+        keywords.sort_unstable();
+        let mut expected = versions.to_vec();
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(
+            keywords, expected,
+            "one row per distinct version at seq {seq}"
+        );
+        for (keyword, value) in &rows {
+            assert_eq!(
+                value,
+                &SearchAttrValue::KeywordList(list.clone()),
+                "row {keyword} at seq {seq} carries the whole applied list"
+            );
+        }
+    }
+
+    context.forget_namespace(base.namespace_id).await?;
+    Ok(())
+}
+
 #[derive(Debug)]
 struct TestContext {
     pool: PgPool,
@@ -466,6 +533,48 @@ impl TestContext {
         .await?;
         row.map(|row| Ok((row.try_get("status_keyword")?, row.try_get("close_time")?)))
             .transpose()
+    }
+
+    async fn read_used_versions_rows(
+        &self,
+        namespace_id: NamespaceId,
+        run_key: RunKey,
+    ) -> Result<Vec<(String, SearchAttrValue)>> {
+        let rows = sqlx::query(
+            "SELECT a.keyword_value, a.value_data FROM execution_visibility_attr_index a \
+             JOIN sa_registry r ON r.namespace_id = a.namespace_id AND r.attr_id = a.attr_id \
+             WHERE a.namespace_id = $1 AND a.run_key = $2 AND r.attr_name = $3",
+        )
+        .bind(namespace_id.0)
+        .bind(run_key.0)
+        .bind(USED_VERSIONS)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let keyword: Option<String> = row.try_get("keyword_value")?;
+                let data: Vec<u8> = row.try_get("value_data")?;
+                Ok((
+                    keyword.unwrap_or_default(),
+                    codec::decode::<SearchAttrValue>(&data)?,
+                ))
+            })
+            .collect()
+    }
+
+    async fn forget_namespace(&self, namespace_id: NamespaceId) -> Result<()> {
+        for statement in [
+            "DELETE FROM execution_visibility_attr_index WHERE namespace_id = $1",
+            "DELETE FROM execution_visibility_current WHERE namespace_id = $1",
+            "DELETE FROM execution_visibility_rollup WHERE namespace_id = $1",
+            "DELETE FROM sa_registry WHERE namespace_id = $1",
+        ] {
+            sqlx::query(statement)
+                .bind(namespace_id.0)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn read_visibility_memo(&self, run_key: RunKey) -> Result<Option<Memo>> {

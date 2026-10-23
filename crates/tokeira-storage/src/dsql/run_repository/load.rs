@@ -11,6 +11,19 @@ const READ_LEGACY_PROJECTION: &str =
     "SELECT partition_id, fanout, run_key, transition_seq, context_data
     FROM projection_log WHERE run_key = $1 ORDER BY transition_seq DESC LIMIT 1";
 
+/// A workflow run's applied `TemporalUsedWorkerDeploymentVersions` value. The
+/// attribute index keeps the whole encoded value on every row it writes for the
+/// attribute, so any one row gives the list (`projection-passes` criterion 2.4).
+const READ_APPLIED_PROJECTION_SEED: &str = "SELECT v.authority_epoch, v.source_transition_seq, \
+    v.business_id, v.run_id, a.value_data \
+    FROM execution_visibility_current v \
+    LEFT JOIN sa_registry r ON r.namespace_id = v.namespace_id \
+        AND r.attr_name = 'TemporalUsedWorkerDeploymentVersions' \
+    LEFT JOIN execution_visibility_attr_index a ON a.namespace_id = v.namespace_id \
+        AND a.run_key = v.run_key AND a.attr_id = r.attr_id \
+    WHERE v.namespace_id = $1 AND v.archetype_id = $3 AND v.run_key = $2 \
+    LIMIT 1";
+
 fn decode_hot_state(
     run_key: RunKey,
     row: Option<(Vec<u8>, Option<i64>)>,
@@ -220,7 +233,45 @@ impl DsqlRunRepository {
                     .with_context(|| {
                         format!("decode projection accumulator seed for run {}", run_key.0)
                     })?;
-                seed_workflow_projection_accumulator(state, previous.as_ref())?;
+                // Once the projector deletes a run's applied images, its visibility row,
+                // read in this snapshot, holds the newest one's list.
+                let applied = sqlx::query_as::<_, (i64, i64, String, Uuid, Option<Vec<u8>>)>(
+                    READ_APPLIED_PROJECTION_SEED,
+                )
+                .bind(state.namespace_id.0)
+                .bind(run_key.0)
+                .bind(i64::from(tokeira_types::ArchetypeId::WORKFLOW.0))
+                .fetch_optional(&mut *tx)
+                .await
+                .with_context(|| {
+                    format!("read applied projection accumulator for run {}", run_key.0)
+                })?
+                .map(
+                    |(epoch, seq, business_id, run_id, value)| -> Result<AppliedProjectionSeed> {
+                        Ok(AppliedProjectionSeed {
+                            workflow_id: WorkflowId(business_id),
+                            run_id: RunId(run_id),
+                            authority_epoch: epoch,
+                            transition_seq: TransitionSeq(convert::u64_from_i64(
+                                seq,
+                                "visibility source_transition_seq",
+                            )?),
+                            versions: value.map(|bytes| codec::decode(&bytes)).transpose()?,
+                        })
+                    },
+                )
+                .transpose()
+                .with_context(|| {
+                    format!(
+                        "decode applied projection accumulator for run {}",
+                        run_key.0
+                    )
+                })?;
+                seed_workflow_projection_accumulator_from_newer(
+                    state,
+                    previous.as_ref(),
+                    applied.as_ref(),
+                )?;
             }
             tx.commit().await?;
             Ok((loaded, stats))

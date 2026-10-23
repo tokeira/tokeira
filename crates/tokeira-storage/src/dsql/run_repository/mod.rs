@@ -30,9 +30,10 @@ use crate::{
     DispatchableActivityTask, DispatchableWorkflowTask, DueActivityDispatch, DueTimer,
     LeaseFenceLost, ProjectionRecord, RequestRecord, RunHistoryStats, RunRepository,
     TransitionAuditRecord, WorkerDeploymentVersionKey, WorkflowRuleCreateResult,
-    WorkflowRuleDeleteResult, WriteFence, deleted_workflow_projection_context,
-    dispatchable_workflow_task, metrics, prepare_workflow_projection,
-    seed_workflow_projection_accumulator, workflow_is_open_and_pinned_to_version,
+    WorkflowRuleDeleteResult, WriteFence, api::AppliedProjectionSeed,
+    deleted_workflow_projection_context, dispatchable_workflow_task, metrics,
+    prepare_workflow_projection, seed_workflow_projection_accumulator_from_newer,
+    workflow_is_open_and_pinned_to_version,
 };
 
 use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert};

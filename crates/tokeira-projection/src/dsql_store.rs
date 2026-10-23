@@ -894,7 +894,9 @@ async fn clear_search_attr_index_rows(
     // in-transaction-replace deviation; V052). Deleting all the run's rows first
     // means a removed attribute does not stay queryable after a newer snapshot
     // omits it, and only the current image is ever present (so queries need no
-    // generation join).
+    // generation join). The storage load relies on it too: it seeds a workflow's
+    // used-versions list from any one of the attribute's rows (`projection-passes`
+    // criterion 2.4), so every row a list leaves must belong to the same image.
     sqlx::query(
         "DELETE FROM execution_visibility_attr_index WHERE namespace_id = $1 AND run_key = $2",
     )
@@ -971,6 +973,11 @@ fn attr_cells(attr_type: SearchAttrType, value: &SearchAttrValue) -> Result<Vec<
     })
 }
 
+/// Writes one row per cell of `value`, each carrying the whole encoded value in
+/// `value_data`. The storage load seeds a workflow's used-versions list from any one of
+/// the attribute's rows (`projection-passes` criterion 2.4), so no row may hold part of a
+/// list. `ON CONFLICT DO NOTHING` leaves an existing row's older value in place, which is
+/// why the apply clears the run's rows first.
 async fn upsert_search_attr_index_row(
     connection: &mut PgConnection,
     run_key: RunKey,

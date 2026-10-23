@@ -98,6 +98,20 @@ The newer of the two is exactly the newest image's list:
   normalized (`normalize_search_attr_value`, `crates/tokeira-projection/src/types.rs`).
 - **The edge cases keep criterion 2.10.** An empty list writes no attribute rows for a workflow, and seeds an empty
   list. A value of another type fails the apply (`dsql_store.rs:549-557`), so its image stays and seeds as before.
+- **Only an image's apply writes a workflow row.** On DSQL, `upsert_execution_row` is the only writer of
+  `execution_visibility_current`, called by the apply and by `VisibilityStore::upsert_execution`, which nothing on
+  DSQL calls outside tests. CHASM writes rows of its own archetypes. A deletion's tombstone goes through the same
+  apply (`apply_tombstone`), from the log or from `apply_deletion`. But the transaction that logs it also deletes the
+  run's hot row, and the apply commits after that transaction, so a snapshot that holds an applied tombstone no longer
+  loads the run, and a load never seeds from one.
+- **The registry holds the attribute for good.** `TemporalUsedWorkerDeploymentVersions` is a predefined attribute,
+  registered in every namespace (`seed_predefined_search_attributes`, `crates/tokeira-projection/src/system_attrs.rs`),
+  and nothing removes a registered attribute: `RemoveSearchAttributes` is unimplemented
+  (`crates/tokeira-edge/src/grpc/operator_service.rs`), and v1.31.0 refuses to remove a predefined one. A namespace
+  without the registry row seeds an empty list, which is right: an image carrying the attribute couldn't have been
+  applied there, so it is still in the log. The attribute's id is `deterministic_attr_id(namespace, name)`,
+  registration inserts it `ON CONFLICT (namespace_id, attr_name) DO NOTHING`, and V030 makes that pair unique, so the
+  join finds at most one registry row, and an index row's `attr_id` always matches it.
 
 The applied value validates as criterion 2.11 validates an image. A row naming another workflow id or run id, or newer
 than the loaded state, fails the load. A run with neither an image nor a visibility row seeds an empty list, as a run
@@ -108,9 +122,11 @@ checks readiness directly. It keeps the latest image of a run whose stored state
 Unseeded runs reach the in-memory store only from a snapshot written before the accumulator moved into run state.
 
 **Earlier releases.** A node of an earlier release seeds from images alone, so it must not run once images are deleted
-(projection-accumulator criterion 4.1). The release that first deletes images is one whose schema those nodes refuse
-at startup ([distributed-schema-startup-check](../distributed-schema-startup-check/bugfix.md)), and it says "Upgrade
-with every node stopped."
+(projection-accumulator criterion 4.1). The release that first deletes images carries a migration past the previous
+release's maximum readable version: dropping `activity_state` (V083) does, if it ships in that release, and so would
+dropping `projection_checkpoint`. Every release that checks its schema at startup then refuses it
+([distributed-schema-startup-check](../distributed-schema-startup-check/bugfix.md)). A release before that check
+refuses nothing, so the release also says "Upgrade with every node stopped."
 
 ## Ownership
 

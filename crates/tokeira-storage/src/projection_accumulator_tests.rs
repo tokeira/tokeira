@@ -13,8 +13,9 @@ use tokeira_types::{LogicalTaskSeq, Payloads, SearchAttrValue, WorkerIdentity};
 use super::*;
 use crate::{
     api::{
-        ProjectionAccumulatorError, ProjectionContext, prepare_workflow_projection,
-        seed_workflow_projection_accumulator,
+        AppliedProjectionSeed, ProjectionAccumulatorError, ProjectionContext,
+        prepare_workflow_projection, seed_workflow_projection_accumulator,
+        seed_workflow_projection_accumulator_from_newer,
     },
     projection_accumulator_oracle::{
         legacy_codec, workflow_projection_context_with_previous as baseline_image,
@@ -739,4 +740,123 @@ fn projection_accumulator_seed_errors_preserve_input_and_ready_state() {
     let before = state.clone();
     assert!(prepare_workflow_projection(&mut state, 0).is_err());
     assert_eq!(state, before);
+}
+
+/// An unseeded state at sequence 5, an image of it with `versions`, and an applied
+/// value for the same run.
+fn newer_seed_inputs(
+    image_seq: u64,
+    image_epoch: i64,
+    image_versions: &[&str],
+    applied_seq: u64,
+    applied_versions: Option<&[&str]>,
+) -> (WorkflowState, ProjectionRecord, AppliedProjectionSeed) {
+    let mut state = fresh_transition(RunKey::new()).next_state;
+    state.transition_seq = TransitionSeq(5);
+    state.used_worker_deployment_versions = None;
+    let mut context = baseline_image(&state, None, 0).unwrap();
+    context.authority_epoch = image_epoch;
+    context.search_attributes.0.insert(
+        "TemporalUsedWorkerDeploymentVersions".into(),
+        SearchAttrValue::KeywordList(image_versions.iter().map(|&v| v.into()).collect()),
+    );
+    let image = ProjectionRecord {
+        partition_id: 0,
+        fanout: 1,
+        run_key: state.run_key,
+        transition_seq: TransitionSeq(image_seq),
+        context,
+    };
+    let applied = AppliedProjectionSeed {
+        workflow_id: state.workflow_id.clone(),
+        run_id: state.run_id,
+        authority_epoch: 0,
+        transition_seq: TransitionSeq(applied_seq),
+        versions: applied_versions.map(|versions| {
+            SearchAttrValue::KeywordList(versions.iter().map(|&v| v.into()).collect())
+        }),
+    };
+    (state, image, applied)
+}
+
+fn seeded(state: &WorkflowState) -> Vec<String> {
+    state
+        .used_worker_deployment_versions
+        .clone()
+        .expect("seeded")
+}
+
+// Feature: projection-passes, criterion 2.4: a seed takes the newer of the latest image
+// and the applied value, and validates both.
+#[test]
+fn projection_accumulator_seeds_from_the_newer_of_image_and_applied_value() {
+    // The image was applied and deleted: only the applied value is left.
+    let (mut state, _, applied) = newer_seed_inputs(5, 0, &[], 5, Some(&["a", "b"]));
+    seed_workflow_projection_accumulator_from_newer(&mut state, None, Some(&applied)).unwrap();
+    assert_eq!(seeded(&state), ["a", "b"]);
+
+    // An older image is left behind; the applied value is newer.
+    let (mut state, image, applied) = newer_seed_inputs(3, 0, &["a"], 5, Some(&["a", "b"]));
+    seed_workflow_projection_accumulator_from_newer(&mut state, Some(&image), Some(&applied))
+        .unwrap();
+    assert_eq!(seeded(&state), ["a", "b"]);
+
+    // The image is as new as the applied value, or newer: the image seeds, as now.
+    let (mut state, image, applied) = newer_seed_inputs(5, 0, &["x", "x"], 5, Some(&["a"]));
+    seed_workflow_projection_accumulator_from_newer(&mut state, Some(&image), Some(&applied))
+        .unwrap();
+    assert_eq!(seeded(&state), ["x", "x"]);
+    let (mut state, image, applied) = newer_seed_inputs(5, 0, &["x"], 4, Some(&["a"]));
+    seed_workflow_projection_accumulator_from_newer(&mut state, Some(&image), Some(&applied))
+        .unwrap();
+    assert_eq!(seeded(&state), ["x"]);
+
+    // A later authority epoch makes an image newer than a higher sequence.
+    let (mut state, image, applied) = newer_seed_inputs(4, 1, &["x"], 5, Some(&["a"]));
+    seed_workflow_projection_accumulator_from_newer(&mut state, Some(&image), Some(&applied))
+        .unwrap();
+    assert_eq!(seeded(&state), ["x"]);
+
+    // A row without the value seeds an empty list, as an image without it does.
+    let (mut state, _, applied) = newer_seed_inputs(5, 0, &[], 5, None);
+    seed_workflow_projection_accumulator_from_newer(&mut state, None, Some(&applied)).unwrap();
+    assert_eq!(seeded(&state), Vec::<String>::new());
+
+    // Neither: an empty list, as before.
+    let (mut state, _, _) = newer_seed_inputs(5, 0, &[], 5, None);
+    seed_workflow_projection_accumulator_from_newer(&mut state, None, None).unwrap();
+    assert_eq!(seeded(&state), Vec::<String>::new());
+}
+
+#[test]
+fn projection_accumulator_newer_seed_rejects_defects_and_keeps_its_input() {
+    let defect = |state: &mut WorkflowState,
+                  image: Option<&ProjectionRecord>,
+                  applied: &AppliedProjectionSeed| {
+        let before = state.clone();
+        let error = seed_workflow_projection_accumulator_from_newer(state, image, Some(applied))
+            .unwrap_err();
+        assert_eq!(*state, before);
+        match error.downcast_ref::<ProjectionAccumulatorError>() {
+            Some(ProjectionAccumulatorError::InvalidSeed { defect, .. }) => *defect,
+            other => panic!("unexpected error: {other:?}"),
+        }
+    };
+    let (mut state, _, mut applied) = newer_seed_inputs(5, 0, &[], 6, Some(&["a"]));
+    assert_eq!(
+        defect(&mut state, None, &applied),
+        "visibility row sequence is newer than the loaded state"
+    );
+    applied.transition_seq = TransitionSeq(5);
+    applied.run_id = RunId::new();
+    assert_eq!(
+        defect(&mut state, None, &applied),
+        "visibility row belongs to another run"
+    );
+    let (mut state, mut image, applied) = newer_seed_inputs(3, 0, &["a"], 5, Some(&["b"]));
+    image.run_key = RunKey::new();
+    assert_eq!(
+        defect(&mut state, Some(&image), &applied),
+        "image belongs to another run"
+    );
 }

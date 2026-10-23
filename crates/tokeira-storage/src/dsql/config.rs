@@ -326,8 +326,8 @@ pub struct DsqlPoolConfig {
     pub shard_count: u32,
     /// Projection partition count used when writing projection-log records.
     ///
-    /// Writers and projection workers must use the same value; otherwise a
-    /// worker fanout can miss records written into partitions it never scans.
+    /// Writers and projectors must use the same value; otherwise a projector
+    /// can miss images written into partitions it never reads.
     pub projection_partition_count: u32,
     /// Workflow-id conflict behavior used by repository start commits.
     pub conflict_policy: CurrentExecutionConflictPolicy,
@@ -401,7 +401,7 @@ pub struct EmbeddedDsqlPoolConfig {
     pub migration: MigrationConfig,
     /// Runtime shard count used for deterministic run-key ownership.
     pub shard_count: u32,
-    /// Projection partition count used by writers and projection workers.
+    /// Projection partition count used by writers and projectors.
     pub projection_partition_count: u32,
     /// Workflow-id conflict behavior used by repository start commits.
     pub conflict_policy: CurrentExecutionConflictPolicy,

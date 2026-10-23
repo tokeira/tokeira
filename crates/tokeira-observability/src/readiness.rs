@@ -87,7 +87,7 @@ pub struct ReadinessRegistry {
 
 /// Mutable readiness handle for long-running loops.
 ///
-/// Background components such as projection workers can update this handle when
+/// Background components such as projectors can update this handle when
 /// they enter degraded or unavailable states without implementing a bespoke
 /// async check.
 #[derive(Clone, Debug)]

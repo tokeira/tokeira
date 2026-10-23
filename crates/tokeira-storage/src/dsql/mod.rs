@@ -65,7 +65,7 @@ pub struct DsqlStore {
     director: Arc<connection::DsqlConnectionDirector>,
     /// Forward-only schema migration runner.
     migration_runner: migration::MigrationRunner,
-    /// Projection log reader used by projection workers.
+    /// Projection log reader used by projectors.
     projection_log: projection_log::DsqlProjectionLog,
     /// Semantic run repository backed by DSQL tables.
     run_repository: run_repository::DsqlRunRepository,

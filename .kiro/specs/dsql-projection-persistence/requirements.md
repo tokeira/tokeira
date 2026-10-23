@@ -4,29 +4,31 @@
 
 This spec covers Feature 6 (Projection Persistence) from the umbrella `dsql-storage-implementation` spec. It implements the read path for the projection log, projector checkpoint management, and the visibility sink that materializes `vis_execution` rows from projection operations.
 
+[projection-passes](../projection-passes/bugfix.md) replaced the cursor and the checkpoint. Projectors read a partition a page at a time from its head on every pass, and delete exactly the images they have finished with; nothing reads or writes a checkpoint. Requirement 1 states the read and delete that hold now, and Requirements 2 and 3 are retired.
+
 The scope is:
 
-1. **`ProjectionLog::read_from`** — partitioned projection log reads from the `projection_log` DSQL table, returning batches of `ProjectionRecord` with cursor advancement.
-2. **Projector checkpoint management** — read and write of per-sink, per-substream cursors in the `projector_checkpoint` table, enabling projection workers to resume from their last committed position after restart.
+1. **`ProjectionLog::read_page` and `ProjectionLog::delete_images`** — a partition's images from the `projection_log` DSQL table, a page at a time in `(run_key, transition_seq)` order, and deletes that name the images a projector has finished with.
+2. **Projector checkpoint management** — retired by projection-passes criterion 2.11. Nothing reads or writes a checkpoint, and the checkpoint table stays until a later migration drops it.
 3. **Visibility sink** — a DSQL-backed `VisibilityStore`/`ProjectionSink` implementation that processes `ProjectionOp::UpsertExecution` and `ProjectionOp::CloseExecution` operations to maintain `vis_execution` rows, the materialized read model for Temporal-compatible list/filter/count queries.
 4. **`ExecutionStatus` stable numeric mapping** — a durable `SMALLINT` encoding for `ExecutionStatus` variants stored in `vis_execution.execution_status`, following the same pattern as `TaskKind::to_db_smallint`.
 
-The authoritative architecture documents are [070-projection-plane](../../../docs/architecture/070-projection-plane.md) and [080-sql-visibility](../../../docs/architecture/080-sql-visibility.md). The in-memory implementation of `ProjectionLog` in `tokeira-storage/src/memory.rs` is the behavioral reference for `read_from`.
+The authoritative architecture documents are [070-projection-plane](../../../docs/architecture/070-projection-plane.md) and [080-sql-visibility](../../../docs/architecture/080-sql-visibility.md). The in-memory implementation of `ProjectionLog` in `tokeira-storage/src/memory.rs` is the behavioral reference for `read_page` and `delete_images`.
 
 ### What This Spec Covers
 
 | Component | Table(s) | Description |
 |---|---|---|
-| `ProjectionLog::read_from` | `projection_log` | Partitioned log reads with cursor-based pagination |
-| Checkpoint read | `projector_checkpoint` | Load last-applied cursor by substream-unique `sink_id` |
-| Checkpoint write | `projector_checkpoint` | Upsert cursor after a batch is successfully applied |
+| `ProjectionLog::read_page` | `projection_log` | A partition's images a page at a time, in key order |
+| `ProjectionLog::delete_images` | `projection_log` | Deletes that name each image by its whole key |
+| Checkpoint read and write | `projector_checkpoint` | Retired by projection-passes |
 | Visibility sink | `vis_execution` | Materialize/update execution rows from `ProjectionOp` |
 | `ExecutionStatus` mapping | `vis_execution` | Stable `SMALLINT` encoding for execution status |
 
 ### What This Spec Does NOT Cover
 
 - **Visibility query API** — list/filter/count queries against `vis_execution` are a separate `projection-visibility` spec.
-- **Projection worker/consumer loop** — the runtime orchestration that calls `read_from`, applies ops to sinks, and writes checkpoints is a runtime concern.
+- **The projector** — the passes that read pages, apply images and delete them belong to [projection-passes](../projection-passes/bugfix.md).
 - **New table DDL** — all tables (`projection_log`, `projector_checkpoint`, `vis_execution`) already exist from Feature 1 (`dsql-schema-connection`). This spec updates the schema-version-1 `V012__vis_execution.sql` definition in place so `vis_execution.run_id` is `UUID` rather than `TEXT`.
 - **`projection_log` writes** — already implemented by `commit_transition` in Feature 2 (`dsql-core-persistence`).
 - **Search attribute indexing** — custom search attribute columns and indexes are deferred.
@@ -46,13 +48,13 @@ The authoritative architecture documents are [070-projection-plane](../../../doc
 
 ## Glossary
 
-- **ProjectionLog**: The read-only trait in `tokeira-storage/src/api.rs` for projection workers to consume partitioned projection log substreams.
-- **ProjectionBatch**: A page of `ProjectionRecord` values returned by `ProjectionLog::read_from`, together with a `next_cursor` for the subsequent call.
+- **ProjectionLog**: The trait in `tokeira-storage/src/api.rs` through which projectors read a partition's images and delete the ones they have finished with.
+- **ProjectionPage**: A page of `ProjectionRecord` values returned by `ProjectionLog::read_page`, in `(run_key, transition_seq)` order, with the time the page's oldest image was written where the log records it.
 - **ProjectionRecord**: One row in the projection log, grouping all `ProjectionOp` values from a single transition. Contains `partition_id`, `fanout`, `run_key`, `transition_seq`, `context: ProjectionContext`, and `ops: Vec<ProjectionOp>`.
 - **ProjectionContext**: Execution metadata snapshot stored alongside projection ops — namespace, workflow identity, status, timestamps, history length, and state transition count.
 - **ProjectionOp**: Semantic projection operation emitted by the kernel. Two variants: `UpsertExecution` (update status, memo, search attributes) and `CloseExecution` (mark terminal with close timestamp).
-- **ProjectionCursor**: Stable cursor for projector progress, shaped around `(partition_id, fanout, last_run_key, last_transition_seq)`. Serialized via postcard for the checkpoint table.
-- **Projector_Checkpoint**: Per-sink, per-substream cursor tracking table keyed by `(sink_id, partition_id, fanout)`. Stores the `last_applied_cursor` as postcard-encoded BYTEA.
+- **ProjectionImageKey**: An image's place in its partition, `(run_key, transition_seq)`. A page read starts after one, and a delete names images by them.
+- **Projector_Checkpoint**: The retired cursor table. Nothing reads or writes it since projection-passes.
 - **Vis_Execution**: Materialized visibility row store for Temporal-compatible list/filter/count queries. One row per `run_key`, upserted by the visibility sink.
 - **Visibility_Sink**: The `ProjectionSink::apply` implementation on `DsqlVisibilityStore` that processes one `ProjectionRecord` at a time and writes to `vis_execution`.
 - **ExecutionStatus**: Enum in `tokeira-types` representing workflow lifecycle states: `Running`, `Paused`, `Completed`, `Failed`, `Cancelled`, `Terminated`, `ContinuedAsNew`, `TimedOut`.
@@ -66,15 +68,15 @@ The authoritative architecture documents are [070-projection-plane](../../../doc
 
 ### Requirement 1: ProjectionLog Read Path
 
-**User Story:** As a Tokeira developer, I want `ProjectionLog::read_from` implemented against DSQL, so that projection workers can consume the partitioned projection log to maintain read models.
+**User Story:** As a Tokeira developer, I want the projection log's reads and deletes implemented against DSQL, so that projectors can apply every image and delete the ones they have finished with.
 
 #### Acceptance Criteria
 
 1. THE DsqlProjectionLog SHALL implement the `ProjectionLog` trait from `tokeira-storage/src/api.rs`.
-2. WHEN `read_from` is called with a cursor at the beginning of a partition (no `last_run_key` or `last_transition_seq`), THE DsqlProjectionLog SHALL return the first `limit` records from the `projection_log` table for the given `(partition_id, fanout)`, ordered by `(run_key, transition_seq)` ascending.
-3. WHEN `read_from` is called with a cursor that has `last_run_key` and `last_transition_seq`, THE DsqlProjectionLog SHALL return records strictly after that position in `(run_key, transition_seq)` order, up to `limit`.
-4. WHEN `read_from` returns records, THE DsqlProjectionLog SHALL set `next_cursor` to the `(partition_id, fanout, run_key, transition_seq)` of the last returned record.
-5. WHEN `read_from` returns no records (the partition is caught up), THE DsqlProjectionLog SHALL return the original cursor unchanged as `next_cursor`.
+2. WHEN `read_page` is called without a position, THE DsqlProjectionLog SHALL return the first `limit` images of the given `(partition_id, fanout)`, ordered by `(run_key, transition_seq)` ascending.
+3. WHEN `read_page` is called after an image's key, THE DsqlProjectionLog SHALL return the images strictly after that key in `(run_key, transition_seq)` order, up to `limit`. The position is the caller's, for one pass only; nothing stores it.
+4. WHEN `read_page` returns images, THE DsqlProjectionLog SHALL also return the earliest `created_at` among them.
+5. WHEN `delete_images` is called, THE DsqlProjectionLog SHALL delete exactly the named images of the given `(partition_id, fanout)`, at most 100 in a statement, each statement in its own transaction, and return how many rows went. A key already deleted SHALL delete nothing.
 6. THE DsqlProjectionLog SHALL deserialize `context_data` using `codec::decode_projection_context` and `ops_data` using `codec::decode_projection_ops` for each returned row.
 7. THE DsqlProjectionLog SHALL use `DbClass::Projection` when acquiring connections.
 8. FOR ALL `ProjectionContext` values, serializing via the codec and then deserializing SHALL produce a value equal to the original (round-trip property).
@@ -82,28 +84,11 @@ The authoritative architecture documents are [070-projection-plane](../../../doc
 
 ### Requirement 2: Projector Checkpoint Read
 
-**User Story:** As a Tokeira developer, I want to read the last-applied cursor for a projection sink's substream, so that projection workers can resume from their committed position after restart.
-
-#### Acceptance Criteria
-
-1. WHEN a checkpoint exists for the given `sink_id`, THE DsqlVisibilityStore SHALL return the deserialized `ProjectionCursor` from the `last_applied_cursor` column of `projector_checkpoint`.
-2. WHEN no checkpoint exists for the given `sink_id`, THE DsqlVisibilityStore SHALL return `None`.
-3. THE DsqlVisibilityStore SHALL deserialize `last_applied_cursor` using `codec::decode_projection_cursor`.
-4. THE DsqlVisibilityStore SHALL use `DbClass::Projection` when acquiring connections.
-5. FOR ALL `ProjectionCursor` values, serializing via the codec and then deserializing SHALL produce a value equal to the original (round-trip property).
-6. THE caller (ProjectionWorker) SHALL ensure `sink_id` is unique per `(partition_id, fanout)` substream (e.g., `"visibility-p0-f1"`). The checkpoint table PK includes `(sink_id, partition_id, fanout)` for future multi-partition-per-sink support, but the current `load_checkpoint` trait signature takes only `sink_id`.
+Retired by [projection-passes](../projection-passes/bugfix.md) criterion 2.11. A cursor over run keys, which are hashes, skipped every image committed below it, and every process's workers wrote one checkpoint row a partition and ended on its write conflicts. Passes start at the head of the partition every time, so nothing reads a checkpoint.
 
 ### Requirement 3: Projector Checkpoint Write
 
-**User Story:** As a Tokeira developer, I want to persist the last-applied cursor for a projection sink's substream, so that projection progress survives restarts and failovers.
-
-#### Acceptance Criteria
-
-1. WHEN a checkpoint is written, THE DsqlVisibilityStore SHALL upsert a row in `projector_checkpoint` with the postcard-serialized `ProjectionCursor` as `last_applied_cursor`, deriving `partition_id` and `fanout` from the cursor.
-2. WHEN a checkpoint row already exists for `(sink_id, partition_id, fanout)`, THE DsqlVisibilityStore SHALL update the `last_applied_cursor` and `updated_at` columns.
-3. WHEN a checkpoint row does not exist, THE DsqlVisibilityStore SHALL insert a new row.
-4. THE DsqlVisibilityStore SHALL serialize the cursor using `codec::encode_projection_cursor`.
-5. THE DsqlVisibilityStore SHALL use `DbClass::Projection` when acquiring connections.
+Retired by [projection-passes](../projection-passes/bugfix.md) criterion 2.11. Nothing writes a checkpoint; progress is the deletion of the images a pass has finished with.
 
 ### Requirement 4: Visibility Sink — Upsert Execution
 
@@ -145,7 +130,7 @@ The authoritative architecture documents are [070-projection-plane](../../../doc
 
 ### Requirement 7: Visibility Store as DSQL Implementation
 
-**User Story:** As a Tokeira developer, I want a DSQL-backed `VisibilityStore` implementation that also implements `ProjectionSink`, so that the `ProjectionWorker` can use it directly for both sink operations and checkpoint management.
+**User Story:** As a Tokeira developer, I want a DSQL-backed `VisibilityStore` implementation that also implements `ProjectionSink`, so that projectors can use it directly as their sink.
 
 #### Acceptance Criteria
 
@@ -175,6 +160,6 @@ The authoritative architecture documents are [070-projection-plane](../../../doc
 #### Acceptance Criteria
 
 1. THE DsqlProjectionLog SHALL annotate all `ProjectionLog` trait methods with `tracing::instrument`.
-2. THE DsqlVisibilityStore SHALL annotate checkpoint read and write methods (`load_checkpoint`, `save_checkpoint`) with `tracing::instrument`.
+2. Retired with the checkpoint methods (projection-passes criterion 2.11).
 3. THE Visibility_Sink SHALL annotate all public methods, including `ProjectionSink::apply`, with `tracing::instrument`.
 4. THE instrumentation SHALL include relevant parameters (partition_id, fanout, sink_id, run_key) as span fields where appropriate, excluding large serialized payloads.

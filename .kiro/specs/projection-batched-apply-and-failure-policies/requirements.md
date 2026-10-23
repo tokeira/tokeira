@@ -2,7 +2,18 @@
 
 ## Introduction
 
-This feature extends the projection sink contract with batched apply semantics and configurable per-sink failure policies. The current `ProjectionSink` trait only supports single-record `apply()`, forcing one SQL round-trip per record. The worker's failure handling is hardcoded (exponential backoff 100ms→5s, no poison-record escape). This feature adds `apply_batch()` for multi-row DSQL inserts, and a declarative failure policy model (retry backoff, max retries, dead-letter) so that operators can tune resilience per sink without code changes.
+This feature extends the projection sink contract with batched apply semantics and configurable per-sink failure policies. The current `ProjectionSink` trait only supports single-record `apply()`, forcing one SQL round-trip per record. This feature adds `apply_batch()` for multi-row DSQL inserts, and a declarative failure policy model (retry backoff, max retries, dead-letter) so that operators can tune resilience per sink without code changes.
+
+## Since projection-passes
+
+[projection-passes](../projection-passes/bugfix.md) replaced the worker, its cursor and its checkpoint with projectors that run passes from the head of their partition, apply each run's newest image in a page, and delete the images whose runs applied. These requirements were written for the worker, and they read as follows now:
+
+- A projector calls the sink. Where a criterion says Projection_Worker, read the projector.
+- There is no cursor and no Checkpoint. Criteria 1.4, 4.5, 5.4, 5.5, 8.2 and 8.3, which hold a cursor back or advance it, no longer apply. A failed apply keeps that run's images for a later pass, and the rest of the page goes on.
+- A failing image holds back nothing, so a Poison_Record no longer blocks its partition, and Requirement 5's durable retry counts have nothing to unblock. An image that never applies is retried every pass and counted. A Dead_Letter_Store stays outside projection-passes.
+- Projectors back off from 100 ms to at most 1 s after a failing pass, and wait 1 s after a pass that changed nothing (projection-passes criteria 2.6 and 2.7). Requirements 3, 4 and 7 would make that backoff configurable.
+- Batching can still follow. A batch would hold the newest image of each run in a page, and the runs it applies decide which of the page's images the projector deletes.
+- `WORKER_BATCH_RECORDS` is gone (criterion 9.5). Passes report the images they read, applied, found current, deleted and failed (projection-passes criterion 2.12).
 
 ## Glossary
 

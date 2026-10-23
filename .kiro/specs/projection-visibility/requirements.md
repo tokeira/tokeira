@@ -32,17 +32,17 @@ The authoritative architecture documents are [070-projection-plane](../../../doc
 
 ### What This Spec Does NOT Cover
 
-- **Projection worker/consumer loop** — already implemented in `tokeira-projection/src/worker.rs`.
-- **Checkpoint management** — `load_checkpoint` and `save_checkpoint` already implemented.
+- **The projector** — its passes over the projection log belong to [projection-passes](../projection-passes/bugfix.md), in `tokeira-projection/src/projector.rs`.
+- **Checkpoint management** — retired by projection-passes criterion 2.11. Passes start at the head of their partition every time, so nothing reads or writes a checkpoint.
 - **`vis_execution` upsert/delete** — `upsert_execution` and `delete_execution` already implemented.
 
 ### What This Spec Updates From `dsql-projection-persistence`
 
-- **`ProjectionSink::apply`** — the existing implementation in `DsqlVisibilityStore` ignores `search_attr_patch` and never calls `accumulate_rollup`. This spec updates `apply` to mirror the generic `VisibilitySink` flow: resolve and index search attributes, compute rollup deltas, and accumulate them. Without this update, the new search-attribute tables and `vis_rollup` would be unused by the live projection worker.
+- **`ProjectionSink::apply`** — the existing implementation in `DsqlVisibilityStore` ignores `search_attr_patch` and never calls `accumulate_rollup`. This spec updates `apply` to mirror the generic `VisibilitySink` flow: resolve and index search attributes, compute rollup deltas, and accumulate them. Without this update, the new search-attribute tables and `vis_rollup` would be unused by the projector.
 
 ### Dependencies
 
-- `dsql-projection-persistence` — `DsqlVisibilityStore` struct, `vis_execution` DDL, checkpoint methods, `upsert_execution`, `delete_execution`, `ProjectionSink::apply`.
+- `dsql-projection-persistence` — `DsqlVisibilityStore` struct, `vis_execution` DDL, `upsert_execution`, `delete_execution`, `ProjectionSink::apply`.
 - `dsql-schema-connection` (Feature 1) — `DsqlConnectionDirector`, codec module, migration runner.
 - `tokeira-projection` — `VisibilityStore` trait, `CompiledFilter`, `FilterExpr`, `FieldRef`, `FilterValue`, `CompareOp`, `SortOrder`, `PageBounds`, `PageToken`, `ListResult`, `CountResult`, `GroupByField`, `RollupDimension`, `RollupDelta`, `RollupCounter`, `AttrDescriptor`, `AttrId`, `SearchAttrType`, `SystemField`, `ExecutionRow`.
 

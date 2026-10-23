@@ -7,6 +7,15 @@ committed migration; **Standard** change per root `AGENTS.md` § Change Classifi
 architectural — the "spec update or approval" the Architectural tier asks for already exists as
 Req 10.9 + V055, and `VisibilityStore` is internal plumbing, not a `proto/upstream/` wire contract).
 
+**Retired by [projection-passes](../../projection-passes/bugfix.md).** A cursor over run keys,
+which are hashes, skipped every image committed below it, and the workers of every process wrote
+the one checkpoint row of each partition and ended on its write conflicts. Projectors now run
+passes from the head of their partition and delete the images they have finished with, so nothing
+reads or writes `projection_checkpoint` (projection-passes criterion 2.11), and the fanout guard
+below has nothing to guard. The table stays until a later migration drops it. One projector runs
+each partition, on the node that holds the partition's home bundle (criterion 2.5), rather than one
+worker per partition on every node. The note is kept as the record of the checkpoint it described.
+
 ---
 
 ## What was already decided (not re-litigated here)

@@ -66,9 +66,9 @@ It neither creates tables nor takes a lease.
 Set `TOKEIRA_DSQL_TEST_DATABASE_URL` to a connection URL for a disposable test database.
 The four integration suites fall back to `DATABASE_URL` when that variable is unset
 and return without connecting when neither is set. The five CHASM tests, the lease-fence
-check, the task-queue policy and worker-deployment tests, and the projection's
-visibility-row test use only `TOKEIRA_DSQL_TEST_DATABASE_URL` and return without
-connecting when it is unset. The
+check, the task-queue policy and worker-deployment tests, the projection store's and
+passes' tests and the projection-log test use only `TOKEIRA_DSQL_TEST_DATABASE_URL` and
+return without connecting when it is unset. The
 seven projection-accumulator tests are ignored by default, use only that variable, and
 fail when it is unset.
 These suites connect through SQLx directly rather than the IAM connector. The database must permit schema setup and test-data writes; do not
@@ -80,13 +80,15 @@ point them at a database holding application data.
 | Storage `dsql_on_conflict_counts` | 6 | The row count DSQL returns for an `ON CONFLICT` statement that leaves its row unwritten, and the answers of the slot, action, provenance, configuration and backlog operations built on one |
 | Storage `dsql_embedded_ownership` | 1 | Embedded ownership lifecycle |
 | Storage `dsql_lease_fence` | 1 | The conflict rules the lease-fence model assumes, through SQLx: ten interleavings of fenced run commits, renewals and takeovers on the suite's own probe tables, including the weaker fences the model rejects; no migrations; `dsql-integration`, URL gate only |
-| Projection `dsql_projection_persistence` | 7 | Visibility persistence and queries, and the attribute-index rows the projection-accumulator seed reads |
+| Projection `dsql_projection_persistence` | 6 | Visibility persistence and queries, a partition's projection-log pages, and the attribute-index rows the projection-accumulator seed reads |
 | Storage `dsql_archetype_scoped_business_ids` | 1 | CHASM Property 8: scoped pointers and backfill; `--features dsql`, URL gate only |
 | Storage `dsql_chasm_node_store_round_trips_and_fences` | 1 | CHASM nodes, atomic pointers and fencing; `--features dsql`, URL gate only |
 | Storage `dsql_concurrent_starts_fence_pointer_and_roll_back_losing_nodes` | 1 | Concurrent CHASM creates and superseding pointers reject stale admission without orphaned nodes; `--features dsql`, URL gate only |
 | Storage `dsql_a_chasm_execution_commits_only_with_its_pointer` | 1 | A new execution's nodes commit only when the current-run pointer held what the start expected; `--features dsql`, URL gate only |
 | Storage `dsql_a_backfill_returns_what_it_copied` | 1 | Each CHASM backfill call returns the pointers it copied; `--features dsql`, URL gate only |
-| Projection `dsql_a_visibility_row_applies_only_a_newer_version` | 1 | A visibility row is replaced only by a newer version; `--features dsql-integration`, URL gate only |
+| Projection `dsql_store::tests` | 5 | A visibility row is replaced only by a newer version; an apply's counters commit with its row; a failed read of the stored row fails the apply; the apply reads its row through the primary key; and concurrent applies in one rollup stripe never conflict; `--features dsql-integration`, URL gate only |
+| Projection `dsql_store::passes_tests` | 5 | Projection passes: images below, above and behind a pass's position all applied; two projectors of one partition outliving a failure, with Count exact; images deleted only once their run's used-versions list is applied, a failed apply keeping its images and an older partition never read; failed applies on a counter or a read keeping their images, with Count exact; and one partition's applies a second, serially; set `TOKEIRA_PROJECTION_THROUGHPUT_OUTPUT` to keep the figures; `--features dsql-integration`, URL gate only |
+| Storage `dsql::projection_log::tests::live` | 1 | A partition of 2,000 images paged in key order and deleted by name, a key at most once, with the page reads and the delete through the primary key; set `TOKEIRA_PROJECTION_LOG_PLAN_OUTPUT` to save the plans; `dsql-integration`, URL gate only |
 | Storage `dsql_task_queue_policy_survives_repository_recreation` | 1 | A task queue's stored policy survives recreating the repository; `--features dsql`, URL gate only |
 | Storage `dsql_worker_deployment_repository_cas_and_pagination_match_contract` | 1 | Worker-deployment compare-and-set and pagination follow the repository contract; `--features dsql`, URL gate only |
 | Storage `dsql_projection_accumulator_*` | 8 | Projection-accumulator contracts: commit images, legacy seeds, the seed from the newer of image and applied value, failure isolation, growth accounting, reset boundaries, mixed writers and pruning, and snapshot races; `dsql-integration`, ignored by default |
@@ -117,7 +119,9 @@ cargo nextest run -p tokeira-storage --features dsql-integration --locked --prof
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test dsql_embedded_ownership --test-threads 1
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test dsql_lease_fence --test-threads 1
 cargo nextest run -p tokeira-projection --features dsql-integration --locked --profile dsql-live --test dsql_projection_persistence --test-threads 1
-cargo nextest run -p tokeira-projection --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(=dsql_store::tests::dsql_a_visibility_row_applies_only_a_newer_version)'
+cargo nextest run -p tokeira-projection --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(/^dsql_store::tests::dsql_/)'
+cargo nextest run -p tokeira-projection --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(/^dsql_store::passes_tests::/)'
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(/^dsql::projection_log::tests::live::/)'
 cargo nextest run -p tokeira-storage --features dsql --locked --profile dsql-live --test-threads 1 -E 'test(=dsql::chasm_node::tests::dsql_archetype_scoped_business_ids) | test(=dsql::chasm_node::tests::dsql_chasm_node_store_round_trips_and_fences) | test(=dsql::chasm_node::tests::dsql_concurrent_starts_fence_pointer_and_roll_back_losing_nodes) | test(=dsql::chasm_node::tests::dsql_a_chasm_execution_commits_only_with_its_pointer) | test(=dsql::chasm_node::tests::dsql_a_backfill_returns_what_it_copied)'
 cargo nextest run -p tokeira-storage --features dsql --locked --profile dsql-live --test-threads 1 -E 'test(=dsql::task_queue_config::tests::dsql_task_queue_policy_survives_repository_recreation) | test(=dsql::worker_deployment_repository::tests::dsql_worker_deployment_repository_cas_and_pagination_match_contract)'
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 --run-ignored only -E 'test(/^dsql::run_repository::projection_accumulator_tests::/)'

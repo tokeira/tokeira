@@ -279,8 +279,8 @@ The storage API should expose the real contract, not a fake ORM abstraction:
 - `start_activity_task`
 - `renew_shard_lease`
 - `find_dispatchable_*`
-- `read_projection_substream`
-- `advance_projector_checkpoint`
+- `read_projection_page`
+- `delete_projection_images`
 
 ## Debuggability
 
@@ -290,7 +290,7 @@ Storage should make it easy to answer:
 - which history batch belongs to which transition,
 - which epoch fenced the write,
 - which task token started the current WFT/activity,
-- which projection substream checkpoint lags.
+- which projection partition's oldest image has waited longest.
 
 That means keeping identifiers explicit in rows, not buried in opaque blobs alone.
 

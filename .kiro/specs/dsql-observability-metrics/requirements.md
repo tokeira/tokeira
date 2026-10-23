@@ -26,7 +26,7 @@ Key constraints:
 - **Connection_Director**: The `DsqlConnectionDirector` in `tokeira-storage::dsql::connection` that manages class-based admission control and delegates physical connection management to the Reservoir.
 - **Reservoir**: The warm connection pool in `tokeira-storage::dsql::reservoir` that pre-creates DSQL connections, retires expired ones, and validates returned connections.
 - **Run_Repository**: The `DsqlRunRepository` in `tokeira-storage::dsql::run_repository` that implements the semantic `RunRepository` contract over DSQL tables.
-- **Projection_Log**: The `DsqlProjectionLog` in `tokeira-storage::dsql::projection_log` that reads projection records for projection workers.
+- **Projection_Log**: The `DsqlProjectionLog` in `tokeira-storage::dsql::projection_log`, from which projectors read projection images and delete the ones they have finished with.
 - **OCC_Conflict**: An optimistic concurrency control conflict (SQLSTATE 40001) returned by DSQL when a transaction's read set was modified by a concurrent commit.
 - **Reservoir_Entry**: A single warmed DSQL connection held in the reservoir's ready channel, with creation time and jittered lifetime.
 - **Class_Budget**: A per-operation-class semaphore in the Connection_Director that prevents one workload type from starving another.
@@ -382,12 +382,7 @@ Key constraints:
 
 ### Requirement 32: Projection Checkpoint Write Latency
 
-**User Story:** As a Tokeira operator, I want a histogram measuring the time to persist the projection worker's cursor checkpoint, so that I can detect when checkpoint writes become a bottleneck for projection throughput.
-
-#### Acceptance Criteria
-
-1. WHEN a projection worker persists its cursor checkpoint, THE Projection_Worker SHALL record `tokeira_projection_checkpoint_write_duration_seconds` as a histogram with label `partition_id`.
-2. THE Projection_Worker SHALL measure duration from the start of the checkpoint write through confirmation of persistence.
+Retired by [projection-passes](../projection-passes/bugfix.md) criterion 2.12: nothing writes a checkpoint. Each pass reports its duration as `tokeira_projection_pass_duration_seconds`, with label `partition_id`.
 
 ---
 
@@ -522,13 +517,13 @@ Key constraints:
 
 ### Requirement 44: Projection Deep Metrics Dashboard Row
 
-**User Story:** As a Tokeira operator, I want a "Projection Deep Metrics" dashboard row showing record-count lag, visibility query latency, search-attribute-attributed query latency, and checkpoint write latency, so that I can diagnose projection pipeline bottlenecks.
+**User Story:** As a Tokeira operator, I want a "Projection Deep Metrics" dashboard row showing the images projection passes read, visibility query latency, search-attribute-attributed query latency, and pass duration, so that I can diagnose projection pipeline bottlenecks.
 
 #### Acceptance Criteria
 
-1. THE Dashboard SHALL include a "Projection Deep Metrics" row with panels for: existing record-count lag per partition, visibility query latency (p50, p95 by query type), search-attribute-attributed query latency (p95 by index table), and checkpoint write latency (p95 by partition).
-2. THE Dashboard record-lag panel SHALL use the existing `tokeira_projection_worker_lag_records` gauge grouped by `partition_id`.
+1. THE Dashboard SHALL include a "Projection Deep Metrics" row with panels for: images read per partition, visibility query latency (p50, p95 by query type), search-attribute-attributed query latency (p95 by index table), and pass duration (p95 by partition).
+2. THE Dashboard images-read panel SHALL use the rate of `tokeira_projection_images_read_total` grouped by `partition_id`. It replaces the worker's record-count lag, which [projection-passes](../projection-passes/bugfix.md) retired with the cursor.
 3. THE Dashboard visibility query panel SHALL use `tokeira_projection_visibility_query_duration_seconds{quantile="0.5"}` and `tokeira_projection_visibility_query_duration_seconds{quantile="0.95"}` grouped by `query_type`.
 4. THE Dashboard search-attribute attribution panel SHALL use `tokeira_projection_sa_index_scan_duration_seconds{quantile="0.95"}` grouped by `index_table`.
-5. THE Dashboard checkpoint panel SHALL use `tokeira_projection_checkpoint_write_duration_seconds{quantile="0.95"}` grouped by `partition_id`.
+5. THE Dashboard pass panel SHALL use `tokeira_projection_pass_duration_seconds{quantile="0.95"}` grouped by `partition_id`.
 6. THE Dashboard panels SHALL use datasource UID `mimir`.

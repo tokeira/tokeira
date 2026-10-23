@@ -2240,7 +2240,7 @@ pub struct TokeiradHandle {
     /// Cancellation token for background workers spawned by the facade.
     ///
     /// Kept alongside the server task so that dropping the handle cancels the
-    /// membership client, routing subscription, projection workers, and
+    /// membership client, routing subscription, projectors, and
     /// schedule engine in lockstep with the gRPC server shutdown.
     background_cancel: CancellationToken,
     log_broadcast: broadcast::Sender<LogEvent>,

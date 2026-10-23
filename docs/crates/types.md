@@ -19,7 +19,7 @@ crates without depending on any of them.
 | Payloads and requests | `payload`, `request`, `retry`: `Payload`, `Headers`, `Memo`, `RequestContext`, `RetryPolicy` |
 | Task queues | `task_queue`, `tokens`: `QueueKey`, `StickyAffinity`, `WorkflowTaskToken`, `ActivityTaskToken` |
 | Placement | `routing`, `spread`: `RoutingSnapshot`, `RoutingDelta`, `BundleOwner`, deterministic spread-key helpers |
-| Visibility | `search_attributes`, `visibility`: `SearchAttrValue`, `SearchAttributes`, `ProjectionCursor`, `ArchetypeId` |
+| Visibility | `search_attributes`, `visibility`: `SearchAttrValue`, `SearchAttributes`, `ArchetypeId` |
 | Workers | `worker_authorization`, `worker_compute`, `worker_heartbeat`: task origins, compute-controller values, heartbeat observations |
 | Other shared records | `observability`, `workflow_rules`: metric naming and transport-neutral Workflow Rule records |
 

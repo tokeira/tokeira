@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use anyhow::{Result, bail, ensure};
 use serde::{Serialize, de::DeserializeOwned};
 use tokeira_kernel::state::Priority;
-use tokeira_types::{Payloads, ProjectionCursor, WorkflowRuleRecord};
+use tokeira_types::{Payloads, WorkflowRuleRecord};
 
 // The hot-state and history-batch envelopes, and the encodings of the rows the
 // paged bulk writes size, live in the feature-independent `crate::codec`: the
@@ -100,16 +100,6 @@ pub fn encode_priority(priority: &Priority) -> Result<Vec<u8>> {
 
 /// Deserialize effective activity dispatch Priority.
 pub fn decode_priority(bytes: &[u8]) -> Result<Priority> {
-    decode(bytes)
-}
-
-/// Serialize projection cursors used by projector checkpoints.
-pub fn encode_projection_cursor(cursor: &ProjectionCursor) -> Result<Vec<u8>> {
-    encode(cursor)
-}
-
-/// Deserialize projection cursors used by projector checkpoints.
-pub fn decode_projection_cursor(bytes: &[u8]) -> Result<ProjectionCursor> {
     decode(bytes)
 }
 
@@ -224,9 +214,8 @@ mod tests {
     use time::OffsetDateTime;
     use tokeira_kernel::{HistoryEvent, HistoryEventKind};
     use tokeira_types::{
-        ArchetypeId, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, ProjectionCursor,
-        RunId, RunKey, SearchAttributes, TaskQueueName, TransitionSeq, VisibilityLifecycleState,
-        WorkflowId, WorkflowType,
+        ArchetypeId, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, RunId, RunKey,
+        SearchAttributes, TaskQueueName, VisibilityLifecycleState, WorkflowId, WorkflowType,
     };
     use uuid::Uuid;
 
@@ -378,32 +367,6 @@ mod tests {
     }
 
     proptest! {
-        #[test]
-        fn projection_cursor_round_trips(partition_id in 0u32..64, fanout in 1u16..64) {
-            let cursor = ProjectionCursor::beginning(partition_id, fanout);
-            let encoded = encode_projection_cursor(&cursor).unwrap();
-            let decoded = decode_projection_cursor(&encoded).unwrap();
-            prop_assert_eq!(decoded, cursor);
-        }
-
-        #[test]
-        fn projection_cursor_position_round_trips(
-            partition_id in 0u32..64,
-            fanout in 1u16..64,
-            run_key in proptest::option::of(any::<u128>()),
-            transition_seq in proptest::option::of(0u64..10_000),
-        ) {
-            let cursor = ProjectionCursor {
-                partition_id,
-                fanout,
-                last_run_key: run_key.map(|value| RunKey(Uuid::from_u128(value))),
-                last_transition_seq: transition_seq.map(TransitionSeq),
-            };
-            let encoded = encode_projection_cursor(&cursor).unwrap();
-            let decoded = decode_projection_cursor(&encoded).unwrap();
-            prop_assert_eq!(decoded, cursor);
-        }
-
         #[test]
         fn projection_context_round_trips(ctx in arb_projection_context()) {
             let encoded = encode_projection_context(&ctx).unwrap();

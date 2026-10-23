@@ -18,7 +18,7 @@ use tokeira_storage::{
     DispatchableWorkflowTask, RunRepository, WorkflowDiscoveryRange, WorkflowDispatchPosition,
     WorkflowDispatchRouting, WorkflowDispatchRow, derive_workflow_dispatch,
 };
-use tokeira_types::{QueueKey, ShardId};
+use tokeira_types::{QueueKey, QueuePartition, ShardId};
 use tokio::{
     sync::Notify,
     time::{Duration, Instant},
@@ -60,17 +60,12 @@ pub(crate) struct PlacementQueueHomes {
     pub(crate) counts: RwLock<(u32, u32)>,
 }
 
-impl QueueHomeProvider for PlacementQueueHomes {
-    fn local_home(&self, queue: &QueueKey) -> Option<QueueHome> {
-        let (partitions, bundles) = *self.counts.read().expect("queue placement lock poisoned");
-        let home = tokeira_types::bundle_for_partition(
-            tokeira_types::workflow_queue_partition(
-                queue.namespace_id,
-                &queue.task_queue.0,
-                partitions,
-            ),
-            bundles,
-        );
+impl PlacementQueueHomes {
+    /// The local acquisition of `partition`'s home bundle, while it is active. The
+    /// task queues of the partition and its projector share this home.
+    pub(crate) fn partition_home(&self, partition: QueuePartition) -> Option<QueueHome> {
+        let (_, bundles) = *self.counts.read().expect("queue placement lock poisoned");
+        let home = tokeira_types::bundle_for_partition(partition, bundles);
         let owner = self.owner.read().expect("shard owner lock poisoned");
         let acquisition = owner
             .acquisition(home)
@@ -80,6 +75,17 @@ impl QueueHomeProvider for PlacementQueueHomes {
             generation: acquisition.generation,
             cancel: acquisition.cancel,
         })
+    }
+}
+
+impl QueueHomeProvider for PlacementQueueHomes {
+    fn local_home(&self, queue: &QueueKey) -> Option<QueueHome> {
+        let (partitions, _) = *self.counts.read().expect("queue placement lock poisoned");
+        self.partition_home(tokeira_types::workflow_queue_partition(
+            queue.namespace_id,
+            &queue.task_queue.0,
+            partitions,
+        ))
     }
 }
 

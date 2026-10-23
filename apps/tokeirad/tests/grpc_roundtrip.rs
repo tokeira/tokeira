@@ -28,7 +28,7 @@ use tokeira_edge::{
 };
 use tokeira_kernel::LoadedRun;
 use tokeira_projection::{
-    InMemoryVisibilityStore, ProjectionWorker, VisibilityQueryService, VisibilitySink,
+    InMemoryVisibilityStore, PAGE_SIZE, Projector, VisibilityQueryService, VisibilitySink,
 };
 use tokeira_proto::{
     common::{Memo, Payloads, SearchAttributes},
@@ -46,7 +46,7 @@ use tokeira_runtime::{
     BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{InMemoryStore, RunRepository};
-use tokeira_types::{ExecutionRef, ProjectionCursor, WorkflowId};
+use tokeira_types::{ExecutionRef, WorkflowId};
 
 #[tokio::test]
 async fn grpc_roundtrip_start_describe_and_reflection() -> Result<()> {
@@ -847,17 +847,14 @@ async fn spawn_test_server() -> Result<(
     let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001"));
     let visibility_store = InMemoryVisibilityStore::default();
     for partition_id in 0..16 {
-        let projection_worker = ProjectionWorker {
+        let projector = Projector {
             log: store.clone(),
             sink: VisibilitySink::new(visibility_store.clone()),
-            batch_size: 256,
+            partition_id,
+            fanout: 1,
+            page_size: PAGE_SIZE,
         };
-        tokio::spawn(async move {
-            let cancel = CancellationToken::new();
-            let _ = projection_worker
-                .run_from_cursor(cancel, ProjectionCursor::beginning(partition_id, 1))
-                .await;
-        });
+        tokio::spawn(async move { projector.run(CancellationToken::new()).await });
     }
     let workflow_broker = runtime.broker();
     let workflow_service = WorkflowService::new_with_buffered_queries(

@@ -198,6 +198,18 @@ pub fn reported_problem_from_state(
         })
 }
 
+/// A node's active acquisition of a partition's home bundle.
+#[derive(Clone, Debug)]
+pub struct PartitionHome {
+    /// The home bundle.
+    pub bundle: ShardId,
+    /// The acquisition's generation. A home lost and regained between two looks
+    /// has a new generation, even when its lease epoch is unchanged.
+    pub generation: u64,
+    /// Cancelled when the acquisition ends.
+    pub cancel: CancellationToken,
+}
+
 /// Public runtime facade.
 ///
 /// This is intentionally small. The point is to expose the
@@ -1100,6 +1112,22 @@ where
             .write()
             .expect("queue placement lock poisoned") = (partition_count, bundle_count);
         self
+    }
+
+    /// This node's acquisition of the home bundle of projection partition
+    /// `partition`, `bundle_for_partition(partition, bundle_count)`, while the
+    /// acquisition is active. It is the home that serves the partition's task queues,
+    /// and the partition's projector runs on the node that holds it, under its token
+    /// (`projection-passes` criterion 2.5).
+    pub fn partition_home(&self, partition: u32) -> Option<PartitionHome> {
+        self.discovery
+            .1
+            .partition_home(tokeira_types::QueuePartition(partition))
+            .map(|home| PartitionHome {
+                bundle: home.id,
+                generation: home.generation,
+                cancel: home.cancel,
+            })
     }
 
     /// Wait for seeded startup reconstruction. A failure leaves the home

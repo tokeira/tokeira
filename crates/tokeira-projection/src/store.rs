@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use tokeira_storage::ProjectionRecord;
-use tokeira_types::{ArchetypeId, NamespaceId, ProjectionCursor, RunKey, SearchAttrValue};
+use tokeira_types::{ArchetypeId, NamespaceId, RunKey, SearchAttrValue};
 
 use crate::types::{
     AttrDescriptor, AttrId, CompiledFilter, CountResult, ExecutionRow, GroupByField, ListResult,
@@ -78,14 +78,6 @@ pub trait VisibilityStore: Send + Sync {
         archetype_id: ArchetypeId,
         dimension: RollupDimension,
     ) -> Result<CountResult>;
-
-    /// Load the resume cursor for `partition_id`, or `None` if this partition
-    /// has never checkpointed. Keyed by `partition_id` alone (V055
-    /// `projection_checkpoint`); the persisted `fanout` rides inside the cursor
-    /// so a re-partitioning can be detected by the worker on resume.
-    async fn load_checkpoint(&self, partition_id: u32) -> Result<Option<ProjectionCursor>>;
-    /// Persist `cursor` as the progress of `cursor.partition_id`.
-    async fn save_checkpoint(&self, cursor: &ProjectionCursor) -> Result<()>;
 
     async fn resolve_attr(
         &self,

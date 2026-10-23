@@ -2424,14 +2424,14 @@ mod tests {
     };
     use tokeira_storage::{
         BacklogEntry, CommitResult, DispatchableActivityTask, DispatchableWorkflowTask, DueTimer,
-        LeaseOutcome, LeaseRepository, ProjectionBatch, ProjectionLog, ProjectionRecord,
+        LeaseOutcome, LeaseRepository, ProjectionImageKey, ProjectionLog, ProjectionPage,
         RequestRecord, TransitionAuditRecord,
     };
     use tokeira_types::{
-        ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payloads,
-        ProjectionCursor, QueueKey, RequestContext, RequestId, RunId, RunKey, SearchAttributes,
-        ShardEpoch, ShardId, TaskKind, TaskQueueName, TransitionSeq as DurableTransitionSeq,
-        WorkerIdentity, WorkflowId, WorkflowType,
+        ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payloads, QueueKey,
+        RequestContext, RequestId, RunId, RunKey, SearchAttributes, ShardEpoch, ShardId, TaskKind,
+        TaskQueueName, TransitionSeq as DurableTransitionSeq, WorkerIdentity, WorkflowId,
+        WorkflowType,
     };
     use tokio::{
         runtime::Runtime,
@@ -2976,15 +2976,26 @@ mod tests {
 
     #[async_trait]
     impl ProjectionLog for MockRepo {
-        async fn read_from(
+        async fn read_page(
             &self,
-            _cursor: &ProjectionCursor,
+            _partition_id: u32,
+            _fanout: u16,
+            _after: Option<ProjectionImageKey>,
             _limit: usize,
-        ) -> Result<ProjectionBatch> {
-            Ok(ProjectionBatch {
-                records: Vec::<ProjectionRecord>::new(),
-                next_cursor: ProjectionCursor::beginning(0, 1),
+        ) -> Result<ProjectionPage> {
+            Ok(ProjectionPage {
+                images: Vec::new(),
+                oldest_written_at: None,
             })
+        }
+
+        async fn delete_images(
+            &self,
+            _partition_id: u32,
+            _fanout: u16,
+            _keys: &[ProjectionImageKey],
+        ) -> Result<u64> {
+            Ok(0)
         }
     }
 

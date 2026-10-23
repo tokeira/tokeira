@@ -16,9 +16,9 @@ use tokeira_storage::{
     dsql::{DsqlPoolConfig, DsqlStore, MigrationConfig, codec},
 };
 use tokeira_types::{
-    ArchetypeId, ExecutionStatus, Memo, NamespaceId, Payload, ProjectionCursor, RunId, RunKey,
-    SearchAttrValue, SearchAttributes, TaskQueueName, TransitionSeq, VisibilityLifecycleState,
-    WorkflowId, WorkflowType,
+    ArchetypeId, ExecutionStatus, Memo, NamespaceId, Payload, RunId, RunKey, SearchAttrValue,
+    SearchAttributes, TaskQueueName, TransitionSeq, VisibilityLifecycleState, WorkflowId,
+    WorkflowType,
 };
 use uuid::Uuid;
 
@@ -153,73 +153,44 @@ async fn component_visibility_hydrates_typed_images_and_scopes_pages() -> Result
 }
 
 #[tokio::test]
-async fn read_from_paginates_projection_log_rows() -> Result<()> {
+async fn read_page_pages_projection_log_rows() -> Result<()> {
     let Some(context) = TestContext::connect().await? else {
         return Ok(());
     };
     let fixture = ProjectionFixture::new(1);
     context.insert_projection_rows(&fixture).await?;
+    let log = context.store.projection_log();
 
-    let first = context
-        .store
-        .projection_log()
-        .read_from(
-            &ProjectionCursor::beginning(fixture.partition_id, fixture.fanout),
+    let first = log
+        .read_page(fixture.partition_id, fixture.fanout, None, 2)
+        .await?;
+    assert_eq!(first.images.len(), 2);
+    assert_eq!(first.images[0].run_key, fixture.run_keys[0]);
+    assert_eq!(first.images[1].run_key, fixture.run_keys[1]);
+    assert!(first.oldest_written_at.is_some());
+
+    let second = log
+        .read_page(
+            fixture.partition_id,
+            fixture.fanout,
+            Some(first.images[1].key()),
             2,
         )
         .await?;
-    assert_eq!(first.records.len(), 2);
-    assert_eq!(first.records[0].run_key, fixture.run_keys[0]);
-    assert_eq!(first.records[1].run_key, fixture.run_keys[1]);
+    assert_eq!(second.images.len(), 1);
+    assert_eq!(second.images[0].run_key, fixture.run_keys[2]);
 
-    let second = context
-        .store
-        .projection_log()
-        .read_from(&first.next_cursor, 2)
+    let third = log
+        .read_page(
+            fixture.partition_id,
+            fixture.fanout,
+            Some(second.images[0].key()),
+            2,
+        )
         .await?;
-    assert_eq!(second.records.len(), 1);
-    assert_eq!(second.records[0].run_key, fixture.run_keys[2]);
-
-    let third = context
-        .store
-        .projection_log()
-        .read_from(&second.next_cursor, 2)
-        .await?;
-    assert!(third.records.is_empty());
-    assert_eq!(third.next_cursor, second.next_cursor);
+    assert!(third.images.is_empty());
+    assert_eq!(third.oldest_written_at, None);
     context.clear_projection_rows(&fixture.run_keys).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn checkpoint_persists_and_resumes_by_partition_id() -> Result<()> {
-    let Some(context) = TestContext::connect().await? else {
-        return Ok(());
-    };
-    let store = context.visibility_store().await?;
-    // Both cursors are for the same partition, so the second save upserts the
-    // first: V055 `projection_checkpoint` is keyed by `partition_id` alone. Pick a
-    // fresh partition per run (positive i32 range) so the initial `None` assertion
-    // is isolated from prior runs against a shared cluster.
-    let partition_id = (Uuid::new_v4().as_u128() as u32) & 0x7fff_ffff;
-    let first = ProjectionCursor {
-        partition_id,
-        fanout: 8,
-        last_run_key: Some(RunKey(Uuid::from_u128(1))),
-        last_transition_seq: Some(TransitionSeq(3)),
-    };
-    let second = ProjectionCursor {
-        partition_id,
-        fanout: 8,
-        last_run_key: Some(RunKey(Uuid::from_u128(2))),
-        last_transition_seq: Some(TransitionSeq(9)),
-    };
-
-    assert_eq!(store.load_checkpoint(partition_id).await?, None);
-    store.save_checkpoint(&first).await?;
-    assert_eq!(store.load_checkpoint(partition_id).await?, Some(first));
-    store.save_checkpoint(&second).await?;
-    assert_eq!(store.load_checkpoint(partition_id).await?, Some(second));
     Ok(())
 }
 

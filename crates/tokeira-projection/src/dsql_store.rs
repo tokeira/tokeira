@@ -1,6 +1,6 @@
 //! DSQL-backed visibility store and projection sink.
 //!
-//! This implementation lives in the projection crate because the live worker
+//! This implementation lives in the projection crate because the projection crate
 //! owns the `ProjectionSink` and `VisibilityStore` traits. Storage provides the
 //! DSQL connection foundation and codecs; projection owns how semantic projection
 //! ops become visibility rows.
@@ -20,8 +20,8 @@ use tokeira_storage::{
     metrics as storage_metrics,
 };
 use tokeira_types::{
-    ArchetypeId, ExecutionStatus, Memo, NamespaceId, ProjectionCursor, RunKey, SearchAttrValue,
-    SearchAttributes, TransitionSeq, VisibilityLifecycleState, dsql_spread_uuid,
+    ArchetypeId, ExecutionStatus, Memo, NamespaceId, RunKey, SearchAttrValue, SearchAttributes,
+    TransitionSeq, VisibilityLifecycleState, dsql_spread_uuid,
 };
 use tracing::{instrument, warn};
 use uuid::Uuid;
@@ -70,6 +70,10 @@ mod apply_faults {
         Ok(())
     }
 }
+
+#[cfg(all(test, feature = "dsql-integration"))]
+#[path = "dsql_passes_tests.rs"]
+mod passes_tests;
 
 #[derive(Clone, Debug)]
 pub struct DsqlVisibilityStore {
@@ -446,63 +450,6 @@ impl VisibilityStore for DsqlVisibilityStore {
         .fetch_all(permit.connection()?)
         .await?;
         rows_to_count_result(rows)
-    }
-
-    // Checkpoints are keyed by `partition_id` alone (V055 `projection_checkpoint`,
-    // Req 10.9). The serialized cursor in `last_applied_version` still carries
-    // `fanout`, so a re-partitioning is detected by the worker on resume; see
-    // reference/DECISION-visibility-checkpoint-partition.md.
-    #[instrument(skip_all, fields(partition_id))]
-    async fn load_checkpoint(&self, partition_id: u32) -> Result<Option<ProjectionCursor>> {
-        let partition_id = i32_from_u32(partition_id, "projection cursor partition_id")?;
-        let mut permit = self.director.acquire(DbClass::Projection).await?;
-        let row = sqlx::query(
-            r#"
-            SELECT last_applied_version
-            FROM projection_checkpoint
-            WHERE partition_id = $1
-            "#,
-        )
-        .bind(partition_id)
-        .fetch_optional(permit.connection()?)
-        .await?;
-
-        row.map(|row| {
-            let data: Vec<u8> = row.try_get("last_applied_version")?;
-            codec::decode_projection_cursor(&data)
-        })
-        .transpose()
-    }
-
-    #[instrument(skip_all, fields(partition_id = cursor.partition_id, fanout = cursor.fanout))]
-    async fn save_checkpoint(&self, cursor: &ProjectionCursor) -> Result<()> {
-        let partition_id = i32_from_u32(cursor.partition_id, "projection cursor partition_id")?;
-        let data = codec::encode_projection_cursor(cursor)?;
-        let mut permit = self.director.acquire(DbClass::Projection).await?;
-        let started = Instant::now();
-        let result = sqlx::query(
-            r#"
-            INSERT INTO projection_checkpoint (
-                partition_id,
-                last_applied_version,
-                updated_at
-            )
-            VALUES ($1, $2, now())
-            ON CONFLICT (partition_id) DO UPDATE
-            SET last_applied_version = EXCLUDED.last_applied_version,
-                updated_at = now()
-            "#,
-        )
-        .bind(partition_id)
-        .bind(data)
-        .execute(permit.connection()?)
-        .await;
-        projection_metrics::record_checkpoint_write_duration(
-            cursor.partition_id,
-            started.elapsed(),
-        );
-        result?;
-        Ok(())
     }
 
     async fn resolve_attr(
@@ -2088,10 +2035,6 @@ fn archetype_clause(filter: &CompiledFilter) -> String {
         .archetype
         .map(|a| format!("AND archetype_id = {}", i64::from(a.0)))
         .unwrap_or_default()
-}
-
-fn i32_from_u32(value: u32, field: &str) -> Result<i32> {
-    i32::try_from(value).map_err(|_| anyhow::anyhow!("{field} {value} exceeds i32 range"))
 }
 
 fn i64_from_u64(value: u64, field: &str) -> Result<i64> {

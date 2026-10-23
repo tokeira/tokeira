@@ -31,12 +31,12 @@
     {
       "id": 2,
       "type": "timeseries",
-      "title": "Checkpoint Lag",
+      "title": "Oldest Image Age",
       "datasource": { "type": "prometheus", "uid": "mimir" },
       "targets": [
         {
-          "expr": "tokeira_projection_checkpoint_lag_seconds",
-          "legendFormat": "lag"
+          "expr": "max by (partition_id) (tokeira_projection_oldest_image_age_seconds)",
+          "legendFormat": "partition {{partition_id}}"
         }
       ],
       "fieldConfig": {
@@ -58,7 +58,7 @@
         }
       },
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 1 },
-      "description": "Elapsed time since the last successful projection checkpoint write."
+      "description": "How long the oldest image a projection pass read had waited in the log, by partition. Reported on DSQL, where the log records when each image was written."
     }
   ]
 }

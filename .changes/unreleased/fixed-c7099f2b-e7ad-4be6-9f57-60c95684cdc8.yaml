@@ -1,0 +1,5 @@
+kind: fixed
+body: On DSQL, a standalone activity's state or a worker invocation request that encodes to more than 1 MiB is now stored in parts, so its writes and reads succeed.
+time: 2026-10-24T20:46:22.226740+01:00
+custom:
+    Slice: c7099f2b-e7ad-4be6-9f57-60c95684cdc8

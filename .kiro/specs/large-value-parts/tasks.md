@@ -69,28 +69,41 @@ worker invocation requests. Each step first shows the defect, with live tests th
     - _Requirements: 2.1-2.4, 2.6, 2.7_
   - [ ] 3.6 Checkpoint, as 2.10
 
-- [ ] 4. Step 3: CHASM nodes
-  - [ ] 4.1 Exploration: write step 3's live test and confirm it fails on the code before the step
+- [x] 4. Step 3: CHASM nodes
+  - [x] 4.1 Exploration: write step 3's live test and confirm it fails on the code before the step
     - _Requirements: 1.4_
-  - [ ] 4.2 Add `chasm_node_part` and `chasm_node.data_parts`, with the migrations' bookkeeping
+    - DONE. On the code before the step, on an ephemeral cluster, DSQL refused the start of an execution whose root
+      node's data was over 1 MiB with its value limit ("datatype limit greater than 1048576 bytes not supported for
+      bytea", SQLSTATE 54000).
+  - [x] 4.2 Add `chasm_node_part` and `chasm_node.data_parts`, with the migrations' bookkeeping
     - _Requirements: 2.1_
-  - [ ] 4.3 Write, delete and read a node's data in parts
+  - [x] 4.3 Write, delete and read a node's data in parts
     - _Requirements: 2.1-2.3, 2.6_
-  - [ ] 4.4 Write the tests of Properties 3, 4 and 6 for CHASM nodes
+  - [x] 4.4 Write the tests of Properties 3, 4 and 6 for CHASM nodes
     - _Requirements: 2.1-2.4, 2.6, 2.7_
-  - [ ] 4.5 Checkpoint, as 2.10
+  - [x] 4.5 Checkpoint, as 2.10
+    - DONE with 5.5.
 
-- [ ] 5. Step 4: worker invocation requests
-  - [ ] 5.1 Exploration: write step 4's live test and confirm it fails on the code before the step
+- [x] 5. Step 4: worker invocation requests
+  - [x] 5.1 Exploration: write step 4's live test and confirm it fails on the code before the step
     - _Requirements: 1.5_
-  - [ ] 5.2 Add `worker_compute_action_part` and `worker_compute_action.request_parts`, with the migrations'
+    - DONE. On the code before the step, on an ephemeral cluster, DSQL refused the decision that inserted an action
+      with a 2 MiB request with the same value limit.
+  - [x] 5.2 Add `worker_compute_action_part` and `worker_compute_action.request_parts`, with the migrations'
     bookkeeping
     - _Requirements: 2.1_
-  - [ ] 5.3 Write and read a request in parts
+  - [x] 5.3 Write and read a request in parts
     - _Requirements: 2.1, 2.3_
-  - [ ] 5.4 Write the tests of Property 3 for requests
+  - [x] 5.4 Write the tests of Property 3 for requests
     - _Requirements: 2.1, 2.3, 2.4, 2.7_
-  - [ ] 5.5 Checkpoint, as 2.10
+  - [x] 5.5 Checkpoint, as 2.10
+    - DONE at `38076002`. Property 3's contracts for node data and requests pass on the in-memory stores. On ephemeral
+      clusters, the five large-value tests of node data and requests pass, the exploration tests among them, and so
+      do the nine of a run's values, the CHASM store's live tests and the on-conflict suite. Each of seven negative
+      controls failed its test: a node's first part written without its other parts, a shrinking node that keeps its
+      old parts, a deletion that keeps an execution's parts, a load that joins parts outside its snapshot, a root scan
+      that ignores parts, a request's first part written without its other parts, and a read of an action that
+      doesn't join its request's parts. The bar passed (3,936 tests passed, 2 skipped).
 
 ## Notes
 

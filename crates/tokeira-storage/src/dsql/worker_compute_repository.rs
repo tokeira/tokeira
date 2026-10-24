@@ -4,6 +4,14 @@
 //! aggregate counter. Controller decisions use owner-epoch plus revision fencing,
 //! and provider actions are inserted in the same transaction as scaler state.
 //! Action delivery scans one namespace and one UUID-derived bucket at a time.
+//!
+//! An action's request may reach the 2 MiB a Nexus payload allows, over DSQL's
+//! 1 MiB value limit. A request over the part size, 960 KiB, is stored in parts
+//! (`large-value-parts`): its first part in `request_data`, its other parts in
+//! `worker_compute_action_part`, and their number in `request_parts`, which is
+//! NULL for a request stored whole. The parts are written in the
+//! transaction that inserts the action, and a request never changes after it, so
+//! every read of an action, each in a transaction, joins the parts it reads there.
 
 use std::sync::Arc;
 
@@ -30,24 +38,33 @@ use crate::{
     WorkerComputeQueueSample, WorkerComputeRepository,
 };
 
-use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, DsqlRunRepository, codec};
+use super::{
+    DsqlConnectionAcquirer, DsqlConnectionDirector, DsqlRunRepository, codec, value_parts,
+};
 
 const ACTION_COLUMNS: &str = "
     action_id, due_bucket, namespace_id, deployment_name, build_id, scaling_group,
     configuration_fingerprint, reason, status, next_attempt_at, claim_owner,
     claim_epoch, claim_until, attempts, attempt_started_at, endpoint_name,
-    request_data, last_error_category, superseded_at, created_at, updated_at";
+    request_data, last_error_category, superseded_at, created_at, updated_at,
+    request_parts";
 const INSERT_ACTION_SQL: &str = "
     INSERT INTO worker_compute_action
     (action_id, due_bucket, namespace_id, deployment_name, build_id,
      scaling_group, configuration_fingerprint, reason, status,
      next_attempt_at, claim_owner, claim_epoch, claim_until, attempts,
      attempt_started_at, endpoint_name, request_data, last_error_category,
-     superseded_at, created_at, updated_at)
+     superseded_at, created_at, updated_at, request_parts)
     VALUES
     ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-     $15, $16, $17, $18, $19, $20, $21)
+     $15, $16, $17, $18, $19, $20, $21, $22)
     ON CONFLICT (action_id) DO NOTHING";
+/// One part after the first of an action's request. Only the transaction whose
+/// insert wrote the action's row writes its parts, and they commit together, so
+/// no part of the action is stored before it.
+const INSERT_REQUEST_PART_SQL: &str = "
+    INSERT INTO worker_compute_action_part (action_id, part_no, data)
+    VALUES ($1, $2, $3)";
 
 /// DSQL-backed Worker Compute Controller repository.
 #[derive(Debug)]
@@ -245,6 +262,8 @@ impl DsqlWorkerComputeRepository {
         Ok(record)
     }
 
+    /// Decode an action's row, with its request as `request_data` holds it: whole,
+    /// or its first part, which [`read_action`](Self::read_action) joins.
     fn decode_action_row(row: &PgRow) -> Result<WorkerComputeProviderAction> {
         let namespace_id = NamespaceId(row.try_get("namespace_id")?);
         let claim_owner = row
@@ -306,6 +325,37 @@ impl DsqlWorkerComputeRepository {
         })
     }
 
+    /// Decode an action read on `tx`, with its request whole: a request stored in
+    /// parts is joined from the parts `tx` reads, in the transaction that read the
+    /// action's row.
+    async fn read_action(
+        tx: &mut sqlx::PgConnection,
+        row: &PgRow,
+    ) -> Result<WorkerComputeProviderAction> {
+        let mut action = Self::decode_action_row(row)?;
+        let count: Option<i32> = row.try_get("request_parts")?;
+        if count.is_some() {
+            let rest = sqlx::query_as::<_, (i32, Vec<u8>)>(
+                "SELECT part_no, data FROM worker_compute_action_part
+                 WHERE action_id = $1 ORDER BY part_no",
+            )
+            .bind(action.action_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            let action_id = action.action_id;
+            action.request_data = value_parts::join(
+                || format!("worker_compute_action.request_data of action {action_id}"),
+                std::mem::take(&mut action.request_data),
+                count,
+                rest,
+            )?;
+        }
+        Ok(action)
+    }
+
+    /// Insert a new action with its request's parts, returning the rows the
+    /// action's insert wrote: one, or none when its id is already stored, which
+    /// the caller answers as a conflict.
     async fn insert_action(
         tx: &mut sqlx::PgConnection,
         action: &WorkerComputeProviderAction,
@@ -313,6 +363,7 @@ impl DsqlWorkerComputeRepository {
         let last_error_category = action
             .last_error_category
             .map(Self::encode_failure_category);
+        let request = value_parts::split(&action.request_data);
         let result = sqlx::query(INSERT_ACTION_SQL)
             .bind(action.action_id)
             .bind(i16::from(action.due_bucket))
@@ -330,14 +381,28 @@ impl DsqlWorkerComputeRepository {
             .bind(Self::i64(action.attempts, "action attempts")?)
             .bind(action.attempt_started_at)
             .bind(&action.endpoint_name)
-            .bind(&action.request_data)
+            .bind(request.first)
             .bind(last_error_category)
             .bind(action.superseded_at)
             .bind(action.created_at)
             .bind(action.updated_at)
+            .bind(request.count)
             .execute(&mut *tx)
             .await?;
-        Ok(result.rows_affected())
+        let inserted = result.rows_affected();
+        // A stored id wrote nothing, and the caller rolls the transaction back;
+        // its parts are the stored action's own.
+        if inserted == 1 {
+            for (part_no, data) in request.numbered() {
+                sqlx::query(INSERT_REQUEST_PART_SQL)
+                    .bind(action.action_id)
+                    .bind(part_no)
+                    .bind(data)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        Ok(inserted)
     }
 
     async fn current_action_fingerprint(
@@ -902,7 +967,7 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
                 .fetch_all(&mut *tx)
                 .await?;
             for row in rows {
-                let mut action = Self::decode_action_row(&row)?;
+                let mut action = Self::read_action(&mut tx, &row).await?;
                 let previous_epoch = action.claim_epoch;
                 let claim = WorkerComputeActionClaim {
                     action_id: action.action_id,
@@ -959,7 +1024,11 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
             .bind(claim.action_id)
             .fetch_optional(&mut *tx)
             .await?;
-        let Some(mut action) = row.as_ref().map(Self::decode_action_row).transpose()? else {
+        let action = match &row {
+            Some(row) => Some(Self::read_action(&mut tx, row).await?),
+            None => None,
+        };
+        let Some(mut action) = action else {
             tx.rollback().await?;
             return Ok(WorkerComputeActionAttemptStart::NotFound);
         };
@@ -1009,7 +1078,11 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
             .bind(claim.action_id)
             .fetch_optional(&mut *tx)
             .await?;
-        let Some(mut action) = row.as_ref().map(Self::decode_action_row).transpose()? else {
+        let action = match &row {
+            Some(row) => Some(Self::read_action(&mut tx, row).await?),
+            None => None,
+        };
+        let Some(mut action) = action else {
             tx.rollback().await?;
             return Ok(WorkerComputeActionFinalizeResult::NotFound);
         };
@@ -1161,12 +1234,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn action_sql_is_namespace_scoped_and_uses_all_twenty_one_binds() {
+    fn action_sql_is_namespace_scoped_and_uses_all_twenty_two_binds() {
         assert!(ACTION_COLUMNS.contains("namespace_id"));
         assert!(ACTION_COLUMNS.contains("configuration_fingerprint"));
         assert!(ACTION_COLUMNS.contains("reason"));
         assert!(INSERT_ACTION_SQL.contains("ON CONFLICT (action_id) DO NOTHING"));
-        for bind in 1..=21 {
+        for bind in 1..=22 {
             assert!(
                 INSERT_ACTION_SQL.contains(&format!("${bind}")),
                 "missing action bind ${bind}"

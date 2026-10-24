@@ -120,6 +120,7 @@ pub(crate) mod pause_point {
 
     use tokeira_types::{RunKey, ShardId};
     use tokio::sync::oneshot;
+    use uuid::Uuid;
 
     /// What a pause point holds.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +143,10 @@ pub(crate) mod pause_point {
         HistoryParts(RunKey),
         /// A purge of this run, after each of its transactions.
         Purge(RunKey),
+        /// A load of the CHASM execution with this run id that met a node stored
+        /// in parts, after its first read and before it reads the nodes again
+        /// with their parts.
+        NodeParts(Uuid),
     }
 
     struct Armed {

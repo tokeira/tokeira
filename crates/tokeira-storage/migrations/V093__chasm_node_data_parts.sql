@@ -1,0 +1,1 @@
+ALTER TABLE chasm_node ADD COLUMN IF NOT EXISTS data_parts INTEGER;

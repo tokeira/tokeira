@@ -599,9 +599,14 @@ chasm_node(
     initial_transition_count BIGINT not null,
     metadata        BYTEA   not null,   -- ChasmNode.metadata (type id, lifecycle, task outboxes)
     data            BYTEA,              -- ChasmNode.data (serialized proto for data fields)
+    data_parts      INTEGER,            -- data's number of parts; NULL when data is stored whole
     PRIMARY KEY (namespace_id, business_id, run_id, encoded_path)
 )
 ```
+
+A node's data over the part size (960 KiB) is stored in parts: its first part in `data`, the others in
+`chasm_node_part`, keyed by the node's key and the part number, and their number in `data_parts`
+([large-value-parts](../large-value-parts/design.md)).
 
 Design properties:
 

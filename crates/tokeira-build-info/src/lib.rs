@@ -122,11 +122,11 @@ mod tests {
     fn build_info_exposes_the_storage_owned_schema_contract() {
         let info = summary();
         assert_eq!(info.schema_min_supported_version, 1);
-        assert_eq!(info.schema_target_version, 87);
-        assert_eq!(info.schema_max_readable_version, 87);
+        assert_eq!(info.schema_target_version, 91);
+        assert_eq!(info.schema_max_readable_version, 91);
         assert_eq!(
             info.schema_migration_set_digest,
-            "sha256:9d4c6cb1f91a2054453a3d1afd66cccb5a1f6cf17b8ab44a17f90f9c413f8d6d"
+            "sha256:78312ca6d50a2506cac3b48a627599b86e1bb6e0b86572584d98326324470592"
         );
     }
 

@@ -53,6 +53,8 @@ mod apply_faults {
         RollupUpsert(NamespaceId),
         /// The read of a run's stored visibility row fails.
         StoredRowRead(RunKey),
+        /// A batch of a staged apply's cells fails, as when the node stops mid-apply.
+        CellBatch(RunKey),
     }
 
     static ARMED: Mutex<Vec<Fault>> = Mutex::new(Vec::new());
@@ -74,6 +76,20 @@ mod apply_faults {
 #[cfg(all(test, feature = "dsql-integration"))]
 #[path = "dsql_passes_tests.rs"]
 mod passes_tests;
+
+#[cfg(all(test, feature = "dsql-integration"))]
+#[path = "dsql_bounded_apply_tests.rs"]
+mod bounded_apply_tests;
+
+#[path = "dsql_attributes.rs"]
+mod attributes;
+
+use attributes::{
+    ATTR_CELL_TABLE, ApplyPlan, ApplyRows, ImageAttributes, ImageCell, TRANSACTION_ROW_BUDGET,
+    Version, cell_batches, count_below, delete_cells_below, delete_values_below, insert_cells,
+    insert_values,
+};
+pub use attributes::{CopyPosition, CopyReport, LegacyCellKey};
 
 #[derive(Clone, Debug)]
 pub struct DsqlVisibilityStore {
@@ -168,13 +184,17 @@ impl DsqlVisibilityStore {
         self.apply_row(tombstone, &row, &[], partition_id).await
     }
 
-    /// Apply one image as a single transaction (`projection-passes` criterion 2.8):
-    /// read the run's stored row by its whole primary key, write the image under the
-    /// version guard, replace the run's search-attribute rows, and add its rollup
-    /// deltas. The read and the writes commit together, so the deltas start from the
-    /// row this transaction replaced: an apply of the same run that commits first
-    /// fails this one with a write conflict, and the retry reads again. A failed
-    /// read fails the apply rather than reading as no row.
+    /// Apply one image (`projection-passes` criterion 2.8, `bounded-visibility-apply`).
+    ///
+    /// The image's cells and values are written at its version, and advancing the run's
+    /// row to that version under the guard makes them the run's attributes. When
+    /// everything fits in [`TRANSACTION_ROW_BUDGET`] rows, one transaction reads the
+    /// stored row by its whole primary key, writes the image, deletes the run's rows
+    /// below its version and adds its rollup deltas. Otherwise the cells go first, in
+    /// transactions of their own, then the flip writes the row, the values and the
+    /// deltas, and cleanup deletes the rows below the version. The read and the writes
+    /// of the row's transaction commit together, so the deltas start from the row it
+    /// replaced, and a failed read fails the apply rather than reading as no row.
     async fn apply_row(
         &self,
         record: &ProjectionRecord,
@@ -183,78 +203,64 @@ impl DsqlVisibilityStore {
         partition_id: u32,
     ) -> Result<ApplyOutcome> {
         let memo = codec::encode(&row.memo)?;
+        let image =
+            ImageAttributes::build(search_attrs, row.archetype_id != ArchetypeId::WORKFLOW)?;
+        let version = Version::of_row(row);
         let stripe = usize::try_from(stripe_for(row.run_key))?;
-        let _stripe = self.stripes[stripe].lock().await;
+        let first = {
+            let _stripe = self.stripes[stripe].lock().await;
+            self.retry_apply(partition_id, || {
+                self.apply_single(record, row, &memo, &image, version)
+            })
+            .await?
+        };
+        let Some(staged) = first else {
+            return Ok(ApplyOutcome::Advanced);
+        };
+        if let SingleAttempt::Current = staged {
+            return Ok(ApplyOutcome::Current);
+        }
+        for batch in cell_batches(image.cells.len()) {
+            let cells = &image.cells[batch];
+            self.retry_apply(partition_id, || self.write_cells(row, version, cells))
+                .await?;
+        }
+        let outcome = {
+            let _stripe = self.stripes[stripe].lock().await;
+            self.retry_apply(partition_id, || {
+                self.flip(record, row, &memo, &image, version)
+            })
+            .await?
+        };
+        if outcome == ApplyOutcome::Advanced
+            && let Err(error) = self
+                .cleanup_below(row.namespace_id, row.run_key, version)
+                .await
+        {
+            attributes::warn_cleanup_failed(row.run_key, &error);
+        }
+        Ok(outcome)
+    }
+
+    /// Run one transaction of an apply, again on a write conflict, up to five retries,
+    /// recording the conflicts and the outcome as the apply always has.
+    async fn retry_apply<T, F, Fut>(&self, partition_id: u32, mut transaction: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
         let mut attempts = 0u32;
-        let outcome = loop {
-            let mut permit = self.director.acquire(DbClass::Projection).await?;
-            let result = async {
-                let mut tx = permit.connection()?.begin().await?;
-
-                let started = Instant::now();
-                let previous =
-                    read_execution_row(&mut tx, row.namespace_id, row.archetype_id, row.run_key)
-                        .await?;
-                storage_metrics::record_dsql_statement_duration(
-                    "projection_apply",
-                    "read_execution",
-                    started.elapsed(),
-                );
-                if !visibility_version_is_newer(
-                    previous.as_ref(),
-                    record.context.authority_epoch,
-                    record.transition_seq,
-                ) {
-                    tx.rollback().await?;
-                    return Ok(ApplyOutcome::Current);
+        loop {
+            match transaction().await {
+                Ok(value) => {
+                    if attempts > 0 {
+                        storage_metrics::record_dsql_retry(
+                            tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
+                            tokeira_observability::RetryOutcomeLabel::Success,
+                        );
+                    }
+                    return Ok(value);
                 }
-
-                let started = Instant::now();
-                let applied = upsert_execution_row(&mut tx, row, Some(memo.clone())).await?;
-                storage_metrics::record_dsql_statement_duration(
-                    "projection_apply",
-                    "upsert_execution",
-                    started.elapsed(),
-                );
-                // The guard sees the snapshot the read saw. Only an apply that wrote
-                // the row may replace its index rows or move its counters; otherwise a
-                // stale image could erase attributes belonging to a newer version.
-                if !applied {
-                    tx.rollback().await?;
-                    return Ok(ApplyOutcome::Current);
-                }
-
-                clear_search_attr_index_rows(&mut tx, row.run_key, row.namespace_id).await?;
-                for (attr, value) in search_attrs {
-                    let started = Instant::now();
-                    upsert_search_attr_index_row(
-                        &mut tx,
-                        row.run_key,
-                        row.namespace_id,
-                        attr.attr_id,
-                        attr.attr_type,
-                        value,
-                        row.archetype_id != ArchetypeId::WORKFLOW,
-                    )
-                    .await?;
-                    storage_metrics::record_dsql_statement_duration(
-                        "projection_apply",
-                        "upsert_search_attr",
-                        started.elapsed(),
-                    );
-                }
-                for delta in compute_rollup_deltas(previous.as_ref(), row) {
-                    upsert_rollup_row(&mut tx, &delta).await?;
-                }
-
-                tx.commit().await?;
-                Ok::<ApplyOutcome, anyhow::Error>(ApplyOutcome::Advanced)
-            }
-            .await;
-            drop(permit);
-
-            match result {
-                Ok(outcome) => break outcome,
                 Err(error) if Self::is_occ_conflict(&error) && attempts < 5 => {
                     attempts += 1;
                     storage_metrics::record_dsql_occ_conflict(
@@ -262,18 +268,13 @@ impl DsqlVisibilityStore {
                     );
                     tokio::time::sleep(Self::retry_delay(attempts)).await;
                 }
-                Err(error) if Self::is_occ_conflict(&error) => {
-                    storage_metrics::record_dsql_retry(
-                        tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
-                        tokeira_observability::RetryOutcomeLabel::Exhausted,
-                    );
-                    projection_metrics::record_sink_error_with_kind(
-                        partition_id,
-                        tokeira_observability::ProjectionErrorKindLabel::Storage,
-                    );
-                    return Err(error);
-                }
                 Err(error) => {
+                    if Self::is_occ_conflict(&error) {
+                        storage_metrics::record_dsql_retry(
+                            tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
+                            tokeira_observability::RetryOutcomeLabel::Exhausted,
+                        );
+                    }
                     projection_metrics::record_sink_error_with_kind(
                         partition_id,
                         tokeira_observability::ProjectionErrorKindLabel::Storage,
@@ -281,15 +282,202 @@ impl DsqlVisibilityStore {
                     return Err(error);
                 }
             }
-        };
-        if attempts > 0 {
-            storage_metrics::record_dsql_retry(
-                tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
-                tokeira_observability::RetryOutcomeLabel::Success,
-            );
         }
-        Ok(outcome)
     }
+
+    /// Read the run's stored row by its whole primary key, in `tx`.
+    async fn read_stored_row(
+        tx: &mut PgConnection,
+        row: &ExecutionRow,
+    ) -> Result<Option<ExecutionRow>> {
+        let started = Instant::now();
+        let previous =
+            read_execution_row(tx, row.namespace_id, row.archetype_id, row.run_key).await?;
+        storage_metrics::record_dsql_statement_duration(
+            "projection_apply",
+            "read_execution",
+            started.elapsed(),
+        );
+        Ok(previous)
+    }
+
+    /// Write the row under the guard, in `tx`. False when a newer row won.
+    async fn write_guarded_row(
+        tx: &mut PgConnection,
+        row: &ExecutionRow,
+        memo: &[u8],
+    ) -> Result<bool> {
+        let started = Instant::now();
+        let applied = upsert_execution_row(tx, row, Some(memo.to_vec())).await?;
+        storage_metrics::record_dsql_statement_duration(
+            "projection_apply",
+            "upsert_execution",
+            started.elapsed(),
+        );
+        Ok(applied)
+    }
+
+    /// The single transaction, when the image fits in it. Answers `None` when it
+    /// committed, `Current` when the image isn't newer, and `TooLarge` when the image
+    /// needs the staged apply, having written nothing.
+    async fn apply_single(
+        &self,
+        record: &ProjectionRecord,
+        row: &ExecutionRow,
+        memo: &[u8],
+        image: &ImageAttributes,
+        version: Version,
+    ) -> Result<Option<SingleAttempt>> {
+        let mut permit = self.director.acquire(DbClass::Projection).await?;
+        let mut tx = permit.connection()?.begin().await?;
+        let previous = Self::read_stored_row(&mut tx, row).await?;
+        if !visibility_version_is_newer(
+            previous.as_ref(),
+            record.context.authority_epoch,
+            record.transition_seq,
+        ) {
+            tx.rollback().await?;
+            return Ok(Some(SingleAttempt::Current));
+        }
+        let deltas = compute_rollup_deltas(previous.as_ref(), row);
+        let below = count_below(&mut tx, row.namespace_id, row.run_key, version).await?;
+        let rows = ApplyRows {
+            new_cells: image.cells.len(),
+            new_values: image.values.len(),
+            older_cells: below.cells,
+            older_values: below.values,
+            deltas: deltas.len(),
+        };
+        if rows.plan() == ApplyPlan::Staged {
+            tx.rollback().await?;
+            return Ok(Some(SingleAttempt::TooLarge));
+        }
+        // The guard sees the snapshot the read saw. Only an apply that wrote the row
+        // may write its attributes or move its counters.
+        if !Self::write_guarded_row(&mut tx, row, memo).await? {
+            tx.rollback().await?;
+            return Ok(Some(SingleAttempt::Current));
+        }
+        let started = Instant::now();
+        insert_cells(
+            &mut tx,
+            row.namespace_id,
+            row.run_key,
+            version,
+            &image.cells,
+        )
+        .await?;
+        insert_values(
+            &mut tx,
+            row.namespace_id,
+            row.run_key,
+            version,
+            &image.values,
+        )
+        .await?;
+        delete_cells_below(&mut tx, row.namespace_id, row.run_key, version).await?;
+        delete_values_below(&mut tx, row.namespace_id, row.run_key, version).await?;
+        storage_metrics::record_dsql_statement_duration(
+            "projection_apply",
+            "upsert_search_attr",
+            started.elapsed(),
+        );
+        for delta in deltas {
+            upsert_rollup_row(&mut tx, &delta).await?;
+        }
+        tx.commit().await?;
+        Ok(None)
+    }
+
+    /// One batch of a staged apply's cells, in a transaction of its own. Cells at a
+    /// version the run's row hasn't reached match no query.
+    async fn write_cells(
+        &self,
+        row: &ExecutionRow,
+        version: Version,
+        cells: &[ImageCell],
+    ) -> Result<()> {
+        #[cfg(all(test, feature = "dsql-integration"))]
+        apply_faults::fire(apply_faults::Fault::CellBatch(row.run_key))?;
+        let mut permit = self.director.acquire(DbClass::Projection).await?;
+        let mut tx = permit.connection()?.begin().await?;
+        let started = Instant::now();
+        insert_cells(&mut tx, row.namespace_id, row.run_key, version, cells).await?;
+        storage_metrics::record_dsql_statement_duration(
+            "projection_apply",
+            "upsert_search_attr",
+            started.elapsed(),
+        );
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The flip of a staged apply: the guarded row, the values at the version and the
+    /// rollup deltas, and the values below the version when they fit.
+    async fn flip(
+        &self,
+        record: &ProjectionRecord,
+        row: &ExecutionRow,
+        memo: &[u8],
+        image: &ImageAttributes,
+        version: Version,
+    ) -> Result<ApplyOutcome> {
+        let mut permit = self.director.acquire(DbClass::Projection).await?;
+        let mut tx = permit.connection()?.begin().await?;
+        let previous = Self::read_stored_row(&mut tx, row).await?;
+        if !visibility_version_is_newer(
+            previous.as_ref(),
+            record.context.authority_epoch,
+            record.transition_seq,
+        ) {
+            tx.rollback().await?;
+            return Ok(ApplyOutcome::Current);
+        }
+        let deltas = compute_rollup_deltas(previous.as_ref(), row);
+        let below = count_below(&mut tx, row.namespace_id, row.run_key, version).await?;
+        let rows = ApplyRows {
+            new_cells: image.cells.len(),
+            new_values: image.values.len(),
+            older_cells: below.cells,
+            older_values: below.values,
+            deltas: deltas.len(),
+        };
+        anyhow::ensure!(
+            rows.flip_fits(),
+            "an image's {} values and {} rollup deltas pass one transaction's {} rows",
+            rows.new_values,
+            rows.deltas,
+            TRANSACTION_ROW_BUDGET
+        );
+        if !Self::write_guarded_row(&mut tx, row, memo).await? {
+            tx.rollback().await?;
+            return Ok(ApplyOutcome::Current);
+        }
+        insert_values(
+            &mut tx,
+            row.namespace_id,
+            row.run_key,
+            version,
+            &image.values,
+        )
+        .await?;
+        if rows.flip_deletes_older_values() {
+            delete_values_below(&mut tx, row.namespace_id, row.run_key, version).await?;
+        }
+        for delta in deltas {
+            upsert_rollup_row(&mut tx, &delta).await?;
+        }
+        tx.commit().await?;
+        Ok(ApplyOutcome::Advanced)
+    }
+}
+
+/// The first transaction's answer when it didn't commit the image.
+enum SingleAttempt {
+    /// The stored row is as new as the image, or newer.
+    Current,
+    /// The image needs the staged apply.
+    TooLarge,
 }
 
 #[async_trait]
@@ -310,6 +498,9 @@ impl VisibilityStore for DsqlVisibilityStore {
             .map(|_| ())
     }
 
+    /// Replace one attribute's cells and value at the run's current version, in one
+    /// transaction. Nothing on DSQL calls this outside tests: the apply writes a run's
+    /// attributes with its row.
     async fn upsert_search_attr_index(
         &self,
         run_key: RunKey,
@@ -318,20 +509,21 @@ impl VisibilityStore for DsqlVisibilityStore {
         attr_type: SearchAttrType,
         value: &SearchAttrValue,
     ) -> Result<()> {
-        let mut permit = self.director.acquire(DbClass::Projection).await?;
-        let connection = permit.connection()?;
-        upsert_search_attr_index_row(
-            connection,
-            run_key,
-            namespace_id,
-            attr_id,
-            attr_type,
-            value,
+        let image = ImageAttributes::build(
+            &[(AttrDescriptor { attr_id, attr_type }, value.clone())],
             false,
-        )
-        .await
+        )?;
+        let mut permit = self.director.acquire(DbClass::Projection).await?;
+        let mut tx = permit.connection()?.begin().await?;
+        let version = current_version_of(&mut tx, namespace_id, run_key).await?;
+        delete_attribute_at(&mut tx, namespace_id, run_key, version, attr_id, attr_type).await?;
+        insert_cells(&mut tx, namespace_id, run_key, version, &image.cells).await?;
+        insert_values(&mut tx, namespace_id, run_key, version, &image.values).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
+    /// Delete one attribute's cells and value at the run's current version.
     async fn remove_search_attr_index(
         &self,
         run_key: RunKey,
@@ -340,8 +532,11 @@ impl VisibilityStore for DsqlVisibilityStore {
         attr_type: SearchAttrType,
     ) -> Result<()> {
         let mut permit = self.director.acquire(DbClass::Projection).await?;
-        let connection = permit.connection()?;
-        remove_search_attr_index_row(connection, run_key, namespace_id, attr_id, attr_type).await
+        let mut tx = permit.connection()?.begin().await?;
+        let version = current_version_of(&mut tx, namespace_id, run_key).await?;
+        delete_attribute_at(&mut tx, namespace_id, run_key, version, attr_id, attr_type).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Autocommit, one counter row at a time, so not atomic with any row's apply.
@@ -707,14 +902,16 @@ async fn hydrate_component_attributes(
         return Ok(());
     }
     let run_keys: Vec<Uuid> = executions.iter().map(|row| row.run_key.0).collect();
-    // Index cells repeat the full value for each element/token. DISTINCT returns
-    // one typed image per attribute without an N+1 query or cross-namespace join.
+    // One value per attribute per image (`bounded-visibility-apply`). Rows of other
+    // versions, awaiting cleanup, are skipped below: only the listed row's version
+    // is the run's attributes.
     let values = sqlx::query(
-        "SELECT DISTINCT idx.run_key, registry.attr_name, idx.value_data
-         FROM execution_visibility_attr_index idx
-         JOIN sa_registry registry ON registry.namespace_id = idx.namespace_id
-             AND registry.attr_id = idx.attr_id
-         WHERE idx.namespace_id = $1 AND idx.run_key = ANY($2)",
+        "SELECT value.run_key, value.authority_epoch, value.source_transition_seq,
+                registry.attr_name, value.value_data
+         FROM execution_visibility_attr_value value
+         JOIN sa_registry registry ON registry.namespace_id = value.namespace_id
+             AND registry.attr_id = value.attr_id
+         WHERE value.namespace_id = $1 AND value.run_key = ANY($2)",
     )
     .bind(namespace_id.0)
     .bind(&run_keys)
@@ -722,15 +919,21 @@ async fn hydrate_component_attributes(
     .await?;
     for value in values {
         let key: Uuid = value.try_get("run_key")?;
+        let epoch: i64 = value.try_get("authority_epoch")?;
+        let seq: i64 = value.try_get("source_transition_seq")?;
         let name: String = value.try_get("attr_name")?;
         let data: Vec<u8> = value.try_get("value_data")?;
+        let Some(row) = executions
+            .iter_mut()
+            .find(|row| row.run_key.0 == key && Version::of_row(row) == Version { epoch, seq })
+        else {
+            continue;
+        };
         let decoded: SearchAttrValue = codec::decode(&data)?;
-        if let Some(row) = executions.iter_mut().find(|row| row.run_key.0 == key) {
-            anyhow::ensure!(
-                row.search_attributes.0.insert(name, decoded).is_none(),
-                "conflicting component visibility attribute images for run {key}"
-            );
-        }
+        anyhow::ensure!(
+            row.search_attributes.0.insert(name, decoded).is_none(),
+            "conflicting component visibility attribute images for run {key}"
+        );
     }
     Ok(())
 }
@@ -832,28 +1035,6 @@ async fn upsert_execution_row(
     Ok(result.rows_affected() > 0)
 }
 
-async fn clear_search_attr_index_rows(
-    connection: &mut PgConnection,
-    run_key: RunKey,
-    namespace_id: NamespaceId,
-) -> Result<()> {
-    // Snapshot application replaces a run's whole attribute set (the deliberate
-    // in-transaction-replace deviation; V052). Deleting all the run's rows first
-    // means a removed attribute does not stay queryable after a newer snapshot
-    // omits it, and only the current image is ever present (so queries need no
-    // generation join). The storage load relies on it too: it seeds a workflow's
-    // used-versions list from any one of the attribute's rows (`projection-passes`
-    // criterion 2.4), so every row a list leaves must belong to the same image.
-    sqlx::query(
-        "DELETE FROM execution_visibility_attr_index WHERE namespace_id = $1 AND run_key = $2",
-    )
-    .bind(namespace_id.0)
-    .bind(run_key.0)
-    .execute(connection)
-    .await?;
-    Ok(())
-}
-
 /// One inverted-index row: a canonical `discriminator` (the PK component that makes
 /// multi-value attributes unique) plus the single populated typed column.
 #[derive(Default)]
@@ -920,52 +1101,6 @@ fn attr_cells(attr_type: SearchAttrType, value: &SearchAttrValue) -> Result<Vec<
     })
 }
 
-/// Writes one row per cell of `value`, each carrying the whole encoded value in
-/// `value_data`. The storage load seeds a workflow's used-versions list from any one of
-/// the attribute's rows (`projection-passes` criterion 2.4), so no row may hold part of a
-/// list. `ON CONFLICT DO NOTHING` leaves an existing row's older value in place, which is
-/// why the apply clears the run's rows first.
-async fn upsert_search_attr_index_row(
-    connection: &mut PgConnection,
-    run_key: RunKey,
-    namespace_id: NamespaceId,
-    attr_id: AttrId,
-    attr_type: SearchAttrType,
-    value: &SearchAttrValue,
-    preserve_empty: bool,
-) -> Result<()> {
-    let attr_id = i64_from_u64(attr_id.0, "search attribute id")?;
-    let value_data = codec::encode(value)?;
-    for cell in stored_attr_cells(attr_type, value, preserve_empty)? {
-        sqlx::query(
-            r#"
-            INSERT INTO execution_visibility_attr_index (
-                namespace_id, run_key, attr_id, attr_type, value_discriminator,
-                keyword_value, int_value, bool_value, double_value, datetime_value,
-                text_token, value_data
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            ON CONFLICT DO NOTHING
-            "#,
-        )
-        .bind(namespace_id.0)
-        .bind(run_key.0)
-        .bind(attr_id)
-        .bind(attr_type.to_db_smallint())
-        .bind(&cell.discriminator)
-        .bind(cell.keyword_value.as_deref())
-        .bind(cell.int_value)
-        .bind(cell.bool_value)
-        .bind(cell.double_value)
-        .bind(cell.datetime_value)
-        .bind(cell.text_token.as_deref())
-        .bind(&value_data)
-        .execute(&mut *connection)
-        .await?;
-    }
-    Ok(())
-}
-
 fn stored_attr_cells(
     attr_type: SearchAttrType,
     value: &SearchAttrValue,
@@ -981,26 +1116,51 @@ fn stored_attr_cells(
     Ok(cells)
 }
 
-async fn remove_search_attr_index_row(
+/// The run's current version, read by namespace and run key, for the trait's
+/// single-attribute writes, which aren't given the archetype.
+async fn current_version_of(
     connection: &mut PgConnection,
-    run_key: RunKey,
     namespace_id: NamespaceId,
+    run_key: RunKey,
+) -> Result<Version> {
+    let (epoch, seq): (i64, i64) = sqlx::query_as(
+        "SELECT authority_epoch, source_transition_seq FROM execution_visibility_current
+         WHERE namespace_id = $1 AND run_key = $2",
+    )
+    .bind(namespace_id.0)
+    .bind(run_key.0)
+    .fetch_optional(connection)
+    .await?
+    .ok_or_else(|| anyhow!("no visibility row for run {}", run_key.0))?;
+    Ok(Version { epoch, seq })
+}
+
+/// Delete one attribute's cells and value at `version`.
+async fn delete_attribute_at(
+    connection: &mut PgConnection,
+    namespace_id: NamespaceId,
+    run_key: RunKey,
+    version: Version,
     attr_id: AttrId,
     attr_type: SearchAttrType,
 ) -> Result<()> {
     let attr_id = i64_from_u64(attr_id.0, "search attribute id")?;
-    sqlx::query(
-        r#"
-        DELETE FROM execution_visibility_attr_index
-        WHERE namespace_id = $1 AND run_key = $2 AND attr_id = $3 AND attr_type = $4
-        "#,
-    )
-    .bind(namespace_id.0)
-    .bind(run_key.0)
-    .bind(attr_id)
-    .bind(attr_type.to_db_smallint())
-    .execute(connection)
-    .await?;
+    for statement in [
+        "DELETE FROM execution_visibility_attr_cell WHERE namespace_id = $1 AND run_key = $2
+         AND authority_epoch = $3 AND source_transition_seq = $4 AND attr_id = $5 AND attr_type = $6",
+        "DELETE FROM execution_visibility_attr_value WHERE namespace_id = $1 AND run_key = $2
+         AND authority_epoch = $3 AND source_transition_seq = $4 AND attr_id = $5 AND attr_type = $6",
+    ] {
+        sqlx::query(statement)
+            .bind(namespace_id.0)
+            .bind(run_key.0)
+            .bind(version.epoch)
+            .bind(version.seq)
+            .bind(attr_id)
+            .bind(attr_type.to_db_smallint())
+            .execute(&mut *connection)
+            .await?;
+    }
     Ok(())
 }
 
@@ -1116,7 +1276,7 @@ fn compile_is_null(field: &FieldRef, compiler: &mut SqlCompiler) -> Result<Strin
                 "search attribute id",
             )?));
             Ok(format!(
-                "NOT EXISTS (SELECT 1 FROM {ATTR_INDEX_TABLE} idx WHERE idx.namespace_id = execution_visibility_current.namespace_id AND idx.run_key = execution_visibility_current.run_key AND idx.attr_id = {attr})"
+                "NOT EXISTS (SELECT 1 FROM {ATTR_CELL_TABLE} idx WHERE {CELL_AT_ROW_VERSION} AND idx.attr_id = {attr})"
             ))
         }
     }
@@ -1219,7 +1379,7 @@ fn compile_multi_value_compare(
             )?));
             let value = compiler.push(value);
             Ok(format!(
-                "run_key IN (SELECT run_key FROM {ATTR_INDEX_TABLE} WHERE namespace_id = $1 AND attr_id = {attr} AND attr_type = {type_id} AND {column} = {value})"
+                "{ROW_AT_VERSION} IN (SELECT {CELL_VERSION_COLUMNS} FROM {ATTR_CELL_TABLE} WHERE namespace_id = $1 AND attr_id = {attr} AND attr_type = {type_id} AND {column} = {value})"
             ))
         }
         CompareOp::Ne => {
@@ -1229,7 +1389,7 @@ fn compile_multi_value_compare(
             )?));
             let value = compiler.push(value);
             Ok(format!(
-                "NOT EXISTS (SELECT 1 FROM {ATTR_INDEX_TABLE} idx WHERE idx.namespace_id = execution_visibility_current.namespace_id AND idx.run_key = execution_visibility_current.run_key AND idx.attr_id = {attr} AND idx.attr_type = {type_id} AND idx.{column} = {value})"
+                "NOT EXISTS (SELECT 1 FROM {ATTR_CELL_TABLE} idx WHERE {CELL_AT_ROW_VERSION} AND idx.attr_id = {attr} AND idx.attr_type = {type_id} AND idx.{column} = {value})"
             ))
         }
         CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge => {
@@ -1254,7 +1414,7 @@ fn compile_scalar_custom_compare(
     )?));
     let value = compiler.push(sql_value_for_attr(attr_type, value)?);
     Ok(format!(
-        "run_key IN (SELECT run_key FROM {table} WHERE namespace_id = $1 AND attr_id = {attr} AND attr_type = {type_id} AND {column} {} {value})",
+        "{ROW_AT_VERSION} IN (SELECT {CELL_VERSION_COLUMNS} FROM {table} WHERE namespace_id = $1 AND attr_id = {attr} AND attr_type = {type_id} AND {column} {} {value})",
         compare_operator(op)
     ))
 }
@@ -1322,7 +1482,7 @@ fn compile_custom_in(
         .map(|value| compiler.push(value))
         .collect::<Vec<_>>();
     Ok(format!(
-        "run_key IN (SELECT run_key FROM {table} WHERE namespace_id = $1 AND attr_id = {attr} AND attr_type = {type_id} AND {column} IN ({}))",
+        "{ROW_AT_VERSION} IN (SELECT {CELL_VERSION_COLUMNS} FROM {table} WHERE namespace_id = $1 AND attr_id = {attr} AND attr_type = {type_id} AND {column} IN ({}))",
         placeholders.join(", ")
     ))
 }
@@ -1364,7 +1524,7 @@ fn compile_between(
             let low = compiler.push(sql_value_for_attr(*attr_type, low)?);
             let high = compiler.push(sql_value_for_attr(*attr_type, high)?);
             Ok(format!(
-                "run_key IN (SELECT run_key FROM {table} WHERE namespace_id = $1 AND attr_id = {attr} AND attr_type = {type_id} AND {column} BETWEEN {low} AND {high})"
+                "{ROW_AT_VERSION} IN (SELECT {CELL_VERSION_COLUMNS} FROM {table} WHERE namespace_id = $1 AND attr_id = {attr} AND attr_type = {type_id} AND {column} BETWEEN {low} AND {high})"
             ))
         }
     }
@@ -1406,7 +1566,7 @@ fn compile_starts_with(
             };
             let pattern = compiler.push(SqlValue::Text(like_prefix(&prefix)));
             Ok(format!(
-                "run_key IN (SELECT run_key FROM {table} WHERE namespace_id = $1 AND attr_id = {attr} AND attr_type = {type_id} AND {column} LIKE {pattern} ESCAPE '\\')"
+                "{ROW_AT_VERSION} IN (SELECT {CELL_VERSION_COLUMNS} FROM {table} WHERE namespace_id = $1 AND attr_id = {attr} AND attr_type = {type_id} AND {column} LIKE {pattern} ESCAPE '\\')"
             ))
         }
     }
@@ -1507,12 +1667,22 @@ fn system_column(field: SystemField) -> &'static str {
     }
 }
 
-/// The single generalized inverted-index table that replaces the per-type `sa_*`
-/// tables; `run_key` correlates each row to its execution.
-const ATTR_INDEX_TABLE: &str = "execution_visibility_attr_index";
+/// Correlates a cell subquery aliased `idx` with the outer visibility row at the row's
+/// version: only those cells are the run's attributes (`bounded-visibility-apply`).
+const CELL_AT_ROW_VERSION: &str = "idx.namespace_id = execution_visibility_current.namespace_id \
+    AND idx.run_key = execution_visibility_current.run_key \
+    AND idx.authority_epoch = execution_visibility_current.authority_epoch \
+    AND idx.source_transition_seq = execution_visibility_current.source_transition_seq";
+
+/// The outer row's key and version, matched against a cell subquery's
+/// [`CELL_VERSION_COLUMNS`].
+const ROW_AT_VERSION: &str = "(run_key, authority_epoch, source_transition_seq)";
+
+/// A cell's run and version.
+const CELL_VERSION_COLUMNS: &str = "run_key, authority_epoch, source_transition_seq";
 
 /// The typed value column an attribute type is queried through in
-/// [`ATTR_INDEX_TABLE`]. `Keyword`/`KeywordList` share the keyword column.
+/// [`ATTR_CELL_TABLE`]. `Keyword`/`KeywordList` share the keyword column.
 fn attr_value_column(attr_type: SearchAttrType) -> &'static str {
     match attr_type {
         SearchAttrType::Keyword | SearchAttrType::KeywordList => "keyword_value",
@@ -1527,7 +1697,7 @@ fn attr_value_column(attr_type: SearchAttrType) -> &'static str {
 /// The table a custom-attribute predicate scans (one shared table now); retained so
 /// the per-query scan metric still has a stable label.
 fn index_table(_attr_type: SearchAttrType) -> Result<&'static str> {
-    Ok(ATTR_INDEX_TABLE)
+    Ok(ATTR_CELL_TABLE)
 }
 
 fn sort_clause(sort: SortOrder) -> &'static str {
@@ -1685,6 +1855,37 @@ async fn count_custom_group(
     attr_id: AttrId,
     attr_type: SearchAttrType,
 ) -> Result<CountResult> {
+    let (sql, values) = custom_group_sql(filter, attr_id, attr_type)?;
+    // SQL safety: `sql` is the SQL compiler's output. Request values reach it
+    // only as `$n` placeholders (Property 2) and are bound below; interpolated
+    // identifiers come from the compiler's own tables.
+    let mut query = sqlx::query(AssertSqlSafe(sql)).bind(namespace_id.0);
+    query = bind_sql_values(query, &values);
+    let mut permit = director.acquire(DbClass::Projection).await?;
+    let rows = query.fetch_all(permit.connection()?).await?;
+    let mut total_count = 0;
+    let mut groups = Vec::new();
+    for row in rows {
+        let count = row.try_get("group_count")?;
+        total_count += count;
+        groups.push(RollupCounter {
+            value: custom_group_value(attr_type, &row)?,
+            count,
+        });
+    }
+    Ok(CountResult {
+        total_count,
+        groups,
+    })
+}
+
+/// The Count grouped by a custom attribute: each listed row joined with its attribute's
+/// cell at the row's version.
+fn custom_group_sql(
+    filter: &CompiledFilter,
+    attr_id: AttrId,
+    attr_type: SearchAttrType,
+) -> Result<(String, Vec<SqlValue>)> {
     if matches!(
         attr_type,
         SearchAttrType::KeywordList | SearchAttrType::Text
@@ -1714,32 +1915,14 @@ async fn count_custom_group(
         ) ve
         LEFT JOIN {table} idx ON idx.run_key = ve.run_key
             AND idx.namespace_id = ve.namespace_id
+            AND idx.authority_epoch = ve.authority_epoch
+            AND idx.source_transition_seq = ve.source_transition_seq
             AND idx.attr_id = {attr_placeholder}
             AND idx.attr_type = {type_id}
         GROUP BY idx.{column}
         "#
     );
-    // SQL safety: `sql` is the SQL compiler's output. Request values reach it
-    // only as `$n` placeholders (Property 2) and are bound below; interpolated
-    // identifiers come from the compiler's own tables.
-    let mut query = sqlx::query(AssertSqlSafe(sql)).bind(namespace_id.0);
-    query = bind_sql_values(query, &values);
-    let mut permit = director.acquire(DbClass::Projection).await?;
-    let rows = query.fetch_all(permit.connection()?).await?;
-    let mut total_count = 0;
-    let mut groups = Vec::new();
-    for row in rows {
-        let count = row.try_get("group_count")?;
-        total_count += count;
-        groups.push(RollupCounter {
-            value: custom_group_value(attr_type, &row)?,
-            count,
-        });
-    }
-    Ok(CountResult {
-        total_count,
-        groups,
-    })
+    Ok((sql, values))
 }
 
 fn system_group_value(field: SystemField, row: &PgRow) -> Result<String> {
@@ -2174,7 +2357,7 @@ mod tests {
         let (sql, values, _) = compile_filter(&filter, 2).unwrap();
 
         assert!(sql.contains("NOT EXISTS"));
-        assert!(sql.contains("execution_visibility_attr_index"));
+        assert!(sql.contains("execution_visibility_attr_cell"));
         assert!(sql.contains("keyword_value"));
         assert!(!sql.contains("value <>"));
         assert_eq!(
@@ -2208,7 +2391,7 @@ mod tests {
         };
 
         let (sql, values, _) = compile_filter(&single, 2).unwrap();
-        assert!(sql.contains("execution_visibility_attr_index"));
+        assert!(sql.contains("execution_visibility_attr_cell"));
         assert!(sql.contains("text_token"));
         assert_eq!(
             values,
@@ -2238,11 +2421,104 @@ mod tests {
 
         let (sql, values, _) = compile_filter(&filter, 2).unwrap();
 
-        assert!(sql.contains("execution_visibility_attr_index"));
+        assert!(sql.contains("execution_visibility_attr_cell"));
         assert!(sql.contains("text_token"));
         assert_eq!(
             values,
             vec![SqlValue::Int(9), SqlValue::Text("hello".to_owned())]
+        );
+    }
+
+    /// Every compiled shape over custom attributes, one filter each.
+    fn custom_attribute_filters() -> Vec<FilterExpr> {
+        let field = |attr_type| FieldRef::Custom {
+            name: "attribute".to_owned(),
+            attr_id: AttrId(7),
+            attr_type,
+        };
+        vec![
+            FilterExpr::IsNull {
+                field: field(SearchAttrType::Keyword),
+            },
+            FilterExpr::Compare {
+                field: field(SearchAttrType::KeywordList),
+                op: CompareOp::Eq,
+                value: FilterValue::String("a".to_owned()),
+            },
+            FilterExpr::Compare {
+                field: field(SearchAttrType::KeywordList),
+                op: CompareOp::Ne,
+                value: FilterValue::String("a".to_owned()),
+            },
+            FilterExpr::Compare {
+                field: field(SearchAttrType::Text),
+                op: CompareOp::Eq,
+                value: FilterValue::String("word".to_owned()),
+            },
+            FilterExpr::Compare {
+                field: field(SearchAttrType::Int),
+                op: CompareOp::Gt,
+                value: FilterValue::Int(3),
+            },
+            FilterExpr::In {
+                field: field(SearchAttrType::Keyword),
+                values: vec![
+                    FilterValue::String("a".to_owned()),
+                    FilterValue::String("b".to_owned()),
+                ],
+            },
+            FilterExpr::Between {
+                field: field(SearchAttrType::Int),
+                low: FilterValue::Int(1),
+                high: FilterValue::Int(9),
+            },
+            FilterExpr::StartsWith {
+                field: field(SearchAttrType::Keyword),
+                prefix: "pre".to_owned(),
+            },
+        ]
+    }
+
+    // `bounded-visibility-apply` criterion 2.2: a query matches only cells at the run's
+    // current version, so it never sees two images of a run, or part of one.
+    #[test]
+    fn every_custom_attribute_query_matches_the_rows_version() {
+        for expr in custom_attribute_filters() {
+            let filter = CompiledFilter {
+                archetype: None,
+                expr: Some(expr.clone()),
+            };
+            let (sql, _, _) = compile_filter(&filter, 2).unwrap();
+            assert!(
+                sql.contains("execution_visibility_attr_cell"),
+                "{expr:?}: {sql}"
+            );
+            assert!(
+                !sql.contains("execution_visibility_attr_index"),
+                "{expr:?}: {sql}"
+            );
+            let correlated = sql.contains(CELL_AT_ROW_VERSION);
+            let uncorrelated = sql.contains(&format!(
+                "{ROW_AT_VERSION} IN (SELECT {CELL_VERSION_COLUMNS} FROM execution_visibility_attr_cell"
+            ));
+            assert!(
+                correlated || uncorrelated,
+                "{expr:?} matches the row's version: {sql}"
+            );
+        }
+        let (sql, _) = custom_group_sql(
+            &CompiledFilter::default(),
+            AttrId(7),
+            SearchAttrType::Keyword,
+        )
+        .unwrap();
+        assert!(
+            sql.contains("idx.authority_epoch = ve.authority_epoch"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("idx.source_transition_seq = ve.source_transition_seq"),
+            "{sql}"
         );
     }
 
@@ -2375,7 +2651,7 @@ mod tests {
         uuid::Uuid::from_u128(value)
     }
 
-    fn test_projection_context(status: ExecutionStatus) -> ProjectionContext {
+    pub(super) fn test_projection_context(status: ExecutionStatus) -> ProjectionContext {
         ProjectionContext {
             archetype_id: ArchetypeId::WORKFLOW,
             namespace_id: NamespaceId(uuid_from_u128(1)),
@@ -2524,7 +2800,7 @@ mod tests {
     }
 
     #[cfg(feature = "dsql-integration")]
-    fn live_image(
+    pub(super) fn live_image(
         run_key: RunKey,
         namespace_id: NamespaceId,
         transition_seq: u64,

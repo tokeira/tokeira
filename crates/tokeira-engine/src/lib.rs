@@ -3081,6 +3081,15 @@ async fn build_dsql_stack(
         tokeira_storage::dsql::DsqlWorkerTaskProvenanceStore::new(director.clone()),
     );
     let visibility_store = DsqlVisibilityStore::new(director);
+    // Before anything here can apply an image (the projectors, the CHASM visibility
+    // adapter, the visibility repair scanner), copy an earlier release's attribute
+    // index into its versioned layout. The listener-backed and embedded engines both
+    // build their stack here; a finished copy returns at once, and an interrupted one
+    // resumes from its stored position (`bounded-visibility-apply`).
+    visibility_store
+        .copy_legacy_attributes()
+        .await
+        .context("failed to copy the visibility attribute index")?;
     let worker_deployment_repository: Arc<dyn WorkerDeploymentRepository> =
         Arc::new(worker_deployment_repository);
     build_service_stack_with_storage(
@@ -5157,6 +5166,39 @@ mod tests {
     // Endpoint target/config types are referenced only by the Nexus endpoint store
     // tests below; importing them here (not at crate scope) keeps the lib build clean.
     use tokeira_runtime::{EndpointTarget, NexusEndpointConfig};
+
+    // `bounded-visibility-apply`: the listener-backed and embedded engines both build
+    // their DSQL stack in `build_dsql_stack`, which copies the attribute index before it
+    // builds anything that can apply an image (the projectors, the CHASM visibility
+    // adapter and the visibility repair scanner all come from
+    // `build_service_stack_with_storage`).
+    #[test]
+    fn the_dsql_stack_copies_the_attribute_index_before_anything_applies_an_image() {
+        let source = include_str!("lib.rs");
+        assert_eq!(
+            source.matches("build_dsql_stack(\n").count(),
+            3,
+            "the definition, build_and_serve's DSQL branch and the embedded engine"
+        );
+        let start = source
+            .find("async fn build_dsql_stack(")
+            .expect("build_dsql_stack is defined");
+        let body = &source[start..];
+        let end = body[1..]
+            .find("\nasync fn ")
+            .map_or(body.len(), |end| end + 1);
+        let body = &body[..end];
+        let copy = body
+            .find(".copy_legacy_attributes()")
+            .expect("build_dsql_stack copies the attribute index");
+        let services = body
+            .find("build_service_stack_with_storage(")
+            .expect("build_dsql_stack builds the services");
+        assert!(
+            copy < services,
+            "the copy runs before the services are built"
+        );
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum StartupModelPhase {

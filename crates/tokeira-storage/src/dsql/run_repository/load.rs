@@ -17,16 +17,17 @@ const READ_LEGACY_PROJECTION: &str =
     "SELECT partition_id, fanout, run_key, transition_seq, context_data
     FROM projection_log WHERE run_key = $1 ORDER BY transition_seq DESC LIMIT 1";
 
-/// A workflow run's applied `TemporalUsedWorkerDeploymentVersions` value. The
-/// attribute index keeps the whole encoded value on every row it writes for the
-/// attribute, so any one row gives the list (`projection-passes` criterion 2.4).
+/// A workflow run's applied `TemporalUsedWorkerDeploymentVersions` value: the one the
+/// visibility store keeps for the attribute at the row's version
+/// (`projection-passes` criterion 2.4, `bounded-visibility-apply`).
 const READ_APPLIED_PROJECTION_SEED: &str = "SELECT v.authority_epoch, v.source_transition_seq, \
     v.business_id, v.run_id, a.value_data \
     FROM execution_visibility_current v \
     LEFT JOIN sa_registry r ON r.namespace_id = v.namespace_id \
         AND r.attr_name = 'TemporalUsedWorkerDeploymentVersions' \
-    LEFT JOIN execution_visibility_attr_index a ON a.namespace_id = v.namespace_id \
-        AND a.run_key = v.run_key AND a.attr_id = r.attr_id \
+    LEFT JOIN execution_visibility_attr_value a ON a.namespace_id = v.namespace_id \
+        AND a.run_key = v.run_key AND a.authority_epoch = v.authority_epoch \
+        AND a.source_transition_seq = v.source_transition_seq AND a.attr_id = r.attr_id \
     WHERE v.namespace_id = $1 AND v.archetype_id = $3 AND v.run_key = $2 \
     LIMIT 1";
 

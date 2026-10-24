@@ -151,13 +151,21 @@ impl Live {
             .collect())
     }
 
-    /// Each of the run's used-versions attribute rows, as its keyword and its whole
-    /// encoded value: the rows the storage load seeds an unseeded run from.
+    /// Each of the run's used-versions cells at its row's version, as its keyword, with
+    /// the attribute's value at that version: the value the storage load seeds an
+    /// unseeded run from.
     async fn used_versions_rows(&self, run_key: RunKey) -> Result<Vec<(String, SearchAttrValue)>> {
         sqlx::query_as::<_, (Option<String>, Vec<u8>)>(
-            "SELECT a.keyword_value, a.value_data FROM execution_visibility_attr_index a \
-             JOIN sa_registry r ON r.namespace_id = a.namespace_id AND r.attr_id = a.attr_id \
-             WHERE a.namespace_id = $1 AND a.run_key = $2 AND r.attr_name = $3",
+            "SELECT c.keyword_value, value.value_data FROM execution_visibility_current v \
+             JOIN sa_registry r ON r.namespace_id = v.namespace_id AND r.attr_name = $3 \
+             JOIN execution_visibility_attr_cell c ON c.namespace_id = v.namespace_id \
+                 AND c.run_key = v.run_key AND c.authority_epoch = v.authority_epoch \
+                 AND c.source_transition_seq = v.source_transition_seq AND c.attr_id = r.attr_id \
+             JOIN execution_visibility_attr_value value ON value.namespace_id = v.namespace_id \
+                 AND value.run_key = v.run_key AND value.authority_epoch = v.authority_epoch \
+                 AND value.source_transition_seq = v.source_transition_seq \
+                 AND value.attr_id = r.attr_id \
+             WHERE v.namespace_id = $1 AND v.archetype_id = 0 AND v.run_key = $2",
         )
         .bind(self.namespace_id.0)
         .bind(run_key.0)
@@ -177,7 +185,8 @@ impl Live {
                 .await?;
         }
         for statement in [
-            "DELETE FROM execution_visibility_attr_index WHERE namespace_id = $1",
+            "DELETE FROM execution_visibility_attr_cell WHERE namespace_id = $1",
+            "DELETE FROM execution_visibility_attr_value WHERE namespace_id = $1",
             "DELETE FROM execution_visibility_current WHERE namespace_id = $1",
             "DELETE FROM execution_visibility_rollup WHERE namespace_id = $1",
             "DELETE FROM sa_registry WHERE namespace_id = $1",

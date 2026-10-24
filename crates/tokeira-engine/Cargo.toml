@@ -86,8 +86,11 @@ prost-types = "0.14"
 proptest.workspace = true
 # The embedder compile check declares its own tasks, and `Task` requires serde.
 serde.workspace = true
+# The live attribute-copy check seeds and reads an operator-supplied cluster.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "time", "uuid"] }
 tonic-prost = "0.14"
 url.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

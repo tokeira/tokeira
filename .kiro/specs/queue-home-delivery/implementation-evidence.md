@@ -114,7 +114,7 @@ At implementation revision `420441131d532a438750e272daa3fe98cafa4fdb`, the follo
 Shard-zero recovery-candidate / dispatch counts were 0 / 0 after each new suite and 31 / 28 after the existing
 ordered-page suite. The new storage fixtures use reserved homes and remove their own keys; the start baseline
 terminates and removes its runs and relinquishes its leases. Placement preparation ran before lease-taking work.
-Both task-owned Aurora DSQL clusters were deleted and their absence verified. The ephemeral validation devbox
+Both original validation clusters were deleted and their absence verified. The ephemeral validation devbox
 was expired and its absence from the active inventory verified.
 
 ## Non-live validation
@@ -133,3 +133,29 @@ the exploration property unexpectedly succeed. Each failed its named invariant, 
 file was restored byte for byte. The schema checksum/digest audit preserves the complete merged migration prefix.
 The scratch changie dry run, offline Markdown link check, `git diff --check`, and dependency bans/licenses/sources
 checks also passed. No dependency version or lockfile changed.
+
+## Review follow-up
+
+The review fix in `d2b365e086efc21ae24fc2a6619c8613d89dc9de` is based on
+`0053c6ac03351580b08f64982744d9b95300b35a`. `HistoryNotifyingRepository`, which the engine places around
+the runtime repository, now forwards the sticky-page operation. The regression uses committed sticky and
+non-sticky runs across distinct homes and checks populated pages, the requested limit, cursor continuation,
+exhaustion and payload equality with the underlying store.
+
+The regression passed locally and in the full workspace suite. A negative control removed only that forwarding
+method: the regression failed with the precise unsupported-operation error. Restoring the source byte for byte
+made it pass again. The DSQL fetch now executes the unchanged key-page/payload-join statement directly on its
+connection; its single statement supplies the shared snapshot without an explicit transaction.
+
+The complete finish bar passed on the rebased tree, including 3,948 workspace tests and the same two existing
+opt-in skips. Formatting, lint, workspace check, doctests, warning-clean documentation, the offline Markdown
+link check and scratch changie dry run passed. The source used remotely was verified byte for byte against the
+local review tree.
+
+All four focused live suites listed above passed again with the review fix: three first/deep-continuation plans
+over 8,192 rows, all sixteen remote-start read cases, all 100 generated sticky-page cases and the existing
+ordered-page contract. The single-statement pages retained index-bound continuation and primary-key payload
+lookups. Every recorded inline/split read total matched the baseline matrix. Shard-zero counts were again 0 / 0
+after each new suite and 31 / 28 after the existing ordered-page suite.
+The additional ephemeral Aurora DSQL cluster was deleted and its absence verified. The review devbox was
+expired and its absence from the active inventory verified.

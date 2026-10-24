@@ -1342,6 +1342,21 @@ pub trait RunRepository: Send + Sync {
         limit: std::num::NonZeroU32,
     ) -> Result<WorkflowDispatchPage>;
 
+    /// Read sticky intent for one execution home in strict run-key order.
+    ///
+    /// At most 64 keys and their payloads are read from one snapshot. This
+    /// neither claims rows nor changes ordinary non-sticky discovery. Advance
+    /// from `last_examined` even when all candidates are refused; restart from
+    /// the head after exhaustion to revisit inserts behind the cursor.
+    async fn list_sticky_workflow_dispatch(
+        &self,
+        _home: ShardId,
+        _after: Option<RunKey>,
+        _limit: std::num::NonZeroU32,
+    ) -> Result<crate::StickyWorkflowDispatchPage> {
+        anyhow::bail!("sticky workflow dispatch pages are not implemented by this repository")
+    }
+
     /// Enumerate every derived key for one execution home, including sticky rows.
     /// The caller owns this pass-local continuation; no database cursor survives.
     async fn list_workflow_dispatch_for_home(
@@ -3058,6 +3073,17 @@ where
     ) -> Result<Vec<RunKey>> {
         (**self)
             .list_workflow_dispatch_for_home(home, after, limit)
+            .await
+    }
+
+    async fn list_sticky_workflow_dispatch(
+        &self,
+        home: ShardId,
+        after: Option<RunKey>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<crate::StickyWorkflowDispatchPage> {
+        (**self)
+            .list_sticky_workflow_dispatch(home, after, limit)
             .await
     }
 

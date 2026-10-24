@@ -274,6 +274,7 @@ fn startup_schema_contract_migrates_and_accepts_required_tables() {
         (93, "chasm_node_data_parts"),
         (94, "worker_compute_action_part"),
         (95, "worker_compute_action_request_parts"),
+        (96, "workflow_dispatch_sticky_home_index"),
     ] {
         assert!(
             recognized
@@ -283,7 +284,7 @@ fn startup_schema_contract_migrates_and_accepts_required_tables() {
     }
     for current in [
         0, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
-        90, 91, 92, 93, 94, 95,
+        90, 91, 92, 93, 94, 95, 96,
     ] {
         let observed = observation(&recognized, current, (current > 0).then_some(current));
         for policy in [
@@ -291,24 +292,24 @@ fn startup_schema_contract_migrates_and_accepts_required_tables() {
             SchemaMigrationPolicy::ValidateOnly,
         ] {
             let expected = match (current, policy) {
-                (95, _) => SchemaDecision::Compatible {
-                    current: 95,
+                (96, _) => SchemaDecision::Compatible {
+                    current: 96,
                     legacy_backfill: false,
                 },
-                (0, SchemaMigrationPolicy::Automatic) => SchemaDecision::Initialize { target: 95 },
+                (0, SchemaMigrationPolicy::Automatic) => SchemaDecision::Initialize { target: 96 },
                 (_, SchemaMigrationPolicy::Automatic) => SchemaDecision::Migrate {
                     from: current,
-                    to: 95,
+                    to: 96,
                 },
                 (_, SchemaMigrationPolicy::ValidateOnly) => SchemaDecision::MigrationRequired {
                     current,
-                    target: 95,
+                    target: 96,
                 },
             };
             assert_eq!(
                 assess_schema_compatibility(&contract, &recognized, &observed, policy),
                 expected,
-                "Unconditional startup requires V095: current={current}, policy={policy:?}",
+                "Unconditional startup requires V096: current={current}, policy={policy:?}",
             );
         }
     }

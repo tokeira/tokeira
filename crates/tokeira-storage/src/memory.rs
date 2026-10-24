@@ -1147,6 +1147,7 @@ impl RunRepository for InMemoryStore {
     }
 
     async fn load_run_with_stats(&self, run_key: RunKey) -> Result<(LoadedRun, RunHistoryStats)> {
+        crate::read_probe::logical(run_key);
         let started = Instant::now();
         let store = self.inner.lock().await;
         let loaded = match store.runs.get(&run_key) {
@@ -1386,6 +1387,11 @@ impl RunRepository for InMemoryStore {
         transition: Transition,
         fence: WriteFence,
     ) -> Result<CommitResult> {
+        if crate::read_probe::reject_commit(run_key) {
+            return Ok(CommitResult::Conflict {
+                reason: "read-baseline injected OCC conflict".into(),
+            });
+        }
         let started = Instant::now();
         if transition.history_events.len() != transition.event_principals.len() {
             anyhow::bail!(
@@ -2377,6 +2383,32 @@ impl RunRepository for InMemoryStore {
         keys.sort_unstable();
         keys.truncate(limit.get() as usize);
         Ok(keys)
+    }
+
+    async fn list_sticky_workflow_dispatch(
+        &self,
+        home: ShardId,
+        after: Option<RunKey>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<crate::StickyWorkflowDispatchPage> {
+        let limit = limit.get().min(crate::STICKY_WORKFLOW_PAGE_LIMIT) as usize;
+        let store = self.inner.lock().await;
+        let mut candidates: Vec<_> = store
+            .workflow_dispatch
+            .values()
+            .filter(|row| {
+                row.execution_home == home
+                    && row.sticky
+                    && after.is_none_or(|key| row.incarnation.run_key > key)
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|row| row.incarnation.run_key);
+        candidates.truncate(limit);
+        Ok(crate::StickyWorkflowDispatchPage {
+            last_examined: candidates.last().map(|row| row.incarnation.run_key),
+            exhausted: candidates.len() < limit,
+            candidates: candidates.into_iter().cloned().collect(),
+        })
     }
 
     async fn list_dispatchable_workflow_tasks(

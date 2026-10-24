@@ -158,6 +158,7 @@ pub(super) async fn read_parts(
     kind: RunValueKind,
     value_key: i64,
 ) -> Result<NumberedParts> {
+    crate::read_probe::sql(run_key, "sql/value-parts");
     Ok(sqlx::query_as(
         "SELECT part_no, data FROM run_value_part
          WHERE run_key = $1 AND value_kind = $2 AND value_key = $3

@@ -51,6 +51,25 @@ async fn workflow_dispatch_repair_rejects_released_owner() {
 
 #[async_trait]
 impl Backend for InMemoryStore {
+    async fn sticky_seed(&self, rows: &[(ShardId, WorkflowState)]) -> Result<()> {
+        let mut store = self.inner.lock().await;
+        for (home, state) in rows {
+            store.workflow_dispatch.insert(
+                state.run_key,
+                derive_workflow_dispatch(state, *home).unwrap(),
+            );
+        }
+        Ok(())
+    }
+
+    async fn sticky_remove(&self, keys: &[RunKey]) -> Result<()> {
+        let mut store = self.inner.lock().await;
+        for key in keys {
+            store.workflow_dispatch.remove(key);
+        }
+        Ok(())
+    }
+
     fn repo(&self) -> &dyn RunRepository {
         self
     }
@@ -68,6 +87,14 @@ impl Backend for InMemoryStore {
             .insert(state.run_key, row);
         Ok(())
     }
+}
+
+#[test]
+fn queue_home_delivery_sticky_pages_memory() {
+    crate::workflow_dispatch_tests::run_sticky_page_cases(
+        &InMemoryStore::default(),
+        &tokio::runtime::Runtime::new().unwrap(),
+    );
 }
 
 #[test]

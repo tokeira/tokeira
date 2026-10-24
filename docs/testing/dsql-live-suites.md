@@ -23,12 +23,16 @@ lease left by `dsql_shard_leasing::stale_epoch_is_fenced_after_expired_takeover`
 The activity-input runtime fixture also prepares placement and belongs before
 lease-taking suites. Its repository and runtime use the same eight homes as
 the placement and acquisition fixtures.
+The queue-home remote-start read baseline also prepares placement before acquiring
+its two homes. Run it in this preparation-sensitive group; it closes and deletes
+each fixture run and releases both leases before the next case.
 
 ```bash
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_generated_complete_repair)'
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(placement_live_)'
 cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --test dsql_activity_inputs --test-threads 1
 cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs)'
+cargo nextest run -p tokeira-edge --features dsql-integration --locked --profile dsql-live --lib -E 'test(queue_home_delivery_live_read_baseline)'
 ```
 
 Then run the remaining suites below. The generated complete-repair contract uses
@@ -96,6 +100,9 @@ point them at a database holding application data.
 | Storage `dsql_projection_accumulator_*` | 8 | Projection-accumulator contracts: commit images, legacy seeds, the seed from the newer of image and applied value, failure isolation, growth accounting, reset boundaries, mixed writers and pruning, and snapshot races; `dsql-integration`, ignored by default |
 | Storage `workflow_dispatch_live_atomic_reference_traces` | 1 | 100 generated atomic state/dispatch cases, reset materialization, duplicate/CAS rejection, rollback, and deletion; `dsql-integration`, URL gate only |
 | Storage `workflow_dispatch_live_ordered_pages` | 1 | Normal/Exact paging, home scans including sticky rows, reset boundaries, speculative legacy delivery, and forced digest collisions; `dsql-integration`, URL gate only |
+| Storage `queue_home_delivery_live_sticky_pages` | 1 | 100 shared generated bounded sticky traversals and cursor mutations on reserved homes, removing only the fixture's own keys; `dsql-integration`, URL gate only |
+| Storage `queue_home_delivery_live_sticky_query_plans` | 1 | Actual first and deep continuation SQL over 8,192 fixture rows: sticky partial-index bounds and bounded primary-key payload lookups; set `TOKEIRA_QUEUE_HOME_PLAN_OUTPUT` to save plans; `dsql-integration`, URL gate only |
+| Edge `queue_home_delivery_live_read_baseline` | 1 | 16 actual remote starts: normal/sticky, warm/cold, inline/split state, and one injected commit conflict or none, with logical run loads and physical read SQL attributed by node and phase; `dsql-integration`, URL gate only |
 | Storage `workflow_dispatch_live_reset_uses_execution_home` | 1 | Eight-shard reset placement of hot state, timers and dispatch before any follow-up commit, with execution home distinct from the successor run-hash shard; `dsql-integration`, URL gate only |
 | Storage `workflow_dispatch_live_generated_ordered_traversal` | 1 | Property 3: 100 generated ordered traversals, ties, multiple execution homes, read-only pages and mutations behind a cursor; `dsql-integration`, URL gate only |
 | Storage `workflow_dispatch_live_generated_sticky_recovery` | 1 | Property 7: 100 generated durable deadline, affinity-reset, paused, speculative, closed and legacy cases, with normal rediscovery after timeout; `dsql-integration`, URL gate only |
@@ -140,6 +147,15 @@ minutes each, inside the profile's twenty-minute limit.
 A green result with the URL gates unset is not live evidence. Record the revision, suite,
 and outcome after a credentialed run. Leave out the connection URL, the run's date and
 times, and the Region.
+
+The sticky-page fixtures reserve homes above 1,000,000 and delete only their generated
+keys. The plan fixture and generated contract write dispatch rows directly: they test
+read selection and pagination, independently of atomic maintenance's existing contracts.
+Their reserved homes do not add recovery work to other suites. Run their checks serially:
+
+```bash
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --lib -E 'test(queue_home_delivery_live_sticky_)'
+```
 
 The workflow-dispatch tests use only `TOKEIRA_DSQL_TEST_DATABASE_URL`, apply the
 embedded migrations, and await ASYNC index readiness. Run them serially on an

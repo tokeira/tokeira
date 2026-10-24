@@ -54,16 +54,17 @@ where
         let callback_tracking = self
             .completion_callback_tracking
             .for_acquisition(recovery.acquisition.clone());
-        let repair = crate::recovery::RepairAcquisition {
-            owner: self.shard_owner.clone(),
-            acquisition: recovery.acquisition.clone(),
-            max_retries: self.config.max_occ_retries,
-        };
         let fence = self
             .shard_owner
             .read()
             .expect("shard owner lock poisoned")
             .fence_at(shard_id, epoch);
+        let repair = crate::recovery::RepairAcquisition {
+            owner: self.shard_owner.clone(),
+            acquisition: recovery.acquisition.clone(),
+            max_retries: self.config.max_occ_retries,
+            fence: fence.clone(),
+        };
         let shutdown = self.runtime_shutdown.cancellation_token();
         let _exclusive = tokio::select! {
             biased;
@@ -101,10 +102,16 @@ where
         completed: tokio::sync::watch::Sender<Option<Result<(), String>>>,
     ) {
         let mut recovery = self.begin_acquisition(ShardId(0), ShardEpoch::ZERO);
+        let fence = self
+            .shard_owner
+            .read()
+            .expect("shard owner lock poisoned")
+            .fence_at(ShardId(0), ShardEpoch::ZERO);
         let repair = crate::recovery::RepairAcquisition {
             owner: self.shard_owner.clone(),
             acquisition: recovery.acquisition.clone(),
             max_retries: self.config.max_occ_retries,
+            fence: fence.clone(),
         };
         let repo = self.repo.clone();
         let broker = self.broker.clone();
@@ -125,11 +132,6 @@ where
             .for_acquisition(recovery.acquisition.clone());
         let purger = self.purger.clone();
         let shutdown = self.runtime_shutdown.cancellation_token();
-        let fence = self
-            .shard_owner
-            .read()
-            .expect("shard owner lock poisoned")
-            .fence_at(ShardId(0), ShardEpoch::ZERO);
         let wake = self.disposal_wake.clone();
         let cancel = recovery.acquisition.cancel.clone();
         let _startup = self.runtime_shutdown.spawn(async move {
@@ -299,6 +301,7 @@ where
             owner: self.shard_owner.clone(),
             acquisition: recovery.acquisition.clone(),
             max_retries: self.config.max_occ_retries,
+            fence: fence.clone(),
         };
         let shutdown = self.runtime_shutdown.cancellation_token();
         let _exclusive = tokio::select! {

@@ -2,13 +2,52 @@
 
 use super::*;
 use crate::{
-    BacklogPayload,
+    BacklogPayload, ExecutionHomeFence,
     workflow_dispatch_tests::{
         Backend, ordered_pages, reset_materialization, routing_and_home_pages, run_atomic_cases,
         speculative_legacy_delivery,
     },
 };
 use tokeira_types::LogicalTaskSeq;
+
+// Feature: workflow-dispatch, Property 9: Ownership loss fences repair
+#[tokio::test]
+async fn workflow_dispatch_repair_rejects_released_owner() {
+    let store = InMemoryStore::default();
+    let home = ShardId(0);
+    let LeaseOutcome::Acquired { epoch } = store
+        .try_acquire_bundle(home, "old".into(), "127.0.0.1:7233".into())
+        .await
+        .unwrap()
+    else {
+        panic!("initial lease must be acquired")
+    };
+    let transition = super::projection_accumulator_tests::fresh_transition(RunKey::new());
+    let key = transition.next_state.run_key;
+    store
+        .commit_transition(key, transition, WriteFence::Unfenced)
+        .await
+        .unwrap();
+    store.inner.lock().await.workflow_dispatch.remove(&key);
+    store
+        .relinquish_bundle(home, "old".into(), epoch)
+        .await
+        .unwrap();
+    let error = store
+        .reconcile_workflow_dispatch_run(
+            home,
+            key,
+            WriteFence::Lease(ExecutionHomeFence {
+                home,
+                owner: "old".into(),
+                epoch,
+            }),
+        )
+        .await
+        .expect_err("a released owner must not repair dispatch");
+    assert!(error.is::<LeaseFenceLost>());
+    assert!(store.row(key).await.unwrap().is_none());
+}
 
 #[async_trait]
 impl Backend for InMemoryStore {
@@ -209,7 +248,7 @@ async fn repair_rejects_wrong_home_and_invalid_encoding_without_partial_changes(
     let row = store.row(key).await.unwrap();
     assert!(
         store
-            .reconcile_workflow_dispatch_run(ShardId(1), key)
+            .reconcile_workflow_dispatch_run(ShardId(1), key, WriteFence::Unfenced)
             .await
             .is_err()
     );
@@ -227,7 +266,7 @@ async fn repair_rejects_wrong_home_and_invalid_encoding_without_partial_changes(
     let before = store.snapshot().await.unwrap();
     assert!(
         store
-            .reconcile_workflow_dispatch_run(ShardId(0), key)
+            .reconcile_workflow_dispatch_run(ShardId(0), key, WriteFence::Unfenced)
             .await
             .is_err()
     );
@@ -331,4 +370,58 @@ async fn workflow_disposal_is_bounded_and_failure_leaves_the_entire_page_unchang
                     && cost.bytes <= crate::write_budget::MAX_BYTES_PER_TRANSACTION
             )
     );
+}
+
+// Feature: workflow-dispatch, Property 9: Ownership loss fences repair
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config::with_cases(128))]
+    #[test]
+    fn workflow_dispatch_repair_generated_ownership(
+        home_number in 0u32..8, delete in proptest::bool::ANY,
+        loss in 0u8..3, repair_first in proptest::bool::ANY,
+    ) {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let store = InMemoryStore::with_shard_count(8);
+            let home = ShardId(home_number);
+            let mut transition = super::projection_accumulator_tests::fresh_transition(RunKey::new());
+            transition.next_state.workflow_id = (0..).map(|i| WorkflowId(format!("repair-fence-{i}")))
+                .find(|id| tokeira_types::execution_home_bundle(
+                    transition.next_state.namespace_id.0.as_bytes(), id.0.as_bytes(), 8) == home).unwrap();
+            let key = transition.next_state.run_key;
+            let LeaseOutcome::Acquired { epoch } = store.try_acquire_bundle(home, "old".into(), "endpoint".into()).await.unwrap() else { panic!("acquire") };
+            let fence = WriteFence::Lease(ExecutionHomeFence { home, owner: "old".into(), epoch });
+            store.commit_transition(key, transition, fence.clone()).await.unwrap();
+            {
+                let mut inner = store.inner.lock().await;
+                if delete { inner.runs.remove(&key); }
+                else { inner.workflow_dispatch.remove(&key); }
+            }
+            let authority = store.load_run(key).await.unwrap();
+            if repair_first {
+                store.reconcile_workflow_dispatch_run(home, key, fence.clone()).await.unwrap();
+                assert_eq!(store.row(key).await.unwrap().is_some(), !delete);
+            }
+            if loss == 0 {
+                assert_eq!(store.renew_bundle(home, "old".into(), epoch, "endpoint".into()).await.unwrap(), LeaseOutcome::Renewed { epoch });
+            } else {
+                store.relinquish_bundle(home, "old".into(), epoch).await.unwrap();
+                if loss == 2 {
+                    let LeaseOutcome::Acquired { epoch: next } = store.try_acquire_bundle(home, "new".into(), "endpoint".into()).await.unwrap() else { panic!("successor") };
+                    store.reconcile_workflow_dispatch_run(home, key, WriteFence::Lease(ExecutionHomeFence { home, owner: "new".into(), epoch: next })).await.unwrap();
+                }
+            }
+            let row_before = store.row(key).await.unwrap();
+            let result = store.reconcile_workflow_dispatch_run(home, key, fence).await;
+            if loss == 0 {
+                assert!(result.is_ok());
+                assert_eq!(store.row(key).await.unwrap().is_some(), !delete);
+            } else {
+                assert!(result.unwrap_err().is::<LeaseFenceLost>());
+                assert_eq!(store.row(key).await.unwrap(), row_before);
+            }
+            assert_eq!(store.load_run(key).await.unwrap(), authority);
+            let wrong_home = WriteFence::Lease(ExecutionHomeFence { home: ShardId((home_number+1)%8), owner: "old".into(), epoch });
+            assert!(store.reconcile_workflow_dispatch_run(home, key, wrong_home).await.is_err());
+        });
+    }
 }

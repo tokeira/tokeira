@@ -47,6 +47,7 @@ struct Repo {
     fail: Mutex<Option<Point>>,
     conflicts: AtomicUsize,
     repair_attempts: AtomicUsize,
+    repair_fences: Mutex<Vec<WriteFence>>,
     loads: AtomicUsize,
     preparation_retries: AtomicUsize,
     preparation_attempts: AtomicUsize,
@@ -559,10 +560,16 @@ impl RunRepository for Repo {
             .await
     }
 
-    async fn reconcile_workflow_dispatch_run(&self, home: ShardId, run_key: RunKey) -> Result<()> {
+    async fn reconcile_workflow_dispatch_run(
+        &self,
+        home: ShardId,
+        run_key: RunKey,
+        fence: WriteFence,
+    ) -> Result<()> {
+        self.repair_fences.lock().unwrap().push(fence.clone());
         self.hit(Point::Repair).await?;
         self.inner
-            .reconcile_workflow_dispatch_run(home, run_key)
+            .reconcile_workflow_dispatch_run(home, run_key, fence)
             .await?;
         let row = match self.inner.load_run(run_key).await? {
             LoadedRun::Existing(state) => derive_workflow_dispatch(&state, home),
@@ -1321,4 +1328,205 @@ async fn seeded_default_constructor_repairs_missing_and_stale_rows_before_activa
     );
     assert_eq!(repo.inner.snapshot().await.unwrap(), before);
     stop(&runtime).await;
+}
+
+/// The final comparison is local. The caller has modeled any corresponding
+/// durable lease loss separately; a database read here would not be atomic with Active.
+// Feature: workflow-dispatch, Property 9: Ownership loss fences repair
+pub(super) async fn final_gate_case<R: RunRepository + 'static>(
+    repo: Arc<R>,
+    home: ShardId,
+    epoch: ShardEpoch,
+    fence: WriteFence,
+    loss: u8,
+    activation_first: bool,
+    lease_change: impl std::future::Future<Output = ()>,
+) {
+    let owner = Arc::new(RwLock::new(ShardOwner::new(256)));
+    owner.write().unwrap().record_acquired(home, epoch);
+    let acquisition = owner.read().unwrap().acquisition(home).unwrap();
+    let repair = crate::recovery::RepairAcquisition {
+        owner: owner.clone(),
+        acquisition: acquisition.clone(),
+        max_retries: 3,
+        fence,
+    };
+    crate::recovery::sweep_shard_inner(
+        home,
+        repo.as_ref(),
+        &InMemoryBroker::default(),
+        &WorkflowTimeoutTrackingState::default(),
+        &WftTimeoutTrackingState::default(),
+        &ActivityTrackingState::default(),
+        &NexusTimeoutTrackingState::default(),
+        &CompletionCallbackTrackingState::default(),
+        &repair,
+    )
+    .await
+    .unwrap();
+    let (at_gate, gate_reached) = oneshot::channel();
+    let (resume, resume_gate) = oneshot::channel();
+    let activating = {
+        let owner = owner.clone();
+        let acquisition = acquisition.clone();
+        tokio::spawn(async move {
+            at_gate.send(()).unwrap();
+            resume_gate.await.unwrap();
+            owner.write().unwrap().activate_acquisition(&acquisition)
+        })
+    };
+    gate_reached.await.unwrap();
+    let lose = || {
+        match loss {
+            0 => {} // Renewal leaves this generation, cancellation and deadline valid.
+            1 => acquisition.cancel.cancel(),
+            2 => *acquisition.deadline.lock().unwrap() = Some(tokio::time::Instant::now()),
+            3 => {
+                owner.write().unwrap().record_acquired(home, epoch);
+            }
+            _ => {
+                owner.write().unwrap().record_acquired(home, epoch.next());
+            }
+        }
+    };
+    let activated = if activation_first {
+        resume.send(()).unwrap();
+        let activated = activating.await.unwrap();
+        lease_change.await;
+        lose();
+        activated
+    } else {
+        lease_change.await;
+        lose();
+        resume.send(()).unwrap();
+        activating.await.unwrap()
+    };
+    assert_eq!(
+        activated,
+        activation_first || loss == 0,
+        "invalid acquisition reached Active"
+    );
+    let owner = owner.read().unwrap();
+    assert_eq!(
+        owner.is_active(home),
+        loss == 0,
+        "loss leaves no serving acquisition"
+    );
+    if loss >= 3 {
+        let replacement = owner.acquisition(home).unwrap();
+        assert!(!replacement.cancel.is_cancelled());
+        assert!(!owner.matches_acquisition(&acquisition));
+    }
+}
+
+// Feature: workflow-dispatch, Property 9: Ownership loss fences repair
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config::with_cases(128))]
+    #[test]
+    fn workflow_dispatch_fenced_repair_final_gate(
+        home in 0u32..8, loss in 0u8..5, activation_first in proptest::bool::ANY,
+    ) {
+        tokio::runtime::Runtime::new().unwrap().block_on(final_gate_case(
+            Arc::new(InMemoryStore::with_shard_count(8)), ShardId(home), ShardEpoch(17),
+            WriteFence::Unfenced, loss, activation_first, std::future::ready(())));
+    }
+}
+
+// Feature: workflow-dispatch, Property 9: Ownership loss fences repair
+#[tokio::test]
+async fn workflow_dispatch_repair_keeps_original_fence_and_stops_on_lease_loss() {
+    let repo = Arc::new(Repo {
+        inner: InMemoryStore::with_shard_count(8),
+        ..Default::default()
+    });
+    let (request, home) = timeout_start();
+    let transition =
+        Kernel::apply(&BasicKernel, LoadedRun::Absent, Command::Start(request)).unwrap();
+    let key = transition.next_state.run_key;
+    repo.inner
+        .commit_transition(key, transition, WriteFence::Unfenced)
+        .await
+        .unwrap();
+    let LeaseOutcome::Acquired { epoch } = repo
+        .inner
+        .try_acquire_bundle(home, "old".into(), "endpoint".into())
+        .await
+        .unwrap()
+    else {
+        panic!("lease")
+    };
+    let runtime = home_runtime(repo.clone(), home, true);
+    runtime
+        .shard_owner
+        .write()
+        .unwrap()
+        .fence_writes("old".into());
+    repo.conflicts.store(2, Ordering::SeqCst);
+    let (entered, resume) = repo.pause(Point::Repair);
+    let acquiring = runtime.clone();
+    let task =
+        tokio::spawn(async move { acquiring.recover_self_assigned_shard(home, epoch).await });
+    entered.await.unwrap();
+    repo.inner
+        .relinquish_bundle(home, "old".into(), epoch)
+        .await
+        .unwrap();
+    let LeaseOutcome::Acquired { epoch: next } = repo
+        .inner
+        .try_acquire_bundle(home, "new".into(), "endpoint".into())
+        .await
+        .unwrap()
+    else {
+        panic!("takeover")
+    };
+    // The old local view has not yet heard of the takeover. Its transaction
+    // must discover loss itself and end without exhausting the retry budget.
+    let before = repo.inner.snapshot().await.unwrap();
+    resume.send(()).unwrap();
+    let error = task.await.unwrap().unwrap_err();
+    assert!(error.is::<LeaseFenceLost>(), "{error:#}");
+    assert_eq!(repo.repair_attempts.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        *repo.repair_fences.lock().unwrap(),
+        vec![
+            WriteFence::Lease(ExecutionHomeFence {
+                home,
+                owner: "old".into(),
+                epoch
+            });
+            3
+        ]
+    );
+    assert_eq!(repo.inner.snapshot().await.unwrap(), before);
+    assert!(runtime.active_shards().is_empty());
+    runtime
+        .shard_owner
+        .write()
+        .unwrap()
+        .fence_writes("new".into());
+    runtime
+        .recover_self_assigned_shard(home, next)
+        .await
+        .unwrap();
+    assert_eq!(runtime.active_shards(), vec![home]);
+    stop(&runtime).await;
+}
+
+// Feature: workflow-dispatch, Property 9: Ownership loss fences repair
+#[tokio::test]
+async fn workflow_dispatch_fenced_repair_empty_home_gate_controls() {
+    for loss in 0..5 {
+        for first in [false, true] {
+            final_gate_case(
+                Arc::new(InMemoryStore::with_shard_count(8)),
+                ShardId(7),
+                ShardEpoch(19),
+                WriteFence::Unfenced,
+                loss,
+                first,
+                std::future::ready(()),
+            )
+            .await;
+        }
+    }
 }

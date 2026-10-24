@@ -99,6 +99,8 @@ point them at a database holding application data.
 | Storage `workflow_dispatch_live_generated_sticky_recovery` | 1 | Property 7: 100 generated durable deadline, affinity-reset, paused, speculative, closed and legacy cases, with normal rediscovery after timeout; `dsql-integration`, URL gate only |
 | Storage `workflow_dispatch_live_generated_complete_repair` | 1 | Property 8: 100 generated two-walk repairs, interrupted head restarts, stale/orphan/sticky rows, NULL/false recovery flags and unchanged authoritative bytes; `dsql-integration`, URL gate only |
 | Storage `workflow_dispatch_live_repair_decode_and_encoding_failures_preserve_authority` | 1 | Wrong-home, corrupt hot bytes and invalid sequence encoding abort repair without partial changes; `dsql-integration`, URL gate only |
+| Storage `workflow_dispatch_live_fenced_repair_*` | 2 | Property 9: 100 generated repair interleavings plus ten fixed insertion/deletion controls; takeover and release in both commit orders, renewal, successor writes and terminal fence loss; `dsql-integration`, URL gate only |
+| Runtime `workflow_dispatch_live_fenced_repair_final_gate` | 1 | Property 9: 100 generated empty-home final-gate interleavings with real lease changes and matching local cancellation, expiry or replacement; `dsql-integration`, URL gate only |
 | Runtime `workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs` | 1 | Real lease acquisition, interrupted recovery and rejected old-generation installs in all recovery trackers; runtime `dsql-integration`, URL gate only; run after storage schema bootstrap |
 | Storage `workflow_dispatch_live_query_plans` | 1 | Before/after queue Live/Exact and actual home page SQL, including full traversal of deep equal-time pages, with 16,384 seeded rows; set `TOKEIRA_WORKFLOW_DISPATCH_PLAN_OUTPUT` to save plans, selectivity, returned-row/page-statement counts and traversal durations; `dsql-integration`, URL gate only |
 | Storage `placement_live_` | 4 | Stopped-cluster hot/timer relocation, concurrent starters and late-page exclusion, raw legacy-encoded lease refusal, corruption diagnostics, reset preservation, duplicates/orphans, exact joined continuation plans and screening latency; `dsql-integration`, URL gate only |
@@ -184,6 +186,26 @@ clears them when it finishes. Run them serially:
 ```bash
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(/^dsql::run_repository::lease_fence_tests::/)'
 ```
+
+The workflow repair fence suites run after preparation-sensitive suites, alongside
+the lease-taking suites. Storage owns home 241 of 256, cleans its recovery candidates
+and dispatch keys after each case, and clears its lease. Runtime owns empty home 242
+of 256 and releases its leases after each case. Neither scans shard 0 or another
+suite's home. Storage bootstraps schema before the runtime suite:
+
+```bash
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --lib --test-threads 1 -E 'test(workflow_dispatch_live_fenced_repair_)'
+cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --lib --test-threads 1 -E 'test(workflow_dispatch_live_fenced_repair_final_gate)'
+```
+
+The fixed storage controls keep every other writer off the repair's dispatch key.
+Only the lease changes while repair is paused. Generated cases additionally permit
+successor writes, and use execution homes different from run-hash mappings. A
+negative control that removes the repair fence must preserve its write pause point;
+otherwise it tests a broken barrier instead of the ownership invariant. The runtime
+control invalidates the original acquisition immediately before its local comparison;
+it does not add a separate database read before activation. URL-unset returns count
+as skipped live coverage, even when the test harness reports success.
 
 The history-event tests also use only `TOKEIRA_DSQL_TEST_DATABASE_URL` and apply the
 embedded migrations. The runtime's activity-input tests reuse the migrated database from

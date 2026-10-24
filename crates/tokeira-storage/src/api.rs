@@ -1353,8 +1353,9 @@ pub trait RunRepository: Send + Sync {
     /// Repair one derived row from an authoritative read in the same transaction.
     ///
     /// The caller must hold this execution home non-serving and exclude every
-    /// authoritative writer for the whole acquisition. This single-owner API
-    /// does not provide the deferred transaction-local competing-owner fence.
+    /// authoritative writer for the whole acquisition. The captured acquisition
+    /// fence is validated inside this transaction, including orphan removal.
+    /// Ownership loss is terminal; retries must retain the original fence.
     /// A home mismatch or corrupt state fails without changing authoritative data.
     /// A serialization error requires retrying the entire call with fresh local
     /// acquisition validation; no decoded state may be reused across attempts.
@@ -1362,6 +1363,7 @@ pub trait RunRepository: Send + Sync {
         &self,
         _home: ShardId,
         _run_key: RunKey,
+        _fence: WriteFence,
     ) -> Result<()> {
         anyhow::bail!("workflow dispatch repair is not implemented by this repository")
     }
@@ -3051,9 +3053,14 @@ where
             .await
     }
 
-    async fn reconcile_workflow_dispatch_run(&self, home: ShardId, run_key: RunKey) -> Result<()> {
+    async fn reconcile_workflow_dispatch_run(
+        &self,
+        home: ShardId,
+        run_key: RunKey,
+        fence: WriteFence,
+    ) -> Result<()> {
         self.as_ref()
-            .reconcile_workflow_dispatch_run(home, run_key)
+            .reconcile_workflow_dispatch_run(home, run_key, fence)
             .await
     }
 

@@ -650,7 +650,7 @@ async fn workflow_dispatch_live_repair_decode_and_encoding_failures_preserve_aut
     assert!(
         fixture
             .repo()
-            .reconcile_workflow_dispatch_run(ShardId(1), key)
+            .reconcile_workflow_dispatch_run(ShardId(1), key, WriteFence::Unfenced)
             .await
             .is_err()
     );
@@ -671,7 +671,7 @@ async fn workflow_dispatch_live_repair_decode_and_encoding_failures_preserve_aut
         assert!(
             fixture
                 .repo()
-                .reconcile_workflow_dispatch_run(ShardId(0), key)
+                .reconcile_workflow_dispatch_run(ShardId(0), key, WriteFence::Unfenced)
                 .await
                 .is_err()
         );

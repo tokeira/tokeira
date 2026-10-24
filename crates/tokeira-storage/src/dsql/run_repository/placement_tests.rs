@@ -164,7 +164,8 @@ async fn placement_live_concurrent_starters_and_late_page() -> Result<()> {
                 .fetch_all(&f.pool)
                 .await?;
         assert_eq!(timers, [shard_uuid(home)]);
-        repo.reconcile_workflow_dispatch_run(home, key).await?;
+        repo.reconcile_workflow_dispatch_run(home, key, WriteFence::Unfenced)
+            .await?;
         let dispatch: Uuid =
             sqlx::query_scalar("SELECT shard_id FROM workflow_dispatch WHERE run_key=$1")
                 .bind(key.0)
@@ -437,7 +438,8 @@ async fn placement_live_stopped_reset_duplicates_and_orphan_timers() -> Result<(
             .await?,
         Some(key)
     );
-    repo.reconcile_workflow_dispatch_run(home, key).await?;
+    repo.reconcile_workflow_dispatch_run(home, key, WriteFence::Unfenced)
+        .await?;
     let row: Uuid = sqlx::query_scalar("SELECT shard_id FROM workflow_dispatch WHERE run_key=$1")
         .bind(key.0)
         .fetch_one(&f.pool)

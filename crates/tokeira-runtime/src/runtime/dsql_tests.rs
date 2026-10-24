@@ -7,7 +7,10 @@ use crate::{
     nexus::{CompletionCallbackTrackingEntry, NexusTimeoutEntry},
 };
 use std::path::Path;
-use tokeira_storage::dsql::{DsqlPoolConfig, DsqlStore, MigrationConfig, ReservoirConfig};
+use tokeira_storage::{
+    WriteFence,
+    dsql::{DsqlPoolConfig, DsqlStore, MigrationConfig, ReservoirConfig},
+};
 
 #[tokio::test]
 async fn workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs() -> Result<()> {
@@ -159,4 +162,111 @@ async fn workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs(
         .await?;
     director.shutdown().await?;
     Ok(())
+}
+
+// Feature: workflow-dispatch, Property 9: Ownership loss fences repair
+#[test]
+fn workflow_dispatch_live_fenced_repair_final_gate() {
+    let Ok(url) = std::env::var("TOKEIRA_DSQL_TEST_DATABASE_URL") else {
+        return;
+    };
+    let executor = tokio::runtime::Runtime::new().unwrap();
+    let store = executor
+        .block_on(DsqlStore::from_database_url_for_tests(
+            url,
+            DsqlPoolConfig {
+                migration: MigrationConfig {
+                    migrations_dir: Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../tokeira-storage/migrations"),
+                },
+                reservoir: ReservoirConfig {
+                    target_ready: 4,
+                    inflight_limit: 2,
+                    ..Default::default()
+                },
+                shard_count: 256,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let (director, repo, _, _, _) = store.into_parts();
+    let repo = Arc::new(repo);
+    let home = ShardId(242);
+    let cases = std::sync::atomic::AtomicUsize::new(0);
+    let result = proptest::test_runner::TestRunner::new(proptest::test_runner::Config::with_cases(
+        100,
+    ))
+    .run(&(0u8..5, proptest::bool::ANY), |(loss, first)| {
+        executor.block_on(async {
+            let LeaseOutcome::Acquired { epoch } = repo
+                .try_acquire_bundle(home, "repair-gate-old".into(), "endpoint".into())
+                .await
+                .unwrap()
+            else {
+                panic!("acquire isolated home")
+            };
+            let fence = WriteFence::Lease(tokeira_storage::ExecutionHomeFence {
+                home,
+                owner: "repair-gate-old".into(),
+                epoch,
+            });
+            let lease_change = async {
+                if loss == 0 || loss == 3 {
+                    assert_eq!(
+                        repo.renew_bundle(home, "repair-gate-old".into(), epoch, "endpoint".into())
+                            .await
+                            .unwrap(),
+                        LeaseOutcome::Renewed { epoch }
+                    );
+                } else {
+                    repo.relinquish_bundle(home, "repair-gate-old".into(), epoch)
+                        .await
+                        .unwrap();
+                    if loss == 4 {
+                        assert!(matches!(
+                            repo.try_acquire_bundle(
+                                home,
+                                "repair-gate-new".into(),
+                                "endpoint".into()
+                            )
+                            .await
+                            .unwrap(),
+                            LeaseOutcome::Acquired { .. }
+                        ));
+                    }
+                }
+            };
+            // Empty-home completion performs no repair writes. Durable loss
+            // is paired with cancellation/deadline/replacement at the local
+            // gate, rather than mistaking a database read for atomic activation.
+            super::repair_tests::final_gate_case(
+                repo.clone(),
+                home,
+                epoch,
+                fence,
+                loss,
+                first,
+                lease_change,
+            )
+            .await;
+            for lease in repo
+                .list_bundle_leases()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|lease| lease.bundle_id == home)
+            {
+                if let Some(owner) = lease.owner_node_id {
+                    repo.relinquish_bundle(home, owner, lease.epoch)
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        cases.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    });
+    executor.block_on(director.shutdown()).unwrap();
+    result.unwrap();
+    assert_eq!(cases.load(std::sync::atomic::Ordering::SeqCst), 100);
 }

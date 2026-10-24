@@ -2163,8 +2163,15 @@ impl RunRepository for InMemoryStore {
         Ok(())
     }
 
-    async fn reconcile_workflow_dispatch_run(&self, home: ShardId, run_key: RunKey) -> Result<()> {
+    async fn reconcile_workflow_dispatch_run(
+        &self,
+        home: ShardId,
+        run_key: RunKey,
+        fence: WriteFence,
+    ) -> Result<()> {
+        fence.ensure_home(home)?;
         let mut store = self.inner.lock().await;
+        store.check_fence(&fence)?;
         // The same critical section protects the authoritative read and its
         // derived replacement. Repair never replays a transition or folds the
         // projection accumulator.

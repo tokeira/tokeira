@@ -126,7 +126,7 @@ proptest! {
             prepare_execution_placement(&store).await.unwrap();
             assert_eq!(store.snapshot().await.unwrap(), before, "completed marker reads do not scan or write");
             for (key, home) in expected {
-                store.reconcile_workflow_dispatch_run(home, key).await.unwrap();
+                store.reconcile_workflow_dispatch_run(home, key, WriteFence::Unfenced).await.unwrap();
                 assert_eq!(store.inner.lock().await.workflow_dispatch[&key].execution_home, home);
             }
         });
@@ -294,7 +294,7 @@ async fn exact_stopped_reset_recovers_placement_before_dispatch_repair() {
     assert_eq!((progress.hot_moved, progress.timers_moved), (1, 1));
     assert_eq!(semantic_snapshot(&restored).await, before);
     restored
-        .reconcile_workflow_dispatch_run(home, key)
+        .reconcile_workflow_dispatch_run(home, key, WriteFence::Unfenced)
         .await
         .unwrap();
     assert_eq!(

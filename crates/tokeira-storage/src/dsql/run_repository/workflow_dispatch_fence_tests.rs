@@ -117,7 +117,9 @@ async fn repair_case(
                 } else {
                     PauseKey::Acquisition(HOME)
                 });
-                start_takeover.send(()).unwrap();
+                start_takeover
+                    .send(())
+                    .expect("takeover is waiting for the repair barrier");
                 at_takeover.await?;
                 held_takeover = Some(resume_takeover);
             }
@@ -190,7 +192,11 @@ async fn repair_case(
             assert_eq!(row.incarnation.run_key, key);
             assert_eq!(
                 row.incarnation.logical_seq,
-                state.pending_workflow_task.as_ref().unwrap().logical_seq
+                state
+                    .pending_workflow_task
+                    .as_ref()
+                    .expect("the fixture starts a pending workflow task")
+                    .logical_seq
             );
         }
         if matches!(event, LeaseEvent::TakeoverLandingLast) {

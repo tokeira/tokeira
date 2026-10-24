@@ -79,8 +79,9 @@ insert ahead and behind it, then check continued traversal and a fresh head pass
 as examined, independent of whether a later consumer admits it. Fixtures remove only their own keys.
 
 The query first selects at most 64 keys through the sticky-home partial index, then fetches their payloads in the
-same snapshot. The live plan check passed against the actual builder with 8,192 fixture rows and 1,024 sticky
-rows in the selected home. It verified exactly 64 returned keys at offsets 0, 512 and 960. The first page uses
+same statement snapshot, without an explicit BEGIN/COMMIT pair. The live plan check passed against the actual
+builder with 8,192 fixture rows and 1,024 sticky rows in the selected home. It verified exactly 64 returned keys
+at offsets 0, 512 and 960. The first page uses
 `idx_workflow_dispatch_sticky_home` with `shard_id` equality as its index condition. Both continuation plans put
 `run_key > cursor` in that same index condition, rather than applying it as a filter after scanning the prefix.
 The payload side uses `workflow_dispatch_pkey` with `run_key = candidates.run_key` under a batched nested loop.
@@ -120,10 +121,7 @@ was expired and its absence from the active inventory verified.
 
 The full finish bar passed on the ephemeral Linux devbox: pinned-nightly formatting, `cargo lint --locked`,
 `cargo check --workspace --locked`, `cargo nextest run --workspace --locked` (3,940 passed), workspace doctests,
-and workspace documentation with `RUSTDOCFLAGS="-D warnings"`. Local nightly formatting passed. The installed
-`tkw` lacked `devbox`, so the exact commands ran through the documented rsync/SSH workflow. Local compilation
-was unavailable because the configured linker could not parse the installed macOS SDK; compiler settings and
-shared caches were unchanged.
+and workspace documentation with `RUSTDOCFLAGS="-D warnings"`. Local nightly formatting passed.
 
 The two default-suite skips are the existing opt-in SDK worker roundtrips
 `sdk_echo_roundtrip_against_post_sync_tokeirad` and

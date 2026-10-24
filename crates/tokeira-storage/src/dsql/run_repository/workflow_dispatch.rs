@@ -112,15 +112,15 @@ impl DsqlRunRepository {
     ) -> Result<crate::StickyWorkflowDispatchPage> {
         let mut query = sticky_page_query(home, after, limit);
         let mut permit = self.director.acquire(DbClass::Read).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        // The key page and payload join are one statement, so they already share
+        // a snapshot without an explicit transaction or a queued rollback on error.
         let candidates = query
             .build()
-            .fetch_all(&mut *tx)
+            .fetch_all(permit.connection()?)
             .await?
             .into_iter()
             .map(decode)
             .collect::<Result<Vec<_>>>()?;
-        tx.commit().await?;
         Ok(crate::StickyWorkflowDispatchPage {
             last_examined: candidates.last().map(|row| row.incarnation.run_key),
             exhausted: candidates.len()

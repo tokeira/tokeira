@@ -1403,6 +1403,44 @@ mod tests {
     }
 
     impl Sim {
+        fn new(a: NodeScript, b: NodeScript) -> Self {
+            Self {
+                base: Instant::now(),
+                owner: None,
+                fence: 0,
+                expires_at: 0,
+                nodes: [a, b]
+                    .into_iter()
+                    .map(|script| SimNode {
+                        rng: script.seed,
+                        script,
+                        run: 0,
+                        state: NodeState::Idle,
+                        in_flight: None,
+                        open_since: None,
+                    })
+                    .collect(),
+                last_closed: None,
+            }
+        }
+
+        /// Run 25 minutes of true time in steps of 100 ms, with at most one gate
+        /// open at every step.
+        fn run(&mut self) -> Result<(), TestCaseError> {
+            let mut now = 0u64;
+            while now <= 1_500_000 {
+                self.step_node(0, now)?;
+                self.step_node(1, now)?;
+                prop_assert!(
+                    !(self.nodes[0].open_since.is_some() && self.nodes[1].open_since.is_some()),
+                    "both gates are open at {}",
+                    now
+                );
+                now += 100;
+            }
+            Ok(())
+        }
+
         fn local(&self, index: usize, now: u64) -> u64 {
             let drift =
                 i128::from(now) * i128::from(self.nodes[index].script.drift_ppm) / 1_000_000;
@@ -1444,10 +1482,13 @@ mod tests {
             now: u64,
             takeover_at: Option<u64>,
         ) -> Result<(), TestCaseError> {
+            // Every close counts, one after the takeover included: a holder whose local
+            // deadline outlives the database's expiry closes late, and that is the
+            // close the quiescence guards against.
             if let (Some(acquired_at), Some(closed)) = (takeover_at, self.last_closed) {
                 prop_assert!(
-                    closed > acquired_at || now >= closed + 300_000,
-                    "after an expired takeover at {}, a gate opened at {} though another closed at {}",
+                    now >= closed + 300_000,
+                    "after an expired takeover at {}, a gate opened at {}, within 5 minutes of a close at {}",
                     acquired_at,
                     now,
                     closed
@@ -1735,34 +1776,43 @@ mod tests {
             a in node_script(0..=30_000),
             b in node_script(0..=600_000),
         ) {
-            let mut sim = Sim {
-                base: Instant::now(),
-                owner: None,
-                fence: 0,
-                expires_at: 0,
-                nodes: [a, b]
-                    .into_iter()
-                    .map(|script| SimNode {
-                        rng: script.seed,
-                        script,
-                        run: 0,
-                        state: NodeState::Idle,
-                        in_flight: None,
-                        open_since: None,
-                    })
-                    .collect(),
-                last_closed: None,
-            };
-            let mut now = 0u64;
-            while now <= 1_500_000 {
-                sim.step_node(0, now)?;
-                sim.step_node(1, now)?;
-                prop_assert!(
-                    !(sim.nodes[0].open_since.is_some() && sim.nodes[1].open_since.is_some()),
-                    "both gates are open at {}", now
-                );
-                now += 100;
-            }
+            Sim::new(a, b).run()?;
         }
+    }
+
+    /// Property 2's quiescence check on a schedule the generator reaches only
+    /// now and then: the holder is cut off from the database but keeps running,
+    /// and the other node is retrying when the hold expires. The holder closes
+    /// its gate at its admission deadline, before the hold expires, so the
+    /// taker's quiescence outlasts that close.
+    #[test]
+    fn a_cut_off_holder_closes_before_its_claim_is_taken() {
+        let script = |start, partitions| NodeScript {
+            runs: vec![Run {
+                start,
+                end: RunEnd::Never,
+            }],
+            partitions,
+            outbound: 100,
+            inbound: 100,
+            drift_ppm: 0,
+            seed: 0,
+        };
+        let mut sim = Sim::new(
+            script(0, vec![(100_000, 190_000)]),
+            script(120_000, Vec::new()),
+        );
+        sim.run().unwrap();
+        assert!(
+            matches!(
+                sim.nodes[1].state,
+                NodeState::Holding {
+                    takeover_at: Some(_),
+                    ..
+                }
+            ) && sim.nodes[1].open_since.is_some(),
+            "the second node takes the expired claim and opens its gate: {:?}",
+            sim.nodes[1]
+        );
     }
 }

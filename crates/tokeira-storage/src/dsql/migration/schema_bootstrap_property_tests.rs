@@ -250,9 +250,10 @@ fn startup_schema_contract_migrates_and_accepts_required_tables() {
     // Default-gate startup reads CHASM pointers and the placement progress marker,
     // and fenced writes need the lease's epoch index (`bundle-lease-fence`). The
     // target also drops `activity_state` (`activity-state-drop`), adds the
-    // parts of a run's values over the part size (`large-value-parts`), and adds
+    // parts of a run's values over the part size (`large-value-parts`), adds
     // the versioned visibility attribute cells and values and their copy's
-    // progress (`bounded-visibility-apply`). A
+    // progress (`bounded-visibility-apply`), and adds the parts of CHASM nodes'
+    // data and worker invocation requests (`large-value-parts`). A
     // self-consistent digest of an older prefix cannot make that schema usable.
     for (version, name) in [
         (69, "chasm_current_execution"),
@@ -269,6 +270,10 @@ fn startup_schema_contract_migrates_and_accepts_required_tables() {
         (89, "idx_execution_visibility_attr_cell_lookup"),
         (90, "execution_visibility_attr_value"),
         (91, "execution_visibility_attr_copy"),
+        (92, "chasm_node_part"),
+        (93, "chasm_node_data_parts"),
+        (94, "worker_compute_action_part"),
+        (95, "worker_compute_action_request_parts"),
     ] {
         assert!(
             recognized
@@ -278,7 +283,7 @@ fn startup_schema_contract_migrates_and_accepts_required_tables() {
     }
     for current in [
         0, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
-        90, 91,
+        90, 91, 92, 93, 94, 95,
     ] {
         let observed = observation(&recognized, current, (current > 0).then_some(current));
         for policy in [
@@ -286,24 +291,24 @@ fn startup_schema_contract_migrates_and_accepts_required_tables() {
             SchemaMigrationPolicy::ValidateOnly,
         ] {
             let expected = match (current, policy) {
-                (91, _) => SchemaDecision::Compatible {
-                    current: 91,
+                (95, _) => SchemaDecision::Compatible {
+                    current: 95,
                     legacy_backfill: false,
                 },
-                (0, SchemaMigrationPolicy::Automatic) => SchemaDecision::Initialize { target: 91 },
+                (0, SchemaMigrationPolicy::Automatic) => SchemaDecision::Initialize { target: 95 },
                 (_, SchemaMigrationPolicy::Automatic) => SchemaDecision::Migrate {
                     from: current,
-                    to: 91,
+                    to: 95,
                 },
                 (_, SchemaMigrationPolicy::ValidateOnly) => SchemaDecision::MigrationRequired {
                     current,
-                    target: 91,
+                    target: 95,
                 },
             };
             assert_eq!(
                 assess_schema_compatibility(&contract, &recognized, &observed, policy),
                 expected,
-                "Unconditional startup requires V091: current={current}, policy={policy:?}",
+                "Unconditional startup requires V095: current={current}, policy={policy:?}",
             );
         }
     }

@@ -26,6 +26,8 @@ pub(crate) mod convert;
 pub mod distributed_bucket;
 pub(crate) mod embedded_reservoir;
 pub(crate) mod key_codec;
+#[cfg(all(test, feature = "dsql-integration"))]
+mod large_value_tests;
 pub mod migration;
 pub mod projection_log;
 pub mod reservoir;

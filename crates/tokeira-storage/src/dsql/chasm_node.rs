@@ -17,6 +17,19 @@
 //! columns and the blob never diverge. The node `data` payload is the nullable
 //! `data` column.
 //!
+//! ## Data over the part size
+//!
+//! A standalone activity's node holds its input, its result and its heartbeat
+//! details, so its data can pass DSQL's 1 MiB value limit. Data over the part
+//! size, 960 KiB, is stored in parts (`large-value-parts`): its first part in
+//! `data`, its other parts in `chasm_node_part`, and their number in
+//! `data_parts`, which is NULL for data stored whole. A persist writes a node's
+//! parts in its transaction and deletes those the node's new data doesn't use, and
+//! a deletion removes an execution's parts with its nodes. A load joins a node's
+//! parts in the snapshot that reads its row: a later persist replaces the first
+//! part and the others together, so parts read in another snapshot could belong
+//! to another version of the data.
+//!
 //! ## The CAS-fenced, all-or-nothing batch
 //!
 //! [`persist_dirty`](ChasmNodeRepository::persist_dirty) runs the whole batch in one
@@ -26,11 +39,11 @@
 //! (SQLSTATE 40001) covers a concurrent writer that slips between the check and the
 //! commit — normalized to the same `Conflict` so the runtime reloads and re-runs.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use async_trait::async_trait;
-use sqlx::{Connection, PgConnection, Row};
+use sqlx::{Connection, PgConnection, Row, postgres::PgRow};
 use tokeira_chasm::{ChasmNode, ExecutionKey, LifecycleState, VersionedTransition};
 use uuid::Uuid;
 
@@ -39,7 +52,56 @@ use crate::{
     CurrentExecutionCursor, CurrentRun, DbClass, ExpectedVersion, NodePersistOutcome, NodeWrite,
 };
 
-use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, DsqlRunRepository, codec};
+use super::{
+    DsqlConnectionAcquirer, DsqlConnectionDirector, DsqlRunRepository, codec,
+    value_parts::{self, Split},
+};
+
+/// An execution's key as its rows store it: `(namespace_id, business_id, run_id)`.
+type ExecutionIds<'a> = (Uuid, &'a str, Uuid);
+
+/// A node's upsert, with its data whole or its first part, and its part count.
+const UPSERT_NODE_SQL: &str = "INSERT INTO chasm_node
+       (namespace_id, business_id, run_id, encoded_path, archetype_id,
+        failover_version, transition_count,
+        initial_failover_version, initial_transition_count,
+        metadata, data, data_parts, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+     ON CONFLICT (namespace_id, business_id, run_id, encoded_path) DO UPDATE SET
+        archetype_id = EXCLUDED.archetype_id,
+        failover_version = EXCLUDED.failover_version,
+        transition_count = EXCLUDED.transition_count,
+        initial_failover_version = EXCLUDED.initial_failover_version,
+        initial_transition_count = EXCLUDED.initial_transition_count,
+        metadata = EXCLUDED.metadata,
+        data = EXCLUDED.data,
+        data_parts = EXCLUDED.data_parts,
+        updated_at = EXCLUDED.updated_at";
+
+/// One part after the first of a node's data, replacing the part a previous
+/// version of the data stored at its number.
+const UPSERT_PART_SQL: &str = "INSERT INTO chasm_node_part
+       (namespace_id, business_id, run_id, encoded_path, part_no, data)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (namespace_id, business_id, run_id, encoded_path, part_no) DO UPDATE SET
+        data = EXCLUDED.data";
+
+/// A node's parts from a number on: those a shorter version of its data doesn't
+/// use.
+const DELETE_PARTS_FROM_SQL: &str = "DELETE FROM chasm_node_part
+     WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3
+       AND encoded_path = $4 AND part_no >= $5";
+
+/// Which of an execution's nodes a load selects.
+#[derive(Clone, Copy, Debug)]
+enum Nodes<'a> {
+    /// Every node of the execution.
+    All,
+    /// The nodes whose paths lie in `[start, end)`: a subtree.
+    Range(&'a str, &'a str),
+    /// The node at one path.
+    At(&'a str),
+}
 
 /// Production CHASM node store backed by Aurora DSQL.
 #[derive(Debug)]
@@ -85,14 +147,178 @@ impl DsqlChasmNodeRepository {
             .map_err(|e| anyhow::anyhow!("CHASM encoded path is not valid UTF-8: {e}"))
     }
 
-    /// Reconstruct a [`ChasmNode`] from a result row (`metadata` blob is
-    /// authoritative; `data` is the nullable column).
-    fn node_from_row(row: &sqlx::postgres::PgRow) -> Result<(Vec<u8>, ChasmNode)> {
-        let encoded_path: String = row.try_get("encoded_path")?;
-        let metadata_blob: Vec<u8> = row.try_get("metadata")?;
-        let data: Option<Vec<u8>> = row.try_get("data")?;
-        let metadata = codec::decode(&metadata_blob)?;
-        Ok((encoded_path.into_bytes(), ChasmNode { metadata, data }))
+    /// Read the rows of the nodes `nodes` selects, in encoded-path order, on
+    /// `connection`: each node's data whole, or its first part with its count.
+    async fn select_nodes(
+        connection: &mut PgConnection,
+        (namespace_id, business_id, run_id): ExecutionIds<'_>,
+        nodes: Nodes<'_>,
+    ) -> Result<Vec<PgRow>> {
+        Ok(match nodes {
+            Nodes::All => {
+                sqlx::query(
+                    "SELECT encoded_path, metadata, data, data_parts
+                     FROM chasm_node
+                     WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3
+                     ORDER BY encoded_path ASC",
+                )
+                .bind(namespace_id)
+                .bind(business_id)
+                .bind(run_id)
+                .fetch_all(connection)
+                .await?
+            }
+            Nodes::Range(start, end) => {
+                sqlx::query(
+                    "SELECT encoded_path, metadata, data, data_parts
+                     FROM chasm_node
+                     WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3
+                       AND encoded_path >= $4 AND encoded_path < $5
+                     ORDER BY encoded_path ASC",
+                )
+                .bind(namespace_id)
+                .bind(business_id)
+                .bind(run_id)
+                .bind(start)
+                .bind(end)
+                .fetch_all(connection)
+                .await?
+            }
+            Nodes::At(encoded_path) => {
+                sqlx::query(
+                    "SELECT encoded_path, metadata, data, data_parts
+                     FROM chasm_node
+                     WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3
+                       AND encoded_path = $4",
+                )
+                .bind(namespace_id)
+                .bind(business_id)
+                .bind(run_id)
+                .bind(encoded_path)
+                .fetch_all(connection)
+                .await?
+            }
+        })
+    }
+
+    /// Whether any of the rows holds the first part of data stored in parts.
+    fn any_split(rows: &[PgRow]) -> Result<bool> {
+        for row in rows {
+            if row.try_get::<Option<i32>, _>("data_parts")?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Rebuild the nodes [`select_nodes`](Self::select_nodes) read, each with its
+    /// data whole (`metadata` blob is authoritative). The parts of data stored in
+    /// parts are read on `connection` in one statement, so `connection` must be
+    /// the snapshot that read the rows whenever any is split.
+    async fn join_nodes(
+        connection: &mut PgConnection,
+        (namespace_id, business_id, run_id): ExecutionIds<'_>,
+        rows: &[PgRow],
+    ) -> Result<Vec<(Vec<u8>, ChasmNode)>> {
+        let mut split = Vec::new();
+        for row in rows {
+            if row.try_get::<Option<i32>, _>("data_parts")?.is_some() {
+                split.push(row.try_get::<String, _>("encoded_path")?);
+            }
+        }
+        let mut parts: BTreeMap<String, Vec<(i32, Vec<u8>)>> = BTreeMap::new();
+        if !split.is_empty() {
+            let fetched = sqlx::query_as::<_, (String, i32, Vec<u8>)>(
+                "SELECT encoded_path, part_no, data
+                 FROM chasm_node_part
+                 WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3
+                   AND encoded_path = ANY($4)
+                 ORDER BY encoded_path, part_no",
+            )
+            .bind(namespace_id)
+            .bind(business_id)
+            .bind(run_id)
+            .bind(&split)
+            .fetch_all(connection)
+            .await?;
+            for (encoded_path, part_no, data) in fetched {
+                parts.entry(encoded_path).or_default().push((part_no, data));
+            }
+        }
+        rows.iter()
+            .map(|row| {
+                let encoded_path: String = row.try_get("encoded_path")?;
+                let metadata_blob: Vec<u8> = row.try_get("metadata")?;
+                let first: Option<Vec<u8>> = row.try_get("data")?;
+                let count: Option<i32> = row.try_get("data_parts")?;
+                let rest = parts.remove(&encoded_path).unwrap_or_default();
+                let value = || {
+                    format!(
+                        "chasm_node.data of run {run_id} in namespace {namespace_id} \
+                         at path {encoded_path:?}"
+                    )
+                };
+                let data = match (first, count) {
+                    (Some(first), count) => Some(value_parts::join(value, first, count, rest)?),
+                    (None, None) => None,
+                    (None, Some(count)) => bail!("{} has {count} parts but no first part", value()),
+                };
+                let metadata = codec::decode(&metadata_blob)?;
+                Ok((encoded_path.into_bytes(), ChasmNode { metadata, data }))
+            })
+            .collect()
+    }
+
+    /// Load the nodes `nodes` selects, each with its data whole.
+    ///
+    /// The first read runs outside a transaction, as every load did before data
+    /// was stored in parts, and a node stored whole is complete in it. When it
+    /// meets a node stored in parts, the load reads the nodes again, with their
+    /// parts, in one read-only snapshot: a persist that commits between the first
+    /// read and a read of the parts would replace them, and the parts of one
+    /// version of the data would join the first part of another.
+    async fn read_nodes(
+        connection: &mut PgConnection,
+        ids: ExecutionIds<'_>,
+        nodes: Nodes<'_>,
+    ) -> Result<Vec<(Vec<u8>, ChasmNode)>> {
+        let rows = Self::select_nodes(connection, ids, nodes).await?;
+        if !Self::any_split(&rows)? {
+            return Self::join_nodes(connection, ids, &rows).await;
+        }
+        #[cfg(all(test, feature = "dsql-integration"))]
+        super::run_repository::pause_point::reached(
+            super::run_repository::pause_point::PauseKey::NodeParts(ids.2),
+        )
+        .await;
+        Self::read_nodes_in_snapshot(connection, ids, nodes).await
+    }
+
+    /// Read the nodes `nodes` selects and their parts in one read-only snapshot
+    /// of its own, each with its data whole.
+    async fn read_nodes_in_snapshot(
+        connection: &mut PgConnection,
+        ids: ExecutionIds<'_>,
+        nodes: Nodes<'_>,
+    ) -> Result<Vec<(Vec<u8>, ChasmNode)>> {
+        let mut tx = connection
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await?;
+        let rows = Self::select_nodes(&mut tx, ids, nodes).await?;
+        let nodes = Self::join_nodes(&mut tx, ids, &rows).await?;
+        tx.commit().await?;
+        Ok(nodes)
+    }
+
+    /// Load the nodes `nodes` selects in `key`'s execution.
+    async fn load_nodes(
+        &self,
+        key: &ExecutionKey,
+        nodes: Nodes<'_>,
+    ) -> Result<Vec<(Vec<u8>, ChasmNode)>> {
+        let ids = Self::key_parts(key)?;
+        let mut permit = self.director.acquire(DbClass::Read).await?;
+        Self::read_nodes(permit.connection()?, ids, nodes).await
     }
 
     fn current_from_row(row: &sqlx::postgres::PgRow) -> Result<CurrentRun> {
@@ -164,24 +390,21 @@ impl DsqlChasmNodeRepository {
             )),
         }
     }
-}
 
-#[async_trait]
-impl ChasmNodeRepository for DsqlChasmNodeRepository {
-    async fn persist_dirty(
-        &self,
-        key: &ExecutionKey,
-        batch: Vec<NodeWrite>,
-    ) -> Result<NodePersistOutcome> {
-        let (namespace_id, business_id, run_id) = Self::key_parts(key)?;
-        let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
-
-        // Phase 1 — check every fence before mutating anything (all-or-nothing).
-        for write in &batch {
+    /// Check every write's fence against its stored row in `tx`, before anything
+    /// is written (all-or-nothing). Returns each node's stored part count, a node
+    /// stored whole or absent counting as one, so its write knows which parts its
+    /// new data leaves unused; or the first failing fence.
+    async fn check_fences(
+        tx: &mut PgConnection,
+        (namespace_id, business_id, run_id): ExecutionIds<'_>,
+        batch: &[NodeWrite],
+    ) -> Result<std::result::Result<Vec<i32>, String>> {
+        let mut stored_parts = Vec::with_capacity(batch.len());
+        for write in batch {
             let encoded_path = Self::path_key(&write.encoded_path)?;
             let stored = sqlx::query(
-                "SELECT failover_version, transition_count
+                "SELECT failover_version, transition_count, data_parts
                  FROM chasm_node
                  WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3
                    AND encoded_path = $4",
@@ -193,7 +416,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
             .fetch_optional(&mut *tx)
             .await?;
 
-            let conflict_reason = match (&write.expected, stored) {
+            let conflict_reason = match (&write.expected, &stored) {
                 (ExpectedVersion::Absent, Some(_)) => Some(format!(
                     "node at {:?} expected absent but already exists",
                     write.encoded_path
@@ -218,56 +441,132 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
                 )),
             };
             if let Some(reason) = conflict_reason {
-                tx.rollback().await?;
-                return Ok(NodePersistOutcome::Conflict { reason });
+                return Ok(Err(reason));
             }
+            stored_parts.push(match &stored {
+                Some(row) => row.try_get::<Option<i32>, _>("data_parts")?.unwrap_or(1),
+                None => 1,
+            });
         }
+        Ok(Ok(stored_parts))
+    }
 
-        // Phase 2 — every fence held; upsert the whole batch.
-        for write in &batch {
+    /// Upsert every node of the batch in `tx`, each fence having held, with its
+    /// data's parts, and delete the parts a node's new data no longer uses.
+    /// `stored_parts` holds each node's part count before the write, as
+    /// [`check_fences`](Self::check_fences) read it. Returns a conflict when DSQL
+    /// refuses a statement as a serialization failure: another writer won.
+    async fn write_nodes(
+        tx: &mut PgConnection,
+        ids: ExecutionIds<'_>,
+        batch: &[NodeWrite],
+        stored_parts: &[i32],
+    ) -> Result<Option<NodePersistOutcome>> {
+        for (write, &stored_parts) in batch.iter().zip(stored_parts) {
             let encoded_path = Self::path_key(&write.encoded_path)?;
             let metadata_blob = codec::encode(&write.node.metadata)?;
-            let vt = write.node.metadata.versioned_transition;
-            let initial_vt = write.node.metadata.initial_versioned_transition;
-            let result = sqlx::query(
-                "INSERT INTO chasm_node
-                   (namespace_id, business_id, run_id, encoded_path, archetype_id,
-                    failover_version, transition_count,
-                    initial_failover_version, initial_transition_count,
-                    metadata, data, updated_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
-                 ON CONFLICT (namespace_id, business_id, run_id, encoded_path) DO UPDATE SET
-                    archetype_id = EXCLUDED.archetype_id,
-                    failover_version = EXCLUDED.failover_version,
-                    transition_count = EXCLUDED.transition_count,
-                    initial_failover_version = EXCLUDED.initial_failover_version,
-                    initial_transition_count = EXCLUDED.initial_transition_count,
-                    metadata = EXCLUDED.metadata,
-                    data = EXCLUDED.data,
-                    updated_at = EXCLUDED.updated_at",
+            let result = Self::write_node(
+                tx,
+                ids,
+                encoded_path,
+                metadata_blob,
+                &write.node,
+                stored_parts,
             )
+            .await;
+            if let Err(err) = result {
+                if DsqlRunRepository::is_serialization_failure(&err) {
+                    return Ok(Some(NodePersistOutcome::Conflict {
+                        reason: "dsql serialization failure during node write".to_owned(),
+                    }));
+                }
+                return Err(err.into());
+            }
+        }
+        Ok(None)
+    }
+
+    /// Write one node: its row, with its data whole or its first part and its
+    /// count, then each other part, one statement each, so that no statement
+    /// carries more than one part. A node whose stored data had more parts than
+    /// its new data has those parts deleted.
+    async fn write_node(
+        tx: &mut PgConnection,
+        (namespace_id, business_id, run_id): ExecutionIds<'_>,
+        encoded_path: &str,
+        metadata_blob: Vec<u8>,
+        node: &ChasmNode,
+        stored_parts: i32,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let split = node.data.as_deref().map(value_parts::split);
+        let vt = node.metadata.versioned_transition;
+        let initial_vt = node.metadata.initial_versioned_transition;
+        sqlx::query(UPSERT_NODE_SQL)
             .bind(namespace_id)
             .bind(business_id)
             .bind(run_id)
             .bind(encoded_path)
-            .bind(i64::from(write.node.metadata.component_type_id))
+            .bind(i64::from(node.metadata.component_type_id))
             .bind(vt.namespace_failover_version)
             .bind(vt.transition_count)
             .bind(initial_vt.namespace_failover_version)
             .bind(initial_vt.transition_count)
             .bind(metadata_blob)
-            .bind(write.node.data.clone())
+            .bind(split.as_ref().map(|split| split.first))
+            .bind(split.as_ref().and_then(|split| split.count))
             .execute(&mut *tx)
-            .await;
-            if let Err(err) = result {
-                if DsqlRunRepository::is_serialization_failure(&err) {
-                    tx.rollback().await?;
-                    return Ok(NodePersistOutcome::Conflict {
-                        reason: "dsql serialization failure during node write".to_owned(),
-                    });
-                }
-                return Err(err.into());
+            .await?;
+        for (part_no, data) in split.iter().flat_map(Split::numbered) {
+            sqlx::query(UPSERT_PART_SQL)
+                .bind(namespace_id)
+                .bind(business_id)
+                .bind(run_id)
+                .bind(encoded_path)
+                .bind(part_no)
+                .bind(data)
+                .execute(&mut *tx)
+                .await?;
+        }
+        // No data, like data stored whole, leaves no part.
+        let parts = split.as_ref().map_or(1, Split::parts);
+        if stored_parts > parts {
+            sqlx::query(DELETE_PARTS_FROM_SQL)
+                .bind(namespace_id)
+                .bind(business_id)
+                .bind(run_id)
+                .bind(encoded_path)
+                .bind(parts)
+                .execute(&mut *tx)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ChasmNodeRepository for DsqlChasmNodeRepository {
+    async fn persist_dirty(
+        &self,
+        key: &ExecutionKey,
+        batch: Vec<NodeWrite>,
+    ) -> Result<NodePersistOutcome> {
+        let ids = Self::key_parts(key)?;
+        let mut permit = self.director.acquire(DbClass::Commit).await?;
+        let mut tx = permit.connection()?.begin().await?;
+
+        // Phase 1 — check every fence before mutating anything (all-or-nothing).
+        let stored_parts = match Self::check_fences(&mut tx, ids, &batch).await? {
+            Ok(stored_parts) => stored_parts,
+            Err(reason) => {
+                tx.rollback().await?;
+                return Ok(NodePersistOutcome::Conflict { reason });
             }
+        };
+
+        // Phase 2 — every fence held; upsert the whole batch.
+        if let Some(conflict) = Self::write_nodes(&mut tx, ids, &batch, &stored_parts).await? {
+            tx.rollback().await?;
+            return Ok(conflict);
         }
 
         match tx.commit().await {
@@ -289,7 +588,8 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         current: CurrentRun,
         expected_current: Option<CurrentRun>,
     ) -> Result<NodePersistOutcome> {
-        let (namespace_id, business_id, run_id) = Self::key_parts(key)?;
+        let ids = Self::key_parts(key)?;
+        let (namespace_id, business_id, _) = ids;
         let mut permit = self.director.acquire(DbClass::Commit).await?;
         let mut tx = permit.connection()?.begin().await?;
 
@@ -311,95 +611,18 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
             .transpose()?;
 
         // Phase 1 — node fences (all-or-nothing), identical to `persist_dirty`.
-        for write in &batch {
-            let encoded_path = Self::path_key(&write.encoded_path)?;
-            let stored = sqlx::query(
-                "SELECT failover_version, transition_count
-                 FROM chasm_node
-                 WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3
-                   AND encoded_path = $4",
-            )
-            .bind(namespace_id)
-            .bind(business_id)
-            .bind(run_id)
-            .bind(encoded_path)
-            .fetch_optional(&mut *tx)
-            .await?;
-            let conflict_reason = match (&write.expected, stored) {
-                (ExpectedVersion::Absent, Some(_)) => Some(format!(
-                    "node at {:?} expected absent but already exists",
-                    write.encoded_path
-                )),
-                (ExpectedVersion::Absent, None) => None,
-                (ExpectedVersion::Vt(expected), Some(row)) => {
-                    let failover: i64 = row.try_get("failover_version")?;
-                    let count: i64 = row.try_get("transition_count")?;
-                    let stored_vt = VersionedTransition::new(failover, count);
-                    if &stored_vt == expected {
-                        None
-                    } else {
-                        Some(format!(
-                            "node at {:?} VT {stored_vt:?} does not match expected {expected:?}",
-                            write.encoded_path
-                        ))
-                    }
-                }
-                (ExpectedVersion::Vt(expected), None) => Some(format!(
-                    "node at {:?} expected VT {expected:?} but is absent",
-                    write.encoded_path
-                )),
-            };
-            if let Some(reason) = conflict_reason {
+        let stored_parts = match Self::check_fences(&mut tx, ids, &batch).await? {
+            Ok(stored_parts) => stored_parts,
+            Err(reason) => {
                 tx.rollback().await?;
                 return Ok(NodePersistOutcome::Conflict { reason });
             }
-        }
+        };
 
         // Phase 2 — upsert the node batch.
-        for write in &batch {
-            let encoded_path = Self::path_key(&write.encoded_path)?;
-            let metadata_blob = codec::encode(&write.node.metadata)?;
-            let vt = write.node.metadata.versioned_transition;
-            let initial_vt = write.node.metadata.initial_versioned_transition;
-            let result = sqlx::query(
-                "INSERT INTO chasm_node
-                   (namespace_id, business_id, run_id, encoded_path, archetype_id,
-                    failover_version, transition_count,
-                    initial_failover_version, initial_transition_count,
-                    metadata, data, updated_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
-                 ON CONFLICT (namespace_id, business_id, run_id, encoded_path) DO UPDATE SET
-                    archetype_id = EXCLUDED.archetype_id,
-                    failover_version = EXCLUDED.failover_version,
-                    transition_count = EXCLUDED.transition_count,
-                    initial_failover_version = EXCLUDED.initial_failover_version,
-                    initial_transition_count = EXCLUDED.initial_transition_count,
-                    metadata = EXCLUDED.metadata,
-                    data = EXCLUDED.data,
-                    updated_at = EXCLUDED.updated_at",
-            )
-            .bind(namespace_id)
-            .bind(business_id)
-            .bind(run_id)
-            .bind(encoded_path)
-            .bind(i64::from(write.node.metadata.component_type_id))
-            .bind(vt.namespace_failover_version)
-            .bind(vt.transition_count)
-            .bind(initial_vt.namespace_failover_version)
-            .bind(initial_vt.transition_count)
-            .bind(metadata_blob)
-            .bind(write.node.data.clone())
-            .execute(&mut *tx)
-            .await;
-            if let Err(err) = result {
-                if DsqlRunRepository::is_serialization_failure(&err) {
-                    tx.rollback().await?;
-                    return Ok(NodePersistOutcome::Conflict {
-                        reason: "dsql serialization failure during node write".to_owned(),
-                    });
-                }
-                return Err(err.into());
-            }
+        if let Some(conflict) = Self::write_nodes(&mut tx, ids, &batch, &stored_parts).await? {
+            tx.rollback().await?;
+            return Ok(conflict);
         }
 
         // Phase 3 — conditionally advance the pointer in the SAME transaction (the
@@ -612,20 +835,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
     }
 
     async fn load_execution(&self, key: &ExecutionKey) -> Result<Vec<(Vec<u8>, ChasmNode)>> {
-        let (namespace_id, business_id, run_id) = Self::key_parts(key)?;
-        let mut permit = self.director.acquire(DbClass::Read).await?;
-        let rows = sqlx::query(
-            "SELECT encoded_path, metadata, data
-             FROM chasm_node
-             WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3
-             ORDER BY encoded_path ASC",
-        )
-        .bind(namespace_id)
-        .bind(business_id)
-        .bind(run_id)
-        .fetch_all(permit.connection()?)
-        .await?;
-        rows.iter().map(Self::node_from_row).collect()
+        self.load_nodes(key, Nodes::All).await
     }
 
     async fn load_subtree(
@@ -633,26 +843,11 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         key: &ExecutionKey,
         encoded_prefix: &[u8],
     ) -> Result<Vec<(Vec<u8>, ChasmNode)>> {
-        let (namespace_id, business_id, run_id) = Self::key_parts(key)?;
         let end = tokeira_chasm::path::subtree_range_end(encoded_prefix);
         let encoded_prefix = Self::path_key(encoded_prefix)?;
         let encoded_end = Self::path_key(&end)?;
-        let mut permit = self.director.acquire(DbClass::Read).await?;
-        let rows = sqlx::query(
-            "SELECT encoded_path, metadata, data
-             FROM chasm_node
-             WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3
-               AND encoded_path >= $4 AND encoded_path < $5
-             ORDER BY encoded_path ASC",
-        )
-        .bind(namespace_id)
-        .bind(business_id)
-        .bind(run_id)
-        .bind(encoded_prefix)
-        .bind(encoded_end)
-        .fetch_all(permit.connection()?)
-        .await?;
-        rows.iter().map(Self::node_from_row).collect()
+        self.load_nodes(key, Nodes::Range(encoded_prefix, encoded_end))
+            .await
     }
 
     async fn delete_execution(&self, key: &ExecutionKey) -> Result<()> {
@@ -661,6 +856,17 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         let mut tx = permit.connection()?.begin().await?;
         sqlx::query(
             "DELETE FROM chasm_node
+             WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3",
+        )
+        .bind(namespace_id)
+        .bind(business_id)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        // The nodes' parts go in the same transaction, so no reader sees a node
+        // without its parts, and none outlives its node.
+        sqlx::query(
+            "DELETE FROM chasm_node_part
              WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3",
         )
         .bind(namespace_id)
@@ -685,31 +891,51 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
 
     async fn scan_executions(&self) -> Result<Vec<(ExecutionKey, ChasmNode)>> {
         let mut permit = self.director.acquire(DbClass::Read).await?;
+        let connection = permit.connection()?;
         // Every execution's root component node (encoded_path = ROOT_PATH, b""),
         // ordered deterministically for the repair scanner (Req 10.11; AGENTS
         // determinism). The root is the empty text key.
         let rows = sqlx::query(
-            "SELECT namespace_id, business_id, run_id, metadata, data
+            "SELECT namespace_id, business_id, run_id, metadata, data, data_parts
              FROM chasm_node
              WHERE encoded_path = $1
              ORDER BY namespace_id ASC, business_id ASC, run_id ASC",
         )
         .bind("")
-        .fetch_all(permit.connection()?)
+        .fetch_all(&mut *connection)
         .await?;
-        rows.iter()
-            .map(|row| {
-                let namespace_id: Uuid = row.try_get("namespace_id")?;
-                let business_id: String = row.try_get("business_id")?;
-                let run_id: Uuid = row.try_get("run_id")?;
+        let mut roots = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let namespace_id: Uuid = row.try_get("namespace_id")?;
+            let business_id: String = row.try_get("business_id")?;
+            let run_id: Uuid = row.try_get("run_id")?;
+            let root = if row.try_get::<Option<i32>, _>("data_parts")?.is_none() {
                 let metadata_blob: Vec<u8> = row.try_get("metadata")?;
-                let data: Option<Vec<u8>> = row.try_get("data")?;
-                let metadata = codec::decode(&metadata_blob)?;
+                Some(ChasmNode {
+                    metadata: codec::decode(&metadata_blob)?,
+                    data: row.try_get("data")?,
+                })
+            } else {
+                // A root stored in parts is read again with its parts, in a
+                // snapshot of its own; each execution's root is independent of
+                // the others'. An execution deleted since the scan's read is left
+                // out, as if the scan had come a moment later.
+                Self::read_nodes_in_snapshot(
+                    connection,
+                    (namespace_id, &business_id, run_id),
+                    Nodes::At(""),
+                )
+                .await?
+                .pop()
+                .map(|(_, root)| root)
+            };
+            if let Some(root) = root {
                 let key =
                     ExecutionKey::new(namespace_id.to_string(), business_id, run_id.to_string());
-                Ok((key, ChasmNode { metadata, data }))
-            })
-            .collect()
+                roots.push((key, root));
+            }
+        }
+        Ok(roots)
     }
 }
 
@@ -751,6 +977,8 @@ mod tests {
             include_str!("../../migrations/V056__chasm_current_run.sql"),
             include_str!("../../migrations/V069__chasm_current_execution.sql"),
             include_str!("../../migrations/V071__chasm_backfill_marker.sql"),
+            include_str!("../../migrations/V092__chasm_node_part.sql"),
+            include_str!("../../migrations/V093__chasm_node_data_parts.sql"),
         ] {
             sqlx::query(sql).execute(&pool).await?;
         }
@@ -975,6 +1203,8 @@ mod tests {
                 include_str!("../../migrations/V056__chasm_current_run.sql"),
                 include_str!("../../migrations/V069__chasm_current_execution.sql"),
                 include_str!("../../migrations/V071__chasm_backfill_marker.sql"),
+                include_str!("../../migrations/V092__chasm_node_part.sql"),
+                include_str!("../../migrations/V093__chasm_node_data_parts.sql"),
             ] {
                 sqlx::query(sql).execute(&pool).await?;
             }
@@ -995,7 +1225,8 @@ mod tests {
             &pointer_tests::dsql_scenarios(), |scenario| {
                 runtime.block_on(async {
                     for sql in ["DELETE FROM chasm_current_execution", "DELETE FROM chasm_current_run",
-                        "DELETE FROM chasm_node", "DELETE FROM chasm_backfill_marker"] {
+                        "DELETE FROM chasm_node", "DELETE FROM chasm_node_part",
+                        "DELETE FROM chasm_backfill_marker"] {
                         sqlx::query(sql).execute(&pool).await?;
                     }
                     let namespace = uuid::Uuid::new_v4().to_string();
@@ -1024,6 +1255,7 @@ mod tests {
                 "chasm_current_execution",
                 "chasm_current_run",
                 "chasm_node",
+                "chasm_node_part",
                 "chasm_backfill_marker",
             ] {
                 // SQL safety: UUID-derived schema and allowlisted table literal.

@@ -78,24 +78,26 @@ SELECT v.authority_epoch, v.source_transition_seq, v.business_id, v.run_id, a.va
 FROM execution_visibility_current v
 LEFT JOIN sa_registry r
   ON r.namespace_id = v.namespace_id AND r.attr_name = 'TemporalUsedWorkerDeploymentVersions'
-LEFT JOIN execution_visibility_attr_index a
-  ON a.namespace_id = v.namespace_id AND a.run_key = v.run_key AND a.attr_id = r.attr_id
+LEFT JOIN execution_visibility_attr_value a
+  ON a.namespace_id = v.namespace_id AND a.run_key = v.run_key
+  AND a.authority_epoch = v.authority_epoch AND a.source_transition_seq = v.source_transition_seq
+  AND a.attr_id = r.attr_id
 WHERE v.namespace_id = $1 AND v.archetype_id = 0 AND v.run_key = $2
 LIMIT 1
 ```
 
 The newer of the two is exactly the newest image's list:
 - **The newest image is applied before it goes.** An image is deleted only once its run's row is at least as new, and
-  nothing dominates the newest image, so the row became that image before the delete. Its attribute rows were replaced
-  in the same transaction.
+  nothing dominates the newest image, so the row became that image before the delete. Its values were written at its
+  version in the transaction that advanced the row ([bounded-visibility-apply](../bounded-visibility-apply/design.md)).
 - **A snapshot without the image sees the applied row.** The apply committed before the delete, so a snapshot in which
   the delete committed also holds the apply. While the newest image is still in the log, it is at least as new as the
   row, and seeds as now.
 - **An old image can't shadow a newer one.** An image left under an earlier partition count is never read, so it is
   never deleted. Taking the newer of the two keeps such an image from seeding once the run's newest image is gone.
-- **The value is stored verbatim.** `value_data` is the encoded attribute as the image gave it
-  (`upsert_search_attr_index_row`, `crates/tokeira-projection/src/dsql_store.rs`), and a keyword list is not
-  normalized (`normalize_search_attr_value`, `crates/tokeira-projection/src/types.rs`).
+- **The value is stored verbatim.** `value_data` in `execution_visibility_attr_value` is the encoded attribute as the
+  image gave it, once per image (`ImageAttributes::build`, `crates/tokeira-projection/src/dsql_attributes.rs`), and a
+  keyword list is not normalized (`normalize_search_attr_value`, `crates/tokeira-projection/src/types.rs`).
 - **The edge cases keep criterion 2.10.** An empty list writes no attribute rows for a workflow, and seeds an empty
   list. A value of another type fails the apply (`dsql_store.rs:549-557`), so its image stays and seeds as before.
 - **Only an image's apply writes a workflow row.** On DSQL, `upsert_execution_row` is the only writer of

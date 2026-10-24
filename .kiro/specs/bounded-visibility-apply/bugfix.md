@@ -70,7 +70,8 @@ image.
 2.3 WHEN an image's rows fit in one transaction with the deletes of the run's older rows and the version guard's
 writes THEN the apply SHALL keep that one transaction. Otherwise it SHALL first write the image's rows in transactions
 of at most 2,500 rows, then advance the run's row in a transaction of its own, and then delete the older rows. Index
-rows SHALL be written by statements of at most 128 rows.
+rows SHALL be written by statements of at most 128 rows, and both ways SHALL leave alone a row already written at the
+image's version, as an interrupted or concurrent apply of the same image leaves one.
 
 2.4 Rows below the run's current version SHALL be deleted once the version has advanced, in transactions of at most
 2,500 rows. This cleanup SHALL never delete a row at or above the run's current version.
@@ -80,12 +81,15 @@ that advances the run's row. Index rows SHALL hold only what queries match. The 
 load's used-versions seed (projection-passes criterion 2.4) SHALL read the value from there, at the run's current
 version.
 
-2.6 WHEN a node of this release starts on a cluster whose attribute index holds rows written by an earlier release THEN
-it SHALL copy them into the new layout before it serves or runs a projector:
+2.6 WHEN a node of this release, listener-backed or embedded, starts on a cluster whose attribute index holds rows
+written by an earlier release THEN it SHALL copy them into the new layout before it builds anything that can apply an
+image:
 - each run's rows at the run's current version, one value per attribute;
-- in transactions of at most 2,500 rows;
+- in transactions of at most 2,500 rows, each recording the copy's position durably, so a copy that stops part-way
+  resumes where it stopped;
 - recording completion durably when nothing is left to copy.
-No projector SHALL apply an image before completion is recorded, and a copy SHALL stop once it is.
+A copy transaction refused with a write conflict SHALL run again, so concurrent copies take turns and none fails its
+node's start. No image SHALL be applied before completion is recorded, and a copy SHALL stop once it is.
 
 2.7 The fix SHALL not change what List, Count, the component hydration or the seed returns for any run.
 

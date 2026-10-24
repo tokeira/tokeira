@@ -28,7 +28,8 @@ The fix returns the DSQL attribute index to the schema decision's generation pat
 - **Orphan**: a cell written at a version the run's row never takes. This happens when an apply is interrupted after
   writing some cells, or its image is superseded before its flip.
 - **Budget**: 2,500 rows written per transaction, under DSQL's 3,000.
-- **The copy**: the one-time move of the old index's rows into the new tables.
+- **The copy**: the one-time move of the old index's rows into the new tables, with its position and completion in
+  a progress row of its own.
 
 ## Bug Details
 
@@ -124,7 +125,7 @@ index. This holds when the copy restarts part-way, and when two nodes copy at on
 
 ### Schema
 
-Three migrations, at the next free numbers after large-value-parts' V084–V087 (V088–V090 as of this writing):
+Four migrations, at the next free numbers after large-value-parts' V084–V087 (V088–V091 as of this writing):
 
 ```sql
 CREATE TABLE IF NOT EXISTS execution_visibility_attr_cell (
@@ -165,14 +166,23 @@ CREATE TABLE IF NOT EXISTS execution_visibility_attr_value (
 );
 ```
 
+```sql
+CREATE TABLE IF NOT EXISTS execution_visibility_attr_copy (
+    name          TEXT        NOT NULL,
+    position_data BYTEA,
+    completed_at  TIMESTAMPTZ,
+    PRIMARY KEY (name)
+);
+```
+
 What each piece is for:
 - **The cell table** keeps V052's typed columns and discriminator, puts the version into the key, and drops
   `value_data`.
 - **The index** is V053's, with the version after the run key. An equality on a keyword then returns the run and the
   version it matches against, from the index alone.
 - **The value table** holds one row per attribute per image.
-- **The copy's completion** is a row named `visibility_attr_cell_copy` in `chasm_backfill_marker` (V071). That table
-  records durable completions by name, and CHASM's retirement rule reads only its own row.
+- **The copy's progress** is the row named `visibility_attr_cell_copy` in `execution_visibility_attr_copy`: the
+  position the copy has reached, and when it finished.
 - **The old table.** `execution_visibility_attr_index` and V053's index stay, unread, until a later migration drops
   them.
 
@@ -187,7 +197,8 @@ What each piece is for:
    `(authority_epoch, source_transition_seq) < ($e, $s)`.
 3. **One transaction when it fits.** Do this when `1 + new cells + older cells + new values + older values + deltas`
    is at most 2,500. In the same transaction:
-   - write the image's cells at its version;
+   - write the image's cells at its version, with `ON CONFLICT DO NOTHING`: an interrupted three-step attempt of the
+     same image leaves its cells at that version;
    - upsert the row under the guard;
    - write the values at the version;
    - delete the cells and values below the version;
@@ -199,11 +210,13 @@ What each piece is for:
      transactions of at most 2,500 rows, with `ON CONFLICT DO NOTHING`, so a retried or concurrent apply of the same
      image writes the same rows. Cells at a version the run's row hasn't reached match no query.
    - **The flip.** In a transaction of its own: read the row by its primary key, check the guard, upsert the row, write
-     the values at the version, delete the values below it, add the deltas, and commit. When the guard fails, the image
+     the values at the version, delete the values below it when they fit in the transaction (cleanup deletes them
+     otherwise), add the deltas, and commit. When the guard fails, the image
      is current (`ApplyOutcome::Current`). If another apply flipped this same image, the cells are the run's
      attributes; otherwise they are orphans.
-   - **Cleanup.** Delete the run's cells below the version, in transactions of at most 2,500 rows. Each one selects up
-     to 2,500 keys below the version and deletes them by key, until none are left.
+   - **Cleanup.** Delete the run's cells, then its values, below the version, in transactions of at most 2,500 rows.
+     Each one finds the 2,500th key below the version in key order and deletes the rows up to it, until none are
+     left.
    The cell writes and the cleanup run outside the stripe lock, since they touch no counter. The flip holds the lock,
    as the apply does today.
 5. **Statements.** Every statement that writes cells writes at most 128 rows, the batch size
@@ -263,31 +276,42 @@ The scan metric labels the new table.
 
 ### The copy
 
-Add `run_visibility_attr_copy` beside the DSQL visibility store. The engine calls it once in `build_and_serve`'s DSQL
-branch, after `check_distributed_schema` and before it builds the projector supervisor
-(`crates/tokeira-engine/src/lib.rs`). That is before anything can apply an image: the projectors, the CHASM visibility
-adapter, the visibility repair scanner and the deletion path all start after it. It follows the pattern of
-`run_current_execution_backfill`, the CHASM pointer copy. Each of its transactions:
-1. Reads the completion row, and stops if it's set.
-2. Reads the next page of runs from `execution_visibility_current` in primary-key order, after a position kept in
-   memory, with each run's version.
-3. Copies each run's old rows into cells at the run's version, and one value per `(attr_id, attr_type)`. The old layout
-   puts the whole value on every row, so any one row gives it. The old table's key prefix `(namespace_id, run_key)`
-   serves each run's read.
-4. Stops adding runs before its writes would pass 2,500 rows. One run's old rows number fewer than 3,000, since one
-   transaction wrote them, so they split across at most two transactions, keyed on the old primary key.
-5. Writes with `ON CONFLICT DO NOTHING`, so a restarted copy, or two nodes copying at once, write the same rows.
+`copy_legacy_attributes`, on the DSQL visibility store, runs inside `build_dsql_stack`
+(`crates/tokeira-engine/src/lib.rs`), before it builds the projector supervisor, the CHASM visibility adapter and the
+visibility repair scanner, so before anything can apply an image. The listener-backed engine and the embedded engine
+both build their stack there, after their schema checks. It follows the pattern of `run_current_execution_backfill`,
+the CHASM pointer copy, which already runs inside `build_dsql_stack`.
 
-When the page reaches the end of the table, the copy writes the completion row.
+Each copy transaction:
+1. Reads the progress row `FOR UPDATE`, and stops if `completed_at` is set.
+2. Takes the position from `position_data`: the last `execution_visibility_current` key it finished,
+   `(namespace_id, archetype_id, run_key)`, and the old table's key within that run while the run is split across
+   transactions. A split run finishes first.
+3. Reads the next page of runs after the position, with each run's version. Each statement fixes a key prefix and
+   takes a range on the next column, which the primary key serves as a seek, so paging moves past runs that have no
+   attributes without rereading the table.
+4. Copies each run's old rows into cells at the run's version, and one value per `(attr_id, attr_type)`, on the server.
+   The old layout puts the whole value on every row of an attribute, so its first row in key order gives it. The old
+   table's key prefix `(namespace_id, run_key)` serves each run's read.
+5. Stops adding runs before its writes, the progress row's update included, would pass 2,500 rows. A run that
+   doesn't fit is split: a chunk takes half the room left, and each value goes with the chunk that holds its
+   attribute's first row, so a chunk of n rows writes at most 2n.
+6. Writes the new position in the same transaction, with `ON CONFLICT DO NOTHING` on every row it copies.
+
+When a page finds no run after the position, the transaction sets `completed_at`, unless it is already set. A
+transaction refused with a write conflict runs again, backing off. Two nodes copying at once conflict on the progress
+row, so they take turns, and neither fails its start. A copy that stops part-way, as the embedded engine's can under
+its startup deadline, resumes from the stored position at the next start.
 
 **Why the version read in the copy's own transaction is right:**
 - Every node of this release runs the copy to completion before it starts anything that applies an image, so no image
   is applied before completion is recorded.
-- A copy transaction that reads the completion row unset therefore reads each run's row as the earlier release left
+- A copy transaction that reads the progress row unfinished therefore reads each run's row as the earlier release left
   it. That is the version its old rows belong to.
 - A copy that starts after the completion commits stops at once.
-- A copy transaction that read before the completion, but commits after some node's flip, writes rows below that run's
-  new version. They match nothing, and cleanup removes them.
+- A copy transaction whose snapshot predates the completion on another node can still write rows at a run's old
+  version, once that node's projectors have flipped the run. Such rows are bounded by one straggling transaction per
+  node, match nothing, and go at that run's next cleanup or deletion.
 
 **After this release** nothing writes the old table. It can be dropped by a later migration, after a full release with
 the completion recorded and no reads of it, as `crates/tokeira-storage/AGENTS.md` has it for CHASM's legacy pointers.
@@ -304,9 +328,9 @@ cells, split across transactions anyway. Its values come to at most 40 KiB.
 
 - **The release** already upgrades with every node stopped ("Upgrade with every node stopped.", in the unreleased
   notes). The copy relies on that: a node of an earlier release would write the old layout.
-- **The schema contract** gains the three migrations as part of the release's target, since startup needs them.
+- **The schema contract** gains the four migrations as part of the release's target, since startup needs them.
 - **Start-up time.** The copy makes the first start take longer, the more attribute rows the cluster holds. It logs its
-  progress.
+  progress, and an interrupted copy resumes from its stored position at the next start.
 
 ### Specs this changes
 
@@ -324,7 +348,8 @@ The code PR aligns these:
 
 - **`docs/testing/dsql-live-suites.md`**: the new live tests.
 - **`docs/diagrams/projection-plane.svg`**: it names the attribute index.
-- **The crate docs** in `dsql_store.rs`: the apply, cleanup and copy.
+- **`crates/tokeira-storage/AGENTS.md`**: the list of migrations.
+- **The crate docs** in `dsql_store.rs` and its `dsql_attributes.rs` module: the apply, cleanup and copy.
 
 ## Testing Strategy
 
@@ -348,31 +373,41 @@ Tagged `// Feature: bounded-visibility-apply, Property N: <title>`.
   with a query check after every step.
 - **Property 4**: for generated images, the values decoded from the value table equal those decoded from today's
   index rows.
-- **Property 5**: the copy over a model of the old index, restarted at generated points and run twice at once.
+- **Property 5**: the copy's decisions over a model of the old index, with generated budgets and page sizes. Every
+  step writes at most the budget, the copy always progresses, and it ends with every old row at its run's version and
+  one value per attribute. A restart, or a second copier taking turns, runs the same steps from the stored position.
 
 ### Unit Tests
 
 - Every query shape from the compiler names the version match.
 - The cleanup's predicate is strictly below the version.
 - Cells are written by statements of at most 128 rows.
-- The copy stops when the completion row exists.
-- The engine runs the copy after the schema check and before it builds the projector supervisor.
+- The engine's `build_dsql_stack`, which both engines call, runs the copy before it builds the services that apply
+  images.
 
 ### Live Tests
 
 On an ephemeral cluster:
 1. **The exploration tests**, which pass after the fix.
 2. **Interleaved applies**: two projectors apply interleaved large images of one run, with a test hook between steps.
-   Filters checked at every hook match exactly one image's tokens.
+   Filters checked at every hook match exactly one image's tokens. A staged apply interrupted before its flip, by a
+   failed cell batch, leaves the previous image matching, and its retry applies the image whole.
 3. **Cleanup and orphans**: no cells or values are left below the current version after cleanup. Cells of an
    interrupted apply match nothing, and the run's next newer image removes them.
-4. **The copy**: an old index written with V052's statements is copied. Filters, Count, hydration and the seed answer
-   as before. A restart part-way copies the rest. A second copy after completion writes nothing.
+4. **The copy**: an old index written with V052's statements is copied with a small budget, so runs split.
+   - A copy stopped part-way resumes from its stored position, not the head, and every filter and value then matches
+     the old index.
+   - Two copies at once both finish without an error.
+   - A copy after completion writes nothing.
+   - The embedded engine, started on the cluster, runs the copy: an old row is a cell at its run's version afterwards.
 5. **The seed**: projection-passes' seed tests, through the value table.
 6. **EXPLAIN**:
    - equality on a keyword uses the lookup index;
-   - the correlated probes and the cleanup's delete use the cell table's primary key;
-   - the copy's per-run read uses the old table's key prefix.
+   - the version-correlated probes read the cell table through one of its indexes with an index condition, never a
+     full scan;
+   - the cleanup's delete uses the cell table's primary key;
+   - the copy's per-run read uses the old table's key prefix;
+   - the copy's pages of runs seek the current table's primary key.
 
 ### Negative controls
 
@@ -380,9 +415,11 @@ Each is patched in alone, and each must fail its test:
 1. Cleanup deletes at or below the current version: live test 1 fails, because the image's tokens are gone.
 2. Queries without the version match: live test 3 fails, because an old image's token matches before cleanup.
 3. The single-transaction check leaves out the older rows: exploration test 2 fails with DSQL's limit.
-4. The flip before the cells are written: live test 2 fails, because a filter matches part of an image.
+4. The flip before the cells are written: the interrupted apply in live test 2 fails, because the run matches neither
+   image.
 5. The copy writes cells one version above the row's: live test 4 fails, because old runs match nothing.
-6. The seed reads the cell table: live test 5 fails, because the list is missing.
+6. The seed reads no value at the row's version: live test 5 fails, because the list is missing.
+7. The copy keeps its position in memory: live test 4's resume fails, because the restarted copy starts from the head.
 
 ### Preservation Checking
 

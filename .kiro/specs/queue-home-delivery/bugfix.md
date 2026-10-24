@@ -43,6 +43,15 @@ The following code was inspected at `a7592f5a9c06ef2686073868892371991ff315b4`. 
 | The poll resolver reads state, and the owner separately reads metadata, sticky identity where applicable, and state with statistics. | `resolve_polled_workflow_task_target` in runtime; `start_workflow_task` in edge |
 | Offer expiry permits later rediscovery; acquisition retirement currently runs from discovery. | [workflow_offers.rs](../../../crates/tokeira-runtime/src/workflow_offers.rs), `expire`, `retire_home`; `retire_offers` in the broker |
 
+Credential provisioning was also checked at `ee9ca4b6`. The
+[JWT verifier](../../../crates/tokeira-auth/src/jwt.rs) already accepts RS256/ES256 and can parse an in-memory JWKS;
+its tests generate an ES256 key and sign tokens. The
+[Secrets Manager resource](../../../crates/tokeira-aws/src/resources/secrets_manager_secret.rs) provisions generated
+password material once and preserves it on update, but it does not yet generate peer signing material. Standard
+[ECS](../../../platforms/ecs/definition.tkdp) and [EKS](../../../platforms/eks/definition.tkdp) definitions use that
+resource. The peer credential resource, its delivery to runtimes, and generated peer configuration below are new
+work, not existing capabilities.
+
 Under roughly uniform, independent execution and queue placement, about `(N-1)/N` of tasks on `N` nodes take the
 discovery path. About 50 tasks/second is an estimate for the modelled scenarios, not a universal throughput cap.
 
@@ -168,6 +177,16 @@ plans SHALL be verified on live DSQL before completion.
 
 2.16 WHEN delivery fails or falls back THEN bounded diagnostics SHALL distinguish ownership, capacity, transport,
 authentication, deadline and sticky-routing outcomes, without credentials or unbounded per-run metric labels.
+
+2.17 WHEN a standard `tkr` deployment is applied THEN its platform SHALL provision and deliver cluster peer signing
+material and matching verifier configuration to every peer-capable runtime without an external identity provider
+or hand-authored peer credentials; IF that material is missing or inconsistent THEN the runtime SHALL fail
+readiness with a corrective diagnostic rather than silently serving with cross-node push disabled.
+
+2.18 WHEN deployments are reapplied, nodes restart or replicas change THEN the cluster's peer trust SHALL remain
+stable and tokens SHALL renew locally; WHEN an operator explicitly rotates or retires credentials THEN the
+plan/apply lifecycle SHALL preserve cluster isolation, secret redaction and the stopped-node rotation contract in
+[design.md](design.md).
 
 ### Unchanged Behavior (Regression Prevention)
 

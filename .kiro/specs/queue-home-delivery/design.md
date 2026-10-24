@@ -43,7 +43,8 @@ Names below specify responsibility; implementation may follow local naming conve
 | `list_sticky_workflow_dispatch(home, after_run_key, limit)` | Read-only repository page operation in both stores; returns candidates, last examined key and exhaustion. |
 | Sticky recovery scheduler | Runtime task per active execution-home acquisition, coordinated under node-wide limits and cancelled with that acquisition. |
 | `PreparedWorkflowStart` | Owner-local, non-serializable validation context from one state/statistics load, used by edge policy/envelope checks and runtime target resolution. Not an alternate commit API. |
-| Peer dispatch credential/verifier adapters | Edge/auth boundary, with server configuration owned by `tokeira-config`; independent of the request-local public poll context. |
+| Peer dispatch credential/verifier adapters | Edge/auth boundary, with server configuration owned by `tokeira-config`; local token signing and verification are independent of the request-local public poll context. |
+| Managed peer credential resource | Platform-owned provisioning through the existing `tkr` plan/apply flow; creates protected signing material once, delivers it to peer-capable runtimes and renders matching non-secret configuration. |
 
 The kernel stays pure. Publisher and recovery may hydrate hints after commit, but neither changes state to reflect
 delivery. Keep these loads separately observable from start-path loads. Existing placement determines queue and
@@ -113,18 +114,24 @@ broker locks. The sender performs it through the same bounded work scheduler.
 
 ### Peer authorization and limits
 
-Background work has no `ForwardedPoll`. Use a dedicated workload JWT policy for **only** `OfferWorkflowTask`,
-reusing the existing JWT/JWKS verification primitives where appropriate, without changing public authentication
-semantics. Configure exact issuer, JWKS source, a nonempty cluster-specific audience, exact allowed peer subjects,
-and an externally refreshed token-file path for the sender. These are explicit edge/auth configuration fields;
-they do not determine shard claims or controller behaviour. No new package dependency is assumed.
+Background work has no `ForwardedPoll`. Standard deployments provision a **cluster peer signing key** through
+`tkr` and mint short-lived workload JWTs locally for **only** `OfferWorkflowTask`. No external identity provider,
+token sidecar or optional operator-authored JWT profile is required for the normal deployment path. Reuse the
+existing JWT/JWKS verification primitives where appropriate without changing public authentication semantics.
+
+Each credential generation contains a cryptographically generated ES256 private key, its public JWKS and `kid`,
+and a stable random cluster UUID. Derive an exact issuer `urn:tokeira:peer:<cluster-uuid>`, audience
+`urn:tokeira:workflow-offers:<cluster-uuid>` and one allowed subject `tokeira-runtime-peer`. Replicas share this
+cluster capability; it authenticates membership in this cluster, not a unique process or a current lease owner.
+Do not reuse deployment-repository signing keys or public worker credentials. The cluster UUID survives rotation;
+the key and `kid` change. Separate deployments get independent keys and UUIDs, even if their display names match.
 
 | Peer configuration field | Validation / effect |
 | --- | --- |
-| Issuer and JWKS source | Nonempty exact issuer and valid JWKS URL; use existing bounded key refresh and last-known-good-key discipline. No trust based on an unverified token's arbitrary URL. |
-| Audience | Nonempty cluster-specific value; require exact membership in the signed audience claim. |
-| Allowed subjects | Explicit nonempty exact-match set, without a wildcard or implicit public-role grant. |
-| Token-file path | Explicit path for externally rotated credentials; missing/unreadable/oversized content fails the attempt without logging it. |
+| Cluster identity, issuer and audience | Rendered from the provisioned cluster UUID; require exact signed issuer and audience membership. Never derive trust from a token's unverified URL or display name. |
+| Allowed subjects | Render the exact peer subject above as a one-element set; no wildcard or implicit public-role grant. |
+| Credential source | A protected local file or an exact provider secret/version reference; platform bootstrap resolves it before runtime readiness. Only the reference, never its secret bytes, enters server TOML or plan output. |
+| Public verification material and generation | Public JWKS, expected `kid` and public-key fingerprint are supplied by provisioning. At startup check their agreement with the signing material, cluster identity and pinned generation. |
 
 Server configuration rejects unknown fields. Mechanical concurrency, retry and page-size constants remain runtime
 implementation settings, not new TOML or environment overrides.
@@ -134,14 +141,67 @@ non-future issuance, unexpired validity, and valid `nbf` when present. Require `
 hour with at most 30 seconds of clock leeway.
 Do not use the public mapper's optional-expiry or optional-audience policy for this endpoint. Public Worker/Admin
 grants, custom worker scope claims and anonymous mode do not authorize peer offers. Missing peer configuration
-fails closed for this method. Remote-delivery wiring validates the complete configuration when installed; direct
-local delivery needs no network credential. Credentials must be supplied for the cross-node push guarantee.
+fails closed for this method **and prevents a peer-capable server from becoming ready**. This is not a switch that
+quietly leaves the standard deployment on discovery-only delivery. Direct in-process fixtures need no network
+credential, but that convenience cannot bypass validation for an installed peer client/server. No ownership-claim
+or controller policy changes are involved.
 
-The credential provider reads the externally rotated file for each attempt, bounded to 8 KiB, and never places its
-token in a hint, persistent row, tracing event or error. Issuance/projection belongs to the operator's identity
-provider; this change does not add an issuer or copy worker credentials. Tests inject a synthetic provider. The
-receiver grants configured peers permission to submit hints across this cluster, not to poll, read history, or
-write a run. The later worker start still uses request-local worker credentials and existing policy checks.
+After validating the protected material at startup, each node signs five-minute tokens in memory and reuses one
+only while at least one minute of validity remains. Renewal needs no network call or external process, and stays
+inside the attempt's bound. Bound an encoded token to 8 KiB and loaded credential/JWKS documents to 64 KiB each;
+discard malformed or oversized material without echoing it. Never put a key or token in a hint, durable run state,
+tracing event, error, command line or generic deployment-state value. Tests generate ephemeral material rather
+than committing keys. The receiver grants peers permission to submit hints, not to poll, read history or write a
+run. Worker starts still use request-local worker credentials and existing policy checks.
+
+### Standard deployment credential lifecycle
+
+The managed resource is part of the normal deployment dependency graph, before runtime service configuration and
+readiness. `tkr` delegates to the bound platform engine; shared runtime/auth code has no provider SDK dependency.
+This is required implementation scope, including the platform definitions and their generated configuration.
+
+1. **Plan:** show creation/adoption of the credential generation, its non-secret destination and consumers. Planning
+   generates no private key and mutates no secret store. Never embed private material in a definition or diff.
+2. **Apply:** create the cluster UUID/key once using the existing cryptographic primitives and protected provider
+   storage. Use create-only/convergent resource identity bound to the deployment and generation. Concurrent apply
+   or retry after an uncertain create adopts the same stored generation after validating its ownership, cluster
+   identity and public fingerprint; it must not overwrite it with another randomly generated key. Reject an
+   unrelated existing resource instead of adopting it solely by name. Persist only public identity, fingerprint,
+   generation and secret reference in generic infrastructure/deployment state.
+3. **Deliver:** render verifier policy and a credential-source reference for every server process that can own an
+   execution or queue home. Replacement replicas obtain the same generation automatically. Do not grant the key
+   to unrelated services. Validate private/public agreement before installing the peer endpoint and sender.
+4. **Reapply/restart:** keep the generation and key unchanged. A lost or inconsistent referenced secret is an error
+   with a repair instruction, not permission for an individual node to invent a new key or disable push. A process
+   already holding valid material can keep renewing tokens during a secret-store outage; a replacement waits for
+   successful bootstrap. Normal token expiry never requires an operator or deployment apply.
+5. **Rotate:** an explicit reviewed plan creates a new key generation with the same cluster identity. Stop every
+   node, apply the new references/verifier material, then restart nodes with only the new public key trusted. No
+   rolling/mixed-generation rotation is claimed. Old tokens fail after cutover; retain the prior secret only as
+   an explicitly controlled rollback artifact, with no runtime read grant or verifier trust, then retire it.
+6. **Destroy/recover:** credential deletion follows the existing explicit destructive plan/confirmation rules and
+   the platform's recovery policy. Recreating a deleted deployment must not adopt another cluster's credential by
+   display name. Recovery of the same deployment requires its validated identity/generation, or an explicit
+   stopped-cluster re-provisioning plan.
+
+| Standard platform | Required provisioning and delivery path |
+| --- | --- |
+| Local | A deployment-owned credential resource creates a private file outside published artifacts, with directory/file modes 0700/0600 and no symlink following. The local service receives its path; recreation/restart reuses it. |
+| Compose | The same protected host resource is mounted read-only into every peer-capable runtime container, with matching rendered verifier configuration. Image layers, compose documents and ordinary environment values contain no key/token. |
+| ECS | A generated Secrets Manager resource holds the key. The task role gets read access to that exact resource; a provider bootstrap adapter retrieves the pinned version into memory before runtime readiness. No private bytes enter the task definition or plan/state output. |
+| EKS | A generated Secrets Manager resource holds the key. The runtime workload identity gets read access to that exact resource; the provider bootstrap adapter resolves the pinned version before readiness. Neither rendered Kubernetes manifests nor ordinary ConfigMaps carry the private material. |
+
+These adapters and the generated ES256 secret variant are future work. Existing anchors are the
+[secret resource](../../../crates/tokeira-aws/src/resources/secrets_manager_secret.rs), the
+[JWT/JWKS primitives](../../../crates/tokeira-auth/src/jwt.rs), and platform-owned definitions under `platforms/`.
+Keep new provider operations in their provider/platform crates and expose only a bounded credential-loader seam
+to server bootstrap. This spec authorizes the necessary existing-library dependency edges for generation/signing
+and bootstrap, which the implementation PR must identify; it does not call for a new cryptographic library family.
+
+Generated-deployment tests must prove this path with no hand-authored peer fields: fresh provisioning, repeated
+apply, uncertain creation, replacement replicas, local token renewal beyond the first token's expiry and explicit
+rotation. Run a split-home push/start using the generated configuration and credentials, with discovery paused.
+Rendering a profile without a working source of signing material does not satisfy the requirement.
 
 The existing peer channel uses the shared public listener over plaintext. This policy authenticates possession of
 a credential; it does not provide confidentiality or resist a network observer replaying that credential within
@@ -153,7 +213,7 @@ Initial implementation constants, subject to evidence-backed spec amendment rath
 | Resource | Bound |
 | --- | --- |
 | Serialized offer request / response | 64 KiB / 4 KiB; enforce request size before full decode. Existing start limits are unchanged. |
-| Offer authentication metadata | 8 KiB; reject excessive metadata before verification. |
+| Offer authentication metadata | 8 KiB; reject excessive metadata before verification. Tokens must fit within this bound including their authorization framing. |
 | Outbound queue | 1,024 entries and 16 MiB retained hint bytes per node, with incarnation coalescing. |
 | Outbound concurrent RPCs | 32 per node, at most 8 per destination; fair scheduling between homes and publication/recovery. |
 | Incoming offer handlers | 64 per node; reject overload without an unbounded waiter queue. |
@@ -241,12 +301,12 @@ to undo it. A lost response has the existing timeout/retry semantics.
 | Failure | Internal outcome / external mapping | Safety and recovery |
 | --- | --- | --- |
 | Malformed hint or inconsistent fields | `InvalidArgument` | No admission or state change. |
-| Missing/invalid/expired peer credential | `Unauthenticated` | No admission; bounded credential diagnostic. |
+| Missing/invalid/expired peer credential | `Unauthenticated` | No admission; bounded credential diagnostic. Missing/inconsistent bootstrap material also prevents runtime readiness. |
 | Verified identity outside peer policy | `PermissionDenied` | No admission; public grants do not substitute. |
 | Oversized request/metadata or handler limit | `ResourceExhausted` | No unbounded allocation/queue; durable retry. |
 | Full offer budget | `Full` typed response | No durable loss; release reservation. |
 | Queue movement or cancelled generation | `NotHome` | Placement refresh; late cleanup cannot touch replacement. |
-| Routing/JWKS/transport unavailable, deadline elapsed in RPC | `Unavailable` / `DeadlineExceeded` | Uncertain admission; no automatic sticky fallback from this alone. |
+| Routing/signing/transport unavailable, deadline elapsed in RPC | `Unavailable` / `DeadlineExceeded` | Uncertain admission; no automatic sticky fallback from this alone. |
 | Sticky semantic unavailability | `StickyUnavailable(reason)` | Normal-home attempt with original deadline. |
 | Execution owner loses lease or incarnation changes | Existing start rejection/status mapping | Existing fenced transaction commits nothing for a stale writer/task. |
 
@@ -372,6 +432,16 @@ SHALL never depend on offer delivery or observation; existing repair/timeout sem
 
 **Validates: Requirements 3.1, 3.2, 3.3, 3.4.**
 
+### Property 10: Standard deployments have stable peer credentials
+
+For any generated deployment and sequence of plan/apply retries, uncertain creates, restarts and replica changes,
+all its peer-capable runtimes SHALL obtain one matching credential generation without an external issuer. A fresh
+cluster SHALL not authenticate as another cluster. Token renewal SHALL continue past initial token expiry without
+operator work; missing or mismatched bootstrap material SHALL fail readiness. Explicit stopped-node rotation SHALL
+invalidate old tokens, and secret material SHALL not appear in plan output, generic state or rendered manifests.
+
+**Validates: Requirements 2.13, 2.14, 2.16, 2.17, 2.18.**
+
 ## Testing, rollout and risks
 
 First execute failing bug-condition exploration properties against the unfixed code, including normal/sticky
@@ -388,12 +458,14 @@ the URL gate actually executed the test. Publish outcomes only; keep cluster ide
 Region out of committed evidence. No live validation is claimed by this specification PR.
 
 The implementation must align the affected portions of workflow-dispatch (the sticky backup and offer lifecycle),
-schema contracts, peer configuration documentation and the live-suite runbook. This spec PR changes only its own
-documents and an internal fragment. No mixed-version compatibility path is introduced.
+schema contracts, peer configuration/provisioning documentation and the live-suite runbook. This spec PR changes
+only its own documents and an internal fragment. No mixed-version compatibility path is introduced.
 
 Upgrade with every node stopped.
 
-Known risks: peer credentials traverse the existing plaintext transport; the sticky sweep adds bounded read and
+Known risks: peer tokens traverse the existing plaintext transport, and a stolen cluster signing key allows peer
+impersonation until explicit rotation; the shared key does not provide per-node identity. Bootstrap depends on the
+protected credential source, though routine token renewal is local. The sticky sweep adds bounded read and
 hydration work and may take multiple periods on a backlog; the new partial index adds write/index cost; a bounded
 push may be refused, making recovery latency visible; liveness depends on fair capacity and working credentials;
 read targets remain provisional until measured. Existing start request-ID retry limitations and the explicitly

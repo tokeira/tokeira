@@ -7,8 +7,9 @@ in a separate task after this spec merges. Read [bugfix.md](bugfix.md) and [desi
 contracts, provisional read target and scope boundaries govern this plan.
 
 First demonstrate the defects and measure the actual read baseline. Then add the bounded hint contract, sticky
-recovery query, peer authorization, admission/retirement, push and recovery, and start-read consolidation. Keep
-each intermediate change green using appropriate focused checks; the full finish bar belongs to the code PRs.
+recovery query, provisioned peer credentials and authorization, admission/retirement, push and recovery, and
+start-read consolidation. Keep each intermediate change green using appropriate focused checks; the full finish
+bar belongs to the code PRs.
 
 ## Tasks
 
@@ -43,20 +44,39 @@ each intermediate change green using appropriate focused checks; the full finish
     - **Property 8: Complete bounded sticky traversal** (storage portion; runtime portion in 6.2)
     - **Validates: Requirements 2.8, 2.9, 2.15, 3.2, 3.5.**
 
-- [ ] 3. Internal offer RPC and dedicated peer policy
+- [ ] 3. Internal offer RPC, managed credentials and dedicated peer policy
   - [ ] 3.1 Extend the Tokeira internal proto/service with `OfferWorkflowTask` and its typed outcomes. Implement the
     field-policy table, unknown-enum/shape validation, request/response bounds and handler concurrency cap. Preserve
     the existing start method and its larger response limit; do not modify upstream Temporal protos.
     - _Requirements: 2.1, 2.13, 2.14_
-  - [ ] 3.2 Implement explicit peer JWT configuration, bounded rotated-token provider and strict receiver policy;
-    reuse verifier/JWKS primitives while retaining the public auth policy unchanged. Reject anonymous callers and
-    public Worker/Admin credentials without the separate peer grant. Document configuration and plaintext risk.
-    - _Requirements: 2.13, 2.14, 2.16_
+  - [ ] 3.2 Implement cluster ES256 material generation, bounded loading, five-minute local token signing/renewal and
+    the strict receiver policy. Reuse existing cryptographic primitives and document any required dependency-edge
+    changes; preserve public authentication. Validate key/public-profile agreement before peer-capable runtime
+    readiness, and reject anonymous callers or public Worker/Admin credentials without the separate peer grant.
+    - _Requirements: 2.13, 2.14, 2.16, 2.17, 2.18_
   - [ ] 3.3 Write generated credential, enum, envelope-size and handler-saturation tests, including exact limits,
     one-over limits, missing configuration, wrong issuer/audience/subject, missing expiry, expiry/rotation, future
-    validity, JWKS refresh failures and token redaction. Validate required peer wiring without changing shard claims.
+    validity, corrupt/mismatched public key material and token redaction. Validate required peer wiring without
+    changing shard claims; missing bootstrap credentials must not silently select discovery-only delivery.
     - **Property 7: Authorized, bounded and non-blocking hints** (auth/wire portion; scheduling portion in 5.3)
     - **Validates: Requirements 2.13, 2.14, 2.16, 3.2.**
+  - [ ] 3.4 Add the platform-owned managed credential resource to the normal `tkr` plan/apply dependency graph.
+    Generate no secrets during planning; create protected material once at apply, validate identity when adopting
+    after an uncertain create, and keep secret bytes out of generic state. Model explicit generation replacement
+    and destructive cleanup with the existing approval semantics; do not rotate on ordinary reapply or restart.
+    - _Requirements: 2.17, 2.18_
+  - [ ] 3.5 Wire Local/Compose protected files/read-only mounts and ECS/EKS generated Secrets Manager resources,
+    exact-resource workload grants and provider bootstrap loaders. Render verifier configuration and credential
+    references for all peer-capable runtimes in each standard definition set, including paired definition formats.
+    Document startup repair and stopped-node key rotation. Keep provider SDKs out of shared runtime/auth code.
+    - _Requirements: 2.13, 2.16, 2.17, 2.18_
+  - [ ] 3.6 Write generated credential lifecycle tests with provider fakes and real local protected-file/signing
+    adapters: fresh/repeated/concurrent apply, lost create response, missing/mismatched material, repeated display
+    names across clusters, restart, scale-out, automatic renewal beyond token expiry, explicit stopped-node
+    rotation, retired-key rejection and deletion/recovery. Assert redaction and absence of private material in
+    plans, ordinary state, rendered manifests and image inputs. Validate each platform's generated graph/config.
+    - **Property 10: Standard deployments have stable peer credentials**
+    - **Validates: Requirements 2.13, 2.14, 2.16, 2.17, 2.18.**
 
 - [ ] 4. Shared admission and acquisition-driven retirement
   - [ ] 4.1 Route local, pushed and discovered normal offers through common bounded admission. Check generation,
@@ -135,12 +155,14 @@ each intermediate change green using appropriate focused checks; the full finish
     - **Validates: Requirements 3.1, 3.2, 3.3, 3.4.**
   - [ ] 8.3 Exercise actual internal gRPC with at least two runtimes for normal push and remote start, then three with
     distinct execution/sticky/normal homes for all sticky fallbacks. Prove push with discovery paused; separately
-    drop sticky push, normal fallback and acknowledgement. Check peer-policy failures, saturation, takeover,
-    prompt retirement, reply statuses and warm/cold read counters, without bypassing the wire authorization path.
-    - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14, 2.16, 3.5_
-  - [ ] 8.4 Checkpoint: exploration tests now pass, negative controls fail for the intended reason, and all nine
+    drop sticky push, normal fallback and acknowledgement. Use configuration and credentials generated by the
+    standard deployment path with no hand-authored peer fields, and keep it running past initial token expiry.
+    Check peer-policy failures, saturation, takeover, prompt retirement, reply statuses and warm/cold read counters,
+    without bypassing the wire authorization path or depending on an external identity provider.
+    - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14, 2.16, 2.17, 2.18, 3.5_
+  - [ ] 8.4 Checkpoint: exploration tests now pass, negative controls fail for the intended reason, and all ten
     properties have executable coverage with deterministic synchronization and useful shrunk counterexamples.
-    - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14, 2.15, 2.16_
+    - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14, 2.15, 2.16, 2.17, 2.18_
 
 - [ ] 9. Live DSQL contracts and plans
   - [ ] 9.1 Under [the live-suite runbook](../../../docs/testing/dsql-live-suites.md), create and clean up an ephemeral
@@ -162,21 +184,22 @@ each intermediate change green using appropriate focused checks; the full finish
 
 - [ ] 10. Align documentation and finish the code PRs
   - [ ] 10.1 Align workflow-dispatch's sticky recovery, offer lifecycle and start-read descriptions, configuration
-    docs and the suite runbook with the implemented contract. Record measured baseline/result counts, query plans,
-    limitations and outcomes without cluster identifiers, live-run dates/times or Region. Preserve the one-line
+    and credential-provisioning docs and the suite runbook with the implemented contract. Record measured
+    baseline/result counts, query plans, limitations and outcomes without cluster identifiers, live-run dates/times
+    or Region. Preserve the one-line
     stopped-node upgrade instruction and the explicit activity/speculative/security deferrals.
-    - _Requirements: 2.8, 2.10, 2.11, 2.13, 2.15, 2.16, 3.3_
+    - _Requirements: 2.8, 2.10, 2.11, 2.13, 2.15, 2.16, 2.17, 2.18, 3.3_
   - [ ] 10.2 Run the full root AGENTS.md §10.4 bar for each code PR, plus its applicable focused/live checks and
     offline links/fragment validation. Report every omission and why; tick only work actually completed. Rebase at
     the PR boundary and follow the repository's attribution, review and exact-head merge protocol.
-    - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14, 2.15, 2.16, 3.1, 3.2, 3.3, 3.4, 3.5_
+    - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14, 2.15, 2.16, 2.17, 2.18, 3.1, 3.2, 3.3, 3.4, 3.5_
 
 ## Task Dependency Graph
 
 ```mermaid
 graph TD
     T1[1 Exploration and baseline] --> T2[2 Hint data and storage pages]
-    T1 --> T3[3 Peer policy and RPC]
+    T1 --> T3[3 Provisioning, peer policy and RPC]
     T2 --> T4[4 Admission and retirement]
     T3 --> T5[5 Push and sticky routing]
     T4 --> T5

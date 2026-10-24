@@ -32,6 +32,16 @@ ignore = [
     "RUSTSEC-2026-0367", # `zip` keeps SUID/SGID bits in `extract`
     "RUSTSEC-2026-0368", # `zip` writes symlinks outside the destination in `extract`
     "RUSTSEC-2026-0369", # `zip` applies permissions through symlinks in `extract`
+    # `crypto-bigint` 0.5.5 reaches the graph only through the AWS SDK: `aws-sigv4`'s
+    # SigV4a signer, and `p256` 0.13 under `aws-config`'s sign-in credentials
+    # provider, which `aurora-dsql-sqlx-connector` turns on. The fix is crypto-bigint
+    # 0.7.6, and no SDK release has moved off 0.5: `aws-sigv4` 1.6.3 still requires
+    # it, and `aws-config` 1.13.0 still requires p256 0.13. S3's endpoint rules ask
+    # for SigV4a only for multi-region access points and S3 on Outposts, and Tokeira
+    # addresses its regional buckets by name; the sign-in provider runs only for an
+    # AWS profile with `login_session`. Drop this entry when the SDK moves to
+    # crypto-bigint 0.7.6.
+    "RUSTSEC-2026-0387", # `crypto-bigint` timing variability in constant-time operations
 ]
 
 [licenses]

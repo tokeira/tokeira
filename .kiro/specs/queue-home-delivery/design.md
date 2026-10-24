@@ -8,6 +8,8 @@ remote start. The execution owner validates and commits that start under its own
 
 The dependencies are [workflow-dispatch](../workflow-dispatch/design.md), including its completed acquisition fence,
 and [bundle-lease-fence](../bundle-lease-fence/design.md). A publisher's identity or epoch is not write authority.
+The no-peer DSQL daemon mode relies on the separately owned [single-node claim](../single-node-claim/design.md)
+contract; this specification consumes that ownership decision and does not implement the claim.
 Source evidence and Temporal v1.31.0 anchors are in [bugfix.md](bugfix.md). No upstream Temporal proto changes,
 authoritative state-format changes, pair-commit changes, or speculative/activity delivery changes are required.
 
@@ -114,8 +116,25 @@ broker locks. The sender performs it through the same bounded work scheduler.
 
 ### Peer authorization and limits
 
-Background work has no `ForwardedPoll`. Standard deployments provision a **cluster peer signing key** through
-`tkr` and mint short-lived workload JWTs locally for **only** `OfferWorkflowTask`. No external identity provider,
+Determine whether a peer can exist from the startup/ownership mode before installing peer delivery. Owning a home
+is not sufficient evidence that a peer can exist, and an empty membership view is not evidence that it cannot.
+
+| Startup mode | Offer push components and credentials |
+| --- | --- |
+| Single node without a placement controller | Under the [single-node claim contract](../single-node-claim/design.md), it owns every home and has no runtime peer. Install no `OfferWorkflowTask` endpoint or remote offer sender; require no peer credential, including for a directly started `tokeirad` not managed by `tkr`. Preserve its existing ownership/startup safeguards. |
+| Embedded engine, in-memory or durable | Its local/exclusive [ownership contract](../managed-embedded-dsql/design.md) permits no runtime peer. Install no offer push endpoint or remote sender and require no peer credential. An optional [public listener](../embedded-engine-listener/requirements.md) exposes clients/workers, not another execution owner, so the exemption still applies. |
+| Controller-managed or another peer-capable runtime mode | Provision and validate credentials before readiness and install the authenticated push endpoint/sender. One current replica, no discovered peers, or temporary controller unavailability does not enable the exemption. |
+
+Reuse the authoritative startup-mode decision; do not add an independent authentication-disable flag. Unknown or
+ambiguous peer capability must not silently select the exemption. A no-peer path constructs no peer credential
+loader, token-renewal work or outbound offer client, and its router exposes no offer push endpoint. This affects
+the new offer method only, not existing public APIs or other internal methods. Local publication, discovery and
+sticky fallback continue in-process. Applying a standard no-peer deployment adds no peer credential resource.
+Changing to a mode that permits peers requires credential provisioning and validation before starting in that
+mode; this spec does not add live mode switching or modify the separately owned single-node claim.
+
+Background work has no `ForwardedPoll`. Standard peer-capable deployments provision a **cluster peer signing key**
+through `tkr` and mint short-lived workload JWTs locally for **only** `OfferWorkflowTask`. No external identity provider,
 token sidecar or optional operator-authored JWT profile is required for the normal deployment path. Reuse the
 existing JWT/JWKS verification primitives where appropriate without changing public authentication semantics.
 
@@ -142,9 +161,9 @@ hour with at most 30 seconds of clock leeway.
 Do not use the public mapper's optional-expiry or optional-audience policy for this endpoint. Public Worker/Admin
 grants, custom worker scope claims and anonymous mode do not authorize peer offers. Missing peer configuration
 fails closed for this method **and prevents a peer-capable server from becoming ready**. This is not a switch that
-quietly leaves the standard deployment on discovery-only delivery. Direct in-process fixtures need no network
-credential, but that convenience cannot bypass validation for an installed peer client/server. No ownership-claim
-or controller policy changes are involved.
+quietly leaves a peer-capable deployment on discovery-only delivery. The no-peer modes above, including real
+single-node and embedded deployments rather than only fixtures, remain ready without these credentials. They
+cannot install the push endpoint or sender. No ownership-claim or controller policy changes are involved.
 
 After validating the protected material at startup, each node signs five-minute tokens in memory and reuses one
 only while at least one minute of validity remains. Renewal needs no network call or external process, and stays
@@ -156,8 +175,9 @@ run. Worker starts still use request-local worker credentials and existing polic
 
 ### Standard deployment credential lifecycle
 
-The managed resource is part of the normal deployment dependency graph, before runtime service configuration and
-readiness. `tkr` delegates to the bound platform engine; shared runtime/auth code has no provider SDK dependency.
+For peer-capable modes, the managed resource is part of the normal deployment dependency graph, before runtime
+service configuration and readiness. `tkr` delegates to the bound platform engine; shared runtime/auth code has no
+provider SDK dependency.
 This is required implementation scope, including the platform definitions and their generated configuration.
 
 1. **Plan:** show creation/adoption of the credential generation, its non-secret destination and consumers. Planning
@@ -168,8 +188,8 @@ This is required implementation scope, including the platform definitions and th
    identity and public fingerprint; it must not overwrite it with another randomly generated key. Reject an
    unrelated existing resource instead of adopting it solely by name. Persist only public identity, fingerprint,
    generation and secret reference in generic infrastructure/deployment state.
-3. **Deliver:** render verifier policy and a credential-source reference for every server process that can own an
-   execution or queue home. Replacement replicas obtain the same generation automatically. Do not grant the key
+3. **Deliver:** render verifier policy and a credential-source reference for every server process whose startup
+   mode permits runtime peers. Replacement replicas obtain the same generation automatically. Do not grant the key
    to unrelated services. Validate private/public agreement before installing the peer endpoint and sender.
 4. **Reapply/restart:** keep the generation and key unchanged. A lost or inconsistent referenced secret is an error
    with a repair instruction, not permission for an individual node to invent a new key or disable push. A process
@@ -184,7 +204,10 @@ This is required implementation scope, including the platform definitions and th
    display name. Recovery of the same deployment requires its validated identity/generation, or an explicit
    stopped-cluster re-provisioning plan.
 
-| Standard platform | Required provisioning and delivery path |
+The following platform adapters apply only where the selected startup mode permits peers; they create no peer
+credential resource for a no-peer deployment. In particular, the current local single-node path remains exempt.
+
+| Standard platform | Provisioning and delivery path when peers are possible |
 | --- | --- |
 | Local | A deployment-owned credential resource creates a private file outside published artifacts, with directory/file modes 0700/0600 and no symlink following. The local service receives its path; recreation/restart reuses it. |
 | Compose | The same protected host resource is mounted read-only into every peer-capable runtime container, with matching rendered verifier configuration. Image layers, compose documents and ordinary environment values contain no key/token. |
@@ -202,6 +225,10 @@ Generated-deployment tests must prove this path with no hand-authored peer field
 apply, uncertain creation, replacement replicas, local token renewal beyond the first token's expiry and explicit
 rotation. Run a split-home push/start using the generated configuration and credentials, with discovery paused.
 Rendering a profile without a working source of signing material does not satisfy the requirement.
+Preservation tests must also start directly configured single-node servers and each embedded storage mode without
+`tkr` or peer credentials, checking readiness and absence of a push route/sender. Attaching an embedded public
+listener must not instantiate peer delivery. The negative control is a peer-capable deployment with one replica:
+it still fails readiness without credentials. Test the same mode decision in provisioning and runtime startup.
 
 The existing peer channel uses the shared public listener over plaintext. This policy authenticates possession of
 a credential; it does not provide confidentiality or resist a network observer replaying that credential within
@@ -430,17 +457,22 @@ For any generated trace using existing local, eager/reserved, speculative, query
 worker-visible outcomes SHALL remain unchanged except for the documented delivery/fallback fixes. Durable state
 SHALL never depend on offer delivery or observation; existing repair/timeout semantics SHALL remain intact.
 
-**Validates: Requirements 3.1, 3.2, 3.3, 3.4.**
+**Validates: Requirements 2.19, 3.1, 3.2, 3.3, 3.4.**
 
 ### Property 10: Standard deployments have stable peer credentials
 
 For any generated deployment and sequence of plan/apply retries, uncertain creates, restarts and replica changes,
 all its peer-capable runtimes SHALL obtain one matching credential generation without an external issuer. A fresh
 cluster SHALL not authenticate as another cluster. Token renewal SHALL continue past initial token expiry without
-operator work; missing or mismatched bootstrap material SHALL fail readiness. Explicit stopped-node rotation SHALL
-invalidate old tokens, and secret material SHALL not appear in plan output, generic state or rendered manifests.
+operator work; missing or mismatched bootstrap material in a peer-capable mode SHALL fail readiness. Explicit
+stopped-node rotation SHALL invalidate old tokens, and secret material SHALL not appear in plan output, generic
+state or rendered manifests.
+For any no-peer mode, provisioning SHALL create no peer credential resource and startup SHALL remain ready without
+credentials while exposing no push endpoint/sender. One observed replica in a peer-capable mode SHALL not bypass
+validation. An upgrade from a deployment without peer material SHALL fail readiness until this release's `tkr`
+reapply supplies it; the no-peer upgrade SHALL require no such step.
 
-**Validates: Requirements 2.13, 2.14, 2.16, 2.17, 2.18.**
+**Validates: Requirements 2.13, 2.14, 2.16, 2.17, 2.18, 2.19, 2.20.**
 
 ## Testing, rollout and risks
 
@@ -462,6 +494,18 @@ schema contracts, peer configuration/provisioning documentation and the live-sui
 only its own documents and an internal fragment. No mixed-version compatibility path is introduced.
 
 Upgrade with every node stopped.
+
+For an existing multi-node cluster, while every node is stopped, reapply its deployment using **this release's
+`tkr`** before starting any new-release nodes. That apply provisions the cluster signing key, delivers its protected
+source and renders matching peer configuration. Confirm the credential resource and runtime references are ready,
+then start the new nodes. Applying only an older deployment definition/tooling that omits this resource is not
+sufficient. Missing or inconsistent material fails readiness with a diagnostic directing the operator to this
+reapply step. No-peer single-node and embedded upgrades need neither peer credentials nor a new `tkr` prerequisite;
+their existing ownership/schema/startup rules still apply.
+
+The implementation's changelog must retain the existing stopped-node line and add a separate plain sentence:
+
+For existing multi-node clusters, reapply the deployment with this release's tkr while all nodes are stopped, before starting new nodes.
 
 Known risks: peer tokens traverse the existing plaintext transport, and a stolen cluster signing key allows peer
 impersonation until explicit rotation; the shared key does not provide per-node identity. Bootstrap depends on the

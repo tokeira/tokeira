@@ -23,11 +23,16 @@ implementation or executed exploration tests.
 | Normal task | A durable, non-speculative workflow task; it may be addressed to a sticky queue. |
 | Offer | A bounded, expiring, volatile hint. Admission acknowledges no start and changes no authoritative state. |
 | Sticky fallback | Delivery to the original normal queue after sticky unavailability; the pending deadline and durable affinity survive. |
+| Peer-capable mode | A startup mode permitting another runtime peer, including controller-managed placement even when only one node is currently running. |
+| No-peer mode | Single-node operation without a controller under its single-node ownership contract, or the embedded engine; neither installs cross-node offer delivery. |
 
 The execution owner pushes a normal task to its selected queue home. That home combines local publication, remote
 push and discovery in one bounded offer set. A poll starts through the existing execution-owner path. Ordinary
 normal-queue discovery remains the backup for non-sticky rows; an execution-home sweep republishes durable sticky
 rows, including those whose previous normal fallback was lost. Neither path claims or deletes dispatch rows.
+In no-peer modes delivery stays local, with no push endpoint, sender or peer-credential requirement, whether or not
+`tkr` manages the deployment. See the [single-node claim](../single-node-claim/design.md) and
+[embedded ownership](../managed-embedded-dsql/design.md) contracts; this specification does not change either.
 
 ## Evidence and reproduction
 
@@ -178,15 +183,26 @@ plans SHALL be verified on live DSQL before completion.
 2.16 WHEN delivery fails or falls back THEN bounded diagnostics SHALL distinguish ownership, capacity, transport,
 authentication, deadline and sticky-routing outcomes, without credentials or unbounded per-run metric labels.
 
-2.17 WHEN a standard `tkr` deployment is applied THEN its platform SHALL provision and deliver cluster peer signing
-material and matching verifier configuration to every peer-capable runtime without an external identity provider
-or hand-authored peer credentials; IF that material is missing or inconsistent THEN the runtime SHALL fail
-readiness with a corrective diagnostic rather than silently serving with cross-node push disabled.
+2.17 WHEN a standard `tkr` deployment whose startup mode permits peers is applied THEN its platform SHALL provision
+and deliver cluster peer signing material and matching verifier configuration to every peer-capable runtime
+without an external identity provider or hand-authored peer credentials; IF that material is missing or
+inconsistent THEN the peer-capable runtime SHALL fail readiness with a corrective diagnostic rather than silently
+serving with cross-node push disabled.
 
-2.18 WHEN deployments are reapplied, nodes restart or replicas change THEN the cluster's peer trust SHALL remain
-stable and tokens SHALL renew locally; WHEN an operator explicitly rotates or retires credentials THEN the
+2.18 WHEN peer-capable deployments are reapplied, nodes restart or replicas change THEN the cluster's peer trust
+SHALL remain stable and tokens SHALL renew locally; WHEN an operator explicitly rotates or retires credentials THEN the
 plan/apply lifecycle SHALL preserve cluster isolation, secret redaction and the stopped-node rotation contract in
 [design.md](design.md).
+
+2.19 WHEN the startup mode guarantees no possible runtime peer THEN the server or embedded engine SHALL install
+neither the offer push endpoint nor its sender, SHALL require no peer credential or provisioning step, and SHALL
+preserve readiness without `tkr`. IF peers are possible, even with only one currently running node, THEN credential
+validation SHALL remain mandatory. An embedded public listener SHALL not change its no-peer mode.
+
+2.20 WHEN an existing multi-node cluster upgrades to this release THEN the rollout instructions and implementation
+changelog SHALL require all nodes to be stopped and the deployment reapplied with this release's `tkr` to provision
+credentials before any new-release node starts; a missing-credential readiness diagnostic SHALL identify this
+prerequisite and its remedy.
 
 ### Unchanged Behavior (Regression Prevention)
 

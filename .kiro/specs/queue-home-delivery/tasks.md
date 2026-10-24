@@ -2,9 +2,9 @@
 
 ## Overview
 
-This is a specification-only PR. Every task below is future work, including exploration tests. Implementation starts
-in a separate task after this spec merges. Read [bugfix.md](bugfix.md) and [design.md](design.md) together; their
-contracts, provisional read target and scope boundaries govern this plan.
+Implementation follows the series and executed evidence in [implementation-evidence.md](implementation-evidence.md).
+Unfinished tasks remain open until the PR that completes them. Read [bugfix.md](bugfix.md) and
+[design.md](design.md) together; their contracts, provisional read target and scope boundaries govern this plan.
 
 First demonstrate the defects and measure the actual read baseline. Then add the bounded hint contract, sticky
 recovery query, provisioned peer credentials and authorization, admission/retirement, push and recovery, and
@@ -13,33 +13,33 @@ bar belongs to the code PRs.
 
 ## Tasks
 
-- [ ] 1. Bug-condition exploration properties, before any fix
-  - [ ] 1.1 Add generated split-home traces which assert that an eligible normal task reaches its queue home without
+- [x] 1. Bug-condition exploration properties, before any fix
+  - [x] 1.1 Add generated split-home traces which assert that an eligible normal task reaches its queue home without
     a discovery tick. Confirm failure on the unfixed implementation; record a shrunk counterexample.
     - _Requirements: 1.1, 2.1, 2.9_
-  - [ ] 1.2 Add the sticky reproduction with execution owner holding neither queue home, a recently polled sticky
+  - [x] 1.2 Add the sticky reproduction with execution owner holding neither queue home, a recently polled sticky
     worker at its actual home, and discovery controlled independently. Assert delivery without waiting out the
     sticky deadline, and immediate retirement when a queue home is lost with discovery paused. Confirm failures.
     - _Requirements: 1.2, 1.4, 2.5, 2.10_
-  - [ ] 1.3 Instrument logical run loads and physical SQL attribution per start attempt without changing delivery.
+  - [x] 1.3 Instrument logical run loads and physical SQL attribution per start attempt without changing delivery.
     Measure normal/sticky, warm/cold caches, and an injected OCC retry, including admission-cache and lane loads.
     Assert the provisional read targets to expose the redundant reads; record the actual baseline and failures.
     Confirm or revise the target with a reason for each necessary read, in this spec, before implementing a fix.
     - _Requirements: 1.3, 2.11, 2.12_
-  - [ ] 1.4 Checkpoint: exploration failures match the source-derived causes, not harness mistakes. If any assertion
+  - [x] 1.4 Checkpoint: exploration failures match the source-derived causes, not harness mistakes. If any assertion
     unexpectedly passes, investigate and correct the premise before proceeding. Use injected time/barriers, no sleeps.
     - _Requirements: 1.1, 1.2, 1.3, 1.4_
 
-- [ ] 2. Hint data and bounded sticky storage pages
-  - [ ] 2.1 Extend normal dispatch hints with execution home, original scheduling order and sticky origin/deadline.
+- [x] 2. Hint data and bounded sticky storage pages
+  - [x] 2.1 Extend normal dispatch hints with execution home, original scheduling order and sticky origin/deadline.
     Preserve priority and exact/live routing distinctions; make credentials and authoritative commands impossible
     to carry in a hint. Keep speculative/eager/query constructors compatible with their existing contracts.
     - _Requirements: 2.1, 2.7, 2.11, 3.1, 3.3, 3.4_
-  - [ ] 2.2 Add the sticky-home partial index in the next free migration with schema contracts, readiness and
+  - [x] 2.2 Add the sticky-home partial index in the next free migration with schema contracts, readiness and
     migration-policy updates required by storage's AGENTS.md. Do not change any merged migration or dispatch row
     format/maintenance. Add the bounded sticky execution-home page operation to memory and DSQL repositories.
     - _Requirements: 2.8, 2.15, 3.2_
-  - [ ] 2.3 Write generated fixed-snapshot and mutation/continuation storage tests, with the same contract cases
+  - [x] 2.3 Write generated fixed-snapshot and mutation/continuation storage tests, with the same contract cases
     exercised by both stores. Expose the actual first/continuation query builders for later live plan checks.
     - **Property 8: Complete bounded sticky traversal** (storage portion; runtime portion in 6.2)
     - **Validates: Requirements 2.8, 2.9, 2.15, 3.2, 3.5.**
@@ -138,6 +138,8 @@ bar belongs to the code PRs.
   - [ ] 6.2 Generate lost sticky and lost normal-fallback pushes separately, with no useful sticky poll demand,
     process restart, queue-home movement, rows inserted behind the cursor, saturation and deadline expiry. Include
     affinity-cleared non-sticky rows covered by normal discovery and finite faults followed by a fair suffix.
+    Drive the appropriate recovery reader independently: normal discovery for non-sticky rows, the sticky sweep
+    for sticky rows including normal-retargeted offers. Discovery pauses isolate prompt-push assertions only.
     - **Property 1: Prompt push and eventual delivery**
     - **Property 4: Sticky routing and deadline preservation** (recovery portion)
     - **Property 8: Complete bounded sticky traversal** (runtime portion)

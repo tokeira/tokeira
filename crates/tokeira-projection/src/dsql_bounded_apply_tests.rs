@@ -919,6 +919,8 @@ async fn dsql_a_finished_copy_writes_nothing() -> Result<()> {
     live.forget_copy(&scope.name).await?;
     live.finish().await?;
     assert!(done.completed);
+    // A finished copy answers from a plain read of its completion: it commits no
+    // transaction, so nodes that start together take no lock on it.
     assert_eq!(
         (
             again.transactions,
@@ -926,7 +928,7 @@ async fn dsql_a_finished_copy_writes_nothing() -> Result<()> {
             again.values,
             again.completed
         ),
-        (1, 0, 0, true),
+        (0, 0, 0, true),
         "{again:?}"
     );
     assert!(late_matches.is_empty());

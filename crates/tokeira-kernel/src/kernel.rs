@@ -338,8 +338,9 @@ impl BasicKernel {
     /// This is intentionally narrower than a full replay engine: it rebuilds
     /// durable kernel state from already-recorded history events, plus the
     /// non-historical envelope fields supplied by [`ReplayContext`].
-    /// Reset starts a new projection lineage: replay leaves deployment observations
-    /// ready empty rather than recovering the predecessor's projection history.
+    /// The used-versions list starts empty and ready, and gains each replayed
+    /// completion's version, untrimmed, as v1.31.0's reset rebuild does
+    /// (`used-deployment-versions` criterion 2.4).
     pub fn replay_history_prefix(
         &self,
         ctx: ReplayContext,
@@ -2222,6 +2223,14 @@ impl BasicKernel {
             completion_deployment_version.as_ref(),
             wft_completed_event_id,
             req.now,
+        );
+        // The recorded completion adds its version to the used-versions list,
+        // trimmed to the value limit; a dropped speculative completion returned
+        // above, and a completion whose command fails its task is discarded whole
+        // (`used-deployment-versions` criteria 2.1-2.3).
+        builder.state.add_used_deployment_version(
+            completion_deployment_version.as_ref(),
+            Some(req.limits.search_attribute_value_size_limit),
         );
         builder.state.previous_started_event_id = started_event_id;
         builder.state.workflow_task_attempt = 1;
@@ -4304,6 +4313,9 @@ impl BasicKernel {
                     event.event_id,
                     event.happened_at,
                 );
+                // Replay adds each completion's version untrimmed, as v1.31.0's
+                // rebuild does (`used-deployment-versions` criterion 2.4).
+                state.add_used_deployment_version(deployment_version.as_ref(), None);
                 state.previous_started_event_id = *started_event_id;
                 state.workflow_task_attempt = 1;
                 // Mirror the hot-path completion reset: success zeroes the

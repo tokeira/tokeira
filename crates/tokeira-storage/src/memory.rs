@@ -1394,7 +1394,7 @@ impl RunRepository for InMemoryStore {
                 transition.event_principals.len()
             );
         }
-        let mut state = transition.next_state.clone();
+        let state = transition.next_state.clone();
         let namespace = Some(state.namespace_id.0.to_string());
         let mut store = self.inner.lock().await;
         let home = tokeira_types::execution_home_bundle(
@@ -1519,7 +1519,7 @@ impl RunRepository for InMemoryStore {
         let history_size_bytes = prior_history_size.saturating_add(appended);
         // Preparation touches only the local clone. A missing seed, invalid image
         // or growth refusal must leave every durable map and statistic untouched.
-        let context = prepare_workflow_projection(&mut state, history_size_bytes)?;
+        let context = prepare_workflow_projection(&state, history_size_bytes)?;
         let execution_home = tokeira_types::execution_home_bundle(
             state.namespace_id.0.as_bytes(),
             state.workflow_id.0.as_bytes(),
@@ -3279,6 +3279,10 @@ fn principals_len(principals: &[Option<tokeira_types::EventPrincipal>]) -> Resul
 pub(crate) mod projection_accumulator_tests;
 
 #[cfg(test)]
+#[path = "used_deployment_versions_tests.rs"]
+pub(crate) mod used_deployment_versions_tests;
+
+#[cfg(test)]
 #[path = "workflow_dispatch_memory_tests.rs"]
 mod workflow_dispatch_tests;
 
@@ -4418,7 +4422,7 @@ mod tests {
             ..WorkflowVersioningInfo::default()
         });
 
-        let projection = prepare_workflow_projection(&mut state, 0).unwrap();
+        let projection = prepare_workflow_projection(&state, 0).unwrap();
         assert_eq!(
             projection
                 .search_attributes
@@ -4451,7 +4455,7 @@ mod tests {
                 .search_attributes
                 .0
                 .contains_key("TemporalUsedWorkerDeploymentVersions"),
-            "a pinned override alone supplies no stored deployment observation"
+            "a pinned override adds nothing to the used-versions list"
         );
         assert!(
             !state
@@ -4462,37 +4466,44 @@ mod tests {
         );
     }
 
+    // The image copies the run's used-versions list and leaves the attribute out
+    // while the list is empty, whatever the stored deployment version says
+    // (`used-deployment-versions` criterion 2.5).
     #[test]
-    fn projection_accumulates_used_worker_deployment_versions_after_completion() {
+    fn projection_copies_the_used_versions_list() {
         let run_key = RunKey::new();
         let mut state = sample_state(run_key);
         state.versioning_info = Some(WorkflowVersioningInfo {
             behavior: tokeira_kernel::VersioningBehavior::AutoUpgrade,
             deployment_version: Some(WorkerDeploymentVersionRef {
                 deployment_name: "deployment".to_owned(),
-                build_id: "build-1".to_owned(),
+                build_id: "stored".to_owned(),
             }),
             ..WorkflowVersioningInfo::default()
         });
-
-        prepare_workflow_projection(&mut state, 0).unwrap();
-        state.versioning_info.as_mut().unwrap().deployment_version =
-            Some(WorkerDeploymentVersionRef {
-                deployment_name: "deployment".to_owned(),
-                build_id: "build-2".to_owned(),
-            });
-        let second = prepare_workflow_projection(&mut state, 0).unwrap();
-
-        assert_eq!(
-            second
+        let listed = |state: &WorkflowState| {
+            prepare_workflow_projection(state, 0)
+                .unwrap()
                 .search_attributes
                 .0
-                .get("TemporalUsedWorkerDeploymentVersions"),
-            Some(&SearchAttrValue::KeywordList(vec![
+                .get("TemporalUsedWorkerDeploymentVersions")
+                .cloned()
+        };
+
+        assert_eq!(listed(&state), None);
+        state.used_worker_deployment_versions = Some(vec![
+            "deployment:build-1".to_owned(),
+            "deployment:build-2".to_owned(),
+        ]);
+        assert_eq!(
+            listed(&state),
+            Some(SearchAttrValue::KeywordList(vec![
                 "deployment:build-1".to_owned(),
                 "deployment:build-2".to_owned(),
             ]))
         );
+        state.used_worker_deployment_versions = None;
+        assert!(prepare_workflow_projection(&state, 0).is_err());
     }
 
     // The completion-callback sweep query must surface BOTH `Scheduled` (first delivery

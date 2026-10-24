@@ -293,6 +293,38 @@ pub fn merged_memo_encoded_len(
         .sum()
 }
 
+/// The length of Go's `json.Marshal` of `versions`, which v1.31.0 measures the
+/// `TemporalUsedWorkerDeploymentVersions` list by against the search-attribute
+/// value limit (`saveUsedDeploymentVersions`, `mutable_state_impl.go:3696-3722 @
+/// v1.31.0`; `used-deployment-versions` criterion 2.3).
+pub fn used_deployment_versions_len(versions: &[String]) -> usize {
+    if versions.is_empty() {
+        return "[]".len();
+    }
+    // The brackets, each entry's quotes, and a comma between entries.
+    1 + 3 * versions.len()
+        + versions
+            .iter()
+            .map(|version| go_json_escaped_len(version))
+            .sum::<usize>()
+}
+
+/// A string's length between the quotes of Go's JSON. Go escapes `<`, `>`, `&`,
+/// U+2028 and U+2029, which JSON allows bare, and has had short escapes for `\b`
+/// and `\f` since Go 1.22 (`encoding/json`'s `appendString`; v1.31.0 builds with
+/// Go 1.26.2).
+fn go_json_escaped_len(value: &str) -> usize {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+            '<' | '>' | '&' | '\u{0}'..='\u{1f}' => "\\u003c".len(),
+            '\u{2028}' | '\u{2029}' => "\\u2028".len(),
+            ch => ch.len_utf8(),
+        })
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +337,30 @@ mod tests {
         assert_eq!(varint_len(16_383), 2);
         assert_eq!(varint_len(16_384), 3);
         assert_eq!(varint_len(u64::MAX), 10);
+    }
+
+    // The lengths of Go's `json.Marshal` of each list, recorded from Go.
+    #[test]
+    fn used_deployment_versions_len_matches_go() {
+        let cases: [(&[&str], usize); 11] = [
+            (&[], 2),
+            (&["d:v1"], 8),
+            (&["deployment:build-1", "d:v2", ""], 32),
+            (&["a\"b\\c"], 11),
+            (&["<a>&b"], 24),
+            (&["x\u{2028}y\u{2029}"], 18),
+            (&["\u{8}\u{c}\n\r\t"], 14),
+            (&["\u{0}\u{1}\u{1f}"], 22),
+            (&["\u{7f}"], 5),
+            (&["é", "日本", "🦀"], 22),
+            (&["dé<p>:\u{2028}\u{2}\"\\", "\t", "plain"], 50),
+        ];
+        for (list, go_len) in cases {
+            let list = list
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(used_deployment_versions_len(&list), go_len, "{list:?}");
+        }
     }
 }

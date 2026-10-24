@@ -1,9 +1,15 @@
-//! Frozen Tokeira projection oracle for the accumulator storage refactor.
+//! Frozen Tokeira projection oracle for the projection-accumulator and
+//! used-deployment-versions changes.
 //!
-//! Copied from `crates/tokeira-storage/src/api.rs` at Tokeira
-//! `689e89a8622d114de1dd80232a22bb63705d50d1`. Both the previous-image fold and
-//! raw derivation are independent of the new preparation helper. Preserve this
-//! baseline, including its documented Temporal compatibility gaps.
+//! The derivation is copied from `crates/tokeira-storage/src/api.rs` at Tokeira
+//! `689e89a8622d114de1dd80232a22bb63705d50d1`, independent of the preparation helper
+//! it checks. Preserve it, including its documented Temporal compatibility gaps.
+//! - [`workflow_projection_context`] is the image this release writes: the frozen
+//!   derivation, which no longer observes the stored deployment version, with the
+//!   run's used-versions list (`used-deployment-versions` criterion 2.5).
+//! - [`legacy_workflow_projection_context_with_previous`] is the image a release
+//!   before that change wrote, its stored-version observation and previous-image
+//!   fold included, for fixtures that play an older writer.
 
 use std::collections::BTreeSet;
 
@@ -22,8 +28,41 @@ use crate::api::ProjectionContext;
 #[path = "projection_accumulator_legacy_codec.rs"]
 pub(crate) mod legacy_codec;
 
-/// Reproduce the complete pre-accumulator image, including its legacy merge.
-pub(crate) fn workflow_projection_context_with_previous(
+/// The complete image this release writes for `state`: the frozen derivation, with
+/// the run's used-versions list as `TemporalUsedWorkerDeploymentVersions` while it
+/// isn't empty. While it is, nothing adds the attribute.
+pub(crate) fn workflow_projection_context(
+    state: &WorkflowState,
+    history_size_bytes: i64,
+) -> Result<ProjectionContext> {
+    let mut context = projection_context(
+        state,
+        if state.status.is_open() {
+            VisibilityLifecycleState::Open
+        } else {
+            VisibilityLifecycleState::Closed
+        },
+        state.closed_at.unwrap_or(state.started_at),
+        false,
+        history_size_bytes,
+        false,
+    )?;
+    if let Some(versions) = state
+        .used_worker_deployment_versions
+        .as_deref()
+        .filter(|versions| !versions.is_empty())
+    {
+        context.search_attributes.0.insert(
+            "TemporalUsedWorkerDeploymentVersions".to_owned(),
+            SearchAttrValue::KeywordList(versions.to_vec()),
+        );
+    }
+    Ok(context)
+}
+
+/// Reproduce the complete image a release before `used-deployment-versions` wrote,
+/// including its stored-version observation and its merge with the previous image.
+pub(crate) fn legacy_workflow_projection_context_with_previous(
     state: &WorkflowState,
     previous: Option<&ProjectionContext>,
     history_size_bytes: i64,
@@ -38,6 +77,7 @@ pub(crate) fn workflow_projection_context_with_previous(
         state.closed_at.unwrap_or(state.started_at),
         false,
         history_size_bytes,
+        true,
     )?;
 
     let mut used_versions = previous
@@ -79,6 +119,7 @@ fn projection_context(
     update_time: OffsetDateTime,
     redact_user_data: bool,
     history_size_bytes: i64,
+    observe_stored_version: bool,
 ) -> Result<ProjectionContext> {
     let transition_count = i64::try_from(state.transition_seq.0).map_err(|_| {
         anyhow!(
@@ -179,7 +220,9 @@ fn projection_context(
                 );
             }
             if let Some(version) = info.deployment_version.as_ref().filter(|version| {
-                !version.deployment_name.is_empty() && !version.build_id.is_empty()
+                observe_stored_version
+                    && !version.deployment_name.is_empty()
+                    && !version.build_id.is_empty()
             }) {
                 // Only a successfully completed WFT populates
                 // `deployment_version`; a start-time pinned override therefore

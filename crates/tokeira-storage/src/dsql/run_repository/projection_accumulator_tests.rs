@@ -34,7 +34,8 @@ use crate::{
         observations, observe, reset_history, state_limit,
     },
     projection_accumulator_oracle::{
-        legacy_codec, workflow_projection_context_with_previous as baseline_image,
+        legacy_codec, legacy_workflow_projection_context_with_previous as legacy_image,
+        workflow_projection_context as expected_image,
     },
 };
 
@@ -398,7 +399,9 @@ fn contract<S: Strategy>(
 
 // Feature: projection-accumulator, Property 1: no projection reads in commits
 // Feature: projection-accumulator, Property 2: complete baseline image equivalence
-// SQL commits preserve complete images without reading a preceding projection.
+// Feature: used-deployment-versions, Property 4: Images carry the list
+// SQL commits write complete images, with each transition's list, without reading a
+// preceding projection.
 #[test]
 #[ignore = "requires an ephemeral Aurora DSQL cluster"]
 fn dsql_projection_accumulator_commit_images() {
@@ -407,11 +410,22 @@ fn dsql_projection_accumulator_commit_images() {
             for bundle in [false, true] {
                 let mut transition = fixture.fresh();
                 let key = transition.next_state.run_key;
-                let mut previous = None;
                 for observation in &steps {
                     observe(&mut transition.next_state, observation);
-                    let expected =
-                        baseline_image(&transition.next_state, previous.as_ref(), 0).unwrap();
+                    // As the kernel's completion would add the reported version.
+                    let reported = transition
+                        .next_state
+                        .versioning_info
+                        .as_ref()
+                        .and_then(|info| info.deployment_version.clone());
+                    transition
+                        .next_state
+                        .add_used_deployment_version(reported.as_ref(), None);
+                    let expected = expected_image(&transition.next_state, 0).unwrap();
+                    let carried = transition
+                        .next_state
+                        .used_worker_deployment_versions
+                        .clone();
                     fixture.statements.take();
                     let state = applied(
                         commit(fixture.repo(), transition, bundle, WriteFence::Unfenced)
@@ -425,16 +439,13 @@ fn dsql_projection_accumulator_commit_images() {
                         LoadedRun::Existing(state.clone())
                     );
                     fixture.statements.assert_no_projection_reads();
-                    prop_assert_eq!(
-                        state.used_worker_deployment_versions.as_ref(),
-                        Some(&image_versions(&expected))
-                    );
+                    // Storage persists and returns the list the transition carried.
+                    prop_assert_eq!(&state.used_worker_deployment_versions, &carried);
                     prop_assert_eq!(
                         codec::decode_workflow_state(key, &fixture.hot(key).await.0).unwrap(),
                         state.clone()
                     );
-                    prop_assert_eq!(fixture.image(key).await, Some(expected.clone()));
-                    previous = Some(expected);
+                    prop_assert_eq!(fixture.image(key).await, Some(expected));
                     transition = following(&state);
                 }
                 sqlx::query("UPDATE projection_log SET context_data = $2 WHERE run_key = $1")
@@ -485,7 +496,7 @@ fn dsql_projection_accumulator_legacy_seeds() {
                 fixture.prune(key).await;
                 state.transition_seq = TransitionSeq(5);
                 state.used_worker_deployment_versions = None;
-                let mut image = baseline_image(&state, None, 37).unwrap();
+                let mut image = legacy_image(&state, None, 37).unwrap();
                 image.search_attributes.0.insert(
                     "TemporalUsedWorkerDeploymentVersions".into(),
                     SearchAttrValue::KeywordList(values.clone()),
@@ -573,7 +584,7 @@ async fn dsql_projection_accumulator_snapshot_races() {
             fixture.prune(key).await;
             original.used_worker_deployment_versions = None;
             original.transition_seq = TransitionSeq(5);
-            let mut image = baseline_image(&original, None, 50).unwrap();
+            let mut image = legacy_image(&original, None, 50).unwrap();
             image.search_attributes.0.insert(
                 "TemporalUsedWorkerDeploymentVersions".into(),
                 SearchAttrValue::KeywordList(vec!["before".into()]),
@@ -735,7 +746,7 @@ fn dsql_projection_accumulator_failure_isolation() {
                         }
                         prop_assert_eq!(fixture.durable(key).await, before);
                     }
-                    let mut collision = baseline_image(&winner, None, 0).unwrap();
+                    let mut collision = expected_image(&winner, 0).unwrap();
                     collision.transition_count += 1;
                     let seq = winner.transition_seq.next();
                     let partition =
@@ -878,7 +889,8 @@ fn dsql_projection_accumulator_growth_accounting() {
     );
 }
 
-// Feature: projection-accumulator, Property 3: reset materialization creates no image and a ready-empty run.
+// Feature: projection-accumulator, Property 3: reset materialization creates no image, and the run lists
+// the versions of the completions it copies (`used-deployment-versions` criterion 2.4).
 #[test]
 #[ignore = "requires an ephemeral Aurora DSQL cluster"]
 fn dsql_projection_accumulator_reset_boundaries() {
@@ -921,7 +933,17 @@ fn dsql_projection_accumulator_reset_boundaries() {
                         let (blob, stats) = fixture.hot(key).await;
                         let mut state = codec::decode_workflow_state(key, &blob).unwrap();
                         fixture.track(&state);
-                        prop_assert_eq!(&state.used_worker_deployment_versions, &Some(Vec::new()));
+                        // Event 10 copies the completions on v1 and v2; event 7, of the
+                        // first reset's copy, only the one on v1.
+                        let copied: Vec<String> = if generation == 0 {
+                            vec!["deployment:v1".into(), "deployment:v2".into()]
+                        } else {
+                            vec!["deployment:v1".into()]
+                        };
+                        prop_assert_eq!(
+                            &state.used_worker_deployment_versions,
+                            &Some(copied.clone())
+                        );
                         prop_assert!(fixture.image(key).await.is_none());
                         if generation == 1 {
                             state.used_worker_deployment_versions = None;
@@ -944,22 +966,16 @@ fn dsql_projection_accumulator_reset_boundaries() {
                         if changed {
                             observe(&mut transition.next_state, &(Some("v3".into()), 0, false));
                         }
-                        let expected = baseline_image(&transition.next_state, None, stats).unwrap();
+                        let expected = expected_image(&transition.next_state, stats).unwrap();
                         let committed = applied(
                             commit(fixture.repo(), transition, bundle, WriteFence::Unfenced)
                                 .await
                                 .unwrap(),
                         );
+                        // An older writer's reset, with no tag or image, is seeded empty.
                         prop_assert_eq!(
                             committed.used_worker_deployment_versions,
-                            Some(vec![
-                                if changed {
-                                    "deployment:v3"
-                                } else {
-                                    "deployment:v2"
-                                }
-                                .into()
-                            ])
+                            Some(if generation == 0 { copied } else { Vec::new() })
                         );
                         prop_assert_eq!(fixture.image(key).await, Some(expected));
                         predecessor = key;
@@ -1033,10 +1049,15 @@ fn dsql_projection_accumulator_mixed_writers_and_pruning() {
                         prop_assert_eq!(fixture.hot(key).await, before);
                         let mut transition = following(&state);
                         observe(&mut transition.next_state, observation);
-                        let expected =
-                            baseline_image(&transition.next_state, previous.as_ref(), history_size)
-                                .unwrap();
-                        if (index % 2 == 0) == old_on_even {
+                        // An older writer's run is next seeded from its image; a current
+                        // writer's keeps the list it committed.
+                        let (expected, listed) = if (index % 2 == 0) == old_on_even {
+                            let expected = legacy_image(
+                                &transition.next_state,
+                                previous.as_ref(),
+                                history_size,
+                            )
+                            .unwrap();
                             fixture.legacy_write(key, observation).await;
                             prop_assert!(
                                 codec::decode_workflow_state(key, &fixture.hot(key).await.0)
@@ -1044,27 +1065,30 @@ fn dsql_projection_accumulator_mixed_writers_and_pruning() {
                                     .used_worker_deployment_versions
                                     .is_none()
                             );
+                            let listed = image_versions(&expected);
+                            (expected, listed)
                         } else {
+                            let expected =
+                                expected_image(&transition.next_state, history_size).unwrap();
+                            let carried = transition
+                                .next_state
+                                .used_worker_deployment_versions
+                                .clone();
                             let state = applied(
                                 commit(&repo, transition, bundle, WriteFence::Unfenced)
                                     .await
                                     .unwrap(),
                             );
-                            prop_assert_eq!(
-                                state.used_worker_deployment_versions,
-                                Some(image_versions(&expected))
-                            );
-                        }
+                            prop_assert_eq!(&state.used_worker_deployment_versions, &carried);
+                            (expected, carried.expect("a ready list"))
+                        };
                         prop_assert_eq!(fixture.image(key).await, Some(expected.clone()));
                         let LoadedRun::Existing(loaded) =
                             fixture.recreated().load_run(key).await.unwrap()
                         else {
                             panic!("load")
                         };
-                        prop_assert_eq!(
-                            loaded.used_worker_deployment_versions,
-                            Some(image_versions(&expected))
-                        );
+                        prop_assert_eq!(loaded.used_worker_deployment_versions, Some(listed));
                         previous = Some(expected);
                     }
                     let LoadedRun::Existing(state) = fixture.repo().load_run(key).await.unwrap()
@@ -1084,7 +1108,10 @@ fn dsql_projection_accumulator_mixed_writers_and_pruning() {
                             .await
                             .unwrap(),
                     );
-                    let retained = fixture.image(key).await.unwrap();
+                    prop_assert_eq!(
+                        Some(image_versions(&fixture.image(key).await.unwrap())),
+                        ready.used_worker_deployment_versions.clone()
+                    );
                     fixture.prune(key).await;
                     let repo = fixture.recreated();
                     let LoadedRun::Existing(reloaded) = repo.load_run(key).await.unwrap() else {
@@ -1092,9 +1119,7 @@ fn dsql_projection_accumulator_mixed_writers_and_pruning() {
                     };
                     prop_assert_eq!(&reloaded, &ready);
                     let transition = following(&reloaded);
-                    let expected =
-                        baseline_image(&transition.next_state, Some(&retained), history_size)
-                            .unwrap();
+                    let expected = expected_image(&transition.next_state, history_size).unwrap();
                     let persisted = applied(
                         commit(&repo, transition, bundle, WriteFence::Unfenced)
                             .await
@@ -1245,7 +1270,7 @@ impl Fixture {
         state.used_worker_deployment_versions = None;
         state.transition_seq = TransitionSeq(5);
         let image = image.map(|(seq, versions)| {
-            let mut context = baseline_image(&state, None, 50).unwrap();
+            let mut context = legacy_image(&state, None, 50).unwrap();
             context.search_attributes.0.insert(
                 "TemporalUsedWorkerDeploymentVersions".into(),
                 SearchAttrValue::KeywordList(versions.iter().map(|&v| v.to_owned()).collect()),

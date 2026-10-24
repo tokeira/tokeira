@@ -1,6 +1,6 @@
 //! Generated projection contracts and shared inputs for memory and live DSQL.
-//! The oracle retains baseline derivation; these helpers only supply transitions
-//! and inspect outputs, so production folding cannot redefine the expected list.
+//! The oracle retains the frozen derivation; these helpers only supply transitions
+//! and inspect outputs, so production preparation cannot redefine the expected image.
 
 use proptest::prelude::*;
 use tokeira_kernel::{
@@ -18,7 +18,8 @@ use crate::{
         seed_workflow_projection_accumulator_from_newer,
     },
     projection_accumulator_oracle::{
-        legacy_codec, workflow_projection_context_with_previous as baseline_image,
+        legacy_codec, legacy_workflow_projection_context_with_previous as legacy_image,
+        workflow_projection_context as expected_image,
     },
 };
 
@@ -197,7 +198,7 @@ pub(crate) fn legacy_step(
     assert!(legacy.used_worker_deployment_versions.is_none());
     legacy.transition_seq = legacy.transition_seq.next();
     observe(&mut legacy, observation);
-    let context = baseline_image(&legacy, previous, history_size).unwrap();
+    let context = legacy_image(&legacy, previous, history_size).unwrap();
     let rewritten = legacy_codec::encode_workflow_state(&legacy).unwrap();
     let decoded = crate::codec::decode_workflow_state(state.run_key, &rewritten).unwrap();
     assert!(decoded.used_worker_deployment_versions.is_none());
@@ -296,7 +297,9 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
     // Feature: projection-accumulator, Property 2: complete baseline image equivalence
-    // Folding changes only the accumulator and emits the complete frozen baseline image.
+    // Feature: used-deployment-versions, Property 4: Images carry the list
+    // Preparation emits the complete frozen image with the run's list, whatever the
+    // stored deployment version or a raw attribute says.
     #[test]
     fn projection_accumulator_complete_image_equivalence(
         steps in observations(),
@@ -307,20 +310,21 @@ proptest! {
         let mut seed = seed;
         if long_seed { seed.extend((0..160).map(|index| format!("historical-deployment:build-{index}"))); }
         state.used_worker_deployment_versions = Some(seed.clone());
-        let mut previous = baseline_image(&state, None, 0).unwrap();
-        previous.search_attributes.0.insert("TemporalUsedWorkerDeploymentVersions".into(), SearchAttrValue::KeywordList(seed));
         for (index, observation) in steps.iter().enumerate() {
             observe(&mut state, observation);
-            let mut unchanged = state.clone();
             let history_size = (index as i64) * 17;
-            let expected = baseline_image(&state, Some(&previous), history_size).unwrap();
-            let actual = prepare_workflow_projection(&mut state, history_size).unwrap();
-            prop_assert_eq!(&actual, &expected);
-            prop_assert_eq!(state.used_worker_deployment_versions.as_ref(), Some(&image_versions(&actual)));
-            unchanged.used_worker_deployment_versions.clone_from(&state.used_worker_deployment_versions);
-            prop_assert_eq!(&state, &unchanged);
-            prop_assert_eq!(prepare_workflow_projection(&mut state, history_size).unwrap(), actual);
-            previous = expected;
+            let actual = prepare_workflow_projection(&state, history_size).unwrap();
+            prop_assert_eq!(&actual, &expected_image(&state, history_size).unwrap());
+            // While the list is empty, the attribute is whatever the run's own search
+            // attributes hold: the stored deployment version never reaches it.
+            if !seed.is_empty() {
+                prop_assert_eq!(image_versions(&actual), seed.clone());
+            } else {
+                prop_assert_eq!(
+                    actual.search_attributes.0.get("TemporalUsedWorkerDeploymentVersions"),
+                    state.search_attributes.0.get("TemporalUsedWorkerDeploymentVersions")
+                );
+            }
         }
     }
 
@@ -340,7 +344,7 @@ proptest! {
             let mut state = fresh_transition(key).next_state;
             state.transition_seq = TransitionSeq(5);
             state.used_worker_deployment_versions = ready.then(|| vec!["already-ready".into()]);
-            let mut context = baseline_image(&state, None, 99).unwrap();
+            let mut context = legacy_image(&state, None, 99).unwrap();
             match attribute_case {
                 0 => { context.search_attributes.0.remove("TemporalUsedWorkerDeploymentVersions"); }
                 1 => { context.search_attributes.0.insert("TemporalUsedWorkerDeploymentVersions".into(), SearchAttrValue::KeywordList(values.clone())); }
@@ -390,7 +394,9 @@ proptest! {
     }
 
     // Feature: projection-accumulator, Property 2: complete baseline image equivalence
-    // Persisted, returned and reloaded state agree with every field of the frozen image.
+    // Feature: used-deployment-versions, Property 4: Images carry the list
+    // Persisted, returned and reloaded state agree with every field of the frozen
+    // image, whose list is the one each transition carries.
     #[test]
     fn projection_accumulator_repository_images_match_baseline(steps in observations()) {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -398,12 +404,18 @@ proptest! {
                 let store = InMemoryStore::default();
                 let key = RunKey::new();
                 let mut transition = fresh_transition(key);
-                let mut previous = None;
                 for observation in &steps {
                     observe(&mut transition.next_state, observation);
-                    let expected = baseline_image(&transition.next_state, previous.as_ref(), 0).unwrap();
+                    // As the kernel's completion would add the reported version.
+                    transition.next_state.add_used_deployment_version(
+                        transition.next_state.versioning_info.as_ref().and_then(|info| info.deployment_version.clone()).as_ref(),
+                        None,
+                    );
+                    let expected = expected_image(&transition.next_state, 0).unwrap();
+                    let carried = transition.next_state.used_worker_deployment_versions.clone();
                     let new_state = applied(commit(&store, transition, bundle, WriteFence::Unfenced).await.unwrap());
-                    assert_eq!(new_state.used_worker_deployment_versions, Some(image_versions(&expected)));
+                    // Storage persists and returns the list the transition carried.
+                    assert_eq!(new_state.used_worker_deployment_versions, carried);
                     assert_eq!(store.load_run(key).await.unwrap(), LoadedRun::Existing(new_state.clone()));
                     let durable = store.inner.lock().await;
                     assert_eq!(durable.runs[&key], new_state);
@@ -411,7 +423,6 @@ proptest! {
                     assert_eq!(durable.projection_image_lookups.load(Ordering::Relaxed), 0);
                     drop(durable);
                     transition = following(&new_state);
-                    previous = Some(expected);
                 }
             }
         });
@@ -507,7 +518,7 @@ proptest! {
     }
 
     // Feature: projection-accumulator, Property 8: exact state growth accounting
-    // Every byte of the folded extension counts; only the activity's retired fields don't.
+    // Every byte of the list's extension counts; only the activity's retired fields don't.
     #[test]
     fn projection_accumulator_growth_counts_folded_bytes(
         values in prop::collection::vec("[ab]{0,80}", 0..140),
@@ -526,8 +537,7 @@ proptest! {
                 transition.next_state.activities.insert(activity.activity_id.clone(), activity);
                 // The activity's empty input and absent header, one byte each.
                 let excluded = 2 * transition.next_state.activities.len();
-                let mut folded = transition.next_state.clone();
-                prepare_workflow_projection(&mut folded, 0).unwrap();
+                let folded = transition.next_state.clone();
                 let bytes = crate::codec::encode_workflow_state(&folded).unwrap();
                 let measured = bytes.len() - excluded;
                 assert_eq!(crate::codec::workflow_state_encoded_len(&folded).unwrap(), bytes.len());
@@ -549,7 +559,9 @@ proptest! {
     }
 
     // Feature: projection-accumulator, Property 3: new run boundaries
-    // Replay copies routing but not prior accumulation; the first image observes only its current version.
+    // A reset run lists the versions of the completions it copies, not its base's list;
+    // an older writer's reset, with no tag or image, is seeded empty; and a write
+    // without a completion keeps the list (`used-deployment-versions` criterion 2.4).
     #[test]
     fn projection_accumulator_reset_boundaries(values in prop::collection::vec("[ab]{0,8}", 0..16)) {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -572,23 +584,30 @@ proptest! {
                         let fork = if generation == 0 { 10 } else { 7 };
                         let expected = store.find_latest_run(base_state.namespace_id, &base_state.workflow_id).await.unwrap();
                         store.materialize_reset_successor(predecessor, fork, run_id, expected, WriteFence::Unfenced).await.unwrap();
+                        // Event 10 copies the completions on v1 and v2; event 7, of the
+                        // first reset's copy, only the one on v1.
+                        let copied: Vec<String> = if generation == 0 {
+                            vec!["deployment:v1".into(), "deployment:v2".into()]
+                        } else {
+                            vec!["deployment:v1".into()]
+                        };
                         {
                             let mut durable = store.inner.lock().await;
-                            assert_eq!(durable.runs[&key].used_worker_deployment_versions, Some(Vec::new()));
+                            assert_eq!(durable.runs[&key].used_worker_deployment_versions, Some(copied.clone()));
                             assert!(!durable.projection_log.values().any(|row| row.run_key == key));
                             if generation == 1 {
                                 // A reset produced by an old writer has no tag or image.
                                 durable.runs.get_mut(&key).unwrap().used_worker_deployment_versions = None;
                             }
                         }
+                        let listed = if generation == 0 { copied } else { Vec::new() };
                         let LoadedRun::Existing(state) = store.load_run(key).await.unwrap() else { panic!("reset") };
-                        assert_eq!(state.used_worker_deployment_versions, Some(Vec::new()));
+                        assert_eq!(state.used_worker_deployment_versions, Some(listed.clone()));
                         let mut transition = following(&state);
                         if change { observe(&mut transition.next_state, &(Some("v3".into()), 0, false)); }
-                        let expected = baseline_image(&transition.next_state, None, store.inner.lock().await.history_size[&key]).unwrap();
+                        let expected = expected_image(&transition.next_state, store.inner.lock().await.history_size[&key]).unwrap();
                         let new_state = applied(commit(&store, transition, bundle, WriteFence::Unfenced).await.unwrap());
-                        let current_version = if change { "deployment:v3" } else if generation == 0 { "deployment:v2" } else { "deployment:v1" };
-                        assert_eq!(new_state.used_worker_deployment_versions, Some(vec![current_version.into()]));
+                        assert_eq!(new_state.used_worker_deployment_versions, Some(listed));
                         assert_eq!(store.inner.lock().await.latest_image(key).unwrap().context, expected);
                         predecessor = key;
                     }
@@ -637,20 +656,27 @@ proptest! {
                     };
                     let mut transition = following(&state);
                     observe(&mut transition.next_state, observation);
-                    let expected = baseline_image(&transition.next_state, previous.as_ref(), history_size).unwrap();
-                    if (index % 2 == 0) == old_on_even {
+                    // An older writer's run is next seeded from its image; a current
+                    // writer's keeps the list it committed.
+                    let (expected, listed) = if (index % 2 == 0) == old_on_even {
+                        let expected = legacy_image(&transition.next_state, previous.as_ref(), history_size).unwrap();
                         memory_legacy_step(&store, key, observation).await;
                         assert!(store.inner.lock().await.runs[&key].used_worker_deployment_versions.is_none());
+                        let listed = image_versions(&expected);
+                        (expected, listed)
                     } else {
+                        let expected = expected_image(&transition.next_state, history_size).unwrap();
+                        let carried = transition.next_state.used_worker_deployment_versions.clone();
                         let applied = applied(commit(&store, transition, bundle, WriteFence::Unfenced).await.unwrap());
-                        assert_eq!(applied.used_worker_deployment_versions, Some(image_versions(&expected)));
+                        assert_eq!(applied.used_worker_deployment_versions, carried);
                         assert_eq!(store.inner.lock().await.runs[&key], applied);
-                    }
+                        (expected, carried.expect("a ready list"))
+                    };
                     assert_eq!(store.inner.lock().await.latest_image(key).unwrap().context, expected);
                     let persisted = store.snapshot().await.unwrap();
                     store = InMemoryStore::from_snapshot(&persisted).unwrap();
                     let LoadedRun::Existing(loaded) = store.load_run(key).await.unwrap() else { panic!("restored") };
-                    assert_eq!(loaded.used_worker_deployment_versions, Some(image_versions(&expected)));
+                    assert_eq!(loaded.used_worker_deployment_versions, Some(listed));
                     assert_eq!(store.snapshot().await.unwrap(), persisted);
                 }
 
@@ -700,7 +726,7 @@ fn projection_accumulator_seed_errors_preserve_input_and_ready_state() {
         fanout: 1,
         run_key: RunKey::new(),
         transition_seq: TransitionSeq(state.transition_seq.0 + 1),
-        context: baseline_image(&state, None, 0).unwrap(),
+        context: legacy_image(&state, None, 0).unwrap(),
     };
     let before = state.clone();
     let error = seed_workflow_projection_accumulator(&mut state, Some(&record)).unwrap_err();
@@ -723,7 +749,7 @@ fn projection_accumulator_seed_errors_preserve_input_and_ready_state() {
     ));
     assert_eq!(state, before);
     assert!(
-        prepare_workflow_projection(&mut state, 0)
+        prepare_workflow_projection(&state, 0)
             .unwrap_err()
             .downcast::<ProjectionAccumulatorError>()
             .is_ok()
@@ -735,7 +761,7 @@ fn projection_accumulator_seed_errors_preserve_input_and_ready_state() {
     assert_eq!(state, ready);
     state.transition_seq = TransitionSeq(u64::MAX);
     let before = state.clone();
-    assert!(prepare_workflow_projection(&mut state, 0).is_err());
+    assert!(prepare_workflow_projection(&state, 0).is_err());
     assert_eq!(state, before);
 }
 
@@ -751,7 +777,7 @@ fn newer_seed_inputs(
     let mut state = fresh_transition(RunKey::new()).next_state;
     state.transition_seq = TransitionSeq(5);
     state.used_worker_deployment_versions = None;
-    let mut context = baseline_image(&state, None, 0).unwrap();
+    let mut context = legacy_image(&state, None, 0).unwrap();
     context.authority_epoch = image_epoch;
     context.search_attributes.0.insert(
         "TemporalUsedWorkerDeploymentVersions".into(),

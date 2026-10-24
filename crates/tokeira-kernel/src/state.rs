@@ -57,11 +57,13 @@ pub struct WorkflowState {
     #[serde(default)]
     pub worker_deployment_name: Option<String>,
 
-    /// Previous committed projection's ordered deployment observations.
+    /// The run's `TemporalUsedWorkerDeploymentVersions` list: each worker deployment
+    /// version a recorded workflow task completion reported, oldest first, without
+    /// duplicates ([`WorkflowState::add_used_deployment_version`]).
     ///
     /// `None` requires repository seeding; `Some(empty)` is ready and deliberately
-    /// empty. Storage alone folds observations and persists extension tag 3, so
-    /// compaction and routing inheritance cannot discard or copy this run's list.
+    /// empty. Storage persists it as extension tag 3 and copies it into each image,
+    /// so compaction and routing inheritance cannot discard or copy this run's list.
     #[serde(skip)]
     pub used_worker_deployment_versions: Option<Vec<String>>,
 
@@ -550,6 +552,42 @@ impl WorkflowState {
         // An unversioned worker that reports a deployment name still records it.
         self.worker_deployment_name = worker_deployment_name;
         self.compact_versioning_info();
+    }
+
+    /// Add the version a recorded workflow task completion reported to the run's
+    /// used-versions list, whatever the run's versioning behaviour, unless the list
+    /// holds it. When that appends and `limit` is given, remove the oldest versions
+    /// until the list's JSON encoding fits it or the list is empty.
+    ///
+    /// The live completion passes its search-attribute value limit, and replay
+    /// passes none, as v1.31.0's rebuild doesn't trim
+    /// (`addUsedDeploymentVersionToLoadedSearchAttribute` and
+    /// `saveUsedDeploymentVersions`, `mutable_state_impl.go:3637-3662, 3696-3722`;
+    /// `workflow_task_state_machine.go:250-257 @ v1.31.0`). An unseeded list is left
+    /// alone: the repository refuses a commit from an unseeded run.
+    pub fn add_used_deployment_version(
+        &mut self,
+        version: Option<&WorkerDeploymentVersionRef>,
+        limit: Option<usize>,
+    ) {
+        let (Some(version), Some(versions)) =
+            (version, self.used_worker_deployment_versions.as_mut())
+        else {
+            return;
+        };
+        let entry = format!("{}:{}", version.deployment_name, version.build_id);
+        if versions.contains(&entry) {
+            return;
+        }
+        versions.push(entry);
+        if let Some(limit) = limit {
+            let fits = (0..versions.len())
+                .find(|&oldest| {
+                    crate::payload_size::used_deployment_versions_len(&versions[oldest..]) <= limit
+                })
+                .unwrap_or(versions.len());
+            versions.drain(..fits);
+        }
     }
 
     /// Record the legacy worker stamp and its visibility-index values from a

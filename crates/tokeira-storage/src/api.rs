@@ -2257,16 +2257,19 @@ pub(crate) enum ProjectionAccumulatorError {
     },
 }
 
-/// Prepare the complete image and its durable accumulator on a local state copy.
+/// Prepare the complete image a commit writes, from its local state copy.
 ///
-/// This preserves Tokeira's image derivation at `689e89a8622d114de1dd80232a22bb63705d50d1`,
-/// including inherited versions and reset's fresh projection lineage. It deliberately
-/// does not implement Temporal's completion-only bookkeeping or trimming.
+/// The kernel's workflow task completions keep the run's used-versions list, and
+/// the image only copies it: `TemporalUsedWorkerDeploymentVersions` is the list
+/// while it isn't empty, and nothing adds the attribute while it is
+/// (`used-deployment-versions` criterion 2.5). No client can set the attribute, so
+/// a run's own search attributes never hold it. An unseeded run is refused before
+/// anything is written.
 pub(crate) fn prepare_workflow_projection(
-    state: &mut WorkflowState,
+    state: &WorkflowState,
     history_size_bytes: i64,
 ) -> Result<ProjectionContext> {
-    let mut used_versions = state.used_worker_deployment_versions.clone().ok_or(
+    let used_versions = state.used_worker_deployment_versions.as_ref().ok_or(
         ProjectionAccumulatorError::Unseeded {
             run_key: state.run_key,
         },
@@ -2282,26 +2285,12 @@ pub(crate) fn prepare_workflow_projection(
         false,
         history_size_bytes,
     )?;
-    if let Some(SearchAttrValue::KeywordList(current)) = context
-        .search_attributes
-        .0
-        .get("TemporalUsedWorkerDeploymentVersions")
-    {
-        for version in current {
-            if !used_versions.contains(version) {
-                used_versions.push(version.clone());
-            }
-        }
-    }
-    // An empty accumulated list leaves the raw attribute alone: absent, explicitly
-    // empty and differently typed baseline inputs must remain distinguishable.
     if !used_versions.is_empty() {
         context.search_attributes.0.insert(
             "TemporalUsedWorkerDeploymentVersions".to_owned(),
             SearchAttrValue::KeywordList(used_versions.clone()),
         );
     }
-    state.used_worker_deployment_versions = Some(used_versions);
     Ok(context)
 }
 
@@ -2536,21 +2525,6 @@ fn projection_context(
                 search_attributes.0.insert(
                     "TemporalWorkflowVersioningBehavior".to_owned(),
                     SearchAttrValue::Keyword(behavior.to_owned()),
-                );
-            }
-            if let Some(version) = info.deployment_version.as_ref().filter(|version| {
-                !version.deployment_name.is_empty() && !version.build_id.is_empty()
-            }) {
-                // Preserve Tokeira's stored-version observation at 689e89a8. Starts
-                // can inherit this value, and reset replay retains only its final
-                // version. Temporal compatibility corrections are separate from
-                // moving the accumulator into durable run state.
-                search_attributes.0.insert(
-                    "TemporalUsedWorkerDeploymentVersions".to_owned(),
-                    SearchAttrValue::KeywordList(vec![format!(
-                        "{}:{}",
-                        version.deployment_name, version.build_id
-                    )]),
                 );
             }
         }

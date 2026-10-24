@@ -1,0 +1,5 @@
+kind: fixed
+body: A run's TemporalUsedWorkerDeploymentVersions list follows Temporal v1.31.0's rules from its next workflow task completion.
+time: 2026-10-24T18:13:24.952240+01:00
+custom:
+    Slice: 147903ef-5f9c-41f9-886f-caae7c7e3405

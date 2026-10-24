@@ -8,10 +8,18 @@ state copy before measuring or writing it. Both stores use the same pure fold.
 Their successful result returns the exact state persisted with the image, so the
 lane caches the updated list without a new runtime feedback mechanism.
 
+[used-deployment-versions](../used-deployment-versions/design.md) later moved the
+fold to the kernel's workflow task completion: the live completion appends the
+version it reports and trims the list to the value limit, replay appends without
+trimming, and `prepare_workflow_projection` only copies the run's list into the
+image. The sections below describe the storage fold this design first built, with
+notes where that change replaced it.
+
 This implements the [approved requirements](bugfix.md). The compatibility baseline
 is Tokeira `689e89a8622d114de1dd80232a22bb63705d50d1`. The four differences documented
-in the requirements remain deferred: reset-prefix accumulation, inherited initial
+in the requirements were deferred: reset-prefix accumulation, inherited initial
 versions, reported versions with unspecified behaviour, and trimming.
+[used-deployment-versions](../used-deployment-versions/design.md) corrects them.
 
 Temporal v1.31.0 supports the architectural decision to store the list in run state
 (`service/history/workflow/mutable_state_impl.go:3564-3585, 3696-3722 @ v1.31.0`).
@@ -147,6 +155,11 @@ ordinary reset commit observes the stored v2 and produces `[v2]`. If the first
 ordinary commit instead changes the stored version to v3, it produces `[v3]`, as
 the baseline with no preceding image does. No prefix observation is pre-added.
 
+Since used-deployment-versions, `apply_replayed_event` adds each replayed
+completion's version, untrimmed, so the materialized run lists `[v1, v2]` and
+persists it with the copied prefix. `apply_wft_versioning` still doesn't touch the
+list, and the stored version no longer reaches an image.
+
 ### Shared projection preparation: `tokeira-storage/src/api.rs`
 
 Replace the production previous-image merge entry point with:
@@ -162,6 +175,13 @@ pub(crate) fn seed_workflow_projection_accumulator(
     previous: Option<&ProjectionRecord>,
 ) -> Result<()>;
 ```
+
+Since used-deployment-versions, the kernel's workflow task completion owns the
+fold (`WorkflowState::add_used_deployment_version`). `prepare_workflow_projection`
+takes `&WorkflowState`: it refuses an unseeded run, puts the run's list in the image
+while it isn't empty and leaves the attribute out while it is, and
+`projection_context` no longer observes the stored version. Steps 3 to 5 below are
+the fold it replaced.
 
 Both helpers are pure and perform no repository lookup. Use a small
 `ProjectionAccumulatorError` deriving `Debug` and `thiserror::Error` for an unseeded
@@ -388,6 +408,10 @@ without trimming; unspecified behaviour SHALL add no cleared parameter value.
 
 **Validates: Requirements 2.2, 2.3, 3.1, 3.4, 3.5.**
 
+Since used-deployment-versions, preparation copies the run's list into the image
+(its Property 4), and the kernel's completions keep the list (its Properties 1 to
+3): a completion adds its version whatever its behaviour, and a live one trims.
+
 ### Property 3: new run boundaries
 
 *For any* fresh start or materialized reset, the pre-projection accumulator SHALL
@@ -396,6 +420,10 @@ Its first ordinary image SHALL match the baseline with no preceding image,
 including inherited initial versions and any change before that first commit.
 
 **Validates: Requirements 2.5, 2.6, 3.2, 3.3.**
+
+Since used-deployment-versions, a materialized reset lists the versions of the
+completions it copies, untrimmed (its Property 3). A fresh start, inherited
+versions included, still starts ready and empty.
 
 ### Property 4: consistent, non-durable legacy seeding
 

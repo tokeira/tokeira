@@ -293,6 +293,19 @@ one behind the release's target, which `tkr schema setup` brings forward, or one
 what the release reads. Leave `infrastructure.dsql.migration_policy` unset or set it to
 `validate_only`; a distributed `tokeirad` refuses `automatic`.
 
+A distributed `tokeirad` without `infrastructure.placement.controller_endpoint` assigns
+itself every execution home, so a DSQL cluster serves one such node. After its schema
+check, the node takes the cluster's single-node claim, a row of `tokeira_control_lease`
+held for 60 s and renewed every 20 s:
+- While another node holds the claim, a starting node tries for 80 s and then refuses to
+  start, with an error that names the holder and when its hold expires. Stop that node
+  first.
+- A node that stops cleanly releases the claim, so the next node starts at once.
+- After a crash, the claim stays held for up to 60 s, and the next node then waits
+  5 minutes more, DSQL's longest transaction, before it serves.
+- A node that loses the claim, because another owner took it or no renewal was confirmed
+  for 40 s, stops admitting DSQL work, drains and exits with an error.
+
 ## Operating and inspecting
 
 Use these read paths before mutation or when a gate refuses:

@@ -16,6 +16,8 @@ First show the defect, with a test that fails on the current code. Then:
   - [x] 1.2 Run it on the current code, on an ephemeral cluster with two ephemeral DynamoDB tables, and confirm that
     both nodes serve and the second holds every lease
     - _Requirements: 1.1, 1.2_
+    - DONE. On the code before the fix, on an ephemeral cluster with two ephemeral DynamoDB tables, the test failed as
+      predicted: node B started while node A served, both served, and B held every lease.
 
 - [x] 2. Let `DsqlConnectionDirector::install_ownership_gate` and `acquire_shutdown_control` accept the coordinated
   reservoir's director, with its checkout path honouring the gate as the embedded one does
@@ -58,6 +60,11 @@ First show the defect, with a test that fails on the current code. Then:
 
 - [x] 7. Run the live test and the negative controls on an ephemeral cluster with two ephemeral DynamoDB tables
   - _Requirements: 2.1-2.8_
+  - DONE. On an ephemeral cluster with two ephemeral DynamoDB tables, the live test passed twice, and so did the
+    distributed-schema tests (3 of 3) and the embedded-ownership test (1 of 1). Each live negative control failed its
+    test: the claim skipped, a refusal that leaves its listener bound, a refusal that leaves the store running, and a
+    busy attempt dropped without rollback. The managed embedded DSQL lifecycle test also passed, on a cluster it
+    created and destroyed.
 
 - [x] 8. Add a `changed` fragment saying that a node without a controller refuses to start while another holds its
   DSQL cluster
@@ -65,6 +72,13 @@ First show the defect, with a test that fails on the current code. Then:
 
 - [x] 9. Checkpoint: the exploration test passes, each negative control fails its test, the live test passes on an
   ephemeral cluster, and the full bar of root `AGENTS.md` §10.4 passes
+  - DONE at `83f7729d`. The exploration test passes. Properties 1 to 4 pass offline, and each offline negative control
+    failed its property: a busy claim taken as acquired, an expired takeover without the wait, a release during the
+    wait, and a gate open past the deadline. The live results are task 7's. The bar passed (3,940 tests passed, 2
+    skipped).
+  - After review, at `e31b45df`: Property 2 counts every close, and a fixed schedule reaches its quiescence check on
+    every run. With the simulated admission deadline 30 s past the hold's expiry, that schedule fails, and the four
+    controls above still fail. The bar passed again (3,941 tests passed, 2 skipped).
 
 ## Notes
 

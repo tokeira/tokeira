@@ -17,15 +17,15 @@ use tokeira_storage::dsql::{ConnectionFactory, schema_state_for_tests};
 use super::*;
 
 /// The cluster and tables the tests run against, from the environment.
-struct Live {
-    endpoint: String,
-    region: String,
+pub(super) struct Live {
+    pub(super) endpoint: String,
+    pub(super) region: String,
     rate_limiter_table: String,
     conn_lease_table: String,
 }
 
 impl Live {
-    fn from_env() -> Self {
+    pub(super) fn from_env() -> Self {
         let var = |name: &str| {
             std::env::var(name)
                 .unwrap_or_else(|_| panic!("set {name} to run the live schema check"))
@@ -40,7 +40,7 @@ impl Live {
 
     /// A distributed node's configuration, its Nexus completion listener on
     /// `nexus`.
-    fn config(&self, nexus: u16) -> TokeiraConfig {
+    pub(super) fn config(&self, nexus: u16) -> TokeiraConfig {
         let mut config = TokeiraConfig::default();
         config.infrastructure.storage = ConfigStorageKind::Dsql;
         config.infrastructure.dsql.endpoint = Some(self.endpoint.clone());
@@ -56,11 +56,15 @@ impl Live {
     }
 
     /// Start a distributed node, its gRPC listener on `grpc`.
-    async fn start(
+    pub(super) async fn start(
         &self,
         grpc: u16,
         nexus: u16,
-    ) -> Result<(ServerStack, Option<EngineSnapshotPolicy>)> {
+    ) -> Result<(
+        ServerStack,
+        Option<EngineSnapshotPolicy>,
+        Option<node_claim::NodeClaim>,
+    )> {
         build_and_serve(
             SocketAddr::from(([127, 0, 0, 1], grpc)),
             Arc::new(self.config(nexus)),
@@ -68,7 +72,7 @@ impl Live {
         .await
     }
 
-    async fn dynamodb(&self) -> aws_sdk_dynamodb::Client {
+    pub(super) async fn dynamodb(&self) -> aws_sdk_dynamodb::Client {
         let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .region(aws_config::Region::new(self.region.clone()))
             .load()
@@ -78,7 +82,10 @@ impl Live {
 
     /// The owners of the connection-slot blocks in the lease table. A node
     /// that leaves its blocks owned adds its own owner here.
-    async fn slot_block_owners(&self, dynamodb: &aws_sdk_dynamodb::Client) -> BTreeSet<String> {
+    pub(super) async fn slot_block_owners(
+        &self,
+        dynamodb: &aws_sdk_dynamodb::Client,
+    ) -> BTreeSet<String> {
         let mut owners = BTreeSet::new();
         let mut start = None;
         loop {
@@ -103,14 +110,14 @@ impl Live {
 }
 
 /// A loopback port nothing is bound to.
-fn free_port() -> u16 {
+pub(super) fn free_port() -> u16 {
     StdTcpListener::bind("127.0.0.1:0")
         .and_then(|listener| listener.local_addr())
         .expect("a free loopback port")
         .port()
 }
 
-fn bindable(port: u16) -> bool {
+pub(super) fn bindable(port: u16) -> bool {
     StdTcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
@@ -195,10 +202,14 @@ async fn a_schema_at_the_target_starts_and_serves() {
         .await
         .expect("the schema reaches the target");
 
-    let ((server_task, bound_addr, shutdown_tx, background_cancel, _logs, _recorder), _snapshot) =
-        live.start(free_port(), free_port())
-            .await
-            .expect("the node starts on the target schema");
+    let (
+        (server_task, bound_addr, shutdown_tx, background_cancel, _logs, _recorder),
+        _snapshot,
+        node_claim,
+    ) = live
+        .start(free_port(), free_port())
+        .await
+        .expect("the node starts on the target schema");
     let mut client = WorkflowServiceClient::connect(format!("http://{bound_addr}"))
         .await
         .expect("the node's listener accepts");
@@ -212,6 +223,12 @@ async fn a_schema_at_the_target_starts_and_serves() {
         .await
         .expect("the server task joins")
         .expect("the node shuts down cleanly");
+    if let Some(claim) = node_claim {
+        claim
+            .shut_down()
+            .await
+            .expect("the node releases its single-node claim");
+    }
 }
 
 /// A schema one version past what the release reads is refused with the

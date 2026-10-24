@@ -74,7 +74,10 @@ pub mod harness;
 mod http_api_transport;
 mod listener;
 mod nexus_http_transport;
+mod node_claim;
 pub mod observability;
+#[cfg(all(test, feature = "dsql-integration"))]
+mod single_node_claim_live_tests;
 
 pub use listener::{EngineListenError, EngineListener, EngineListenerShutdownError};
 
@@ -2297,6 +2300,7 @@ impl TokeiradHandle {
         let (
             (server_task, bound_addr, shutdown_tx, background_cancel, log_broadcast, _recorder),
             snapshot_policy,
+            _node_claim,
         ) = build_and_serve(addr, effective_config).await?;
         Ok(Self {
             bound_addr,
@@ -2484,6 +2488,7 @@ pub async fn run_from_cli(cli: Cli) -> Result<()> {
             wire_recorder,
         ),
         snapshot_policy,
+        node_claim,
     ) = build_and_serve(addr, effective_config).await?;
     readiness.mark_started();
     info!("tokeirad gRPC server listening on {bound_addr}");
@@ -2539,6 +2544,14 @@ pub async fn run_from_cli(cli: Cli) -> Result<()> {
         }
     };
     background_cancel.cancel();
+    // A node without a controller releases its single-node claim once its
+    // background work is cancelled and its admitted DSQL work has drained, so
+    // the next node starts at once. When the claim was lost, the claim's task
+    // started this drain, and the node exits with that error.
+    let claim_result = match node_claim {
+        Some(claim) => claim.shut_down().await,
+        None => Ok(()),
+    };
     // The final consistent cut runs after the drain regardless of how the
     // server exited, so an error exit still leaves the freshest snapshot. A
     // snapshot failure must not mask the server's own exit status; it is
@@ -2568,6 +2581,7 @@ pub async fn run_from_cli(cli: Cli) -> Result<()> {
     }
 
     serve_result?;
+    claim_result?;
     snapshot_result?;
     Ok(())
 }
@@ -2876,7 +2890,9 @@ fn distributed_schema_admission(decision: SchemaDecision) -> Result<u32> {
 /// Storage selection is driven only by `infrastructure.storage`: endpoint
 /// presence alone is not treated as intent. This keeps failed DSQL writeback
 /// and explicit in-memory deployments from being conflated. A DSQL node checks
-/// its schema before it builds anything ([`check_distributed_schema`]).
+/// its schema before it builds anything ([`check_distributed_schema`]), and a
+/// DSQL node without a controller then takes its cluster's single-node claim
+/// ([`take_node_claim`]), which it returns for the caller to release.
 ///
 /// Factored out so both the CLI entrypoint and the in-memory facade share one
 /// bootstrap path. Deliberately long and sequential: each block mirrors the
@@ -2884,8 +2900,13 @@ fn distributed_schema_admission(decision: SchemaDecision) -> Result<u32> {
 async fn build_and_serve(
     addr: SocketAddr,
     effective_config: Arc<TokeiraConfig>,
-) -> Result<(ServerStack, Option<EngineSnapshotPolicy>)> {
+) -> Result<(
+    ServerStack,
+    Option<EngineSnapshotPolicy>,
+    Option<node_claim::NodeClaim>,
+)> {
     let mut snapshot_inputs = None;
+    let mut node_claim = None;
     let stack = match effective_config.infrastructure.storage {
         ConfigStorageKind::InMemory => {
             // The listener-backed in-memory server shares the embedded
@@ -2936,6 +2957,29 @@ async fn build_and_serve(
                 }
                 return Err(refusal);
             }
+            // A node without a controller assigns itself every home and writes
+            // unfenced, so it serves only while it holds the cluster's
+            // single-node claim. Refusing the claim leaves nothing started, as
+            // refusing the schema does.
+            if effective_config
+                .infrastructure
+                .placement
+                .controller_endpoint
+                .is_none()
+            {
+                match take_node_claim(&dsql_store).await {
+                    Ok(claim) => node_claim = Some(claim),
+                    Err(refusal) => {
+                        if let Err(error) = dsql_store.shutdown().await {
+                            tracing::warn!(
+                                error = %format!("{error:#}"),
+                                "failed to shut DSQL storage down after refusing to start"
+                            );
+                        }
+                        return Err(refusal);
+                    }
+                }
+            }
             build_dsql_stack(
                 StackTransport::Network(addr),
                 effective_config,
@@ -2945,19 +2989,65 @@ async fn build_and_serve(
             )
             .await
         }
-    }?;
-    match stack {
-        ConstructedStack::Network(stack) => {
-            // The policy shares the stack's cancellation token so the periodic
-            // task dies with the server's other background work; the final
-            // consistent cut stays with the caller's shutdown sequence.
-            let snapshot_policy = snapshot_inputs
-                .map(|(store, config)| EngineSnapshotPolicy::start(store, config, stack.3.clone()));
-            Ok((stack, snapshot_policy))
+    };
+    let stack = match stack {
+        Ok(ConstructedStack::Network(stack)) => stack,
+        Ok(ConstructedStack::Embedded(_)) => {
+            release_node_claim_after_failed_start(node_claim).await;
+            return Err(anyhow!(
+                "network service construction returned an embedded stack"
+            ));
         }
-        ConstructedStack::Embedded(_) => Err(anyhow!(
-            "network service construction returned an embedded stack"
-        )),
+        Err(error) => {
+            release_node_claim_after_failed_start(node_claim).await;
+            return Err(error);
+        }
+    };
+    // A lost claim cancels the stack's background work, which also stops the
+    // server: the node drains, and its caller exits with the claim's error.
+    if let Some(claim) = &node_claim {
+        claim.drain_on_loss(stack.3.clone());
+    }
+    // The policy shares the stack's cancellation token so the periodic task
+    // dies with the server's other background work; the final consistent cut
+    // stays with the caller's shutdown sequence.
+    let snapshot_policy = snapshot_inputs
+        .map(|(store, config)| EngineSnapshotPolicy::start(store, config, stack.3.clone()));
+    Ok((stack, snapshot_policy, node_claim))
+}
+
+/// Take the DSQL cluster's single-node claim for a node without a controller,
+/// after its schema check and before it builds anything (`single-node-claim`
+/// 2.1–2.5): acquire it, start renewing it, install its admission gate on the
+/// store's director, and wait out the quiescence after an expired holder. A
+/// claim another node holds is tried again for 80 s, then refused.
+async fn take_node_claim(dsql_store: &DsqlStore) -> Result<node_claim::NodeClaim> {
+    let director = dsql_store.connection_director_arc();
+    let acquired = node_claim::acquire(&director).await?;
+    let gate = acquired.gate();
+    let mut claim = acquired.start(director.clone());
+    if let Err(error) = director.install_ownership_gate(gate) {
+        release_node_claim_after_failed_start(Some(claim)).await;
+        return Err(error.context("failed to install the single-node claim's admission gate"));
+    }
+    if let Err(error) = claim.wait_until_serving().await {
+        release_node_claim_after_failed_start(Some(claim)).await;
+        return Err(error);
+    }
+    Ok(claim)
+}
+
+/// Stop a node's claim after a failed start: it is released as on a clean
+/// shutdown, unless an expired takeover's quiescence is still running, when it
+/// is left to expire (`single-node-claim` 2.8).
+async fn release_node_claim_after_failed_start(claim: Option<node_claim::NodeClaim>) {
+    if let Some(claim) = claim
+        && let Err(error) = claim.shut_down().await
+    {
+        tracing::warn!(
+            error = %format!("{error:#}"),
+            "the single-node claim was lost while the node failed to start"
+        );
     }
 }
 

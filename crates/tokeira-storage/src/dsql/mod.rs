@@ -20,6 +20,8 @@ pub mod connection;
 pub(crate) mod connection_coordinator;
 pub mod connection_factory;
 pub mod control_lease;
+#[cfg(any(test, feature = "dsql-integration"))]
+pub mod control_lease_state_for_tests;
 pub(crate) mod convert;
 pub mod distributed_bucket;
 pub(crate) mod embedded_reservoir;

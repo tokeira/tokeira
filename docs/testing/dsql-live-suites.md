@@ -331,6 +331,31 @@ run on a new cluster applies the whole corpus.
   listener addresses. Each test then restores the ledger.
 - The third starts a node on the target schema and calls `GetSystemInfo`.
 
+## Single-node claim
+
+The ignored `single_node_claim_live_tests` test in `tokeira-engine` starts listener-backed
+distributed nodes without a controller on one cluster, with the environment and the two
+tables of the distributed schema check's tests. Run it after those tests, so that a new
+cluster's first migration doesn't count against its time limit.
+
+```bash
+cargo nextest run -p tokeira-engine --features dsql-integration --lib --locked --profile dsql-live \
+  --test-threads 1 --run-ignored only -E 'test(/single_node_claim_live_tests::/)'
+```
+
+The test removes the `tokeirad-owner` claim, then:
+- starts node A, then node B beside it. B tries for 80 s and refuses, naming A's claim. It
+  leaves both its listener addresses free, the ledger, the shard leases and A's claim as
+  they were, and none of its connection-slot blocks owned;
+- stops A cleanly, which releases the claim, and starts B at once;
+- starts A again and crashes it without a release. B serves only once A's hold has
+  expired and 5 minutes more have passed on the database's clock;
+- gives the claim to another owner with SQL. B's next renewal is fenced, B's server
+  drains, and B returns an error.
+
+The crash step waits out a full quiescence, so the test takes about seven minutes. It
+removes the claim when it ends.
+
 ## Managed lifecycle
 
 The [managed embedded DSQL live-AWS runbook](managed-embedded-dsql-live-aws.md) covers the

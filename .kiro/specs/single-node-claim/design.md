@@ -207,6 +207,9 @@ Written and run on the code before the fix, failing there:
 
 - The refusal's error names the holder, the hold's expiry and what to do.
 - The claim's name, identity and owner prefix are as this design gives them.
+- Property 2 on a fixed schedule the generated ones seldom reach: a holder cut off from the database keeps running while
+  the other node takes its expired claim. The new owner's gate opens no earlier than 5 minutes after the holder's gate
+  closed.
 
 ### Live Test
 

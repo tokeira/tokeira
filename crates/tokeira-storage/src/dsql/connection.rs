@@ -324,8 +324,9 @@ pub struct DsqlConnectionDirector {
     /// established immediate-checkout behavior.
     accepting: AtomicBool,
     admission_lock: AsyncMutex<()>,
-    /// Managed embedded ownership admission. Distributed mode never installs
-    /// this gate and therefore retains its established acquisition path.
+    /// Owner admission: the managed embedded engine's claim, or a distributed
+    /// node's single-node claim when it has no controller. A director with no
+    /// gate keeps its established acquisition path.
     ownership_gate: StdRwLock<Option<OwnershipAdmissionGate>>,
     /// Tracks long-lived checkouts without using stack traces or raw call-site
     /// strings as labels. The call-site dimension is derived from `DbClass`.
@@ -433,36 +434,41 @@ impl DsqlConnectionDirector {
         self.reservoir.target_ready()
     }
 
-    /// Install the singleton-owner gate on an embedded director exactly once.
+    /// Install the singleton-owner gate on the director exactly once.
     ///
-    /// The shared gate makes loss of the DSQL owner claim close both the
-    /// in-process RPC boundary and subsequent physical connection checkouts.
+    /// The shared gate makes loss of the DSQL owner claim close subsequent
+    /// physical connection checkouts, and for the embedded engine its
+    /// in-process RPC boundary too. The embedded director and the coordinated
+    /// reservoir's director honour it the same way.
     pub fn install_ownership_gate(&self, gate: OwnershipAdmissionGate) -> Result<()> {
-        if !matches!(self.reservoir.as_ref(), ReservoirController::Embedded(_)) {
-            bail!("ownership admission is available only for embedded DSQL");
-        }
         let mut installed = self
             .ownership_gate
             .write()
-            .expect("embedded ownership gate lock poisoned");
+            .expect("DSQL ownership gate lock poisoned");
         if installed.is_some() {
-            bail!("embedded DSQL ownership admission is already installed");
+            bail!("DSQL ownership admission is already installed");
         }
         *installed = Some(gate);
         Ok(())
     }
 
-    /// Acquire the control connection needed to conditionally release the
-    /// owner claim after ordinary ownership admission has closed.
+    /// Acquire a control connection past the owner gate, for the owner
+    /// claim's own renewals and its conditional release once ordinary
+    /// admission has closed.
     ///
-    /// This narrow shutdown seam bypasses only the owner gate. Director
-    /// shutdown admission and every class/physical pool bound still apply.
+    /// This narrow seam bypasses only the owner gate. Director shutdown
+    /// admission and every class/physical pool bound still apply.
     pub async fn acquire_shutdown_control(&self) -> Result<DsqlPermit> {
-        let ReservoirController::Embedded(reservoir) = self.reservoir.as_ref() else {
-            bail!("shutdown control acquisition is available only for embedded DSQL");
-        };
-        self.acquire_embedded(DbClass::Control, reservoir, false)
-            .await
+        match self.reservoir.as_ref() {
+            ReservoirController::Distributed(reservoir) => {
+                self.acquire_distributed(DbClass::Control, reservoir, false)
+                    .await
+            }
+            ReservoirController::Embedded(reservoir) => {
+                self.acquire_embedded(DbClass::Control, reservoir, false)
+                    .await
+            }
+        }
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -542,7 +548,7 @@ impl ConnectionDirector for DsqlConnectionDirector {
     async fn acquire(&self, class: DbClass) -> Result<DsqlPermit> {
         match self.reservoir.as_ref() {
             ReservoirController::Distributed(reservoir) => {
-                self.acquire_distributed(class, reservoir).await
+                self.acquire_distributed(class, reservoir, true).await
             }
             ReservoirController::Embedded(reservoir) => {
                 self.acquire_embedded(class, reservoir, true).await
@@ -556,11 +562,34 @@ impl DsqlConnectionDirector {
         &self,
         class: DbClass,
         reservoir: &Reservoir,
+        enforce_ownership: bool,
     ) -> Result<DsqlPermit> {
         // This is the pre-embedded `tokeirad` acquisition sequence: class
         // permit, immediate checkout, and the existing slot-block-backed permit.
+        // An installed owner gate admits the checkout first, as on the embedded
+        // path, and holds its admission until the permit drops.
+        let ownership_gate = enforce_ownership
+            .then(|| {
+                self.ownership_gate
+                    .read()
+                    .expect("DSQL ownership gate lock poisoned")
+                    .clone()
+            })
+            .flatten();
+        let ownership_guard = ownership_gate
+            .as_ref()
+            .map(OwnershipAdmissionGate::admit)
+            .transpose()?;
         let started = Instant::now();
         let class_guard = self.class_budgets.acquire(class).await?;
+        // The class permit may have waited while the gate closed: a closed gate
+        // starts no checkout, though the admission it counted drains normally.
+        if ownership_gate
+            .as_ref()
+            .is_some_and(|gate| gate.state() != OwnershipAdmissionState::Open)
+        {
+            bail!("DSQL connection admission is closed");
+        }
         let entry = reservoir.checkout()?;
         // From this point until `DsqlPermit::drop`, the connection is out of
         // the ready reservoir but still owns exactly one slot reservation.
@@ -578,6 +607,7 @@ impl DsqlConnectionDirector {
             Arc::clone(&self.in_flight),
             Arc::clone(&self.leak_tracker),
             leak_checkout,
+            ownership_guard,
         ))
     }
 
@@ -763,7 +793,7 @@ pub struct DsqlPermit {
     leak_checkout: CheckoutLeak,
     /// Caller-set flag that causes return processing to discard the connection.
     marked_bad: bool,
-    /// Managed embedded owner admission held for the checkout lifetime.
+    /// Owner admission held for the checkout lifetime, when a gate is installed.
     _ownership_guard: Option<OwnershipAdmissionPermit>,
 }
 
@@ -798,6 +828,7 @@ impl DsqlPermit {
         director_in_flight: Arc<AtomicUsize>,
         leak_tracker: Arc<CheckoutLeakTracker>,
         leak_checkout: CheckoutLeak,
+        ownership_guard: Option<OwnershipAdmissionPermit>,
     ) -> Self {
         Self {
             class,
@@ -814,7 +845,7 @@ impl DsqlPermit {
             leak_tracker,
             leak_checkout,
             marked_bad: false,
-            _ownership_guard: None,
+            _ownership_guard: ownership_guard,
         }
     }
 

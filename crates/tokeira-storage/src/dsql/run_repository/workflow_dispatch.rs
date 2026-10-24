@@ -108,9 +108,18 @@ impl DsqlRunRepository {
         &self,
         home: ShardId,
         run_key: RunKey,
+        fence: &WriteFence,
     ) -> Result<()> {
+        fence.ensure_home(home)?;
         let mut permit = self.director.acquire(DbClass::Maintenance).await?;
         let mut tx = permit.connection()?.begin().await?;
+        // The lease read must share the repair transaction: takeover/release
+        // changes a key column, so even an otherwise uncontended derived write
+        // conflicts at commit. Non-key renewal stays compatible.
+        if let Some(lost) = Self::check_fence(&mut tx, fence, run_key).await? {
+            tx.rollback().await?;
+            return Err(lost.into());
+        }
         let hot = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
             "SELECT shard_id, state_data FROM workflow_hot WHERE run_key=$1",
         )
@@ -131,9 +140,8 @@ impl DsqlRunRepository {
                 ) == home,
                 "workflow dispatch authoritative placement mismatch for {run_key:?}"
             );
-            // Only the derived row is written. The caller excludes single-owner
-            // writers while acquiring; transaction-local takeover fencing is a
-            // separate prerequisite, not implied by this repeatable-read snapshot.
+            // The local acquisition gate excludes same-owner authoritative
+            // writers; the transaction fence excludes a replacement owner.
             maintain(&mut tx, &state, home).await?;
         } else {
             let stored_home: Option<Uuid> =

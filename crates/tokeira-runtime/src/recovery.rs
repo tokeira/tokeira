@@ -25,7 +25,8 @@
 //! only activates the same local acquisition that began it. Workflow-task
 //! deadline installation and every other recovery tracker check that acquisition
 //! under the owner lock, so an old sweep cannot overwrite successor tracking. These local checks do
-//! not establish a transaction-local fence against competing durable owners.
+//! not establish a durable fence: every repair transaction separately validates
+//! the original acquisition's owner and epoch, including across OCC retries.
 
 use std::sync::Arc;
 
@@ -33,7 +34,7 @@ use anyhow::{Context, Result, anyhow};
 #[cfg(test)]
 use time::OffsetDateTime;
 use tokeira_storage::{
-    LeaseOutcome, LeaseRepository, RecoveryCursor, RunRepository, recovery_entries,
+    LeaseOutcome, LeaseRepository, RecoveryCursor, RunRepository, WriteFence, recovery_entries,
 };
 use tokeira_types::{ShardEpoch, ShardId};
 use tokio::sync::oneshot;
@@ -118,6 +119,7 @@ where
         owner.acquisition(shard_id).unwrap()
     };
     let repair = RepairAcquisition {
+        fence: owner.read().unwrap().fence_at(shard_id, acquisition.epoch),
         owner: owner.clone(),
         acquisition: acquisition.clone(),
         max_retries: 3,
@@ -150,12 +152,15 @@ where
     Ok(result)
 }
 
-/// Local acquisition identity carried through every repair attempt and page.
+/// Acquisition identity and captured durable fence retained across every retry.
 #[derive(Debug)]
 pub(crate) struct RepairAcquisition {
     pub(crate) owner: Arc<std::sync::RwLock<crate::shard::ShardOwner>>,
     pub(crate) acquisition: crate::shard::ShardAcquisition,
     pub(crate) max_retries: u32,
+    // Never read the current owner's fence on retry: a replacement may already
+    // hold this home, while this work still belongs to the old acquisition.
+    pub(crate) fence: WriteFence,
 }
 
 impl RepairAcquisition {
@@ -171,7 +176,11 @@ impl RepairAcquisition {
         for attempt in 0..=self.max_retries {
             self.validate()?;
             match repo
-                .reconcile_workflow_dispatch_run(self.acquisition.shard_id, run_key)
+                .reconcile_workflow_dispatch_run(
+                    self.acquisition.shard_id,
+                    run_key,
+                    self.fence.clone(),
+                )
                 .await
             {
                 Err(error)

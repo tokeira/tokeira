@@ -1,0 +1,5 @@
+kind: fixed
+body: Workflow dispatch repair now rejects stale owners after lease takeover or release while allowing compatible lease renewal.
+time: 2026-10-24T17:15:46.545544+00:00
+custom:
+    Slice: 5dc6e395-f63c-4b43-8847-5227a4d0fa53

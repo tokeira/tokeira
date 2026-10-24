@@ -877,3 +877,6 @@ async fn dsql_lease_fence_a_write_landing_first_aborts_a_takeover() -> anyhow::R
     interleaving(&fixture, 1, LeaseEvent::TakeoverLandingLast, &[0, 1, 2]).await;
     Ok(())
 }
+
+#[path = "workflow_dispatch_fence_tests.rs"]
+mod workflow_dispatch_fence_tests;

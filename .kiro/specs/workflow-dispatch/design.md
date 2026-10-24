@@ -52,13 +52,14 @@ change, compatible renewal and local expiry self-fencing implement the conflict
 relationship in [30_bundle_lease.tla](../../../spec/tla/30_bundle_lease.tla).
 A separate successful precheck cannot substitute for this contract.
 
-Acquisition repair does not yet consume that fence. The cutover remains explicitly
-single-owner for reconciliation: cancellation, failure handling and the non-serving
-gate do not establish safety under competing durable owners. Tasks 17–18 integrate
-the landed protocol into repair and verify its competing-owner behavior without
-redesigning lease acquisition or renewal. Requirements 8.4–8.6 and Property 9 remain
-deferred; single-owner results cannot discharge them. Verified SQLx affected-row
-behavior is independent of this ownership dependency.
+Acquisition repair consumes that same transaction-local fence. Every retry retains
+its original home, owner and epoch; a fresh lease check and authoritative read
+occur together inside each attempt. Local cancellation, generation and deadline
+checks separately guard activation. A database precheck cannot atomically guard
+local `Active` publication, so an undetected ownership change is fenced at every
+subsequent write. Competing-owner evidence is recorded separately from the earlier
+single-owner checkpoints. Verified SQLx affected-row behavior is independent of
+this ownership dependency.
 
 Operation rows, close intents, atomic successor creation, projection discovery,
 admitted-update recovery, and speculative-task redesign are excluded. Preserve
@@ -206,14 +207,18 @@ async fn reconcile_workflow_dispatch_run(
     &self,
     home: ShardId,
     run_key: RunKey,
+    fence: WriteFence,
 ) -> Result<()>;
 ```
 
-The implemented repair interface carries a single-owner execution home. The caller
-holds its local writer barrier throughout acquisition. The transaction-local
-`ExecutionHomeFence` is [bundle-lease-fence](../bundle-lease-fence/design.md)'s, which
-every write of a run's authoritative state carries; tasks 17–18 will thread it through
-this repair interface, which until then makes no competing-owner claim. A typed `WorkflowDispatchRepairConflict` requests a whole-call retry.
+The repair interface carries the execution home and the captured acquisition's
+`WriteFence`. The caller holds its local writer barrier throughout acquisition.
+`WriteFence::Lease` uses [bundle-lease-fence](../bundle-lease-fence/design.md)'s
+transaction-local owner/epoch check before any state read or derived write;
+`Unfenced` remains the self-assigned configuration. `ensure_home` rejects a fence
+for another home. Memory validates under the same mutex as repair. A typed
+`WorkflowDispatchRepairConflict` requests a whole-call retry with the original
+fence; `LeaseFenceLost` is terminal and ends that acquisition.
 
 `Derive` returns a row exactly when status is `Running`, the pending task is
 unstarted, and its type is normal. A transient retry is normal for this purpose.
@@ -621,11 +626,11 @@ home must remain disabled during repair. The implementation must test this mappi
 explicitly: a local lane being Active is insufficient to bypass its execution
 home's acquisition gate.
 
-The following protocol describes the complete competing-owner design. The initial
-single-owner implementation retains acquisition identity, cancellation, local
-expiry checks, transactional authoritative reads, and the non-serving gate.
-Transaction-local takeover/renewal fencing and its concurrency claims remain
-deferred to Tasks 17–18; this does not block single-owner repair or backlog retirement.
+The protocol combines transaction-local fencing with local acquisition identity,
+cancellation, conservative expiry, and the non-serving writer barrier. Takeover
+and release change the lease epoch key, conflicting with a repair's `FOR KEY SHARE`
+read at commit; renewal changes only non-key columns. The original acquisition's
+fence is immutable across repair retries.
 
 Repair and the admission barrier apply to every construction path. A seeded
 constructor may activate synchronously only when the repository proves its recovery
@@ -700,9 +705,9 @@ request's start time; a renewal returned after that deadline cannot revive them.
    corrects mismatched contents.
 4. After both walks and timeout reconstruction finish, verify the acquisition's
    fence is still locally valid and publish `Active` only by a compare against the
-   same home/epoch/cancellation state. Every later write still takes its own
-   transaction fence; an ownership loss racing with this local mark cannot admit
-   a successful stale-owner write.
+   same home/epoch/generation/cancellation/deadline state. Every later write still
+   takes its own transaction fence; an ownership loss racing with this local mark
+   cannot admit a successful stale-owner write.
 
 One repair transaction does the following:
 
@@ -771,8 +776,8 @@ Installation checks that identity under the ownership lock. Activation and clean
 use the same identity, so a cancelled, failed or superseded sweep cannot activate
 or overwrite/remove its successor's deadline entries. Both acquisition paths cancel
 partial sweeps, and the managed lease-loss watcher retains the acquisition's cleanup
-guard after activation. These local lifecycle checks do not replace the deferred
-transaction-local competing-owner fence.
+guard after activation. These local lifecycle checks complement the
+transaction-local competing-owner fence; neither substitutes for the other.
 
 Each installed timeout also has a monotonically increasing local revision. After
 awaiting submission, success and stale rejection retire only the submitted
@@ -871,14 +876,21 @@ or repeated replies. Today a failure can reuse a sequence; the new allocator rul
 is necessary to make this mapping true. Retry is a new abstract incarnation even
 when it emits no new Scheduled event.
 
+The abstract serving owner is the durable owner whose local acquisition is Active.
+A stale node's unobserved local Active bit conveys no write authority: the next
+transaction must validate its original fence. If durable ownership changes before
+the local comparison hears of it, the stale local publication is a stuttering step,
+not another owner's abstract `Reconcile`. No separate lease precheck can make
+those two observations atomic.
+
 During multi-transaction reconciliation, map the concrete home to abstract
 `serving = FALSE`. Intermediate repairs and timer installation are stuttering
 steps with respect to serving behavior. Since no current-owner state writer runs
 during the sweep and stale-owner writes are fenced, completion establishes exactly
-the model's derived row set. The final Active publication corresponds to atomic
-`Reconcile`. A failed/cancelled attempt has no such final step. This argument
-depends on execution-home admission and the lease fence, not on a global database
-snapshot spanning all repair pages.
+the model's derived row set. The current durable owner's final Active publication
+corresponds to atomic `Reconcile`. A failed/cancelled attempt has no such final
+step. This argument depends on execution-home admission and the lease fence, not
+on a global database snapshot spanning all repair pages.
 
 The abstract model has few runs and atomic pass admission. Its concrete companion,
 [41_dispatch_repair.tla](../../../spec/tla/41_dispatch_repair.tla), adds a multi-page
@@ -987,13 +999,20 @@ non-serving, and a restart from the head converges without a durable checkpoint.
 
 ### Property 9: Ownership loss fences repair
 
-Deferred: requires the separately implemented and verified transaction-local
-lease fence; single-owner implementation and tests do not establish this property.
+The transaction-local lease fence and local activation comparison are tested
+separately; earlier single-owner evidence does not establish this property.
 
 For any interleaving of repair, ownership change, run commit, and activation, the
-old owner cannot commit repair over the successor's state; losing ownership cannot
-mark the old acquisition serving. The result holds when execution-home and local
-lane mappings differ and when takeover races the final local activation check.
+old owner cannot commit repair over the successor's state. A locally cancelled,
+expired or replaced acquisition cannot publish `Active`, including replacement at
+the same epoch and an empty home with no repair writes. If durable ownership changes
+before the runtime learns of it, subsequent writes are still fenced; there is no
+claim of an atomic database-to-local activation check. Tests model the matching
+local deadline or loss notification when forcing durable lease loss. The result
+holds when execution-home and local-lane mappings differ and when loss races the
+final local activation comparison. Isolated controls change only the lease while
+repair is paused, exercising insertion and deletion in both commit orders; valid
+renewal stays compatible. Negative controls retain all synchronization barriers.
 
 **Validates: Requirements 8.4, 8.5, 8.6, 10.8, 12.5, 12.8**
 

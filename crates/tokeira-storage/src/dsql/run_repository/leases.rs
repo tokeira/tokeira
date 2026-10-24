@@ -310,6 +310,8 @@ impl LeaseRepository for DsqlRunRepository {
                 .context("failed to relinquish shard lease")?;
 
             if let Some((new_epoch,)) = row {
+                #[cfg(all(test, feature = "dsql-integration"))]
+                super::pause_point::reached(super::pause_point::PauseKey::Release(bundle)).await;
                 tx.commit().await?;
                 return Ok(LeaseOutcome::Acquired {
                     epoch: epoch_from_sql(new_epoch)?,

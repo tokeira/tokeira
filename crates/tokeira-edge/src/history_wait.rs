@@ -300,11 +300,16 @@ where
         Ok(())
     }
 
-    async fn reconcile_workflow_dispatch_run(&self, home: ShardId, run_key: RunKey) -> Result<()> {
+    async fn reconcile_workflow_dispatch_run(
+        &self,
+        home: ShardId,
+        run_key: RunKey,
+        fence: WriteFence,
+    ) -> Result<()> {
         // Repair changes derived intent only, so it must reach storage without
         // waking history readers or falling back to the trait's test-double stub.
         self.inner
-            .reconcile_workflow_dispatch_run(home, run_key)
+            .reconcile_workflow_dispatch_run(home, run_key, fence)
             .await
     }
 

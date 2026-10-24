@@ -1021,7 +1021,7 @@ async fn repair_retry(backend: &impl RepairBackend, key: RunKey) -> Result<()> {
     for attempt in 0..10 {
         match backend
             .repo()
-            .reconcile_workflow_dispatch_run(backend.repair_home(), key)
+            .reconcile_workflow_dispatch_run(backend.repair_home(), key, WriteFence::Unfenced)
             .await
         {
             Err(error) if error.is::<crate::WorkflowDispatchRepairConflict>() && attempt < 9 => {
@@ -1152,7 +1152,11 @@ pub(crate) fn run_disposal_cases(
                     prop_assert_eq!(backend.disposal_authority(&keys).await.unwrap(), authority);
                     backend
                         .repo()
-                        .reconcile_workflow_dispatch_run(ShardId(0), uncovered.run_key)
+                        .reconcile_workflow_dispatch_run(
+                            ShardId(0),
+                            uncovered.run_key,
+                            WriteFence::Unfenced,
+                        )
                         .await
                         .unwrap();
                     after = None;

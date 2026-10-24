@@ -1,16 +1,16 @@
 # Implementation Plan: Durable Workflow-Task Dispatch
 
 This plan implements the [requirements](requirements.md) and [design](design.md).
-Implementation proceeds in independently verified PRs. The initial scope is
-single-owner; deferred competing-owner work remains separately unchecked below.
+Implementation proceeds in independently verified PRs. The initial scope was
+single-owner; competing-owner integration and evidence are tracked separately below.
 Completed checks and remaining verification are recorded in
 [implementation evidence](implementation-evidence.md).
 
 The external `lease-fence` prerequisite means the passing transaction-local
 ownership protocol described in the design and
 [30_bundle_lease.tla](../../../spec/tla/30_bundle_lease.tla). That protocol has landed;
-its integration into acquisition repair and competing-owner verification remain
-in Tasks 17–18. Those tasks do not redesign lease acquisition/renewal.
+its integration into acquisition repair and competing-owner verification are
+covered by Tasks 17–18. Those tasks do not redesign lease acquisition/renewal.
 Single-owner reconciliation and backlog retirement do not depend on those tasks.
 
 ## Tasks
@@ -246,7 +246,7 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
       for that acquisition. Gate every relevant run writer, including retention
       and materialization, on the same execution home; test where lane-local
       run-key placement differs. Retain cancellation and local lifecycle checks;
-      competing-owner write fencing remains Task 17.
+      competing-owner write fencing is covered by Task 17.
     - Abandon lost acquisitions and restart both walks from the head after failure;
       never persist a continuation or serve after partial repair.
     - _Requirements: 8.1, 8.2, 8.3, 8.7, 8.9, 8.11, 12.5_
@@ -265,7 +265,8 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
     and doctests for broker, discovery, registration, sticky timers, and repair.
     Confirm every background task cancels and every new error has the design's
     existing admission/poll behavior and actionable diagnostics.
-  - Leave competing-owner integration and its verification in Tasks 17–18.
+  - This checkpoint covers single-owner repair; competing-owner integration and
+    verification are recorded separately in Tasks 17–18.
     Single-owner completion may proceed; the landed lease prerequisite does not
     make these results competing-owner verification.
   - _Requirements: 4.1, 5.4, 6.5, 7.3, 8.1, 8.9, 10.8, 12.9_
@@ -412,29 +413,32 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
     Run Markdown link and whitespace checks for implementation documentation.
   - Reconcile actual commands/results with the evidence record. Do not mark live
     DSQL, ownership safety, or a property test complete from plan text alone.
-    Keep Tasks 17–18 and Requirements 8.4–8.6 outstanding; this checkpoint does not
-    declare the full competing-owner design implemented.
+    This checkpoint did not discharge Tasks 17–18 or Requirements 8.4–8.6;
+    the later competing-owner checkpoint records its own implementation and evidence.
   - _Requirements: 10.3, 10.4, 10.5, 10.6, 12.4, 12.5, 12.6, 12.7, 12.8, 12.9_
 
-- [ ] 17. Consume the lease fence and verify competing-owner repair
-  - Deferred: the lease fence has landed; its acquisition-repair integration and competing-owner verification remain separate.
-  - [ ] 17.1 Protect every repair and final activation against ownership loss
+- [x] 17. Consume the lease fence and verify competing-owner repair
+  - Consume the landed lease protocol without redesigning acquisition or renewal.
+  - [x] 17.1 Protect every repair and final activation against ownership loss
     - Consume the landed home/owner/epoch fence inside every repair transaction.
       Preserve takeover/release conflict ordering, compatible renewal, and local
-      expiry self-fencing. A lost acquisition cannot publish serving state.
+      expiry self-fencing. Retain the original acquisition's fence across every
+      retry; terminal `LeaseFenceLost` ends repair. Preserve the final local
+      generation/cancellation/deadline comparison, including empty homes and
+      same-epoch replacement. Do not add a separate database precheck before Active.
     - _Requirements: 8.4, 8.5, 8.6, 10.8, 12.5_
-  - [ ] 17.2 Required property test: Property 9 — Ownership loss fences repair
+  - [x] 17.2 Required property test: Property 9 — Ownership loss fences repair
     - Implement at least 100 generated interleaving cases with deterministic
       barriers in runtime and storage tests, including the real DSQL adapter.
       Race old-owner repair, takeover, renewal, successor writes, and activation.
-    - Verify stale repair cannot overwrite successor state, no lost acquisition
-      becomes serving, and renewal does not spuriously abort valid owner writes.
+    - Verify stale repair cannot overwrite successor state, no locally invalid
+      acquisition becomes serving, and renewal does not abort valid owner writes.
       Include differing execution-home/local-lane mappings and final-gate races.
     - Tag: `// Feature: workflow-dispatch, Property 9: Ownership loss fences repair`
     - _Requirements: 8.4, 8.5, 8.6, 10.8, 12.5, 12.8_
 
-- [ ] 18. Execute competing-owner live DSQL verification
-  - Deferred: requires Task 17's transaction-local fence and concurrency tests.
+- [x] 18. Execute competing-owner live DSQL verification
+  - Requires Task 17's transaction-local fence and concurrency tests.
   - Run deterministic renewal/takeover/repair and final-activation races on an
     owned ephemeral real DSQL cluster, including at least 100 Property 9 cases.
     Record actual outcomes under Task 15's evidence rules; keep lifecycle times private.
@@ -482,11 +486,11 @@ unrelated lease work in this feature.
 | 2: Incarnation fencing and observable retry preservation | 2.3 | Storage effects also exercised by 3.2/15 |
 | 3: Ordered read-only traversal | 6.3 | 15 |
 | 4: Bounded slices without prefix starvation | 6.4 | Plan/read-cost evidence in 15 |
-| 5: Demand registration and home independence | 7.2 | Start checks in 15; competing-owner fence deferred to 17.2/18 |
+| 5: Demand registration and home independence | 7.2 | Start checks in 15; competing-owner fence in 17.2/18 |
 | 6: Volatile offer loss and ambiguity | 5.3 | Atomic start/rollback also exercised by 3.2/15 |
 | 7: Sticky recovery and affinity independence | 8.2 | State/reconstruction also exercised by 9.3/15 |
 | 8: Complete bounded repair | 9.3 | 15 |
-| 9: Ownership loss fences repair | 17.2 (deferred) | 18 (deferred) |
+| 9: Ownership loss fences repair | 17.2 | 18 |
 | 10: Workflow-only backlog retirement | 11.3 | 15 |
 | 11: Routing, state, and delivery preservation | 12.2 | Storage portions in 15 |
 | 12: Next-pass recovery and eventual resolution | 14.1 | Query-cost evidence in 15; no wall-clock guarantee |
@@ -509,12 +513,12 @@ unrelated lease work in this feature.
   dispatch reconstruction and the serving gate are wired and verified together.
   Upgrade with every node stopped.
   Ordinary constructors now use discovery, bounded offers and complete
-  single-owner reconstruction before activation. All five recovery trackers are
-  scoped to their acquisition. Workflow backlog delivery is retired while
+  reconstruction before activation, with each repair transaction fenced. All five
+  recovery trackers are scoped to their acquisition. Workflow backlog delivery is retired while
   activity recovery and backlog delivery remain operational. Task 13's positive
   and negative models pass on both checkers. The implementation evidence records
-  the cutover's workspace and live verification; competing-owner repair remains
-  deferred to Tasks 17–18.
+  the cutover's workspace and live verification separately from Tasks 17–18's
+  competing-owner repair verification.
 - Read crate-local instructions before implementing kernel/storage/runtime work.
   Keep API shape and public behavior tied to the vendored protos and Temporal
   v1.31.0 sources cited in requirements/design. Existing request-result gaps are

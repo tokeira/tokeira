@@ -1,5 +1,84 @@
 # Workflow dispatch implementation evidence
 
+## Acquisition repair ownership fence
+
+Live-tested implementation revision: `4f2bee04cfc0bdfadb8c86096eb0b034a5475faf`.
+
+Repair now takes the acquisition's captured `WriteFence`. DSQL checks the
+execution-home owner and epoch with the existing `FOR KEY SHARE` protocol as the
+first statement of the repair transaction; memory checks under the same mutex as
+the authoritative read and derived write. Whole-call OCC retries retain the
+original fence. `LeaseFenceLost` is terminal. Forwarding repositories preserve the
+argument. There is no new migration, dependency, lockfile or lease protocol change.
+
+The final local comparison still checks generation, cancellation and monotonic
+deadline. A separate database read is not an atomic guard on local Active
+publication. Tests distinguish that local guarantee from the durable fence that
+rejects every later stale-owner write, including orphan dispatch removal.
+
+### Validation executed
+
+| Check | Outcome |
+|---|---|
+| Nightly formatting | Passed locally and with the pinned nightly check on Linux |
+| Workspace lint and check, locked | Passed |
+| Storage/runtime/edge Clippy with DSQL integration features and all targets | Passed with warnings denied |
+| Workspace nextest, locked | 3,903 passed; two existing ignored SDK integration tests remained skipped |
+| Workspace doctests and warnings-as-errors documentation, locked | Passed |
+| Focused repair and runtime fence audit | Six passed, including 128 generated memory ownership cases and 128 runtime final-gate cases |
+| Fragment validation | Pinned changie scratch-copy batch passed |
+| Changed-document offline links and whitespace | Passed |
+| Exploration before the fix | Released-owner repair incorrectly succeeded; the invariant assertion failed |
+| Memory fence negative control | Omitting the repair fence failed the released-owner assertion |
+| Local activation negative control | Omitting the final comparison failed the invalid-acquisition assertion |
+| Live DSQL isolated repair controls | Ten passed: insertion/deletion, takeover/release in both commit orders, and compatible renewal |
+| Live DSQL generated repair interleavings | 100 passed, including successor writes and terminal stale-owner retry rejection |
+| Live DSQL final-gate interleavings | 100 executed and passed; the test asserts the executed count |
+| Live DSQL fence negative control | Omitting only the repair fence, while retaining its pause barrier, failed the stale-repair invariant assertion |
+| Live DSQL restored positive controls | All ten fixed controls passed again after exact source restoration |
+
+Each negative control was applied alone and restored byte for byte. The fixed
+local gate controls cover both orders for valid ownership, cancellation, expiry,
+same-epoch replacement and next-epoch replacement on an empty home. The actual
+runtime recovery regression retains the original fence across two injected OCC
+conflicts, terminates on lease loss rather than retrying it, remains non-serving,
+and allows a successor's fresh acquisition. Its execution home differs from the
+run-hash mapping. The writer audit now includes repair.
+
+The local focused build could not link dependency build scripts against the Mac
+SDK, before executing tests. No local toolchain or cache configuration changed;
+the complete bar and focused checks ran on an ephemeral Linux validation host.
+Default-suite URL-gated returns are not live evidence. These live checks had the
+dedicated URL set and ran against an owned ephemeral Aurora DSQL cluster. Storage
+executed 100 generated interleavings and ten fixed controls; runtime executed 100
+generated final-gate interleavings. Broader live suites from earlier checkpoints
+were not rerun for this lease-fence integration.
+
+The live suites used `cargo nextest run`, `--features dsql-integration`, `--locked`,
+`--profile dsql-live`, `--lib` and `--test-threads 1`, selecting each test below
+with `-E 'test(<name>)'`. Shared-cluster ordering and complete commands are in the
+[live-suite runbook](../../../docs/testing/dsql-live-suites.md).
+
+- Storage: `workflow_dispatch_live_fenced_repair_isolates_lease_conflicts`.
+- Storage: `workflow_dispatch_live_fenced_repair_generated_interleavings`.
+- Runtime: `workflow_dispatch_live_fenced_repair_final_gate`.
+
+All changed Rust sources on the validation host matched that committed revision
+after control restoration. The negative controls failed invariant assertions,
+not compilation or timeouts. Subsequent lint cleanup replaced two live-test
+helper `unwrap()` calls with explanatory `expect()` messages; it changed failure
+diagnostics only. The complete workspace bar and feature-enabled Clippy passed
+again after that cleanup; live checks were not repeated for it.
+The owned ephemeral cluster was deleted and its absence confirmed. Lifecycle
+details remain private.
+
+The default suite retains its two existing ignored SDK integration tests, which
+spawn a server and pinned SDK workers (one also starts an authorization endpoint).
+This ownership change does not alter their public API behavior.
+
+Earlier sections below describe their own historical implementation checkpoints;
+their single-owner outcomes do not establish competing-owner repair correctness.
+
 ## Default delivery cutover
 
 Base: `1ebc763f56a50db20c450f12bacaf7459ba054f7`; the PR records its final base

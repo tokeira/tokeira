@@ -265,11 +265,12 @@ normal queue even across a restart, so that affinity cannot strand execution.
 
 ### Requirement 8: Complete fenced acquisition
 
-The initial implementation supports a single execution-home owner. Requirements
-8.4–8.6 remain deferred until the transaction-local lease fence is implemented and
-verified. Single-owner scope includes complete reconciliation, cancellation,
-failure handling, and the non-serving gate; it does not discharge competing-owner
-correctness or the corresponding Property 9 checks.
+The initial single-owner checkpoint established complete reconciliation,
+cancellation, failure handling and the non-serving gate. Competing-owner repair
+also requires the transaction-local lease fence and Property 9 verification;
+its evidence is separate from that earlier checkpoint. Local activation compares
+the acquisition's generation, cancellation and deadline. An ownership change not
+yet observed locally is rejected by the transaction fence on subsequent writes.
 
 **User Story:** As a shard owner, I want a complete repaired dispatch view before
 serving, so that old storage, partial repair, and ownership changes cannot hide work.
@@ -281,7 +282,7 @@ serving, so that old storage, partial repair, and ownership changes cannot hide 
 3. THE reconciliation SHALL inspect enough existing dispatch rows to remove every unwanted row, including rows whose run is absent or excluded by the recovery index.
 4. WHEN a repair writes a row, THE storage transaction SHALL validate the execution-home ownership fence protecting that repair.
 5. IF ownership changes during repair, THEN THE storage layer SHALL prevent stale repair writes from overwriting the successor owner's dispatch state.
-6. WHEN ownership is lost, THE runtime SHALL abandon that acquisition without marking the shard serving.
+6. WHEN lease loss is observed locally or an acquisition is cancelled, expired, or superseded, THE runtime SHALL abandon that acquisition without publishing it as serving; every subsequent write SHALL still validate its transaction-local ownership fence.
 7. THE repair protocol SHALL be restartable after any committed batch without depending on a durable continuation.
 8. THE repair transactions SHALL remain within DSQL's aggregate row and modified-data limits.
 9. WHEN a repair query, decode, or write fails, THE runtime SHALL leave the shard non-serving for retry or acquisition failure handling.
@@ -317,7 +318,7 @@ state, routing, and delivery contracts without expanding into unrelated mechanis
 5. THE implementation SHALL preserve existing workflow priority, fairness metadata, version-routing, query, and eager-delivery contracts at their public boundaries.
 6. THE implementation SHALL leave speculative scheduling and admitted-update recovery mechanisms to their owning specs.
 7. THE discovery interfaces SHALL permit later activity integration without removing today's activity recovery path.
-8. THE design SHALL record the transaction-local lease-fencing dependency and retain competing-owner verification as deferred until that fence is implemented and verified.
+8. THE design SHALL record the transaction-local lease-fencing dependency and record separate competing-owner evidence after that fence is integrated and verified.
 
 ### Requirement 11: Recovery latency and progress
 

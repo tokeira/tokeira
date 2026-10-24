@@ -125,6 +125,8 @@ pub(crate) mod pause_point {
         Write(RunKey),
         /// An acquisition of this home, before its commit.
         Acquisition(ShardId),
+        /// A release of this home, before its commit.
+        Release(ShardId),
         /// A copy page of this materialized run, before its transaction.
         Page(RunKey),
         /// Legacy workflow backlog deletes before the page commits.
@@ -714,8 +716,13 @@ impl RunRepository for DsqlRunRepository {
         self.do_list_run_bulk_writes(shard_id, after, limit).await
     }
 
-    async fn reconcile_workflow_dispatch_run(&self, home: ShardId, run_key: RunKey) -> Result<()> {
-        self.do_reconcile_workflow_dispatch_run(home, run_key)
+    async fn reconcile_workflow_dispatch_run(
+        &self,
+        home: ShardId,
+        run_key: RunKey,
+        fence: WriteFence,
+    ) -> Result<()> {
+        self.do_reconcile_workflow_dispatch_run(home, run_key, &fence)
             .await
             .map_err(|error| {
                 if error

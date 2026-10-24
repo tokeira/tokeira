@@ -31,6 +31,172 @@ pub(crate) trait Backend {
     fn repo(&self) -> &dyn RunRepository;
     async fn row(&self, key: RunKey) -> Result<Option<WorkflowDispatchRow>>;
     async fn seed_stale_row(&self, state: &WorkflowState) -> Result<()>;
+    async fn sticky_seed(&self, rows: &[(ShardId, WorkflowState)]) -> Result<()>;
+    async fn sticky_remove(&self, keys: &[RunKey]) -> Result<()>;
+}
+
+// Feature: queue-home-delivery, Property 8: Complete bounded sticky traversal.
+// The oracle selects by fixture coordinates; mutations require a fresh head pass.
+pub(crate) fn run_sticky_page_cases(backend: &impl Backend, runtime: &tokio::runtime::Runtime) {
+    let strategy = (
+        prop::collection::vec((any::<bool>(), any::<bool>(), any::<bool>()), 2..130),
+        1u32..100,
+    );
+    let mut runner = TestRunner::new(ProptestConfig {
+        cases: 100,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    });
+    let case_number = std::sync::atomic::AtomicU32::new(0);
+    runner
+        .run(&strategy, |(coordinates, requested)| {
+            runtime.block_on(async {
+                let home = ShardId(
+                    1_234_567 + 2 * case_number.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                );
+                let limit = NonZeroU32::new(requested).unwrap();
+                let effective = requested.min(crate::STICKY_WORKFLOW_PAGE_LIMIT) as usize;
+                let prefix = uuid::Uuid::new_v4().as_u128() & !0xffff;
+                let mut rows = Vec::new();
+                let mut oracle = std::collections::BTreeMap::new();
+                for (i, (sticky, same_home, exact)) in coordinates.iter().copied().enumerate() {
+                    let sticky = sticky || i < 70;
+                    let same_home = same_home || i < 70;
+                    let key = RunKey(uuid::Uuid::from_u128(prefix + 2 * (i as u128 + 1)));
+                    let mut state = fresh_transition(key).next_state;
+                    if sticky {
+                        state.sticky = Some(StickyAffinity {
+                            worker_identity: WorkerIdentity("sticky-worker".into()),
+                            sticky_queue: TaskQueueName("sticky-page".into()),
+                            schedule_to_start_timeout: Duration::seconds(30),
+                        });
+                        state
+                            .pending_workflow_task
+                            .as_mut()
+                            .unwrap()
+                            .schedule_to_start_deadline =
+                            Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(30));
+                    }
+                    if exact {
+                        state.deployment = Some(DeploymentId(String::new()));
+                        state.build_id = Some(BuildId(String::new()));
+                    }
+                    let assigned = if same_home { home } else { ShardId(home.0 + 1) };
+                    if sticky && same_home {
+                        let mut expected = reference(&state).unwrap();
+                        expected.execution_home = assigned;
+                        oracle.insert(key, expected);
+                    }
+                    rows.push((assigned, state));
+                }
+                backend.sticky_seed(&rows).await.unwrap();
+                let mut cursor = None;
+                let mut seen = Vec::new();
+                loop {
+                    let page = backend
+                        .repo()
+                        .list_sticky_workflow_dispatch(home, cursor, limit)
+                        .await
+                        .unwrap();
+                    prop_assert!(page.candidates.len() <= effective);
+                    prop_assert_eq!(page.exhausted, page.candidates.len() < effective);
+                    prop_assert_eq!(
+                        page.last_examined,
+                        page.candidates.last().map(|row| row.incarnation.run_key)
+                    );
+                    for row in &page.candidates {
+                        prop_assert!(cursor.is_none_or(|key| row.incarnation.run_key > key));
+                    }
+                    cursor = page.last_examined.or(cursor);
+                    seen.extend(page.candidates);
+                    if page.exhausted {
+                        break;
+                    }
+                }
+                prop_assert_eq!(&seen, &oracle.values().cloned().collect::<Vec<_>>());
+                // Even a fully refused page consumes its keys. Deleting the cursor,
+                // inserting behind it, and inserting ahead cannot strand a later page.
+                let first = backend
+                    .repo()
+                    .list_sticky_workflow_dispatch(home, None, NonZeroU32::new(1).unwrap())
+                    .await
+                    .unwrap();
+                if let Some(after) = first.last_examined {
+                    let mut behind = rows
+                        .iter()
+                        .find(|(_, state)| state.run_key == after)
+                        .unwrap()
+                        .1
+                        .clone();
+                    behind.run_key = RunKey(uuid::Uuid::from_u128(prefix + 1));
+                    let mut ahead = behind.clone();
+                    ahead.run_key = RunKey(uuid::Uuid::from_u128(prefix + 999));
+                    backend.sticky_remove(&[after]).await.unwrap();
+                    oracle.remove(&after);
+                    for state in [&behind, &ahead] {
+                        let mut row = reference(state).unwrap();
+                        row.execution_home = home;
+                        oracle.insert(state.run_key, row);
+                    }
+                    backend
+                        .sticky_seed(&[(home, behind.clone()), (home, ahead.clone())])
+                        .await
+                        .unwrap();
+                    rows.extend([(home, behind), (home, ahead)]);
+                    let mut continued = Vec::new();
+                    let mut position = Some(after);
+                    loop {
+                        let page = backend
+                            .repo()
+                            .list_sticky_workflow_dispatch(home, position, limit)
+                            .await
+                            .unwrap();
+                        prop_assert!(page.candidates.len() <= effective);
+                        for row in &page.candidates {
+                            prop_assert!(position.is_none_or(|key| row.incarnation.run_key > key));
+                        }
+                        position = page.last_examined.or(position);
+                        continued.extend(page.candidates);
+                        if page.exhausted {
+                            break;
+                        }
+                    }
+                    prop_assert_eq!(
+                        continued,
+                        oracle
+                            .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                            .map(|(_, row)| row.clone())
+                            .collect::<Vec<_>>()
+                    );
+                    let head = backend
+                        .repo()
+                        .list_sticky_workflow_dispatch(home, None, NonZeroU32::new(1).unwrap())
+                        .await
+                        .unwrap();
+                    prop_assert_eq!(head.candidates.first(), oracle.values().next());
+                }
+                backend
+                    .sticky_remove(
+                        &rows
+                            .iter()
+                            .map(|(_, state)| state.run_key)
+                            .collect::<Vec<_>>(),
+                    )
+                    .await
+                    .unwrap();
+                prop_assert!(
+                    backend
+                        .repo()
+                        .list_sticky_workflow_dispatch(home, None, limit)
+                        .await
+                        .unwrap()
+                        .candidates
+                        .is_empty()
+                );
+                Ok(())
+            })
+        })
+        .unwrap();
 }
 
 pub(crate) async fn commit(backend: &impl Backend, transition: Transition) -> Result<CommitResult> {

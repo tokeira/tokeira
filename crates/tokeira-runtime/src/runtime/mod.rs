@@ -98,6 +98,8 @@ mod lifecycle;
 mod membership;
 mod query;
 #[cfg(test)]
+mod queue_home_delivery_exploration_tests;
+#[cfg(test)]
 mod repair_tests;
 pub(crate) mod workflow_task;
 

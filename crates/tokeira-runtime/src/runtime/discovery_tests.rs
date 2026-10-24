@@ -132,7 +132,7 @@ async fn stop(runtime: &TokeiraRuntime<InMemoryStore>) {
         .unwrap();
 }
 
-fn offer(item: &Transition) -> DispatchableWorkflowTask {
+pub(super) fn offer(item: &Transition) -> DispatchableWorkflowTask {
     DispatchableWorkflowTask {
         run_key: item.next_state.run_key,
         logical_seq: item

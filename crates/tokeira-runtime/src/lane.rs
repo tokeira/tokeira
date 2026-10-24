@@ -3367,6 +3367,7 @@ mod tests {
             pending_updates: BTreeMap::new(),
             admitted_updates: std::collections::HashSet::new(),
             history_admitted_updates: Default::default(),
+            completed_updates: Default::default(),
             pending_nexus_operations: BTreeMap::new(),
             versioning_info: None,
             worker_deployment_name: None,

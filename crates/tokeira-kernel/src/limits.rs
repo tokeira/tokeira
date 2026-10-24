@@ -160,6 +160,12 @@ impl RunLimitExceeded {
 /// `history.maximumSignalsPerExecution` (`constants.go:2351-2355 @ v1.31.0`).
 /// The kernel reads it as a constant: no corpus test overrides it.
 pub const MAXIMUM_SIGNALS_PER_EXECUTION: u64 = 10_000;
+
+/// The workflow task attempt from which a running workflow refuses an update:
+/// its task keeps failing, so the update would wait for a task that fails too
+/// (`failUpdateWorkflowTaskAttemptCount`, `updateworkflow/api.go:32-35,
+/// 132-143 @ v1.31.0`).
+pub const FAIL_UPDATE_WORKFLOW_TASK_ATTEMPT: u32 = 3;
 /// `history.maxInFlightUpdates` (`constants.go:2289-2293 @ v1.31.0`).
 pub const MAX_IN_FLIGHT_UPDATES: usize = 10;
 /// `history.maxInFlightUpdatePayloads` (`constants.go:2294-2298 @ v1.31.0`).

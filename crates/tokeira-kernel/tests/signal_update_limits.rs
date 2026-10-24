@@ -103,6 +103,7 @@ fn open_state(signal_count: u64) -> WorkflowState {
         pending_updates: BTreeMap::new(),
         admitted_updates: HashSet::new(),
         history_admitted_updates: Default::default(),
+        completed_updates: Default::default(),
         pending_nexus_operations: BTreeMap::new(),
         completion_callbacks: Vec::new(),
         user_metadata: None,

@@ -1161,6 +1161,13 @@ impl RunRepository for InMemoryStore {
                         store.latest_projection(run_key),
                     )?;
                 }
+                if crate::codec::completed_updates_missing(&state) {
+                    // The history read under the state's lock is the one the state
+                    // belongs to.
+                    state.completed_updates = tokeira_kernel::completed_update_ids(
+                        store.history.get(&run_key).into_iter().flatten(),
+                    );
+                }
                 LoadedRun::Existing(state)
             }
             None => LoadedRun::Absent,
@@ -3860,6 +3867,7 @@ mod tests {
             pending_updates: Default::default(),
             admitted_updates: Default::default(),
             history_admitted_updates: Default::default(),
+            completed_updates: Default::default(),
             pending_nexus_operations: Default::default(),
             versioning_info: None,
             worker_deployment_name: None,

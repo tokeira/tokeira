@@ -312,6 +312,7 @@ fn make_open_state() -> WorkflowState {
         pending_updates: BTreeMap::new(),
         admitted_updates: std::collections::HashSet::new(),
         history_admitted_updates: Default::default(),
+        completed_updates: Default::default(),
         pending_nexus_operations: BTreeMap::new(),
         completion_callbacks: Vec::new(),
         user_metadata: None,

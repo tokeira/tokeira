@@ -158,16 +158,29 @@ pub struct InvalidWorkflowCommand {
 #[error("workflow operation can not be applied because workflow is closing")]
 pub struct WorkflowClosing;
 
-/// Query admission rejected because the workflow cannot serve a query right
+/// Query or update admission rejected because the workflow cannot take it right
 /// now — v1.31.0's `serviceerror.WorkflowNotReady` (gRPC FAILED_PRECONDITION
 /// with a `WorkflowNotReadyFailure` detail). The message is one of the three
 /// pre-dispatch guard messages from `queryworkflow/api.go:116-143 @ v1.31.0`,
-/// asserted verbatim by the corpus.
+/// asserted verbatim by the corpus, or [`UPDATE_WORKFLOW_TASK_FAILING`].
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 #[error("{message}")]
 pub struct WorkflowNotReady {
     pub message: &'static str,
 }
+
+/// The message of the [`WorkflowNotReady`] an update request gets when its
+/// running workflow's task keeps failing (`updateworkflow/api.go:132-143 @
+/// v1.31.0`).
+pub const UPDATE_WORKFLOW_TASK_FAILING: &str =
+    "Unable to perform workflow execution update due to Workflow Task in failed state.";
+
+/// An update request reached a paused workflow — v1.31.0's
+/// `serviceerror.FailedPrecondition` with this exact message
+/// (`updateworkflow/api.go:128-130 @ v1.31.0`).
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("Workflow is paused. Cannot update the workflow.")]
+pub struct UpdatePaused;
 
 /// A closed pinned workflow targets a drained Worker Deployment Version whose
 /// workflow task queue has no pollers capable of answering a query.

@@ -227,6 +227,24 @@ pub struct WorkflowState {
     /// section. A state stored before the set existed reads it as empty.
     #[serde(skip)]
     pub history_admitted_updates: BTreeSet<String>,
+    /// The id of each update that has completed in this run: the updates whose
+    /// WorkflowExecutionUpdateCompleted event, in either form, is in its
+    /// history. v1.31.0's mutable state keeps every completed update's record,
+    /// so its registry finds a completed update, and a message for one fails the
+    /// workflow task (`ExecutionInfo.UpdateInfos`; `GetUpdateOutcome`,
+    /// `mutable_state_impl.go:1412-1442`; `update/update.go:648-656 @
+    /// v1.31.0`). Bounded by the total update limit, as those records are. A
+    /// continue-as-new run starts with none; a reset's new run holds those of the
+    /// history it copies.
+    ///
+    /// Not part of the positional layout: `#[serde(skip)]` leaves every
+    /// postcard encoding of `WorkflowState` unchanged, and the storage codec
+    /// persists the set in the state extension's completed updates section. A
+    /// state stored before the set existed reads it as empty, and the stores
+    /// recover it from history when such a run is open and has completed an
+    /// update ([`crate::completed_update_ids`]).
+    #[serde(skip)]
+    pub completed_updates: BTreeSet<String>,
     /// Pending Nexus operations keyed by operation ID.
     pub pending_nexus_operations: BTreeMap<String, PendingNexusOperation>,
     /// Completion callbacks attached to this execution.
@@ -1636,6 +1654,7 @@ pub(crate) mod tests {
             pending_updates: BTreeMap::new(),
             admitted_updates: HashSet::new(),
             history_admitted_updates: BTreeSet::new(),
+            completed_updates: BTreeSet::new(),
             pending_nexus_operations: BTreeMap::new(),
             completion_callbacks: Vec::new(),
             user_metadata: None,

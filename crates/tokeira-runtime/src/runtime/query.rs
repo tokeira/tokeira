@@ -347,6 +347,17 @@ where
             .await?
             .ok_or_else(|| anyhow!("execution not found"))?;
 
+        // A running workflow refuses the request first, when it is paused,
+        // failing or closing (`refuse_update`). Only then is the id looked up,
+        // in the state the refusals read.
+        let lookup = match self.repo.load_run(run_key).await? {
+            LoadedRun::Existing(state) => {
+                self.refuse_update(run_key, &state)?;
+                self.look_up_update_in(run_key, &state, execution.clone(), &update_id)
+                    .await?
+            }
+            LoadedRun::Absent => UpdateLookup::Unknown,
+        };
         // Dedupe by update id BEFORE admitting: an update already known
         // durably (accepted/completed events, kernel-admitted state) attaches
         // to the in-flight update or replays its outcome — repeated requests
@@ -354,10 +365,7 @@ where
         // WFT (`FindOrCreate` attach + `GetUpdateOutcome` replay,
         // registry.go:398-484 @ v1.31.0). A lost update's retry is admitted
         // anew, taking over the id the run still holds.
-        let readmit = match self
-            .look_up_update(run_key, execution.clone(), &update_id)
-            .await?
-        {
+        let readmit = match lookup {
             UpdateLookup::Found(_) => {
                 return self
                     .wait_for_update_stage(
@@ -433,7 +441,7 @@ where
             }
             Err(error) => {
                 self.update_registry.remove(run_key, &update_id);
-                return Err(error);
+                return Err(update_refusal(error));
             }
         };
 
@@ -708,6 +716,36 @@ where
         )
     }
 
+    /// Refuse an update request to a running workflow, before its id is looked
+    /// up, in v1.31.0's order: a paused workflow, then one whose workflow task
+    /// keeps failing, then one that is closing (`updateworkflow/api.go:118-155
+    /// @ v1.31.0`). A closed workflow is refused nothing here: its lookup answers
+    /// with the update's outcome, and otherwise the kernel refuses the request.
+    ///
+    /// The refusals read the state the request is then looked up in, so a
+    /// request that attaches to an update in flight is checked here alone, as
+    /// v1.31.0 checks a request just before the workflow changes. The kernel
+    /// checks the paused and failing refusals again when it admits a new update,
+    /// since the run can change before the lane applies it. The closing record
+    /// is this runtime's volatile one, as v1.31.0's is, so its check runs only
+    /// here, as the signal's does.
+    fn refuse_update(&self, run_key: RunKey, state: &WorkflowState) -> Result<()> {
+        let close_attempted = self
+            .close_attempt_tracking
+            .lock()
+            .expect("close-attempt tracking lock")
+            .contains(&run_key);
+        let closing = close_attempted
+            && state
+                .pending_workflow_task
+                .as_ref()
+                .is_some_and(|pending| pending.started_event_id.is_some());
+        match UpdateRefusal::of(state.status, state.workflow_task_attempt, closing) {
+            Some(refusal) => Err(refusal.into_error()),
+            None => Ok(()),
+        }
+    }
+
     /// Find the update `update_id` of `run_key` as a client sees it: in history,
     /// as an update the run holds admitted, or nowhere.
     async fn look_up_update(
@@ -716,10 +754,23 @@ where
         execution: ExecutionRef,
         update_id: &str,
     ) -> Result<UpdateLookup> {
-        let state = match self.repo.load_run(run_key).await? {
-            LoadedRun::Existing(state) => state,
-            LoadedRun::Absent => return Ok(UpdateLookup::Unknown),
-        };
+        match self.repo.load_run(run_key).await? {
+            LoadedRun::Existing(state) => {
+                self.look_up_update_in(run_key, &state, execution, update_id)
+                    .await
+            }
+            LoadedRun::Absent => Ok(UpdateLookup::Unknown),
+        }
+    }
+
+    /// [`Self::look_up_update`] in `state`, the run's state as already read.
+    async fn look_up_update_in(
+        &self,
+        run_key: RunKey,
+        state: &WorkflowState,
+        execution: ExecutionRef,
+        update_id: &str,
+    ) -> Result<UpdateLookup> {
         let workflow_execution = ExecutionRef {
             run_id: Some(state.run_id),
             ..execution
@@ -906,6 +957,53 @@ where
     }
 }
 
+/// One of v1.31.0's refusals of an update request to a running workflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpdateRefusal {
+    /// The workflow is paused.
+    Paused,
+    /// The workflow's task keeps failing: its attempt is
+    /// [`tokeira_kernel::limits::FAIL_UPDATE_WORKFLOW_TASK_ATTEMPT`] or more.
+    Failing,
+    /// The workflow has tried to close, and a workflow task is started.
+    Closing,
+}
+
+impl UpdateRefusal {
+    /// The refusal that answers an update request to a run with this `status`,
+    /// workflow task attempt and closing record: the first of v1.31.0's that
+    /// holds, in its order (`updateworkflow/api.go:118-155 @ v1.31.0`), or none.
+    /// A closed run gets none, since its lookup answers. Nothing here depends on
+    /// the update's id, so a request repeating a known id is refused as a new
+    /// one is.
+    fn of(status: ExecutionStatus, workflow_task_attempt: u32, closing: bool) -> Option<Self> {
+        if !status.is_open() {
+            None
+        } else if status == ExecutionStatus::Paused {
+            Some(Self::Paused)
+        } else if workflow_task_attempt >= tokeira_kernel::limits::FAIL_UPDATE_WORKFLOW_TASK_ATTEMPT
+        {
+            Some(Self::Failing)
+        } else if closing {
+            Some(Self::Closing)
+        } else {
+            None
+        }
+    }
+
+    /// The error a client gets for this refusal.
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Paused => crate::errors::UpdatePaused.into(),
+            Self::Failing => crate::errors::WorkflowNotReady {
+                message: crate::errors::UPDATE_WORKFLOW_TASK_FAILING,
+            }
+            .into(),
+            Self::Closing => crate::errors::WorkflowClosing.into(),
+        }
+    }
+}
+
 /// What a client finds for an update id (`look_up_update`).
 enum UpdateLookup {
     /// An update in history, or one the run holds admitted.
@@ -927,6 +1025,22 @@ fn requested_stage(wait_policy: UpdateWaitPolicy) -> UpdateLifecycleStage {
     }
 }
 
+/// The kernel's paused and failing refusals of an update request, which a
+/// change between the runtime's read and the lane's apply can still raise,
+/// answered as [`TokeiraRuntime::refuse_update`] answers them; any other error as
+/// it is.
+fn update_refusal(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast_ref::<crate::KernelRejected>() {
+        Some(crate::KernelRejected(tokeira_kernel::Reject::WorkflowPaused)) => {
+            UpdateRefusal::Paused.into_error()
+        }
+        Some(crate::KernelRejected(tokeira_kernel::Reject::UpdateWorkflowTaskFailing)) => {
+            UpdateRefusal::Failing.into_error()
+        }
+        _ => error,
+    }
+}
+
 /// A kernel `DuplicateUpdateId` reject surfaced through the lane — the update
 /// id is already admitted or accepted on the run; the caller ATTACHES instead
 /// of erroring (`FindOrCreate` dedupe, registry.go:398-452 @ v1.31.0).
@@ -940,8 +1054,73 @@ fn is_duplicate_update_reject(error: &anyhow::Error) -> bool {
 mod tests {
     use proptest::prelude::*;
     use time::{Duration, OffsetDateTime};
+    use tokeira_types::ExecutionStatus;
 
-    use super::query_sticky_deadline;
+    use super::{UpdateRefusal, query_sticky_deadline, update_refusal};
+
+    fn status() -> impl Strategy<Value = ExecutionStatus> {
+        prop_oneof![
+            Just(ExecutionStatus::Running),
+            Just(ExecutionStatus::Paused),
+            Just(ExecutionStatus::Completed),
+            Just(ExecutionStatus::Failed),
+            Just(ExecutionStatus::Cancelled),
+            Just(ExecutionStatus::Terminated),
+            Just(ExecutionStatus::ContinuedAsNew),
+            Just(ExecutionStatus::TimedOut),
+        ]
+    }
+
+    proptest! {
+        // Feature: update-refusals, Property 1: The refusals come first, in order
+        #[test]
+        fn the_first_refusal_that_holds_answers(
+            status in status(),
+            attempt in 0u32..6,
+            closing in any::<bool>(),
+        ) {
+            let refusal = UpdateRefusal::of(status, attempt, closing);
+            let holding = [
+                (status == ExecutionStatus::Paused, UpdateRefusal::Paused),
+                (attempt >= 3, UpdateRefusal::Failing),
+                (closing, UpdateRefusal::Closing),
+            ];
+            let expected = status
+                .is_open()
+                .then(|| holding.iter().find(|(holds, _)| *holds).map(|(_, refusal)| *refusal))
+                .flatten();
+            prop_assert_eq!(refusal, expected);
+        }
+    }
+
+    /// The kernel's refusals, raised when the run changed after the runtime's
+    /// read, answer as the runtime's own do; any other error passes through.
+    #[test]
+    fn the_kernels_update_refusals_answer_as_the_runtimes() {
+        let paused =
+            update_refusal(crate::KernelRejected(tokeira_kernel::Reject::WorkflowPaused).into());
+        assert!(
+            paused
+                .downcast_ref::<crate::errors::UpdatePaused>()
+                .is_some()
+        );
+        let failing = update_refusal(
+            crate::KernelRejected(tokeira_kernel::Reject::UpdateWorkflowTaskFailing).into(),
+        );
+        assert_eq!(
+            failing
+                .downcast_ref::<crate::errors::WorkflowNotReady>()
+                .map(|not_ready| not_ready.message),
+            Some(crate::errors::UPDATE_WORKFLOW_TASK_FAILING)
+        );
+        let other = update_refusal(
+            crate::KernelRejected(tokeira_kernel::Reject::RunClosed(
+                ExecutionStatus::Completed,
+            ))
+            .into(),
+        );
+        assert!(other.downcast_ref::<crate::KernelRejected>().is_some());
+    }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]

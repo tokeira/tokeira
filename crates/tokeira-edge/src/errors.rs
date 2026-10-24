@@ -402,10 +402,17 @@ impl From<anyhow::Error> for EdgeError {
                 }
             };
         }
-        // Query pre-dispatch guards surface v1.31.0's WorkflowNotReady
-        // (queryworkflow/api.go:116-143).
+        // Query pre-dispatch guards, and an update to a workflow whose task keeps
+        // failing, surface v1.31.0's WorkflowNotReady (queryworkflow/api.go:116-143;
+        // updateworkflow/api.go:132-143).
         if let Some(not_ready) = value.downcast_ref::<tokeira_runtime::WorkflowNotReady>() {
             return Self::WorkflowNotReady(not_ready.message.to_string());
+        }
+        // An update to a paused workflow surfaces v1.31.0's plain
+        // FailedPrecondition, with no typed failure detail
+        // (updateworkflow/api.go:128-130).
+        if let Some(paused) = value.downcast_ref::<tokeira_runtime::UpdatePaused>() {
+            return Self::FailedPrecondition(paused.to_string());
         }
         // A closed pinned workflow whose drained version has no workflow
         // pollers fails before dispatch with an ordinary FAILED_PRECONDITION;

@@ -61,6 +61,10 @@
 //! Section [`HISTORY_ADMITTED_UPDATES_SECTION`] holds the admitted updates a
 //! WorkflowExecutionUpdateAdmitted event records. A reader without it treats the run
 //! as holding none, which is how every release before the set behaves.
+//! Section [`COMPLETED_UPDATES_SECTION`] holds the ids of the run's completed updates.
+//! A reader without it can't tell a completed update from an unknown one, which is
+//! how every release before the set behaves; this release's stores recover the ids
+//! from history when they load an open run whose state lacks them (`update-refusals`).
 //!
 //! [`history_batch_encoded_len`] is the one definition of a batch's persisted size.
 //! The DSQL repository and the in-memory store both account the per-run History Size
@@ -113,6 +117,22 @@ pub const USED_WORKER_DEPLOYMENT_VERSIONS_SECTION: u32 = 3;
 /// Written only when the run holds such an update, so any other state encodes as it
 /// did before the set existed.
 pub const HISTORY_ADMITTED_UPDATES_SECTION: u32 = 4;
+
+/// State-extension tag of the section holding the ids of the run's completed
+/// updates, a postcard `Vec<String>` in ascending order. This layout is frozen.
+/// Written only when the run has completed an update, so any other state encodes as
+/// it did before the set existed.
+pub const COMPLETED_UPDATES_SECTION: u32 = 5;
+
+/// Whether `state` lacks the ids of updates it has completed: an open run with
+/// completions but an empty set. Each completion this release applies adds its id,
+/// so only a state that an earlier release wrote, or rewrote and dropped the
+/// section, gets here. The stores then recover the ids from the run's history, in
+/// the read that loads the state, before the run takes a command. A closed run
+/// needs none: no update message reaches it (`update-refusals` criterion 2.8).
+pub(crate) fn completed_updates_missing(state: &WorkflowState) -> bool {
+    state.is_open() && state.completed_update_count > 0 && state.completed_updates.is_empty()
+}
 
 /// One tagged section of an extension. The payload layout is fixed per tag.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,6 +420,13 @@ pub(crate) fn encode_state_extension(state: &WorkflowState) -> postcard::Result<
             payload: postcard::to_allocvec(&update_ids)?,
         });
     }
+    if !state.completed_updates.is_empty() {
+        let update_ids = state.completed_updates.iter().collect::<Vec<_>>();
+        sections.push(ExtensionSection {
+            tag: COMPLETED_UPDATES_SECTION,
+            payload: postcard::to_allocvec(&update_ids)?,
+        });
+    }
     encode_extension(WORKFLOW_STATE_EXTENSION_MAGIC, &sections)
 }
 
@@ -427,6 +454,14 @@ pub(crate) fn apply_state_extension(
             }
             HISTORY_ADMITTED_UPDATES_SECTION => {
                 apply_history_admitted_updates_section(state, &section.payload)?;
+            }
+            COMPLETED_UPDATES_SECTION => {
+                let update_ids = decode_exact::<Vec<String>>(&section.payload)
+                    .ok_or("undecodable completed updates section")?;
+                if !update_ids.windows(2).all(|pair| pair[0] < pair[1]) {
+                    return Err("completed updates out of order or listed twice");
+                }
+                state.completed_updates = update_ids.into_iter().collect();
             }
             // A later release's section: its data is safe to drop by rule.
             _ => {}
@@ -890,6 +925,7 @@ mod tests {
             pending_updates: Default::default(),
             admitted_updates: Default::default(),
             history_admitted_updates: Default::default(),
+            completed_updates: Default::default(),
             pending_nexus_operations: Default::default(),
             versioning_info: None,
             worker_deployment_name: None,
@@ -1626,6 +1662,103 @@ mod tests {
     }
 
     #[test]
+    fn completed_updates_follow_the_history_admitted_updates() {
+        let mut state = layout_state();
+        state.admitted_updates = ["reapplied"].map(String::from).into();
+        state.history_admitted_updates = ["reapplied"].map(String::from).into();
+        state.completed_updates = ["update-b", "update-a"].map(String::from).into();
+        let encoded = encode_workflow_state(&state).expect("encodes");
+        // The state's own bytes are unchanged; the ids follow in ascending order,
+        // as a postcard Vec<String>.
+        let positional = positional_encoding(&state);
+        assert_eq!(&encoded[..positional.len()], positional.as_slice());
+        let extension = encode_extension(
+            WORKFLOW_STATE_EXTENSION_MAGIC,
+            &[
+                ExtensionSection {
+                    tag: HISTORY_ADMITTED_UPDATES_SECTION,
+                    payload: update_ids(&["reapplied"]),
+                },
+                ExtensionSection {
+                    tag: COMPLETED_UPDATES_SECTION,
+                    payload: update_ids(&["update-a", "update-b"]),
+                },
+            ],
+        )
+        .expect("encodes");
+        assert_eq!(&encoded[positional.len()..], extension.as_slice());
+        assert_eq!(
+            decode_workflow_state(run_key(), &encoded).expect("decodes"),
+            state
+        );
+    }
+
+    #[test]
+    fn a_state_with_no_completed_update_writes_no_section() {
+        let state = layout_state();
+        assert!(state.completed_updates.is_empty());
+        assert_eq!(
+            encode_workflow_state(&state).expect("encodes"),
+            positional_encoding(&state)
+        );
+    }
+
+    #[test]
+    fn malformed_completed_updates_are_refused() {
+        for (payload, defect) in [
+            (vec![0xff; 3], "undecodable completed updates section"),
+            (
+                update_ids(&["update-b", "update-a"]),
+                "completed updates out of order or listed twice",
+            ),
+            (
+                update_ids(&["update-a", "update-a"]),
+                "completed updates out of order or listed twice",
+            ),
+        ] {
+            let extension = encode_extension(
+                WORKFLOW_STATE_EXTENSION_MAGIC,
+                &[ExtensionSection {
+                    tag: COMPLETED_UPDATES_SECTION,
+                    payload,
+                }],
+            )
+            .expect("encodes");
+            let error =
+                decode_workflow_state(run_key(), &with_extension(&layout_state(), &extension))
+                    .expect_err("a malformed section is refused")
+                    .downcast::<StateExtensionError>()
+                    .expect("an extension error");
+            assert_eq!(error.defect, defect);
+        }
+    }
+
+    /// Only an open run with completions and no ids lacks them: one whose state
+    /// an earlier release wrote.
+    #[test]
+    fn completed_updates_are_missing_only_from_an_open_run_with_completions() {
+        for (status, count, ids, missing) in [
+            (ExecutionStatus::Running, 2, false, true),
+            (ExecutionStatus::Paused, 1, false, true),
+            (ExecutionStatus::Running, 0, false, false),
+            (ExecutionStatus::Running, 2, true, false),
+            (ExecutionStatus::Completed, 2, false, false),
+        ] {
+            let mut state = layout_state();
+            state.status = status;
+            state.completed_update_count = count;
+            if ids {
+                state.completed_updates = ["update-a"].map(String::from).into();
+            }
+            assert_eq!(
+                completed_updates_missing(&state),
+                missing,
+                "{status:?}, {count} completed, ids {ids}"
+            );
+        }
+    }
+
+    #[test]
     fn malformed_extension_error_names_the_blob_and_run() {
         let error =
             decode_workflow_state(run_key(), &with_extension(&layout_state(), &[0xff, 0x01]))
@@ -1709,6 +1842,33 @@ mod tests {
             prop_assert_eq!(pre_extension_decode(&encoded), without);
         }
 
+        // Feature: update-refusals, Property 5: A run from before this change recovers its ids
+        // (the codec's part: the section is stored when, and only when, it has ids)
+        #[test]
+        fn property_completed_updates_are_stored(
+            state in arb_state(),
+            completed in proptest::collection::btree_set("[a-z]{1,6}", 0..4),
+        ) {
+            let mut state = state;
+            state.completed_updates = completed.clone();
+            let encoded = encode_workflow_state(&state).expect("encodes");
+            prop_assert_eq!(
+                decode_workflow_state(run_key(), &encoded).expect("decodes"),
+                state.clone()
+            );
+            let extension = &encoded[positional_encoding(&state).len()..];
+            let written = !extension.is_empty()
+                && decode_extension(WORKFLOW_STATE_EXTENSION_MAGIC, extension)
+                    .expect("frames")
+                    .iter()
+                    .any(|section| section.tag == COMPLETED_UPDATES_SECTION);
+            prop_assert_eq!(written, !completed.is_empty());
+            // A reader without the section sees the run holding none.
+            let mut without = state.clone();
+            without.completed_updates.clear();
+            prop_assert_eq!(pre_extension_decode(&encoded), without_times(without));
+        }
+
         // Feature: activity-heartbeat-time, Property 4: Malformed extensions are
         // rejected
         #[test]
@@ -1730,9 +1890,9 @@ mod tests {
         #[test]
         fn property_unknown_sections_and_activities_are_ignored(
             state in arb_state(),
-            // Tags 1 to 4 are known; anything above is a later release's.
+            // Tags 1 to 5 are known; anything above is a later release's.
             unknown in proptest::collection::btree_map(
-                5u32..64,
+                6u32..64,
                 proptest::collection::vec(any::<u8>(), 0..16),
                 0..3,
             ),

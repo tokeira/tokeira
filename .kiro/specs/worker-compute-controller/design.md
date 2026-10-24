@@ -792,6 +792,11 @@ Primary key:
 | `last_error_category TEXT NULL` | Bounded diagnostic category |
 | `superseded_at TIMESTAMPTZ NULL` | In-flight stale-config marker |
 | `created_at`, `updated_at TIMESTAMPTZ` | Latency and audit |
+| `request_parts INTEGER NULL` | The request's number of parts; NULL when it is stored whole |
+
+A request over the part size (960 KiB) is stored in parts: its first part in `request_data`, the others in
+`worker_compute_action_part`, keyed by the action's id and the part number, and their number in `request_parts`
+([large-value-parts](../large-value-parts/design.md)).
 
 A separate migration creates the asynchronous due index on
 `(namespace_id, due_bucket, status, next_attempt_at, action_id)`. Claim workers scan

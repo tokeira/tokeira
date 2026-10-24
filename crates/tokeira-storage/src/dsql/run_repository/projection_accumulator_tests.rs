@@ -838,14 +838,9 @@ fn dsql_projection_accumulator_growth_accounting() {
                         .insert(activity.activity_id.clone(), activity);
                     // The activity's empty input and absent header, one byte each.
                     let excluded = 2 * transition.next_state.activities.len();
-                    let mut expected_state = transition.next_state.clone();
-                    if observe_new {
-                        expected_state
-                            .used_worker_deployment_versions
-                            .as_mut()
-                            .unwrap()
-                            .push("deployment:new".into());
-                    }
+                    // Storage keeps the list the transition carries: only a recorded
+                    // completion adds its version (`used-deployment-versions` criterion 2.2).
+                    let expected_state = transition.next_state.clone();
                     let expected = codec::encode_workflow_state(&expected_state).unwrap();
                     let measured = expected.len() - excluded;
                     transition.growth_limits = Some(state_limit(measured - 1));

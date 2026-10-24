@@ -2,7 +2,11 @@
 //! Projection preparation precedes growth accounting and every write; only a successful
 //! transaction returns the folded state to the caller's cache.
 
-use super::*;
+use super::{
+    run_value_parts::{self, OnConflict, RunValueKind, STATE_VALUE_KEY},
+    *,
+};
+use crate::dsql::value_parts::{self, Split};
 
 impl DsqlRunRepository {
     pub(super) async fn do_commit_transition(
@@ -56,9 +60,12 @@ impl DsqlRunRepository {
                 // The History Size is read under the same FOR UPDATE lock as the
                 // OCC fence, so the value added to in this transaction is the one
                 // the previous committed transition wrote (Requirement 1.2). A
-                // NULL column is a row written before V068 and reads as zero.
-                let row = sqlx::query_as::<_, (i64, Option<i64>)>(
-                    "SELECT transition_seq, history_size_bytes FROM workflow_hot \
+                // NULL column is a row written before V068 and reads as zero. The
+                // stored state's part count comes with them, so the write knows
+                // which parts the new state leaves unused without another
+                // statement (`large-value-parts`).
+                let row = sqlx::query_as::<_, (i64, Option<i64>, Option<i32>)>(
+                    "SELECT transition_seq, history_size_bytes, state_parts FROM workflow_hot \
                      WHERE run_key = $1 FOR UPDATE",
                 )
                 .bind(run_key.0)
@@ -69,12 +76,13 @@ impl DsqlRunRepository {
                     "load_hot",
                     started.elapsed(),
                 );
-                let (current_seq, prior_history_size_bytes) = match row {
-                    Some((seq, history_size_bytes)) => (
+                let (current_seq, prior_history_size_bytes, prior_state_parts) = match row {
+                    Some((seq, history_size_bytes, state_parts)) => (
                         TransitionSeq(convert::u64_from_i64(seq, "workflow_hot.transition_seq")?),
                         history_size_bytes.unwrap_or(0),
+                        state_parts,
                     ),
-                    None => (TransitionSeq::ZERO, 0),
+                    None => (TransitionSeq::ZERO, 0, None),
                 };
                 // The transition sequence is the per-run OCC fence. We check it inside
                 // the same transaction as the write set so successful commits remain
@@ -174,6 +182,7 @@ impl DsqlRunRepository {
                     &transition,
                     &mut state,
                     prior_history_size_bytes,
+                    prior_state_parts,
                 )
                 .await?;
                 match tx.commit().await {
@@ -249,6 +258,7 @@ async fn write_transition(
     transition: &Transition,
     state: &mut WorkflowState,
     prior_history_size_bytes: i64,
+    prior_state_parts: Option<i32>,
 ) -> Result<()> {
     if transition.history_events.len() != transition.event_principals.len() {
         bail!(
@@ -289,15 +299,39 @@ async fn write_transition(
     // every side table from the same transition/state pair. History remains the
     // authority; side tables are rebuildable projections that make dispatch and
     // sweep queries efficient.
+    // A state over the part size goes in parts: its first in the row, the rest
+    // in `run_value_part`, all in this transaction (`large-value-parts`). The
+    // whole state is rewritten, so every part is, and the parts the previous
+    // state used beyond the new count go with it.
+    let state_split = value_parts::split(&state_data);
     insert_workflow_hot(
         tx,
         run_key,
         shard_id,
         state,
-        &state_data,
+        &state_split,
         history_size_bytes,
     )
     .await?;
+    run_value_parts::write_parts(
+        tx,
+        run_key,
+        RunValueKind::State,
+        STATE_VALUE_KEY,
+        &state_split,
+        OnConflict::Replace,
+    )
+    .await?;
+    if prior_state_parts.unwrap_or(1) > state_split.parts() {
+        run_value_parts::delete_parts_from(
+            tx,
+            run_key,
+            RunValueKind::State,
+            STATE_VALUE_KEY,
+            state_split.parts(),
+        )
+        .await?;
+    }
     super::workflow_dispatch::maintain(tx, state, shard_id).await?;
     if let Some(events_data) = events_data {
         insert_history_batch(
@@ -443,25 +477,30 @@ async fn write_transition(
 /// The one statement that writes `workflow_hot`. It also stores whether the
 /// state holds work the recovery sweep rebuilds (`$8`), so the sweep can find
 /// those runs through `idx_workflow_hot_recovery` without adding a statement
-/// to the commit (recovery-index Requirement 1).
+/// to the commit (recovery-index Requirement 1). `state_data` holds the whole
+/// state, or its first part with the count in `state_parts` (`$9`), which an
+/// update always rewrites: a state that shrinks to the part size has none.
 pub(super) const WORKFLOW_HOT_UPSERT_SQL: &str = "INSERT INTO workflow_hot
          (run_key, namespace_id, workflow_id, shard_id, transition_seq, state_data, \
-          history_size_bytes, recovery_needed, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+          history_size_bytes, recovery_needed, state_parts, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
          ON CONFLICT (run_key) DO UPDATE SET
              transition_seq = EXCLUDED.transition_seq,
              state_data = EXCLUDED.state_data,
              history_size_bytes = EXCLUDED.history_size_bytes,
              recovery_needed = EXCLUDED.recovery_needed,
+             state_parts = EXCLUDED.state_parts,
              shard_id = EXCLUDED.shard_id,
              updated_at = EXCLUDED.updated_at";
 
+/// Write the run's row with `state_data`'s first part and count; the caller
+/// writes the other parts in the same transaction.
 pub(super) async fn insert_workflow_hot(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_key: RunKey,
     shard_id: ShardId,
     state: &WorkflowState,
-    state_data: &[u8],
+    state_data: &Split<'_>,
     history_size_bytes: i64,
 ) -> Result<()> {
     // `workflow_hot` is a materialized snapshot for recovery and read paths.
@@ -476,9 +515,10 @@ pub(super) async fn insert_workflow_hot(
             state.transition_seq.0,
             "transition_seq",
         )?)
-        .bind(state_data)
+        .bind(state_data.first)
         .bind(history_size_bytes)
         .bind(recovery_needed(state))
+        .bind(state_data.count)
         .execute(&mut **tx)
         .await?;
     metrics::record_dsql_statement_duration(
@@ -491,7 +531,8 @@ pub(super) async fn insert_workflow_hot(
 
 /// Insert one committed batch whose `events_data` the caller already encoded
 /// with `codec::encode_history_events`, so the bytes counted into the History
-/// Size are the bytes persisted.
+/// Size are the bytes persisted. Events or principals over the part size go in
+/// parts, written in the same transaction (`large-value-parts`).
 pub(super) async fn insert_history_batch(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_key: RunKey,
@@ -521,24 +562,95 @@ pub(super) async fn insert_history_batch(
         .any(Option::is_some)
         .then(|| codec::encode_history_principals(principals))
         .transpose()?;
-    sqlx::query(
-        "INSERT INTO history_batch
-         (run_key, first_event_id, last_event_id, transition_seq, events_data, principals_data, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, now())",
+    write_history_batch(
+        tx,
+        run_key,
+        first_event_id,
+        last_event_id,
+        transition_seq,
+        &events_data,
+        principals_data.as_deref(),
+        OnConflict::Replace,
     )
-    .bind(run_key.0)
-    .bind(first_event_id)
-    .bind(last_event_id)
-    .bind(convert::i64_from_u64(transition_seq.0, "transition_seq")?)
-    .bind(events_data)
-    .bind(principals_data)
-    .execute(&mut **tx)
     .await?;
     metrics::record_dsql_statement_duration(
         "commit_transition",
         "append_history",
         started.elapsed(),
     );
+    Ok(())
+}
+
+macro_rules! insert_history_batch_sql {
+    () => {
+        "INSERT INTO history_batch
+         (run_key, first_event_id, last_event_id, transition_seq, events_data, events_parts, \
+          principals_data, principals_parts, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())"
+    };
+}
+
+const INSERT_HISTORY_BATCH_SQL: &str = insert_history_batch_sql!();
+
+const INSERT_HISTORY_BATCH_KEEPING_SQL: &str = concat!(
+    insert_history_batch_sql!(),
+    " ON CONFLICT (run_key, first_event_id) DO NOTHING"
+);
+
+/// Write one history batch row with each value's first part and count, then the
+/// values' other parts. A batch never changes once written. A commit inserts it
+/// once, with [`OnConflict::Replace`]: a row already there fails the insert, as it
+/// always has. A reset's copy page, which can repeat, passes [`OnConflict::Keep`]
+/// and keeps what an earlier attempt wrote, `ON CONFLICT DO NOTHING` for the row
+/// and for each part.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn write_history_batch(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_key: RunKey,
+    first_event_id: i64,
+    last_event_id: i64,
+    transition_seq: TransitionSeq,
+    events_data: &[u8],
+    principals_data: Option<&[u8]>,
+    on_conflict: OnConflict,
+) -> Result<()> {
+    let events = value_parts::split(events_data);
+    let principals = principals_data.map(value_parts::split);
+    let sql = match on_conflict {
+        OnConflict::Replace => INSERT_HISTORY_BATCH_SQL,
+        OnConflict::Keep => INSERT_HISTORY_BATCH_KEEPING_SQL,
+    };
+    sqlx::query(sql)
+        .bind(run_key.0)
+        .bind(first_event_id)
+        .bind(last_event_id)
+        .bind(convert::i64_from_u64(transition_seq.0, "transition_seq")?)
+        .bind(events.first)
+        .bind(events.count)
+        .bind(principals.as_ref().map(|split| split.first))
+        .bind(principals.as_ref().and_then(|split| split.count))
+        .execute(&mut **tx)
+        .await?;
+    run_value_parts::write_parts(
+        tx,
+        run_key,
+        RunValueKind::Events,
+        first_event_id,
+        &events,
+        on_conflict,
+    )
+    .await?;
+    if let Some(principals) = &principals {
+        run_value_parts::write_parts(
+            tx,
+            run_key,
+            RunValueKind::Principals,
+            first_event_id,
+            principals,
+            on_conflict,
+        )
+        .await?;
+    }
     Ok(())
 }
 

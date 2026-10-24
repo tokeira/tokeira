@@ -57,7 +57,7 @@ This spec covers these limits on a run's growth. The limits on what a request or
 ### Out of Scope
 
 - v1.31.0's state check on a write that closes the run. v1.31.0 still persists the closing write and then answers `InvalidArgument` (`context.go:423-460, 1093-1122 @ v1.31.0`); Tokeira checks only writes that leave the run open.
-- DSQL's 1 MiB column and 2 MiB row limits, which a state or batch below these limits can still exceed. A separate change bounds them.
+- DSQL's 1 MiB column and 2 MiB row limits, which a state or batch below these limits can still exceed. [large-value-parts](../large-value-parts/bugfix.md) stores such a value in parts. DSQL's limit on what one transaction writes stays out of scope.
 - A reset's copied history, which [bounded-bulk-writes](../bounded-bulk-writes/design.md) writes in batches within DSQL's limits.
 - What a timer or scanner does with a refused write. v1.31.0's task executors retry the error and eventually move the task to a dead-letter queue.
 - The limits on a run's signals and updates, which [signal-update-limits](../signal-update-limits/bugfix.md) covers.

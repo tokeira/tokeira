@@ -122,7 +122,7 @@ pub(crate) fn reset_history(state: &WorkflowState) -> Vec<HistoryEvent> {
         original_execution_run_id: None,
         continued_failure: None,
         cron_schedule: None,
-        last_completion_result: None,
+        last_completion_result: state.last_completion_result.clone(),
         versioning_info: None,
         worker_deployment_name: None,
         priority: None,

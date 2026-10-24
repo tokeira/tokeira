@@ -227,13 +227,23 @@ impl DsqlRunRepository {
                     let target = home(*namespace, workflow, self.shard_count);
                     if *stored != shard_uuid(target) {
                         validate_source(key, *stored, target, self.shard_count)?;
-                        let bytes: Vec<u8> = sqlx::query_scalar(
-                            "SELECT state_data FROM workflow_hot WHERE run_key=$1",
+                        let (first, parts): (Vec<u8>, Option<i32>) = sqlx::query_as(
+                            "SELECT state_data, state_parts FROM workflow_hot WHERE run_key=$1",
                         )
                         .bind(key.0)
                         .fetch_one(&mut *tx)
                         .await?;
-                        let state = codec::decode_workflow_state(key, &bytes).with_context(||
+                        // The update rewrites the row, which holds a split state's
+                        // first part; the other parts stay where they are.
+                        let row_bytes = first.len();
+                        let rest = if parts.is_some() {
+                            super::run_value_parts::read_state_parts(&mut tx, key).await?
+                        } else {
+                            Vec::new()
+                        };
+                        let state = super::run_value_parts::join_state_parts(key, first, parts, rest)
+                            .and_then(|bytes| codec::decode_workflow_state(key, &bytes))
+                            .with_context(||
                             format!("placement upgrade run={key:?} stored_shard={stored} computed_home={target:?}: cannot decode relocation identity"))?;
                         validate_identity(
                             key,
@@ -243,7 +253,7 @@ impl DsqlRunRepository {
                             &WorkflowId(workflow.clone()),
                             &state,
                         )?;
-                        let cost = bytes.len() + workflow.len() + 128;
+                        let cost = row_bytes + workflow.len() + 128;
                         if bytes_written + cost > MAX_BYTES_PER_TRANSACTION
                             || rows_written + 1 > MAX_ROWS_PER_TRANSACTION
                         {
@@ -296,13 +306,20 @@ impl DsqlRunRepository {
                         if *stored != shard_uuid(target) {
                             validate_source(key, *stored, target, self.shard_count)?;
                             if validated.insert(key) {
-                                let bytes: Vec<u8> = sqlx::query_scalar(
-                                    "SELECT state_data FROM workflow_hot WHERE run_key=$1",
+                                let (first, parts): (Vec<u8>, Option<i32>) = sqlx::query_as(
+                                    "SELECT state_data, state_parts FROM workflow_hot WHERE run_key=$1",
                                 )
                                 .bind(key.0)
                                 .fetch_one(&mut *tx)
                                 .await?;
-                                let state = codec::decode_workflow_state(key, &bytes).with_context(||
+                                let rest = if parts.is_some() {
+                                    super::run_value_parts::read_state_parts(&mut tx, key).await?
+                                } else {
+                                    Vec::new()
+                                };
+                                let state = super::run_value_parts::join_state_parts(key, first, parts, rest)
+                                    .and_then(|bytes| codec::decode_workflow_state(key, &bytes))
+                                    .with_context(||
                                     format!("placement upgrade run={key:?} stored_shard={stored} computed_home={target:?}: cannot decode timer relocation identity"))?;
                                 validate_identity(
                                     key,

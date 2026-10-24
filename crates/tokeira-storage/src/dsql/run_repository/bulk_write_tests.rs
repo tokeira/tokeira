@@ -137,13 +137,24 @@ impl Backend for Fixture {
                     run_key,
                 )
                 .await?,
+            parts: self
+                .count(
+                    "SELECT count(*) FROM run_value_part WHERE run_key = $1",
+                    run_key,
+                )
+                .await?,
         })
     }
 
+    /// Each batch's encoded size counts the parts of its events.
     async fn history_batches(&self, run_key: RunKey) -> Result<Vec<StoredBatch>> {
-        sqlx::query_as::<_, (i64, i64, i32)>(
-            "SELECT first_event_id, last_event_id, octet_length(events_data)
-             FROM history_batch WHERE run_key = $1 ORDER BY first_event_id",
+        sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT first_event_id, last_event_id,
+                 octet_length(events_data) + coalesce((
+                     SELECT sum(octet_length(part.data)) FROM run_value_part part
+                     WHERE part.run_key = batch.run_key AND part.value_kind = 2
+                         AND part.value_key = batch.first_event_id), 0)::bigint
+             FROM history_batch batch WHERE run_key = $1 ORDER BY first_event_id",
         )
         .bind(run_key.0)
         .fetch_all(&self.pool)

@@ -1314,8 +1314,9 @@ pub trait RunRepository: Send + Sync {
     ///
     /// A `Materializing` record is first abandoned, as
     /// [`Self::abandon_materialization`] does. The rows go table by table, in
-    /// transactions within the budgets of [`crate::write_budget`], history last,
-    /// and the record goes with the last history rows. A run without a record
+    /// transactions within the budgets of [`crate::write_budget`]: history after
+    /// every row derived from it, then any parts of the run's values a store
+    /// keeps apart, and the record with the last rows. A run without a record
     /// is left untouched. Every transaction is safe to repeat and to run beside
     /// another purge of the same run, so a purge that stops early is finished by
     /// any later one.

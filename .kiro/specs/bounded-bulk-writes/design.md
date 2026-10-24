@@ -4,7 +4,7 @@
 
 Each of the four writes becomes a series of transactions within fixed budgets:
 - **The spill** keeps its one call per pass. Storage splits the call into transactions and reports how far it got, so the scanner re-publishes only what wasn't persisted.
-- **A deletion** makes the run unreachable in one fenced transaction, which also records the run for purging, and DeleteWorkflowExecution returns once it commits. A purge then removes the run's other rows in pages, history last, and removes the record with the last of them.
+- **A deletion** makes the run unreachable in one fenced transaction, which also records the run for purging, and DeleteWorkflowExecution returns once it commits. A purge then removes the run's other rows in pages, history after every row derived from it and the parts of the run's values last, and removes the record with the last of them.
 - **A reset** records the successor as being materialized, writes the copied history and the timer rows in pages, and then writes the successor's mutable state, dispatch row and current pointer in a final transaction that removes the record. That transaction makes the successor current only if the pointer still names the run it named when the reset was admitted, open or closed.
 - **An interrupted write is finished by a purge.** A purge recorded by a deletion runs to completion. A materialization that never reached its final transaction is purged like a deleted run.
 
@@ -89,12 +89,12 @@ _For any_ interleaving of deletions, purges and materializations, each stopped a
 
 **Validates: Requirements 2.3, 2.6, 2.7, 2.8**
 
-Property 4: A purge finishes, removes only its run's rows, and removes history last
+Property 4: A purge finishes, removes only its run's rows, and removes history after the rows derived from it
 
 _For any_ run with any mix of owned rows, beside other runs' rows, and any sequence of purge attempts, each stopped after any transaction and some running at the same time, once an attempt returns success:
 - no row of the run and no record SHALL remain;
 - every other run's rows SHALL be unchanged;
-- at no point SHALL the run have lost a history row while it still had a row in another owned table.
+- at no point SHALL the run have lost a history row while it still had a row in another owned table but `run_value_part`, nor a row of `run_value_part` while it still had a history row ([large-value-parts](../large-value-parts/design.md)).
 
 **Validates: Requirements 2.4, 2.5, 2.9**
 
@@ -209,10 +209,11 @@ The memory store mirrors this under its lock: it removes the run, its pointers a
   - `timer_bucket`;
   - `activity_dispatch`;
   - `dispatch_backlog`;
-  - `history_batch`, last.
+  - `history_batch`;
+  - `run_value_part`, the parts of the run's values over the part size, last ([large-value-parts](../large-value-parts/design.md)). A batch's parts outlast every batch row of the run, so a history read that finds a batch finds its parts.
 
   Each transaction selects a page of the table's keys for the run, in key order, and deletes the run's rows up to the page's last key, which are exactly the page.
-- The transaction that deletes the run's last history rows also deletes the record, within the same 1,000 rows. A run with no history rows left has its record deleted alone.
+- The transaction that deletes the run's last parts also deletes the record, within the same 1,000 rows. A run with no parts left has its record deleted alone.
 - Every step is a delete of rows that no one recreates: the run has no mutable state, so no commit writes to it. Repeating a step, or running two purges of the run at once, deletes nothing twice. A transaction refused with a serialization conflict, as one of two concurrent purges can be, is retried, as the materialization's are. The record goes only when every table is empty, so a purge that stops early leaves the record for the next attempt (Property 4).
 
 ### Materialization (`materialize_reset_successor`)
@@ -225,11 +226,11 @@ The call gains the run the successor replaces as current: `materialize_reset_suc
 
 Today the materialization is one transaction. It becomes:
 1. **Read the base.** Read the base's state and its history in one read transaction, which is today's reads moved out of the write transaction, and replay the prefix into the successor's state, as today. The copied events must run from event 1 without a gap. A purge of the base removes its history in pages, first events first, so a read that overlaps one would otherwise copy a prefix with its start missing.
-2. **Cut the batches.** Split the copied events, with their principals, into batches in event order. A batch closes when the next event would take its encoded events, or its encoded principals, over 512 KiB, and an event that alone exceeds that forms a batch of its own (Property 7). A history DSQL accepted holds no event over 1 MiB, since each of its batches fit a value. Every batch carries the transition sequence today's single batch carries.
+2. **Cut the batches.** Split the copied events, with their principals, into batches in event order. A batch closes when the next event would take its encoded events, or its encoded principals, over 512 KiB, and an event that alone exceeds that forms a batch of its own (Property 7). An event over the part size is copied in a batch of its own, in parts ([large-value-parts](../large-value-parts/design.md)). Every batch carries the transition sequence today's single batch carries.
 3. **Record.** In one transaction, check that the successor has no hot row and insert its record with phase `materializing` and the successor's execution home.
-4. **Copy.** Write the batches and then the successor's timer rows, paged within the budgets. Each transaction first reads the record `FOR UPDATE` and stops unless it says `materializing`. Batches are inserted with `ON CONFLICT (run_key, first_event_id) DO NOTHING`, and timers upserted as today, so a retried transaction writes nothing twice.
+4. **Copy.** Write the batches, then the successor's timer rows, then the parts after the first of a successor's state over the part size, paged within the budgets. A batch costs a row for each part of its events and principals. Each transaction first reads the record `FOR UPDATE` and stops unless it says `materializing`. Batches and parts are inserted with `ON CONFLICT ... DO NOTHING`, and timers upserted as today, so a retried transaction writes nothing twice.
 5. **Final transaction.** Read the record `FOR UPDATE` and require `materializing`. Read the current pointer `FOR UPDATE` and require that it names `expected_current`, the run it named at admission, open or closed, or is absent if that is `None` (2.13). Then:
-   - insert the successor's hot row with History Size equal to the sum of the batches' encoded sizes (2.11);
+   - insert the successor's hot row, holding its state whole or its first part and count, with History Size equal to the sum of the batches' encoded sizes (2.11);
    - maintain its `workflow_dispatch` row at the execution home, as today;
    - point the current pointer at the successor;
    - delete the record.
@@ -345,7 +346,7 @@ The live suite runs on an ephemeral cluster under the `dsql-live` profile ([docs
 ### Unit Tests
 
 - The first transaction changes only the rows the design lists.
-- The purge's table order, and the purge of an abandoned materialization, which has only history and timer rows.
+- The purge's table order, and the purge of an abandoned materialization, which has only history, timer and part rows.
 - The listing of a shard's records in run-key order.
 - `delete_workflow` returns after the first transaction, and the purger removes the run's rows. With `purge_inline`, the rows are gone when it returns, and an inline purge that fails is handed to the purger.
 - The recovery switches a `materializing` record before it hands the record's run to the purger, and a takeover leaves no record `materializing` once the shard is activated. The recovery hands the shard's records to the purger without waiting for them.

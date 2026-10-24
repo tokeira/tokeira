@@ -120,17 +120,18 @@ impl DsqlRunRepository {
             tx.rollback().await?;
             return Err(lost.into());
         }
-        let hot = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
-            "SELECT shard_id, state_data FROM workflow_hot WHERE run_key=$1",
+        let hot = sqlx::query_as::<_, (Uuid, Vec<u8>, Option<i32>)>(
+            "SELECT shard_id, state_data, state_parts FROM workflow_hot WHERE run_key=$1",
         )
         .bind(run_key.0)
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some((stored_home, bytes)) = hot {
+        if let Some((stored_home, first, parts)) = hot {
             anyhow::ensure!(
                 Self::shard_id_from_uuid(stored_home)? == home,
                 "workflow dispatch repair home mismatch for {run_key:?}"
             );
+            let bytes = super::run_value_parts::join_state(&mut tx, run_key, first, parts).await?;
             let state = codec::decode_workflow_state(run_key, &bytes)?;
             anyhow::ensure!(
                 tokeira_types::execution_home_bundle(

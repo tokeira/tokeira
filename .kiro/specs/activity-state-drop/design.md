@@ -13,7 +13,7 @@ A migration drops the `activity_state` table, which nothing writes or reads, and
 
 - **Plain runner path:** `MigrationRunner::apply_connection`, which `tkr schema setup` uses. It applies each unapplied migration in its own transaction and records its ledger row.
 - **Automatic path:** `MigrationRunner::apply_decision`, which the embedded engine uses under the automatic policy. It applies only migrations it can prove idempotent (`migration_is_idempotent`), so that it can replay one interrupted between its statement and its ledger row.
-- **Purge:** the paged deletion of the tables a deleted run owns, history last (`PURGE_TABLES`, `crates/tokeira-storage/src/dsql/run_repository/bulk_write.rs`).
+- **Purge:** the paged deletion of the tables a deleted run owns, history after the rows derived from it and the parts of the run's values last (`PURGE_TABLES`, `crates/tokeira-storage/src/dsql/run_repository/bulk_write.rs`; [large-value-parts](../large-value-parts/design.md)).
 
 ## How DSQL drops the table
 
@@ -45,7 +45,7 @@ The bug condition holds wherever the code or the schema still keeps `activity_st
 
 - Earlier schemas, rows included, migrate forward under both paths (3.1).
 - The migrations that created the table stay as they are (3.2).
-- Run deletion purges every other table a run owns, history last (3.3).
+- Run deletion purges every other table a run owns, history after the rows derived from it and the parts of the run's values last (3.3).
 - The in-memory store's snapshots keep their activity state table's slot (3.4).
 
 ## Root Cause
@@ -69,7 +69,7 @@ _For any_ schema whose drop committed but whose ledger row didn't, applying the 
 
 Property 3: A run's deletion purges what it owns, and never `activity_state`
 
-_For any_ run, deleting it SHALL purge every table it owns, history last, and SHALL issue no statement against `activity_state`.
+_For any_ run, deleting it SHALL purge every table it owns, history after the rows derived from it and the parts of the run's values last, and SHALL issue no statement against `activity_state`.
 
 **Validates: Requirements 2.3, 3.3**
 

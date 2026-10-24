@@ -9,8 +9,10 @@
 //! cannot erase any of a run.
 //!
 //! The run's other rows can outnumber what one DSQL transaction may change, so
-//! the purge in `bulk_write` removes them in pages, history last
-//! (`bounded-bulk-writes`).
+//! the purge in `bulk_write` removes them in pages, history after the rows
+//! derived from it and the parts of the run's values last
+//! (`bounded-bulk-writes`, `large-value-parts`). This transaction leaves the
+//! parts of the run's state to the purge too, so it stays at most five rows.
 
 use super::*;
 
@@ -65,8 +67,8 @@ impl DsqlRunRepository {
                     return Err(lost.into());
                 }
 
-                let row = sqlx::query_as::<_, (i64, Option<i64>, Vec<u8>)>(
-                    "SELECT transition_seq, history_size_bytes, state_data
+                let row = sqlx::query_as::<_, (i64, Option<i64>, Vec<u8>, Option<i32>)>(
+                    "SELECT transition_seq, history_size_bytes, state_data, state_parts
                      FROM workflow_hot
                      WHERE run_key = $1
                      FOR UPDATE",
@@ -74,10 +76,12 @@ impl DsqlRunRepository {
                 .bind(run_key.0)
                 .fetch_optional(&mut *tx)
                 .await?;
-                let Some((durable_seq, history_size_bytes, state_data)) = row else {
+                let Some((durable_seq, history_size_bytes, first, parts)) = row else {
                     tx.rollback().await?;
                     return Ok(DeleteRunResult::NotFound);
                 };
+                let state_data =
+                    super::run_value_parts::join_state(&mut tx, run_key, first, parts).await?;
                 let state = codec::decode_workflow_state(run_key, &state_data)?;
                 let durable_seq = TransitionSeq(convert::u64_from_i64(
                     durable_seq,
@@ -131,7 +135,8 @@ impl DsqlRunRepository {
                 // order, each stage safe to retry
                 // (`service/history/shard/context_impl.go:941-963 @ v1.31.0`).
                 // This transaction is the first three stages at once; the
-                // purge is the fourth, history last.
+                // purge is the fourth, history after the rows derived from it,
+                // and the parts of the run's values after history.
                 sqlx::query(
                     "INSERT INTO projection_log
                      (partition_id, fanout, run_key, transition_seq, context_data, ops_data, created_at)

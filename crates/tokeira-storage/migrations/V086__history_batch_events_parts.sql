@@ -1,0 +1,1 @@
+ALTER TABLE history_batch ADD COLUMN IF NOT EXISTS events_parts INTEGER;

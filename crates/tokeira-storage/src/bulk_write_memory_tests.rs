@@ -43,6 +43,7 @@ impl Backend for InMemoryStore {
                 .iter()
                 .filter(|entry| entry.run_key == run_key)
                 .count(),
+            parts: 0,
         })
     }
 

@@ -34,6 +34,9 @@ pub(crate) struct OwnedRows {
     pub(crate) activity_dispatch: usize,
     pub(crate) workflow_dispatch: usize,
     pub(crate) backlog: usize,
+    /// Parts of the run's values over the part size, which only DSQL stores
+    /// (`large-value-parts`): the in-memory store has none.
+    pub(crate) parts: usize,
 }
 
 /// One stored history batch: how many events it holds, and its encoded size.
@@ -216,7 +219,15 @@ pub(crate) async fn commit_base(
     backend: &impl Backend,
     chunks: Vec<Vec<HistoryEventKind>>,
 ) -> (WorkflowState, i64) {
-    let start = fresh_transition(RunKey::new());
+    commit_base_from(backend, fresh_transition(RunKey::new()), chunks).await
+}
+
+/// As [`commit_base`], from `start`, whose state the start event records.
+pub(crate) async fn commit_base_from(
+    backend: &impl Backend,
+    start: Transition,
+    chunks: Vec<Vec<HistoryEventKind>>,
+) -> (WorkflowState, i64) {
     let prefix = reset_history(&start.next_state)[..4]
         .iter()
         .map(|event| event.kind.clone())
@@ -354,7 +365,11 @@ pub(crate) async fn materialize(
 /// Materialize a successor of `base`, which its pointer names, and check what it
 /// holds: the base's history before the fork, in batches within the budget, and
 /// a History Size that is the sum of those batches.
-async fn materialize_and_check(backend: &impl Backend, base: &WorkflowState, fork: i64) -> RunKey {
+pub(crate) async fn materialize_and_check(
+    backend: &impl Backend,
+    base: &WorkflowState,
+    fork: i64,
+) -> RunKey {
     let successor_run_id = RunId::new();
     materialize(backend, base, fork, successor_run_id, Some(base.run_key))
         .await

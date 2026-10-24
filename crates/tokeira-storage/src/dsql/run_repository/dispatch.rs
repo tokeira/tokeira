@@ -67,14 +67,27 @@ impl DsqlRunRepository {
                 continue;
             }
             workflows += 1;
-            let state = sqlx::query_scalar::<_, Vec<u8>>(
-                "SELECT state_data FROM workflow_hot WHERE run_key=$1",
+            let row = sqlx::query_as::<_, (Vec<u8>, Option<i32>)>(
+                "SELECT state_data, state_parts FROM workflow_hot WHERE run_key=$1",
             )
             .bind(run)
             .fetch_optional(&mut *tx)
-            .await?
-            .map(|bytes| codec::decode_workflow_state(RunKey(*run), &bytes))
-            .transpose();
+            .await?;
+            // A split state's parts are read in this transaction; parts that don't
+            // fit together defer the copy as an undecodable state does.
+            let state = match row {
+                None => Ok(None),
+                Some((first, count)) => {
+                    let rest = if count.is_some() {
+                        super::run_value_parts::read_state_parts(&mut tx, RunKey(*run)).await?
+                    } else {
+                        Vec::new()
+                    };
+                    super::run_value_parts::join_state_parts(RunKey(*run), first, count, rest)
+                        .and_then(|bytes| codec::decode_workflow_state(RunKey(*run), &bytes))
+                        .map(Some)
+                }
+            };
             let state = match state {
                 Ok(state) => state,
                 Err(error) => {
@@ -206,8 +219,8 @@ impl DsqlRunRepository {
             }
 
             let mut permit = self.director.acquire(DbClass::Read).await?;
-            let rows = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
-                "SELECT run_key, state_data
+            let rows = sqlx::query_as::<_, (Uuid, Vec<u8>, Option<i32>)>(
+                "SELECT run_key, state_data, state_parts
              FROM workflow_hot
              WHERE namespace_id = $1",
             )
@@ -215,6 +228,12 @@ impl DsqlRunRepository {
             .fetch_all(permit.connection()?)
             .await?;
             metrics::record_dsql_rows_read("list_dispatchable_workflow_tasks", rows.len());
+            // A run deleted since the scan read it has nothing to dispatch.
+            let rows = super::run_value_parts::whole_states(permit.connection()?, rows)
+                .await?
+                .into_iter()
+                .filter_map(|(run_key, state_data)| Some((run_key, state_data?)))
+                .collect();
 
             collect_dispatchable_workflow_tasks(rows, Some(queue), limit)
         })

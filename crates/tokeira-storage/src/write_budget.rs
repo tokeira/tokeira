@@ -96,9 +96,10 @@ impl WriteBudget {
 /// Cut items, in order, into consecutive pages within `budget`.
 ///
 /// The pages cover the items exactly and in order. Every page holds at least one
-/// item, so an item that alone exceeds the budget forms a page of its own. The
-/// callers' items never do: each fits DSQL's value limit, and a budget holds
-/// several of those.
+/// item, so an item that alone exceeds the budget forms a page of its own, as a
+/// reset's copied batch of one large event can. An item's value can be over
+/// DSQL's value limit; it is then written in parts that each fit it, and its cost
+/// counts a row for each part (`large-value-parts`).
 #[must_use]
 pub fn pages(costs: &[WriteCost], budget: WriteBudget) -> Vec<Range<usize>> {
     let mut pages = Vec::new();

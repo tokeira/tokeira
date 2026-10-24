@@ -186,7 +186,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(16))]
 
     // Feature: bounded-bulk-writes, Property 4: A purge finishes, removes only
-    // its run's rows, and removes history last
+    // its run's rows, and removes history after the rows derived from it
     #[test]
     fn property_a_purge_finishes_and_removes_only_its_runs_rows(
         batches in prop::collection::vec(1usize..3, 0..1_200),

@@ -348,43 +348,58 @@ async fn acquire_once_connection(
     // DSQL fixes isolation at repeatable read and accepts the explicit level on
     // BEGIN. A separate SET TRANSACTION is rejected before the fence can advance.
     let mut transaction = connection.begin_with(CONTROL_LEASE_ISOLATION_SQL).await?;
-    let row = sqlx::query_as::<
-        _,
-        (
-            String,
-            String,
-            Option<String>,
-            i64,
-            OffsetDateTime,
-            OffsetDateTime,
-        ),
-    >(LOCK_CLAIM_SQL)
-    .bind(&request.claim_name)
-    .fetch_one(&mut *transaction)
-    .await?;
-    let snapshot = LeaseSnapshot {
-        cluster: ControlLeaseClusterIdentity {
-            cluster_id: row.0,
-            cluster_arn: row.1,
-        },
-        owner_id: row.2,
-        fence_token: row.3,
-        expires_at: row.4,
-    };
-    let outcome = acquisition_outcome(&snapshot, &request.cluster, row.5)?;
-    let next_fence = snapshot
-        .fence_token
-        .checked_add(1)
-        .ok_or_else(|| ControlLeaseError::InvalidRequest("fence token exhausted".to_owned()))?;
-    let database_expires_at = sqlx::query_scalar::<_, OffsetDateTime>(ACQUIRE_CLAIM_SQL)
+    let attempt = async {
+        let row = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                Option<String>,
+                i64,
+                OffsetDateTime,
+                OffsetDateTime,
+            ),
+        >(LOCK_CLAIM_SQL)
         .bind(&request.claim_name)
-        .bind(&request.owner_id)
-        .bind(next_fence)
-        .bind(timing.lease_millis)
-        .bind(snapshot.fence_token)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(ControlLeaseError::Fenced)?;
+        .fetch_one(&mut *transaction)
+        .await?;
+        let snapshot = LeaseSnapshot {
+            cluster: ControlLeaseClusterIdentity {
+                cluster_id: row.0,
+                cluster_arn: row.1,
+            },
+            owner_id: row.2,
+            fence_token: row.3,
+            expires_at: row.4,
+        };
+        let outcome = acquisition_outcome(&snapshot, &request.cluster, row.5)?;
+        let next_fence = snapshot
+            .fence_token
+            .checked_add(1)
+            .ok_or_else(|| ControlLeaseError::InvalidRequest("fence token exhausted".to_owned()))?;
+        let database_expires_at = sqlx::query_scalar::<_, OffsetDateTime>(ACQUIRE_CLAIM_SQL)
+            .bind(&request.claim_name)
+            .bind(&request.owner_id)
+            .bind(next_fence)
+            .bind(timing.lease_millis)
+            .bind(snapshot.fence_token)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(ControlLeaseError::Fenced)?;
+        Ok::<_, ControlLeaseError>((outcome, next_fence, database_expires_at))
+    }
+    .await;
+    let (outcome, next_fence, database_expires_at) = match attempt {
+        Ok(taken) => taken,
+        Err(error) => {
+            // Roll back now, a busy claim included. Dropping the transaction
+            // would only queue its rollback until the connection's next
+            // statement, and a director's connection can sit idle past DSQL's
+            // 5-minute transaction age limit, which then refuses that statement.
+            let _ = transaction.rollback().await;
+            return Err(error);
+        }
+    };
     transaction.commit().await?;
 
     let confirmed_at = clock.now();
@@ -667,7 +682,9 @@ struct OwnershipAdmissionInner {
     drained: Notify,
 }
 
-/// Atomic admission gate for all managed embedded workflow and storage work.
+/// Atomic admission gate for the work of a claim's owner: all managed embedded
+/// workflow and storage work, or a distributed node's DSQL work while it holds
+/// its single-node claim.
 #[derive(Clone, Debug)]
 pub struct OwnershipAdmissionGate {
     inner: Arc<OwnershipAdmissionInner>,
@@ -790,17 +807,17 @@ fn decode_state(state: u8) -> OwnershipAdmissionState {
     }
 }
 
-/// Rejection returned when managed embedded ownership cannot admit new work.
+/// Rejection returned when an owner claim's gate cannot admit new work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum OwnershipAdmissionError {
     /// Ownership is closing and existing work is draining.
-    #[error("managed embedded ownership is closing")]
+    #[error("DSQL owner admission is closing")]
     Closing,
     /// An expired takeover is still in its safety quiescence interval.
-    #[error("managed embedded ownership is quiescing after expired takeover")]
+    #[error("DSQL owner admission is quiescing after an expired takeover")]
     Quiescing,
     /// Ownership was lost and this process is permanently fenced.
-    #[error("managed embedded ownership was fenced")]
+    #[error("DSQL owner admission was fenced: another owner holds the claim")]
     Fenced,
 }
 

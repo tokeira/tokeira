@@ -80,6 +80,10 @@ complete.
   state remains available, but out-of-band object or parameter drift is not visible.
 - Controller and autoscaler still need service-owned configuration documents matching
   their own schemas.
+- The `tokeirad` services share one DSQL configuration and set no placement controller,
+  so one `tokeirad` serves the cluster: the first to take the cluster's single-node claim
+  serves, and the others, the `tkr admin` task's included, refuse to start while it does
+  ([deployment configuration](../../provisioning/deployment-configuration.md#image-and-schema-configuration)).
 - Live AWS verification covers endpoint reachability, IAM sufficiency, ALB health,
   Service Connect, rollout convergence, and teardown; it is operator-driven rather than
   part of the hermetic test suite.

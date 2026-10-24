@@ -1,0 +1,5 @@
+kind: changed
+body: A tokeirad without a placement controller now refuses to start while another holds its DSQL cluster, and after a crash its replacement waits up to six minutes.
+time: 2026-10-24T18:31:50.930783+01:00
+custom:
+    Slice: c1e12859-dc25-405e-b995-b010bf88c127

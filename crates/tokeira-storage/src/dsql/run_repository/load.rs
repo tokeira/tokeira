@@ -257,9 +257,11 @@ impl DsqlRunRepository {
         &self,
         run_key: RunKey,
     ) -> Result<(LoadedRun, crate::RunHistoryStats)> {
+        crate::read_probe::logical(run_key);
         record_dsql_operation!(self, "load_run", Some(self.shard_for_run_key(run_key)), {
             let mut permit = self.director.acquire(DbClass::Read).await?;
             let connection = permit.connection()?;
+            crate::read_probe::sql(run_key, "sql/hot-state-fast");
             let row = sqlx::query_as::<_, (Vec<u8>, Option<i64>, Option<i32>)>(READ_HOT_STATE)
                 .bind(run_key.0)
                 .fetch_optional(&mut *connection)
@@ -292,9 +294,11 @@ impl DsqlRunRepository {
                 super::projection_accumulator_tests::LoadStage::BeforeSnapshot,
             )
             .await;
+            crate::read_probe::sql(run_key, "sql/begin-read-snapshot");
             let mut tx = connection
                 .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 .await?;
+            crate::read_probe::sql(run_key, "sql/hot-state-snapshot");
             let row = sqlx::query_as::<_, (Vec<u8>, Option<i64>, Option<i32>)>(READ_HOT_STATE)
                 .bind(run_key.0)
                 .fetch_optional(&mut *tx)
@@ -318,6 +322,7 @@ impl DsqlRunRepository {
             {
                 // Historical rows can belong to a different partition count. Do
                 // not hide newer-than-state rows: the seed validator must see them.
+                crate::read_probe::sql(run_key, "sql/projection-seed");
                 let row =
                     sqlx::query_as::<_, (i32, i16, Uuid, i64, Vec<u8>)>(READ_LEGACY_PROJECTION)
                         .bind(run_key.0)
@@ -350,6 +355,7 @@ impl DsqlRunRepository {
                     })?;
                 // Once the projector deletes a run's applied images, its visibility row,
                 // read in this snapshot, holds the newest one's list.
+                crate::read_probe::sql(run_key, "sql/applied-projection-seed");
                 let applied = sqlx::query_as::<_, (i64, i64, String, Uuid, Option<Vec<u8>>)>(
                     READ_APPLIED_PROJECTION_SEED,
                 )
@@ -388,6 +394,7 @@ impl DsqlRunRepository {
                     applied.as_ref(),
                 )?;
             }
+            crate::read_probe::sql(run_key, "sql/commit-read-snapshot");
             tx.commit().await?;
             Ok((loaded, stats))
         })

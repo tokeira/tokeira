@@ -14,7 +14,7 @@ the schema.
 This file is the **canonical** home of the root heading *Adding or Changing a DSQL
 Migration* (the root keeps the name and points here). The rules:
 
-- **Baseline lock discipline.** The tracked baseline through V095 prevents
+- **Baseline lock discipline.** The tracked baseline through V096 prevents
   uncoordinated edits and makes any migration/lock mismatch a build failure. Before
   Tokeira declares its first durable release baseline, an explicitly approved schema
   re-cut may replace a locked migration only when migration bytes, baseline metadata,
@@ -24,7 +24,7 @@ Migration* (the root keeps the name and points here). The rules:
   every schema change is a new migration above the current head, including any
   supported, idempotent `ALTER TABLE` operation.
 - **Contiguous versions.** No gaps or duplicate `VNNN`; the immutable prefix now ends
-  at V095. V068 (the per-run history size) was the first forward-only migration above
+  at V096. V068 (the per-run history size) was the first forward-only migration above
   the original V067 baseline; V069–V071 add the archetype pointer and backfill marker;
   V072–V073 add the recovery flag and its index; V074–V076 add workflow dispatch
   and its queue/home indexes; V077–V080 add the bulk-write record, its shard index,
@@ -36,8 +36,9 @@ Migration* (the root keeps the name and points here). The rules:
   `workflow_hot.state_data` and `history_batch`'s two values; V088–V091 add the
   versioned visibility attribute cells, their lookup index, the values stored once
   per image and the copy's progress row (`bounded-visibility-apply`); V092–V095 add the
-  parts tables and count columns of CHASM nodes' data and worker invocation requests.
-  The next schema change is V096. The release target must include every migration needed by unconditional startup,
+  parts tables and count columns of CHASM nodes' data and worker invocation requests;
+  V096 adds the sticky execution-home workflow-dispatch index. The next schema change
+  is V097. The release target must include every migration needed by unconditional startup,
   including CHASM backfill with activity gates off.
 - **DSQL DDL subset always.** One statement per file; secondary indexes created `ASYNC`;
   no `CHECK` constraints (validate in the application); no `BIGSERIAL` (generate IDs

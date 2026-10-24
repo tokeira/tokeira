@@ -380,6 +380,18 @@ do not hide failed attempts. For each injected OCC conflict, show the required f
 separately. The target is not permission to skip correctness reads: if the measured architecture requires more,
 explain and revise the target before the fix, while still eliminating duplicate reads of the same preflight state.
 
+The foundations measurement is recorded in [implementation-evidence.md](implementation-evidence.md). The
+conflict-free memory and live DSQL baseline is 3/4 logical loads for warm/cold normal starts and 4/5 for warm/cold
+sticky starts; the evidence also records inline and split-state SQL counts.
+One rejected commit adds one fresh lane reload. Keep the provisional target: owner metadata, sticky authorization
+and target resolution can share preparation, while a cold execution cache and an OCC retry still need their
+independent authoritative load. These measurements do not authorize removing any of those checks.
+
+Prompt-publication tests pause discovery only for the assertion that a successful push does not depend on a tick.
+Loss-recovery tests independently drive normal discovery for non-sticky intent and the execution-home sticky
+sweep for sticky intent, including a sticky offer previously retargeted to the normal queue. They must not leave
+every recovery reader paused while asserting eventual delivery.
+
 ## Correctness properties
 
 Every property is a required generated test in [tasks.md](tasks.md), tagged `Feature: queue-home-delivery, Property N`.

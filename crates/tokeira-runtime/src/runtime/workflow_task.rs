@@ -964,7 +964,15 @@ where
     ) -> Result<PolledWorkflowTaskTarget> {
         // One round trip returns the state and its History Size (Requirement 1.8);
         // the statistic read here is the one the start transition records.
-        let (loaded, stats) = self.repo.load_run_with_stats(offered.run_key).await?;
+        let (loaded, stats) = tokeira_storage::read_probe::scope(
+            if forwarded {
+                "execution-owner/resolve"
+            } else {
+                "queue-home/resolve"
+            },
+            self.repo.load_run_with_stats(offered.run_key),
+        )
+        .await?;
         let LoadedRun::Existing(state) = loaded else {
             return Err(crate::lane::KernelRejected(tokeira_kernel::Reject::MissingRun).into());
         };

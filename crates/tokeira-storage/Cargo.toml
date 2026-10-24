@@ -41,6 +41,8 @@ uuid.workspace = true
 
 [features]
 default = []
+# Opt-in read observation and explicitly armed test commit-conflict injection.
+test-support = []
 dsql = [
     "dep:async-channel",
     "dep:aurora-dsql-sqlx-connector",

@@ -672,6 +672,11 @@ impl RunRepository for DsqlRunRepository {
         transition: Transition,
         fence: WriteFence,
     ) -> Result<CommitResult> {
+        if crate::read_probe::reject_commit(run_key) {
+            return Ok(CommitResult::Conflict {
+                reason: "read-baseline injected OCC conflict".into(),
+            });
+        }
         self.do_commit_transition(run_key, transition, fence).await
     }
 
@@ -682,6 +687,11 @@ impl RunRepository for DsqlRunRepository {
         transition: Transition,
         fence: WriteFence,
     ) -> Result<CommitResult> {
+        if crate::read_probe::reject_commit(run_key) {
+            return Ok(CommitResult::Conflict {
+                reason: "read-baseline injected OCC conflict".into(),
+            });
+        }
         self.do_commit_transition_for_bundle(run_key, execution_home_bundle, transition, fence)
             .await
     }
@@ -769,6 +779,16 @@ impl RunRepository for DsqlRunRepository {
         limit: std::num::NonZeroU32,
     ) -> Result<Vec<RunKey>> {
         self.do_list_workflow_dispatch_for_home(home, after, limit)
+            .await
+    }
+
+    async fn list_sticky_workflow_dispatch(
+        &self,
+        home: ShardId,
+        after: Option<RunKey>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<crate::StickyWorkflowDispatchPage> {
+        self.do_list_sticky_workflow_dispatch(home, after, limit)
             .await
     }
 

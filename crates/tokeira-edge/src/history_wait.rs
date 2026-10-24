@@ -335,6 +335,17 @@ where
             .await
     }
 
+    async fn list_sticky_workflow_dispatch(
+        &self,
+        home: ShardId,
+        after: Option<RunKey>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<tokeira_storage::StickyWorkflowDispatchPage> {
+        self.inner
+            .list_sticky_workflow_dispatch(home, after, limit)
+            .await
+    }
+
     async fn list_dispatchable_workflow_tasks(
         &self,
         queue: &QueueKey,
@@ -519,15 +530,14 @@ mod tests {
         WorkflowRuleTrigger, WorkflowType,
     };
 
-    async fn seed_open_pinned_run(
-        repo: &HistoryNotifyingRepository<InMemoryStore>,
+    fn pinned_start_transition(
         namespace_id: NamespaceId,
         version: &WorkerDeploymentVersionKey,
-    ) {
+    ) -> Transition {
         let workflow_id = WorkflowId("pinned-workflow".to_string());
         let run_id = RunId::new();
         let run_key = RunKey::derive(namespace_id, &workflow_id, run_id);
-        let transition = BasicKernel
+        BasicKernel
             .apply(
                 LoadedRun::Absent,
                 Command::Start(StartRequest {
@@ -592,7 +602,16 @@ mod tests {
                     inherited_versioning_info: None,
                 }),
             )
-            .expect("pinned start transition");
+            .expect("pinned start transition")
+    }
+
+    async fn seed_open_pinned_run(
+        repo: &HistoryNotifyingRepository<InMemoryStore>,
+        namespace_id: NamespaceId,
+        version: &WorkerDeploymentVersionKey,
+    ) {
+        let transition = pinned_start_transition(namespace_id, version);
+        let run_key = transition.next_state.run_key;
         assert!(matches!(
             repo.commit_transition(run_key, transition, WriteFence::Unfenced)
                 .await
@@ -646,6 +665,93 @@ mod tests {
         assert_eq!(progress.hot_examined, 1);
         assert!(restored.placement_ready());
         assert!(repo.placement_ready());
+    }
+
+    #[tokio::test]
+    async fn sticky_workflow_dispatch_delegates_through_history_notifier() {
+        let inner = Arc::new(InMemoryStore::with_shard_count(8));
+        let repo = HistoryNotifyingRepository::new(inner.clone(), HistoryWaitRegistry::default());
+        let version = WorkerDeploymentVersionKey {
+            deployment_name: DeploymentName("deployment".into()),
+            build_id: BuildId("build".into()),
+        };
+        let home = ShardId(5);
+        let mut namespace = 1;
+        let mut expected = Vec::new();
+        for (selected_home, sticky) in [
+            (home, true),
+            (home, true),
+            (ShardId(6), true),
+            (home, false),
+        ] {
+            let mut transition = loop {
+                let candidate = pinned_start_transition(
+                    NamespaceId(uuid::Uuid::from_u128(namespace)),
+                    &version,
+                );
+                namespace += 1;
+                let state = &candidate.next_state;
+                if tokeira_types::execution_home_bundle(
+                    state.namespace_id.0.as_bytes(),
+                    state.workflow_id.0.as_bytes(),
+                    8,
+                ) == selected_home
+                {
+                    break candidate;
+                }
+            };
+            let state = &mut transition.next_state;
+            let key = state.run_key;
+            if sticky {
+                state.sticky = Some(tokeira_types::StickyAffinity {
+                    worker_identity: tokeira_types::WorkerIdentity("worker".into()),
+                    sticky_queue: TaskQueueName("sticky".into()),
+                    schedule_to_start_timeout: Duration::seconds(30),
+                });
+                state
+                    .pending_workflow_task
+                    .as_mut()
+                    .unwrap()
+                    .schedule_to_start_deadline =
+                    Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(30));
+                if selected_home == home {
+                    expected.push(tokeira_storage::derive_workflow_dispatch(state, home).unwrap());
+                }
+            }
+            assert!(matches!(
+                repo.commit_transition(key, transition, WriteFence::Unfenced)
+                    .await
+                    .unwrap(),
+                CommitResult::Applied { .. }
+            ));
+        }
+        expected.sort_by_key(|row| row.incarnation.run_key);
+        let limit = std::num::NonZeroU32::new(1).unwrap();
+        let mut after = None;
+        for row in expected {
+            let page = repo
+                .list_sticky_workflow_dispatch(home, after, limit)
+                .await
+                .unwrap();
+            assert_eq!(
+                page,
+                inner
+                    .list_sticky_workflow_dispatch(home, after, limit)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(page.candidates, vec![row.clone()]);
+            assert_eq!(page.last_examined, Some(row.incarnation.run_key));
+            assert!(!page.exhausted);
+            after = page.last_examined;
+        }
+        let end = repo
+            .list_sticky_workflow_dispatch(home, after, limit)
+            .await
+            .unwrap();
+        assert!(end.candidates.is_empty());
+        assert!(end.last_examined.is_none());
+        assert!(end.exhausted);
     }
 
     #[tokio::test]

@@ -1,0 +1,5 @@
+kind: security
+body: tokio 1.51.6 closes RUSTSEC-2026-0386, and ctutils 0.4.5 closes RUSTSEC-2026-0385.
+time: 2026-10-23T22:28:22.000000+01:00
+custom:
+    Slice: 17d1bd92-80e8-4489-8aa6-ca6e4c095a97

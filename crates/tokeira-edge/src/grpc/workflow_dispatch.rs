@@ -394,12 +394,12 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
                 .map_err(|_| Status::invalid_argument("run_key must be a UUID"))?,
         );
         if request.sticky {
-            let tokeira_kernel::LoadedRun::Existing(state) = self
-                .runtime
-                .repo()
-                .load_run(run_key)
-                .await
-                .map_err(|_| Status::unavailable("workflow state could not be loaded"))?
+            let tokeira_kernel::LoadedRun::Existing(state) = tokeira_storage::read_probe::scope(
+                "execution-owner/sticky-binding",
+                self.runtime.repo().load_run(run_key),
+            )
+            .await
+            .map_err(|_| Status::unavailable("workflow state could not be loaded"))?
             else {
                 return Err(stale_offer_status());
             };
@@ -441,12 +441,12 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
         // this request. Six bytes per source byte bounds JSON escaping, with
         // repeated queue fields included. Refuse even malformed restored state
         // before starting, rather than trusting only public admission limits.
-        let tokeira_kernel::LoadedRun::Existing(state) = self
-            .runtime
-            .repo()
-            .load_run(run_key)
-            .await
-            .map_err(|_| Status::unavailable("workflow metadata unavailable"))?
+        let tokeira_kernel::LoadedRun::Existing(state) = tokeira_storage::read_probe::scope(
+            "execution-owner/metadata",
+            self.runtime.repo().load_run(run_key),
+        )
+        .await
+        .map_err(|_| Status::unavailable("workflow metadata unavailable"))?
         else {
             return Err(stale_offer_status());
         };
@@ -557,6 +557,10 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
 }
 
 #[cfg(test)]
+#[path = "workflow_dispatch_read_baseline.rs"]
+mod read_baseline;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
@@ -591,7 +595,7 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
     use tokio_util::sync::CancellationToken;
 
-    struct WorkerAuth(AtomicUsize);
+    pub(super) struct WorkerAuth(pub(super) AtomicUsize);
     #[async_trait]
     impl Authenticator for WorkerAuth {
         async fn authenticate(&self, headers: &HeaderMap) -> EdgeResult<Option<Claims>> {
@@ -1285,7 +1289,7 @@ mod tests {
         response_rx
     }
 
-    fn start_dto() -> crate::translate::StartWorkflowExecutionRequest {
+    pub(super) fn start_dto() -> crate::translate::StartWorkflowExecutionRequest {
         crate::translate::StartWorkflowExecutionRequest {
             namespace: "default".to_string(),
             workflow_id: "workflow-a".to_string(),

@@ -45,6 +45,7 @@ mod placement_upgrade_tests;
 mod preservation_property_tests;
 #[cfg(test)]
 mod projection_accumulator_oracle;
+pub mod read_probe;
 pub mod recovery_index;
 pub mod schema_contract;
 pub mod worker_compute;

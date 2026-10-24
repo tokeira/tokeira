@@ -11,8 +11,8 @@ use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{Priority, WorkflowState, WorkflowTaskType};
 use tokeira_types::{
-    BuildId, DeploymentId, ExecutionStatus, LogicalTaskSeq, NamespaceId, RunKey, ShardId,
-    StickyAffinity, TaskQueueName, WorkerIdentity,
+    BuildId, DeploymentId, ExecutionStatus, LogicalTaskSeq, NamespaceId, QueueKey, RunKey, ShardId,
+    StickyAffinity, TaskKind, TaskQueueName, WorkerIdentity,
 };
 
 /// A repair transaction lost OCC; retry from a fresh state read and acquisition check.
@@ -27,6 +27,99 @@ pub struct WorkflowTaskIncarnation {
     pub run_key: RunKey,
     /// Monotonic task generation, independent of worker-visible attempts.
     pub logical_seq: LogicalTaskSeq,
+}
+
+/// Disposable normal-task offer with immutable scheduling and routing origin.
+///
+/// The selected destination may be resolved or retargeted by delivery policy;
+/// the origin remains the committed intent. Neither part can carry credentials,
+/// history, update/query attachments, or an authoritative command. Speculative
+/// and eager paths continue using their existing envelopes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowOfferHint {
+    /// Current volatile destination and worker preference.
+    pub task: crate::DispatchableWorkflowTask,
+    /// Execution owner to contact; validated again against state before start.
+    pub execution_home: ShardId,
+    /// Committed schedule time; retries must not replace it with arrival time.
+    pub scheduled_at: OffsetDateTime,
+    /// Original routing policy, preserved even after selecting a live target.
+    pub routing: WorkflowDispatchRouting,
+    /// Sticky origin retained even when the selected queue becomes normal.
+    pub sticky_origin: Option<StickyWorkflowOfferOrigin>,
+}
+
+/// Original sticky coordinates; fallback changes selection, never this origin.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StickyWorkflowOfferOrigin {
+    /// Full original sticky destination.
+    pub sticky_queue: QueueKey,
+    /// Full original normal destination before a live routing refresh.
+    pub normal_queue: QueueKey,
+    /// Worker whose sticky cache was selected at scheduling.
+    pub worker: WorkerIdentity,
+    /// Pending task's absolute deadline, also retained on normal fallback.
+    pub deadline: OffsetDateTime,
+}
+
+impl WorkflowOfferHint {
+    /// Construct from durable normal intent without resolving live policy.
+    ///
+    /// Exact coordinates retain absent versus present values. A live destination
+    /// must still pass the runtime resolver before admission. Malformed sticky
+    /// origin is rejected rather than fabricating a worker or deadline.
+    pub fn from_dispatch(row: &WorkflowDispatchRow) -> Result<Self> {
+        row.validate()?;
+        let (deployment, build_id) = match &row.routing {
+            WorkflowDispatchRouting::Live => (None, None),
+            WorkflowDispatchRouting::Exact {
+                deployment,
+                build_id,
+            } => (Some(deployment.clone()), build_id.clone()),
+        };
+        let queue = QueueKey {
+            namespace_id: row.namespace_id,
+            task_queue: row.queue_name.clone(),
+            task_kind: TaskKind::Workflow,
+            deployment,
+            build_id,
+        };
+        let normal = QueueKey {
+            task_queue: row.normal_queue_name.clone(),
+            ..queue.clone()
+        };
+        let sticky_origin = if row.sticky {
+            Some(StickyWorkflowOfferOrigin {
+                sticky_queue: queue.clone(),
+                normal_queue: normal.clone(),
+                worker: row
+                    .sticky_worker
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("sticky offer has no worker"))?,
+                deadline: row
+                    .schedule_to_start_deadline
+                    .ok_or_else(|| anyhow::anyhow!("sticky offer has no deadline"))?,
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            task: crate::DispatchableWorkflowTask {
+                run_key: row.incarnation.run_key,
+                logical_seq: row.incarnation.logical_seq,
+                queue,
+                sticky_preferred: row.sticky_worker.clone(),
+                normal_queue: row.sticky.then_some(normal),
+                sticky_deadline: row.schedule_to_start_deadline,
+                priority: row.priority.clone(),
+                order: None,
+            },
+            execution_home: row.execution_home,
+            scheduled_at: row.scheduled_at,
+            routing: row.routing.clone(),
+            sticky_origin,
+        })
+    }
 }
 
 /// Stored routing coordinates, without freezing a registry-selected target.
@@ -104,6 +197,20 @@ pub struct WorkflowDispatchPage {
     /// Last examined row, even when every candidate is later rejected.
     pub last_examined: Option<WorkflowDispatchPosition>,
     /// True when the bounded query returned fewer rows than requested.
+    pub exhausted: bool,
+}
+
+/// Maximum keys examined by one execution-home sticky recovery read.
+pub const STICKY_WORKFLOW_PAGE_LIMIT: u32 = 64;
+
+/// Snapshot-consistent sticky intent for one bounded execution-home read.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StickyWorkflowDispatchPage {
+    /// Sticky rows, ordered by run key; admission remains the caller's decision.
+    pub candidates: Vec<WorkflowDispatchRow>,
+    /// Last examined key, including candidates the caller refuses or skips.
+    pub last_examined: Option<RunKey>,
+    /// Fewer rows than the effective (at most 64) limit were read.
     pub exhausted: bool,
 }
 
@@ -312,6 +419,55 @@ fn lookup_digest(domain: &[u8], value: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+        // Feature: queue-home-delivery, Property 4: Sticky routing and deadline preservation.
+        // A hint retains source routing, priority and expiry independently of its selected destination.
+        #[test]
+        fn queue_home_delivery_hint_preserves_origin(
+            sticky in any::<bool>(), home in any::<u32>(),
+            deployment in prop::option::of("[ab]{0,4}"), build in prop::option::of("[xy]{0,4}"),
+            priority in 0i32..6, schedule in 0i64..100_000,
+        ) {
+            let mut state = crate::memory::projection_accumulator_tests::fresh_transition(RunKey::new()).next_state;
+            state.deployment = deployment.map(DeploymentId);
+            state.build_id = state.deployment.as_ref().and(build.map(BuildId));
+            state.priority = Some(tokeira_kernel::Priority { priority_key: priority, fairness_key: "fairness".into(), fairness_weight: 1.0 });
+            let scheduled = OffsetDateTime::UNIX_EPOCH + Duration::seconds(schedule);
+            let pending = state.pending_workflow_task.as_mut().unwrap();
+            pending.scheduled_at = scheduled;
+            pending.schedule_to_start_deadline = Some(scheduled + Duration::seconds(30));
+            state.sticky = sticky.then(|| StickyAffinity {
+                worker_identity: WorkerIdentity("worker".into()), sticky_queue: TaskQueueName("sticky".into()),
+                schedule_to_start_timeout: Duration::seconds(30),
+            });
+            let row = derive_workflow_dispatch(&state, ShardId(home)).unwrap();
+            let mut hint = WorkflowOfferHint::from_dispatch(&row).unwrap();
+            prop_assert_eq!(hint.execution_home, ShardId(home));
+            prop_assert_eq!(hint.scheduled_at, scheduled);
+            prop_assert_eq!(&hint.routing, &row.routing);
+            prop_assert_eq!(&hint.task.priority, &state.priority);
+            prop_assert_eq!(&hint.task.queue.deployment, &state.deployment);
+            prop_assert_eq!(&hint.task.queue.build_id, &state.build_id);
+            prop_assert_eq!(hint.task.sticky_deadline, row.schedule_to_start_deadline);
+            prop_assert_eq!(hint.sticky_origin.is_some(), sticky);
+            let encoded = postcard::to_allocvec(&hint).unwrap();
+            prop_assert_eq!(postcard::from_bytes::<WorkflowOfferHint>(&encoded).unwrap(), hint.clone());
+            if let Some(origin) = hint.sticky_origin.clone() {
+                prop_assert_eq!(&origin.sticky_queue, &hint.task.queue);
+                prop_assert_eq!(&origin.normal_queue.task_queue, &state.task_queue);
+                prop_assert_eq!(&origin.worker, hint.task.sticky_preferred.as_ref().unwrap());
+                hint.task.queue = origin.normal_queue.clone();
+                hint.task.sticky_preferred = None;
+                hint.task.normal_queue = None;
+                prop_assert_eq!(&hint.sticky_origin, &Some(origin.clone()));
+                prop_assert_eq!(hint.task.sticky_deadline, Some(origin.deadline));
+                prop_assert_eq!(origin.sticky_queue.task_queue.0, "sticky");
+            }
+        }
+    }
 
     #[test]
     fn timestamp_normalization_matches_sqlx_on_both_sides_of_its_epoch() {
@@ -353,6 +509,10 @@ mod tests {
         let table = include_str!("../migrations/V074__workflow_dispatch.sql");
         let queue = include_str!("../migrations/V075__workflow_dispatch_queue_index.sql");
         let home = include_str!("../migrations/V076__workflow_dispatch_home_index.sql");
+        let sticky = include_str!("../migrations/V088__workflow_dispatch_sticky_home_index.sql");
+        assert!(sticky.contains("CREATE INDEX ASYNC"));
+        assert!(sticky.contains("(shard_id, run_key)"));
+        assert!(sticky.contains("WHERE sticky = true"));
         // Merged migrations remain immutable across the delivery cutover.
         assert_eq!(
             format!("{:x}", Sha256::digest(table.as_bytes())),

@@ -82,6 +82,7 @@ path = "../tokeira-projection"
 version = "0.6.1"
 
 [features]
+dsql-integration = ["tokeira-storage/dsql-integration"]
 # Compiles the dynamic-override read seam into the admission sites
 # (`conformance::overrides`). The override registry itself is test-harness
 # machinery this crate never links; the serving application installs read
@@ -89,6 +90,7 @@ version = "0.6.1"
 conformance = []
 
 [dev-dependencies]
+tokeira-storage = { path = "../tokeira-storage", features = ["test-support"] }
 metrics-util.workspace = true
 proptest = "1"
 # Version-less on purpose: `cargo publish` strips path-only dev-dependencies,

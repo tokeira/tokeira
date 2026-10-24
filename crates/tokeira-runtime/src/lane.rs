@@ -337,7 +337,11 @@ async fn resolve_identity_request<R: RunRepository>(
         match cache.get_with(request.run_key, loaded_execution_identity) {
             Some(identity) => identity,
             None => {
-                let loaded = repo.load_run(request.run_key).await?;
+                let loaded = tokeira_storage::read_probe::scope(
+                    "execution-owner/admission-cache",
+                    repo.load_run(request.run_key),
+                )
+                .await?;
                 let identity = loaded_execution_identity(&loaded);
                 cache.insert(request.run_key, loaded);
                 identity
@@ -1823,7 +1827,11 @@ where
         let loaded = match cache.get(run_key) {
             Some(loaded) => loaded,
             None => {
-                let loaded = repo.load_run(run_key).await?;
+                let loaded = tokeira_storage::read_probe::scope(
+                    "execution-owner/lane-cache-or-retry",
+                    repo.load_run(run_key),
+                )
+                .await?;
                 cache.insert(run_key, loaded.clone());
                 loaded
             }

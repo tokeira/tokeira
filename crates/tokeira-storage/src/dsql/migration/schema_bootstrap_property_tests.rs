@@ -263,6 +263,7 @@ fn startup_schema_contract_migrates_and_accepts_required_tables() {
         (85, "workflow_hot_state_parts"),
         (86, "history_batch_events_parts"),
         (87, "history_batch_principals_parts"),
+        (88, "workflow_dispatch_sticky_home_index"),
     ] {
         assert!(
             recognized
@@ -271,7 +272,7 @@ fn startup_schema_contract_migrates_and_accepts_required_tables() {
         );
     }
     for current in [
-        0, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87,
+        0, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88,
     ] {
         let observed = observation(&recognized, current, (current > 0).then_some(current));
         for policy in [
@@ -279,24 +280,24 @@ fn startup_schema_contract_migrates_and_accepts_required_tables() {
             SchemaMigrationPolicy::ValidateOnly,
         ] {
             let expected = match (current, policy) {
-                (87, _) => SchemaDecision::Compatible {
-                    current: 87,
+                (88, _) => SchemaDecision::Compatible {
+                    current: 88,
                     legacy_backfill: false,
                 },
-                (0, SchemaMigrationPolicy::Automatic) => SchemaDecision::Initialize { target: 87 },
+                (0, SchemaMigrationPolicy::Automatic) => SchemaDecision::Initialize { target: 88 },
                 (_, SchemaMigrationPolicy::Automatic) => SchemaDecision::Migrate {
                     from: current,
-                    to: 87,
+                    to: 88,
                 },
                 (_, SchemaMigrationPolicy::ValidateOnly) => SchemaDecision::MigrationRequired {
                     current,
-                    target: 87,
+                    target: 88,
                 },
             };
             assert_eq!(
                 assess_schema_compatibility(&contract, &recognized, &observed, policy),
                 expected,
-                "Unconditional startup requires V087: current={current}, policy={policy:?}",
+                "Unconditional startup requires V088: current={current}, policy={policy:?}",
             );
         }
     }

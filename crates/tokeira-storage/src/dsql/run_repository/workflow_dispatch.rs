@@ -104,6 +104,31 @@ pub(super) fn decode(row: PgRow) -> Result<WorkflowDispatchRow> {
 }
 
 impl DsqlRunRepository {
+    pub(super) async fn do_list_sticky_workflow_dispatch(
+        &self,
+        home: ShardId,
+        after: Option<RunKey>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<crate::StickyWorkflowDispatchPage> {
+        let mut query = sticky_page_query(home, after, limit);
+        let mut permit = self.director.acquire(DbClass::Read).await?;
+        let mut tx = permit.connection()?.begin().await?;
+        let candidates = query
+            .build()
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(decode)
+            .collect::<Result<Vec<_>>>()?;
+        tx.commit().await?;
+        Ok(crate::StickyWorkflowDispatchPage {
+            last_examined: candidates.last().map(|row| row.incarnation.run_key),
+            exhausted: candidates.len()
+                < limit.get().min(crate::STICKY_WORKFLOW_PAGE_LIMIT) as usize,
+            candidates,
+        })
+    }
+
     pub(super) async fn do_reconcile_workflow_dispatch_run(
         &self,
         home: ShardId,
@@ -272,6 +297,28 @@ pub(super) fn queue_page_query(
         .push(") AS candidates ORDER BY priority_key, scheduled_at, run_key LIMIT ")
         .push_bind(i64::from(limit.get()))
         .push(") SELECT intent.* FROM candidates JOIN workflow_dispatch AS intent USING (run_key) ORDER BY candidates.priority_key, candidates.scheduled_at, candidates.run_key");
+    query
+}
+
+/// Shared with live EXPLAIN: the materialized index-covered key page bounds
+/// payload lookups in the same snapshot, including deep continuation pages.
+pub(super) fn sticky_page_query(
+    home: ShardId,
+    after: Option<RunKey>,
+    limit: std::num::NonZeroU32,
+) -> sqlx::QueryBuilder<sqlx::Postgres> {
+    let mut query = sqlx::QueryBuilder::new(
+        "WITH candidates AS MATERIALIZED (SELECT run_key FROM workflow_dispatch WHERE shard_id=",
+    );
+    query
+        .push_bind(DsqlRunRepository::shard_id_to_uuid(home))
+        .push(" AND sticky=true");
+    if let Some(after) = after {
+        query.push(" AND run_key>").push_bind(after.0);
+    }
+    query.push(" ORDER BY run_key LIMIT ")
+        .push_bind(i64::from(limit.get().min(crate::STICKY_WORKFLOW_PAGE_LIMIT)))
+        .push(") SELECT intent.* FROM candidates JOIN workflow_dispatch AS intent USING (run_key) ORDER BY candidates.run_key");
     query
 }
 

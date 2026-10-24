@@ -24,6 +24,112 @@ pub(super) struct Fixture {
     shard_count: u32,
 }
 
+// Feature: queue-home-delivery, Property 8: Complete bounded sticky traversal.
+#[tokio::test]
+async fn queue_home_delivery_live_sticky_query_plans() -> Result<()> {
+    if std::env::var_os("TOKEIRA_DSQL_TEST_DATABASE_URL").is_none() {
+        return Ok(());
+    }
+    let fixture = Fixture::connect(8).await?;
+    let home = ShardId(2_345_678);
+    let mut template =
+        crate::memory::projection_accumulator_tests::fresh_transition(RunKey::new()).next_state;
+    let mut keys = Vec::new();
+    let mut target = Vec::new();
+    for batch in 0..32 {
+        let mut rows = Vec::new();
+        for offset in 0..256 {
+            let index = batch * 256 + offset;
+            template.run_key = RunKey::new();
+            template.sticky = (index % 2 == 0).then(|| tokeira_types::StickyAffinity {
+                worker_identity: WorkerIdentity("plan-worker".into()),
+                sticky_queue: TaskQueueName("plan-sticky".into()),
+                schedule_to_start_timeout: Duration::seconds(30),
+            });
+            template
+                .pending_workflow_task
+                .as_mut()
+                .unwrap()
+                .schedule_to_start_deadline = template
+                .sticky
+                .as_ref()
+                .map(|_| OffsetDateTime::UNIX_EPOCH + Duration::seconds(30));
+            let assigned = if index < 2048 {
+                home
+            } else {
+                ShardId(home.0 + 1 + index % 64)
+            };
+            keys.push(template.run_key);
+            if assigned == home && template.sticky.is_some() {
+                target.push(template.run_key);
+            }
+            rows.push((assigned, template.clone()));
+        }
+        fixture.sticky_seed(&rows).await?;
+    }
+    target.sort();
+    let mut report = String::from(
+        "Sticky page plans: 8192 fixture rows; 1024 sticky rows in the selected home; limit 64.\n",
+    );
+    for offset in [0, 512, 960] {
+        let after = (offset > 0).then(|| target[offset - 1]);
+        let limit = std::num::NonZeroU32::new(64).unwrap();
+        let page = fixture
+            .repo()
+            .list_sticky_workflow_dispatch(home, after, limit)
+            .await?;
+        assert_eq!(
+            page.candidates
+                .iter()
+                .map(|row| row.incarnation.run_key)
+                .collect::<Vec<_>>(),
+            target[offset..offset + 64]
+        );
+        let mut builder = super::workflow_dispatch::sticky_page_query(home, after, limit);
+        let mut query = builder.build();
+        let arguments = query
+            .take_arguments()
+            .map_err(anyhow::Error::from_boxed)?
+            .expect("bound sticky page");
+        let mut explain =
+            sqlx::QueryBuilder::<sqlx::Postgres>::with_arguments("EXPLAIN ", arguments);
+        explain.push(query.sql().as_str());
+        let plan = explain
+            .build_query_as::<(String,)>()
+            .fetch_all(&fixture.pool)
+            .await?;
+        assert!(
+            plan.iter()
+                .any(|(line,)| line.contains("idx_workflow_dispatch_sticky_home")),
+            "{plan:#?}"
+        );
+        assert!(
+            plan.iter().any(|(line,)| line.contains("Index Cond:")
+                && line.contains("shard_id =")
+                && (after.is_none() || line.contains("run_key >"))),
+            "{plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|(line,)| line.contains("Index Cond:") && line.contains("run_key =")),
+            "payload fetch must use bounded primary-key lookups: {plan:#?}"
+        );
+        report.push_str(&format!("\nOffset {offset}:\n"));
+        for (line,) in plan {
+            report.push_str(&line);
+            report.push('\n');
+        }
+    }
+    for batch in keys.chunks(256) {
+        fixture.sticky_remove(batch).await?;
+    }
+    if let Some(path) = std::env::var_os("TOKEIRA_QUEUE_HOME_PLAN_OUTPUT") {
+        std::fs::write(path, report)?;
+    }
+    fixture.store.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn workflow_dispatch_live_query_plans() -> Result<()> {
     if std::env::var_os("TOKEIRA_DSQL_TEST_DATABASE_URL").is_none() {
@@ -322,6 +428,66 @@ impl Fixture {
 
 #[async_trait]
 impl Backend for Fixture {
+    async fn sticky_seed(&self, rows: &[(ShardId, WorkflowState)]) -> Result<()> {
+        let rows = rows
+            .iter()
+            .map(|(home, state)| {
+                let row = crate::derive_workflow_dispatch(state, *home)
+                    .expect("sticky traversal fixture has pending normal intent");
+                row.validate()?;
+                let priority = row
+                    .priority
+                    .as_ref()
+                    .map(codec::encode_priority)
+                    .transpose()?;
+                Ok((row, priority))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut query = sqlx::QueryBuilder::new(
+            "INSERT INTO workflow_dispatch (run_key, shard_id, queue_namespace, queue_name,
+             normal_queue_name, sticky, routing_mode, deployment, build_id, queue_key,
+             deployment_key, build_key, logical_seq, scheduled_at, priority_key, priority_data,
+             sticky_worker, schedule_to_start_deadline) ",
+        );
+        query.push_values(&rows, |mut values, (row, priority)| {
+            let [queue, deployment_key, build_key] = row.lookup_keys();
+            let (mode, deployment, build) = row.routing.coordinates();
+            values
+                .push_bind(row.incarnation.run_key.0)
+                .push_bind(DsqlRunRepository::shard_id_to_uuid(row.execution_home))
+                .push_bind(row.namespace_id.0)
+                .push_bind(&row.queue_name.0)
+                .push_bind(&row.normal_queue_name.0)
+                .push_bind(row.sticky)
+                .push_bind(mode)
+                .push_bind(deployment)
+                .push_bind(build)
+                .push_bind(queue)
+                .push_bind(deployment_key)
+                .push_bind(build_key)
+                .push_bind(i64::try_from(row.incarnation.logical_seq.0).unwrap())
+                .push_bind(row.scheduled_at)
+                .push_bind(row.priority_key)
+                .push_bind(priority)
+                .push_bind(row.sticky_worker.as_ref().map(|worker| worker.0.as_str()))
+                .push_bind(row.schedule_to_start_deadline);
+        });
+        let mut tx = self.pool.begin().await?;
+        query.build().execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn sticky_remove(&self, keys: &[RunKey]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM workflow_dispatch WHERE run_key=ANY($1)")
+            .bind(keys.iter().map(|key| key.0).collect::<Vec<_>>())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     fn repo(&self) -> &dyn RunRepository {
         self.store.run_repository()
     }
@@ -344,6 +510,17 @@ impl Backend for Fixture {
         tx.commit().await?;
         Ok(())
     }
+}
+
+#[test]
+fn queue_home_delivery_live_sticky_pages() {
+    if std::env::var_os("TOKEIRA_DSQL_TEST_DATABASE_URL").is_none() {
+        return;
+    }
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let fixture = runtime.block_on(Fixture::connect(8)).unwrap();
+    crate::workflow_dispatch_tests::run_sticky_page_cases(&fixture, &runtime);
+    runtime.block_on(fixture.store.shutdown()).unwrap();
 }
 
 #[test]

@@ -72,9 +72,9 @@
   <!-- index -->
   <rect x="1400" y="188" width="540" height="250" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
   <text x="1424" y="220" class="boxtitle">One shared index, two generations</text>
-  <text x="1424" y="248" class="mono">execution_visibility_current · _attr_index · _rollup</text>
-  <text x="1424" y="276" class="small">The archetype-aware generation: typed attribute index with</text>
-  <text x="1424" y="296" class="small">generations, rollups striped 16 ways by run key.</text>
+  <text x="1424" y="248" class="mono">execution_visibility_current · _attr_cell · _attr_value · _rollup</text>
+  <text x="1424" y="276" class="small">The archetype-aware generation: typed attribute cells at each</text>
+  <text x="1424" y="296" class="small">image's version, values once, rollups striped 16 ways.</text>
   <text x="1424" y="324" class="mono">vis_execution · vis_rollup — the legacy pair, still present</text>
   <text x="1424" y="352" class="small">Both live in DSQL beside the authoritative tables — visibility</text>
   <text x="1424" y="372" class="small">is SQL, not a second datastore.</text>

@@ -1223,29 +1223,29 @@ impl Fixture {
             versions.iter().map(|&version| version.to_owned()).collect(),
         ))
         .unwrap();
-        let mut elements = versions.to_vec();
-        elements.sort_unstable();
-        elements.dedup();
-        for element in elements {
-            sqlx::query(
-                "INSERT INTO execution_visibility_attr_index (namespace_id, run_key, attr_id, \
-                 attr_type, value_discriminator, keyword_value, value_data) \
-                 VALUES ($1, $2, $3, 1, $4, $4, $5)",
-            )
-            .bind(state.namespace_id.0)
-            .bind(state.run_key.0)
-            .bind(attr_id)
-            .bind(element)
-            .bind(&value)
-            .execute(&self.pool)
-            .await
-            .unwrap();
+        // The visibility store keeps the applied value once, at the row's version, and
+        // none for an empty list, which writes no cells for a workflow.
+        if versions.is_empty() {
+            return;
         }
+        sqlx::query(
+            "INSERT INTO execution_visibility_attr_value (namespace_id, run_key, \
+             authority_epoch, source_transition_seq, attr_id, attr_type, value_data) \
+             VALUES ($1, $2, 0, $3, $4, 1, $5)",
+        )
+        .bind(state.namespace_id.0)
+        .bind(state.run_key.0)
+        .bind(seq)
+        .bind(attr_id)
+        .bind(&value)
+        .execute(&self.pool)
+        .await
+        .unwrap();
     }
 
     async fn forget_applied_row(&self, state: &WorkflowState) {
         for statement in [
-            "DELETE FROM execution_visibility_attr_index WHERE namespace_id = $1 AND run_key = $2",
+            "DELETE FROM execution_visibility_attr_value WHERE namespace_id = $1 AND run_key = $2",
             "DELETE FROM execution_visibility_current \
              WHERE namespace_id = $1 AND archetype_id = 0 AND run_key = $2",
         ] {

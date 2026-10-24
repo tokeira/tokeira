@@ -37,6 +37,10 @@ transaction-size bounding, not a missing cross-table transaction.
 3. **Generation-pattern attr index** — one typed `execution_visibility_attr_index` whose **generation
    is the snapshot version** `(authority_epoch, source_transition_seq)` (Kiro Item 1), replacing
    `sa_current` + every `sa_*_idx`. Keep `sa_registry` for name → `(attr_id, attr_type)`.
+   V052 departed from this and replaced a run's attributes inside the apply's transaction, which DSQL
+   refuses past its row limit. `execution_visibility_attr_cell` and `execution_visibility_attr_value`
+   restore the generation pattern, with each attribute's value stored once per image
+   ([bounded-visibility-apply](../../bounded-visibility-apply/design.md)).
 4. **Partitioned checkpoints** — `projection_checkpoint(partition_id, last_applied_version)`.
 5. **Apply-iff-newer fenced OCC transaction** — gate on `(authority_epoch, source_transition_seq)`;
    row + rollup counters + generation flip in one narrow commit.
@@ -79,6 +83,10 @@ rows), far under the 3,000-row limit. Striping only avoids a hot counter row. Ro
 from `execution_visibility_current` (Requirement 10.8).
 
 ### H4 — Generation numbering (Kiro Item 1, correctness fix), justification, GC, crash-safety
+
+> [bounded-visibility-apply](../../bounded-visibility-apply/design.md) implements this section on
+> `execution_visibility_attr_cell`: rows keyed by the snapshot version, the flip in the guarded row
+> write, queries joined to the current version, and cleanup strictly below it.
 
 **Generation = the snapshot version, NOT `N = current+1`** (the must-fix gap). Attribute rows are
 written at `generation = (authority_epoch, source_transition_seq)` — the version of the snapshot being

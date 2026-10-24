@@ -36,8 +36,10 @@ not credentials; scope always comes from the handle, including for forged tokens
 Each call observes current projection state; concurrent changes may affect later pages.
 
 `VisibilityStore::list_component_executions` defaults to existing list mechanics. DSQL
-overrides it to hydrate indexed `value_data` joined to the namespace's attribute registry
-in the same read transaction as the row selection. The ordinary Temporal list keeps its
+overrides it to hydrate each attribute's value, stored once per image in
+`execution_visibility_attr_value` and read at the listed row's version
+([bounded-visibility-apply](../bounded-visibility-apply/design.md)), joined to the namespace's
+attribute registry in the same read transaction as the row selection. The ordinary Temporal list keeps its
 existing mapping. For non-workflow components, empty KeywordList/tokenless Text values
 get an index cell with no queryable typed value so the contribution is not lost. This
 uses existing columns and leaves workflow empty-value behavior unchanged.

@@ -1,0 +1,5 @@
+kind: fixed
+body: A run whose search attributes need thousands of index rows now appears in List and Count, instead of its visibility staying stale.
+time: 2026-10-24T19:17:09.019430+01:00
+custom:
+    Slice: dbbb7dc3-5f2c-4dd7-aeca-b9e0c993d58a

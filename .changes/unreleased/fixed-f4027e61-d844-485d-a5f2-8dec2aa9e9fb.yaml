@@ -1,0 +1,5 @@
+kind: fixed
+body: List and Count no longer miss transitions or stop updating, and the projection log no longer grows without bound.
+time: 2026-10-23T22:52:41.121898+01:00
+custom:
+    Slice: f4027e61-d844-485d-a5f2-8dec2aa9e9fb

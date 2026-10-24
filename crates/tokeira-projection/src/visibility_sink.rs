@@ -1,9 +1,8 @@
 //! Projection sink that materializes post-transition visibility snapshots.
 //!
 //! The sink is the write-side of the CQRS projection plane. It receives
-//! `ProjectionRecord`s from the projection worker, resolves search-attribute
-//! schemas, computes rollup deltas, and persists the results through the
-//! [`VisibilityStore`] trait.
+//! `ProjectionRecord`s from projectors, resolves search-attribute schemas, computes
+//! rollup deltas, and persists the results through the [`VisibilityStore`] trait.
 //!
 //! Rollup deltas are computed by [`compute_rollup_deltas`] so that aggregate
 //! counts (by status, workflow type, task queue) stay consistent without
@@ -118,15 +117,6 @@ where
         self.store
             .count_from_rollup(namespace_id, archetype_id, dimension)
             .await
-    }
-    async fn load_checkpoint(
-        &self,
-        partition_id: u32,
-    ) -> Result<Option<tokeira_types::ProjectionCursor>> {
-        self.store.load_checkpoint(partition_id).await
-    }
-    async fn save_checkpoint(&self, cursor: &tokeira_types::ProjectionCursor) -> Result<()> {
-        self.store.save_checkpoint(cursor).await
     }
     async fn resolve_attr(
         &self,

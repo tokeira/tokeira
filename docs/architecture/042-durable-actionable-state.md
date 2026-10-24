@@ -161,7 +161,7 @@ Every consequence a commit leaves behind, built from the code: each `DispatchOp`
 **Visibility.** Derived: `projection_log`, kept and redefined as an unordered set of unapplied, immutable images. Each row is a full image (`ProjectionRecord` in `crates/tokeira-storage/src/api.rs`).
 
 - *Today:* `projection_log` is read through a key cursor, and every commit reads the run's latest row for its accumulator (`insert_projection_log` in `crates/tokeira-storage/src/dsql/run_repository/commit.rs`). A commit that lands below the cursor is skipped.
-- *Discoverer · executor:* a projector per partition · a monotonic upsert (`upsert_execution_row` in `crates/tokeira-projection/src/dsql_store.rs`).
+- *Discoverer · executor:* a projector per partition, on the node that holds the partition's home bundle, `bundle_for_partition(partition, bundle_count)`, the home that also serves the partition's task queues · a monotonic upsert (`upsert_execution_row` in `crates/tokeira-projection/src/dsql_store.rs`).
 - *Incarnation · dedup identity:* `(authority_epoch, transition_seq)` · the strictly-newer guard.
 - *Remover · retry authority:* the projector deletes exactly the images it observed, once each is applied or dominated by an image it applied, and never a range. It is the named second writer, on rows no commit writes again · the projector.
 
@@ -242,6 +242,7 @@ never:     WHERE key > durable_cursor
 - **Queue-home ownership is for efficiency; it isn't a correctness fence.** While a queue moves between homes, both may discover and offer the same incarnation. The run's fenced start transition lets only one start commit, so no queue-home fencing is needed.
 - **Operations and timers** are found by their source's shard owner, through an index by shard and due time.
 - **The projector** runs the same passes over its partition. It deletes exactly the images it observed, once each is applied or dominated. A late image it never saw survives to the next pass, because every delete names a key the pass read. Deleting only successfully applied images would leak: an image dominated by a newer one is never applied, so it would never go.
+- **One projector per partition**, on the node that holds the partition's home bundle, while that home's acquisition lasts. Like queue-home ownership, it saves work and isn't a fence: while a home moves, two projectors may run one partition, and each apply reads the stored row in its own transaction, so the later of two applies of a run retries from a fresh read.
 
 ## Hand-off
 
@@ -344,7 +345,7 @@ The closer analogy is a level-triggered controller: an event prompts a look, and
 - **Derived rows** converge through the reconcile at acquisition, so a store written by an older release, or a rollback, is repaired before its shards serve.
 - **Intent rows** are written only by new close and reset transitions. Runs closed by an older release keep today's behaviour. A one-off repair can find their broken chains: continue-as-new runs without a successor, and parents waiting on closed children.
 - **The backlog** drains and retires once no node of an older release can run. Until then its writes must be idempotent: storing an entry whose identity is already held must not fail the batch.
-- **The projector** switches from the cursor to passes that apply and delete. Checkpoints go afterwards.
+- **The projector** switches from the cursor to passes that apply and delete, and nothing reads or writes the checkpoint ([projection-passes](../../.kiro/specs/projection-passes/bugfix.md)). Its table goes in a later migration, once no node of an earlier release can run.
 - **Mixed versions:** a node of an older release commits without writing these rows, just as a 0.5.1 node rewrites `workflow_hot` rows without updating the recovery flag. Either upgrade with every node stopped, or reconcile once the upgrade completes.
 
 ## Dependencies

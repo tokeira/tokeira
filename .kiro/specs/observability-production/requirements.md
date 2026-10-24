@@ -2,9 +2,9 @@
 
 ## Introduction
 
-Production-facing observability for the full Tokeira ECS deployment surface: `tokeirad` (edge, runtime, kernel, storage, and embedded projection workers), `tokeira-controller` (placement and routing), `tokeira-autoscaler` (scaling and retirement), projection workers (whether embedded in `tokeirad` or running as a future standalone process), and the supporting observability infrastructure services (Alloy, Mimir, Loki, Grafana, and optional trace backends).
+Production-facing observability for the full Tokeira ECS deployment surface: `tokeirad` (edge, runtime, kernel, storage, and embedded projectors), `tokeira-controller` (placement and routing), `tokeira-autoscaler` (scaling and retirement), projectors (whether embedded in `tokeirad` or running as a future standalone process), and the supporting observability infrastructure services (Alloy, Mimir, Loki, Grafana, and optional trace backends).
 
-This spec defines the production observability contract for Tokeira. It covers per-process telemetry endpoints, Prometheus scrape, optional OTLP push, structured logging, trace propagation and export, metric naming and cardinality governance, DSQL-specific operational metrics, placement controller metrics, autoscaler metrics, projection worker metrics, infrastructure health signals, health/readiness endpoints, dashboard provisioning, alerting rules, runbooks, and smoke tests.
+This spec defines the production observability contract for Tokeira. It covers per-process telemetry endpoints, Prometheus scrape, optional OTLP push, structured logging, trace propagation and export, metric naming and cardinality governance, DSQL-specific operational metrics, placement controller metrics, autoscaler metrics, projector metrics, infrastructure health signals, health/readiness endpoints, dashboard provisioning, alerting rules, runbooks, and smoke tests.
 
 This spec builds on two completed specs:
 
@@ -34,7 +34,7 @@ The following guidance applies to all new span and metric instrumentation in thi
 - **Storage_Layer**: The DSQL-backed persistence layer for histories, hot state, leases, visibility logs, and supporting tables.
 - **Placement_Controller**: The `tokeira-controller` binary that manages bundle placement, shard ownership, routing snapshots, connection budget allocation, and drain coordination.
 - **Autoscaler**: The `tokeira-autoscaler` binary that manages replica scaling, runtime scale-out, runtime retirement, and scale-in nomination.
-- **Projection_Worker**: A projection worker that reads committed transition records and applies visibility updates. Projection currently runs embedded in `tokeirad`; a standalone projection process is a future packaging concern.
+- **Projection_Worker**: A projector, which runs passes over one partition of the projection log, applying committed transition images to the visibility store and deleting the images it has finished with ([projection-passes](../projection-passes/bugfix.md)). Projectors currently run embedded in `tokeirad`; a standalone projection process is a future packaging concern.
 - **Export_Pipeline**: The subsystem responsible for exposing, pushing, and forwarding telemetry.
 - **Prometheus_Endpoint**: The HTTP `/metrics` endpoint that exposes metrics in Prometheus exposition format.
 - **OTLP_Exporter**: The OpenTelemetry Protocol exporter that pushes metrics or traces to a configured collector using gRPC or HTTP.
@@ -64,9 +64,9 @@ The following guidance applies to all new span and metric instrumentation in thi
 
 #### Acceptance Criteria
 
-1. THE `tokeirad`, `tokeira-controller`, `tokeira-autoscaler`, and projection workers SHALL each expose a Prometheus-compatible `/metrics` endpoint from the process that hosts them.
-2. THE `tokeirad`, `tokeira-controller`, `tokeira-autoscaler`, and projection workers SHALL each expose structured logs suitable for Alloy collection and Loki ingestion from the process that hosts them.
-3. THE `tokeirad`, `tokeira-controller`, `tokeira-autoscaler`, and projection workers SHALL each support trace context propagation and trace export when tracing is enabled.
+1. THE `tokeirad`, `tokeira-controller`, `tokeira-autoscaler`, and projectors SHALL each expose a Prometheus-compatible `/metrics` endpoint from the process that hosts them.
+2. THE `tokeirad`, `tokeira-controller`, `tokeira-autoscaler`, and projectors SHALL each expose structured logs suitable for Alloy collection and Loki ingestion from the process that hosts them.
+3. THE `tokeirad`, `tokeira-controller`, `tokeira-autoscaler`, and projectors SHALL each support trace context propagation and trace export when tracing is enabled.
 4. THE Alloy scrape configuration SHALL include one scrape job per process type with stable labels: `service`, `cluster`, `deployment`, `task_id`, and `node_id` where available.
 5. WHEN a process is unavailable, THE scrape target SHALL become visibly unhealthy through scrape metrics rather than being hidden by aggregation.
 6. THE Dashboard system SHALL include scrape health panels per process type.
@@ -332,20 +332,22 @@ The following guidance applies to all new span and metric instrumentation in thi
 
 ### Requirement 19: Projection Worker Observability
 
-**User Story:** As an operator, I want visibility into projection worker throughput, lag, cursor progression, and failure rates, so that I can detect when visibility freshness degrades and identify bottlenecks in the projection pipeline.
+**User Story:** As an operator, I want visibility into projector throughput, lag and failure rates, so that I can detect when visibility freshness degrades and identify bottlenecks in the projection pipeline.
+
+[projection-passes](../projection-passes/bugfix.md) replaced the worker's cursor and checkpoint with passes from the head of each partition (its criterion 2.12). The metrics of the cursor, its batches, its empty polls and its checkpoint went with them; criteria 2, 4 and 6-9 name what replaced them.
 
 #### Acceptance Criteria
 
-1. THE Projection_Worker SHALL add a bounded `outcome` label to the existing `tokeira_projection_records_processed_total` counter, which already has a `partition_id` label.
-2. THE Projection_Worker SHALL expose the existing projection lag gauge (`tokeira_projection_worker_lag_records`) with `partition_id` label reflecting the number of unprocessed records between the worker cursor and the latest committed transition.
-3. THE Projection_Worker SHALL expose the existing sink write duration histogram (`tokeira_projection_sink_write_duration_seconds`) with `partition_id` label recording the time to apply each batch to the visibility sink.
-4. THE Projection_Worker SHALL expose `tokeira_projection_worker_batch_records` histogram with `partition_id` label recording the number of records processed per batch.
+1. THE Projection_Worker SHALL add a bounded `outcome` label to the existing `tokeira_projection_records_processed_total` counter, which already has a `partition_id` label: `success` for a run whose newest image became its row, `skipped` for one already at least as new, `failure` for one whose apply failed.
+2. THE Projection_Worker SHALL expose `tokeira_projection_images_read_total` counter with `partition_id` label, counting the images each pass read. The log holds only images no pass has finished with, so its rate is the projection backlog.
+3. THE Projection_Worker SHALL expose the existing sink write duration histogram (`tokeira_projection_sink_write_duration_seconds`) with `partition_id` label recording the time to apply each image to the visibility sink.
+4. THE Projection_Worker SHALL expose `tokeira_projection_images_deleted_total` counter with `partition_id` label, counting the images each pass deleted.
 5. THE Projection_Worker SHALL add a bounded `error_kind` label to the existing projection sink error counter (`tokeira_projection_sink_error_total`), which already has a `partition_id` label.
-6. THE Projection_Worker SHALL expose `tokeira_projection_checkpoint_lag_seconds` gauge reflecting the time since the last successful checkpoint write.
-7. THE Projection_Worker SHALL expose `tokeira_projection_checkpoint_transition_sequence` gauge with `partition_id` label reflecting the latest persisted checkpoint sequence.
-8. THE Projection_Worker SHALL expose `tokeira_projection_latest_transition_sequence` gauge with `partition_id` label reflecting the latest known transition sequence available for projection.
-9. THE Projection_Worker SHALL expose `tokeira_projection_poll_empty_total` counter with `partition_id` label for empty projection polling cycles.
-10. THE Projection_Worker SHALL emit Structured_Log records for repeated sink failures and checkpoint write failures.
+6. THE Projection_Worker SHALL expose `tokeira_projection_oldest_image_age_seconds` gauge with `partition_id` label, reflecting on DSQL how long the oldest image a pass read had waited in the log.
+7. THE Projection_Worker SHALL expose `tokeira_projection_pass_failures_total` counter with `partition_id` label and a bounded `kind` label (`read`, `apply`, `delete`).
+8. THE Projection_Worker SHALL expose `tokeira_projection_pass_duration_seconds` histogram with `partition_id` label.
+9. Retired with the worker's empty polls: an idle pass reads nothing, and passes come a second apart.
+10. THE Projection_Worker SHALL emit Structured_Log records for failed reads, applies and deletes.
 
 ### Requirement 20: Infrastructure Service Health Metrics
 
@@ -374,7 +376,7 @@ The following guidance applies to all new span and metric instrumentation in thi
 4. THE `/readyz` endpoint for `tokeirad` SHALL fail if storage is unavailable, required routing ownership is absent, or critical runtime loops are not running.
 5. THE `/readyz` endpoint for `tokeira-controller` SHALL fail if the controller cannot read or write placement state.
 6. THE `/readyz` endpoint for `tokeira-autoscaler` SHALL fail if the autoscaler cannot query Mimir or reach required ECS control-plane APIs.
-7. THE `/readyz` endpoint for the process hosting projection workers SHALL fail if those workers cannot read projection input or write checkpoints.
+7. THE `/readyz` endpoint for the process hosting projectors SHALL fail if those projectors cannot read projection input.
 8. THE health and readiness endpoints SHALL NOT require authentication on the task-local health port used by ECS health checks.
 9. THE health and readiness endpoints SHALL NOT expose secrets, connection strings, or raw dependency errors in response bodies.
 
@@ -388,10 +390,10 @@ The following guidance applies to all new span and metric instrumentation in thi
 2. THE Dashboard system SHALL provision a "DSQL Connection Health" dashboard displaying reservoir ready connections, in-flight connections, utilization ratio, target connections, rate-limiter tokens, throttle duration, class-budget saturation, connection errors, refill errors, and leak suspects.
 3. THE Dashboard system SHALL provision an "OCC Contention" dashboard displaying conflict rates by operation, retry attempt histograms, retry exhaustion, commit duration percentiles, and top contended operation classes.
 4. THE Dashboard system SHALL update or provision a "Broker Runtime Health" dashboard displaying poll admission, broker dispatch, lane queue depth, lane processing duration, task completion outcomes, and `NotShardOwner` errors.
-5. THE Dashboard system SHALL update or provision a "Storage Projection Health" dashboard displaying migration events, DSQL statement-level duration breakdowns, projection lag, projection throughput, and checkpoint health.
+5. THE Dashboard system SHALL update or provision a "Storage Projection Health" dashboard displaying migration events, DSQL statement-level duration breakdowns, projection lag, projection throughput, and pass duration.
 6. THE Dashboard system SHALL provision a "Placement Controller" dashboard displaying membership node count, routing snapshot size, bundle ownership churn rate, generation CAS success/failure rates, placement loop duration percentiles, drain active nodes, routing publish outcomes, and budget allocation outcomes.
 7. THE Dashboard system SHALL provision an "Autoscaler" dashboard displaying loop durations by type, scaling decisions by direction/reason, desired vs actual replica counts, metric freshness age, stale metric events, nomination outcomes, active reconciler lease state, and Mimir query latency.
-8. THE Dashboard system SHALL provision a "Projection Workers" dashboard displaying records processed rate by partition, projection lag by partition, batch apply duration percentiles, sink error rates, checkpoint lag, and checkpoint sequence progression.
+8. THE Dashboard system SHALL provision a "Projection Workers" dashboard displaying records processed rate by partition, the age of the oldest image a pass read by partition, sink write duration percentiles, sink error rates, and pass failures by kind.
 9. THE Dashboard system SHALL provision an "Infrastructure Health" dashboard as described by Requirement 20.
 10. WHEN a new dashboard JSON file is added to the platform dashboard directory, THE Compose_Platform SHALL automatically provision it in Grafana on the next `tkr infra apply`.
 11. WHEN dashboard provisioning fails, THE platform apply operation SHALL surface the failure clearly and SHALL NOT silently ignore invalid dashboard JSON.

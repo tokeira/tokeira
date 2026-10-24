@@ -27,10 +27,10 @@ use tokeira_kernel::{
 };
 use tokeira_types::{
     ArchetypeId, BuildId as RuntimeBuildId, DeploymentId, EventPrincipal, ExecutionRef,
-    ExecutionStatus, GenerationCounter, Memo, NamespaceId, Payload, Payloads, ProjectionCursor,
-    QueueKey, RequestId, RunId, RunKey, SearchAttrValue, SearchAttributes, ShardEpoch, ShardId,
-    TaskKind, TaskQueueName, TransitionSeq, VisibilityLifecycleState, WorkerIdentity,
-    WorkerTaskOrigin, WorkflowId, WorkflowRuleRecord, WorkflowType,
+    ExecutionStatus, GenerationCounter, Memo, NamespaceId, Payload, Payloads, QueueKey, RequestId,
+    RunId, RunKey, SearchAttrValue, SearchAttributes, ShardEpoch, ShardId, TaskKind, TaskQueueName,
+    TransitionSeq, VisibilityLifecycleState, WorkerIdentity, WorkerTaskOrigin, WorkflowId,
+    WorkflowRuleRecord, WorkflowType,
 };
 use uuid::Uuid;
 
@@ -2094,18 +2094,39 @@ pub fn workflow_is_open_and_pinned_to_version(
         })
 }
 
-/// Read-only interface for projection workers.
+/// The projection log as projectors see it (`projection-passes`).
 ///
-/// Projection sinks consume a partitioned log of complete post-transition
-/// visibility snapshots. The log remains partitioned by run so workers can
-/// checkpoint incrementally, but each record is self-contained and does not
-/// require replaying prior projection deltas.
+/// Every commit adds a complete post-transition visibility image of its run, and
+/// nothing rewrites one. A projector reads a partition a page at a time, in
+/// `(run_key, transition_seq)` order, and deletes exactly the images it read once
+/// their runs' visibility rows are at least as new. Run keys are hashes, so
+/// commits arrive in no key order: a reader holds its position for one pass only,
+/// and the next pass starts at the head again, where any late image waits.
 #[async_trait]
 pub trait ProjectionLog: Send + Sync {
-    /// Read projection records from `cursor` forward,
-    /// returning at most `limit` records and an
-    /// updated cursor for the next call.
-    async fn read_from(&self, cursor: &ProjectionCursor, limit: usize) -> Result<ProjectionBatch>;
+    /// Read at most `limit` images of the partition after `after`, or from its head
+    /// when `after` is `None`, in `(run_key, transition_seq)` order.
+    async fn read_page(
+        &self,
+        partition_id: u32,
+        fanout: u16,
+        after: Option<ProjectionImageKey>,
+        limit: usize,
+    ) -> Result<ProjectionPage>;
+
+    /// Delete exactly the named images of the partition, and return how many went.
+    /// A key that is already gone deletes nothing.
+    ///
+    /// The in-memory store keeps the latest image of a run whose stored state is
+    /// unseeded, whatever it is asked: that image seeds the run's accumulator at its
+    /// next load (`projection-passes` criterion 2.4). On DSQL the load seeds from the
+    /// newer of the image and the applied visibility value instead.
+    async fn delete_images(
+        &self,
+        partition_id: u32,
+        fanout: u16,
+        keys: &[ProjectionImageKey],
+    ) -> Result<u64>;
 }
 
 /// One row in the projection log, grouping all
@@ -2638,14 +2659,34 @@ pub struct ProjectionRecord {
     pub context: ProjectionContext,
 }
 
-/// A page of projection records returned by
-/// [`ProjectionLog::read_from`].
+impl ProjectionRecord {
+    /// The image's place in its partition of the projection log.
+    pub fn key(&self) -> ProjectionImageKey {
+        ProjectionImageKey {
+            run_key: self.run_key,
+            transition_seq: self.transition_seq,
+        }
+    }
+}
+
+/// An image's place in its partition of the projection log, which orders images by
+/// run key, then by transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProjectionImageKey {
+    /// The run the image belongs to.
+    pub run_key: RunKey,
+    /// The transition that produced the image.
+    pub transition_seq: tokeira_types::TransitionSeq,
+}
+
+/// A page of one partition's images, returned by [`ProjectionLog::read_page`].
 #[derive(Clone, Debug, PartialEq)]
-pub struct ProjectionBatch {
-    /// The projection records in this page.
-    pub records: Vec<ProjectionRecord>,
-    /// Cursor to pass into the next `read_from` call.
-    pub next_cursor: ProjectionCursor,
+pub struct ProjectionPage {
+    /// The images, in `(run_key, transition_seq)` order.
+    pub images: Vec<ProjectionRecord>,
+    /// When the page's oldest image was written, where the log records it: DSQL's
+    /// `created_at`. The in-memory log records no time.
+    pub oldest_written_at: Option<time::OffsetDateTime>,
 }
 
 /// Lease repository for shard or bundle ownership.
@@ -3192,8 +3233,23 @@ impl<T> ProjectionLog for std::sync::Arc<T>
 where
     T: ProjectionLog + ?Sized,
 {
-    async fn read_from(&self, cursor: &ProjectionCursor, limit: usize) -> Result<ProjectionBatch> {
-        (**self).read_from(cursor, limit).await
+    async fn read_page(
+        &self,
+        partition_id: u32,
+        fanout: u16,
+        after: Option<ProjectionImageKey>,
+        limit: usize,
+    ) -> Result<ProjectionPage> {
+        (**self).read_page(partition_id, fanout, after, limit).await
+    }
+
+    async fn delete_images(
+        &self,
+        partition_id: u32,
+        fanout: u16,
+        keys: &[ProjectionImageKey],
+    ) -> Result<u64> {
+        (**self).delete_images(partition_id, fanout, keys).await
     }
 }
 

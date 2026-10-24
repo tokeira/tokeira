@@ -231,13 +231,21 @@ label_enum! {
 }
 
 label_enum! {
-    /// Bounded projection sink/checkpoint error categories.
+    /// Bounded projection sink error categories.
     pub enum ProjectionErrorKindLabel {
         Storage => "storage",
         Sink => "sink",
         Serialization => "serialization",
-        Checkpoint => "checkpoint",
         Unknown => "unknown",
+    }
+}
+
+label_enum! {
+    /// The step of a projector's pass that failed.
+    pub enum ProjectionFailureKindLabel {
+        Read => "read",
+        Apply => "apply",
+        Delete => "delete",
     }
 }
 
@@ -406,8 +414,10 @@ mod tests {
                 ProjectionErrorKindLabel::Serialization.as_str(),
                 "serialization",
             ),
-            (ProjectionErrorKindLabel::Checkpoint.as_str(), "checkpoint"),
             (ProjectionErrorKindLabel::Unknown.as_str(), "unknown"),
+            (ProjectionFailureKindLabel::Read.as_str(), "read"),
+            (ProjectionFailureKindLabel::Apply.as_str(), "apply"),
+            (ProjectionFailureKindLabel::Delete.as_str(), "delete"),
             (QueryDispatchPathLabel::Direct.as_str(), "direct"),
             (QueryDispatchPathLabel::Buffered.as_str(), "buffered"),
             (QueryDispatchOutcomeLabel::Published.as_str(), "published"),

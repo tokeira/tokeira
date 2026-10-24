@@ -17,14 +17,12 @@ pub enum ApplyOutcome {
 
 /// Projection sink contract.
 ///
-/// A sink should be idempotent with respect to replay of the same record. The
-/// worker intentionally provides records in log order for a partition/fanout
-/// stream, but operational reality means restarts and retries still happen.
+/// A sink applies images in any order and any number of times: an image becomes the
+/// stored row only when it is strictly newer, by `(authority_epoch,
+/// transition_seq)`, so a repeat or an older image changes nothing. Projectors rely
+/// on that, applying only each run's newest image in a page, and so do CHASM's
+/// direct applies and its visibility repair.
 #[async_trait]
 pub trait ProjectionSink: Send + Sync {
     async fn apply(&self, record: &ProjectionRecord, partition_id: u32) -> Result<ApplyOutcome>;
-
-    // TODO(projection): add batched apply once the SQL sink exists.
-    // TODO(projection): add checkpoint persistence hooks for sinks that want to
-    // own their own cursor durability.
 }

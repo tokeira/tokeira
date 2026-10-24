@@ -17,7 +17,7 @@ optimistic and ownership fences, and exposes ordered projection records.
 | Workflow authority | `RunRepository`, `CommitResult`, request deduplication, transition audit, run deletion and purge, reset successor materialization |
 | Ownership | `LeaseRepository`, `ControlRepository`, `BundleLease`, `LeaseOutcome` |
 | Derived work | Dispatchable workflow/activity tasks, durable backlog, timer and timeout sweep records |
-| Projection feed | `ProjectionLog`, `ProjectionRecord`, partitioned `ProjectionCursor` batches |
+| Projection feed | `ProjectionLog`, `ProjectionRecord`, a partition's `ProjectionPage`s in key order, deletes by `ProjectionImageKey` |
 | CHASM | `ChasmNodeRepository`, atomic dirty-node batches, `ExpectedVersion`, archetype-keyed current-execution pointers, `CurrentExecution` scans |
 | Worker control | Deployment, task-queue configuration, provenance, and Worker Compute repository contracts |
 | Connections | `ConnectionDirector`, operation-class `DbClass`, admitted `DbPermit` values |

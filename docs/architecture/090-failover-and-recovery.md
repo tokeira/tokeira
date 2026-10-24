@@ -108,8 +108,8 @@ The projection plane is designed to lag safely.
 
 If a projector crashes:
 
-1. restart worker,
-2. read from last sink/substream checkpoint,
+1. the node that holds its partition's home starts it again, or another node does once it holds that home,
+2. its first pass starts at the head of the partition, where every image no pass has finished with still is,
 3. reapply idempotently,
 4. continue.
 
@@ -199,7 +199,7 @@ Recovery is a good fit for formalization. Interesting invariants include:
 - one owner per shard epoch,
 - no double start for one logical task sequence,
 - every durable pending task is rediscoverable,
-- projector checkpoints are prefixes,
+- a projector deletes an image only once its run's visibility row is at least as new,
 - stale completions do not mutate state.
 
 This is a natural place for TLA+ or Stateright work later.

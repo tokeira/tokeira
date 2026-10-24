@@ -321,7 +321,7 @@ Expected response:
 Expected response:
 
 1. ECS replaces the task,
-2. projector restarts from its last durable checkpoint,
+2. projectors start on the nodes that now hold their partitions' homes, from the head of each partition,
 3. lag grows temporarily but correctness is unaffected.
 
 ### DSQL pressure spike

@@ -16,9 +16,9 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokeira_storage::ProjectionRecord;
 use tokeira_types::{
-    ArchetypeId, ExecutionStatus, Memo, NamespaceId, ProjectionCursor, RunId, RunKey,
-    SearchAttrValue, SearchAttributes, TaskQueueName, TransitionSeq, VisibilityLifecycleState,
-    WorkflowId, WorkflowType,
+    ArchetypeId, ExecutionStatus, Memo, NamespaceId, RunId, RunKey, SearchAttrValue,
+    SearchAttributes, TaskQueueName, TransitionSeq, VisibilityLifecycleState, WorkflowId,
+    WorkflowType,
 };
 use uuid::Uuid;
 
@@ -364,7 +364,7 @@ impl ExecutionRow {
 
 /// Return true when an incoming visibility version can replace `current`.
 ///
-/// Projection workers may retry or observe records out of order. Comparing the
+/// Projectors may retry or observe records out of order. Comparing the
 /// authority epoch first and source transition second enforces the design rule
 /// that a retired producer cannot regress a row owned by a newer authority, and
 /// that duplicate records from the same authority are idempotent no-ops.
@@ -676,10 +676,6 @@ pub(crate) fn text_search_tokens(text: &str) -> Vec<String> {
         out.insert(token);
     }
     out.into_iter().collect()
-}
-
-pub fn beginning_cursor() -> ProjectionCursor {
-    ProjectionCursor::beginning(0, 1)
 }
 
 #[cfg(test)]

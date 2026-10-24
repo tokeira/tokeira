@@ -197,6 +197,13 @@ THE next new-reader load SHALL seed from that image under criteria 2.7-2.12.
 SHALL treat it as non-durable for deletion eligibility, including after a no-op or
 an unsuccessful commit.
 
+projection-passes meets this on both stores. The in-memory store decides from the
+stored state, which a load never changes: a run stays unseeded there, and keeps its
+latest image, until a successful transition writes the section. On DSQL the
+projector deletes an image only once its run's visibility row is at least as new,
+and a load seeds from that row (criterion 2.7), so deletion never depends on a
+loaded seed.
+
 2.16 WHEN ready state is encoded, THE codec SHALL persist the accumulator in
 state-extension tag **3**, including an empty list, with the positional state
 layout and envelope version unchanged.
@@ -255,6 +262,13 @@ history accounting and growth thresholds.
 
 4.1 WHILE legacy writers or rollback to them remain permitted, THE deleting system
 SHALL retain the latest projection image of every extant run.
+
+projection-passes meets this with its release gate (its criterion 2.13). The
+release that first deletes images carries a migration past the previous release's
+maximum readable version, so a node of any release that checks its schema at
+startup refuses to run against it, and a rollback to such a release is refused the
+same way. Releases before that check refuse nothing, so the release says to upgrade
+with every node stopped.
 
 4.2 WHILE an extant run is not durably ready, THE deleting system SHALL retain its
 latest projection image, or on DSQL the applied visibility row of that image, even

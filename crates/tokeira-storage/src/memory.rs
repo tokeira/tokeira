@@ -15,6 +15,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    ops::Bound,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
@@ -30,9 +31,8 @@ use tokeira_kernel::{
     WorkflowState, merge_priority,
 };
 use tokeira_types::{
-    ExecutionRef, ExecutionStatus, GenerationCounter, NamespaceId, ProjectionCursor, QueueKey,
-    RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, TransitionSeq, WorkflowId,
-    WorkflowRuleRecord,
+    ExecutionRef, ExecutionStatus, GenerationCounter, NamespaceId, QueueKey, RequestId, RunId,
+    RunKey, ShardEpoch, ShardId, TaskKind, TransitionSeq, WorkflowId, WorkflowRuleRecord,
 };
 use tokio::sync::Mutex;
 
@@ -50,9 +50,9 @@ use crate::{
         ConnectionDirector, ControlRepository, CurrentExecutionConflictPolicy, DbClass, DbPermit,
         DeleteRunRequest, DeleteRunResult, DeploymentCasResult, DeploymentKey, DeploymentName,
         DispatchableActivityTask, DispatchableWorkflowTask, DueActivityDispatch, DueTimer,
-        GenerationAdvanceResult, LeaseFenceLost, LeaseOutcome, LeaseRepository, ProjectionBatch,
-        ProjectionLog, ProjectionRecord, ProvenancePut, RequestRecord, RunBulkWrite,
-        RunHistoryStats, RunRepository, StaleTimer, StoredTaskQueueConfig,
+        GenerationAdvanceResult, LeaseFenceLost, LeaseOutcome, LeaseRepository, ProjectionImageKey,
+        ProjectionLog, ProjectionPage, ProjectionRecord, ProvenancePut, RequestRecord,
+        RunBulkWrite, RunHistoryStats, RunRepository, StaleTimer, StoredTaskQueueConfig,
         StoredTaskQueueConfigKey, StoredWorkerDeployment, TaskQueueConfigCasResult,
         TaskQueueConfigRepository, TransitionAuditRecord, WorkerDeploymentRepository,
         WorkerDeploymentVersionKey, WorkerTaskProvenance, WorkerTaskProvenanceError,
@@ -171,16 +171,14 @@ struct StoreState {
     request_dedupe: HashMap<(NamespaceId, String, String), RequestRecord>,
     /// Test/admin transition audit records.
     transition_audit: HashMap<RunKey, Vec<TransitionAuditRecord>>,
-    /// Projection records awaiting projection workers.
-    projection_log: Vec<ProjectionRecord>,
-    /// Disposable cursor-to-log-position index for projection reads.
+    /// Projection images awaiting projectors, in the DSQL log's key order.
+    projection_log: BTreeMap<ProjectionLogKey, ProjectionRecord>,
+    /// Disposable pointer to the latest projection image of each run.
     ///
     /// Keeping this outside the snapshot document avoids duplicating durable
     /// state. Restore reconstructs it from `projection_log` before the store is
     /// exposed.
-    projection_cursor_offsets: HashMap<(u32, u16, RunKey, TransitionSeq), usize>,
-    /// Disposable pointer to the latest projection image for each run.
-    latest_projection_offsets: HashMap<RunKey, usize>,
+    latest_projection_keys: HashMap<RunKey, ProjectionLogKey>,
     /// Counts actual image lookups without changing the production path.
     #[cfg(test)]
     projection_image_lookups: AtomicUsize,
@@ -340,58 +338,103 @@ impl StoreState {
     }
 
     fn append_projection_record(&mut self, record: ProjectionRecord) {
-        let offset = self.projection_log.len();
-        self.projection_cursor_offsets.insert(
-            (
-                record.partition_id,
-                record.fanout,
-                record.run_key,
-                record.transition_seq,
-            ),
-            offset,
-        );
-        self.latest_projection_offsets
-            .insert(record.run_key, offset);
-        self.projection_log.push(record);
+        let key = projection_log_key(&record);
+        self.latest_projection_keys.insert(record.run_key, key);
+        self.projection_log.insert(key, record);
     }
 
     fn rebuild_projection_indexes(&mut self) {
-        self.projection_cursor_offsets.clear();
-        self.latest_projection_offsets.clear();
-        for (offset, record) in self.projection_log.iter().enumerate() {
-            self.projection_cursor_offsets.insert(
-                (
-                    record.partition_id,
-                    record.fanout,
-                    record.run_key,
-                    record.transition_seq,
-                ),
-                offset,
-            );
-            self.latest_projection_offsets
-                .insert(record.run_key, offset);
+        self.latest_projection_keys.clear();
+        // Key order puts each run's images in transition order, so the last one
+        // seen is the run's latest.
+        for key in self.projection_log.keys() {
+            self.latest_projection_keys.insert(key.2, *key);
         }
-    }
-
-    fn projection_read_start(&self, cursor: &ProjectionCursor) -> usize {
-        let Some(transition_seq) = cursor.last_transition_seq else {
-            return 0;
-        };
-        let Some(run_key) = cursor.last_run_key else {
-            return self.projection_log.len();
-        };
-        self.projection_cursor_offsets
-            .get(&(cursor.partition_id, cursor.fanout, run_key, transition_seq))
-            .map_or(self.projection_log.len(), |offset| offset + 1)
     }
 
     fn latest_projection(&self, run_key: RunKey) -> Option<&ProjectionRecord> {
         #[cfg(test)]
         self.projection_image_lookups
             .fetch_add(1, Ordering::Relaxed);
-        self.latest_projection_offsets
+        self.latest_projection_keys
             .get(&run_key)
-            .and_then(|offset| self.projection_log.get(*offset))
+            .and_then(|key| self.projection_log.get(key))
+    }
+
+    /// The latest image of `run_key`, without counting a lookup.
+    #[cfg(test)]
+    fn latest_image(&self, run_key: RunKey) -> Option<&ProjectionRecord> {
+        self.latest_projection_keys
+            .get(&run_key)
+            .and_then(|key| self.projection_log.get(key))
+    }
+
+    fn projection_page(
+        &self,
+        partition_id: u32,
+        fanout: u16,
+        after: Option<ProjectionImageKey>,
+        limit: usize,
+    ) -> Vec<ProjectionRecord> {
+        let start = match after {
+            Some(after) => {
+                Bound::Excluded((partition_id, fanout, after.run_key, after.transition_seq))
+            }
+            None => Bound::Included((
+                partition_id,
+                fanout,
+                RunKey(uuid::Uuid::nil()),
+                TransitionSeq(0),
+            )),
+        };
+        let end = Bound::Included((
+            partition_id,
+            fanout,
+            RunKey(uuid::Uuid::from_u128(u128::MAX)),
+            TransitionSeq(u64::MAX),
+        ));
+        self.projection_log
+            .range((start, end))
+            .take(limit)
+            .map(|(_, record)| record.clone())
+            .collect()
+    }
+
+    /// Delete the named images, except the latest image of a run whose stored state
+    /// is unseeded: its next load seeds the run's accumulator from that image
+    /// (`projection-passes` criterion 2.4).
+    fn delete_projection_images(
+        &mut self,
+        partition_id: u32,
+        fanout: u16,
+        keys: &[ProjectionImageKey],
+    ) -> u64 {
+        let mut deleted = 0;
+        for image in keys {
+            let key = (partition_id, fanout, image.run_key, image.transition_seq);
+            let latest = self.latest_projection_keys.get(&image.run_key) == Some(&key);
+            let unseeded = self
+                .runs
+                .get(&image.run_key)
+                .is_some_and(|state| state.used_worker_deployment_versions.is_none());
+            if (latest && unseeded) || self.projection_log.remove(&key).is_none() {
+                continue;
+            }
+            deleted += 1;
+            if latest {
+                let run_images = (partition_id, fanout, image.run_key, TransitionSeq(0))
+                    ..=(partition_id, fanout, image.run_key, TransitionSeq(u64::MAX));
+                match self.projection_log.range(run_images).next_back() {
+                    Some((newest, _)) => {
+                        self.latest_projection_keys.insert(image.run_key, *newest);
+                    }
+                    None => {
+                        self.latest_projection_keys.remove(&image.run_key);
+                    }
+                }
+            }
+        }
+        deleted
     }
 }
 
@@ -885,8 +928,7 @@ impl SnapshotDoc {
             request_dedupe,
             transition_audit,
             projection_log,
-            projection_cursor_offsets: _,
-            latest_projection_offsets: _,
+            latest_projection_keys: _,
             #[cfg(test)]
                 projection_image_lookups: _,
             bundle_leases,
@@ -939,7 +981,7 @@ impl SnapshotDoc {
             history_principals: sorted_pairs(history_principals),
             request_dedupe: sorted_pairs(request_dedupe),
             transition_audit: sorted_pairs(transition_audit),
-            projection_log: projection_log.clone(),
+            projection_log: projection_log.values().cloned().collect(),
             bundle_leases: sorted_pairs(bundle_leases),
             routing_generation: *routing_generation,
             budget_version: *budget_version,
@@ -990,9 +1032,13 @@ impl SnapshotDoc {
             history_principals: self.history_principals.into_iter().collect(),
             request_dedupe: self.request_dedupe.into_iter().collect(),
             transition_audit: self.transition_audit.into_iter().collect(),
-            projection_log: self.projection_log,
-            projection_cursor_offsets: HashMap::new(),
-            latest_projection_offsets: HashMap::new(),
+            // Any order restores: the log's key order is the map's.
+            projection_log: self
+                .projection_log
+                .into_iter()
+                .map(|record| (projection_log_key(&record), record))
+                .collect(),
+            latest_projection_keys: HashMap::new(),
             #[cfg(test)]
             projection_image_lookups: AtomicUsize::new(0),
             bundle_leases: self.bundle_leases.into_iter().collect(),
@@ -2916,36 +2962,28 @@ impl TaskQueueConfigRepository for InMemoryStore {
 
 #[async_trait]
 impl ProjectionLog for InMemoryStore {
-    async fn read_from(&self, cursor: &ProjectionCursor, limit: usize) -> Result<ProjectionBatch> {
+    async fn read_page(
+        &self,
+        partition_id: u32,
+        fanout: u16,
+        after: Option<ProjectionImageKey>,
+        limit: usize,
+    ) -> Result<ProjectionPage> {
         let store = self.inner.lock().await;
-        let mut out = Vec::new();
-        // Empty polls dominate steady-state projection traffic. Resolving the
-        // cursor through the derived offset map starts at the unconsumed
-        // suffix instead of rescanning the whole log while holding the same
-        // lock used by authoritative commits.
-        let start = store.projection_read_start(cursor);
-        for record in &store.projection_log[start..] {
-            if record.partition_id != cursor.partition_id || record.fanout != cursor.fanout {
-                continue;
-            }
-            out.push(record.clone());
-            if out.len() >= limit {
-                break;
-            }
-        }
-        let next_cursor = match out.last() {
-            Some(last) => ProjectionCursor {
-                partition_id: cursor.partition_id,
-                fanout: cursor.fanout,
-                last_run_key: Some(last.run_key),
-                last_transition_seq: Some(last.transition_seq),
-            },
-            None => cursor.clone(),
-        };
-        Ok(ProjectionBatch {
-            records: out,
-            next_cursor,
+        Ok(ProjectionPage {
+            images: store.projection_page(partition_id, fanout, after, limit),
+            oldest_written_at: None,
         })
+    }
+
+    async fn delete_images(
+        &self,
+        partition_id: u32,
+        fanout: u16,
+        keys: &[ProjectionImageKey],
+    ) -> Result<u64> {
+        let mut store = self.inner.lock().await;
+        Ok(store.delete_projection_images(partition_id, fanout, keys))
     }
 }
 
@@ -3155,6 +3193,18 @@ impl ConnectionDirector for InMemoryStore {
     async fn acquire(&self, class: DbClass) -> Result<DbPermit> {
         Ok(DbPermit { class })
     }
+}
+
+/// A projection image's place in the log: partition, fanout, run key, transition.
+type ProjectionLogKey = (u32, u16, RunKey, TransitionSeq);
+
+fn projection_log_key(record: &ProjectionRecord) -> ProjectionLogKey {
+    (
+        record.partition_id,
+        record.fanout,
+        record.run_key,
+        record.transition_seq,
+    )
 }
 
 fn partition_for(run_key: RunKey) -> u32 {
@@ -3997,42 +4047,31 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn projection_cursor_indexes_preserve_pagination_after_snapshot_restore() {
-        let store = InMemoryStore::default();
-        let run_a = RunKey(uuid::Uuid::from_u128(1));
-        let other_partition = RunKey(uuid::Uuid::from_u128(2));
-        let run_b = RunKey(uuid::Uuid::from_u128(17));
+    fn image_keys(page: &ProjectionPage) -> Vec<(RunKey, TransitionSeq)> {
+        page.images
+            .iter()
+            .map(|record| (record.run_key, record.transition_seq))
+            .collect()
+    }
 
-        let CommitResult::Applied {
-            new_state: mut run_a_state,
-        } = store
-            .commit_transition(run_a, start_transition(run_a), WriteFence::Unfenced)
-            .await
-            .unwrap()
-        else {
-            panic!("first projection transition must apply");
+    fn image_key(run_key: RunKey, transition_seq: u64) -> ProjectionImageKey {
+        ProjectionImageKey {
+            run_key,
+            transition_seq: TransitionSeq(transition_seq),
+        }
+    }
+
+    async fn commit_second_transition(store: &InMemoryStore, run_key: RunKey) {
+        let LoadedRun::Existing(mut state) = store.load_run(run_key).await.unwrap() else {
+            panic!("the run exists");
         };
+        state.transition_seq = state.transition_seq.next();
         store
             .commit_transition(
-                other_partition,
-                start_transition(other_partition),
-                WriteFence::Unfenced,
-            )
-            .await
-            .unwrap();
-        store
-            .commit_transition(run_b, start_transition(run_b), WriteFence::Unfenced)
-            .await
-            .unwrap();
-
-        run_a_state.transition_seq = run_a_state.transition_seq.next();
-        store
-            .commit_transition(
-                run_a,
+                run_key,
                 Transition {
                     expected_seq: TransitionSeq(1),
-                    next_state: run_a_state,
+                    next_state: state,
                     history_events: Default::default(),
                     event_principals: Default::default(),
                     request_dedupe_ops: Default::default(),
@@ -4046,35 +4085,276 @@ mod tests {
             )
             .await
             .unwrap();
+    }
 
-        let cursor = ProjectionCursor {
-            partition_id: 1,
-            fanout: 1,
-            last_run_key: Some(run_a),
-            last_transition_seq: Some(TransitionSeq(1)),
-        };
-        let batch = store.read_from(&cursor, 10).await.unwrap();
+    // `projection-passes` criterion 2.1: a partition's images are read in DSQL's key
+    // order, whatever order they were committed in, before and after a snapshot.
+    #[tokio::test]
+    async fn projection_pages_follow_key_order_across_snapshot_restore() {
+        let store = InMemoryStore::default();
+        let run_b = RunKey(uuid::Uuid::from_u128(17));
+        let other_partition = RunKey(uuid::Uuid::from_u128(2));
+        let run_a = RunKey(uuid::Uuid::from_u128(1));
+        for run_key in [run_b, other_partition, run_a] {
+            store
+                .commit_transition(run_key, start_transition(run_key), WriteFence::Unfenced)
+                .await
+                .unwrap();
+        }
+        commit_second_transition(&store, run_a).await;
+
+        let whole = store.read_page(1, 1, None, 10).await.unwrap();
         assert_eq!(
-            batch
-                .records
-                .iter()
-                .map(|record| (record.run_key, record.transition_seq))
-                .collect::<Vec<_>>(),
-            vec![(run_b, TransitionSeq(1)), (run_a, TransitionSeq(2))]
+            image_keys(&whole),
+            vec![
+                (run_a, TransitionSeq(1)),
+                (run_a, TransitionSeq(2)),
+                (run_b, TransitionSeq(1)),
+            ]
+        );
+        assert_eq!(whole.oldest_written_at, None);
+        let first = store.read_page(1, 1, None, 2).await.unwrap();
+        let rest = store
+            .read_page(1, 1, Some(first.images[1].key()), 2)
+            .await
+            .unwrap();
+        assert_eq!(image_keys(&first), image_keys(&whole)[..2]);
+        assert_eq!(image_keys(&rest), image_keys(&whole)[2..]);
+        assert!(
+            store
+                .read_page(1, 1, None, 0)
+                .await
+                .unwrap()
+                .images
+                .is_empty()
         );
 
         let restored = InMemoryStore::from_snapshot(&store.snapshot().await.unwrap()).unwrap();
-        assert_eq!(restored.read_from(&cursor, 10).await.unwrap(), batch);
-        let inner = restored.inner.lock().await;
+        assert_eq!(restored.read_page(1, 1, None, 10).await.unwrap(), whole);
         assert_eq!(
-            inner.projection_cursor_offsets.len(),
-            inner.projection_log.len()
-        );
-        assert_eq!(
-            inner
+            restored
+                .inner
+                .lock()
+                .await
                 .latest_projection(run_a)
                 .map(|record| record.transition_seq),
             Some(TransitionSeq(2))
+        );
+    }
+
+    // `projection-passes` criterion 3.5: snapshots carry the log as a list, and any
+    // order of that list restores the same log.
+    #[tokio::test]
+    async fn a_snapshot_log_restores_in_any_order() {
+        let store = InMemoryStore::default();
+        let run_keys = [17, 1, 33].map(|key| RunKey(uuid::Uuid::from_u128(key)));
+        for run_key in run_keys {
+            store
+                .commit_transition(run_key, start_transition(run_key), WriteFence::Unfenced)
+                .await
+                .unwrap();
+            commit_second_transition(&store, run_key).await;
+        }
+        let state = store.inner.lock().await;
+        let mut doc = SnapshotDoc::capture(&state);
+        doc.projection_log.reverse();
+        let restored = doc.into_state();
+
+        assert_eq!(restored.projection_log, state.projection_log);
+        assert_eq!(
+            restored.latest_projection_keys,
+            state.latest_projection_keys
+        );
+    }
+
+    // `projection-passes` criteria 2.3 and 2.4: a delete removes exactly the named
+    // images, a key already gone deletes nothing, and the latest image of a run whose
+    // stored state is unseeded stays until the run is ready.
+    #[tokio::test]
+    async fn deleting_images_keeps_only_an_unseeded_runs_latest_image() {
+        let store = InMemoryStore::default();
+        let ready = RunKey(uuid::Uuid::from_u128(1));
+        let unseeded = RunKey(uuid::Uuid::from_u128(17));
+        let untouched = RunKey(uuid::Uuid::from_u128(33));
+        for run_key in [ready, unseeded, untouched] {
+            store
+                .commit_transition(run_key, start_transition(run_key), WriteFence::Unfenced)
+                .await
+                .unwrap();
+            commit_second_transition(&store, run_key).await;
+        }
+        store
+            .inner
+            .lock()
+            .await
+            .runs
+            .get_mut(&unseeded)
+            .unwrap()
+            .used_worker_deployment_versions = None;
+        let named = [
+            image_key(ready, 1),
+            image_key(ready, 2),
+            image_key(unseeded, 1),
+            image_key(unseeded, 2),
+        ];
+
+        assert_eq!(store.delete_images(1, 1, &named).await.unwrap(), 3);
+        assert_eq!(store.delete_images(1, 1, &named).await.unwrap(), 0);
+        assert_eq!(
+            image_keys(&store.read_page(1, 1, None, 10).await.unwrap()),
+            vec![
+                (unseeded, TransitionSeq(2)),
+                (untouched, TransitionSeq(1)),
+                (untouched, TransitionSeq(2)),
+            ]
+        );
+        {
+            let inner = store.inner.lock().await;
+            assert_eq!(inner.latest_image(ready), None);
+            assert_eq!(
+                inner
+                    .latest_image(unseeded)
+                    .map(|record| record.transition_seq),
+                Some(TransitionSeq(2))
+            );
+        }
+        let LoadedRun::Existing(loaded) = store.load_run(unseeded).await.unwrap() else {
+            panic!("the unseeded run exists");
+        };
+        assert!(loaded.used_worker_deployment_versions.is_some());
+
+        store
+            .inner
+            .lock()
+            .await
+            .runs
+            .get_mut(&unseeded)
+            .unwrap()
+            .used_worker_deployment_versions = Some(Vec::new());
+        assert_eq!(
+            store
+                .delete_images(1, 1, &[image_key(unseeded, 2), image_key(untouched, 1)])
+                .await
+                .unwrap(),
+            2
+        );
+        let inner = store.inner.lock().await;
+        assert_eq!(inner.latest_image(unseeded), None);
+        assert_eq!(
+            inner
+                .latest_image(untouched)
+                .map(|record| record.transition_seq),
+            Some(TransitionSeq(2))
+        );
+    }
+
+    /// Commit the run's next transition, carrying `versions` as its accumulator.
+    async fn commit_with_versions(store: &InMemoryStore, run_key: RunKey, versions: Vec<String>) {
+        let mut transition = start_transition(run_key);
+        if let LoadedRun::Existing(state) = store.load_run(run_key).await.unwrap() {
+            transition.expected_seq = state.transition_seq;
+            transition.next_state = state;
+            transition.next_state.transition_seq = transition.expected_seq.next();
+        }
+        transition.next_state.used_worker_deployment_versions = Some(versions);
+        store
+            .commit_transition(run_key, transition, WriteFence::Unfenced)
+            .await
+            .unwrap();
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        // Feature: projection-passes, Property 2: Deleting is safe
+        // Whatever images a projector asks the store to delete, every unseeded run
+        // keeps its latest image, and its next load seeds that image's list.
+        #[test]
+        fn prop_deletes_keep_every_unseeded_runs_seed(
+            runs in prop::collection::vec(
+                (1u64..=3, prop::collection::vec("[a-c]", 0..4), any::<bool>()),
+                1..6,
+            ),
+            rounds in prop::collection::vec(prop::collection::vec(any::<prop::sample::Index>(), 0..8), 1..4),
+        ) {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let store = InMemoryStore::default();
+                let mut expected = Vec::new();
+                let mut keys = Vec::new();
+                for (index, (transitions, versions, unseeded)) in runs.iter().enumerate() {
+                    // Run keys ending in 1 put every run in partition 1.
+                    let run_key = RunKey(uuid::Uuid::from_u128(index as u128 * 16 + 1));
+                    for transition_seq in 1..=*transitions {
+                        let seen = versions.len().min(transition_seq as usize);
+                        commit_with_versions(&store, run_key, versions[..seen].to_vec()).await;
+                        keys.push(image_key(run_key, transition_seq));
+                    }
+                    let seen = versions.len().min(*transitions as usize);
+                    expected.push((run_key, *transitions, versions[..seen].to_vec(), *unseeded));
+                }
+                // Runs restored from a snapshot an earlier release wrote are unseeded.
+                let store = InMemoryStore::from_snapshot(&store.snapshot().await.unwrap()).unwrap();
+                for (run_key, _, _, unseeded) in &expected {
+                    if *unseeded {
+                        store.inner.lock().await.runs.get_mut(run_key).unwrap()
+                            .used_worker_deployment_versions = None;
+                    }
+                }
+                for round in &rounds {
+                    let named = round.iter().map(|index| *index.get(&keys)).collect::<Vec<_>>();
+                    store.delete_images(1, 1, &named).await.unwrap();
+                    for (run_key, transitions, versions, unseeded) in &expected {
+                        if !*unseeded {
+                            continue;
+                        }
+                        let latest = store.inner.lock().await.latest_image(*run_key)
+                            .map(|record| record.transition_seq);
+                        prop_assert_eq!(latest, Some(TransitionSeq(*transitions)));
+                        let LoadedRun::Existing(loaded) = store.load_run(*run_key).await.unwrap() else {
+                            return Err(TestCaseError::fail("the run exists"));
+                        };
+                        prop_assert_eq!(loaded.used_worker_deployment_versions.as_ref(), Some(versions));
+                    }
+                }
+                Ok(())
+            })?;
+        }
+    }
+
+    // Deleting a run's latest image leaves its newest remaining image as the latest.
+    #[tokio::test]
+    async fn deleting_a_latest_image_points_at_the_newest_left() {
+        let store = InMemoryStore::default();
+        let run_key = RunKey(uuid::Uuid::from_u128(1));
+        store
+            .commit_transition(run_key, start_transition(run_key), WriteFence::Unfenced)
+            .await
+            .unwrap();
+        commit_second_transition(&store, run_key).await;
+
+        assert_eq!(
+            store
+                .delete_images(1, 1, &[image_key(run_key, 2)])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .inner
+                .lock()
+                .await
+                .latest_image(run_key)
+                .map(|record| record.transition_seq),
+            Some(TransitionSeq(1))
+        );
+        assert_eq!(
+            store
+                .delete_images(2, 1, &[image_key(run_key, 1)])
+                .await
+                .unwrap(),
+            0,
+            "a key names its partition"
         );
     }
 
@@ -7227,7 +7507,7 @@ mod tests {
                 prop_assert!(inner.activity_dispatch.keys().all(|(candidate, _)| *candidate != run_key));
                 prop_assert!(inner.dispatch_backlog.iter().all(|entry| entry.run_key != run_key));
                 prop_assert!(!inner.bulk_writes.contains_key(&run_key));
-                prop_assert_eq!(inner.projection_log.last(), Some(&tombstone));
+                prop_assert_eq!(inner.latest_image(run_key), Some(&tombstone));
                 Ok(())
             })?;
         }

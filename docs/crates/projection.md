@@ -14,7 +14,7 @@ state.
 
 | Area | Representative contracts |
 |---|---|
-| Consumption | `ProjectionWorker`, `ProjectionLog`, per-partition checkpoints, cancellation and retry |
+| Consumption | `Projector` passes over `ProjectionLog`: each run's newest image, named deletes, backoff and pacing, cancellation |
 | Application | `ProjectionSink`, `VisibilitySink`, monotonic version checks, deletion tombstones |
 | Storage API | `VisibilityStore`, `InMemoryVisibilityStore`, feature-gated `DsqlVisibilityStore` |
 | Query API | `VisibilityApi`, `VisibilityQueryService`, workflow and standalone-activity list/count types |

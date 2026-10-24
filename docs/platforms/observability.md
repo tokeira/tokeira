@@ -20,7 +20,7 @@ Each production process exposes:
 - `/readyz`: readiness as JSON. Required dependency or loop failures return a
   non-2xx response.
 
-Projection workers currently run embedded in `tokeirad`, so projection metrics
+Projectors currently run embedded in `tokeirad`, so projection metrics
 are exposed through the `tokeirad` endpoint and are identified by the
 `tokeira_projection_*` metric prefix. A standalone projection process can add
 its own endpoint later without changing metric names.

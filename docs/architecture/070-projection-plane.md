@@ -90,6 +90,8 @@ Tenant-specific or product-specific indexes that should not contaminate the cano
 
 ## Checkpoint model
 
+For canonical visibility, [projection-passes](../../.kiro/specs/projection-passes/bugfix.md) replaced this model. Run keys are hashes, so a cursor over them skipped every transition committed below it. Projectors run passes from the head of each partition, apply each run's newest image, and delete the images they have finished with; nothing reads or writes a checkpoint, and the log holds only images no pass has finished with ([042](042-durable-actionable-state.md)). The model below stays as written for other sinks.
+
 Each sink should keep an independent checkpoint per substream:
 
 ```text
@@ -152,7 +154,7 @@ This matters because it keeps the architecture open-ended without making the ent
 
 ## Apply loop
 
-A sink worker should operate roughly like this:
+Canonical visibility runs the passes described under [Checkpoint model](#checkpoint-model) instead. A sink worker should operate roughly like this:
 
 1. read next batch from one substream after checkpoint,
 2. apply idempotently to sink storage,

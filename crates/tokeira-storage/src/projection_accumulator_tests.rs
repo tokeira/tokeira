@@ -206,10 +206,7 @@ pub(crate) fn legacy_step(
 
 async fn memory_legacy_step(store: &InMemoryStore, key: RunKey, observation: &Observation) {
     let mut durable = store.inner.lock().await;
-    let previous = durable
-        .latest_projection_offsets
-        .get(&key)
-        .map(|offset| &durable.projection_log[*offset].context);
+    let previous = durable.latest_image(key).map(|record| &record.context);
     let (state, context) = legacy_step(
         &durable.runs[&key],
         previous,
@@ -367,7 +364,7 @@ proptest! {
                 if image_case != 0 {
                     durable.append_projection_record(record.clone());
                     // An invalid stored index/row must not seed a different run.
-                    durable.latest_projection_offsets.insert(key, 0);
+                    durable.latest_projection_keys.insert(key, projection_log_key(&record));
                 }
             }
             let result = store.load_run_with_stats(key).await;
@@ -410,7 +407,7 @@ proptest! {
                     assert_eq!(store.load_run(key).await.unwrap(), LoadedRun::Existing(new_state.clone()));
                     let durable = store.inner.lock().await;
                     assert_eq!(durable.runs[&key], new_state);
-                    assert_eq!(durable.projection_log.last().unwrap().context, expected);
+                    assert_eq!(durable.latest_image(key).unwrap().context, expected);
                     assert_eq!(durable.projection_image_lookups.load(Ordering::Relaxed), 0);
                     drop(durable);
                     transition = following(&new_state);
@@ -578,7 +575,7 @@ proptest! {
                         {
                             let mut durable = store.inner.lock().await;
                             assert_eq!(durable.runs[&key].used_worker_deployment_versions, Some(Vec::new()));
-                            assert!(!durable.projection_log.iter().any(|row| row.run_key == key));
+                            assert!(!durable.projection_log.values().any(|row| row.run_key == key));
                             if generation == 1 {
                                 // A reset produced by an old writer has no tag or image.
                                 durable.runs.get_mut(&key).unwrap().used_worker_deployment_versions = None;
@@ -592,7 +589,7 @@ proptest! {
                         let new_state = applied(commit(&store, transition, bundle, WriteFence::Unfenced).await.unwrap());
                         let current_version = if change { "deployment:v3" } else if generation == 0 { "deployment:v2" } else { "deployment:v1" };
                         assert_eq!(new_state.used_worker_deployment_versions, Some(vec![current_version.into()]));
-                        assert_eq!(store.inner.lock().await.projection_log.last().unwrap().context, expected);
+                        assert_eq!(store.inner.lock().await.latest_image(key).unwrap().context, expected);
                         predecessor = key;
                     }
                 }
@@ -636,7 +633,7 @@ proptest! {
                     assert_eq!(store.snapshot().await.unwrap(), before_load);
                     let (previous, history_size) = {
                         let durable = store.inner.lock().await;
-                        (durable.latest_projection_offsets.get(&key).map(|offset| durable.projection_log[*offset].context.clone()), durable.history_size.get(&key).copied().unwrap_or(0))
+                        (durable.latest_image(key).map(|record| record.context.clone()), durable.history_size.get(&key).copied().unwrap_or(0))
                     };
                     let mut transition = following(&state);
                     observe(&mut transition.next_state, observation);
@@ -649,7 +646,7 @@ proptest! {
                         assert_eq!(applied.used_worker_deployment_versions, Some(image_versions(&expected)));
                         assert_eq!(store.inner.lock().await.runs[&key], applied);
                     }
-                    assert_eq!(store.inner.lock().await.projection_log.last().unwrap().context, expected);
+                    assert_eq!(store.inner.lock().await.latest_image(key).unwrap().context, expected);
                     let persisted = store.snapshot().await.unwrap();
                     store = InMemoryStore::from_snapshot(&persisted).unwrap();
                     let LoadedRun::Existing(loaded) = store.load_run(key).await.unwrap() else { panic!("restored") };
@@ -672,7 +669,7 @@ proptest! {
                     let control = applied(commit(&store, transition.clone(), bundle, WriteFence::Unfenced).await.unwrap());
                     let after_prune = applied(commit(&pruned, transition, bundle, WriteFence::Unfenced).await.unwrap());
                     assert_eq!(control, after_prune);
-                    assert_eq!(store.inner.lock().await.projection_log.last().unwrap().context, pruned.inner.lock().await.projection_log.last().unwrap().context);
+                    assert_eq!(store.inner.lock().await.latest_image(key).unwrap().context, pruned.inner.lock().await.latest_image(key).unwrap().context);
                 }
 
                 let unseeded = InMemoryStore::from_snapshot(&persisted).unwrap();

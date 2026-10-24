@@ -98,8 +98,11 @@ mod tests {
             .is_ok()
         );
         assert!(
-            validate_metric_name("tokeira_projection_worker_lag_records", MetricType::Gauge)
-                .is_ok()
+            validate_metric_name(
+                "tokeira_projection_oldest_image_age_seconds",
+                MetricType::Gauge
+            )
+            .is_ok()
         );
         assert!(validate_metric_name("tokeira_build_info", MetricType::Gauge).is_ok());
     }

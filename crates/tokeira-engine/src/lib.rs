@@ -253,8 +253,8 @@ use tokeira_observability::{
     ErrorClassLabel, OwnershipOutcomeLabel, SchemaOutcomeLabel, record_embedded_lifecycle,
 };
 use tokeira_projection::{
-    DsqlVisibilityStore, InMemoryVisibilityStore, ProjectionSink, ProjectionWorker, SearchAttrType,
-    VisibilityQueryService, VisibilitySink, VisibilityStore,
+    DsqlVisibilityStore, InMemoryVisibilityStore, ProjectionSink, ProjectorHome,
+    ProjectorSupervisor, SearchAttrType, VisibilityQueryService, VisibilitySink, VisibilityStore,
 };
 use tokeira_runtime::{
     ChannelDemandObservationSink, ChannelWorkerComputeReconcileSink,
@@ -287,8 +287,8 @@ use tokeira_storage::{
     },
 };
 use tokeira_types::{
-    ExecutionRef, IncarnationId, NamespaceId, NodeEndpoint, PlacementConfig, ProjectionCursor,
-    SearchAttrValue, ShardEpoch, ShardId, WorkflowId,
+    ExecutionRef, IncarnationId, NamespaceId, NodeEndpoint, PlacementConfig, SearchAttrValue,
+    ShardEpoch, ShardId, WorkflowId,
 };
 
 /// Nexus-endpoint bootstrap target used by the dev startup path. Kept in the
@@ -2240,7 +2240,7 @@ pub struct TokeiradHandle {
     /// Cancellation token for background workers spawned by the facade.
     ///
     /// Kept alongside the server task so that dropping the handle cancels the
-    /// membership client, routing subscription, projection workers, and
+    /// membership client, routing subscription, projectors, and
     /// schedule engine in lockstep with the gRPC server shutdown.
     background_cancel: CancellationToken,
     log_broadcast: broadcast::Sender<LogEvent>,
@@ -3737,25 +3737,26 @@ where
         .with_declared_search_attributes(declared.clone()),
     );
 
-    for partition_id in 0..effective_config.infrastructure.placement.partition_count {
-        let projection_worker = ProjectionWorker {
-            log: projection_log.clone(),
-            sink: projection_sink(),
-            batch_size: 256,
-        };
-        let projection_cancel = background_cancel.clone();
-        let _projection_worker = engine_tasks.spawn(async move {
-            if let Err(error) = projection_worker
-                .run_from_cursor(
-                    projection_cancel,
-                    ProjectionCursor::beginning(partition_id, 1),
-                )
-                .await
-            {
-                tracing::warn!(?error, partition_id, "projection worker exited");
+    // One projector per partition in the deployment: this node runs a partition's
+    // projector while it holds the partition's home bundle, as it serves the
+    // partition's task queues (`projection-passes` criterion 2.5).
+    let projectors = ProjectorSupervisor {
+        log: projection_log.clone(),
+        sink: projection_sink.clone(),
+        partitions: effective_config.infrastructure.placement.partition_count,
+        fanout: 1,
+        page_size: tokeira_projection::PAGE_SIZE,
+        homes: {
+            let runtime = runtime.clone();
+            move |partition| {
+                runtime.partition_home(partition).map(|home| ProjectorHome {
+                    generation: home.generation,
+                    cancel: home.cancel,
+                })
             }
-        });
-    }
+        },
+    };
+    let _projectors = engine_tasks.spawn(projectors.run(background_cancel.clone()));
 
     let nexus_http_waiters = tokeira_edge::nexus_http::NexusHttpWaiterRegistry::default();
     let workflow_service =

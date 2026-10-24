@@ -3,7 +3,7 @@
 //! Implements the engine's [`VisibilitySink`] hook by converting a component's
 //! typed [`VisibilitySnapshot`] into a projection [`ProjectionRecord`] and applying
 //! it to the shared visibility store through the same [`ProjectionSink`] the
-//! workflow projection worker uses. The write happens post-commit, **off the
+//! workflow projector uses. The write happens post-commit, **off the
 //! correctness path** (Requirement 10.15; design.md "writes the snapshot to the
 //! shared visibility store"; `reference/DECISION-visibility-engine-adapter.md`).
 //!

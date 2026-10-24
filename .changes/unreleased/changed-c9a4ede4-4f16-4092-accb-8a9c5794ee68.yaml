@@ -1,0 +1,5 @@
+kind: changed
+body: Projection metrics now describe passes, replacing the checkpoint and worker lag metrics, and the ProjectionCheckpointLag alert is now ProjectionLagHigh.
+time: 2026-10-23T23:26:49.000000+01:00
+custom:
+    Slice: c9a4ede4-4f16-4092-accb-8a9c5794ee68

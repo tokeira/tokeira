@@ -44,9 +44,9 @@ pub use labels::{
     AutoscalerLoopLabel, BoundedLabel, ClusterStatusLabel, ControllerCasOutcomeLabel, DbClassLabel,
     EmbeddedOperationLabel, EmbeddedStorageModeLabel, ErrorClassLabel, NominationOutcomeLabel,
     NotShardOwnerOperationLabel, OutcomeLabel, OwnershipOutcomeLabel, ProjectionErrorKindLabel,
-    ProjectionOutcomeLabel, QueryBufferOutcomeLabel, QueryDispatchOutcomeLabel,
-    QueryDispatchPathLabel, RetryOutcomeLabel, ScalingDirectionLabel, SchemaOutcomeLabel,
-    ServiceLabel, StorageOperationLabel, bounded_metric_label,
+    ProjectionFailureKindLabel, ProjectionOutcomeLabel, QueryBufferOutcomeLabel,
+    QueryDispatchOutcomeLabel, QueryDispatchPathLabel, RetryOutcomeLabel, ScalingDirectionLabel,
+    SchemaOutcomeLabel, ServiceLabel, StorageOperationLabel, bounded_metric_label,
 };
 pub use manifest::{
     FORBIDDEN_METRIC_LABEL_NAMES, LANE_ID_LABEL, LabelCardinality, LabelDescriptor, ManifestError,

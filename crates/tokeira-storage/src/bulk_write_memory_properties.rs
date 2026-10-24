@@ -581,7 +581,7 @@ async fn the_first_transaction_changes_the_pointer_state_and_record() {
             // closed run has no dispatch row.
             rows: 4,
             bytes: crate::codec::encode_projection_context(
-                &inner.projection_log.last().unwrap().context
+                &inner.latest_image(run.run_key).unwrap().context
             )
             .unwrap()
             .len(),

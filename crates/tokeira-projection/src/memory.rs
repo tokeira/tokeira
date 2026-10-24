@@ -13,9 +13,7 @@ use std::{
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use tokeira_storage::ProjectionRecord;
-use tokeira_types::{
-    ArchetypeId, NamespaceId, ProjectionCursor, RunKey, SearchAttrValue, VisibilityLifecycleState,
-};
+use tokeira_types::{ArchetypeId, NamespaceId, RunKey, SearchAttrValue, VisibilityLifecycleState};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -57,7 +55,6 @@ struct VisibilityState {
     sa_text_idx: HashMap<(NamespaceId, AttrId, String), HashSet<RunKey>>,
     rollups: HashMap<(NamespaceId, ArchetypeId, RollupDimension, String), i64>,
     registry: HashMap<(NamespaceId, String), AttrDescriptor>,
-    checkpoints: HashMap<u32, ProjectionCursor>,
     next_attr_id: u64,
 }
 
@@ -371,25 +368,6 @@ impl VisibilityStore for InMemoryVisibilityStore {
             total_count,
             groups,
         })
-    }
-
-    async fn load_checkpoint(&self, partition_id: u32) -> Result<Option<ProjectionCursor>> {
-        Ok(self
-            .inner
-            .lock()
-            .await
-            .checkpoints
-            .get(&partition_id)
-            .cloned())
-    }
-
-    async fn save_checkpoint(&self, cursor: &ProjectionCursor) -> Result<()> {
-        self.inner
-            .lock()
-            .await
-            .checkpoints
-            .insert(cursor.partition_id, cursor.clone());
-        Ok(())
     }
 
     async fn resolve_attr(
@@ -929,21 +907,6 @@ mod tests {
     };
     use uuid::Uuid;
 
-    fn arb_projection_cursor() -> impl Strategy<Value = ProjectionCursor> {
-        (
-            0u32..100,
-            1u16..64,
-            proptest::option::of(any::<u128>().prop_map(|v| RunKey(Uuid::from_u128(v)))),
-            proptest::option::of(any::<u64>().prop_map(TransitionSeq)),
-        )
-            .prop_map(|(pid, fanout, rk, ts)| ProjectionCursor {
-                partition_id: pid,
-                fanout,
-                last_run_key: rk,
-                last_transition_seq: ts,
-            })
-    }
-
     fn arb_status() -> impl Strategy<Value = ExecutionStatus> {
         prop_oneof![
             Just(ExecutionStatus::Running),
@@ -1380,38 +1343,6 @@ mod tests {
             .await
             .unwrap();
         assert!(result.rows.is_empty());
-    }
-
-    // Feature: projection-visibility, Property 15:
-    // Checkpoint Round-Trip
-    // **Validates: Requirements 9.1, 9.2**
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
-        #[test]
-        fn prop_checkpoint_round_trip(
-            cursor in arb_projection_cursor(),
-        ) {
-            let rt =
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-            rt.block_on(async {
-                let store =
-                    InMemoryVisibilityStore::default();
-                store
-                    .save_checkpoint(&cursor)
-                    .await
-                    .unwrap();
-                let loaded = store
-                    .load_checkpoint(cursor.partition_id)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                prop_assert_eq!(loaded, cursor);
-                Ok(())
-            })?;
-        }
     }
 
     // Feature: projection-visibility, Property 3:

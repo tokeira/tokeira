@@ -8,8 +8,8 @@ use tokeira_edge::{
     record_grpc_request_duration, set_grpc_active_requests,
 };
 use tokeira_projection::{
-    LAG_RECORDS, RECORDS_PROCESSED_TOTAL, SINK_WRITE_DURATION_SECONDS, record_records_processed,
-    record_sink_write_duration, set_projection_lag,
+    OLDEST_IMAGE_AGE_SECONDS, RECORDS_PROCESSED_TOTAL, SINK_WRITE_DURATION_SECONDS,
+    record_records_processed, record_sink_write_duration, set_oldest_image_age,
 };
 use tokeira_runtime::{
     BROKER_PUBLISH_TOTAL, BROKER_QUEUE_DEPTH, LANE_SUBMIT_DURATION_SECONDS, record_broker_publish,
@@ -26,7 +26,7 @@ enum MetricOp {
     EdgeActive(u16),
     EdgeDuration(u16),
     ProjectionProcessed(u8),
-    ProjectionLag(u16),
+    ProjectionOldestImageAge(u16),
     ProjectionSinkDuration(u16),
 }
 
@@ -68,7 +68,7 @@ fn op_strategy() -> impl Strategy<Value = MetricOp> {
         (0u16..1000).prop_map(MetricOp::EdgeActive),
         (1u16..1000).prop_map(MetricOp::EdgeDuration),
         (1u8..20).prop_map(MetricOp::ProjectionProcessed),
-        (0u16..1000).prop_map(MetricOp::ProjectionLag),
+        (0u16..1000).prop_map(MetricOp::ProjectionOldestImageAge),
         (1u16..1000).prop_map(MetricOp::ProjectionSinkDuration),
     ]
 }
@@ -90,7 +90,7 @@ proptest! {
         let mut edge_active = None::<f64>;
         let mut edge_duration_count = 0usize;
         let mut projection_processed_total = 0u64;
-        let mut projection_lag = None::<f64>;
+        let mut projection_oldest_image_age = None::<f64>;
         let mut projection_sink_write_count = 0usize;
 
         with_local_recorder(&recorder, || {
@@ -138,9 +138,10 @@ proptest! {
                         record_records_processed(7, count as usize);
                         projection_processed_total += count as u64;
                     }
-                    MetricOp::ProjectionLag(value) => {
-                        set_projection_lag(7, value as usize);
-                        projection_lag = Some(value as f64);
+                    MetricOp::ProjectionOldestImageAge(ms) => {
+                        let age = std::time::Duration::from_millis(ms as u64);
+                        set_oldest_image_age(7, age);
+                        projection_oldest_image_age = Some(age.as_secs_f64());
                     }
                     MetricOp::ProjectionSinkDuration(ms) => {
                         record_sink_write_duration(
@@ -203,9 +204,9 @@ proptest! {
                 DebugValue::Counter(projection_processed_total)
             );
         }
-        if let Some(expected) = projection_lag {
+        if let Some(expected) = projection_oldest_image_age {
             assert_eq!(
-                snapshot.get(LAG_RECORDS).unwrap().1,
+                snapshot.get(OLDEST_IMAGE_AGE_SECONDS).unwrap().1,
                 DebugValue::Gauge(expected.into())
             );
         }

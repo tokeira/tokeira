@@ -1801,7 +1801,7 @@
     {
       "id": 43,
       "type": "timeseries",
-      "title": "Projection Throughput And Lag",
+      "title": "Projection Throughput And Backlog",
       "datasource": {
         "type": "prometheus",
         "uid": "mimir"
@@ -1812,8 +1812,8 @@
           "legendFormat": "partition {{partition_id}} processed/s"
         },
         {
-          "expr": "sum by (partition_id) (tokeira_projection_worker_lag_records)",
-          "legendFormat": "partition {{partition_id}} lag"
+          "expr": "sum by (partition_id) (rate(tokeira_projection_images_read_total[5m]))",
+          "legendFormat": "partition {{partition_id}} read/s"
         }
       ],
       "fieldConfig": {
@@ -1837,7 +1837,7 @@
         "x": 0,
         "y": 143
       },
-      "description": "Projection processing rate and record-count lag by partition. Lag should converge to zero after bursts.",
+      "description": "Images applied and images read per second by partition. A pass reads only images no pass has finished with, so the read rate is the backlog, and it should fall back towards the applied rate after bursts.",
       "options": {
         "tooltip": {
           "mode": "multi",
@@ -2033,14 +2033,14 @@
     {
       "id": 48,
       "type": "timeseries",
-      "title": "Checkpoint Write Latency",
+      "title": "Projection Pass Duration",
       "datasource": {
         "type": "prometheus",
         "uid": "mimir"
       },
       "targets": [
         {
-          "expr": "tokeira_projection_checkpoint_write_duration_seconds{quantile=\"0.95\"}",
+          "expr": "tokeira_projection_pass_duration_seconds{quantile=\"0.95\"}",
           "legendFormat": "partition {{partition_id}} p95"
         }
       ],
@@ -2065,7 +2065,7 @@
         "x": 0,
         "y": 161
       },
-      "description": "Projection cursor checkpoint write latency by partition.",
+      "description": "Time for one projection pass over its partition, from its head to its end, by partition.",
       "options": {
         "tooltip": {
           "mode": "multi",

@@ -161,8 +161,8 @@ The authoritative architecture documents are [005-decisions-and-boundaries](../.
 
 #### Acceptance Criteria
 
-1. WHEN a projection worker processes a batch, THE Projection SHALL increment `tokeira_projection_records_processed_total` with label `partition_id`.
-2. THE Projection SHALL record `tokeira_projection_lag_records` as a gauge reflecting the number of unprocessed projection log records per partition, with label `partition_id`.
+1. WHEN a projection pass applies images, THE Projection SHALL increment `tokeira_projection_records_processed_total` with label `partition_id`.
+2. THE Projection SHALL report each pass's images read as `tokeira_projection_images_read_total`, and on DSQL the age of the oldest image a pass read as the gauge `tokeira_projection_oldest_image_age_seconds`, each with label `partition_id`. These replace the record-count lag gauge, which counted records behind a cursor that [projection-passes](../projection-passes/bugfix.md) retired.
 3. WHEN a visibility sink write completes, THE Projection SHALL record `tokeira_projection_sink_write_duration_seconds` as a histogram with label `partition_id`.
 4. WHEN a visibility sink write fails, THE Projection SHALL increment `tokeira_projection_sink_error_total` with label `partition_id`.
 

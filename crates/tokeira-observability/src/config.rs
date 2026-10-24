@@ -52,7 +52,7 @@ pub struct ProcessObservabilityConfig {
 
 /// Stable service labels used by process metadata and scrape labels.
 ///
-/// Projection does not appear as a Phase 1 service because projection workers
+/// Projection does not appear as a Phase 1 service because projectors
 /// currently run embedded in `tokeirad`; their metrics are distinguished by the
 /// `tokeira_projection_*` prefix on the same scrape target.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

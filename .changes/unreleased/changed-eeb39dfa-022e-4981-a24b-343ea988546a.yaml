@@ -1,0 +1,5 @@
+kind: changed
+body: The first start after upgrading copies the visibility attribute index into a new layout before serving, taking longer the more attributes a cluster holds.
+time: 2026-10-24T19:17:09.071017+01:00
+custom:
+    Slice: eeb39dfa-022e-4981-a24b-343ea988546a

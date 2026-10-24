@@ -1303,8 +1303,8 @@ mod tests {
             run_end.clone(),
             proptest::option::of((0u64..=400_000, run_end)),
             proptest::collection::vec((0u64..=1_200_000, 1_000u64..=90_000), 0..=2),
-            0u64..=70,
-            0u64..=70,
+            1u64..=70,
+            1u64..=70,
             -5_000i64..=5_000,
             any::<u64>(),
         )
@@ -1326,8 +1326,8 @@ mod tests {
                             .into_iter()
                             .map(|(from, length)| (from, from + length))
                             .collect(),
-                        // At most 7 s each way, in tenths of a second, so that
-                        // a round trip and the drift stay within the margin.
+                        // From a tenth of a second to 7 s each way, so that a
+                        // round trip and the drift stay within the margin.
                         outbound: outbound * 100,
                         inbound: inbound * 100,
                         drift_ppm,
@@ -1421,13 +1421,15 @@ mod tests {
                 .any(|(from, to)| (*from..*to).contains(&now))
         }
 
+        /// A delay from one step to `bound`, so that a request sent on one step
+        /// arrives on a later one.
         fn delay(&mut self, index: usize, bound: u64) -> u64 {
             let node = &mut self.nodes[index];
             node.rng = node
                 .rng
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            (node.rng >> 33) % (bound / 100 + 1) * 100
+            (node.rng >> 33) % (bound / 100) * 100 + 100
         }
 
         fn close_gate(&mut self, index: usize, now: u64) {

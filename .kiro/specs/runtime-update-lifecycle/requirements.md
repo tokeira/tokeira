@@ -153,8 +153,10 @@ The authoritative specifications are [020-kernel](../../../docs/architecture/020
 #### Acceptance Criteria
 
 1. WHEN `update_workflow` is called and the kernel rejects the `Command::Update` with `Reject::RunClosed`, THE Runtime SHALL return an error indicating the execution is closed.
-2. WHEN `update_workflow` is called and the kernel rejects the `Command::Update` with `Reject::WorkflowPaused`, THE Runtime SHALL return an error indicating the workflow is paused.
+2. WHEN `update_workflow` is called for a running workflow that is paused, THE Runtime SHALL refuse the request before it looks the update up, with `FailedPrecondition` "Workflow is paused. Cannot update the workflow.", and SHALL answer the kernel's `Reject::WorkflowPaused` the same ([update-refusals](../update-refusals/bugfix.md) criteria 2.1 and 2.2).
 3. WHEN `update_workflow` is called and the kernel rejects the `Command::Update` with `Reject::DuplicateUpdateId`, THE Runtime SHALL return an error indicating the update ID is already pending.
+5. WHEN `update_workflow` is called for a running workflow that is not paused and whose workflow task attempt is 3 or more, THE Runtime SHALL refuse the request before it looks the update up, with `WorkflowNotReady` "Unable to perform workflow execution update due to Workflow Task in failed state.", and SHALL answer the kernel's `Reject::UpdateWorkflowTaskFailing` the same ([update-refusals](../update-refusals/bugfix.md) criterion 2.3).
+6. WHEN `update_workflow` is called for a running workflow that is neither paused nor failing, that has tried to close and that has a workflow task started, THE Runtime SHALL refuse the request before it looks the update up, with `ErrWorkflowClosing` ([update-refusals](../update-refusals/bugfix.md) criterion 2.4).
 4. THE Runtime SHALL NOT register the caller in the Update_Registry when `wait_policy = Accepted` (no completion waiting needed) or when `CommitResult::Duplicate` is returned (the update may already be terminal). For `wait_policy = Completed`, the caller is pre-registered before `submit()` and removed on failure — see Requirement 2.2.
 
 ---

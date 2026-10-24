@@ -412,7 +412,10 @@ graph TD
 | Condition | Behavior | Registry Impact |
 |---|---|---|
 | `ExecutionRef` not found | `resolve_execution` returns `None` → `update_workflow` returns `anyhow!("execution not found")` | No entry created |
-| Kernel rejects with `Reject::WorkflowPaused` | Error returned: "workflow is paused" | Pre-registered entry removed |
+| A running workflow is paused | `UpdatePaused`, before the lookup: `FAILED_PRECONDITION` "Workflow is paused. Cannot update the workflow." ([update-refusals](../update-refusals/design.md)) | No entry created |
+| A running workflow's task attempt is 3 or more | `WorkflowNotReady` "Unable to perform workflow execution update due to Workflow Task in failed state.", before the lookup | No entry created |
+| A running workflow has tried to close, with a task started | `WorkflowClosing`, before the lookup | No entry created |
+| Kernel rejects with `Reject::WorkflowPaused` or `Reject::UpdateWorkflowTaskFailing`: the run changed after the runtime's read | The same answer as the runtime's own refusal | Pre-registered entry removed |
 | Kernel rejects with `Reject::DuplicateUpdateId` | Error returned: "duplicate update id" | Pre-registered entry removed |
 | Kernel rejects with `Reject::RunClosed` | Error returned: "run closed" | Pre-registered entry removed |
 | OCC retry exhaustion | Lane returns error after max retries | Pre-registered entry removed |

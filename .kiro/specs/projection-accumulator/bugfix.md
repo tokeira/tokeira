@@ -107,9 +107,13 @@ define the accumulator lifecycle.
 | Completion reporting a deployment with unspecified workflow behaviour | No new observation from the cleared stored version; earlier entries remain | Reported deployment reaches the used-version update independently of behaviour: `service/history/workflow/workflow_task_state_machine.go:1293-1301, 1326-1345, 1381-1389 @ v1.31.0`; request validation does not forbid unspecified behaviour with versioned worker options: `service/history/api/respondworkflowtaskcompleted/api.go:216-225 @ v1.31.0` |
 | List size | No trimming | Live saves remove oldest values until the encoded payload fits the value limit: `service/history/workflow/mutable_state_impl.go:3696-3722`; default 2 KiB: `common/dynamicconfig/constants.go:812-816 @ v1.31.0` |
 
-These cases stay outside the correction set. In particular, migration copies the
-legacy image's list; it does not repair that list from history. A future correction
-must specify its own treatment of legacy runs, mixed-version writers and trimming.
+This spec kept these cases.
+[used-deployment-versions](../used-deployment-versions/bugfix.md) corrects all
+four: only a recorded workflow task completion adds to the list, whatever the run's
+versioning behaviour; a live completion trims the list to the value limit; and a
+reset replays its copied completions. Migration still copies the legacy image's list
+and doesn't repair it from history: a run written before that change keeps its
+stored list, and the rules apply from its next completion (its criterion 2.6).
 
 ## Bug Analysis
 
@@ -157,8 +161,11 @@ any part of the transition, rather than reading an image inside the commit.
 2.5 WHEN a fresh run is initialized, THE system SHALL provide a ready empty
 accumulator as the input to its first projection-producing commit.
 
-2.6 WHEN a reset successor is materialized, THE system SHALL initialize its
-accumulator as ready and empty, regardless of versions in its replayed prefix.
+2.6 *Replaced by
+[used-deployment-versions](../used-deployment-versions/bugfix.md) criterion 2.4.*
+This criterion initialized a reset successor's accumulator as ready and empty,
+regardless of its replayed prefix. A reset run now lists each version its copied
+completions reported, untrimmed.
 
 2.7 WHEN `load_run` or `load_run_with_stats` loads an unseeded existing run, THE
 repository SHALL return it ready using the accumulator from its latest committed
@@ -235,19 +242,26 @@ SHALL use the existing growth-limit response defined by
 projection images as the baseline oracle, including list order, string formatting,
 duplicate suppression for new observations and attribute presence.
 
-3.2 WHEN a start carries an inherited stored deployment version, THE first image
-SHALL CONTINUE TO include it as the baseline does, without copying the predecessor's
-or parent's accumulated list.
+3.2 *Replaced by
+[used-deployment-versions](../used-deployment-versions/bugfix.md) criterion 2.2.*
+This criterion kept a start's inherited stored deployment version in its first
+image. A start, an inherited version included, now adds nothing to the list, and
+still copies no predecessor's or parent's list.
 
-3.3 WHEN a reset's first projection commit sees stored version v2 after replaying
-completions on v1 then v2, THE image SHALL CONTINUE TO contain `[v2]`, not `[v1, v2]`.
+3.3 *Replaced by
+[used-deployment-versions](../used-deployment-versions/bugfix.md) criterion 2.4.*
+This criterion kept `[v2]` for a reset after completions on v1 then v2. The reset
+run now lists `[v1, v2]`.
 
-3.4 WHEN an unspecified-behaviour completion clears the stored version, THE system
-SHALL CONTINUE TO retain prior accumulated observations without adding the cleared
-version from the completion parameter.
+3.4 *Replaced by
+[used-deployment-versions](../used-deployment-versions/bugfix.md) criterion 2.1.*
+This criterion kept an unspecified-behaviour completion's version out of the list. A
+completion now adds the version it reports, whatever the run's versioning behaviour.
 
-3.5 WHEN applying the baseline merge, THE system SHALL CONTINUE TO leave the
-accumulated list untrimmed.
+3.5 *Replaced by
+[used-deployment-versions](../used-deployment-versions/bugfix.md) criterion 2.3.*
+This criterion left the list untrimmed. A live completion that changes the list now
+trims it to the search-attribute value limit.
 
 3.6 WHEN a transition is rejected, conflicts, is a duplicate or performs no durable
 write, THE system SHALL CONTINUE TO leave the durable projection image unchanged.
@@ -326,8 +340,9 @@ missing-image behaviour.
 
 ## Out of Scope
 
-- Correcting the four Temporal differences above, or migrating old lists to
-  completion-derived semantics.
+- Correcting the four Temporal differences above, which
+  [used-deployment-versions](../used-deployment-versions/bugfix.md) does, or migrating
+  old lists to completion-derived semantics.
 - Changing routing or inheritance, introducing a new public field, or adding a
   user-visible configuration setting.
 - History/event format changes, schema migrations, dependencies or lockfile changes.
@@ -336,5 +351,6 @@ missing-image behaviour.
 
 These approved requirements are implemented by the run-state accumulator and
 repository contracts described in the [design](design.md). Validation evidence
-and task completion are recorded in the [implementation plan](tasks.md); the four
-deferred Temporal compatibility corrections remain out of scope.
+and task completion are recorded in the [implementation plan](tasks.md). The four
+deferred Temporal compatibility corrections are
+[used-deployment-versions](../used-deployment-versions/bugfix.md)'s.

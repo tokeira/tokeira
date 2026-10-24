@@ -43,7 +43,7 @@ The table stayed because a node of an earlier release still wrote it. A release 
 
 3.2 Migrations V007, V014, V015 and V021 SHALL CONTINUE TO be applied as they are, since migrations are forward-only.
 
-3.3 Run deletion SHALL CONTINUE TO purge every other table a run owns, history last.
+3.3 Run deletion SHALL CONTINUE TO purge every other table a run owns, history after the rows derived from it and the parts of the run's values last ([large-value-parts](../large-value-parts/design.md)).
 
 3.4 The in-memory store SHALL CONTINUE TO keep its activity state table's slot in its snapshots, so snapshots decode across releases in both directions.
 

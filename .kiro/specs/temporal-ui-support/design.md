@@ -25,8 +25,9 @@ open execution is terminated with reason `Delete workflow execution` and identit
 `history-service`, while deletion removes visibility, the current pointer, mutable
 state, and history in an idempotent staged operation. Tokeira stages it too: one
 transaction appends the visibility tombstone, removes the current pointer and mutable
-state, and records the run for a purge that removes its other rows, history last
-([bounded-bulk-writes](../bounded-bulk-writes/design.md)).
+state, and records the run for a purge that removes its other rows, history after the
+rows derived from it and the parts of the run's values last
+([bounded-bulk-writes](../bounded-bulk-writes/design.md), [large-value-parts](../large-value-parts/design.md)).
 
 ## Dependencies and Non-Goals
 
@@ -136,8 +137,9 @@ For `GetClusterInfo`, the `WorkflowService` needs access to the `OperatorApi` (o
    projection record at the next sequence, conditionally removes the current pointer
    only if it still names the target, removes the target's mutable state and workflow
    dispatch row, and records the run for purging, in one transaction. The runtime's
-   purger then removes the run's other rows in pages, history last
-   ([bounded-bulk-writes](../bounded-bulk-writes/design.md)).
+   purger then removes the run's other rows in pages, history after the rows derived
+   from it and the parts of the run's values last
+   ([bounded-bulk-writes](../bounded-bulk-writes/design.md), [large-value-parts](../large-value-parts/design.md)).
 4. The runtime removes disposable broker entries, timeout tracking, update/query
    waiters, and callback tracking for the run. Work already delivered to a worker is
    harmless: any later completion reloads an absent run and cannot recreate it.
@@ -723,7 +725,7 @@ Tests to implement:
 - `DeleteWorkflowExecution` rejects missing execution, empty workflow id, and malformed run id with INVALID_ARGUMENT
 - Running deletion uses reason `Delete workflow execution` and identity `history-service`
 - Closed deletion does not append a termination transition
-- DSQL deletion SQL guards `current_execution` by both pointer key and target run key; the first transaction removes the run's mutable state and dispatch row and records it, and the purge covers every other run-owned table, history last
+- DSQL deletion SQL guards `current_execution` by both pointer key and target run key; the first transaction removes the run's mutable state and dispatch row and records it, and the purge covers every other run-owned table, history after the rows derived from it and the parts of the run's values last
 - Visibility list, filtered count, grouped count, and rollup count all exclude a retained `Deleted` row
 - `ResetWorkflowExecution` with non-WFT-completed event returns INVALID_ARGUMENT
 - `RegisterNamespace` with empty name returns INVALID_ARGUMENT

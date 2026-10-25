@@ -50,8 +50,14 @@ First show the defects, with tests that fail on the current code. Then:
     - _Requirements: 2.1-2.3_
   - [ ] 5.2 Back off on a failed read, apply or delete without ending, and pace idle passes at 1 s
     - _Requirements: 2.6, 2.7_
-  - [ ] 5.3 Apply the runs of different stripes concurrently, at most one run of a stripe at a time
+  - [x] 5.3 Apply the runs of different stripes concurrently, at most one run of a stripe at a time
     - _Requirements: 2.10_
+    - DONE. A pass gives each stripe in a page a lane and runs the lanes together; each lane applies its runs one at
+      a time, in page order. On an ephemeral cluster, one partition of 250 runs, four images each, in the four
+      stripes a partition holds under the default partition count (Live Test step 6): serially 4.5, 5.0 and 5.3
+      applies a second; by stripe 16.2, 14.7 and 15.3, with Count exact. Each of three negative controls failed its
+      test: a lane per run, one lane for the page, and a lane per image. The bar passed (3,954 tests passed, 2
+      skipped).
   - [ ] 5.4 Report the pass metrics, and remove the checkpoint metrics
     - _Requirements: 2.12_
 

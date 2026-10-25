@@ -465,7 +465,10 @@ impl Backend for Fixture {
                 .push_bind(queue)
                 .push_bind(deployment_key)
                 .push_bind(build_key)
-                .push_bind(i64::try_from(row.incarnation.logical_seq.0).unwrap())
+                .push_bind(
+                    i64::try_from(row.incarnation.logical_seq.0)
+                        .expect("a fixture's logical sequence fits in i64"),
+                )
                 .push_bind(row.scheduled_at)
                 .push_bind(row.priority_key)
                 .push_bind(priority)

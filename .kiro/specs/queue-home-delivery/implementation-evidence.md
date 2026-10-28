@@ -57,35 +57,27 @@ mode 0600, overwrite refusal, symlink rejection, missing/inconsistent startup me
 and Start's larger response. Durable bootstrap tests use the existing provider/connection fakes and common embedded
 router; they preserve ownership safeguards and do not constitute live DSQL readiness evidence.
 
-### Validation and remaining gates
+### Validation
 
-`cargo check -p tokeira-engine --lib --offline` passed and refreshed the lockfile without package/version changes.
-Nightly formatting/check and warning-denied workspace/all-targets clippy passed. The requested auth/config/edge
-nextest command initially stopped on a sandbox-denied local listener; its `--no-fail-fast` rerun completed with
-705 passes and five listener failures (`Operation not permitted`). Three failures are existing auth JWT/STS tests;
-two are edge forwarded-start/read-baseline tests. One passing existing payload-limit test was reported leaky.
-All six generated auth/config/edge properties above passed at 100 cases each.
+Locally, nightly formatting and warning-denied workspace/all-targets clippy pass, and `cargo check` refreshed the
+lockfile without package or version changes. All six generated auth/config/edge properties above pass at 100 cases
+each. `generated_upgrade_bootstrap` and `generated_peer_file_restart_rotation` each pass 100 cases, as do the
+create-only CLI generation, mode and overwrite refusal, symlink and public-mode rejection, and both startup
+diagnostics.
 
-The response-frame example exposed a Tonic trailers-only decoding-limit bypass during verification. The dormant
-offer client now rejects malformed initial success status and bounds the unary response body independently.
-Exact/one-over response-frame and unchanged Start-limit regressions pass. No sender or handler was activated.
+The response-frame example exposed a Tonic trailers-only decoding-limit bypass. The dormant offer client now rejects
+a malformed initial success status and bounds the unary response body independently. Exact/one-over response-frame
+and unchanged Start-limit regressions pass. No sender or handler is activated.
 
-The requested engine peer/generate filter ran all eight selected tests: six passed, two failed, 133 were filtered
-out. Create-only CLI generation, mode/overwrite refusal, symlink/public-mode rejection and both startup diagnostics
-passed. `generated_upgrade_bootstrap` and `generated_peer_file_restart_rotation` each passed 100 cases. The
-`generated_no_peer_startup` and `generated_durable_peer_exemption` properties failed during listener binding with
-sandbox `Operation not permitted`; their configured 100 cases are not claimed as completed.
+The full bar passes on the final head, on a fresh Linux devbox: fmt, lint, check, test (3,978 passed, 2 skipped),
+doctest and doc, with `generated_no_peer_startup` and `generated_durable_peer_exemption` among the tests run.
+`cargo clippy --features dsql-integration` is clean for `tokeira-engine` and `tokeira-edge`. The binding inventory
+fixture gains only this part's internal messages, enums and the `OfferWorkflowTask` method. No live provider or
+network validation is claimed.
 
-Disk was checked before every build and remained above the 12 GiB threshold at each start. After the engine run it
-fell below that threshold, so no further builds were started. Cached native objects emitted linker SDK-version
-warnings; build/cache configuration was left unchanged. The full bar remains for the orchestrator's devbox run.
-No live provider or network validation is claimed.
-
-The exact 174-character changed fragment is: “Controller-managed clusters need a peer credential file on every
-node: generate one with tokeirad, stop every node, and set it in each node's configuration before restarting.”
-Its scratch-copy `changie batch 999.999.999 --dry-run --allow-no-changes=false` passed. Offline Markdown links,
-`git diff --check origin/main` and the requested secret-pattern scan over the diff and untracked files passed.
-All work remains uncommitted; restored platform, deployment and daemon paths were left untouched.
+The changed fragment is: “Controller-managed clusters need a peer credential file on every node: generate one with
+tokeirad, stop every node, and set it in each node's configuration before restarting.” The changie dry run, offline
+Markdown links, `git diff --check` and a scan of the diff for key material pass.
 
 ## Exploration
 

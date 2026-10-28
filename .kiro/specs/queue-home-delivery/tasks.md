@@ -79,7 +79,7 @@ bar belongs to the code PRs.
     the single-node claim and embedded ownership safeguards without modifying them.
     - **Property 10: Credential files are stable across restarts and rotation is explicit**
     - **Validates: Requirements 2.13, 2.16, 2.17, 2.18, 2.19, 2.20.**
-    - DONE — Real-file restart/rotation and upgrade properties pass at 100 cases each; create-only mode, overwrite refusal, symlink and diagnostic examples pass. The two no-peer startup properties compile but hit sandbox-denied listeners; devbox execution remains required. See implementation-evidence.md; live durable readiness is not claimed.
+    - DONE — Real-file restart/rotation and upgrade properties pass at 100 cases each; create-only mode, overwrite refusal, symlink and diagnostic examples pass. The two no-peer startup properties pass in the full bar on a devbox. See implementation-evidence.md; live durable readiness is not claimed.
 
 - [ ] 4. Shared admission and acquisition-driven retirement
   - [ ] 4.1 Route local, pushed and discovered normal offers through common bounded admission. Check generation,

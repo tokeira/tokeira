@@ -137,6 +137,13 @@ impl DsqlRunRepository {
                 // This transaction is the first three stages at once; the
                 // purge is the fourth, history after the rows derived from it,
                 // and the parts of the run's values after history.
+                let context_data = codec::encode_projection_context(&tombstone.context)?;
+                // Deletion erases user memo and attributes. Keeping this image whole
+                // preserves the fixed first-transaction budget of the bounded purge.
+                anyhow::ensure!(
+                    context_data.len() <= crate::dsql::value_parts::PART_BYTES,
+                    "a deletion tombstone must fit in one projection image part"
+                );
                 sqlx::query(
                     "INSERT INTO projection_log
                      (partition_id, fanout, run_key, transition_seq, context_data, ops_data, created_at)
@@ -149,7 +156,7 @@ impl DsqlRunRepository {
                     tombstone_seq.0,
                     "delete tombstone transition_seq",
                 )?)
-                .bind(codec::encode_projection_context(&tombstone.context)?)
+                .bind(context_data)
                 .bind(codec::LEGACY_EMPTY_PROJECTION_OPS_DATA)
                 .execute(&mut *tx)
                 .await?;

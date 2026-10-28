@@ -1,0 +1,5 @@
+kind: fixed
+body: On DSQL, visibility images and memos over 1 MiB are now stored in parts, so commits, projection applies and visibility reads preserve the whole value.
+time: 2026-10-28T22:01:17.654471Z
+custom:
+    Slice: 258423e4-caf0-41fc-9fda-481c77b2d7d0

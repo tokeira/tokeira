@@ -1,4 +1,4 @@
-//! CHASM nodes' data and worker invocation requests over the part size
+//! Visibility images, CHASM nodes' data and worker invocation requests over the part size
 //! (`large-value-parts`) against an operator-owned ephemeral Aurora DSQL cluster:
 //! the shared contracts, and the cases only DSQL can show: the parts each write
 //! leaves, those a deletion removes, and a load held against a persist. No
@@ -16,12 +16,21 @@ use tokeira_chasm::{
     ChasmNode, ExecutionKey, LifecycleState, NodeMetadata, VersionedTransition,
     path::{self, PathSegment},
 };
+use tokeira_kernel::{
+    LoadedRun,
+    limits::{MEMO_SIZE_LIMIT_ERROR, RunGrowthLimits},
+    payload_size::memo_encoded_len,
+};
+use tokeira_types::{Payload, RunKey, TransitionSeq};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 use crate::{
-    ChasmNodeRepository, CurrentRun, ExpectedVersion, NodePersistOutcome, NodeWrite,
+    ChasmNodeRepository, CommitResult, CurrentRun, ExpectedVersion, NodePersistOutcome, NodeWrite,
+    ProjectionImageKey, ProjectionLog, RunRepository, WriteFence,
+    api::prepare_workflow_projection,
     bulk_write_tests::noise,
+    codec,
     dsql::{
         DsqlPoolConfig, DsqlStore, MigrationConfig, ReservoirConfig,
         run_repository::pause_point::{self, PauseKey},
@@ -30,12 +39,193 @@ use crate::{
     large_value_tests::{
         nodes_over_the_part_size_read_back, requests_over_the_part_size_read_back,
     },
+    memory::projection_accumulator_tests::{following, fresh_transition},
 };
 
 const MIB: usize = 1024 * 1024;
 
 /// The archetype of the executions these cases write.
 const ARCHETYPE: u32 = 7;
+
+async fn forget_visibility_run(pool: &PgPool, run: RunKey) -> Result<()> {
+    for sql in [
+        "DELETE FROM current_execution WHERE run_key = $1",
+        "DELETE FROM workflow_dispatch WHERE run_key = $1",
+        "DELETE FROM run_value_part WHERE run_key = $1",
+        "DELETE FROM workflow_hot WHERE run_key = $1",
+    ] {
+        sqlx::query(sql).bind(run.0).execute(pool).await?;
+    }
+    Ok(())
+}
+
+async fn image_partition(pool: &PgPool, run: RunKey) -> Result<(u32, u16)> {
+    let (partition, fanout) = sqlx::query_as::<_, (i32, i16)>(
+        "SELECT partition_id, fanout FROM projection_log WHERE run_key = $1 LIMIT 1",
+    )
+    .bind(run.0)
+    .fetch_one(pool)
+    .await?;
+    Ok((u32::try_from(partition)?, u16::try_from(fanout)?))
+}
+
+// Feature: large-value-parts, Property 6: Removing a value removes its parts
+#[test]
+fn dsql_deleting_images_removes_their_parts() {
+    let runtime = Runtime::new().unwrap();
+    let Some((pool, store)) = runtime.block_on(connect()).unwrap() else {
+        return;
+    };
+    let result = TestRunner::new(ProptestConfig::with_cases(8)).run(
+        &(PART_BYTES..=(2 * PART_BYTES)),
+        |len| {
+            runtime
+                .block_on(async {
+                    let run = RunKey::new();
+                    let mut start = fresh_transition(run);
+                    start
+                        .next_state
+                        .memo
+                        .0
+                        .insert("large".to_owned(), Payload::new(noise(len, 1)));
+                    let CommitResult::Applied { new_state } = store
+                        .run_repository()
+                        .commit_transition(run, start, WriteFence::Unfenced)
+                        .await?
+                    else {
+                        anyhow::bail!("the image commits")
+                    };
+                    let mut next = following(&new_state);
+                    next.next_state
+                        .memo
+                        .0
+                        .insert("large".to_owned(), Payload::new(noise(len, 2)));
+                    let CommitResult::Applied { new_state: latest } = store
+                        .run_repository()
+                        .commit_transition(run, next, WriteFence::Unfenced)
+                        .await?
+                    else {
+                        anyhow::bail!("the next image commits")
+                    };
+                    let (partition, fanout) = image_partition(&pool, run).await?;
+                    let key = ProjectionImageKey {
+                        run_key: run,
+                        transition_seq: new_state.transition_seq,
+                    };
+                    let deleted = store
+                        .projection_log()
+                        .delete_images(partition, fanout, &[key])
+                        .await?;
+                    ensure!(deleted == 1, "one image was deleted");
+                    let remaining: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM projection_image_part
+                         WHERE run_key = $1 AND transition_seq = $2",
+                    )
+                    .bind(run.0)
+                    .bind(i64::try_from(key.transition_seq.0)?)
+                    .fetch_one(&pool)
+                    .await?;
+                    ensure!(remaining == 0, "the deleted image leaves no parts");
+                    let page = store
+                        .projection_log()
+                        .read_page(partition, fanout, Some(key), 1)
+                        .await?;
+                    ensure!(
+                        page.images.len() == 1 && page.images[0].context.memo == latest.memo,
+                        "the later image's parts remain intact",
+                    );
+                    let key = ProjectionImageKey {
+                        run_key: run,
+                        transition_seq: latest.transition_seq,
+                    };
+                    store
+                        .projection_log()
+                        .delete_images(partition, fanout, &[key])
+                        .await?;
+                    let remaining: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM projection_image_part WHERE run_key = $1",
+                    )
+                    .bind(run.0)
+                    .fetch_one(&pool)
+                    .await?;
+                    ensure!(remaining == 0, "all deleted images' parts are gone");
+                    forget_visibility_run(&pool, run).await
+                })
+                .map_err(|error| TestCaseError::fail(format!("{error:?}")))
+        },
+    );
+    runtime.block_on(store.shutdown()).unwrap();
+    result.unwrap();
+}
+
+// Feature: large-value-parts, Property 3: A stored value reads back whole
+#[tokio::test]
+async fn dsql_a_split_image_seeds_the_legacy_accumulator() -> Result<()> {
+    let Some((pool, store)) = connect().await? else {
+        return Ok(());
+    };
+    let run = RunKey::new();
+    let mut start = fresh_transition(run);
+    start
+        .next_state
+        .memo
+        .0
+        .insert("large".to_owned(), Payload::new(noise(2 * PART_BYTES, 9)));
+    start.next_state.used_worker_deployment_versions = Some(vec!["deployment.build".to_owned()]);
+    let CommitResult::Applied { mut new_state } = store
+        .run_repository()
+        .commit_transition(run, start, WriteFence::Unfenced)
+        .await?
+    else {
+        anyhow::bail!("the image commits")
+    };
+    new_state.used_worker_deployment_versions = None;
+    let encoded = codec::encode_workflow_state(&new_state)?;
+    let split = value_parts::split(&encoded);
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE workflow_hot SET state_data = $2, state_parts = $3 WHERE run_key = $1")
+        .bind(run.0)
+        .bind(split.first)
+        .bind(split.count)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM run_value_part WHERE run_key = $1 AND value_kind = 1")
+        .bind(run.0)
+        .execute(&mut *tx)
+        .await?;
+    for (part_no, data) in split.numbered() {
+        sqlx::query("INSERT INTO run_value_part (run_key, value_kind, value_key, part_no, data) VALUES ($1, 1, 0, $2, $3)")
+            .bind(run.0).bind(part_no).bind(data).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    let loaded = store.run_repository().load_run(run).await;
+    let (partition, fanout) = image_partition(&pool, run).await?;
+    store
+        .projection_log()
+        .delete_images(
+            partition,
+            fanout,
+            &[ProjectionImageKey {
+                run_key: run,
+                transition_seq: new_state.transition_seq,
+            }],
+        )
+        .await?;
+    forget_visibility_run(&pool, run).await?;
+    store.shutdown().await?;
+    let LoadedRun::Existing(loaded) = loaded? else {
+        anyhow::bail!("the run loads")
+    };
+    ensure!(
+        loaded.memo == new_state.memo,
+        "the state still contains the whole memo"
+    );
+    ensure!(
+        loaded.used_worker_deployment_versions == Some(vec!["deployment.build".to_owned()]),
+        "the seed joins the whole image before decoding its attributes"
+    );
+    Ok(())
+}
 
 /// The cluster's store with Tokeira's schema, and a pool for checking its rows, or
 /// none when the live suite isn't configured.
@@ -64,6 +254,106 @@ async fn connect() -> Result<Option<(PgPool, DsqlStore)>> {
     .await?;
     store.migration_runner().apply(&pool).await?;
     Ok(Some((pool, store)))
+}
+
+// Feature: large-value-parts, exploratory bug condition checking: visibility image.
+// The 1.25 MiB memo fits the 2 MiB admission limit, but makes context_data exceed
+// DSQL's 1 MiB value limit (SQLSTATE 54000 before visibility parts). State parts
+// already exist; an empty history isolates the unsplit projection image.
+#[tokio::test]
+async fn dsql_a_visibility_image_over_one_mib_commits_and_reads_back() -> Result<()> {
+    let Some((pool, store)) = connect().await? else {
+        return Ok(());
+    };
+    let run_key = RunKey::new();
+    let checked = async {
+        let mut transition = fresh_transition(run_key);
+        transition.growth_limits = Some(RunGrowthLimits::default());
+        transition
+            .next_state
+            .memo
+            .0
+            .insert("large".to_owned(), Payload::new(noise(MIB + MIB / 4, 1)));
+        ensure!(
+            memo_encoded_len(&transition.next_state.memo) <= MEMO_SIZE_LIMIT_ERROR,
+            "the memo must fit Tokeira's admission limit"
+        );
+        let context = prepare_workflow_projection(&transition.next_state, 0)?;
+        let encoded = codec::encode_projection_context(&context)?;
+        ensure!(encoded.len() > MIB, "the image must exceed 1 MiB");
+        ensure!(
+            codec::encode_workflow_state(&transition.next_state)?.len() + encoded.len() < 4 * MIB,
+            "the state and image together must stay below the transaction budget"
+        );
+        let image_key = ProjectionImageKey {
+            run_key,
+            transition_seq: transition.next_state.transition_seq,
+        };
+        let committed = store
+            .run_repository()
+            .commit_transition(run_key, transition, WriteFence::Unfenced)
+            .await
+            .context("a commit with a visibility image over 1 MiB must succeed")?;
+        ensure!(
+            matches!(committed, CommitResult::Applied { .. }),
+            "the commit did not apply: {committed:?}"
+        );
+        let (partition_id, fanout) = sqlx::query_as::<_, (i32, i16)>(
+            "SELECT partition_id, fanout FROM projection_log WHERE run_key = $1",
+        )
+        .bind(run_key.0)
+        .fetch_one(&pool)
+        .await?;
+        let partition_id = u32::try_from(partition_id)?;
+        let fanout = u16::try_from(fanout)?;
+        let page = store
+            .projection_log()
+            .read_page(
+                partition_id,
+                fanout,
+                Some(ProjectionImageKey {
+                    run_key,
+                    transition_seq: TransitionSeq::ZERO,
+                }),
+                1,
+            )
+            .await;
+        store
+            .projection_log()
+            .delete_images(partition_id, fanout, &[image_key])
+            .await?;
+        let page = page?;
+        ensure!(page.images.len() == 1, "the image must read back");
+        let image = &page.images[0];
+        ensure!(
+            image.run_key == run_key && image.transition_seq == image_key.transition_seq,
+            "the page must return the committed image"
+        );
+        ensure!(
+            codec::encode_projection_context(&image.context)? == encoded,
+            "the visibility context must read back byte for byte, including its whole memo"
+        );
+        Ok(())
+    }
+    .await;
+    let cleanup = async {
+        for statement in [
+            "DELETE FROM current_execution WHERE run_key = $1",
+            "DELETE FROM workflow_dispatch WHERE run_key = $1",
+            "DELETE FROM run_value_part WHERE run_key = $1",
+            "DELETE FROM workflow_hot WHERE run_key = $1",
+        ] {
+            sqlx::query(statement)
+                .bind(run_key.0)
+                .execute(&pool)
+                .await?;
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    pool.close().await;
+    let shutdown = store.shutdown().await;
+    checked.and(cleanup).and(shutdown)
 }
 
 #[tokio::test]

@@ -253,7 +253,7 @@ fn startup_schema_contract_migrates_and_accepts_required_tables() {
     // parts of a run's values over the part size (`large-value-parts`), adds
     // the versioned visibility attribute cells and values and their copy's
     // progress (`bounded-visibility-apply`), and adds the parts of CHASM nodes'
-    // data and worker invocation requests (`large-value-parts`). A
+    // data, worker invocation requests, visibility images and memos (`large-value-parts`). A
     // self-consistent digest of an older prefix cannot make that schema usable.
     for (version, name) in [
         (69, "chasm_current_execution"),
@@ -275,6 +275,10 @@ fn startup_schema_contract_migrates_and_accepts_required_tables() {
         (94, "worker_compute_action_part"),
         (95, "worker_compute_action_request_parts"),
         (96, "workflow_dispatch_sticky_home_index"),
+        (97, "projection_image_part"),
+        (98, "projection_log_context_parts"),
+        (99, "visibility_memo_part"),
+        (100, "execution_visibility_memo_parts"),
     ] {
         assert!(
             recognized
@@ -284,7 +288,7 @@ fn startup_schema_contract_migrates_and_accepts_required_tables() {
     }
     for current in [
         0, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
-        90, 91, 92, 93, 94, 95, 96,
+        90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100,
     ] {
         let observed = observation(&recognized, current, (current > 0).then_some(current));
         for policy in [
@@ -292,24 +296,24 @@ fn startup_schema_contract_migrates_and_accepts_required_tables() {
             SchemaMigrationPolicy::ValidateOnly,
         ] {
             let expected = match (current, policy) {
-                (96, _) => SchemaDecision::Compatible {
-                    current: 96,
+                (100, _) => SchemaDecision::Compatible {
+                    current: 100,
                     legacy_backfill: false,
                 },
-                (0, SchemaMigrationPolicy::Automatic) => SchemaDecision::Initialize { target: 96 },
+                (0, SchemaMigrationPolicy::Automatic) => SchemaDecision::Initialize { target: 100 },
                 (_, SchemaMigrationPolicy::Automatic) => SchemaDecision::Migrate {
                     from: current,
-                    to: 96,
+                    to: 100,
                 },
                 (_, SchemaMigrationPolicy::ValidateOnly) => SchemaDecision::MigrationRequired {
                     current,
-                    target: 96,
+                    target: 100,
                 },
             };
             assert_eq!(
                 assess_schema_compatibility(&contract, &recognized, &observed, policy),
                 expected,
-                "Unconditional startup requires V096: current={current}, policy={policy:?}",
+                "Unconditional startup requires V100: current={current}, policy={policy:?}",
             );
         }
     }

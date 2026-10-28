@@ -29,6 +29,7 @@ pub(crate) mod key_codec;
 #[cfg(all(test, feature = "dsql-integration"))]
 mod large_value_tests;
 pub mod migration;
+pub(crate) mod projection_image_parts;
 pub mod projection_log;
 pub mod reservoir;
 pub mod run_repository;
@@ -38,7 +39,7 @@ pub mod schema_state_for_tests;
 pub mod slot_block_manager;
 pub mod task_queue_config;
 pub mod validation;
-pub(crate) mod value_parts;
+pub mod value_parts;
 pub mod worker_compute_repository;
 pub mod worker_deployment_repository;
 pub mod worker_task_provenance;

@@ -70,6 +70,7 @@ The `RunRepository` trait methods assigned to Feature 2 in the umbrella spec aud
 - **Workflow_Hot**: Small current summary row per open run, containing the compact `WorkflowState` needed for the runtime to process the next command.
 - **History_Batch**: Immutable append-only event batch table. Each row contains a contiguous range of history events from one transition.
 - **Run_Value_Part**: The parts after the first of a run's values over the part size: its state, and each history batch's events and principals. The value's own column holds its first part, and a count column beside it (`workflow_hot.state_parts`, `history_batch.events_parts`, `history_batch.principals_parts`) holds its number of parts, NULL for a value stored whole ([large-value-parts](../large-value-parts/design.md)).
+- **Projection_Image_Part**: The parts after the first of an image's encoded context, keyed by `(partition_id, fanout, run_key, transition_seq, part_no)`. `projection_log.context_data` holds the first part and `context_parts` the count; a whole value has a NULL count and no parts. `visibility_memo_part` similarly extends `execution_visibility_current.memo_blob`, keyed by `(namespace_id, archetype_id, run_key, part_no)`, with `memo_parts` beside the first part. These tables and nullable INTEGER counts are added by V097–V100 ([large-value-parts](../large-value-parts/design.md)).
 - **Current_Execution**: Mapping table from `(namespace_id, workflow_id)` to the current run identity and open/closed status.
 - **Request_Dedupe**: Idempotency record table for external command deduplication, keyed by `(namespace_id, workflow_id, request_id)`.
 - **Shard_Lease**: Table tracking shard ownership with epoch fencing for single-writer guarantees. Read (not written) by this spec during commit fencing.
@@ -118,7 +119,7 @@ The `RunRepository` trait methods assigned to Feature 2 in the umbrella spec aud
 5. WHEN `commit_transition` succeeds and the transition contains `TimerOp::Upsert` entries, THE DsqlRunRepository SHALL have upserted corresponding rows in `timer_bucket`.
 6. WHEN `commit_transition` succeeds and the transition contains `TimerOp::Delete` entries, THE DsqlRunRepository SHALL have deleted corresponding rows from `timer_bucket`.
 7. WHEN `commit_transition` succeeds and the transition contains `RequestDedupeOp` entries, THE DsqlRunRepository SHALL have inserted records into `request_dedupe`.
-8. WHEN `commit_transition` succeeds and the transition contains `ProjectionOp` entries, THE DsqlRunRepository SHALL have appended records to `projection_log` within the same transaction.
+8. WHEN `commit_transition` succeeds and the transition contains `ProjectionOp` entries, THE DsqlRunRepository SHALL have appended records to `projection_log` within the same transaction, with a context over the part size split into Projection_Image_Part rows in that transaction. An accumulator seed SHALL join the context's parts in the snapshot that reads the image.
 9. THE transaction write set SHALL remain within DSQL's 3,000-row mutation limit for any single transition.
 10. THE transaction SHALL complete within DSQL's 5-minute maximum transaction time.
 

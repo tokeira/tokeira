@@ -2,6 +2,7 @@
 //! Migration loads reread state and statistics with the seed in one DSQL snapshot;
 //! readiness stays local until a later fenced transition persists it.
 
+use crate::{ProjectionImageKey, dsql::projection_image_parts};
 use sqlx::PgConnection;
 
 use super::{
@@ -14,7 +15,7 @@ const READ_HOT_STATE: &str =
     "SELECT state_data, history_size_bytes, state_parts FROM workflow_hot WHERE run_key = $1";
 
 const READ_LEGACY_PROJECTION: &str =
-    "SELECT partition_id, fanout, run_key, transition_seq, context_data
+    "SELECT partition_id, fanout, run_key, transition_seq, context_data, context_parts
     FROM projection_log WHERE run_key = $1 ORDER BY transition_seq DESC LIMIT 1";
 
 /// A workflow run's applied `TemporalUsedWorkerDeploymentVersions` value: the one the
@@ -325,36 +326,39 @@ impl DsqlRunRepository {
                 // Historical rows can belong to a different partition count. Do
                 // not hide newer-than-state rows: the seed validator must see them.
                 crate::read_probe::sql(run_key, "sql/projection-seed");
-                let row =
-                    sqlx::query_as::<_, (i32, i16, Uuid, i64, Vec<u8>)>(READ_LEGACY_PROJECTION)
-                        .bind(run_key.0)
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .with_context(|| {
-                            format!("read projection accumulator seed for run {}", run_key.0)
-                        })?;
-                let previous = row
-                    .map(
-                        |(partition, fanout, key, seq, data)| -> Result<ProjectionRecord> {
-                            Ok(ProjectionRecord {
-                                partition_id: convert::u32_from_i32(
-                                    partition,
-                                    "projection partition_id",
-                                )?,
-                                fanout: u16::try_from(fanout)?,
-                                run_key: RunKey(key),
-                                transition_seq: TransitionSeq(convert::u64_from_i64(
-                                    seq,
-                                    "projection transition_seq",
-                                )?),
-                                context: codec::decode_projection_context(&data)?,
-                            })
-                        },
+                let row = sqlx::query_as::<_, (i32, i16, Uuid, i64, Vec<u8>, Option<i32>)>(
+                    READ_LEGACY_PROJECTION,
+                )
+                .bind(run_key.0)
+                .fetch_optional(&mut *tx)
+                .await
+                .with_context(|| {
+                    format!("read projection accumulator seed for run {}", run_key.0)
+                })?;
+                let previous = if let Some((partition, fanout, key, seq, data, count)) = row {
+                    let image_key = ProjectionImageKey {
+                        run_key: RunKey(key),
+                        transition_seq: TransitionSeq(convert::u64_from_i64(
+                            seq,
+                            "projection transition_seq",
+                        )?),
+                    };
+                    let data = projection_image_parts::join(
+                        &mut tx, partition, fanout, image_key, data, count,
                     )
-                    .transpose()
-                    .with_context(|| {
-                        format!("decode projection accumulator seed for run {}", run_key.0)
-                    })?;
+                    .await?;
+                    Some(ProjectionRecord {
+                        partition_id: convert::u32_from_i32(partition, "projection partition_id")?,
+                        fanout: u16::try_from(fanout)?,
+                        run_key: image_key.run_key,
+                        transition_seq: image_key.transition_seq,
+                        context: codec::decode_projection_context(&data).with_context(|| {
+                            format!("decode projection accumulator seed for run {}", run_key.0)
+                        })?,
+                    })
+                } else {
+                    None
+                };
                 // Once the projector deletes a run's applied images, its visibility row,
                 // read in this snapshot, holds the newest one's list.
                 crate::read_probe::sql(run_key, "sql/applied-projection-seed");

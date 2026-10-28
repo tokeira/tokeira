@@ -20,7 +20,7 @@
 
 /// The most bytes one part holds, in a value's own column or in a parts table:
 /// 960 KiB, under DSQL's 1 MiB value limit with room for two parts in one row.
-pub(crate) const PART_BYTES: usize = 983_040;
+pub const PART_BYTES: usize = 983_040;
 
 // A part fits DSQL's value limit. That a row of two parts commits is DSQL's to
 // say: a live test writes one.
@@ -28,38 +28,38 @@ const _: () = assert!(PART_BYTES <= crate::write_budget::DSQL_MAX_VALUE_BYTES);
 
 /// A value as it is stored.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Split<'a> {
+pub struct Split<'a> {
     /// What the value's own column holds: the whole value, or its first part.
-    pub(crate) first: &'a [u8],
+    pub first: &'a [u8],
     /// The parts after the first, in order: `rest[0]` is part 1. Empty for a whole
     /// value.
-    pub(crate) rest: Vec<&'a [u8]>,
+    pub rest: Vec<&'a [u8]>,
     /// What the value's count column holds: `None` for a whole value, otherwise
     /// the number of parts, two or more.
-    pub(crate) count: Option<i32>,
+    pub count: Option<i32>,
 }
 
 impl Split<'_> {
     /// The parts after the first, each with its part number.
-    pub(crate) fn numbered(&self) -> impl Iterator<Item = (i32, &[u8])> {
+    pub fn numbered(&self) -> impl Iterator<Item = (i32, &[u8])> {
         (1..).zip(self.rest.iter().copied())
     }
 
     /// The number of parts, a whole value counting as one.
-    pub(crate) fn parts(&self) -> i32 {
+    pub fn parts(&self) -> i32 {
         self.count.unwrap_or(1)
     }
 }
 
 /// The number of parts [`split`] cuts a value of `len` bytes into, a whole value
 /// counting as one: the rows the value takes, its own and one per other part.
-pub(crate) fn parts_of(len: usize) -> usize {
+pub fn parts_of(len: usize) -> usize {
     len.div_ceil(PART_BYTES).max(1)
 }
 
 /// Cut `value` as it is stored: whole when it is at most [`PART_BYTES`], otherwise
 /// into parts of `PART_BYTES` and a shorter last part.
-pub(crate) fn split(value: &[u8]) -> Split<'_> {
+pub fn split(value: &[u8]) -> Split<'_> {
     if value.len() <= PART_BYTES {
         return Split {
             first: value,
@@ -86,12 +86,12 @@ pub(crate) fn split(value: &[u8]) -> Split<'_> {
 /// means a corrupt value; the value is not returned.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{value} is stored in parts that don't fit together: {defect}")]
-pub(crate) struct ValuePartsError {
+pub struct ValuePartsError {
     /// The value, by its column and its row, such as
     /// `workflow_hot.state_data of run <run key>`.
-    pub(crate) value: String,
+    pub value: String,
     /// What is wrong with the parts.
-    pub(crate) defect: String,
+    pub defect: String,
 }
 
 /// Rebuild a value from what its own column holds, its count and its other parts,
@@ -101,7 +101,7 @@ pub(crate) struct ValuePartsError {
 /// and no other parts, or a count of two or more, parts numbered from 1 to one less
 /// than the count, each part but the last holding exactly [`PART_BYTES`], and the
 /// last between 1 and `PART_BYTES`. `value` names the value in the error.
-pub(crate) fn join(
+pub fn join(
     value: impl FnOnce() -> String,
     first: Vec<u8>,
     count: Option<i32>,

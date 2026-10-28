@@ -256,14 +256,18 @@ run or stripe, every rollup counter SHALL equal the count over the rows once the
   - `read_page(partition, fanout, after, limit)`: the images after `after`, or from the head, in
     `(run_key, transition_seq)` order;
   - `delete_images(partition, fanout, keys)`: deletes exactly the named images, and returns how many went.
-- **DSQL** (`dsql/projection_log.rs`). `read_page` keeps today's two queries, and returns each image's key.
-  `delete_images` names at most 100 `(run_key, transition_seq)` pairs a statement, within one partition and fanout,
-  each statement in its own transaction.
+- **DSQL** (`dsql/projection_log.rs`). `read_page` returns each image's key and reads a page of whole images in one
+  query. If any `context_parts` count is present, it discards that page and reads it again with its
+  `projection_image_part` rows in one `REPEATABLE READ READ ONLY` transaction, joining before decoding. A concurrent
+  deletion therefore cannot leave a reader with a count but no parts. `delete_images` names at most 100
+  `(run_key, transition_seq)` pairs, within one partition and fanout, and deletes their parts in the same transaction.
+  It counts both images and parts toward 3,000 changed rows, rolling back and reducing the batch if necessary.
 - **In memory** (`memory.rs`). The log becomes a map in key order, with each run's latest image indexed for seeding.
   `delete_images` keeps the latest image of a run whose stored state is unseeded. Snapshots still carry a list of
   images, and restore accepts any order. The disposable cursor index goes.
 - **The applied value** (`dsql/run_repository/load.rs`). For an unseeded workflow run, the load runs the visibility
-  query after `READ_LEGACY_PROJECTION`, in the same transaction, and seeds from the newer.
+  query after `READ_LEGACY_PROJECTION`, in the same transaction, and seeds from the newer. A split image's context
+  is joined with its parts in that transaction before the accumulator is seeded.
   `seed_workflow_projection_accumulator` in `api.rs` takes the image, the applied value's version, identity and value,
   or both, and validates each the same way.
 
@@ -273,6 +277,12 @@ run or stripe, every rollup counter SHALL equal the count over the rows once the
 - **The DSQL apply** (`dsql_store.rs`). `apply` and `apply_deletion` take the shape in [The apply](#the-apply), with
   the read by full key inside the transaction and the counters in it. `accumulate_rollup_striped`'s autocommit
   upserts become statements of the apply's transaction.
+- **Large memos** (`dsql_store.rs`). The bounded apply's single transaction or staged flip writes a memo's first
+  part and `memo_parts` count with the visibility row. Only a winning guarded upsert replaces
+  `visibility_memo_part` rows and deletes the unused tail, in that transaction. Its row budget counts written and
+  deleted parts. Stored-row reads join inside the apply's transaction; a list page containing a split memo is
+  re-read with its parts in one read-only snapshot. Whole values and legacy rows have no count or overflow rows
+  ([large-value-parts](../large-value-parts/design.md)).
 - **Stripe locks** (`dsql_store.rs`). A counter conflict now aborts the whole apply under one retry budget, so the
   store holds one lock per rollup stripe, shared by its clones, and an apply holds its run's stripe for its whole
   transaction. Applies in one process, the projector's and CHASM's direct ones alike, never conflict on a counter row,

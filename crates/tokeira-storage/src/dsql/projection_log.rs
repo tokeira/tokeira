@@ -7,9 +7,9 @@
 
 use std::{sync::Arc, time::Instant};
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use async_trait::async_trait;
-use sqlx::{Postgres, QueryBuilder};
+use sqlx::{Connection, PgConnection, Postgres, QueryBuilder};
 use time::OffsetDateTime;
 use tokeira_types::{RunKey, TransitionSeq};
 use tracing::instrument;
@@ -18,17 +18,19 @@ use uuid::Uuid;
 use crate::{
     DbClass, ProjectionContext, ProjectionImageKey, ProjectionLog, ProjectionPage,
     ProjectionRecord,
-    dsql::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert},
+    dsql::{
+        DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert, projection_image_parts,
+    },
     metrics,
 };
 
-/// The most images one delete statement names. Each statement commits on its own,
-/// so a delete stays far inside DSQL's 3,000 rows a transaction.
+/// The most images one delete statement names. The transaction also deletes their
+/// parts, reducing this batch when their combined row count exceeds 3,000.
 pub(crate) const DELETE_STATEMENT_KEYS: usize = 100;
 
 /// The page read from a partition's head.
 pub(crate) const READ_HEAD_SQL: &str = r#"
-    SELECT run_key, transition_seq, context_data, created_at
+    SELECT run_key, transition_seq, context_data, created_at, context_parts
     FROM projection_log
     WHERE partition_id = $1 AND fanout = $2
     ORDER BY run_key ASC, transition_seq ASC
@@ -40,7 +42,7 @@ pub(crate) const READ_HEAD_SQL: &str = r#"
 /// primary-key range, so each read passes over the images still behind the position;
 /// a pass deletes what it finishes with, which leaves few.
 pub(crate) const READ_AFTER_SQL: &str = r#"
-    SELECT run_key, transition_seq, context_data, created_at
+    SELECT run_key, transition_seq, context_data, created_at, context_parts
     FROM projection_log
     WHERE partition_id = $1
       AND fanout = $2
@@ -49,7 +51,7 @@ pub(crate) const READ_AFTER_SQL: &str = r#"
     LIMIT $5
 "#;
 
-type ImageRow = (Uuid, i64, Vec<u8>, OffsetDateTime);
+type ImageRow = (Uuid, i64, Vec<u8>, OffsetDateTime, Option<i32>);
 
 #[derive(Clone, Debug)]
 pub struct DsqlProjectionLog {
@@ -94,36 +96,37 @@ impl ProjectionLog for DsqlProjectionLog {
         let db_fanout = convert::i16_from_u16(fanout, "projection fanout")?;
         let db_limit = convert::i64_from_usize(limit, "projection read limit")?;
         let mut permit = self.director.acquire(DbClass::Projection).await?;
-        let rows = match after {
-            None => {
-                sqlx::query_as::<_, ImageRow>(READ_HEAD_SQL)
-                    .bind(db_partition_id)
-                    .bind(db_fanout)
-                    .bind(db_limit)
-                    .fetch_all(permit.connection()?)
-                    .await?
-            }
-            Some(after) => {
-                let transition_seq = convert::i64_from_u64(
-                    after.transition_seq.0,
-                    "projection page position transition_seq",
-                )?;
-                sqlx::query_as::<_, ImageRow>(READ_AFTER_SQL)
-                    .bind(db_partition_id)
-                    .bind(db_fanout)
-                    .bind(after.run_key.0)
-                    .bind(transition_seq)
-                    .bind(db_limit)
-                    .fetch_all(permit.connection()?)
-                    .await?
-            }
+        let read = ImageRead {
+            partition: db_partition_id,
+            fanout: db_fanout,
+            after,
+            limit: db_limit,
+        };
+        let connection = permit.connection()?;
+        let mut rows = read.rows(connection).await?;
+        let (images, oldest_written_at) = if image_page_needs_snapshot(&rows) {
+            // Throw away the first read. A deletion commits the image and its parts
+            // together, so only a snapshot that rereads both can return it whole.
+            let mut tx = connection
+                .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .await?;
+            rows = read.rows(&mut tx).await?;
+            let oldest = rows.iter().map(|row| row.3).min();
+            let images = decode_projection_rows(&mut tx, partition_id, fanout, rows).await?;
+            tx.commit().await?;
+            (images, oldest)
+        } else {
+            let oldest = rows.iter().map(|row| row.3).min();
+            (
+                decode_projection_rows(connection, partition_id, fanout, rows).await?,
+                oldest,
+            )
         };
         metrics::record_dsql_projection_read_duration(partition_id, started.elapsed());
-        metrics::record_dsql_projection_batch_size(partition_id, rows.len());
+        metrics::record_dsql_projection_batch_size(partition_id, images.len());
 
-        let oldest_written_at = rows.iter().map(|row| row.3).min();
         Ok(ProjectionPage {
-            images: decode_projection_rows(partition_id, fanout, rows)?,
+            images,
             oldest_written_at,
         })
     }
@@ -142,11 +145,58 @@ impl ProjectionLog for DsqlProjectionLog {
         let db_fanout = convert::i16_from_u16(fanout, "projection fanout")?;
         let mut permit = self.director.acquire(DbClass::Projection).await?;
         let mut deleted = 0;
-        for chunk in keys.chunks(DELETE_STATEMENT_KEYS) {
+        let mut offset = 0;
+        let mut chunk_len = DELETE_STATEMENT_KEYS.min(keys.len());
+        while offset < keys.len() {
+            let chunk = &keys[offset..offset + chunk_len];
+            let mut tx = permit.connection()?.begin().await?;
             let mut query = QueryBuilder::new("");
             push_delete_images(&mut query, db_partition_id, db_fanout, chunk)?;
-            let result = query.build().execute(permit.connection()?).await?;
-            deleted += result.rows_affected();
+            query.push(" RETURNING run_key, transition_seq, context_parts");
+            let removed = query
+                .build_query_as::<(Uuid, i64, Option<i32>)>()
+                .fetch_all(&mut *tx)
+                .await?;
+            let cost = image_delete_rows(removed.iter().map(|row| row.2))?;
+            if cost > 3_000 {
+                // Counts are immutable with their images. Retry a smaller chunk
+                // after rollback; no transaction can delete more than the budget.
+                tx.rollback().await?;
+                ensure!(
+                    chunk_len > 1,
+                    "one projection image exceeds the 3,000-row deletion budget"
+                );
+                chunk_len = chunk_len.div_ceil(2);
+                continue;
+            }
+            let split_keys = removed
+                .iter()
+                .filter(|row| row.2.is_some())
+                .map(|row| {
+                    Ok(ProjectionImageKey {
+                        run_key: RunKey(row.0),
+                        transition_seq: TransitionSeq(convert::u64_from_i64(
+                            row.1,
+                            "projection transition_seq",
+                        )?),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if !split_keys.is_empty() {
+                let mut parts = QueryBuilder::new("");
+                push_delete_rows(
+                    &mut parts,
+                    "projection_image_part",
+                    db_partition_id,
+                    db_fanout,
+                    &split_keys,
+                )?;
+                parts.build().execute(&mut *tx).await?;
+            }
+            tx.commit().await?;
+            deleted += u64::try_from(removed.len())?;
+            offset += chunk_len;
+            chunk_len = DELETE_STATEMENT_KEYS.min(keys.len() - offset);
         }
         Ok(deleted)
     }
@@ -160,8 +210,20 @@ pub(crate) fn push_delete_images(
     fanout: i16,
     keys: &[ProjectionImageKey],
 ) -> Result<()> {
+    push_delete_rows(query, "projection_log", partition_id, fanout, keys)
+}
+
+fn push_delete_rows(
+    query: &mut QueryBuilder<Postgres>,
+    table: &'static str,
+    partition_id: i32,
+    fanout: i16,
+    keys: &[ProjectionImageKey],
+) -> Result<()> {
     query
-        .push("DELETE FROM projection_log WHERE partition_id = ")
+        .push("DELETE FROM ")
+        .push(table)
+        .push(" WHERE partition_id = ")
         .push_bind(partition_id)
         .push(" AND fanout = ")
         .push_bind(fanout)
@@ -184,26 +246,92 @@ pub(crate) fn push_delete_images(
     Ok(())
 }
 
-fn decode_projection_rows(
+/// Presence of any count, even an invalid one, requires a snapshot before joining.
+fn image_page_needs_snapshot(rows: &[ImageRow]) -> bool {
+    rows.iter().any(|row| row.4.is_some())
+}
+
+/// Count the owning rows and all their parts, including rows deleted from either table.
+fn image_delete_rows(mut counts: impl Iterator<Item = Option<i32>>) -> Result<usize> {
+    counts.try_fold(0usize, |total, count| {
+        let count = count.unwrap_or(1);
+        ensure!(count >= 1, "invalid projection image part count {count}");
+        total
+            .checked_add(usize::try_from(count)?)
+            .ok_or_else(|| anyhow::anyhow!("projection deletion row count overflow"))
+    })
+}
+
+struct ImageRead {
+    partition: i32,
+    fanout: i16,
+    after: Option<ProjectionImageKey>,
+    limit: i64,
+}
+
+impl ImageRead {
+    async fn rows(&self, connection: &mut PgConnection) -> Result<Vec<ImageRow>> {
+        Ok(match self.after {
+            None => {
+                sqlx::query_as::<_, ImageRow>(READ_HEAD_SQL)
+                    .bind(self.partition)
+                    .bind(self.fanout)
+                    .bind(self.limit)
+                    .fetch_all(connection)
+                    .await?
+            }
+            Some(after) => {
+                let transition_seq = convert::i64_from_u64(
+                    after.transition_seq.0,
+                    "projection page position transition_seq",
+                )?;
+                sqlx::query_as::<_, ImageRow>(READ_AFTER_SQL)
+                    .bind(self.partition)
+                    .bind(self.fanout)
+                    .bind(after.run_key.0)
+                    .bind(transition_seq)
+                    .bind(self.limit)
+                    .fetch_all(connection)
+                    .await?
+            }
+        })
+    }
+}
+
+async fn decode_projection_rows(
+    connection: &mut PgConnection,
     partition_id: u32,
     fanout: u16,
     rows: Vec<ImageRow>,
 ) -> Result<Vec<ProjectionRecord>> {
-    rows.into_iter()
-        .map(|(run_key, transition_seq, context_data, _)| {
-            let context: ProjectionContext = codec::decode_projection_context(&context_data)?;
-            Ok(ProjectionRecord {
-                partition_id,
-                fanout,
-                run_key: RunKey(run_key),
-                transition_seq: TransitionSeq(convert::u64_from_i64(
-                    transition_seq,
-                    "projection_log.transition_seq",
-                )?),
-                context,
-            })
-        })
-        .collect()
+    let mut images = Vec::with_capacity(rows.len());
+    for (run_key, transition_seq, context_data, _, count) in rows {
+        let key = ProjectionImageKey {
+            run_key: RunKey(run_key),
+            transition_seq: TransitionSeq(convert::u64_from_i64(
+                transition_seq,
+                "projection_log.transition_seq",
+            )?),
+        };
+        let data = projection_image_parts::join(
+            connection,
+            i32::try_from(partition_id)?,
+            i16::try_from(fanout)?,
+            key,
+            context_data,
+            count,
+        )
+        .await?;
+        let context: ProjectionContext = codec::decode_projection_context(&data)?;
+        images.push(ProjectionRecord {
+            partition_id,
+            fanout,
+            run_key: key.run_key,
+            transition_seq: key.transition_seq,
+            context,
+        });
+    }
+    Ok(images)
 }
 
 #[cfg(test)]
@@ -217,6 +345,32 @@ mod tests {
     use crate::dsql::DsqlPermit;
 
     use super::*;
+
+    #[test]
+    fn only_pages_with_counts_need_a_snapshot() {
+        assert!(!image_page_needs_snapshot(&[]));
+        for count in [None, Some(0), Some(2), Some(3)] {
+            let rows = vec![(
+                Uuid::nil(),
+                1,
+                Vec::new(),
+                OffsetDateTime::UNIX_EPOCH,
+                count,
+            )];
+            assert_eq!(image_page_needs_snapshot(&rows), count.is_some());
+        }
+    }
+
+    #[test]
+    fn deletion_budget_includes_every_parts_row() {
+        assert_eq!(
+            image_delete_rows([None, Some(3), Some(2)].into_iter()).unwrap(),
+            6
+        );
+        assert_eq!(image_delete_rows([Some(3); 100].into_iter()).unwrap(), 300);
+        assert!(image_delete_rows([Some(-1)].into_iter()).is_err());
+        assert!(image_delete_rows([Some(31); 100].into_iter()).unwrap() > 3_000);
+    }
 
     #[test]
     fn rejects_negative_transition_sequence_from_database() {

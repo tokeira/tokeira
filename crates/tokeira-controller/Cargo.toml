@@ -10,7 +10,7 @@ license.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 buffa = { version = "0.9", features = ["json"] }
-connectrpc = { version = "0.9.1", features = ["client"] }
+connectrpc = { version = "0.9.1", default-features = false, features = ["client", "gzip", "json"] }
 futures = "0.3"
 metrics.workspace = true
 prost-types = "0.14"

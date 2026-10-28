@@ -23,7 +23,7 @@ buffa = { version = "0.9", features = ["json"] }
 buffa-types = { version = "0.9", features = ["json"] }
 chrono.workspace = true
 chrono-tz.workspace = true
-connectrpc = { version = "0.9.1", features = ["client"] }
+connectrpc = { version = "0.9.1", default-features = false, features = ["client", "gzip", "json"] }
 dashmap.workspace = true
 metrics.workspace = true
 opentelemetry.workspace = true

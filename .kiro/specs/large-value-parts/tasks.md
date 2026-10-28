@@ -55,7 +55,7 @@ worker invocation requests. Each step first shows the defect, with live tests th
       workflow-dispatch and lease-fence suites passed, and each of the eight negative controls failed its test. The
       bar passed (3,914 tests passed, 2 skipped).
 
-- [ ] 3. Step 2: visibility, built on [projection-passes](../projection-passes/design.md)'s projector
+- [x] 3. Step 2: visibility, built on [projection-passes](../projection-passes/design.md)'s projector
   - [x] 3.1 Exploration: write step 2's live tests and confirm each fails on the code before the step
     - _Requirements: 1.3_
     - DONE. On the code before the step, on an ephemeral cluster, both tests failed: DSQL refused the commit of a
@@ -70,7 +70,14 @@ worker invocation requests. Each step first shows the defect, with live tests th
     - _Requirements: 2.1-2.3_
   - [x] 3.5 Write the tests of Properties 3, 4 and 6 for visibility
     - _Requirements: 2.1-2.4, 2.6, 2.7_
-  - [ ] 3.6 Checkpoint, as 2.10
+  - [x] 3.6 Checkpoint, as 2.10
+    - DONE at `fe163eef`. On an ephemeral cluster, the ten large-value tests of images and memos pass, the
+      exploration tests among them, and so do the projection suite, the storage suites of the large values, the
+      projection log and the accumulator, and the engine's visibility tests: 199 tests. Each of five negative
+      controls failed its test: an image's first part written without its other parts, a shrinking memo that
+      keeps its old parts, a deletion that keeps an image's parts, a list read that joins a page's parts outside
+      its snapshot, and an accumulator seed that reads only an image's first part. The bar passed (4,017 tests
+      passed, 2 skipped).
 
 - [x] 4. Step 3: CHASM nodes
   - [x] 4.1 Exploration: write step 3's live test and confirm it fails on the code before the step

@@ -278,7 +278,9 @@ impl DsqlRunRepository {
                     run_key,
                     row.map(|(state_data, history_size_bytes, _)| (state_data, history_size_bytes)),
                 )?;
-                if !matches!(&loaded, LoadedRun::Existing(state) if state.used_worker_deployment_versions.is_none())
+                if !matches!(&loaded, LoadedRun::Existing(state)
+                    if state.used_worker_deployment_versions.is_none()
+                        || crate::codec::completed_updates_missing(state))
                 {
                     return Ok((loaded, stats));
                 }
@@ -393,6 +395,22 @@ impl DsqlRunRepository {
                     previous.as_ref(),
                     applied.as_ref(),
                 )?;
+            }
+            if let LoadedRun::Existing(state) = &mut loaded
+                && crate::codec::completed_updates_missing(state)
+            {
+                // An earlier release wrote this state without its completed
+                // updates. Recover them from the history in this snapshot, which
+                // the state belongs to, each batch whole (`update-refusals`
+                // criterion 2.8). The next commit writes them.
+                crate::read_probe::sql(run_key, "sql/completed-update-recovery");
+                let rows = BatchRead::All.rows(&mut tx, run_key).await?;
+                let mut completed = std::collections::BTreeSet::new();
+                for batch in run_value_parts::join_batches(&mut tx, run_key, rows).await? {
+                    let events = codec::decode_history_events(run_key, &batch.events_data)?;
+                    completed.extend(tokeira_kernel::completed_update_ids(&events));
+                }
+                state.completed_updates = completed;
             }
             crate::read_probe::sql(run_key, "sql/commit-read-snapshot");
             tx.commit().await?;

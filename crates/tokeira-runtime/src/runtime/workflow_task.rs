@@ -1375,19 +1375,6 @@ where
                     "failed to persist WFT failure for invalid command"
                 );
             }
-            // The workflow tried to close and bounced off buffered events:
-            // while the RETRY WFT is started, new signals are rejected with
-            // WorkflowClosing. Set only after the WFT-failed persist so a
-            // concurrent signal cannot be rejected while the OLD attempt
-            // still shows as started — v1.31.0 sets `workflowCloseAttempted`
-            // atomically with the UNHANDLED_COMMAND failure event
-            // (workflow_task_state_machine.go:924-928).
-            if is_unhandled_command {
-                self.close_attempt_tracking
-                    .lock()
-                    .expect("close-attempt tracking lock")
-                    .insert(run_key);
-            }
             return Err(crate::errors::InvalidWorkflowCommand {
                 message: wire_message,
             }
@@ -1468,14 +1455,6 @@ where
         }
         match &result {
             Ok(CommitResult::Applied { .. } | CommitResult::Duplicate) => {
-                // A successfully completed WFT means the workflow observed the
-                // buffered events and moved on — a stale close-attempt must not
-                // keep rejecting signals (v1.31.0's volatile bit dies with the
-                // reloaded mutable state).
-                self.close_attempt_tracking
-                    .lock()
-                    .expect("close-attempt tracking lock")
-                    .remove(&run_key);
                 // The consecutive-problem count and its derived search
                 // attribute clear inside the kernel's completion transition
                 // (`workflow_task_state_machine.go:838-846 @ v1.31.0`).
@@ -3333,6 +3312,7 @@ pub(crate) mod tests {
             pending_updates: BTreeMap::new(),
             admitted_updates: HashSet::new(),
             history_admitted_updates: Default::default(),
+            completed_updates: Default::default(),
             pending_nexus_operations: BTreeMap::new(),
             completion_callbacks: Vec::new(),
             user_metadata: None,

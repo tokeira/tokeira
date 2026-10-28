@@ -1,0 +1,5 @@
+kind: fixed
+body: An update to a paused, failing or closing workflow is refused as Temporal v1.31.0 refuses it, and a worker message for a completed update fails the workflow task.
+time: 2026-10-25T00:20:47.384705+01:00
+custom:
+    Slice: 0c8546fc-01ce-4df2-aeae-c79da7b7b25d

@@ -100,6 +100,8 @@ mod placement;
 mod placement_tests;
 mod run_value_parts;
 mod timers;
+#[cfg(all(test, feature = "dsql-integration"))]
+mod update_refusals_tests;
 mod visibility;
 mod workflow_dispatch;
 #[cfg(all(test, feature = "dsql-integration"))]
@@ -1900,6 +1902,7 @@ mod tests {
             pending_updates: Default::default(),
             admitted_updates: Default::default(),
             history_admitted_updates: Default::default(),
+            completed_updates: Default::default(),
             pending_nexus_operations: Default::default(),
             versioning_info: None,
             worker_deployment_name: None,

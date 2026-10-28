@@ -16,7 +16,7 @@ The run's state gains the set of its updates admitted by a WorkflowExecutionUpda
 
 ## How this maps onto Tokeira's architecture
 
-v1.31.0 keeps a run's updates in an in-memory registry that it rebuilds from mutable state when it loads the run. Mutable state holds accepted and completed updates, and history-admitted ones without their requests (`registry.go:168-224 @ v1.31.0`). Tokeira differs in four ways that shape the fix.
+v1.31.0 keeps a run's updates in an in-memory registry that it rebuilds from mutable state when it loads the run. Mutable state holds accepted and completed updates, and history-admitted ones without their requests (`registry.go:168-224 @ v1.31.0`). Tokeira's run state holds the first two as well: its accepted updates, and the ids of its completed ones ([update-refusals](../update-refusals/design.md)). Tokeira differs in four ways that shape the fix.
 
 1. **Admitted ids are stored with the run.** Tokeira keeps every admitted id in `WorkflowState::admitted_updates` and the requests in the registry, so after a restart the state names updates whose requests are gone. Forgetting those ids is the step that matches v1.31.0's rebuild. The lane takes it, since it alone sees both the state it loaded and the registry, immediately before the kernel applies the next command; the forget lands in that command's transition. It is the same seam through which the lane reports the held updates' request bytes today (`signal-update-limits`).
 2. **History admission is not recorded apart.** The state doesn't say which admitted ids have a WorkflowExecutionUpdateAdmitted event. The fix records them in a new state-extension section, since the state's own layout is positional.

@@ -469,6 +469,7 @@ impl BasicKernel {
             pending_updates: BTreeMap::new(),
             admitted_updates: std::collections::HashSet::new(),
             history_admitted_updates: std::collections::BTreeSet::new(),
+            completed_updates: std::collections::BTreeSet::new(),
             pending_nexus_operations: BTreeMap::new(),
             completion_callbacks: completion_callbacks.clone(),
             user_metadata: user_metadata.clone(),
@@ -607,6 +608,7 @@ impl BasicKernel {
             pending_updates: BTreeMap::new(),
             admitted_updates: std::collections::HashSet::new(),
             history_admitted_updates: std::collections::BTreeSet::new(),
+            completed_updates: std::collections::BTreeSet::new(),
             pending_nexus_operations: BTreeMap::new(),
             completion_callbacks: completion_callbacks.clone(),
             user_metadata: req.user_metadata.clone(),
@@ -775,6 +777,7 @@ impl BasicKernel {
             pending_updates: BTreeMap::new(),
             admitted_updates: std::collections::HashSet::new(),
             history_admitted_updates: std::collections::BTreeSet::new(),
+            completed_updates: std::collections::BTreeSet::new(),
             pending_nexus_operations: BTreeMap::new(),
             completion_callbacks: Vec::new(),
             user_metadata: req.user_metadata.clone(),
@@ -958,8 +961,16 @@ impl BasicKernel {
     /// validate the update before it becomes durable.
     fn apply_update(&self, loaded: LoadedRun, req: UpdateRequest) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
+        // A running workflow refuses an update when it is paused, then when its
+        // workflow task keeps failing, before anything looks the update's id up
+        // (`updateworkflow/api.go:118-143 @ v1.31.0`). The runtime refuses both
+        // before the lane; the kernel checks them again because the run can
+        // change between the runtime's read and this command.
         if state.status == ExecutionStatus::Paused {
             return Err(Reject::WorkflowPaused);
+        }
+        if state.workflow_task_attempt >= crate::limits::FAIL_UPDATE_WORKFLOW_TASK_ATTEMPT {
+            return Err(Reject::UpdateWorkflowTaskFailing);
         }
         // Reject duplicate update IDs — check both pending_updates
         // (already accepted) and admitted_updates (awaiting worker acceptance).
@@ -4800,6 +4811,7 @@ impl BasicKernel {
                 state.pending_updates.remove(update_id);
                 state.admitted_updates.remove(update_id);
                 state.completed_update_count = state.completed_update_count.saturating_add(1);
+                state.completed_updates.insert(update_id.clone());
             }
             HistoryEventKind::WorkflowExecutionUpdateRejected { update_id, .. } => {
                 state.pending_updates.remove(update_id);
@@ -6508,6 +6520,7 @@ fn apply_workflow_command(
                 outcome: UpdateEventOutcome::Success(result),
             });
             builder.state.pending_updates.remove(&update_id);
+            builder.state.completed_updates.insert(update_id);
             Ok(false)
         }
         WorkflowCommand::UpdateRejected { update_id, failure } => {
@@ -6551,6 +6564,13 @@ fn apply_workflow_command(
                     if !builder.state.pending_updates.contains_key(&update_id)
                         && !builder.state.admitted_updates.contains(&update_id)
                     {
+                        if builder.state.completed_updates.contains(&update_id) {
+                            return Err(completed_update_message(
+                                builder,
+                                &update_id,
+                                "Acceptance",
+                            ));
+                        }
                         // Unknown update. When the worker echoed the original
                         // request (non-empty handler name), RESURRECT it and
                         // proceed as if admitted (`TryResurrect` rebuilds the
@@ -6686,6 +6706,9 @@ fn apply_workflow_command(
                                 not_found: false,
                             });
                         }
+                        if builder.state.completed_updates.contains(&update_id) {
+                            return Err(completed_update_message(builder, &update_id, "Response"));
+                        }
                         // `TryResurrect` still makes its total check before it
                         // finds no request in a Response (criterion 2.13).
                         builder.check_resurrection(limits.total_updates)?;
@@ -6724,6 +6747,7 @@ fn apply_workflow_command(
                     // (`registry.go:220, 382, 496-505 @ v1.31.0`).
                     builder.state.completed_update_count =
                         builder.state.completed_update_count.saturating_add(1);
+                    builder.state.completed_updates.insert(update_id);
                 }
                 UpdateProtocolBody::Rejected { update_id, failure } => {
                     // A rejection leaves NO durable trace: v1.31.0 writes no
@@ -6747,6 +6771,9 @@ fn apply_workflow_command(
                     if !builder.state.admitted_updates.contains(&update_id)
                         && !builder.state.pending_updates.contains_key(&update_id)
                     {
+                        if builder.state.completed_updates.contains(&update_id) {
+                            return Err(completed_update_message(builder, &update_id, "Rejection"));
+                        }
                         builder.resurrect_update(limits.total_updates)?;
                     }
                     builder.state.admitted_updates.remove(&update_id);
@@ -6772,6 +6799,65 @@ fn apply_workflow_command(
             Ok(false)
         }
     }
+}
+
+/// v1.31.0's answer to an update message for an update that has completed: a
+/// completed update's state machine takes no acceptance, rejection or response.
+/// v1.31.0's registry finds the completed update, so the message never rebuilds
+/// it, and the workflow task fails with `BAD_UPDATE_WORKFLOW_EXECUTION_MESSAGE`
+/// (`checkStateSet`, `update/update.go:470, 562, 609, 648-656`;
+/// `update/state.go:45-46`; `workflow_task_completed_handler.go:375-386 @
+/// v1.31.0`). `message_type` names the message as Go's `%T` prints it,
+/// `Acceptance`, `Rejection` or `Response`.
+fn completed_update_message(
+    builder: &TransitionBuilder,
+    update_id: &str,
+    message_type: &str,
+) -> Reject {
+    // Responses take effect only on commit. A later message in this same
+    // completion still sees ProvisionallyCompleted; a prior task's response
+    // sees Completed (service/history/workflow/update/update.go:619-624 and
+    // registry.go:455-459 @ v1.31.0).
+    let completed_this_transition = builder.history_events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            HistoryEventKind::WorkflowExecutionUpdateCompleted { update_id: id, .. }
+                | HistoryEventKind::WorkflowExecutionUpdateCompletedV2 { update_id: id, .. }
+                if id == update_id
+        )
+    });
+    let state_name = if completed_this_transition {
+        "ProvisionallyCompleted"
+    } else {
+        "Completed"
+    };
+    Reject::BadUpdateMessage {
+        message: format!(
+            "invalid state transition attempted for Update {update_id}: received \
+             *update.{message_type} message while in state {state_name}"
+        ),
+        not_found: false,
+    }
+}
+
+/// The ids of the updates whose WorkflowExecutionUpdateCompleted event, in either
+/// form, is among `events`: the completed updates a run's history records. The
+/// kernel's replay of a history keeps the same set in the state it rebuilds, and
+/// the stores recover it from history for a run whose state an earlier release
+/// wrote without it (`update-refusals`).
+pub fn completed_update_ids<'a>(
+    events: impl IntoIterator<Item = &'a HistoryEvent>,
+) -> std::collections::BTreeSet<String> {
+    events
+        .into_iter()
+        .filter_map(|event| match &event.kind {
+            HistoryEventKind::WorkflowExecutionUpdateCompleted { update_id, .. }
+            | HistoryEventKind::WorkflowExecutionUpdateCompletedV2 { update_id, .. } => {
+                Some(update_id.clone())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Internal builder that assembles a [`Transition`] from a
@@ -8413,6 +8499,12 @@ pub enum Reject {
     /// it is.
     #[error("workflow is paused")]
     WorkflowPaused,
+    /// An update request reached a running workflow whose workflow task keeps
+    /// failing: its attempt is [`crate::limits::FAIL_UPDATE_WORKFLOW_TASK_ATTEMPT`]
+    /// or more. v1.31.0 answers `WorkflowNotReady` at once
+    /// (`updateworkflow/api.go:132-143 @ v1.31.0`).
+    #[error("workflow task keeps failing")]
+    UpdateWorkflowTaskFailing,
     /// A pause was requested but the workflow is already
     /// paused.
     #[error("workflow is already paused")]

@@ -408,10 +408,10 @@ where
     /// Decision ladder mirrors `multioperation/api.go @ v1.31.0`, consulting
     /// the current/latest run BEFORE start adjudication: (1) an update id the
     /// run already knows replays/attaches with NO mutation — durable outcomes
-    /// replay even on CLOSED workflows, and an in-flight update attaches even
-    /// under TERMINATE_EXISTING (the "given an accepted update, attach to it"
-    /// behavior); (2) request-id dedup and USE_EXISTING attach to the running
-    /// incumbent; (3) conflict-policy FAIL rejects the start leg; (4) fresh
+    /// replay even on CLOSED workflows, and an in-flight update passes the
+    /// running-workflow refusals before attaching even under TERMINATE_EXISTING;
+    /// (2) request-id dedup and USE_EXISTING attach to the running incumbent;
+    /// (3) conflict-policy FAIL rejects the start leg; (4) fresh
     /// starts fold run creation + update admission into ONE
     /// `Command::StartAndUpdate` transition so a crash can never separate
     /// them.
@@ -441,16 +441,27 @@ where
             }
         };
         if let Some(run_key) = latest_run
-            && self
+            && let Some(snapshot) = self
                 .update_lifecycle_snapshot(run_key, current.clone(), &update_id)
                 .await?
-                .is_some()
         {
             let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
                 return Err(anyhow!("latest run vanished during update-with-start"));
             };
             let run_id = state.run_id;
             let execution_status = state.status;
+            // Only a completed outcome bypasses ApplyRequest. An in-flight
+            // update on an open run must pass the same refusals as a new one
+            // (service/history/api/multioperation/api.go:196-224, 306-327
+            // @ v1.31.0), before waiting can attach a caller.
+            if snapshot.stage != UpdateLifecycleStage::Completed {
+                self.refuse_update(run_key, &state).map_err(|source| {
+                    MultiOperationError::UpdateFailed {
+                        started: false,
+                        source,
+                    }
+                })?;
+            }
             let update = self
                 .wait_for_update_stage(
                     run_key,

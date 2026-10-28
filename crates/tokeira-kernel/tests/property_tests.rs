@@ -187,6 +187,7 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         pending_updates: BTreeMap::new(),
         admitted_updates: std::collections::HashSet::new(),
         history_admitted_updates: Default::default(),
+        completed_updates: Default::default(),
         pending_nexus_operations: BTreeMap::new(),
         completion_callbacks: Vec::new(),
         user_metadata: None,
@@ -8567,6 +8568,7 @@ proptest! {
         let mut admitted: BTreeSet<String> = BTreeSet::new();
         let mut accepted: BTreeSet<String> = BTreeSet::new();
         let mut completed: u32 = 0;
+        let mut completed_ids: BTreeSet<String> = BTreeSet::new();
         let mut seq = 70u64;
         for (kind, slot) in ops {
             let update_id = format!("update-{slot}");
@@ -8600,9 +8602,14 @@ proptest! {
                 // Acceptance moves an id into the accepted set; an id the
                 // registry never saw is resurrected as accepted, exactly as
                 // the kernel does, while a second acceptance of an accepted id
-                // is an invalid transition the kernel refuses.
+                // is an invalid transition the kernel refuses. An acceptance or
+                // a rejection for a completed update that isn't in flight again
+                // fails the task, as v1.31.0's registry finds it completed
+                // (`update-refusals` criterion 2.7).
                 _ => {
                     let started = with_pending_wft(state.clone(), seq, Some(22), 1);
+                    let in_flight = admitted.contains(&update_id) || accepted.contains(&update_id);
+                    let refused = kind != 2 && !in_flight && completed_ids.contains(&update_id);
                     let body = match kind {
                         1 => {
                             if accepted.contains(&update_id) {
@@ -8630,24 +8637,34 @@ proptest! {
                             failure: payload("rejected"),
                         },
                     };
-                    let transition = kernel
-                        .apply(
-                            LoadedRun::Existing(started.clone()),
-                            Command::WorkflowTaskCompleted(completion_request(
-                                &started,
-                                vec![WorkflowCommand::ProtocolMessage {
-                                    message_id: format!("msg-{seq}"),
-                                    body,
-                                }],
-                                Default::default(),
-                                None,
-                                None,
-                                false,
-                                now,
-                            )),
-                        )
-                        .unwrap();
-                    state = transition.next_state;
+                    let result = kernel.apply(
+                        LoadedRun::Existing(started.clone()),
+                        Command::WorkflowTaskCompleted(completion_request(
+                            &started,
+                            vec![WorkflowCommand::ProtocolMessage {
+                                message_id: format!("msg-{seq}"),
+                                body,
+                            }],
+                            Default::default(),
+                            None,
+                            None,
+                            false,
+                            now,
+                        )),
+                    );
+                    if refused {
+                        prop_assert!(
+                            matches!(
+                                result,
+                                Err(Reject::BadUpdateMessage { not_found: false, .. })
+                            ),
+                            "a message for completed {} answered {:?}",
+                            update_id,
+                            result
+                        );
+                        continue;
+                    }
+                    state = result.unwrap().next_state;
                     match kind {
                         1 => {
                             admitted.remove(&update_id);
@@ -8656,6 +8673,7 @@ proptest! {
                         2 => {
                             accepted.remove(&update_id);
                             completed += 1;
+                            completed_ids.insert(update_id);
                         }
                         _ => {
                             admitted.remove(&update_id);
@@ -8669,6 +8687,7 @@ proptest! {
                 admitted.len() + accepted.len()
             );
             prop_assert_eq!(state.completed_update_count, completed);
+            prop_assert_eq!(&state.completed_updates, &completed_ids);
         }
     }
 

@@ -264,9 +264,9 @@ pub struct TokeiraRuntime<R> {
     /// in-memory mirror of v1.31.0's volatile
     /// `MutableStateImpl.workflowCloseAttempted` (mutable_state_impl.go:191,
     /// set at workflow_task_state_machine.go:924-928; checked by
-    /// signal_workflow_util.go:63-70). Cleared when a later WFT completes
-    /// successfully (the workflow moved on) — v1.31.0 clears on
-    /// mutable-state reload, which every WFT failure triggers.
+    /// signal_workflow_util.go:63-70). The lane clears it whenever a started
+    /// task closes and sets it again only for an UnhandledCommand failure
+    /// (workflow_task_state_machine.go:1094-1108 @ v1.31.0).
     close_attempt_tracking: Arc<std::sync::Mutex<std::collections::HashSet<RunKey>>>,
     /// Runtime-local index of `BackingOff` completion callbacks to re-fire.
     completion_callback_tracking: CompletionCallbackTrackingState,
@@ -776,6 +776,8 @@ where
         let activity_broker = InMemoryActivityBroker::default();
         let workflow_timeout_tracking = WorkflowTimeoutTrackingState::default();
         let wft_timeout_tracking = WftTimeoutTrackingState::default();
+        let close_attempt_tracking =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let activity_tracking = ActivityTrackingState::default();
         let nexus_timeout_tracking = NexusTimeoutTrackingState::default();
         let completion_callback_tracking = CompletionCallbackTrackingState::default();
@@ -854,6 +856,7 @@ where
                     wft_timeout_tracking.clone(),
                     nexus_timeout_tracking.clone(),
                     update_registry.clone(),
+                    close_attempt_tracking.clone(),
                     config.clone(),
                 )
             })
@@ -1049,9 +1052,7 @@ where
             wft_timeout_scanner_handle,
             wft_timeout_scanner_cancel,
             nexus_timeout_tracking,
-            close_attempt_tracking: Arc::new(std::sync::Mutex::new(
-                std::collections::HashSet::new(),
-            )),
+            close_attempt_tracking,
             completion_callback_tracking,
             nexus_task_broker,
             nexus_registry,

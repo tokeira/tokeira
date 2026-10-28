@@ -577,6 +577,43 @@ mod tests {
         }
     }
 
+    /// An update to a paused workflow answers v1.31.0's plain FailedPrecondition,
+    /// and one to a workflow whose task keeps failing its WorkflowNotReady, with
+    /// the typed detail (`updateworkflow/api.go:128-143 @ v1.31.0`).
+    #[test]
+    fn update_refusals_answer_as_v1_31_0_does() {
+        let paused = Status::from(EdgeError::from(anyhow::Error::from(
+            tokeira_runtime::UpdatePaused,
+        )));
+        assert_eq!(paused.code(), Code::FailedPrecondition);
+        assert_eq!(
+            paused.message(),
+            "Workflow is paused. Cannot update the workflow."
+        );
+        assert!(
+            RpcStatus::decode(paused.details())
+                .map(|rpc| rpc.details.is_empty())
+                .unwrap_or(true),
+            "a paused workflow's refusal carries no typed detail"
+        );
+
+        let failing = Status::from(EdgeError::from(anyhow::Error::from(
+            tokeira_runtime::WorkflowNotReady {
+                message: tokeira_runtime::UPDATE_WORKFLOW_TASK_FAILING,
+            },
+        )));
+        assert_eq!(failing.code(), Code::FailedPrecondition);
+        assert_eq!(
+            failing.message(),
+            "Unable to perform workflow execution update due to Workflow Task in failed state."
+        );
+        let rpc = RpcStatus::decode(failing.details()).expect("google.rpc.Status");
+        assert_eq!(
+            rpc.details[0].type_url,
+            "type.googleapis.com/temporal.api.errordetails.v1.WorkflowNotReadyFailure"
+        );
+    }
+
     #[test]
     fn authorization_denial_has_exact_message_and_typed_reason() {
         for (reason, expected) in [

@@ -1,0 +1,5 @@
+kind: changed
+body: An open run from an earlier release recovers its completed updates when it loads, unless it was reset before 0.6.0; until its next commit, each load rereads its history.
+time: 2026-10-28T21:13:53.000000+00:00
+custom:
+    Slice: 35512272-71e5-4be7-8670-80b2d980f0dc

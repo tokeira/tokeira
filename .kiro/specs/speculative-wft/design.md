@@ -308,6 +308,7 @@ embedding crates; the engine release that carries it is a minor version bump.
 | Unknown update id, no resurrect payload | WFT fails (`BadUpdateWorkflowExecutionMessage`); NotFound "update {id} wasn't found on the server…" |
 | `PROTOCOL_MESSAGE` command → absent message id | WFT fails; InvalidArgument "ProtocolMessageCommand referenced absent message ID {id}" |
 | Wrong-state message (double accept, complete-before-accept) | WFT fails; InvalidArgument "invalid state transition attempted for Update {id}: …" |
+| Acceptance, rejection or response for an update the run has completed | WFT fails; InvalidArgument "invalid state transition attempted for Update {id}: received *update.{Acceptance, Rejection or Response} message while in state Completed" ([update-refusals](../update-refusals/bugfix.md) 2.7) |
 | Any of the above | update waiter aborts: WorkflowNotReady "Unable to perform workflow execution update due to unexpected workflow task failure." |
 | Explicit RespondWorkflowTaskFailed | update stays admitted; redelivered on the retry WFT |
 | Late completion of timed-out started speculative | NotFound "Workflow task not found." |

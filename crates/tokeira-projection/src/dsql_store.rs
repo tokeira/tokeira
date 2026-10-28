@@ -574,9 +574,10 @@ impl VisibilityStore for DsqlVisibilityStore {
         page: &PageBounds,
     ) -> Result<ListResult> {
         let mut permit = self.director.acquire(DbClass::Projection).await?;
-        // Both SELECTs must share DSQL's transaction snapshot: a projection apply
-        // atomically replaces the row and attributes, so separate reads could
-        // otherwise label new values with an older transition version.
+        // Both SELECTs must share DSQL's transaction snapshot: the hydration keeps
+        // only the values at each listed row's version, and a flip and its cleanup
+        // between two separate reads would delete them, so the row would list
+        // without its attributes.
         let mut tx = permit.connection()?.begin().await?;
         let result = list_rows(&mut tx, namespace_id, filter, sort, page, true).await?;
         tx.commit().await?;

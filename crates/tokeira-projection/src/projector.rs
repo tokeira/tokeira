@@ -3,7 +3,9 @@
 //! Each pass reads the partition from its head, a page at a time in
 //! `(run_key, transition_seq)` order, applies each run's newest image in the page
 //! through the strictly-newer guard, and then deletes every image of the page whose
-//! run's apply succeeded (`projection-passes` criteria 2.1-2.3). The position lives
+//! run's apply succeeded (`projection-passes` criteria 2.1-2.3). The runs of different
+//! rollup stripes are applied concurrently, one run of a stripe at a time (criterion
+//! 2.10). The position lives
 //! inside one pass: run keys are hashes, so commits land anywhere in key order, and an
 //! image committed behind the position is at or after the head of the next pass.
 //! Nothing durable records progress, so there is no checkpoint to conflict on.
@@ -20,9 +22,13 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
+    pin::Pin,
+    task::Poll,
     time::{Duration, Instant},
 };
 
+use anyhow::Result;
 use time::OffsetDateTime;
 use tokeira_observability::{
     ErrorBiasedSamplingReason, ProjectionFailureKindLabel, ProjectionOutcomeLabel,
@@ -35,6 +41,7 @@ use tracing::{debug, warn};
 
 use crate::{
     metrics as projection_metrics,
+    rollup::stripe_for,
     sink::{ApplyOutcome, ProjectionSink},
 };
 
@@ -122,6 +129,42 @@ pub fn next_pause(report: &PassReport, backoff: Duration) -> (Duration, Duration
     } else {
         (Duration::ZERO, FIRST_BACKOFF)
     }
+}
+
+/// A run's newest image by `(authority_epoch, transition_seq)`.
+fn newest_image(run: &[ProjectionRecord]) -> &ProjectionRecord {
+    run.iter()
+        .max_by_key(|image| (image.context.authority_epoch, image.transition_seq))
+        .expect("chunk_by yields no empty run")
+}
+
+/// Drive `futures` to completion together on the calling task, and answer their
+/// outputs in order. A pass has at most one future a rollup stripe, so polling each
+/// unfinished one on every wake costs little.
+async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut futures: Vec<Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
+    let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (future, output) in futures.iter_mut().zip(outputs.iter_mut()) {
+            if output.is_none() {
+                match future.as_mut().poll(cx) {
+                    Poll::Ready(value) => *output = Some(value),
+                    Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    })
+    .await;
+    outputs
+        .into_iter()
+        .map(|output| output.expect("every future finished"))
+        .collect()
 }
 
 impl<L, S> Projector<L, S>
@@ -221,23 +264,51 @@ where
     /// or is found current, the stored row is at least as new as all of them, so all
     /// of them can go. Superseded images are never applied, and they go with it:
     /// deleting only applied images would keep every dominated image for ever.
+    ///
+    /// The runs of different rollup stripes are applied concurrently, at most one run
+    /// of a stripe at a time (criterion 2.10). Their rows and counter rows are
+    /// disjoint, so their applies never conflict, while two runs of one stripe would
+    /// contend on its counter rows. Each stripe's runs go in page order, on this task,
+    /// and the store bounds how many applies hold a connection at once: on DSQL, the
+    /// projection class's.
     async fn apply_page(
         &self,
         images: &[ProjectionRecord],
         report: &mut PassReport,
         cancel: &CancellationToken,
     ) -> Vec<ProjectionImageKey> {
-        let mut finished = Vec::with_capacity(images.len());
         // The log returns a run's images together, in key order.
-        for run in images.chunk_by(|left, right| left.run_key == right.run_key) {
-            if cancel.is_cancelled() {
-                break;
-            }
-            let newest = run
-                .iter()
-                .max_by_key(|image| (image.context.authority_epoch, image.transition_seq))
-                .expect("chunk_by yields no empty run");
-            match self.sink.apply(newest, self.partition_id).await {
+        let runs: Vec<&[ProjectionRecord]> = images
+            .chunk_by(|left, right| left.run_key == right.run_key)
+            .collect();
+        // One lane per stripe in the page, in the order of its first run.
+        let mut lanes: Vec<Vec<usize>> = Vec::new();
+        let mut lane_of_stripe = HashMap::new();
+        for (index, run) in runs.iter().enumerate() {
+            let lane = *lane_of_stripe
+                .entry(stripe_for(run[0].run_key))
+                .or_insert_with(|| {
+                    lanes.push(Vec::new());
+                    lanes.len() - 1
+                });
+            lanes[lane].push(index);
+        }
+        let mut outcomes: Vec<(usize, Result<ApplyOutcome>)> = join_all(
+            lanes
+                .into_iter()
+                .map(|lane| self.apply_lane(&runs, lane, cancel))
+                .collect(),
+        )
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+        outcomes.sort_unstable_by_key(|(index, _)| *index);
+
+        let mut finished = Vec::with_capacity(images.len());
+        for (index, outcome) in outcomes {
+            let run = runs[index];
+            match outcome {
                 Ok(outcome) => {
                     match outcome {
                         ApplyOutcome::Advanced => report.applied += 1,
@@ -248,6 +319,7 @@ where
                 Err(error) => {
                     report.failed_applies += 1;
                     mark_error_biased_sample(ErrorBiasedSamplingReason::ProjectionSinkFailure);
+                    let newest = newest_image(run);
                     warn!(
                         ?error,
                         partition = self.partition_id,
@@ -259,6 +331,28 @@ where
             }
         }
         finished
+    }
+
+    /// Apply the newest image of each of `lane`'s runs, one run at a time, and answer
+    /// each run's index in `runs` with its outcome.
+    async fn apply_lane(
+        &self,
+        runs: &[&[ProjectionRecord]],
+        lane: Vec<usize>,
+        cancel: &CancellationToken,
+    ) -> Vec<(usize, Result<ApplyOutcome>)> {
+        let mut outcomes = Vec::with_capacity(lane.len());
+        for index in lane {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let outcome = self
+                .sink
+                .apply(newest_image(runs[index]), self.partition_id)
+                .await;
+            outcomes.push((index, outcome));
+        }
+        outcomes
     }
 
     fn record(&self, report: &PassReport, duration: Duration) {
@@ -608,6 +702,103 @@ mod tests {
         }
     }
 
+    /// The most applies a sink had in flight at once: in all, of one rollup stripe,
+    /// and of one run.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct Overlap {
+        all: usize,
+        stripe: usize,
+        run: usize,
+    }
+
+    /// A test sink whose every apply yields once before it reaches the store, so the
+    /// applies a projector runs together are all in flight before any finishes. It
+    /// records the most it saw in flight at once.
+    #[derive(Clone)]
+    struct OverlapSink {
+        inner: TestSink,
+        in_flight: Arc<Mutex<Vec<RunKey>>>,
+        most: Arc<Mutex<Overlap>>,
+    }
+
+    impl OverlapSink {
+        fn new(inner: TestSink) -> Self {
+            Self {
+                inner,
+                in_flight: Default::default(),
+                most: Default::default(),
+            }
+        }
+
+        fn most(&self) -> Overlap {
+            *self.most.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl ProjectionSink for OverlapSink {
+        async fn apply(
+            &self,
+            record: &ProjectionRecord,
+            partition_id: u32,
+        ) -> Result<ApplyOutcome> {
+            {
+                let mut in_flight = self.in_flight.lock().unwrap();
+                in_flight.push(record.run_key);
+                let stripe = stripe_for(record.run_key);
+                let mut most = self.most.lock().unwrap();
+                most.all = most.all.max(in_flight.len());
+                most.stripe = most.stripe.max(
+                    in_flight
+                        .iter()
+                        .filter(|run_key| stripe_for(**run_key) == stripe)
+                        .count(),
+                );
+                most.run = most.run.max(
+                    in_flight
+                        .iter()
+                        .filter(|run_key| **run_key == record.run_key)
+                        .count(),
+                );
+            }
+            tokio::task::yield_now().await;
+            let outcome = self.inner.apply(record, partition_id).await;
+            let mut in_flight = self.in_flight.lock().unwrap();
+            let position = in_flight
+                .iter()
+                .position(|run_key| *run_key == record.run_key)
+                .expect("this apply is in flight");
+            in_flight.swap_remove(position);
+            outcome
+        }
+    }
+
+    fn overlap_projector(log: &TestLog, sink: &OverlapSink) -> Projector<TestLog, OverlapSink> {
+        Projector {
+            log: log.clone(),
+            sink: sink.clone(),
+            partition_id: 0,
+            fanout: 1,
+            page_size: PAGE_SIZE,
+        }
+    }
+
+    async fn status_counts(store: &InMemoryVisibilityStore) -> BTreeMap<String, i64> {
+        store
+            .count_from_rollup(
+                NamespaceId(Uuid::from_u128(1)),
+                ArchetypeId::WORKFLOW,
+                crate::RollupDimension::ExecutionStatus,
+            )
+            .await
+            .unwrap()
+            .groups
+            .into_iter()
+            .map(|group| (group.value, group.count))
+            .filter(|(_, count)| *count != 0)
+            .collect()
+    }
+
     fn image(run: u128, transition_seq: u64) -> ProjectionRecord {
         let run_key = RunKey(Uuid::from_u128(run));
         let workflow_id = WorkflowId(format!("workflow-{run}"));
@@ -721,6 +912,62 @@ mod tests {
         assert_eq!(
             sink.stored_seq(RunKey(Uuid::from_u128(1))).await,
             Some(TransitionSeq(3))
+        );
+    }
+
+    // `projection-passes` criterion 2.10: the runs of different rollup stripes are
+    // applied together, and the runs of one stripe one at a time, in page order.
+    #[tokio::test]
+    async fn a_pass_applies_the_runs_of_different_stripes_together() {
+        let (inner, log) = TestSink::with_log();
+        let sink = OverlapSink::new(inner.clone());
+        // Stripes 1 to 4, two runs each: run 17 shares run 1's stripe, and so on.
+        let runs = [1u128, 2, 3, 4, 17, 18, 19, 20];
+        for run in runs {
+            log.commit(image(run, 1));
+            log.commit(image(run, 2));
+        }
+
+        let report = overlap_projector(&log, &sink)
+            .pass(&CancellationToken::new())
+            .await;
+
+        assert_eq!(
+            sink.most(),
+            Overlap {
+                all: 4,
+                stripe: 1,
+                run: 1
+            },
+            "the four stripes together, one run of each at a time"
+        );
+        let applied = inner.applied.lock().unwrap().clone();
+        assert_eq!(
+            applied.iter().copied().collect::<BTreeSet<_>>(),
+            runs.iter().map(|run| key(*run, 2)).collect::<BTreeSet<_>>(),
+            "each run's newest image"
+        );
+        assert_eq!(applied.len(), runs.len(), "once each: {applied:?}");
+        let position = |run| applied.iter().position(|applied| *applied == key(run, 2));
+        for (first, second) in [(1, 17), (2, 18), (3, 19), (4, 20)] {
+            assert!(
+                position(first) < position(second),
+                "a stripe's runs in page order: {applied:?}"
+            );
+        }
+        assert_eq!(
+            report,
+            PassReport {
+                read: 16,
+                applied: 8,
+                deleted: 16,
+                ..PassReport::default()
+            }
+        );
+        assert!(log.keys().is_empty());
+        assert_eq!(
+            status_counts(&inner.store).await,
+            BTreeMap::from([(crate::workflow_status_keyword(ExecutionStatus::Running), 8)])
         );
     }
 
@@ -1193,8 +1440,9 @@ mod tests {
 
     fn run_number(run: usize) -> u128 {
         // Spread the runs across the key space, so a page's position falls between
-        // them.
-        (run as u128 + 1) << 100
+        // them, and over three rollup stripes, so some runs share one and the rest
+        // apply together.
+        ((run as u128 + 1) << 100) | (run as u128 % 3)
     }
 
     async fn run_pass(
@@ -1364,6 +1612,49 @@ mod tests {
                 ];
                 converge(&projectors, &histories, &order, &passes, &faults).await;
                 expect_converged(&sink, &log, &histories).await
+            })?;
+        }
+
+        // `projection-passes` criterion 2.10: whatever stripes a page's runs fall in,
+        // a pass applies one image of each run, its newest, and at most one run of a
+        // stripe at a time, while the runs of different stripes apply together. Every
+        // run is counted once.
+        #[test]
+        fn prop_runs_of_different_stripes_apply_together(
+            stripes in prop::collection::vec(0u128..16, 1..12),
+            transitions in 1u64..4,
+        ) {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                let (inner, log) = TestSink::with_log();
+                let sink = OverlapSink::new(inner.clone());
+                let runs = stripes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, stripe)| ((index as u128 + 1) << 100) | stripe)
+                    .collect::<Vec<_>>();
+                for run in &runs {
+                    for transition_seq in 1..=transitions {
+                        log.commit(image(*run, transition_seq));
+                    }
+                }
+
+                let report = overlap_projector(&log, &sink).pass(&CancellationToken::new()).await;
+
+                let distinct = stripes.iter().collect::<BTreeSet<_>>().len();
+                prop_assert_eq!(sink.most(), Overlap { all: distinct, stripe: 1, run: 1 });
+                let applied = inner.applied.lock().unwrap().clone();
+                prop_assert_eq!(applied.len(), runs.len());
+                prop_assert_eq!(
+                    applied.into_iter().collect::<BTreeSet<_>>(),
+                    runs.iter().map(|run| key(*run, transitions)).collect::<BTreeSet<_>>()
+                );
+                prop_assert_eq!(report.applied, runs.len());
+                prop_assert_eq!(log.keys(), Vec::<ProjectionImageKey>::new());
+                prop_assert_eq!(
+                    status_counts(&inner.store).await,
+                    BTreeMap::from([(crate::workflow_status_keyword(ExecutionStatus::Running), runs.len() as i64)])
+                );
+                Ok(())
             })?;
         }
     }

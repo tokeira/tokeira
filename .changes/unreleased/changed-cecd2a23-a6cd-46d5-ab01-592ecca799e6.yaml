@@ -1,0 +1,5 @@
+kind: changed
+body: The visibility projector now applies runs in different rollup stripes concurrently, so List and Count catch up sooner under load.
+time: 2026-10-25T01:58:47.000000+01:00
+custom:
+    Slice: cecd2a23-a6cd-46d5-ab01-592ecca799e6

@@ -504,13 +504,22 @@ where
                 if DsqlVisibilityStore::is_occ_conflict(&error)
                     && attempts.is_none_or(|limit| attempt < limit) =>
             {
-                let backoff = 10u64.saturating_mul(1 << attempt.min(7)).min(1_000);
-                tokio::time::sleep(Duration::from_millis(backoff)).await;
+                let random = Uuid::new_v4().as_u128() as u64;
+                tokio::time::sleep(conflict_backoff(attempt, random)).await;
                 attempt += 1;
             }
             result => return result,
         }
     }
+}
+
+/// The wait after a transaction's `attempt`-th write conflict: its ceiling doubles
+/// from 20 ms to a second, and `random` picks a point in the ceiling's upper half, so
+/// transactions that conflicted together don't all try again together.
+pub(super) fn conflict_backoff(attempt: u32, random: u64) -> Duration {
+    let ceiling = 10u64.saturating_mul(1 << attempt.min(7)).min(1_000);
+    let floor = ceiling / 2;
+    Duration::from_millis(floor + random % (ceiling - floor + 1))
 }
 
 /// Where the copy has reached: the last `execution_visibility_current` key it
@@ -536,7 +545,8 @@ pub struct LegacyCellKey {
 /// What one call of the copy did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CopyReport {
-    /// Copy transactions this call committed, the final one included.
+    /// Copy transactions this call committed, the final one included: none when the
+    /// copy had already finished.
     pub transactions: usize,
     /// Runs whose old rows this call copied, in full or in part.
     pub runs: usize,
@@ -942,7 +952,8 @@ impl DsqlVisibilityStore {
     /// a write conflict runs again. One whose snapshot predates completion on another
     /// node can still write rows at a run's old version: at most one straggling
     /// transaction per node, matching nothing, gone at that run's next cleanup or
-    /// deletion.
+    /// deletion. A finished copy answers from a plain read of its completion, so
+    /// nodes that start together take no lock on it.
     pub async fn copy_legacy_attributes(&self) -> Result<CopyReport> {
         self.copy_legacy_attributes_with(&CopyScope::cluster(), CopyLimits::default())
             .await
@@ -957,6 +968,23 @@ impl DsqlVisibilityStore {
             limits.budget > 2 && limits.run_page > 0,
             "the copy needs room for its progress row and at least one run"
         );
+        // Completion is never undone, so a completion this read sees is final.
+        let completed_at: Option<Option<OffsetDateTime>> = {
+            let mut permit = self.director.acquire(DbClass::Projection).await?;
+            sqlx::query_scalar(
+                "SELECT completed_at FROM execution_visibility_attr_copy WHERE name = $1",
+            )
+            .bind(&scope.name)
+            .fetch_optional(permit.connection()?)
+            .await
+            .context("read the visibility attribute copy's completion")?
+        };
+        if completed_at.flatten().is_some() {
+            return Ok(CopyReport {
+                completed: true,
+                ..CopyReport::default()
+            });
+        }
         retry_conflicts(None, || async {
             let mut permit = self.director.acquire(DbClass::Projection).await?;
             sqlx::query(
@@ -1713,5 +1741,26 @@ mod tests {
             rows += statement_rows;
         }
         assert_eq!(rows, 300);
+    }
+
+    // A conflicted transaction waits within its ceiling, which doubles from 20 ms to a
+    // second, and transactions that conflicted together spread over its upper half.
+    #[test]
+    fn conflict_backoff_spreads_within_its_ceiling() {
+        for attempt in 1..=12u32 {
+            let ceiling =
+                Duration::from_millis(10u64 << attempt.min(7)).min(Duration::from_secs(1));
+            let waits: BTreeSet<Duration> = [0, 1, 7, 99, 12_345, u64::MAX]
+                .into_iter()
+                .map(|random| conflict_backoff(attempt, random))
+                .collect();
+            assert!(
+                waits
+                    .iter()
+                    .all(|wait| (ceiling / 2..=ceiling).contains(wait)),
+                "attempt {attempt}: {waits:?}"
+            );
+            assert!(waits.len() > 1, "attempt {attempt} spreads: {waits:?}");
+        }
     }
 }

@@ -213,6 +213,12 @@ fn run_key_ranked(rank: u8) -> RunKey {
     ))
 }
 
+/// A run key that sorts at `rank`, in one of the rollup stripes 0, 4, 8 and 12: the
+/// four a partition holds under DSQL's default of four partitions.
+fn run_key_ranked_in_partition_zero(rank: u8) -> RunKey {
+    RunKey(Uuid::from_u128(run_key_ranked(rank).0.as_u128() & !0b11))
+}
+
 fn image_in(
     partition_id: u32,
     namespace_id: NamespaceId,
@@ -632,8 +638,9 @@ async fn dsql_failed_applies_keep_their_images_and_count_stays_exact() -> Result
 const MEASURED_RUNS: u8 = 250;
 const MEASURED_TRANSITIONS: u64 = 4;
 
-// `projection-passes` Live Test step 6: applies a second for one partition, with one
-// projector applying runs one at a time. Set `TOKEIRA_PROJECTION_THROUGHPUT_OUTPUT`
+// `projection-passes` Live Test step 6: applies a second for one partition. Its runs
+// fall in the four rollup stripes a partition holds under DSQL's default partition
+// count, and the Count afterwards is exact. Set `TOKEIRA_PROJECTION_THROUGHPUT_OUTPUT`
 // to keep the figures with the run's evidence.
 #[tokio::test]
 async fn dsql_projection_pass_throughput() -> Result<()> {
@@ -641,7 +648,7 @@ async fn dsql_projection_pass_throughput() -> Result<()> {
         return Ok(());
     };
     for index in 0..MEASURED_RUNS {
-        let run_key = run_key_ranked(index);
+        let run_key = run_key_ranked_in_partition_zero(index);
         for transition_seq in 1..=MEASURED_TRANSITIONS {
             live.commit(&live.image(run_key, transition_seq, ExecutionStatus::Running))
                 .await?;
@@ -661,6 +668,7 @@ async fn dsql_projection_pass_throughput() -> Result<()> {
     }
     let elapsed = started.elapsed();
     let left = live.images(live.partition_id).await?;
+    let counts = live.status_counts().await?;
     live.finish(&[]).await?;
     let applied: usize = passes.iter().map(|pass| pass.applied).sum();
     let deleted: u64 = passes.iter().map(|pass| pass.deleted).sum();
@@ -681,6 +689,14 @@ async fn dsql_projection_pass_throughput() -> Result<()> {
         deleted,
         u64::from(MEASURED_RUNS) * MEASURED_TRANSITIONS,
         "{report}"
+    );
+    assert_eq!(
+        counts,
+        BTreeMap::from([(
+            workflow_status_keyword(ExecutionStatus::Running),
+            i64::from(MEASURED_RUNS)
+        )]),
+        "each run counted once: {report}"
     );
     Ok(())
 }

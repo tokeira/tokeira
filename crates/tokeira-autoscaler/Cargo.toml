@@ -11,7 +11,7 @@ authors.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 buffa = { version = "0.9", features = ["json"] }
-connectrpc = { version = "0.9.1", features = ["client"] }
+connectrpc = { version = "0.9.1", default-features = false, features = ["client", "gzip", "json"] }
 metrics.workspace = true
 reqwest.workspace = true
 serde.workspace = true

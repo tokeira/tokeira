@@ -11,7 +11,7 @@ description = "Buffa/connect-rust bindings for the Tokeira conformance control A
 [dependencies]
 buffa = { version = "0.9", features = ["json"] }
 buffa-types = { version = "0.9", features = ["json"] }
-connectrpc = { version = "0.9.1", features = ["client"] }
+connectrpc = { version = "0.9.1", default-features = false, features = ["client", "gzip", "json"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

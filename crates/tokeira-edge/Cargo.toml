@@ -22,7 +22,7 @@ async-trait = "0.1"
 base64.workspace = true
 bytes = "1"
 buffa = { version = "0.9", features = ["json"] }
-connectrpc = { version = "0.9.1", features = ["client"] }
+connectrpc = { version = "0.9.1", default-features = false, features = ["client", "gzip", "json"] }
 http = "1"
 http-body-util.workspace = true
 metrics.workspace = true

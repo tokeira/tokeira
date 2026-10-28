@@ -1,0 +1,5 @@
+kind: security
+body: pulldown-cmark 0.13.5 closes RUSTSEC-2026-0414, and turning off connectrpc's unused zstd support closes RUSTSEC-2026-0391, -0398, -0403 and -0410.
+time: 2026-10-28T20:29:28.000000+00:00
+custom:
+    Slice: 09b03d91-76fe-4e9d-807a-82e237caf71a

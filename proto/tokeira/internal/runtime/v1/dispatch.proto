@@ -1,10 +1,108 @@
 syntax = "proto3";
 package tokeira.internal.runtime.v1;
 
+import "google/protobuf/timestamp.proto";
+
 // Queue-home matching delegates the authoritative start to the execution owner.
-// Only this operation is exposed; it cannot submit arbitrary kernel commands.
+// Offers are disposable hints; neither method accepts arbitrary kernel commands.
 service WorkflowTaskDispatch {
   rpc StartWorkflowTask(StartWorkflowTaskRequest) returns (StartWorkflowTaskResponse);
+  rpc OfferWorkflowTask(OfferWorkflowTaskRequest) returns (OfferWorkflowTaskResponse);
+}
+
+// Every enum rejects UNSPECIFIED and unknown values at the receiver.
+enum OfferQueueKind {
+  OFFER_QUEUE_KIND_UNSPECIFIED = 0;
+  OFFER_QUEUE_KIND_NORMAL = 1;
+  OFFER_QUEUE_KIND_STICKY = 2;
+}
+
+enum OfferRoutingMode {
+  OFFER_ROUTING_MODE_UNSPECIFIED = 0;
+  OFFER_ROUTING_MODE_LIVE = 1;
+  OFFER_ROUTING_MODE_EXACT = 2;
+}
+
+message OfferQueue {
+  string name = 1;
+  // Presence is significant, including a present empty coordinate.
+  optional string deployment = 2;
+  optional string build_id = 3;
+}
+
+message OfferRouting {
+  OfferRoutingMode mode = 1;
+  optional string deployment = 2;
+  optional string build_id = 3;
+}
+
+enum OfferVersionBehavior {
+  OFFER_VERSION_BEHAVIOR_UNSPECIFIED = 0;
+  OFFER_VERSION_BEHAVIOR_UNVERSIONED = 1;
+  OFFER_VERSION_BEHAVIOR_PINNED = 2;
+  OFFER_VERSION_BEHAVIOR_AUTO_UPGRADE = 3;
+}
+
+// Source policy, not authority: the receiver re-resolves current routing.
+message OfferVersionDirective {
+  OfferVersionBehavior behavior = 1;
+  optional string deployment = 2;
+  optional string build_id = 3;
+  optional string assigned_build_id = 4;
+}
+
+message OfferPriority {
+  int32 priority_key = 1;
+  string fairness_key = 2;
+  float fairness_weight = 3;
+}
+
+message OfferStickyOrigin {
+  OfferQueue sticky_queue = 1;
+  OfferQueue normal_queue = 2;
+  string worker_identity = 3;
+  google.protobuf.Timestamp deadline = 4;
+}
+
+// No credentials, payloads, history, updates, queries or publisher lease epoch.
+// A successful reply grants no authority to start or mutate a run.
+message OfferWorkflowTaskRequest {
+  bytes run_key = 1;
+  uint64 logical_seq = 2;
+  uint32 execution_home = 3;
+  uint32 destination_home = 4;
+  bytes namespace_id = 5;
+  OfferQueue selected_queue = 6;
+  OfferQueueKind queue_kind = 7;
+  OfferRouting routing = 8;
+  OfferVersionDirective version_directive = 9;
+  google.protobuf.Timestamp scheduled_at = 10;
+  OfferPriority priority = 11;
+  OfferStickyOrigin sticky_origin = 12;
+}
+
+enum OfferOutcome {
+  OFFER_OUTCOME_UNSPECIFIED = 0;
+  OFFER_OUTCOME_ADMITTED = 1;
+  OFFER_OUTCOME_KNOWN = 2;
+  OFFER_OUTCOME_STICKY_UNAVAILABLE = 3;
+  OFFER_OUTCOME_NOT_HOME = 4;
+  OFFER_OUTCOME_FULL = 5;
+  OFFER_OUTCOME_EXPIRED = 6;
+}
+
+enum OfferStickyUnavailableReason {
+  OFFER_STICKY_UNAVAILABLE_REASON_UNSPECIFIED = 0;
+  OFFER_STICKY_UNAVAILABLE_REASON_NO_RECENT_POLLER = 1;
+  OFFER_STICKY_UNAVAILABLE_REASON_DEPLOYMENT_CHANGED = 2;
+  OFFER_STICKY_UNAVAILABLE_REASON_BUILD_REDIRECTED = 3;
+  OFFER_STICKY_UNAVAILABLE_REASON_COMPATIBLE_SET_DEFAULT_CHANGED = 4;
+}
+
+message OfferWorkflowTaskResponse {
+  OfferOutcome outcome = 1;
+  // Present exactly when outcome is STICKY_UNAVAILABLE; no redirect endpoint.
+  optional OfferStickyUnavailableReason sticky_unavailable_reason = 2;
 }
 
 message StartWorkflowTaskRequest {

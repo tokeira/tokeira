@@ -7,7 +7,7 @@ Unfinished tasks remain open until the PR that completes them. Read [bugfix.md](
 [design.md](design.md) together; their contracts, provisional read target and scope boundaries govern this plan.
 
 First demonstrate the defects and measure the actual read baseline. Then add the bounded hint contract, sticky
-recovery query, provisioned peer credentials and authorization, admission/retirement, push and recovery, and
+recovery query, file-based peer credentials and authorization, admission/retirement, push and recovery, and
 start-read consolidation. Keep each intermediate change green using appropriate focused checks; the full finish
 bar belongs to the code PRs.
 
@@ -44,52 +44,42 @@ bar belongs to the code PRs.
     - **Property 8: Complete bounded sticky traversal** (storage portion; runtime portion in 6.2)
     - **Validates: Requirements 2.8, 2.9, 2.15, 3.2, 3.5.**
 
-- [ ] 3. Internal offer RPC, managed credentials and dedicated peer policy
-  - [ ] 3.1 Extend the Tokeira internal proto/service with `OfferWorkflowTask` and its typed outcomes. Implement the
+- [ ] 3. Internal offer RPC, protected credential files and dedicated peer policy
+  - [x] 3.1 Extend the Tokeira internal proto/service with `OfferWorkflowTask` and its typed outcomes. Implement the
     field-policy table, unknown-enum/shape validation, request/response bounds and handler concurrency cap. Preserve
     the existing start method and its larger response limit; do not modify upstream Temporal protos.
     - _Requirements: 2.1, 2.13, 2.14_
-  - [ ] 3.2 Implement cluster ES256 material generation, bounded loading, five-minute local token signing/renewal and
+    - DONE — Internal proto/generated service, field validation, bounds, cap and dormant client are implemented; Start retains 128 MiB. No offer is admitted or acknowledged. Workspace clippy and edge wire/bounds/cap regressions pass; details are in implementation-evidence.md.
+
+  - [x] 3.2 Implement cluster ES256 material generation, bounded loading, five-minute local token signing/renewal and
     the strict receiver policy. Reuse existing cryptographic primitives and document any required dependency-edge
     changes; preserve public authentication. Validate key/public-profile agreement before peer-capable runtime
     readiness, and reject anonymous callers or public Worker/Admin credentials without the separate peer grant.
     Derive peer capability from the authoritative startup mode: single-node without a controller and embedded
     paths construct no new offer endpoint, sender or credential loader. Do not infer it from current membership.
+    Add the create-only mode-0600 `tokeirad peer-credential generate --out <path>` command; configuration names only
+    the protected file, whose embedded profile supplies verifier trust. Provisioning is external to this repository.
     - _Requirements: 2.13, 2.14, 2.16, 2.17, 2.18, 2.19_
-  - [ ] 3.3 Write generated credential, enum, envelope-size and handler-saturation tests, including exact limits,
+    - DONE — File-only bootstrap, create-only generator, ES256 signing/renewal and strict verification are implemented behind the existing no-controller decision. Public authentication is unchanged. Workspace clippy and auth/config peer properties pass at 100 cases each; generator verification is recorded in implementation-evidence.md.
+
+  - [x] 3.3 Write generated credential, enum, envelope-size and handler-saturation tests, including exact limits,
     one-over limits, missing configuration, wrong issuer/audience/subject, missing expiry, expiry/rotation, future
     validity, corrupt/mismatched public key material and token redaction. Validate required peer wiring without
     changing shard claims; missing bootstrap credentials must not silently select discovery-only delivery.
     - **Property 7: Authorized, bounded and non-blocking hints** (auth/wire portion; scheduling portion in 5.3)
     - **Validates: Requirements 2.13, 2.14, 2.16, 3.2.**
-  - [ ] 3.4 Add the platform-owned managed credential resource to the normal `tkr` plan/apply dependency graph.
-    Generate no secrets during planning; create protected material once at apply, validate identity when adopting
-    after an uncertain create, and keep secret bytes out of generic state. Model explicit generation replacement
-    and destructive cleanup with the existing approval semantics; do not rotate on ordinary reapply or restart.
-    - _Requirements: 2.17, 2.18_
-  - [ ] 3.5 Wire Local/Compose protected files/read-only mounts and ECS/EKS generated Secrets Manager resources,
-    exact-resource workload grants and provider bootstrap loaders. Render verifier configuration and credential
-    references for all peer-capable runtimes in each standard definition set, including paired definition formats.
-    Create no peer resource for no-peer modes. Document startup repair and stopped-node key rotation. Keep provider
-    SDKs out of shared runtime/auth code.
-    - _Requirements: 2.13, 2.16, 2.17, 2.18, 2.19_
-  - [ ] 3.6 Write generated credential lifecycle tests with provider fakes and real local protected-file/signing
-    adapters: fresh/repeated/concurrent apply, lost create response, missing/mismatched material, repeated display
-    names across clusters, restart, scale-out, automatic renewal beyond token expiry, explicit stopped-node
-    rotation, retired-key rejection and deletion/recovery. Assert redaction and absence of private material in
-    plans, ordinary state, rendered manifests and image inputs. Validate each platform's generated graph/config.
-    - **Property 10: Standard deployments have stable peer credentials**
-    - **Validates: Requirements 2.13, 2.14, 2.16, 2.17, 2.18.**
-  - [ ] 3.7 Extend the generated credential tests with startup modes and upgrades: directly started single-node
-    `tokeirad` without `tkr` or credentials; in-memory, managed-DSQL and existing-DSQL embedded engines, including
-    an attached public listener; and controller-managed mode with one current replica. Assert that no-peer paths
-    become ready, resolve no credential and expose no offer push endpoint/sender, while peer-capable paths without
-    credentials fail readiness. Test upgrade from an existing multi-node deployment without the resource: this
-    release's reapply must use credential-capable platform definitions/engine wiring and supply matching material
-    before new nodes start. Verify the missing-key diagnostic names the reapply remedy. Preserve the single-node
-    claim/embedded ownership safeguards; do not implement or modify them here.
-    - **Property 10: Standard deployments have stable peer credentials** (mode and upgrade cases)
+    - DONE — Property 7 auth/config/edge properties pass at 100 cases each, covering credentials, shapes, exact/one-over bounds, saturation and redaction. Response-frame and unchanged Start-limit examples pass; details are in implementation-evidence.md.
+
+  - [x] 3.7 Extend generated credential tests with file stability across restarts and explicit replacement, plus
+    startup modes and upgrades: directly started single-node `tokeirad` without credentials; in-memory,
+    managed-DSQL and existing-DSQL embedded engines, including a public listener; and controller-managed mode
+    with one current replica. No-peer paths resolve no file and expose no offer endpoint/sender. Peer-capable
+    upgrades without a file fail readiness until an explicitly generated file is installed. Check distinct missing
+    and inconsistent diagnostics naming generation, same-file installation and stopped-node restart. Preserve
+    the single-node claim and embedded ownership safeguards without modifying them.
+    - **Property 10: Credential files are stable across restarts and rotation is explicit**
     - **Validates: Requirements 2.13, 2.16, 2.17, 2.18, 2.19, 2.20.**
+    - DONE — Real-file restart/rotation and upgrade properties pass at 100 cases each; create-only mode, overwrite refusal, symlink and diagnostic examples pass. The two no-peer startup properties compile but hit sandbox-denied listeners; devbox execution remains required. See implementation-evidence.md; live durable readiness is not claimed.
 
 - [ ] 4. Shared admission and acquisition-driven retirement
   - [ ] 4.1 Route local, pushed and discovered normal offers through common bounded admission. Check generation,
@@ -171,8 +161,8 @@ bar belongs to the code PRs.
     - **Validates: Requirements 2.19, 3.1, 3.2, 3.3, 3.4.**
   - [ ] 8.3 Exercise actual internal gRPC with at least two runtimes for normal push and remote start, then three with
     distinct execution/sticky/normal homes for all sticky fallbacks. Prove push with discovery paused; separately
-    drop sticky push, normal fallback and acknowledgement. Use configuration and credentials generated by the
-    standard deployment path with no hand-authored peer fields, and keep it running past initial token expiry.
+    drop sticky push, normal fallback and acknowledgement. Use the credential file and path configuration emitted by
+    the daemon generator, and keep it running past initial token expiry.
     Check peer-policy failures, saturation, takeover, prompt retirement, reply statuses and warm/cold read counters,
     without bypassing the wire authorization path or depending on an external identity provider.
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14, 2.16, 2.17, 2.18, 3.5_
@@ -200,12 +190,12 @@ bar belongs to the code PRs.
 
 - [ ] 10. Align documentation and finish the code PRs
   - [ ] 10.1 Align workflow-dispatch's sticky recovery, offer lifecycle and start-read descriptions, configuration
-    and credential-provisioning docs and the suite runbook with the implemented contract. Record measured
+    and credential-file docs and the suite runbook with the implemented contract. Record measured
     baseline/result counts, query plans, limitations and outcomes without cluster identifiers, live-run dates/times
     or Region. Preserve the one-line stopped-node upgrade instruction and the explicit activity/speculative/security
-    deferrals. Add the design's existing-multi-node reapply step to rollout documentation and an implementation
-    `changed` changelog fragment, making clear it runs with this release's `tkr` while all nodes are stopped and
-    before new nodes start. State that no-peer single-node/embedded upgrades need no credential or `tkr` step.
+    deferrals. Add the controller-managed upgrade's generate/install/configure step to rollout documentation and
+    an implementation `changed` fragment; every node must be stopped during installation before any restarts.
+    State that no-peer single-node/embedded upgrades need no credential file.
     - _Requirements: 2.8, 2.10, 2.11, 2.13, 2.15, 2.16, 2.17, 2.18, 2.19, 2.20, 3.3_
   - [ ] 10.2 Run the full root AGENTS.md §10.4 bar for each code PR, plus its applicable focused/live checks and
     offline links/fragment validation. Report every omission and why; tick only work actually completed. Rebase at
@@ -217,7 +207,7 @@ bar belongs to the code PRs.
 ```mermaid
 graph TD
     T1[1 Exploration and baseline] --> T2[2 Hint data and storage pages]
-    T1 --> T3[3 Provisioning, peer policy and RPC]
+    T1 --> T3[3 Credential files, peer policy and RPC]
     T2 --> T4[4 Admission and retirement]
     T3 --> T5[5 Push and sticky routing]
     T4 --> T5

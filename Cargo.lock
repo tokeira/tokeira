@@ -8485,6 +8485,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "jsonwebtoken",
+ "p256",
  "proptest",
  "quick-xml",
  "regex",
@@ -8499,6 +8500,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -8804,6 +8806,7 @@ dependencies = [
  "async-trait",
  "clap",
  "proptest",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -9110,6 +9113,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tempfile",
  "temporalio-client",
  "time",
  "tokeira-auth",

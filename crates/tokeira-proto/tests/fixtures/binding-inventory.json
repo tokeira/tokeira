@@ -141,6 +141,119 @@
             "number": 3
           }
         ]
+      },
+      {
+        "enum": "tokeira.internal.runtime.v1.OfferOutcome",
+        "values": [
+          {
+            "name": "OFFER_OUTCOME_UNSPECIFIED",
+            "number": 0
+          },
+          {
+            "name": "OFFER_OUTCOME_ADMITTED",
+            "number": 1
+          },
+          {
+            "name": "OFFER_OUTCOME_KNOWN",
+            "number": 2
+          },
+          {
+            "name": "OFFER_OUTCOME_STICKY_UNAVAILABLE",
+            "number": 3
+          },
+          {
+            "name": "OFFER_OUTCOME_NOT_HOME",
+            "number": 4
+          },
+          {
+            "name": "OFFER_OUTCOME_FULL",
+            "number": 5
+          },
+          {
+            "name": "OFFER_OUTCOME_EXPIRED",
+            "number": 6
+          }
+        ]
+      },
+      {
+        "enum": "tokeira.internal.runtime.v1.OfferQueueKind",
+        "values": [
+          {
+            "name": "OFFER_QUEUE_KIND_UNSPECIFIED",
+            "number": 0
+          },
+          {
+            "name": "OFFER_QUEUE_KIND_NORMAL",
+            "number": 1
+          },
+          {
+            "name": "OFFER_QUEUE_KIND_STICKY",
+            "number": 2
+          }
+        ]
+      },
+      {
+        "enum": "tokeira.internal.runtime.v1.OfferRoutingMode",
+        "values": [
+          {
+            "name": "OFFER_ROUTING_MODE_UNSPECIFIED",
+            "number": 0
+          },
+          {
+            "name": "OFFER_ROUTING_MODE_LIVE",
+            "number": 1
+          },
+          {
+            "name": "OFFER_ROUTING_MODE_EXACT",
+            "number": 2
+          }
+        ]
+      },
+      {
+        "enum": "tokeira.internal.runtime.v1.OfferStickyUnavailableReason",
+        "values": [
+          {
+            "name": "OFFER_STICKY_UNAVAILABLE_REASON_UNSPECIFIED",
+            "number": 0
+          },
+          {
+            "name": "OFFER_STICKY_UNAVAILABLE_REASON_NO_RECENT_POLLER",
+            "number": 1
+          },
+          {
+            "name": "OFFER_STICKY_UNAVAILABLE_REASON_DEPLOYMENT_CHANGED",
+            "number": 2
+          },
+          {
+            "name": "OFFER_STICKY_UNAVAILABLE_REASON_BUILD_REDIRECTED",
+            "number": 3
+          },
+          {
+            "name": "OFFER_STICKY_UNAVAILABLE_REASON_COMPATIBLE_SET_DEFAULT_CHANGED",
+            "number": 4
+          }
+        ]
+      },
+      {
+        "enum": "tokeira.internal.runtime.v1.OfferVersionBehavior",
+        "values": [
+          {
+            "name": "OFFER_VERSION_BEHAVIOR_UNSPECIFIED",
+            "number": 0
+          },
+          {
+            "name": "OFFER_VERSION_BEHAVIOR_UNVERSIONED",
+            "number": 1
+          },
+          {
+            "name": "OFFER_VERSION_BEHAVIOR_PINNED",
+            "number": 2
+          },
+          {
+            "name": "OFFER_VERSION_BEHAVIOR_AUTO_UPGRADE",
+            "number": 3
+          }
+        ]
       }
     ],
     "fields": [
@@ -215,6 +328,16 @@
         "type_name": ""
       },
       {
+        "field": "assigned_build_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferVersionDirective",
+        "number": 4,
+        "oneof": 2,
+        "proto3_optional": true,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
         "field": "available_connections",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.internal.controller.v1.RuntimeHeartbeat",
@@ -255,6 +378,16 @@
         "type_name": ""
       },
       {
+        "field": "behavior",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferVersionDirective",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_ENUM",
+        "type_name": ".tokeira.internal.runtime.v1.OfferVersionBehavior"
+      },
+      {
         "field": "bool_value",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.conformance.v1.DynamicConfigValue",
@@ -271,6 +404,36 @@
         "number": 6,
         "oneof": null,
         "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "build_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferQueue",
+        "number": 3,
+        "oneof": 1,
+        "proto3_optional": true,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "build_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferRouting",
+        "number": 3,
+        "oneof": 1,
+        "proto3_optional": true,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "build_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferVersionDirective",
+        "number": 3,
+        "oneof": 1,
+        "proto3_optional": true,
         "type": "TYPE_STRING",
         "type_name": ""
       },
@@ -415,6 +578,16 @@
         "type_name": ""
       },
       {
+        "field": "deadline",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferStickyOrigin",
+        "number": 4,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.Timestamp"
+      },
+      {
         "field": "delta",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.internal.controller.v1.RoutingUpdate",
@@ -425,6 +598,36 @@
         "type_name": ".tokeira.internal.controller.v1.RoutingDeltaMessage"
       },
       {
+        "field": "deployment",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferQueue",
+        "number": 2,
+        "oneof": 0,
+        "proto3_optional": true,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "deployment",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferRouting",
+        "number": 2,
+        "oneof": 0,
+        "proto3_optional": true,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "deployment",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferVersionDirective",
+        "number": 2,
+        "oneof": 0,
+        "proto3_optional": true,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
         "field": "desired_placement",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.internal.controller.v1.ControllerDirective",
@@ -433,6 +636,16 @@
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".tokeira.internal.controller.v1.DesiredPlacementDirective"
+      },
+      {
+        "field": "destination_home",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferWorkflowTaskRequest",
+        "number": 4,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_UINT32",
+        "type_name": ""
       },
       {
         "field": "double_value",
@@ -543,6 +756,36 @@
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".tokeira.compatibility.v1.CompatibilityEvidence"
+      },
+      {
+        "field": "execution_home",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferWorkflowTaskRequest",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_UINT32",
+        "type_name": ""
+      },
+      {
+        "field": "fairness_key",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferPriority",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "fairness_weight",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferPriority",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_FLOAT",
+        "type_name": ""
       },
       {
         "field": "feature",
@@ -835,6 +1078,16 @@
         "type_name": ""
       },
       {
+        "field": "logical_seq",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferWorkflowTaskRequest",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_UINT64",
+        "type_name": ""
+      },
+      {
         "field": "max_reservoir_size",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.internal.controller.v1.ConnectionBudgetDirective",
@@ -865,10 +1118,30 @@
         "type_name": ""
       },
       {
+        "field": "mode",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferRouting",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_ENUM",
+        "type_name": ".tokeira.internal.runtime.v1.OfferRoutingMode"
+      },
+      {
         "field": "name",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.compatibility.v1.FeatureEntry",
         "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "name",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferQueue",
+        "number": 1,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
@@ -882,6 +1155,16 @@
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "namespace_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferWorkflowTaskRequest",
+        "number": 5,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BYTES",
         "type_name": ""
       },
       {
@@ -975,6 +1258,16 @@
         "type_name": ".tokeira.internal.controller.v1.NodeEndpointEntry"
       },
       {
+        "field": "normal_queue",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferStickyOrigin",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".tokeira.internal.runtime.v1.OfferQueue"
+      },
+      {
         "field": "notes",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.compatibility.v1.FeatureEntry",
@@ -993,6 +1286,16 @@
         "proto3_optional": false,
         "type": "TYPE_STRING",
         "type_name": ""
+      },
+      {
+        "field": "outcome",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferWorkflowTaskResponse",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_ENUM",
+        "type_name": ".tokeira.internal.runtime.v1.OfferOutcome"
       },
       {
         "field": "owned_bundle_count",
@@ -1115,6 +1418,26 @@
         "type_name": ""
       },
       {
+        "field": "priority",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferWorkflowTaskRequest",
+        "number": 11,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".tokeira.internal.runtime.v1.OfferPriority"
+      },
+      {
+        "field": "priority_key",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferPriority",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_INT32",
+        "type_name": ""
+      },
+      {
         "field": "process_identity",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.compatibility.v1.GetCompatibilityResponse",
@@ -1133,6 +1456,16 @@
         "proto3_optional": false,
         "type": "TYPE_STRING",
         "type_name": ""
+      },
+      {
+        "field": "queue_kind",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferWorkflowTaskRequest",
+        "number": 7,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_ENUM",
+        "type_name": ".tokeira.internal.runtime.v1.OfferQueueKind"
       },
       {
         "field": "rate_per_second",
@@ -1195,6 +1528,16 @@
         "type_name": ""
       },
       {
+        "field": "routing",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferWorkflowTaskRequest",
+        "number": 8,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".tokeira.internal.runtime.v1.OfferRouting"
+      },
+      {
         "field": "routing_update",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.internal.controller.v1.ControllerDirective",
@@ -1212,6 +1555,16 @@
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "run_key",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferWorkflowTaskRequest",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BYTES",
         "type_name": ""
       },
       {
@@ -1253,6 +1606,16 @@
         "proto3_optional": false,
         "type": "TYPE_STRING",
         "type_name": ""
+      },
+      {
+        "field": "scheduled_at",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferWorkflowTaskRequest",
+        "number": 10,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.Timestamp"
       },
       {
         "field": "sdk_matrix",
@@ -1305,6 +1668,16 @@
         "type_name": ""
       },
       {
+        "field": "selected_queue",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferWorkflowTaskRequest",
+        "number": 6,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".tokeira.internal.runtime.v1.OfferQueue"
+      },
+      {
         "field": "shard_count",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.internal.controller.v1.PlacementConfigMessage",
@@ -1343,6 +1716,36 @@
         "proto3_optional": false,
         "type": "TYPE_ENUM",
         "type_name": ".tokeira.internal.controller.v1.NodeDrainState"
+      },
+      {
+        "field": "sticky_origin",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferWorkflowTaskRequest",
+        "number": 12,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".tokeira.internal.runtime.v1.OfferStickyOrigin"
+      },
+      {
+        "field": "sticky_queue",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferStickyOrigin",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".tokeira.internal.runtime.v1.OfferQueue"
+      },
+      {
+        "field": "sticky_unavailable_reason",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferWorkflowTaskResponse",
+        "number": 2,
+        "oneof": 0,
+        "proto3_optional": true,
+        "type": "TYPE_ENUM",
+        "type_name": ".tokeira.internal.runtime.v1.OfferStickyUnavailableReason"
       },
       {
         "field": "string_value",
@@ -1509,6 +1912,26 @@
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.internal.controller.v1.RuntimeRegistration",
         "number": 5,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "version_directive",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferWorkflowTaskRequest",
+        "number": 9,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".tokeira.internal.runtime.v1.OfferVersionDirective"
+      },
+      {
+        "field": "worker_identity",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferStickyOrigin",
+        "number": 3,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
@@ -1704,6 +2127,13 @@
       "tokeira.internal.controller.v1.RuntimeRegistration",
       "tokeira.internal.controller.v1.ScaleInCandidate",
       "tokeira.internal.controller.v1.SubscribeRoutingRequest",
+      "tokeira.internal.runtime.v1.OfferPriority",
+      "tokeira.internal.runtime.v1.OfferQueue",
+      "tokeira.internal.runtime.v1.OfferRouting",
+      "tokeira.internal.runtime.v1.OfferStickyOrigin",
+      "tokeira.internal.runtime.v1.OfferVersionDirective",
+      "tokeira.internal.runtime.v1.OfferWorkflowTaskRequest",
+      "tokeira.internal.runtime.v1.OfferWorkflowTaskResponse",
       "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
       "tokeira.internal.runtime.v1.StartWorkflowTaskResponse"
     ],
@@ -1803,6 +2233,14 @@
         "output": ".tokeira.internal.controller.v1.RoutingUpdate",
         "server_streaming": true,
         "service": "tokeira.internal.controller.v1.PlacementController"
+      },
+      {
+        "client_streaming": false,
+        "input": ".tokeira.internal.runtime.v1.OfferWorkflowTaskRequest",
+        "method": "OfferWorkflowTask",
+        "output": ".tokeira.internal.runtime.v1.OfferWorkflowTaskResponse",
+        "server_streaming": false,
+        "service": "tokeira.internal.runtime.v1.WorkflowTaskDispatch"
       },
       {
         "client_streaming": true,

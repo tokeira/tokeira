@@ -1,0 +1,5 @@
+kind: changed
+body: "Controller-managed clusters need a peer credential file on every node: generate one with tokeirad, stop every node, and set it in each node's configuration before restarting."
+time: 2026-10-28T19:48:27.990465+00:00
+custom:
+    Slice: ebb5ab65-0779-4e92-b827-ab1842f37f87

@@ -432,6 +432,7 @@ All accepted production leaves are listed below. Fields are startup-static; chan
 | `infrastructure.observability.otlp_protocol` | infrastructure | `"grpc"` | no | yes | — | OTLP trace transport protocol. |
 | `infrastructure.observability.smoke_test_timeout_ms` | infrastructure | `30000` | no | yes | — | Observability smoke-test timeout. |
 | `infrastructure.observability.trace_sample_rate` | infrastructure | `1.0` | no | yes | — | Base trace sampling ratio from zero through one. |
+| `infrastructure.peer.path` | infrastructure | `<unset>` | no | yes | — | Absolute path to the private peer credential file, including its verifier profile. Required for controller-managed runtimes; generate with tokeirad peer-credential generate and install the same file on every node while all nodes are stopped. |
 | `infrastructure.placement.bundle_count` | infrastructure | `1` | no | yes | — | Placement bundle count; must equal shard_count. Unequal counts fail startup; automatic repartitioning is not supported. |
 | `infrastructure.placement.controller_endpoint` | infrastructure | `<unset>` | no | yes | — | Placement-controller endpoint; absence selects the single-node path. |
 | `infrastructure.placement.hash_version` | infrastructure | `1` | no | yes | — | Pinned placement hash algorithm version. |

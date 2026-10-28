@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod jwt;
+pub mod peer;
 mod sts;
 mod worker_scope;
 

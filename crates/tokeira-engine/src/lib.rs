@@ -76,6 +76,7 @@ mod listener;
 mod nexus_http_transport;
 mod node_claim;
 pub mod observability;
+mod peer;
 #[cfg(all(test, feature = "dsql-integration"))]
 mod single_node_claim_live_tests;
 
@@ -89,7 +90,7 @@ use tokeira_auth::{
     WorkerScopeRule, WorkerScopeRules,
 };
 use tokeira_chasm::Library as _;
-use tokeira_config::{Cli, ConfigStorageKind};
+use tokeira_config::{Cli, CliCommand, ConfigStorageKind, PeerCredentialCommand};
 pub use tokeira_config::{
     DsqlMigrationPolicy, EmbeddedEngineConfig, EmbeddedStorageConfig, SnapshotPolicyConfig,
     TokeiraConfig,
@@ -1246,6 +1247,7 @@ async fn start_embedded_dsql(
                 dsql_store,
                 connection_endpoint.clone(),
                 extensions,
+                None,
             )
             .await
             .map_err(embedded_stack_error)
@@ -2435,10 +2437,16 @@ fn dsql_coordination_table_names(config: &TokeiraConfig) -> (String, String) {
 /// or SIGTERM, then drains gracefully: in-flight requests finish, background
 /// work is cancelled, and (for in-memory storage with a snapshot policy) the
 /// final consistent cut is persisted before exit.
-// `--version` / `--dump-config` are CLI outputs to stdout by contract; daemon
-// logging elsewhere speaks `tracing` only.
+// CLI output is intentional for --version, --dump-config and generated path config.
 #[allow(clippy::print_stdout)]
 pub async fn run_from_cli(cli: Cli) -> Result<()> {
+    if let Some(CliCommand::PeerCredential {
+        command: PeerCredentialCommand::Generate { out },
+    }) = cli.command
+    {
+        println!("{}", peer::generate(&out)?);
+        return Ok(());
+    }
     if cli.version {
         println!("{}", render_build_info(cli.verbose, cli.json));
         return Ok(());
@@ -2905,6 +2913,20 @@ async fn build_and_serve(
     Option<EngineSnapshotPolicy>,
     Option<node_claim::NodeClaim>,
 )> {
+    // This is the existing single-node ownership decision, shared with peer
+    // bootstrap. Membership size never grants the no-peer exemption.
+    let no_controller = effective_config
+        .infrastructure
+        .placement
+        .controller_endpoint
+        .is_none();
+    let peer = if no_controller {
+        None
+    } else {
+        Some(peer::bootstrap(
+            effective_config.infrastructure.peer.as_ref(),
+        )?)
+    };
     let mut snapshot_inputs = None;
     let mut node_claim = None;
     let stack = match effective_config.infrastructure.storage {
@@ -2925,6 +2947,7 @@ async fn build_and_serve(
                 store,
                 restored,
                 ChasmExtensions::default(),
+                peer,
             )
             .await
         }
@@ -2961,12 +2984,7 @@ async fn build_and_serve(
             // unfenced, so it serves only while it holds the cluster's
             // single-node claim. Refusing the claim leaves nothing started, as
             // refusing the schema does.
-            if effective_config
-                .infrastructure
-                .placement
-                .controller_endpoint
-                .is_none()
-            {
+            if no_controller {
                 match take_node_claim(&dsql_store).await {
                     Ok(claim) => node_claim = Some(claim),
                     Err(refusal) => {
@@ -2986,6 +3004,7 @@ async fn build_and_serve(
                 dsql_store,
                 endpoint,
                 ChasmExtensions::default(),
+                peer,
             )
             .await
         }
@@ -3057,6 +3076,7 @@ async fn build_dsql_stack(
     dsql_store: DsqlStore,
     endpoint: String,
     extensions: ChasmExtensions,
+    peer: Option<Arc<tokeira_edge::grpc::workflow_offer::PeerOfferEndpoint>>,
 ) -> Result<ConstructedStack> {
     let (director, run_repository, projection_log, worker_deployment_repository, _migration_runner) =
         dsql_store.into_parts();
@@ -3111,6 +3131,7 @@ async fn build_dsql_stack(
         false,
         budget_applier,
         extensions,
+        peer,
     )
     .await
 }
@@ -3127,6 +3148,7 @@ async fn build_embedded(
         store,
         recover_self_assigned_shard,
         extensions,
+        None,
     )
     .await?
     {
@@ -3143,6 +3165,7 @@ async fn build_in_memory_stack(
     store: InMemoryStore,
     recover_self_assigned_shard: bool,
     extensions: ChasmExtensions,
+    peer: Option<Arc<tokeira_edge::grpc::workflow_offer::PeerOfferEndpoint>>,
 ) -> Result<ConstructedStack> {
     let visibility_store = InMemoryVisibilityStore::default();
     let chasm_node_repo: Arc<dyn tokeira_storage::ChasmNodeRepository> =
@@ -3177,6 +3200,7 @@ async fn build_in_memory_stack(
         // The in-memory store has no connection reservoir to budget.
         Arc::new(NoopConnectionBudgetApplier),
         extensions,
+        peer,
     )
     .await
 }
@@ -3365,6 +3389,7 @@ async fn build_service_stack_with_storage<R, L, S, V, F>(
     recover_self_assigned_shard: bool,
     budget_applier: Arc<dyn ConnectionBudgetApplier>,
     extensions: ChasmExtensions,
+    peer: Option<Arc<tokeira_edge::grpc::workflow_offer::PeerOfferEndpoint>>,
 ) -> Result<ConstructedStack>
 where
     R: LeaseRepository + RunRepository + 'static,
@@ -3911,7 +3936,8 @@ where
         runtime.clone(),
         interceptors.clone(),
         workflow_service.clone(),
-    );
+    )
+    .with_peer(peer);
     let operator_service = OperatorService::new(operator_api, interceptors)
         .with_nexus_endpoints(nexus_endpoint_admin)
         .with_namespace_deletion(namespaces.clone(), Arc::new(workflow_service.clone()));
@@ -6016,6 +6042,7 @@ mod tests {
             .expect("write config");
 
         let mut daemon = tokio::spawn(run_from_cli(Cli {
+            command: None,
             config: Some(config_path.display().to_string()),
             dump_config: false,
             version: false,

@@ -2,6 +2,7 @@ pub mod documentation;
 pub mod embedded;
 pub mod loader;
 pub mod overlay;
+pub mod peer;
 pub mod secret;
 pub mod source;
 pub use documentation::{CONFIG_FIELD_CATALOG, ConfigFieldClass, ConfigFieldDocumentation};
@@ -24,8 +25,16 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(clap::Parser, Debug)]
-#[command(name = "tokeirad", disable_version_flag = true)]
+#[command(
+    name = "tokeirad",
+    disable_version_flag = true,
+    args_conflicts_with_subcommands = true
+)]
 pub struct Cli {
+    /// Operator commands that run without starting a server.
+    #[command(subcommand)]
+    pub command: Option<CliCommand>,
+
     /// Configuration locator: a file path, `file:<path>`, or `env:<VAR>`.
     #[arg(long)]
     pub config: Option<String>,
@@ -47,6 +56,28 @@ pub struct Cli {
     pub json: bool,
 }
 
+/// Daemon operator commands; none starts the runtime or resolves server config.
+#[derive(clap::Subcommand, Debug)]
+pub enum CliCommand {
+    /// Manage the protected credential shared by controller-managed runtimes.
+    PeerCredential {
+        /// Explicit credential operation.
+        #[command(subcommand)]
+        command: PeerCredentialCommand,
+    },
+}
+
+/// Credential generation is explicit and refuses to replace an existing file.
+#[derive(clap::Subcommand, Debug)]
+pub enum PeerCredentialCommand {
+    /// Create a fresh cluster identity and ES256 key, then print path-only config.
+    Generate {
+        /// New credential file; its parent directory must already exist.
+        #[arg(long)]
+        out: PathBuf,
+    },
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TokeiraConfig {
@@ -63,6 +94,9 @@ pub struct TokeiraConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InfrastructureConfig {
+    /// Offer-only cluster trust; ignored by startup modes that cannot have peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<peer::PeerConfig>,
     #[serde(default = "default_cluster_name")]
     pub cluster_name: String,
     #[serde(default = "default_region")]
@@ -921,6 +955,7 @@ pub enum ValidationError {
 impl Default for InfrastructureConfig {
     fn default() -> Self {
         Self {
+            peer: None,
             cluster_name: default_cluster_name(),
             region: default_region(),
             storage: ConfigStorageKind::InMemory,
@@ -2580,6 +2615,7 @@ mod tests {
                     worker_compute_enabled,
                 )| TokeiraConfig {
                     infrastructure: InfrastructureConfig {
+                        peer: None,
                         storage: ConfigStorageKind::InMemory,
                         cluster_name,
                         region,

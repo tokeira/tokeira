@@ -306,6 +306,8 @@ held for 60 s and renewed every 20 s:
 - A node that loses the claim, because another owner took it or no renewal was confirmed
   for 40 s, stops admitting DSQL work, drains and exits with an error.
 
+For controller-managed startup, see [runtime peer credentials](../operations/peer-credentials.md) for generation, installation and stopped-node rotation.
+
 ## Operating and inspecting
 
 Use these read paths before mutation or when a gate refuses:

@@ -12,6 +12,81 @@ schedule time, priority, exact/live routing and original sticky coordinates surv
 speculative, eager and query envelopes stay compatible. Wiring the new normal envelope into publication,
 discovery and remote start belongs to the delivery and read-consolidation changes; this PR activates no push path.
 
+## Part 2: credentials and wire contract
+
+Tasks 3.1–3.3 and 3.7 implement the runtime credential and wire contract. Provisioning belongs to deployment tooling
+outside this repository; tasks 3.4–3.6 are removed. No admission, sender, retirement or sticky fallback is activated.
+The handler authenticates and validates then returns `Unavailable`, without calling the legacy publisher. Start's
+128 MiB response limit is preserved.
+
+The existing no-controller decision in `build_and_serve` (`crates/tokeira-engine/src/lib.rs`) gates peer bootstrap
+and the unchanged single-node claim. Embedded construction passes no peer capability, including durable modes and
+an attached public listener. No-peer startup builds no file loader, signer, renewal work or offer sender/endpoint.
+Controller-managed startup requires valid material even with one replica.
+
+`infrastructure.peer.path` names an absolute protected file. `tokeirad peer-credential generate --out <path>` creates
+it once with mode 0600, refuses overwrite and prints only path configuration. The versioned JSON contains fresh
+cluster identity, ES256 PKCS#8 DER encoded as base64url and its public profile; there is no provider reference,
+sidecar or deployment adoption state. File opens reject symlinks component by component; loading bounds size and
+rejects group/world permissions. Key/profile agreement and signing are checked before readiness. Missing and
+inconsistent failures are distinct and redacted, with the generator/install/stopped-node restart remedy.
+Restarts do not rewrite the file; explicit generation at a new path and installation on every stopped node rotates
+trust. Public authentication is unchanged. See [operator guidance](../../../docs/operations/peer-credentials.md).
+
+Dependency changes are edges to packages already in the lockfile: auth uses `p256`/`uuid`, config uses `rustix`, and
+engine tests use `tempfile`. The existing `jsonwebtoken` ring backend and P-256/ECDSA family are reused. The lockfile
+is refreshed offline after removing provider-related edges. No new crates, migrations or upstream proto edits.
+
+### Regression inventory
+
+| Property | Generated test | Configured cases |
+| --- | --- | --- |
+| 7 | auth `generated_peer_policy` | 100 |
+| 7 | auth `generated_material_agreement` | 100 |
+| 10 | auth `generated_renewal_and_rotation` | 100 |
+| 7 | config `generated_bounded_file_loading` | 100 |
+| 7 | edge `generated_wire_shapes` | 100 |
+| 7 | edge `generated_bounds_and_handler_saturation` | 100 |
+| 10 | engine `generated_peer_file_restart_rotation` | 100 |
+| 10 | engine `generated_upgrade_bootstrap` | 100 |
+| 10 | engine `generated_no_peer_startup` | 100 |
+| 10 | engine `generated_durable_peer_exemption` | 100 |
+
+Examples cover validity/leeway and byte boundaries, corrupt/mismatched keys, token redaction, create-only generation,
+mode 0600, overwrite refusal, symlink rejection, missing/inconsistent startup messages, frame bounds, absent routes
+and Start's larger response. Durable bootstrap tests use the existing provider/connection fakes and common embedded
+router; they preserve ownership safeguards and do not constitute live DSQL readiness evidence.
+
+### Validation and remaining gates
+
+`cargo check -p tokeira-engine --lib --offline` passed and refreshed the lockfile without package/version changes.
+Nightly formatting/check and warning-denied workspace/all-targets clippy passed. The requested auth/config/edge
+nextest command initially stopped on a sandbox-denied local listener; its `--no-fail-fast` rerun completed with
+705 passes and five listener failures (`Operation not permitted`). Three failures are existing auth JWT/STS tests;
+two are edge forwarded-start/read-baseline tests. One passing existing payload-limit test was reported leaky.
+All six generated auth/config/edge properties above passed at 100 cases each.
+
+The response-frame example exposed a Tonic trailers-only decoding-limit bypass during verification. The dormant
+offer client now rejects malformed initial success status and bounds the unary response body independently.
+Exact/one-over response-frame and unchanged Start-limit regressions pass. No sender or handler was activated.
+
+The requested engine peer/generate filter ran all eight selected tests: six passed, two failed, 133 were filtered
+out. Create-only CLI generation, mode/overwrite refusal, symlink/public-mode rejection and both startup diagnostics
+passed. `generated_upgrade_bootstrap` and `generated_peer_file_restart_rotation` each passed 100 cases. The
+`generated_no_peer_startup` and `generated_durable_peer_exemption` properties failed during listener binding with
+sandbox `Operation not permitted`; their configured 100 cases are not claimed as completed.
+
+Disk was checked before every build and remained above the 12 GiB threshold at each start. After the engine run it
+fell below that threshold, so no further builds were started. Cached native objects emitted linker SDK-version
+warnings; build/cache configuration was left unchanged. The full bar remains for the orchestrator's devbox run.
+No live provider or network validation is claimed.
+
+The exact 174-character changed fragment is: “Controller-managed clusters need a peer credential file on every
+node: generate one with tokeirad, stop every node, and set it in each node's configuration before restarting.”
+Its scratch-copy `changie batch 999.999.999 --dry-run --allow-no-changes=false` passed. Offline Markdown links,
+`git diff --check origin/main` and the requested secret-pattern scan over the diff and untracked files passed.
+All work remains uncommitted; restored platform, deployment and daemon paths were left untouched.
+
 ## Exploration
 
 Base: `ad71615c129e5d9c85417b6553ea62e42dfc6d21`. The runtime tests invoke the existing publisher and broker over

@@ -249,6 +249,49 @@ proptest! {
     }
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    // Feature: queue-home-delivery, Property 10
+    // Both durable bootstrap paths retain exclusive mode; the common embedded
+    // router stays offer-free with a listener. Database/ownership integration
+    // remains covered by the existing durable suite, not this offline adapter.
+    #[test]
+    fn generated_durable_peer_exemption(managed in any::<bool>(), listener in any::<bool>()) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let temporary = tempfile::tempdir().unwrap();
+            let mut config = existing_config(PUBLIC);
+            if managed {
+                config.storage = EmbeddedStorageConfig::ManagedDsql(ManagedEmbeddedDsqlConfig {
+                    intent: ManagedClusterIntent::CreateOrRecover,
+                    descriptor_path: temporary.path().join("cluster.json"),
+                    region: config.server.infrastructure.dsql.region.clone().unwrap_or_else(|| "eu-west-2".into()),
+                    migration_policy: None, limits: EmbeddedDsqlLimits::default(), tags: BTreeMap::new(),
+                });
+            }
+            let mut control = FakeControl::new([observation(ClusterStatus::Active, PUBLIC), observation(ClusterStatus::Active, PUBLIC)]);
+            control.allow_create = managed;
+            let time = FakeTime::new();
+            let connected = connect_embedded_dsql(config, control, time.clone(), time.now() + StdDuration::from_secs(60), capture_connection).await.unwrap();
+            assert!(connected.server.infrastructure.placement.controller_endpoint.is_none());
+            assert!(connected.server.infrastructure.peer.is_none());
+            let engine = Engine::start_with_config(connected.server).await.unwrap();
+            let error = engine.endpoint().call(InProcessGrpcRequest {
+                service: "tokeira.internal.runtime.v1.WorkflowTaskDispatch".into(), rpc: "OfferWorkflowTask".into(), headers: Default::default(), proto: bytes::Bytes::new(),
+            }).await.unwrap_err();
+            assert_eq!(error.code(), tonic::Code::Unimplemented);
+            if listener {
+                let public = engine.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+                let mut client = tokeira_proto::internal::runtime::workflow_task_dispatch_client::WorkflowTaskDispatchClient::connect(format!("http://{}", public.bound_addr())).await.unwrap();
+                assert_eq!(client.offer_workflow_task(tokeira_proto::internal::runtime::OfferWorkflowTaskRequest::default()).await.unwrap_err().code(), tonic::Code::Unimplemented);
+                public.shutdown().await.unwrap();
+            }
+            engine.shutdown().await.unwrap();
+        });
+    }
+}
+
 #[tokio::test]
 async fn identity_disagreement_is_rejected_at_resolution_readiness_and_wake() {
     for stage in 0..3 {

@@ -44,6 +44,7 @@
 # @field infrastructure.observability.otlp_protocol | infrastructure | default="grpc" | OTLP trace transport protocol.
 # @field infrastructure.observability.smoke_test_timeout_ms | infrastructure | default=30000 | Observability smoke-test timeout.
 # @field infrastructure.observability.trace_sample_rate | infrastructure | default=1.0 | Base trace sampling ratio from zero through one.
+# @field infrastructure.peer.path | infrastructure | default=<unset> | Absolute path to the private peer credential file, including its verifier profile. Required for controller-managed runtimes; generate with tokeirad peer-credential generate and install the same file on every node while all nodes are stopped.
 # @field infrastructure.placement.bundle_count | infrastructure | default=1 | Placement bundle count; must equal shard_count. Unequal counts fail startup; automatic repartitioning is not supported.
 # @field infrastructure.placement.controller_endpoint | infrastructure | default=<unset> | Placement-controller endpoint; absence selects the single-node path.
 # @field infrastructure.placement.hash_version | infrastructure | default=1 | Pinned placement hash algorithm version.
@@ -110,6 +111,11 @@ region = "us-east-1"
 storage = "in-memory"
 
 [infrastructure.dsql]
+
+# Required only when a placement controller is configured. Generate one file,
+# stop every node, and securely install that same file on each runtime node.
+# [infrastructure.peer]
+# path = "/etc/tokeira/peer.json"
 
 [infrastructure.placement]
 heartbeat_interval_ms = 5000

@@ -12,6 +12,73 @@ schedule time, priority, exact/live routing and original sticky coordinates surv
 speculative, eager and query envelopes stay compatible. Wiring the new normal envelope into publication,
 discovery and remote start belongs to the delivery and read-consolidation changes; this PR activates no push path.
 
+## Part 2: credentials and wire contract
+
+Tasks 3.1–3.3 and 3.7 implement the runtime credential and wire contract. Provisioning belongs to deployment tooling
+outside this repository; tasks 3.4–3.6 are removed. No admission, sender, retirement or sticky fallback is activated.
+The handler authenticates and validates then returns `Unavailable`, without calling the legacy publisher. Start's
+128 MiB response limit is preserved.
+
+The existing no-controller decision in `build_and_serve` (`crates/tokeira-engine/src/lib.rs`) gates peer bootstrap
+and the unchanged single-node claim. Embedded construction passes no peer capability, including durable modes and
+an attached public listener. No-peer startup builds no file loader, signer, renewal work or offer sender/endpoint.
+Controller-managed startup requires valid material even with one replica.
+
+`infrastructure.peer.path` names an absolute protected file. `tokeirad peer-credential generate --out <path>` creates
+it once with mode 0600, refuses overwrite and prints only path configuration. The versioned JSON contains fresh
+cluster identity, ES256 PKCS#8 DER encoded as base64url and its public profile; there is no provider reference,
+sidecar or deployment adoption state. File opens reject symlinks component by component; loading bounds size and
+rejects group/world permissions. Key/profile agreement and signing are checked before readiness. Missing and
+inconsistent failures are distinct and redacted, with the generator/install/stopped-node restart remedy.
+Restarts do not rewrite the file; explicit generation at a new path and installation on every stopped node rotates
+trust. Public authentication is unchanged. See [operator guidance](../../../docs/operations/peer-credentials.md).
+
+Dependency changes are edges to packages already in the lockfile: auth uses `p256`/`uuid`, config uses `rustix`, and
+engine tests use `tempfile`. The existing `jsonwebtoken` ring backend and P-256/ECDSA family are reused. The lockfile
+is refreshed offline after removing provider-related edges. No new crates, migrations or upstream proto edits.
+
+### Regression inventory
+
+| Property | Generated test | Configured cases |
+| --- | --- | --- |
+| 7 | auth `generated_peer_policy` | 100 |
+| 7 | auth `generated_material_agreement` | 100 |
+| 10 | auth `generated_renewal_and_rotation` | 100 |
+| 7 | config `generated_bounded_file_loading` | 100 |
+| 7 | edge `generated_wire_shapes` | 100 |
+| 7 | edge `generated_bounds_and_handler_saturation` | 100 |
+| 10 | engine `generated_peer_file_restart_rotation` | 100 |
+| 10 | engine `generated_upgrade_bootstrap` | 100 |
+| 10 | engine `generated_no_peer_startup` | 100 |
+| 10 | engine `generated_durable_peer_exemption` | 100 |
+
+Examples cover validity/leeway and byte boundaries, corrupt/mismatched keys, token redaction, create-only generation,
+mode 0600, overwrite refusal, symlink rejection, missing/inconsistent startup messages, frame bounds, absent routes
+and Start's larger response. Durable bootstrap tests use the existing provider/connection fakes and common embedded
+router; they preserve ownership safeguards and do not constitute live DSQL readiness evidence.
+
+### Validation
+
+Locally, nightly formatting and warning-denied workspace/all-targets clippy pass, and `cargo check` refreshed the
+lockfile without package or version changes. All six generated auth/config/edge properties above pass at 100 cases
+each. `generated_upgrade_bootstrap` and `generated_peer_file_restart_rotation` each pass 100 cases, as do the
+create-only CLI generation, mode and overwrite refusal, symlink and public-mode rejection, and both startup
+diagnostics.
+
+The response-frame example exposed a Tonic trailers-only decoding-limit bypass. The dormant offer client now rejects
+a malformed initial success status and bounds the unary response body independently. Exact/one-over response-frame
+and unchanged Start-limit regressions pass. No sender or handler is activated.
+
+The full bar passes on the final head, on a fresh Linux devbox: fmt, lint, check, test (3,978 passed, 2 skipped),
+doctest and doc, with `generated_no_peer_startup` and `generated_durable_peer_exemption` among the tests run.
+`cargo clippy --features dsql-integration` is clean for `tokeira-engine` and `tokeira-edge`. The binding inventory
+fixture gains only this part's internal messages, enums and the `OfferWorkflowTask` method. No live provider or
+network validation is claimed.
+
+The changed fragment is: “Controller-managed clusters need a peer credential file on every node: generate one with
+tokeirad, stop every node, and set it in each node's configuration before restarting.” The changie dry run, offline
+Markdown links, `git diff --check` and a scan of the diff for key material pass.
+
 ## Exploration
 
 Base: `ad71615c129e5d9c85417b6553ea62e42dfc6d21`. The runtime tests invoke the existing publisher and broker over

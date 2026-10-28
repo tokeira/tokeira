@@ -79,6 +79,14 @@ macro_rules! field {
 /// they are authored through `UpdateTaskQueueConfig`, not startup TOML.
 pub const CONFIG_FIELD_CATALOG: &[ConfigFieldDocumentation] = &[
     field!(
+        "infrastructure.peer.path",
+        Infrastructure,
+        "<unset>",
+        false,
+        None,
+        "Absolute path to the private peer credential file, including its verifier profile. Required for controller-managed runtimes; generate with tokeirad peer-credential generate and install the same file on every node while all nodes are stopped."
+    ),
+    field!(
         "infrastructure.cluster_name",
         Infrastructure,
         "\"tokeira-local\"",
@@ -852,6 +860,7 @@ pub const CONFIG_FIELD_CATALOG: &[ConfigFieldDocumentation] = &[
 const COMPLETE_ANNOTATED_CONFIG_FIXTURE: &str = r#"
 # Infrastructure fields define process topology rather than Temporal behavior.
 [infrastructure]
+peer = { path = "/protected/peer.json" }
 cluster_name = "catalog-test"
 region = "us-east-1"
 storage = "in-memory"

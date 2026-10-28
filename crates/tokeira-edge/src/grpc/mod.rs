@@ -9,5 +9,6 @@ pub mod translate;
 pub mod workflow_service;
 
 pub mod workflow_dispatch;
+pub mod workflow_offer;
 
 pub(crate) mod peer_transport;

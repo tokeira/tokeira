@@ -78,6 +78,7 @@ dsql-integration = [
 ]
 
 [dev-dependencies]
+tempfile.workspace = true
 http-body = "1"
 hyper = { workspace = true, features = ["client"] }
 metrics-util.workspace = true

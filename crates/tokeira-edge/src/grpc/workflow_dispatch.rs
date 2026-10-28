@@ -17,7 +17,8 @@ use http::HeaderMap;
 use prost::Message as _;
 use tokeira_proto::{
     internal::runtime::{
-        StartWorkflowTaskRequest, StartWorkflowTaskResponse,
+        OfferWorkflowTaskRequest, OfferWorkflowTaskResponse, StartWorkflowTaskRequest,
+        StartWorkflowTaskResponse,
         workflow_task_dispatch_client::WorkflowTaskDispatchClient,
         workflow_task_dispatch_server::{WorkflowTaskDispatch, WorkflowTaskDispatchServer},
     },
@@ -314,6 +315,7 @@ pub struct WorkflowTaskDispatchGrpc<R> {
     interceptors: Arc<EdgeInterceptors>,
     workflow_service: WorkflowService,
     attachment_limit: usize,
+    peer: Option<Arc<super::workflow_offer::PeerOfferEndpoint>>,
 }
 
 impl<R> fmt::Debug for WorkflowTaskDispatchGrpc<R> {
@@ -329,6 +331,7 @@ impl<R> Clone for WorkflowTaskDispatchGrpc<R> {
             interceptors: self.interceptors.clone(),
             workflow_service: self.workflow_service.clone(),
             attachment_limit: self.attachment_limit,
+            peer: self.peer.clone(),
         }
     }
 }
@@ -346,18 +349,49 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatchGrpc<R> {
             interceptors,
             workflow_service,
             attachment_limit: MAX_START_RESPONSE_BYTES - START_METADATA_RESERVE,
+            peer: None,
         }
     }
     /// Bound the input envelope before protobuf decoding; no history is accepted.
-    pub fn into_service(self) -> WorkflowTaskDispatchServer<Self> {
-        WorkflowTaskDispatchServer::new(self)
-            .max_decoding_message_size(MAX_START_REQUEST_BYTES)
-            .max_encoding_message_size(MAX_START_RESPONSE_BYTES)
+    pub fn into_service(
+        self,
+    ) -> super::workflow_offer::OfferGate<WorkflowTaskDispatchServer<Self>> {
+        let peer = self.peer.clone();
+        super::workflow_offer::OfferGate::new(
+            WorkflowTaskDispatchServer::new(self)
+                .max_decoding_message_size(MAX_START_REQUEST_BYTES)
+                .max_encoding_message_size(MAX_START_RESPONSE_BYTES),
+            peer,
+        )
+    }
+
+    /// Install only after peer-capable startup has validated protected material.
+    pub fn with_peer(
+        mut self,
+        peer: Option<Arc<super::workflow_offer::PeerOfferEndpoint>>,
+    ) -> Self {
+        self.peer = peer;
+        self
     }
 }
 
 #[tonic::async_trait]
 impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGrpc<R> {
+    async fn offer_workflow_task(
+        &self,
+        request: Request<OfferWorkflowTaskRequest>,
+    ) -> std::result::Result<Response<OfferWorkflowTaskResponse>, Status> {
+        if self.peer.is_none() {
+            return Err(Status::unimplemented("unknown method"));
+        }
+        super::workflow_offer::validate_request(request.get_ref())?;
+        // Legacy publication deduplicates before checking ownership and clears
+        // sticky deadlines on fallback. It cannot back a positive acknowledgement.
+        Err(Status::unavailable(
+            "workflow offer admission is not active",
+        ))
+    }
+
     async fn start_workflow_task(
         &self,
         request: Request<StartWorkflowTaskRequest>,

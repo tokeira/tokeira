@@ -363,7 +363,7 @@ graph TD
 
 *For any* `update_workflow` call where the kernel rejects the `Command::Update` (with `Reject::WorkflowPaused`, `Reject::DuplicateUpdateId`, or `Reject::RunClosed`), the runtime SHALL return an error to the caller AND the `UpdateRegistry` SHALL NOT contain an entry for that `(RunKey, update_id)` after the call returns. If the caller had `wait_policy = Completed`, the pre-registered entry SHALL be removed before the error is returned.
 
-**Validates: Requirements 1.6, 8.1, 8.2, 8.3, 8.4**
+**Validates: Requirements 1.6, 8.1, 8.2, 8.3, 8.6**
 
 ### Property 3: Acceptance notification carries correct event ID
 

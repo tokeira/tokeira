@@ -48,7 +48,7 @@ Add update dispatch and two-phase lifecycle coordination to `tokeira-runtime`. T
       - `Ok(Ok(UpdateResolution::RunClosed))` → return error "run closed before update completed"
       - `Ok(Err(_))` → return error "update response channel closed"
       - `Err(_)` → `self.update_registry.remove(run_key, &update_id)`, return timeout error
-    - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 2.2, 2.3, 3.1, 3.2, 3.3, 3.4, 3.5, 4.5, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 6.1, 6.2, 6.3, 8.1, 8.2, 8.3, 8.4_
+    - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 2.2, 2.3, 3.1, 3.2, 3.3, 3.4, 3.5, 4.5, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 6.1, 6.2, 6.3, 8.1, 8.2, 8.3, 8.6_
 
 - [x] 3. Checkpoint — Verify types and `update_workflow` compile
   - Ensure all tests pass, ask the user if questions arise.
@@ -84,7 +84,7 @@ Add update dispatch and two-phase lifecycle coordination to `tokeira-runtime`. T
     - **Property 2: Kernel rejections propagate and clean up pre-registered entry**
     - Generate random rejection scenarios (`Reject::WorkflowPaused`, `Reject::DuplicateUpdateId`, `Reject::RunClosed`)
     - Call `update_workflow` with `wait_policy = Completed`, verify error is returned and `UpdateRegistry` contains no entry for that `(RunKey, update_id)` — the pre-registered entry must have been cleaned up
-    - **Validates: Requirements 1.6, 8.1, 8.2, 8.3, 8.4**
+    - **Validates: Requirements 1.6, 8.1, 8.2, 8.3, 8.6**
   - [x] 6.3 Write property test: acceptance notification carries correct event ID
     - **Property 3: Acceptance notification carries correct event ID**
     - Generate random updates, commit successfully, verify `accepted_event_id` in the returned `UpdateOutcome` matches the `pending_updates` entry

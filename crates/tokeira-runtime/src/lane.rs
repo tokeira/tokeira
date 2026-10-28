@@ -16,8 +16,8 @@
 //! across the entire chain, not just the current run.
 
 use std::{
-    collections::{HashMap, VecDeque},
-    sync::{Arc, RwLock},
+    collections::{HashMap, HashSet, VecDeque},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use anyhow::{Result, anyhow};
@@ -389,6 +389,7 @@ where
         wft_timeout_tracking,
         nexus_timeout_tracking,
         update_registry,
+        Arc::new(Mutex::new(HashSet::new())),
         config,
     )
 }
@@ -404,6 +405,7 @@ pub(crate) fn spawn_lane_with_id<K, R, P>(
     wft_timeout_tracking: crate::wft_timeout::WftTimeoutTrackingState,
     nexus_timeout_tracking: crate::nexus::NexusTimeoutTrackingState,
     update_registry: UpdateRegistry,
+    close_attempt_tracking: Arc<Mutex<HashSet<RunKey>>>,
     config: LaneConfig,
 ) -> LaneHandle
 where
@@ -459,6 +461,7 @@ where
                 &wft_timeout_tracking,
                 &nexus_timeout_tracking,
                 &update_registry,
+                &close_attempt_tracking,
                 &mut rx,
                 message,
                 &config,
@@ -516,6 +519,7 @@ where
         wft_timeout_tracking,
         nexus_timeout_tracking,
         update_registry,
+        &Arc::new(Mutex::new(HashSet::new())),
         rx,
         first_message,
         config,
@@ -547,6 +551,7 @@ async fn run_activation_with_cache<K, R, P>(
     wft_timeout_tracking: &crate::wft_timeout::WftTimeoutTrackingState,
     nexus_timeout_tracking: &crate::nexus::NexusTimeoutTrackingState,
     update_registry: &UpdateRegistry,
+    close_attempt_tracking: &Arc<Mutex<HashSet<RunKey>>>,
     rx: &mut mpsc::Receiver<LaneMessage>,
     first_message: LaneMessage,
     config: &LaneConfig,
@@ -634,6 +639,39 @@ where
         let stop_draining = result.is_err() || breach.is_some();
         let reply = match result {
             Ok((commit_result, mut dispatch_ops, history_events)) => {
+                if let CommitResult::Applied { new_state } = &commit_result {
+                    // Clear on every committed started-task closure, including
+                    // transient failures with no history event. Do this in the
+                    // lane before publishing a retry: an RPC/scanner callback
+                    // could otherwise race a newer close attempt. Only an
+                    // UnhandledCommand failure sets it again
+                    // (service/history/workflow/workflow_task_state_machine.go:
+                    // 923-925, 1094-1108 @ v1.31.0).
+                    let closes_started_task = match &committed_command {
+                        Command::WorkflowTaskFailed(_)
+                        | Command::TerminateOnWorkflowTaskFailed(_) => true,
+                        Command::WorkflowTaskTimedOut(request) => matches!(
+                            request.timeout_type,
+                            tokeira_kernel::WorkflowTaskTimeoutType::StartToClose
+                        ),
+                        _ => crate::run_growth::completes_workflow_task(&committed_command),
+                    };
+                    if closes_started_task || new_state.closed_at.is_some() {
+                        let mut tracking = close_attempt_tracking
+                            .lock()
+                            .expect("close-attempt tracking lock");
+                        tracking.remove(&message.run_key);
+                        if new_state.closed_at.is_none()
+                            && matches!(
+                                &committed_command,
+                                Command::WorkflowTaskFailed(request)
+                                    if request.failure_cause == tokeira_kernel::WorkflowTaskFailedCause::UnhandledCommand
+                            )
+                        {
+                            tracking.insert(message.run_key);
+                        }
+                    }
+                }
                 // Only an applied transition has post-commit effects. Derive
                 // their home from that state, with no run-hash fallback for a
                 // duplicate or conflict.

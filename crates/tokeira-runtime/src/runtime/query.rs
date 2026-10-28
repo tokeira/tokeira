@@ -729,7 +729,7 @@ where
     /// since the run can change before the lane applies it. The closing record
     /// is this runtime's volatile one, as v1.31.0's is, so its check runs only
     /// here, as the signal's does.
-    fn refuse_update(&self, run_key: RunKey, state: &WorkflowState) -> Result<()> {
+    pub(super) fn refuse_update(&self, run_key: RunKey, state: &WorkflowState) -> Result<()> {
         let close_attempted = self
             .close_attempt_tracking
             .lock()

@@ -16,13 +16,14 @@ use anyhow::Result;
 use proptest::prelude::*;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    HistoryEventKind, PauseWorkflowRequest, SignalRequest, StartRequest, UpdateProtocolBody,
-    WorkflowCommand, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
+    Command, HistoryEventKind, LoadedRun, PauseWorkflowRequest, SignalRequest, StartRequest,
+    UpdateProtocolBody, WorkflowCommand, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
+    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
 };
 use tokeira_runtime::{
-    BacklogConfig, InvalidWorkflowCommand, KernelRejected, LaneConfig, StartedWorkflowTask,
-    TimerScannerConfig, TokeiraRuntime, UpdateLifecycleSnapshot, UpdatePaused, UpdateWaitPolicy,
-    WorkflowClosing, WorkflowNotReady, WorkflowTimeoutScannerConfig,
+    BacklogConfig, InvalidWorkflowCommand, KernelRejected, LaneConfig, MultiOperationError,
+    StartedWorkflowTask, TimerScannerConfig, TokeiraRuntime, UpdateLifecycleSnapshot, UpdatePaused,
+    UpdateWaitPolicy, WorkflowClosing, WorkflowNotReady, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -583,6 +584,197 @@ async fn prepare(
         pause(runtime, namespace_id).await?;
     }
     Ok(run_key)
+}
+
+async fn assert_multi_operation_refused(
+    failures: usize,
+    closing: bool,
+    paused: bool,
+    expected: Answer,
+) -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = runtime(store.clone());
+    let namespace_id = NamespaceId::new();
+    let run_key = prepare(&runtime, namespace_id, true, failures, closing, paused).await?;
+    let LoadedRun::Existing(before) = store.load_run(run_key).await? else {
+        panic!("the run is stored");
+    };
+    assert!(before.admitted_updates.contains(UPDATE_ID));
+    let history_before = store.read_history_to_end(run_key, 0).await?;
+    let error = runtime
+        .execute_multi_operation(
+            start_request(namespace_id),
+            UPDATE_ID.to_string(),
+            UPDATE_NAME.to_string(),
+            payloads("input"),
+            context("repeat-with-start"),
+            Duration::milliseconds(50),
+            UpdateWaitPolicy::Admitted,
+            0,
+        )
+        .await
+        .expect_err("an admitted update must be refused before attaching");
+    let MultiOperationError::UpdateFailed { started, source } =
+        error.downcast::<MultiOperationError>()?
+    else {
+        panic!("the update leg must fail");
+    };
+    assert!(!started);
+    assert_eq!(answer(Err(source)), expected);
+    let LoadedRun::Existing(after) = store.load_run(run_key).await? else {
+        panic!("the run is stored");
+    };
+    assert_eq!(after, before);
+    assert_eq!(store.read_history_to_end(run_key, 0).await?, history_before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_with_start_refuses_an_admitted_update_while_paused() -> Result<()> {
+    assert_multi_operation_refused(0, false, true, Answer::Paused).await
+}
+
+#[tokio::test]
+async fn update_with_start_refuses_an_admitted_update_at_attempt_three() -> Result<()> {
+    assert_multi_operation_refused(2, false, false, Answer::Failing).await
+}
+
+#[tokio::test]
+async fn update_with_start_refuses_an_admitted_update_while_closing() -> Result<()> {
+    assert_multi_operation_refused(0, true, false, Answer::Closing).await
+}
+
+async fn closing_retry(
+    runtime: &TokeiraRuntime<InMemoryStore>,
+    namespace_id: NamespaceId,
+) -> Result<StartedWorkflowTask> {
+    start(runtime, namespace_id).await?;
+    let task = poll(runtime, namespace_id).await?;
+    runtime
+        .signal_workflow(execution(namespace_id), signal("buffered"))
+        .await?;
+    runtime
+        .complete_workflow_task(completion(
+            task,
+            vec![WorkflowCommand::CompleteWorkflow {
+                result: Payloads::default(),
+            }],
+        ))
+        .await
+        .expect_err("the close bounces off the buffered signal");
+    let retry = poll(runtime, namespace_id).await?;
+    assert_eq!(retry.token.attempt, 1);
+    assert_eq!(
+        answer(request_update(runtime, namespace_id, "closing").await),
+        Answer::Closing
+    );
+    Ok(retry)
+}
+
+async fn timeout_closing_retry(
+    runtime: &TokeiraRuntime<InMemoryStore>,
+    namespace_id: NamespaceId,
+) -> Result<()> {
+    let retry = closing_retry(runtime, namespace_id).await?;
+    let result = runtime
+        .submit(
+            retry.token.run_key,
+            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                logical_seq: retry.token.logical_seq,
+                started_event_id: retry.token.started_event_id,
+                timeout_type: WorkflowTaskTimeoutType::StartToClose,
+                now: OffsetDateTime::now_utc() + Duration::seconds(11),
+            }),
+        )
+        .await?;
+    assert!(matches!(result, CommitResult::Applied { .. }));
+    assert_eq!(poll(runtime, namespace_id).await?.token.attempt, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_timed_out_close_retry_allows_updates_on_attempt_two() -> Result<()> {
+    let runtime = runtime(Arc::new(InMemoryStore::default()));
+    let namespace_id = NamespaceId::new();
+    timeout_closing_retry(&runtime, namespace_id).await?;
+    assert_eq!(
+        answer(request_update(&runtime, namespace_id, "after-timeout").await),
+        Answer::Taken
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_timed_out_close_retry_allows_signals_on_attempt_two() -> Result<()> {
+    let runtime = runtime(Arc::new(InMemoryStore::default()));
+    let namespace_id = NamespaceId::new();
+    timeout_closing_retry(&runtime, namespace_id).await?;
+    runtime
+        .signal_workflow(execution(namespace_id), signal("after-timeout"))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_worker_failed_close_retry_allows_updates() -> Result<()> {
+    let runtime = runtime(Arc::new(InMemoryStore::default()));
+    let namespace_id = NamespaceId::new();
+    let retry = closing_retry(&runtime, namespace_id).await?;
+    runtime
+        .fail_workflow_task(
+            retry.token,
+            WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+            None,
+            WorkerIdentity("worker".to_string()),
+            context("failed-retry"),
+            OffsetDateTime::now_utc(),
+        )
+        .await?;
+    assert_eq!(poll(&runtime, namespace_id).await?.token.attempt, 2);
+    assert_eq!(
+        answer(request_update(&runtime, namespace_id, "after-failure").await),
+        Answer::Taken
+    );
+    Ok(())
+}
+
+async fn server_failed_close_retry(command: WorkflowCommand) -> Result<()> {
+    let runtime = runtime(Arc::new(InMemoryStore::default()));
+    let namespace_id = NamespaceId::new();
+    let retry = closing_retry(&runtime, namespace_id).await?;
+    let error = runtime
+        .complete_workflow_task(completion(retry, vec![command]))
+        .await
+        .expect_err("the invalid completion fails the started task");
+    assert!(
+        error.downcast_ref::<InvalidWorkflowCommand>().is_some(),
+        "{error:#}"
+    );
+    assert_eq!(poll(&runtime, namespace_id).await?.token.attempt, 2);
+    assert_eq!(
+        answer(request_update(&runtime, namespace_id, "after-failure").await),
+        Answer::Taken
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_invalid_command_closing_the_retry_allows_updates() -> Result<()> {
+    server_failed_close_retry(WorkflowCommand::InvalidSearchAttributes {
+        message: "invalid search attribute".to_string(),
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_bad_message_closing_the_retry_allows_updates() -> Result<()> {
+    server_failed_close_retry(WorkflowCommand::ProtocolMessage {
+        message_id: "missing".to_string(),
+        body: UpdateProtocolBody::UnresolvedMessage {
+            message_id: "missing".to_string(),
+        },
+    })
+    .await
 }
 
 // Feature: update-refusals, Property 1: The refusals come first, in order

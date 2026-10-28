@@ -254,6 +254,27 @@ impl Run {
             )
             .unwrap()
     }
+
+    fn reset_at_fork(&mut self, fork: usize) {
+        self.started_task();
+        let fork_points: Vec<_> = self
+            .history
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                matches!(event.kind, HistoryEventKind::WorkflowTaskStarted { .. })
+                    .then_some(index + 1)
+            })
+            .collect();
+        self.history.truncate(fork_points[fork % fork_points.len()]);
+        self.state.run_id = RunId::new();
+        self.state.run_key = RunKey::derive(
+            self.state.namespace_id,
+            &self.state.workflow_id,
+            self.state.run_id,
+        );
+        self.state = self.replayed();
+    }
 }
 
 fn accepted(update_id: &str) -> UpdateProtocolBody {
@@ -291,20 +312,39 @@ fn completed_refusal(update_id: &str, message_type: &str) -> Reject {
     }
 }
 
+#[test]
+fn a_response_after_a_response_in_the_same_task_is_provisionally_completed() {
+    let mut run = Run::start();
+    run.admit("update-0").unwrap();
+    assert_eq!(
+        run.complete(vec![
+            accepted("update-0"),
+            responded("update-0"),
+            responded("update-0")
+        ]),
+        Err(Reject::BadUpdateMessage {
+            message: "invalid state transition attempted for Update update-0: received \
+                      *update.Response message while in state ProvisionallyCompleted"
+                .into(),
+            not_found: false,
+        })
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
     // Feature: update-refusals, Property 3: The completed ids are the history's
     /// Whatever the run's admissions, acceptances, responses and rejections, its
-    /// completed ids are those of the completion events in its history, after
-    /// every step, and the state a replay of that history rebuilds, as a reset's
-    /// new run does, holds the same ids.
+    /// completed ids are those of its history, including after a reset forks
+    /// a prefix into a new run and discards completions beyond the fork.
     #[test]
     fn the_completed_ids_are_the_historys(
-        ops in prop::collection::vec((0u8..5, 0u8..3), 1..16),
+        ops in prop::collection::vec((0u8..6, 0u8..3, any::<usize>()), 1..16),
+        final_fork in any::<usize>(),
     ) {
         let mut run = Run::start();
-        for (kind, slot) in ops {
+        for (kind, slot, fork) in ops {
             let update_id = format!("update-{slot}");
             let in_flight = run.state.admitted_updates.contains(&update_id)
                 || run.state.pending_updates.contains_key(&update_id);
@@ -322,17 +362,24 @@ proptest! {
                 4 if run.state.admitted_updates.contains(&update_id) => {
                     run.complete(vec![accepted(&update_id), responded(&update_id)])
                 }
+                5 => {
+                    run.reset_at_fork(fork);
+                    Ok(())
+                }
                 _ => Ok(()),
             };
             prop_assert_eq!(&run.state.completed_updates, &completed_update_ids(&run.history));
             prop_assert_eq!(&run.replayed().completed_updates, &run.state.completed_updates);
         }
+        run.reset_at_fork(final_fork);
+        prop_assert_eq!(&run.state.completed_updates, &completed_update_ids(&run.history));
+        prop_assert_eq!(&run.replayed().completed_updates, &run.state.completed_updates);
     }
 
     // Feature: update-refusals, Property 4: A message for a completed update fails the task
     /// An acceptance, a rejection or a response for any of a run's completed
     /// updates fails the workflow task with v1.31.0's invalid state transition,
-    /// so the run writes no event for it and keeps its counts.
+    /// so the kernel returns no transition to persist.
     #[test]
     fn a_message_for_a_completed_update_fails_the_task(
         completed in 1usize..4,
@@ -347,7 +394,6 @@ proptest! {
         }
         let update_id = format!("update-{}", target % completed);
         run.started_task();
-        let before = run.state.clone();
         let (body, name) = match message_type {
             0 => (accepted(&update_id), "Acceptance"),
             1 => (rejected(&update_id), "Rejection"),
@@ -355,8 +401,6 @@ proptest! {
         };
         let refused = run.complete(vec![body]);
         prop_assert_eq!(refused, Err(completed_refusal(&update_id, name)));
-        prop_assert_eq!(&run.state, &before);
-        prop_assert_eq!(run.state.completed_update_count as usize, completed);
     }
 }
 

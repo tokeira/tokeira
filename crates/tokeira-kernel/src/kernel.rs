@@ -6565,7 +6565,11 @@ fn apply_workflow_command(
                         && !builder.state.admitted_updates.contains(&update_id)
                     {
                         if builder.state.completed_updates.contains(&update_id) {
-                            return Err(completed_update_message(&update_id, "Acceptance"));
+                            return Err(completed_update_message(
+                                builder,
+                                &update_id,
+                                "Acceptance",
+                            ));
                         }
                         // Unknown update. When the worker echoed the original
                         // request (non-empty handler name), RESURRECT it and
@@ -6703,7 +6707,7 @@ fn apply_workflow_command(
                             });
                         }
                         if builder.state.completed_updates.contains(&update_id) {
-                            return Err(completed_update_message(&update_id, "Response"));
+                            return Err(completed_update_message(builder, &update_id, "Response"));
                         }
                         // `TryResurrect` still makes its total check before it
                         // finds no request in a Response (criterion 2.13).
@@ -6768,7 +6772,7 @@ fn apply_workflow_command(
                         && !builder.state.pending_updates.contains_key(&update_id)
                     {
                         if builder.state.completed_updates.contains(&update_id) {
-                            return Err(completed_update_message(&update_id, "Rejection"));
+                            return Err(completed_update_message(builder, &update_id, "Rejection"));
                         }
                         builder.resurrect_update(limits.total_updates)?;
                     }
@@ -6805,11 +6809,32 @@ fn apply_workflow_command(
 /// `update/state.go:45-46`; `workflow_task_completed_handler.go:375-386 @
 /// v1.31.0`). `message_type` names the message as Go's `%T` prints it,
 /// `Acceptance`, `Rejection` or `Response`.
-fn completed_update_message(update_id: &str, message_type: &str) -> Reject {
+fn completed_update_message(
+    builder: &TransitionBuilder,
+    update_id: &str,
+    message_type: &str,
+) -> Reject {
+    // Responses take effect only on commit. A later message in this same
+    // completion still sees ProvisionallyCompleted; a prior task's response
+    // sees Completed (service/history/workflow/update/update.go:619-624 and
+    // registry.go:455-459 @ v1.31.0).
+    let completed_this_transition = builder.history_events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            HistoryEventKind::WorkflowExecutionUpdateCompleted { update_id: id, .. }
+                | HistoryEventKind::WorkflowExecutionUpdateCompletedV2 { update_id: id, .. }
+                if id == update_id
+        )
+    });
+    let state_name = if completed_this_transition {
+        "ProvisionallyCompleted"
+    } else {
+        "Completed"
+    };
     Reject::BadUpdateMessage {
         message: format!(
             "invalid state transition attempted for Update {update_id}: received \
-             *update.{message_type} message while in state Completed"
+             *update.{message_type} message while in state {state_name}"
         ),
         not_found: false,
     }

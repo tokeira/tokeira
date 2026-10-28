@@ -943,6 +943,10 @@ pub trait RunRepository: Send + Sync {
     /// invalid seed data fails the load. Seeding changes only the returned copy,
     /// so the latest image remains necessary until readiness is persisted and
     /// writers that discard the extension have been excluded.
+    ///
+    /// An open run written before completed-update ids were stored may also
+    /// require reading its whole history in the same snapshot to recover those
+    /// ids. Recovery changes only the returned state until its next commit.
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun>;
 
     /// Load the run and its persisted history statistics from one snapshot.

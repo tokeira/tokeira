@@ -16,7 +16,7 @@ use sqlx::{
 };
 use tokeira_storage::{
     ConnectionDirector, DbClass, ProjectionRecord,
-    dsql::{DsqlConnectionDirector, codec},
+    dsql::{DsqlConnectionDirector, codec, value_parts},
     metrics as storage_metrics,
 };
 use tokeira_types::{
@@ -80,6 +80,17 @@ mod passes_tests;
 #[cfg(all(test, feature = "dsql-integration"))]
 #[path = "dsql_bounded_apply_tests.rs"]
 mod bounded_apply_tests;
+
+#[cfg(all(test, feature = "dsql-integration"))]
+#[path = "dsql_memo_read_pause.rs"]
+mod memo_read_pause;
+
+#[cfg(all(test, feature = "dsql-integration"))]
+#[path = "dsql_large_value_tests.rs"]
+mod large_value_tests;
+
+#[path = "dsql_memo_parts.rs"]
+mod memo_parts;
 
 #[path = "dsql_attributes.rs"]
 mod attributes;
@@ -289,7 +300,7 @@ impl DsqlVisibilityStore {
     async fn read_stored_row(
         tx: &mut PgConnection,
         row: &ExecutionRow,
-    ) -> Result<Option<ExecutionRow>> {
+    ) -> Result<(Option<ExecutionRow>, Option<i32>)> {
         let started = Instant::now();
         let previous =
             read_execution_row(tx, row.namespace_id, row.archetype_id, row.run_key).await?;
@@ -306,9 +317,11 @@ impl DsqlVisibilityStore {
         tx: &mut PgConnection,
         row: &ExecutionRow,
         memo: &[u8],
+        previous_parts: Option<i32>,
     ) -> Result<bool> {
         let started = Instant::now();
-        let applied = upsert_execution_row(tx, row, Some(memo.to_vec())).await?;
+        let applied =
+            upsert_execution_row(tx, row, Some(memo.to_vec()), previous_parts, false).await?;
         storage_metrics::record_dsql_statement_duration(
             "projection_apply",
             "upsert_execution",
@@ -330,7 +343,7 @@ impl DsqlVisibilityStore {
     ) -> Result<Option<SingleAttempt>> {
         let mut permit = self.director.acquire(DbClass::Projection).await?;
         let mut tx = permit.connection()?.begin().await?;
-        let previous = Self::read_stored_row(&mut tx, row).await?;
+        let (previous, previous_parts) = Self::read_stored_row(&mut tx, row).await?;
         if !visibility_version_is_newer(
             previous.as_ref(),
             record.context.authority_epoch,
@@ -347,6 +360,10 @@ impl DsqlVisibilityStore {
             older_cells: below.cells,
             older_values: below.values,
             deltas: deltas.len(),
+            memo_parts: memo_parts::replacement_rows(
+                value_parts::parts_of(memo.len()),
+                previous_parts,
+            )?,
         };
         if rows.plan() == ApplyPlan::Staged {
             tx.rollback().await?;
@@ -354,7 +371,7 @@ impl DsqlVisibilityStore {
         }
         // The guard sees the snapshot the read saw. Only an apply that wrote the row
         // may write its attributes or move its counters.
-        if !Self::write_guarded_row(&mut tx, row, memo).await? {
+        if !Self::write_guarded_row(&mut tx, row, memo, previous_parts).await? {
             tx.rollback().await?;
             return Ok(Some(SingleAttempt::Current));
         }
@@ -424,7 +441,7 @@ impl DsqlVisibilityStore {
     ) -> Result<ApplyOutcome> {
         let mut permit = self.director.acquire(DbClass::Projection).await?;
         let mut tx = permit.connection()?.begin().await?;
-        let previous = Self::read_stored_row(&mut tx, row).await?;
+        let (previous, previous_parts) = Self::read_stored_row(&mut tx, row).await?;
         if !visibility_version_is_newer(
             previous.as_ref(),
             record.context.authority_epoch,
@@ -441,15 +458,20 @@ impl DsqlVisibilityStore {
             older_cells: below.cells,
             older_values: below.values,
             deltas: deltas.len(),
+            memo_parts: memo_parts::replacement_rows(
+                value_parts::parts_of(memo.len()),
+                previous_parts,
+            )?,
         };
         anyhow::ensure!(
             rows.flip_fits(),
-            "an image's {} values and {} rollup deltas pass one transaction's {} rows",
+            "an image's {} values, {} rollup deltas and {} memo parts pass one transaction's {} rows",
             rows.new_values,
             rows.deltas,
+            rows.memo_parts,
             TRANSACTION_ROW_BUDGET
         );
-        if !Self::write_guarded_row(&mut tx, row, memo).await? {
+        if !Self::write_guarded_row(&mut tx, row, memo, previous_parts).await? {
             tx.rollback().await?;
             return Ok(ApplyOutcome::Current);
         }
@@ -486,9 +508,31 @@ impl VisibilityStore for DsqlVisibilityStore {
     async fn upsert_execution(&self, row: &ExecutionRow) -> Result<()> {
         let memo = codec::encode(&row.memo)?;
         let mut permit = self.director.acquire(DbClass::Projection).await?;
-        upsert_execution_row(permit.connection()?, row, Some(memo))
-            .await
-            .map(|_| ())
+        // Preserve the one-statement whole-value write. The extra guard refuses to
+        // overwrite a split row here; that case must read its count and remove its
+        // old tail in one transaction. A stale image never writes any parts.
+        if memo.len() <= value_parts::PART_BYTES
+            && upsert_execution_row(permit.connection()?, row, Some(memo.clone()), None, true)
+                .await?
+        {
+            return Ok(());
+        }
+        let mut tx = permit.connection()?.begin().await?;
+        let (previous, count) = Self::read_stored_row(&mut tx, row).await?;
+        if visibility_version_is_newer(
+            previous.as_ref(),
+            row.authority_epoch,
+            row.source_transition_seq,
+        ) {
+            let cost = memo_parts::replacement_rows(value_parts::parts_of(memo.len()), count)?;
+            anyhow::ensure!(
+                cost < TRANSACTION_ROW_BUDGET,
+                "memo replacement exceeds the row budget"
+            );
+            upsert_execution_row(&mut tx, row, Some(memo), count, false).await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     #[instrument(skip_all, fields(run_key = %tombstone.run_key.0))]
@@ -578,7 +622,10 @@ impl VisibilityStore for DsqlVisibilityStore {
         // only the values at each listed row's version, and a flip and its cleanup
         // between two separate reads would delete them, so the row would list
         // without its attributes.
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit
+            .connection()?
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await?;
         let result = list_rows(&mut tx, namespace_id, filter, sort, page, true).await?;
         tx.commit().await?;
         Ok(result)
@@ -834,6 +881,7 @@ async fn list_rows(
                 task_queue,
                 transition_count,
                 memo_blob,
+                memo_parts,
                 execution_time,
                 execution_duration,
                 history_length,
@@ -854,25 +902,79 @@ async fn list_rows(
         sort_clause(sort),
         next_param
     );
-    // SQL safety: `sql` is the SQL compiler's output. Request values reach it
-    // only as `$n` placeholders (Property 2) and are bound below; interpolated
-    // identifiers come from the compiler's own tables.
-    let mut query = sqlx::query(AssertSqlSafe(sql)).bind(namespace_id.0);
-    query = bind_sql_values(query, &values);
-    query = query.bind(i64::try_from(limit + 1)?);
     let referenced_tables = referenced_search_attr_index_tables(filter, None)?;
     let started = Instant::now();
-    let rows = query.fetch_all(&mut *connection).await;
+    let rows = fetch_list_rows(connection, &sql, namespace_id, &values, limit).await?;
     let duration = started.elapsed();
     projection_metrics::record_visibility_query_duration("list", duration);
     for table in referenced_tables {
         projection_metrics::record_sa_index_scan_duration(table, duration);
     }
-    let rows = rows?;
-    let mut executions = rows
-        .into_iter()
-        .map(row_to_execution)
-        .collect::<Result<Vec<_>>>()?;
+    if memo_page_needs_snapshot(
+        rows.iter()
+            .map(|row| row.try_get("memo_parts"))
+            .collect::<Result<Vec<Option<i32>>, _>>()?
+            .iter()
+            .copied(),
+    ) && !hydrate_attributes
+    {
+        // The initial page is only a probe. Reread its rows and parts in one
+        // snapshot; a flip may replace or remove parts between autocommit reads.
+        let mut tx = connection
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await?;
+        let rows = fetch_list_rows(&mut tx, &sql, namespace_id, &values, limit).await?;
+        #[cfg(all(test, feature = "dsql-integration"))]
+        memo_read_pause::reached(namespace_id).await;
+        let result = decode_list_page(&mut tx, rows, namespace_id, sort, limit, false).await?;
+        tx.commit().await?;
+        Ok(result)
+    } else {
+        // Component lists already own a snapshot for their attribute hydration.
+        decode_list_page(
+            connection,
+            rows,
+            namespace_id,
+            sort,
+            limit,
+            hydrate_attributes,
+        )
+        .await
+    }
+}
+
+fn memo_page_needs_snapshot(counts: impl Iterator<Item = Option<i32>>) -> bool {
+    counts.into_iter().any(|count| count.is_some())
+}
+
+async fn fetch_list_rows(
+    connection: &mut PgConnection,
+    sql: &str,
+    namespace_id: NamespaceId,
+    values: &[SqlValue],
+    limit: usize,
+) -> Result<Vec<PgRow>> {
+    // SQL safety: only the compiler's identifiers are interpolated; all request
+    // values stay bound parameters, including the page's cursor and limit.
+    let query = sqlx::query(AssertSqlSafe(sql.to_owned())).bind(namespace_id.0);
+    Ok(bind_sql_values(query, values)
+        .bind(i64::try_from(limit + 1)?)
+        .fetch_all(connection)
+        .await?)
+}
+
+async fn decode_list_page(
+    connection: &mut PgConnection,
+    rows: Vec<PgRow>,
+    namespace_id: NamespaceId,
+    sort: SortOrder,
+    limit: usize,
+    hydrate_attributes: bool,
+) -> Result<ListResult> {
+    let mut executions = Vec::with_capacity(rows.len());
+    for row in rows {
+        executions.push(row_to_execution(connection, row).await?);
+    }
     let next_page_token = if executions.len() > limit {
         let last = executions[limit - 1].clone();
         executions.truncate(limit);
@@ -943,6 +1045,8 @@ async fn upsert_execution_row(
     connection: &mut PgConnection,
     row: &ExecutionRow,
     memo: Option<Vec<u8>>,
+    previous_parts: Option<i32>,
+    whole_only: bool,
 ) -> Result<bool> {
     // Apply-iff-newer at the SQL level: the `ON CONFLICT ... DO UPDATE ... WHERE`
     // guard makes the upsert a no-op unless the incoming `(authority_epoch,
@@ -950,6 +1054,7 @@ async fn upsert_execution_row(
     // or out-of-order snapshot can neither regress the row nor double-apply
     // (reference/DECISION-visibility-dsql-schema.md). The row's version columns are
     // also the search-attribute generation pointer.
+    let value = memo.as_deref().map(value_parts::split);
     let result = sqlx::query(
         r#"
         INSERT INTO execution_visibility_current (
@@ -976,9 +1081,10 @@ async fn upsert_execution_row(
             parent_workflow_id,
             parent_run_id,
             root_workflow_id,
-            root_run_id
+            root_run_id,
+            memo_parts
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
         ON CONFLICT (namespace_id, archetype_id, run_key) DO UPDATE
         SET business_id = EXCLUDED.business_id,
             run_id = EXCLUDED.run_id,
@@ -993,6 +1099,8 @@ async fn upsert_execution_row(
             task_queue = EXCLUDED.task_queue,
             transition_count = EXCLUDED.transition_count,
             memo_blob = COALESCE(EXCLUDED.memo_blob, execution_visibility_current.memo_blob),
+            memo_parts = CASE WHEN EXCLUDED.memo_blob IS NULL
+                THEN execution_visibility_current.memo_parts ELSE EXCLUDED.memo_parts END,
             execution_time = EXCLUDED.execution_time,
             execution_duration = EXCLUDED.execution_duration,
             history_length = EXCLUDED.history_length,
@@ -1001,10 +1109,11 @@ async fn upsert_execution_row(
             parent_run_id = EXCLUDED.parent_run_id,
             root_workflow_id = EXCLUDED.root_workflow_id,
             root_run_id = EXCLUDED.root_run_id
-        WHERE execution_visibility_current.authority_epoch < EXCLUDED.authority_epoch
+        WHERE (NOT $26 OR execution_visibility_current.memo_parts IS NULL)
+          AND (execution_visibility_current.authority_epoch < EXCLUDED.authority_epoch
            OR (execution_visibility_current.authority_epoch = EXCLUDED.authority_epoch
                AND execution_visibility_current.source_transition_seq
-                   < EXCLUDED.source_transition_seq)
+                   < EXCLUDED.source_transition_seq))
         "#,
     )
     .bind(row.namespace_id.0)
@@ -1022,7 +1131,7 @@ async fn upsert_execution_row(
     .bind(&row.workflow_type.0)
     .bind(&row.task_queue.0)
     .bind(row.transition_count)
-    .bind(memo)
+    .bind(value.as_ref().map(|value| value.first))
     .bind(row.execution_time)
     .bind(row.execution_duration)
     .bind(row.history_length)
@@ -1031,9 +1140,15 @@ async fn upsert_execution_row(
     .bind(row.parent_run_id.map(|value| value.0))
     .bind(&row.root_workflow_id.0)
     .bind(row.root_run_id.0)
-    .execute(connection)
+    .bind(value.as_ref().and_then(|value| value.count))
+    .bind(whole_only)
+    .execute(&mut *connection)
     .await?;
-    Ok(result.rows_affected() > 0)
+    let applied = result.rows_affected() > 0;
+    if applied && let Some(value) = value {
+        memo_parts::replace(connection, row, &value, previous_parts).await?;
+    }
+    Ok(applied)
 }
 
 /// One inverted-index row: a canonical `discriminator` (the PK component that makes
@@ -1997,7 +2112,7 @@ macro_rules! execution_row_select {
         concat!(
             "SELECT run_key, namespace_id, archetype_id, business_id, run_id, authority_epoch, ",
             "source_transition_seq, status_keyword, lifecycle_state, start_time, update_time, ",
-            "close_time, execution_type, task_queue, transition_count, memo_blob, ",
+            "close_time, execution_type, task_queue, transition_count, memo_blob, memo_parts, ",
             "execution_time, execution_duration, history_length, history_size_bytes, ",
             "parent_workflow_id, parent_run_id, root_workflow_id, root_run_id ",
             "FROM execution_visibility_current WHERE ",
@@ -2014,12 +2129,37 @@ async fn get_execution_row(
     connection: &mut PgConnection,
     run_key: RunKey,
 ) -> Result<Option<ExecutionRow>> {
-    let row = sqlx::query(execution_row_select!("run_key = $1"))
+    let sql = execution_row_select!("run_key = $1");
+    let row = sqlx::query(sql)
         .bind(run_key.0)
-        .fetch_optional(connection)
+        .fetch_optional(&mut *connection)
         .await?;
-
-    row.map(row_to_execution).transpose()
+    if row
+        .as_ref()
+        .map(|row| row.try_get::<Option<i32>, _>("memo_parts"))
+        .transpose()?
+        .flatten()
+        .is_some()
+    {
+        let mut tx = connection
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await?;
+        let row = sqlx::query(sql)
+            .bind(run_key.0)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let result = match row {
+            Some(row) => Some(row_to_execution(&mut tx, row).await?),
+            None => None,
+        };
+        tx.commit().await?;
+        Ok(result)
+    } else {
+        match row {
+            Some(row) => Ok(Some(row_to_execution(connection, row).await?)),
+            None => Ok(None),
+        }
+    }
 }
 
 async fn read_execution_row(
@@ -2027,17 +2167,22 @@ async fn read_execution_row(
     namespace_id: NamespaceId,
     archetype_id: ArchetypeId,
     run_key: RunKey,
-) -> Result<Option<ExecutionRow>> {
+) -> Result<(Option<ExecutionRow>, Option<i32>)> {
     #[cfg(all(test, feature = "dsql-integration"))]
     apply_faults::fire(apply_faults::Fault::StoredRowRead(run_key))?;
     let row = sqlx::query(READ_EXECUTION_ROW_SQL)
         .bind(namespace_id.0)
         .bind(i64::from(archetype_id.0))
         .bind(run_key.0)
-        .fetch_optional(connection)
+        .fetch_optional(&mut *connection)
         .await?;
-
-    row.map(row_to_execution).transpose()
+    match row {
+        Some(row) => {
+            let parts = row.try_get("memo_parts")?;
+            Ok((Some(row_to_execution(connection, row).await?), parts))
+        }
+        None => Ok((None, None)),
+    }
 }
 
 /// Add one rollup delta to its striped counter row.
@@ -2071,8 +2216,11 @@ async fn upsert_rollup_row(connection: &mut PgConnection, entry: &RollupDelta) -
     Ok(())
 }
 
-fn row_to_execution(row: sqlx::postgres::PgRow) -> Result<ExecutionRow> {
-    let memo = decode_optional_memo(row.try_get("memo_blob")?)?.unwrap_or_default();
+async fn row_to_execution(
+    connection: &mut PgConnection,
+    row: sqlx::postgres::PgRow,
+) -> Result<ExecutionRow> {
+    let memo = memo_parts::read(connection, &row).await?;
     let business_id: String = row.try_get("business_id")?;
     let run_id_uuid = row.try_get::<Uuid, _>("run_id")?;
     let status_keyword: String = row.try_get("status_keyword")?;
@@ -2241,6 +2389,15 @@ mod tests {
 
     use super::*;
     use crate::types::{workflow_lifecycle_state, workflow_status_keyword};
+
+    #[test]
+    fn only_memo_pages_with_counts_need_a_snapshot() {
+        assert!(!memo_page_needs_snapshot([].into_iter()));
+        assert!(!memo_page_needs_snapshot([None, None].into_iter()));
+        for count in [0, 2, 3] {
+            assert!(memo_page_needs_snapshot([None, Some(count)].into_iter()));
+        }
+    }
 
     #[test]
     fn empty_component_values_have_an_image_without_searchable_elements() {
@@ -2750,10 +2907,11 @@ mod tests {
                     next.task_queue = TaskQueueName("incoming".to_owned());
                     let mut connection = pool.acquire().await?;
                     anyhow::ensure!(
-                        upsert_execution_row(&mut connection, &row, None).await?,
+                        upsert_execution_row(&mut connection, &row, None, None, false).await?,
                         "the fixture row wasn't applied"
                     );
-                    let applied = upsert_execution_row(&mut connection, &next, None).await?;
+                    let applied =
+                        upsert_execution_row(&mut connection, &next, None, None, false).await?;
                     let kept = get_execution_row(&mut connection, run_key)
                         .await?
                         .ok_or_else(|| anyhow!("the row is stored"))?;

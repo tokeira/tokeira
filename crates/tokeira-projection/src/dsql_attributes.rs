@@ -140,6 +140,8 @@ pub(super) struct ApplyRows {
     pub(super) older_cells: usize,
     pub(super) older_values: usize,
     pub(super) deltas: usize,
+    /// Memo overflow rows inserted, rewritten or removed in the guarded transaction.
+    pub(super) memo_parts: usize,
 }
 
 /// How an apply commits an image.
@@ -156,7 +158,12 @@ impl ApplyRows {
     /// The row, the cells and values at the version, the deletes below it and the
     /// rollup deltas.
     pub(super) fn single_transaction(self) -> usize {
-        1 + self.new_cells + self.new_values + self.older_cells + self.older_values + self.deltas
+        1 + self.new_cells
+            + self.new_values
+            + self.older_cells
+            + self.older_values
+            + self.deltas
+            + self.memo_parts
     }
 
     pub(super) fn plan(self) -> ApplyPlan {
@@ -170,12 +177,13 @@ impl ApplyRows {
     /// The flip writes the row, the values and the deltas. It also deletes the values
     /// below the version when they fit; otherwise cleanup does.
     pub(super) fn flip_deletes_older_values(self) -> bool {
-        1 + self.new_values + self.older_values + self.deltas <= TRANSACTION_ROW_BUDGET
+        1 + self.new_values + self.older_values + self.deltas + self.memo_parts
+            <= TRANSACTION_ROW_BUDGET
     }
 
     /// Whether the flip alone fits, which the search-attribute limits always allow.
     pub(super) fn flip_fits(self) -> bool {
-        1 + self.new_values + self.deltas <= TRANSACTION_ROW_BUDGET
+        1 + self.new_values + self.deltas + self.memo_parts <= TRANSACTION_ROW_BUDGET
     }
 }
 
@@ -1263,6 +1271,27 @@ mod tests {
         })
     }
 
+    #[test]
+    fn memo_parts_can_force_staging_and_fill_the_flip_budget() {
+        let mut rows = ApplyRows {
+            new_cells: 2498,
+            new_values: 0,
+            older_cells: 0,
+            older_values: 0,
+            deltas: 1,
+            memo_parts: 0,
+        };
+        assert_eq!(rows.plan(), ApplyPlan::Single);
+        rows.memo_parts = 1;
+        assert_eq!(rows.plan(), ApplyPlan::Staged);
+        rows.memo_parts = 2498;
+        assert!(rows.flip_fits());
+        rows.older_values = 1;
+        assert!(!rows.flip_deletes_older_values());
+        rows.memo_parts = 2499;
+        assert!(!rows.flip_fits());
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
 
@@ -1289,6 +1318,7 @@ mod tests {
                 older_cells,
                 older_values,
                 deltas,
+                memo_parts: 2,
             };
             match rows.plan() {
                 ApplyPlan::Single => prop_assert!(rows.single_transaction() <= TRANSACTION_ROW_BUDGET),

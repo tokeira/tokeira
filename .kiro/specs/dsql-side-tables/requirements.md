@@ -60,6 +60,15 @@ Since [activity-state-writes](../activity-state-writes/bugfix.md), no release wr
 
 **workflow_hot** — PK: `(run_key)`, indexes: `(shard_id)`, `(namespace_id)` (V024, added by this spec)
 
+**Visibility schema shared with core persistence** — V097–V100 add `projection_image_part`, keyed by
+`(partition_id, fanout, run_key, transition_seq, part_no)`, and `visibility_memo_part`, keyed by
+`(namespace_id, archetype_id, run_key, part_no)`, each with BYTEA `data`. Nullable INTEGER `projection_log.context_parts`
+and `execution_visibility_current.memo_parts` count the parts including the first, which stays in `context_data`
+or `memo_blob`. A value within 960 KiB, including a legacy row, has no count and no overflow parts. The projection
+readers join a split value in the snapshot that reads its row, and replacement or deletion changes its parts in
+the transaction that changes the row ([large-value-parts](../large-value-parts/design.md)). Dispatch and sweep queries
+continue to read run state and do not read these projection tables.
+
 ## Glossary
 
 - **DsqlRunRepository**: The struct implementing `RunRepository` against Aurora DSQL, using `DsqlConnectionDirector` for connection management and the codec module for serialization.

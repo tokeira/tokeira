@@ -6,7 +6,13 @@ use super::{
     run_value_parts::{self, OnConflict, RunValueKind, STATE_VALUE_KEY},
     *,
 };
-use crate::dsql::value_parts::{self, Split};
+use crate::{
+    ProjectionImageKey,
+    dsql::{
+        projection_image_parts,
+        value_parts::{self, Split},
+    },
+};
 
 impl DsqlRunRepository {
     pub(super) async fn do_commit_transition(
@@ -862,21 +868,32 @@ async fn insert_projection_log(
     projection_partition_count: u32,
     context_data: &[u8],
 ) -> Result<()> {
+    let value = value_parts::split(context_data);
+    let partition = i32::try_from(partition_for(run_key, projection_partition_count))?;
     sqlx::query(
         "INSERT INTO projection_log
-         (partition_id, fanout, run_key, transition_seq, context_data, ops_data, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, now())",
+         (partition_id, fanout, run_key, transition_seq, context_data, ops_data, created_at, context_parts)
+         VALUES ($1, $2, $3, $4, $5, $6, now(), $7)",
     )
-    .bind(i32::try_from(partition_for(
-        run_key,
-        projection_partition_count,
-    ))?)
+    .bind(partition)
     .bind(PROJECTION_FANOUT)
     .bind(run_key.0)
     .bind(convert::i64_from_u64(transition_seq.0, "transition_seq")?)
-    .bind(context_data)
+    .bind(value.first)
     .bind(codec::LEGACY_EMPTY_PROJECTION_OPS_DATA)
+    .bind(value.count)
     .execute(&mut **tx)
+    .await?;
+    projection_image_parts::insert(
+        tx,
+        partition,
+        PROJECTION_FANOUT,
+        ProjectionImageKey {
+            run_key,
+            transition_seq,
+        },
+        &value,
+    )
     .await?;
     Ok(())
 }

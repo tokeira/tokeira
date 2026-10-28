@@ -95,6 +95,8 @@ the strictly-newer guard.
 2.3 After a page, the projector SHALL delete each image it read whose run's stored row is then at least as new as the
 image, naming each key, and no other row. WHEN the apply of a run's newest image fails THEN none of that run's images
 in the page SHALL be deleted.
+On DSQL, an image's parts SHALL be read in the snapshot that reads the image, and deleted in the transaction that
+deletes it; each deletion transaction SHALL count both images and their parts toward the 3,000-row limit.
 
 2.4 Deleting SHALL lose no run's accumulator:
 - on DSQL, WHEN a load seeds an unseeded workflow run THEN it SHALL also read the run's applied
@@ -102,7 +104,7 @@ in the page SHALL be deleted.
   from whichever is newer: the latest image, or the applied value, where a visibility row without the value gives an
   empty list. A run with neither an image nor a visibility row seeds an empty list. The load SHALL fail, as
   projection-accumulator criterion 2.11 fails it for an image, when the visibility row identifies another run or is
-  newer than the state;
+  newer than the state. An image stored in parts SHALL be joined in this snapshot before seeding;
 - in memory, the store SHALL keep the latest image of a run whose stored state is unseeded, whatever the projector
   asks it to delete.
 

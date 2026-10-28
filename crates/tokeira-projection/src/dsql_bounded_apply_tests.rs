@@ -2,16 +2,19 @@
 //! (`bounded-visibility-apply`, Live Tests). No connection occurs unless the dedicated
 //! test URL is provided. Each test applies into a namespace of its own and deletes what
 //! it wrote, a few hundred rows a statement.
+//! The large-value exploration also exercises a memo beyond DSQL's value limit.
 
 use std::path::Path;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, ensure};
 use sqlx::PgPool;
 use tokeira_storage::{
-    ProjectionRecord,
+    ProjectionRecord, codec,
     dsql::{DsqlPoolConfig, DsqlStore, MigrationConfig},
 };
-use tokeira_types::{ExecutionStatus, NamespaceId, RunKey, SearchAttrValue, SearchAttributes};
+use tokeira_types::{
+    ExecutionStatus, NamespaceId, Payload, RunKey, SearchAttrValue, SearchAttributes,
+};
 use uuid::Uuid;
 
 use super::tests::live_image;
@@ -33,7 +36,12 @@ struct NamespaceTable {
 }
 
 /// The tables an image's attributes and its row live in, cleared after each test.
-const NAMESPACE_TABLES: [NamespaceTable; 6] = [
+const NAMESPACE_TABLES: [NamespaceTable; 7] = [
+    NamespaceTable {
+        runs: Some("SELECT DISTINCT run_key FROM visibility_memo_part WHERE namespace_id = $1"),
+        attrs: None,
+        delete: "DELETE FROM visibility_memo_part WHERE namespace_id = $1 AND run_key = $2",
+    },
     NamespaceTable {
         runs: Some(
             "SELECT DISTINCT run_key FROM execution_visibility_attr_index WHERE namespace_id = $1",
@@ -267,6 +275,78 @@ pub(super) fn text_value(tokens: &[String]) -> Result<SearchAttrValue> {
         text.len()
     );
     Ok(SearchAttrValue::Text(text))
+}
+
+/// Bytes no store can shrink: a SplitMix64 stream, so a value's stored size is
+/// its length whatever a store compresses.
+pub(super) fn noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let mut bytes = Vec::with_capacity(len + 8);
+    while bytes.len() < len {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        bytes.extend_from_slice(&(z ^ (z >> 31)).to_le_bytes());
+    }
+    bytes.truncate(len);
+    bytes
+}
+
+// Feature: large-value-parts, exploratory bug condition checking: visibility memo.
+// One 1.25 MiB payload leaves ample room for protobuf framing under the 2 MiB
+// memo limit (common/dynamicconfig/constants.go @ v1.31.0), while memo_blob's
+// postcard encoding exceeds 1 MiB. Applying directly isolates SQLSTATE 54000 at
+// the visibility row from the separate projection_log.context_data limit.
+#[tokio::test]
+async fn dsql_a_visibility_memo_over_one_mib_applies_and_reads_back() -> Result<()> {
+    let Some(live) = Live::connect().await? else {
+        return Ok(());
+    };
+    let checked = async {
+        const MIB: usize = 1024 * 1024;
+        let run_key = RunKey(Uuid::new_v4());
+        let mut image = live.image(run_key, 1, Vec::new());
+        image
+            .context
+            .memo
+            .0
+            .insert("large".to_owned(), Payload::new(noise(MIB + MIB / 4, 1)));
+        let encoded = codec::encode(&image.context.memo)?;
+        ensure!(encoded.len() > MIB, "the stored memo must exceed 1 MiB");
+        ensure!(encoded.len() < 2 * MIB, "the memo must stay below 2 MiB");
+        let outcome = live
+            .visibility
+            .apply(&image, 0)
+            .await
+            .context("an apply with a memo over 1 MiB must succeed")?;
+        ensure!(outcome == ApplyOutcome::Advanced, "the apply must advance");
+        let page = live
+            .visibility
+            .list_executions(
+                live.namespace_id,
+                &CompiledFilter {
+                    archetype: None,
+                    expr: None,
+                },
+                SortOrder::Default,
+                &PageBounds {
+                    limit: 1,
+                    after: None,
+                },
+            )
+            .await?;
+        ensure!(page.rows.len() == 1, "the applied row must appear in List");
+        ensure!(page.rows[0].run_key == run_key, "List must return this run");
+        ensure!(
+            codec::encode(&page.rows[0].memo)? == encoded,
+            "List must return the whole memo byte for byte"
+        );
+        Ok(())
+    }
+    .await;
+    let cleanup = live.finish().await;
+    checked.and(cleanup)
 }
 
 // Feature: bounded-visibility-apply, exploration 1: a first apply past 3,000 rows.

@@ -56,16 +56,19 @@ worker invocation requests. Each step first shows the defect, with live tests th
       bar passed (3,914 tests passed, 2 skipped).
 
 - [ ] 3. Step 2: visibility, built on [projection-passes](../projection-passes/design.md)'s projector
-  - [ ] 3.1 Exploration: write step 2's live tests and confirm each fails on the code before the step
+  - [x] 3.1 Exploration: write step 2's live tests and confirm each fails on the code before the step
     - _Requirements: 1.3_
-  - [ ] 3.2 Add `projection_image_part`, `visibility_memo_part` and the two count columns, with the migrations'
+    - DONE. On the code before the step, on an ephemeral cluster, both tests failed: DSQL refused the commit of a
+      visibility image over 1 MiB, and the apply of a memo over 1 MiB, each with its value limit ("datatype limit
+      greater than 1048576 bytes not supported for bytea", SQLSTATE 54000).
+  - [x] 3.2 Add `projection_image_part`, `visibility_memo_part` and the two count columns, with the migrations'
     bookkeeping
     - _Requirements: 2.1_
-  - [ ] 3.3 Write, read and delete an image's parts with the image, `load_run`'s accumulator seed included
+  - [x] 3.3 Write, read and delete an image's parts with the image, `load_run`'s accumulator seed included
     - _Requirements: 2.1-2.3, 2.6_
-  - [ ] 3.4 Write and read a visibility row's memo in parts
+  - [x] 3.4 Write and read a visibility row's memo in parts
     - _Requirements: 2.1-2.3_
-  - [ ] 3.5 Write the tests of Properties 3, 4 and 6 for visibility
+  - [x] 3.5 Write the tests of Properties 3, 4 and 6 for visibility
     - _Requirements: 2.1-2.4, 2.6, 2.7_
   - [ ] 3.6 Checkpoint, as 2.10
 

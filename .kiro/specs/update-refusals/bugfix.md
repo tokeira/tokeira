@@ -112,9 +112,17 @@ worker with `InvalidArgument` "invalid state transition attempted for Update `<i
 message while in state Completed", with `Rejection` or `Response` in place of `Acceptance` for those messages. It SHALL
 NOT rebuild the update, write an event for the message, or count the message toward the update limits.
 
-2.8 WHEN the system loads a run whose state holds no record of its completed updates but whose count of completed
-updates is above zero THEN it SHALL recover the ids from the run's history before the run takes a command. A run that
-has completed no update SHALL need no recovery.
+2.8 WHEN the system loads an open run written by an earlier release whose state holds no record of its completed
+updates but whose count of completed updates is above zero THEN it SHALL recover the ids from the run's history before
+the run takes a command. A run that has completed no update SHALL need no recovery.
+
+Two known limits apply only to open runs written by an earlier release:
+
+- **Runs reset before 0.6.0 aren't recovered** when all their completed updates came from the copied history before
+  the reset. Those releases didn't count completions on replay, so these runs have a completed-update count of zero
+  and don't trigger recovery.
+- **Recovery repeats until the next commit.** Until a recovered run's next commit stores its ids, each load of that
+  run reads its whole history again.
 
 ### Unchanged Behavior (Regression Prevention)
 

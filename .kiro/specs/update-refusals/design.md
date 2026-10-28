@@ -202,6 +202,14 @@ count above zero, since each completion adds an id. The stores recover its ids w
 A closed run needs no recovery, since no message reaches it. So a closed run from before this change loads as it does
 today. A recovered run keeps its ids from its next commit on.
 
+Two known limits apply only to open runs written by an earlier release:
+
+- **Runs reset before 0.6.0 aren't recovered** when all their completed updates came from the copied history before
+  the reset. Those releases didn't count completions on replay, so these runs have a completed-update count of zero
+  and don't trigger recovery. Recovery still requires a count above zero.
+- **Recovery repeats until the next commit.** Recovery changes only the loaded state. Until a recovered run's next
+  commit stores its ids, each load of that run reads its whole history again.
+
 ### Specs this changes
 
 The code PR aligns these:

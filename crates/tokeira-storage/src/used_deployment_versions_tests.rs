@@ -58,7 +58,7 @@ fn plain_json_len(list: &[String]) -> usize {
 
 /// `state` with a workflow task scheduled and started, as a schedule and a poll leave
 /// it, and the two events that record them.
-fn with_started_task(mut state: WorkflowState) -> (WorkflowState, [HistoryEvent; 2]) {
+pub(crate) fn with_started_task(mut state: WorkflowState) -> (WorkflowState, [HistoryEvent; 2]) {
     let logical_seq = state.next_workflow_task_seq;
     let scheduled_event_id = state.last_event_id + 1;
     state.pending_workflow_task = Some(PendingWorkflowTask {

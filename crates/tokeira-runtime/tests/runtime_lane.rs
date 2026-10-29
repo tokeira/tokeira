@@ -23,6 +23,9 @@ use tokeira_types::{
     TaskQueueName, WorkerIdentity, WorkerTaskClass, WorkflowId, WorkflowType,
 };
 
+#[path = "runtime_lane/atomic_successors_exploration.rs"]
+mod atomic_successors_exploration;
+
 #[tokio::test]
 async fn start_and_signal_publish_workflow_tasks() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());

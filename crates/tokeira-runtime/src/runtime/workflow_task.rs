@@ -14,6 +14,7 @@
 //! source for each non-obvious decision.
 
 use super::*;
+use crate::successor::SuccessorPlan;
 use prost::Message as _;
 use tokeira_kernel::{
     ContinueAsNewVersioningBehavior, RetryContinuation, RetryState, VersioningBehavior,
@@ -1262,27 +1263,38 @@ where
         } else {
             None
         };
-        // Capture the successor id before `req` moves into the command: a Retry
-        // continuation means the committed WorkflowExecutionFailed will carry
-        // this new_execution_run_id, and we must start that successor run after
-        // the predecessor's close commits (Req 2.2).
-        let retry_successor_run_id = match &retry_continuation {
-            Some(RetryContinuation::Retry { new_run_id }) => Some(*new_run_id),
-            _ => None,
+        // These reads must precede submission: a successor rejected by the kernel
+        // leaves the close unapplied (workflow_task_completed_handler.go:1354-1369
+        // @ v1.31.0), and a committed close must already own its successor.
+        let successor_plan = if matches!(retry_continuation, Some(RetryContinuation::Retry { .. }))
+        {
+            let events = self.repo.read_history(run_key, 0, 1).await?;
+            let (input, started_versioning_info) = match events.first().map(|event| &event.kind) {
+                Some(HistoryEventKind::WorkflowExecutionStarted {
+                    input,
+                    versioning_info,
+                    ..
+                })
+                | Some(HistoryEventKind::WorkflowExecutionStartedV2 {
+                    input,
+                    versioning_info,
+                    ..
+                }) => (input.clone(), versioning_info.clone().map(Box::new)),
+                _ => (Payloads::default(), None),
+            };
+            Some(SuccessorPlan::Retry {
+                input,
+                started_versioning_info,
+                timeout_prior_outcome: None,
+            })
+        } else {
+            cron_continuation.as_ref().map(|cron| SuccessorPlan::Cron {
+                schedule: cron.cron_schedule.clone(),
+                input: cron.input.clone(),
+                now: req.now,
+                timeout: false,
+            })
         };
-        // A cron completion/failure closes with its real outcome carrying this
-        // successor id; the runtime starts the cron successor after the close
-        // commits (the same derived-effect posture as the retry successor).
-        let cron_successor = cron_continuation.as_ref().map(|cron| {
-            (
-                cron.new_run_id,
-                cron.cron_schedule.clone(),
-                cron.input.clone(),
-            )
-        });
-        // Anchor the cron backoff on the completion time (`req.now`), captured before
-        // `req` moves into the command below.
-        let completion_now = req.now;
         // A server-decided failure of this completion is authored on behalf of
         // the same authenticated worker call. Preserve its edge-derived
         // principal before moving the request into the first kernel attempt.
@@ -1302,7 +1314,9 @@ where
             },
             (None, None) => Command::WorkflowTaskCompleted(req),
         };
-        let result = self.submit_for_owned_shard(run_key, command).await;
+        let result = self
+            .submit_for_owned_shard_with_successor(run_key, command, successor_plan)
+            .await;
         // v1.31.0's invalid-command contract: the completion is discarded, the
         // WORKFLOW TASK is failed with the command's cause (persisted — unless
         // a transient attempt keeps failing on a non-UnhandledCommand cause,
@@ -1493,36 +1507,6 @@ where
                 runtime_metrics::record_workflow_task_completed(OutcomeLabel::Failure);
             }
         }
-        // Start the attempt-N+1 successor once the predecessor's Failed-with-retry
-        // close is durable. The successor start is a derived effect of the
-        // authoritative close: if it fails, the predecessor close still stands
-        // (Req 2.2.3), mirroring the continue-as-new successor posture. The
-        // successor run id is fixed by the committed new_execution_run_id, so a
-        // re-drive is idempotent on the derived run key.
-        if let (Ok(CommitResult::Applied { .. }), Some(new_run_id)) =
-            (&result, retry_successor_run_id)
-            && let Err(error) = self.start_retry_successor(run_key, new_run_id).await
-        {
-            tracing::error!(
-                ?error,
-                predecessor_run_key = ?run_key,
-                "failed to start workflow retry successor",
-            );
-        }
-        // Start the cron successor once the predecessor's real-outcome close is
-        // durable — same derived-effect posture as retry.
-        if let (Ok(CommitResult::Applied { .. }), Some((new_run_id, cron_schedule, input))) =
-            (&result, cron_successor)
-            && let Err(error) = self
-                .start_cron_successor(run_key, new_run_id, cron_schedule, input, completion_now)
-                .await
-        {
-            tracing::error!(
-                ?error,
-                predecessor_run_key = ?run_key,
-                "failed to start workflow cron successor",
-            );
-        }
         result
     }
 
@@ -1697,118 +1681,6 @@ where
         Ok(Some(RetryContinuation::Retry {
             new_run_id: RunId::new(),
         }))
-    }
-
-    /// Start the attempt-N+1 successor after a Failed-with-retry close commits.
-    ///
-    /// Mirrors the continue-as-new / cron successor start in `lane.rs`: the
-    /// successor inherits the run's type/queue/input/policy/timeouts, chains its
-    /// lineage (`continued_execution_run_id`, first-run identity), carries the
-    /// predecessor's failure as `continued_failure`, and delays its first workflow
-    /// task by the recomputed backoff. The original input re-runs on retry, read
-    /// from the run's `WorkflowExecutionStarted` event (the same source cron uses).
-    /// The successor start is submitted through the normal run-routing path so it
-    /// lands on the owning lane; `Duplicate` is treated as success because a
-    /// re-driven close mints the same derived run key (Req 2.2, 5.1.3).
-    async fn start_retry_successor(
-        &self,
-        predecessor_run_key: RunKey,
-        new_run_id: RunId,
-    ) -> Result<()> {
-        let LoadedRun::Existing(state) = self.repo.load_run(predecessor_run_key).await? else {
-            return Err(anyhow!("predecessor run not found for retry successor"));
-        };
-        let Some(policy) = state.retry_policy.clone() else {
-            return Err(anyhow!("retry successor requested without a retry policy"));
-        };
-        let start_event = self.repo.read_history(predecessor_run_key, 0, 1).await?;
-        let (input, started_versioning_info) = match start_event.first().map(|event| &event.kind) {
-            Some(HistoryEventKind::WorkflowExecutionStarted {
-                input,
-                versioning_info,
-                ..
-            })
-            | Some(HistoryEventKind::WorkflowExecutionStartedV2 {
-                input,
-                versioning_info,
-                ..
-            }) => (input.clone(), versioning_info.as_ref()),
-            _ => (Payloads::default(), None),
-        };
-        let start_request = build_retry_successor_start(
-            &state,
-            started_versioning_info,
-            &policy,
-            input,
-            new_run_id,
-        );
-        let successor_run_key = start_request.run_key;
-        match self
-            .submit(successor_run_key, Command::Start(start_request))
-            .await?
-        {
-            CommitResult::Applied { .. } | CommitResult::Duplicate => Ok(()),
-            CommitResult::Conflict { reason } => {
-                Err(anyhow!("retry successor start conflicted: {reason}"))
-            }
-            CommitResult::CurrentExecutionConflict {
-                existing_run_key, ..
-            } => Err(anyhow!(
-                "retry successor current-execution conflict: {existing_run_key:?}"
-            )),
-        }
-    }
-
-    /// Start the cron successor after a cron run's real-outcome close commits
-    /// (complete / fail). The successor carries the predecessor's failure (if it
-    /// failed) as `continued_failure` and the last SUCCESSFUL completion result:
-    /// a completion sets `close_result`, so it becomes the successor's
-    /// `last_completion_result`; a failure leaves `close_result` empty, so the
-    /// previously-carried result flows through instead. Derived-effect posture:
-    /// the close stands even if the successor start fails; `cron-successor:*` is
-    /// a deterministic request id so a re-drive dedupes.
-    async fn start_cron_successor(
-        &self,
-        predecessor_run_key: RunKey,
-        new_run_id: RunId,
-        cron_schedule: String,
-        input: Payloads,
-        now: OffsetDateTime,
-    ) -> Result<()> {
-        let LoadedRun::Existing(state) = self.repo.load_run(predecessor_run_key).await? else {
-            return Err(anyhow!("predecessor run not found for cron successor"));
-        };
-        let continued_failure = state.close_failure.clone();
-        let last_completion_result = state
-            .close_result
-            .clone()
-            .or_else(|| state.last_completion_result.clone());
-        let start_request = build_cron_successor_start(
-            &state,
-            cron_schedule,
-            input,
-            new_run_id,
-            now,
-            OffsetDateTime::now_utc(),
-            continued_failure,
-            last_completion_result,
-        )
-        .map_err(|error| anyhow!("invalid cron schedule on continuation: {error:?}"))?;
-        let successor_run_key = start_request.run_key;
-        match self
-            .submit(successor_run_key, Command::Start(start_request))
-            .await?
-        {
-            CommitResult::Applied { .. } | CommitResult::Duplicate => Ok(()),
-            CommitResult::Conflict { reason } => {
-                Err(anyhow!("cron successor start conflicted: {reason}"))
-            }
-            CommitResult::CurrentExecutionConflict {
-                existing_run_key, ..
-            } => Err(anyhow!(
-                "cron successor current-execution conflict: {existing_run_key:?}"
-            )),
-        }
     }
 
     /// Atomically transition a polled workflow task into the Started state.

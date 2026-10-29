@@ -365,7 +365,7 @@ The implementation is organized into 10 incremental features with explicit depen
 1. WHEN a ContinueAsNew workflow command is received within WorkflowTaskCompleted, THE Kernel SHALL emit a WorkflowExecutionContinuedAsNew event carrying the new run ID, workflow type, task queue, input, memo, and search attributes.
 2. WHEN a ContinueAsNew workflow command is received, THE Kernel SHALL close the current run with ExecutionStatus::ContinuedAsNew.
 3. WHEN a ContinueAsNew workflow command is received, THE Kernel SHALL emit a ProjectionOp::CloseExecution with ContinuedAsNew status.
-4. THE Kernel SHALL NOT create the successor run; the runtime reads the event and issues a Start command for the successor.
+4. THE Kernel SHALL NOT create the successor run; the runtime reads the event, applies a Start command to an absent run, and commits both transitions together.
 
 ### Requirement 4.2: WorkflowExecutionTimedOut Command
 

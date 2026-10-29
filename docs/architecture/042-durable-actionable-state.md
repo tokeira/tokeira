@@ -42,7 +42,7 @@ Six gaps in today's code share one cause: a consequence of a commit that lives o
 | Commits whose run key sorts below the projection cursor, so List and Count go stale | The reader pages `projection_log` by `(run_key, transition_seq)` after a cursor (`read_from` in `crates/tokeira-storage/src/dsql/projection_log.rs`). |
 | Child starts, terminations and cancellations; external signals and cancellations; a Nexus operation's first attempt | Spawned after the commit by the `DispatchOp` arms of `publish` in `crates/tokeira-runtime/src/publisher.rs`. Nothing rebuilds them. |
 | A closed child's result, so the parent waits for ever | Spawned by the lane after the child's close. Failures are only logged. |
-| A successor run (continue-as-new, retry or cron), so the chain silently ends | Started in a separate transaction after the close: by the lane for continue-as-new, by `start_retry_successor` in `crates/tokeira-runtime/src/runtime/workflow_task.rs`, and by `start_timeout_retry_successor` and `start_timeout_cron_successor` in `crates/tokeira-runtime/src/timeout.rs`. Errors are only logged. |
+| A successor run (continue-as-new, retry or cron) | Written with its close in one fenced transaction. Only an explicit DSQL size refusal uses a separate start; that fallback retains a crash gap. |
 | Reset's follow-up: post-reset options, and failing the fork-point workflow task with the reapplied events | Spawned by the lane after the reset. |
 
 Each gap could get a remedy of its own: a reconciliation pass for failed publishes, an ordering protocol for the projection, a rebuild pass for spawned deliveries. They all ask where the durable record of "this still needs to happen" lives. This design answers that once.
@@ -143,12 +143,12 @@ Every consequence a commit leaves behind, built from the code: each `DispatchOp`
 
 ### Consequences of a close or reset, in the same execution home
 
-**Successor run: continue-as-new, retry or cron.** Target: written in the close's own transaction, as v1.31.0 does (`updateWorkflowExecutionTx`, `common/persistence/sql/execution.go:360-439 @ v1.31.0`). Both runs share an execution home, so this needs only admission on the execution home and a commit that writes two runs; no data moves. Until then: intent, with a `run_intent` row on the predecessor.
+**Successor run: continue-as-new, retry or cron.** Implemented: written in the close's own transaction, as v1.31.0 does (`updateWorkflowExecutionTx`, `common/persistence/sql/execution.go:360-439 @ v1.31.0`). Both runs share an execution home, so this needs only admission on the execution home and a commit that writes two runs; no data moves. An explicit DSQL size refusal alone permits the separate-start fallback; no `run_intent` repair is added here.
 
-- *Today:* started in a separate transaction after the close (see [Why](#why)). Errors are only logged, so the successor is lost on a crash or an error.
-- *Discoverer · executor:* none once atomic · meanwhile, the predecessor's shard owner and an operation executor.
+- *Today:* both runs and the current-run pointer commit together. The size fallback commits the close alone, then spawns the already-built start past drain admission; its two-transaction gap remains exceptional.
+- *Discoverer · executor:* the successor is immediately discoverable as a committed run; the closing lane publishes its first dispatch, and recovery rebuilds missed effects.
 - *Incarnation · dedup identity:* the successor run id · the request id `continue-as-new:{predecessor}:{successor}`, already in use.
-- *Remover · retry authority:* nothing to remove once atomic · meanwhile, the executor, after a definitive outcome.
+- *Remover · retry authority:* nothing to remove for the pair · the closing lane retries both on conflict, preserving successor identity. The fallback start uses its lane's bounded OCC retries.
 
 **Reset follow-up.** Target: written with the reset and the new run in one transaction, as v1.31.0 applies post-reset operations before it persists (`service/history/ndc/workflow_resetter.go:239-247, 414 @ v1.31.0`). It has the same home and the same prerequisites as a successor. Until then: intent, with a `run_intent` row on the base run.
 

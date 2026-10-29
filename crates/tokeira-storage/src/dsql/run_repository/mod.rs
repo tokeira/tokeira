@@ -81,6 +81,8 @@ macro_rules! record_dsql_commit_operation {
 }
 
 mod activity;
+#[cfg(all(test, feature = "dsql-integration"))]
+mod atomic_successors_live_tests;
 mod bulk_write;
 #[cfg(all(test, feature = "dsql-integration"))]
 mod bulk_write_tests;
@@ -95,6 +97,7 @@ mod large_value_tests;
 mod lease_fence_tests;
 mod leases;
 mod load;
+mod pair;
 mod placement;
 #[cfg(all(test, feature = "dsql-integration"))]
 mod placement_tests;
@@ -554,6 +557,17 @@ fn classify_connection_error(error: &anyhow::Error) -> Option<&'static str> {
 
 #[async_trait]
 impl RunRepository for DsqlRunRepository {
+    async fn commit_transition_pair(
+        &self,
+        run_key: RunKey,
+        closing: Transition,
+        successor_run_key: RunKey,
+        successor: Transition,
+        fence: WriteFence,
+    ) -> Result<crate::PairCommitResult> {
+        self.do_commit_transition_pair(run_key, closing, successor_run_key, successor, fence)
+            .await
+    }
     fn placement_ready(&self) -> bool {
         self.placement_ready
             .load(std::sync::atomic::Ordering::Acquire)
@@ -1988,8 +2002,8 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct TestDatabaseError {
-        code: Option<&'static str>,
+    pub(super) struct TestDatabaseError {
+        pub(super) code: Option<&'static str>,
     }
 
     impl fmt::Display for TestDatabaseError {

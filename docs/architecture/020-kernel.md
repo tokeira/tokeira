@@ -638,8 +638,8 @@ Specifically (failure path — implemented; see `.kiro/specs/workflow-retry-chai
 
 - The runtime evaluates the retry decision (`retry_continuation_for_completion`): it decodes the failure to test `non_retryable_error_types`, checks `maximum_attempts` and the execution-expiration cap, and computes the exponential backoff — all wall-clock/policy-dependent work that stays out of the pure kernel. It submits the completion as `WorkflowTaskCompletedWithCron`, `WorkflowTaskCompletedWithRetry`, or plain `WorkflowTaskCompleted` (retry is evaluated before cron; they are mutually exclusive per completion).
 - On `WorkflowTaskCompletedWithRetry`, the kernel records the runtime's decision on `WorkflowExecutionFailed`: `retry_state = InProgress` and `new_execution_run_id = Some(successor)` when the chain continues, or the terminal `retry_state` (`MaximumAttemptsReached` / `NonRetryableFailure` / `RetryPolicyNotSet`) with `new_execution_run_id = None`. The kernel evaluates no policy logic; it only records the outcome and authors the event, so replay reconstructs the same close.
-- After the Failed-with-retry close commits, the runtime starts the attempt-N+1 successor (`start_retry_successor`), mirroring the continue-as-new successor path: inherited config, `attempt = N+1`, `continued_execution_run_id` linking back, inherited first-run identity, the predecessor's failure as `continued_failure`, and a backoff-delayed first workflow task. A capability-aware client follows `new_execution_run_id` to that successor.
-- **Timeout path (not yet wired):** `WorkflowExecutionTimedOut` already carries `new_execution_run_id`, but the timeout retry-continuation + successor are the same mechanism and are deferred until a timeout-retry case demands them.
+- Before committing a Failed-with-retry close, the runtime builds and applies the attempt-N+1 successor and writes both in one fenced transaction: inherited config, `attempt = N+1`, `continued_execution_run_id` linking back, inherited first-run identity, the predecessor's failure as `continued_failure`, and a backoff-delayed first workflow task. A capability-aware client follows `new_execution_run_id` to that successor.
+- **Timeout path:** run-timeout retry and cron continuations use the same pair commit. Only an explicit DSQL size refusal permits the close to commit alone followed by a spawned start directly on the successor lane, past drain admission.
 
 This keeps the kernel focused on single-run transitions while giving the runtime full control over retry semantics.
 
@@ -921,11 +921,11 @@ Continue-As-New is expressed as a workflow command within `WorkflowTaskCompleted
 1. Emit `WorkflowExecutionContinuedAsNew` event carrying the new run ID, workflow type, task queue, input, memo, search attributes, workflow execution timeout, workflow run timeout, and workflow task timeout.
 2. Close the current run with `ExecutionStatus::ContinuedAsNew`.
 
-**What the kernel does not do:** The kernel does not create the successor run. The runtime reads the event and issues a `Start` command for the successor.
+**What the kernel does not do:** The kernel does not create the successor run. The runtime reads the event, applies a `Start` command to an absent successor and commits both transitions with one fence. It then performs the close's effects and the successor's tracking and dispatch before replying. A rejected start leaves the close uncommitted.
 
 **Chain metadata:** The successor's `WorkflowExecutionStarted` event carries `continued_execution_run_id`, `first_execution_run_id`, and `initiator`. This metadata is set by the runtime, not the kernel.
 
-**Rationale:** Keeping continue-as-new as close-current + start-successor means the kernel never reasons about two runs simultaneously.
+**Rationale:** Separate kernel applications keep each state transition about one run; the runtime and storage make publication of the close and successor atomic (`common/persistence/sql/execution.go:401-439 @ v1.31.0`).
 
 ### `Reset` (eventually)
 

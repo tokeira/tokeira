@@ -256,7 +256,7 @@ impl DsqlRunRepository {
     }
 }
 
-async fn write_transition(
+pub(super) async fn write_transition(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_key: RunKey,
     shard_id: ShardId,

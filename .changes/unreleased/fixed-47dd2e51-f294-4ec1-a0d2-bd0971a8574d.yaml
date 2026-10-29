@@ -1,0 +1,5 @@
+kind: fixed
+body: Continue-as-new, retry and cron successors are now written with their run’s close, so a crash or a drain no longer ends the chain.
+time: 2026-10-29T00:28:50.393722Z
+custom:
+    Slice: 47dd2e51-f294-4ec1-a0d2-bd0971a8574d

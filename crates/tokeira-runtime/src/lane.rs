@@ -1597,6 +1597,8 @@ where
     K: Kernel + Send + Sync + 'static,
     R: RunRepository + 'static,
 {
+    // Start timing is frozen across OCC retries, independently of the retry/cron
+    // delay evaluation clock carried in the plan (see successor::build_successor_start).
     let successor_now = OffsetDateTime::now_utc();
     let mut attempts = 0u32;
     loop {
@@ -2658,6 +2660,8 @@ mod tests {
         commit_calls: usize,
         commit_behaviors: VecDeque<CommitBehavior>,
         commit_gate: Option<CommitGate>,
+        pair_behaviors: VecDeque<PairBehavior>,
+        pairs: Vec<(Transition, Transition)>,
     }
 
     struct CommitGate {
@@ -2673,6 +2677,15 @@ mod tests {
         Error,
     }
 
+    #[derive(Clone, Copy)]
+    enum PairBehavior {
+        Applied,
+        Conflict,
+        Duplicate,
+        Error,
+        SizeRefused,
+    }
+
     impl MockRepo {
         fn new(initial: LoadedRun, commit_behaviors: Vec<CommitBehavior>) -> Self {
             Self {
@@ -2682,6 +2695,8 @@ mod tests {
                     commit_calls: 0,
                     commit_behaviors: commit_behaviors.into(),
                     commit_gate: None,
+                    pair_behaviors: VecDeque::new(),
+                    pairs: Vec::new(),
                 })),
             }
         }
@@ -2706,17 +2721,35 @@ mod tests {
 
     #[async_trait]
     impl RunRepository for MockRepo {
-        // This single-run mock exercises the retained size fallback. Atomic
-        // publication is tested separately against the real memory repository.
         async fn commit_transition_pair(
             &self,
             _run_key: RunKey,
-            _closing: Transition,
+            closing: Transition,
             _successor_run_key: RunKey,
-            _successor: Transition,
+            successor: Transition,
             _fence: WriteFence,
         ) -> Result<PairCommitResult> {
-            Ok(PairCommitResult::SizeRefused)
+            let mut state = self.state.lock().await;
+            state.pairs.push((closing.clone(), successor.clone()));
+            match state
+                .pair_behaviors
+                .pop_front()
+                .unwrap_or(PairBehavior::SizeRefused)
+            {
+                PairBehavior::Applied => {
+                    state.loaded = LoadedRun::Existing(closing.next_state.clone());
+                    Ok(PairCommitResult::Applied {
+                        closing_state: closing.next_state,
+                        successor_state: successor.next_state,
+                    })
+                }
+                PairBehavior::Conflict => Ok(PairCommitResult::Conflict {
+                    reason: "injected pair conflict".into(),
+                }),
+                PairBehavior::Duplicate => Ok(PairCommitResult::Duplicate),
+                PairBehavior::Error => Err(anyhow!("injected pair rejection")),
+                PairBehavior::SizeRefused => Ok(PairCommitResult::SizeRefused),
+            }
         }
 
         async fn resolve_execution(&self, _execution: &ExecutionRef) -> Result<Option<RunKey>> {
@@ -4634,7 +4667,8 @@ mod tests {
                 new_state: successor_state.clone(),
             })
             .await;
-        let (first, first_reply) = lane_message(run_key, "continue");
+        let (mut first, first_reply) = lane_message(run_key, "continue");
+        first.successor_plan = Some(SuccessorPlan::ContinueAsNew { links: Vec::new() });
         let (_tx, mut rx) = mpsc::channel(8);
         let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
@@ -4722,7 +4756,8 @@ mod tests {
                 };
                 kernel.include_continue_event = is_continued_as_new;
                 let publisher = MockPublisher::new();
-                let (first, first_reply) = lane_message(run_key, "continue");
+                let (mut first, first_reply) = lane_message(run_key, "continue");
+        first.successor_plan = Some(SuccessorPlan::ContinueAsNew { links: Vec::new() });
                 let (_tx, mut rx) = mpsc::channel(8);
                 let activity_tracking =
                     crate::activity_timeout::ActivityTrackingState::default();
@@ -4772,7 +4807,8 @@ mod tests {
         );
         let kernel = ContinueAsNewKernel::continued_as_new();
         let publisher = MockPublisher::new().with_failure().await;
-        let (first, first_reply) = lane_message(run_key, "continue");
+        let (mut first, first_reply) = lane_message(run_key, "continue");
+        first.successor_plan = Some(SuccessorPlan::ContinueAsNew { links: Vec::new() });
         let (_tx, mut rx) = mpsc::channel(8);
         let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
@@ -4824,7 +4860,8 @@ mod tests {
         let publisher = MockPublisher::new()
             .with_submit_result(CommitResult::Duplicate)
             .await;
-        let (first, first_reply) = lane_message(run_key, "continue");
+        let (mut first, first_reply) = lane_message(run_key, "continue");
+        first.successor_plan = Some(SuccessorPlan::ContinueAsNew { links: Vec::new() });
         let (_tx, mut rx) = mpsc::channel(8);
         let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
         let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();

@@ -1,11 +1,8 @@
-//! Successor preparation preserves old builders and fails before publication.
+//! Successor preparation preserves lineage and fails before publication.
 
 use super::*;
-use crate::{
-    runtime::workflow_task::{
-        build_cron_successor_start, build_retry_successor_start, workflow_run_timeout_failure,
-    },
-    successor::{SuccessorPlan, build_successor_start},
+use crate::successor::{
+    SuccessorCause, SuccessorPlan, SuccessorStartedEvent, SuccessorTiming, build_successor_start,
 };
 use tokeira_kernel::{HistoryEventKind, RetryState};
 use tokeira_types::{Payload, RetryPolicy};
@@ -58,21 +55,35 @@ fn plan(
     version: Option<WorkflowVersioningInfo>,
     now: OffsetDateTime,
 ) -> Option<SuccessorPlan> {
-    match kind {
-        0 => None,
-        1 | 3 => Some(SuccessorPlan::Retry {
-            input,
-            started_versioning_info: version.map(Box::new),
-            timeout_prior_outcome: (kind == 3)
-                .then(|| (state.close_failure.clone(), state.close_result.clone())),
-        }),
-        _ => Some(SuccessorPlan::Cron {
-            schedule: "* * * * *".into(),
-            input,
-            now,
-            timeout: kind == 4,
-        }),
-    }
+    let started = Box::new(SuccessorStartedEvent {
+        input,
+        versioning_info: version,
+        cron_schedule: Some("* * * * *".into()),
+        last_completion_result: state.last_completion_result.clone(),
+        ..Default::default()
+    });
+    let cause = if kind >= 3 {
+        SuccessorCause::RunTimeout
+    } else {
+        SuccessorCause::WorkflowTask
+    };
+    let timing = SuccessorTiming {
+        now,
+        backoff: Duration::seconds(2),
+    };
+    Some(match kind {
+        0 => SuccessorPlan::ContinueAsNew { links: Vec::new() },
+        1 | 3 => SuccessorPlan::Retry {
+            started,
+            timing,
+            cause,
+        },
+        _ => SuccessorPlan::Cron {
+            started,
+            timing,
+            cause,
+        },
+    })
 }
 
 fn policy() -> RetryPolicy {
@@ -87,9 +98,67 @@ fn policy() -> RetryPolicy {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
-    // Feature: atomic-successors, Property 3: The successor is today's.
+    // Feature: successor-semantics, Property 5: corrected starts keep their identity and fields across OCC and fallback.
     #[test]
-    fn successor_matches_separate_start(kind in 0u8..5, attempt in 1u32..7, bytes in prop::collection::vec(any::<u8>(), 0..128), child in any::<bool>(), versioned in any::<bool>()) {
+    fn corrected_start_retains_commit_safety(kind in 0u8..5, conflicts in 0usize..4, outcome in 0u8..4, bytes in prop::collection::vec(any::<u8>(), 0..48)) {
+        Runtime::new().unwrap().block_on(async {
+            let mut state = sample_state(RunKey::new());
+            state.started_at = OffsetDateTime::UNIX_EPOCH + Duration::seconds(20);
+            state.retry_policy = Some(policy());
+            let transition = closing(&state, kind);
+            let kernel = FrozenClose(transition.clone());
+            let mut plan = plan(&state, kind, Payloads(vec![Payload::new(bytes.clone())]), None, state.started_at);
+            let header = Some(tokeira_types::Headers([("original".into(), Payload::new(bytes.clone()))].into()));
+            let links = vec![tokeira_kernel::Link::BatchJob { job_id: format!("job-{bytes:?}") }];
+            match plan.as_mut().unwrap() {
+                SuccessorPlan::Retry { started, .. } | SuccessorPlan::Cron { started, .. } => {
+                    started.header = header.clone(); started.links = links.clone();
+                    started.memo = Memo([("memo".into(), Payload::new(bytes))].into());
+                    started.search_attributes = SearchAttributes([("key".into(), tokeira_types::SearchAttrValue::Int(7))].into());
+                }
+                SuccessorPlan::ContinueAsNew { links: original, .. } => *original = links.clone(),
+            }
+            let repo = MockRepo::new(LoadedRun::Existing(state.clone()), vec![CommitBehavior::Applied]);
+            repo.state.lock().await.pair_behaviors = std::iter::repeat_n(PairBehavior::Conflict, conflicts).chain([match outcome { 0 => PairBehavior::Applied, 1 => PairBehavior::SizeRefused, 2 => PairBehavior::Duplicate, _ => PairBehavior::Error }]).collect();
+            let mut effect = None;
+            let result = handle_message_with_successor(&kernel, &repo, &test_shard_owner(), &UpdateRegistry::new(), state.run_key, sample_command("close"), plan.as_ref(), &mut effect, 5, &mut LaneCache::new(&LaneConfig::default()), &mut None).await;
+            let recorded = repo.state.lock().await;
+            prop_assert_eq!(recorded.pairs.len(), conflicts + 1);
+            let first = &recorded.pairs[0].1;
+            for (_, successor) in &recorded.pairs { prop_assert_eq!(successor, first); }
+            let inputs = crate::successor::started_event_inputs(&first.history_events[0]).unwrap();
+            prop_assert_eq!(inputs.links, links);
+            if kind != 0 { prop_assert_eq!(inputs.header, header); }
+            match outcome {
+                0 => {
+                    prop_assert!(matches!(result, Ok((CommitResult::Applied { .. }, _, _))), "applied close");
+                    let Some(SuccessorEffect::Committed(actual)) = effect else { panic!("pair effects") };
+                    prop_assert_eq!(actual.state, first.next_state.clone());
+                    prop_assert_eq!(recorded.commit_calls, 0);
+                }
+                1 => {
+                    prop_assert!(matches!(result, Ok((CommitResult::Applied { .. }, _, _))), "applied close");
+                    let Some(SuccessorEffect::Deferred(start)) = effect else { panic!("fallback start") };
+                    let fallback = tokeira_kernel::BasicKernel.apply(LoadedRun::Absent, Command::Start(*start)).unwrap();
+                    prop_assert_eq!(&fallback.next_state, &first.next_state);
+                    prop_assert_eq!(&fallback.history_events, &first.history_events);
+                    prop_assert_eq!(&fallback.timer_ops, &first.timer_ops);
+                    prop_assert_eq!(&fallback.dispatch_ops, &first.dispatch_ops);
+                    prop_assert_eq!(recorded.commit_calls, 1);
+                }
+                _ => {
+                    prop_assert!(if outcome == 2 { matches!(result, Ok((CommitResult::Duplicate, _, _))) } else { result.is_err() }, "duplicate or rejected pair");
+                    prop_assert!(effect.is_none());
+                    prop_assert_eq!(&recorded.loaded, &LoadedRun::Existing(state));
+                    prop_assert_eq!(recorded.commit_calls, 0);
+                }
+            }
+            Ok(())
+        })?;
+    }
+    // Feature: atomic-successors, Property 3: identity, lineage and versioning remain unchanged.
+    #[test]
+    fn successor_preserves_identity_and_lineage(kind in 0u8..5, attempt in 1u32..7, bytes in prop::collection::vec(any::<u8>(), 0..128), child in any::<bool>(), versioned in any::<bool>()) {
         let mut state = sample_state(RunKey::new());
         let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(20);
         state.started_at = now;
@@ -103,18 +172,26 @@ proptest! {
         let transition = closing(&state, kind);
         let plan = plan(&state, kind, input.clone(), version.clone(), now);
         let actual = build_successor_start(&transition, plan.as_ref(), now).unwrap().unwrap();
-        // The former timeout path built retry starts from its pre-close load;
-        // completion paths reloaded the committed close.
-        let committed = &transition.next_state;
-        let mut expected = match kind {
-            0 => crate::successor::legacy_tests::continue_as_new_start(committed, &transition.history_events, now).unwrap(),
-            1 | 3 => build_retry_successor_start(if kind == 3 { &state } else { committed }, version.as_ref(), &policy(), input, actual.run_id),
-            _ => build_cron_successor_start(committed, "* * * * *".into(), input, actual.run_id, now, now,
-                if kind == 4 { Some(workflow_run_timeout_failure()) } else { committed.close_failure.clone() },
-                if kind == 4 { state.last_completion_result.clone() } else { committed.close_result.clone().or_else(|| committed.last_completion_result.clone()) }).unwrap(),
-        };
-        expected.now = now; expected.request.received_at = now;
-        prop_assert_eq!(actual, expected);
+        prop_assert_eq!(actual.namespace_id, state.namespace_id);
+        prop_assert_eq!(&actual.workflow_id, &state.workflow_id);
+        prop_assert_eq!(actual.continued_execution_run_id, Some(state.run_id));
+        prop_assert_eq!(actual.first_execution_run_id, state.first_execution_run_id);
+        prop_assert_eq!(actual.first_run_started_at, state.first_run_started_at);
+        prop_assert_eq!(actual.parent_run_key, state.parent_run_key);
+        prop_assert_eq!(actual.parent_run_id, state.parent_run_id);
+        prop_assert_eq!(actual.root_run_id, state.root_run_id);
+        prop_assert_eq!(actual.attempt, if kind == 1 || kind == 3 { attempt + 1 } else { 1 });
+        if kind == 0 {
+            let expected = crate::successor::legacy_tests::continue_as_new_start(&transition.next_state, &transition.history_events, now).unwrap();
+            prop_assert_eq!(actual, expected);
+        } else {
+            prop_assert_eq!(actual.input, input);
+            prop_assert_eq!(actual.retry_policy, state.retry_policy);
+            prop_assert_eq!(actual.now, now);
+            prop_assert_eq!(actual.request.received_at, now);
+            prop_assert_eq!(actual.cron_schedule.as_deref(), Some("* * * * *"));
+            prop_assert_eq!(actual.inherited_versioning_info, if kind == 1 || kind == 3 { version } else { None });
+        }
     }
 
     // Feature: atomic-successors, Property 5: A rejected successor fails the close.
@@ -133,6 +210,17 @@ proptest! {
             prop_assert_eq!(loaded, LoadedRun::Existing(state));
             Ok(())
         })?;
+    }
+}
+
+struct FrozenClose(Transition);
+impl Kernel for FrozenClose {
+    fn apply(&self, loaded: LoadedRun, command: Command) -> Result<Transition, Reject> {
+        if matches!(command, Command::Start(_)) {
+            tokeira_kernel::BasicKernel.apply(loaded, command)
+        } else {
+            Ok(self.0.clone())
+        }
     }
 }
 

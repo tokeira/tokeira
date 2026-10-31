@@ -19,12 +19,12 @@ use tokeira_storage::{
     memory::{RUN_STATE_EXTENSION_SECTION, SNAPSHOT_EXTENSION_MAGIC},
 };
 use tokeira_types::{
-    ExecutionRef, Payloads, RequestContext, RetryPolicy, RunId, RunKey, TransitionSeq,
-    WorkerIdentity,
+    ExecutionRef, RequestContext, RetryPolicy, RunId, RunKey, TransitionSeq, WorkerIdentity,
 };
 
 use crate::{
     BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    successor::{SuccessorStartedEvent, SuccessorTiming},
 };
 
 /// Commit fixture state through the same public repository used by runtime.
@@ -127,10 +127,15 @@ async fn projection_accumulator_runtime_reset_commits_from_materialized_state() 
     };
     let mut start = crate::runtime::workflow_task::build_retry_successor_start(
         &parent,
-        None,
+        &SuccessorStartedEvent::default(),
         &policy,
-        Payloads::default(),
         RunId::new(),
+        SuccessorTiming {
+            now: parent.started_at,
+            backoff: Duration::seconds(1),
+        },
+        None,
+        None,
     );
     start.workflow_start_delay = None;
     let store = Arc::new(InMemoryStore::default());

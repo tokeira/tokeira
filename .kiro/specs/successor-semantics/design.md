@@ -178,14 +178,28 @@ intact; do not decode and reconstruct application failures in the builder.
 Freeze one evaluation instant for each close attempt submitted to a lane: the
 workflow-task request's `now` or timeout scan's supplied `now`. Carry it with the
 selected delay. Derive execution age from the predecessor's start plus its own
-first-task delay, and apply the minimum helper after retry/cron selection. The
-successor start and delay timer use that same evaluation instant, retained across
-the existing lane OCC retries. Builder code must not call `now_utc()` again.
+first-task delay, and apply the minimum helper after retry/cron selection.
+
+Separately retain the existing lane's once-per-submission successor start clock.
+Use that clock for the successor started timestamp and delay timer, and retain
+both clocks across OCC retries and explicit size fallback. Builders must not call
+`now_utc()` again. The evaluation clock determines the selected/minimum delay;
+the start clock determines when that delay begins. Temporal also constructs the
+new mutable state's start time separately from its backoff calculation
+(`service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:handleRetry/handleCron` and
+`service/history/workflow/retry.go:SetupNewWorkflowForRetryOrCron @ v1.31.0`).
+
+Using the predecessor close timestamp as the new start timestamp causes a public
+TaskId ordering regression with Tokeira's current timestamp-derived serializer:
+the successor resets event ids to one. Preserve the prior start-clock separation
+and test retry/cron as well as explicit continue-as-new at the wire boundary.
+A shard-global durable TaskId allocator is outside this change; clock separation
+does not claim to replace one.
 
 The timeout cron path currently substitutes the nominal timeout deadline for
-processing time. Use the supplied scan time for this calculation and successor
-start. Cron phase is preserved by passing the predecessor's execution time as the
-schedule anchor, not by backdating the new run. This follows
+processing time. Use the supplied scan time for delay calculation and the lane's
+processing-time clock for successor start. Cron phase is preserved by passing the
+predecessor's execution time as the schedule anchor, not by backdating the new run. This follows
 `GetCronBackoffDuration` and `ContinueAsNewMinBackoff` in
 `mutable_state_impl.go @ v1.31.0`, and `t.Now()` in
 `timer_queue_active_task_executor.go:683-754 @ v1.31.0`. Include delayed-scan tests.
@@ -214,7 +228,8 @@ fails before a write; it cannot authorize a close-only normal commit.
 | Carried result | `Option<Payloads>` in runtime input | Started attributes field 13; cause-specific handlers | Existing started `last_completion_result` |
 | Started versioning | Existing `WorkflowVersioningInfo` in runtime input | Existing worker-versioning contract | No policy change |
 | Failure retry state | `CronContinuation.failure_retry_state` | Failed-event retry state from `handleCommandFailWorkflow @ v1.31.0` | Existing failed-event field, no new variant |
-| Close cause, selected delay, evaluation time | Runtime-private enum/timing values | Cause-specific handlers and minimum-delay helper | Existing start timestamp, first-task backoff and timer |
+| Close cause, selected delay, evaluation time | Runtime-private enum/timing values | Cause-specific handlers and minimum-delay helper | Existing first-task backoff |
+| Successor start clock | Lane-local value, frozen before OCC retries | `handleRetry`/`handleCron @ v1.31.0`; preserved lane start timing | Existing start timestamp and delay-timer anchor |
 
 Do not read `WorkflowState.links` for original links: it includes later attachments.
 Do not persist the prepared input merely to avoid a history read. The started event
@@ -256,6 +271,8 @@ For any non-negative execution age and selected backoff, the successor SHALL use
 `B` from the requirements and keep its first task ineligible until start plus `B`.
 For cron integration cases, generate selected backoff from actual schedule/clock
 inputs. Changing scanner lag must not change the schedule anchor or backdate start.
+Assert the delay from the evaluation clock and eligibility from the independently
+frozen successor start clock; OCC retries must not resample either clock.
 
 **Validates: Requirements 4.1, 4.2, 4.3, 4.4**
 

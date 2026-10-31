@@ -29,6 +29,7 @@ First show the defects, with tests that fail on the current code. Then:
 
 - [x] 3. The runtime
   - DONE: Carried successor plans into the lane, applied and committed both runs, ordered post-commit effects, and retained only the size-refusal separate start.
+    The server's history-notifying repository forwards the pair and wakes both histories only after application.
   - [x] 3.1 Carry each close's successor plan in the lane's message: read the started event before submitting a retry
     completion, and pass the plans `submit_workflow_timeout` already reads
     - _Requirements: 2.4_
@@ -61,7 +62,10 @@ First show the defects, with tests that fail on the current code. Then:
   - DONE: Aligned the listed compatibility specifications and architecture, readiness and live-suite documentation.
   - _Requirements: 2.1, 2.5, 2.6_
 
-- [ ] 7. Run the live test and the negative controls on an ephemeral cluster
+- [x] 7. Run the live test and the negative controls on an ephemeral cluster
+  - DONE: Reviewed the recorded live DSQL pass (555.219 seconds) and both live controls' intended failures:
+    omitting the successor writes leaves no successor row, and bypassing the pointer condition overwrites another
+    run's pointer. The runtime and storage sources are unchanged from that live-verified implementation.
   - _Requirements: 2.1-2.3, 2.6_
 
 - [x] 8. Add a `fixed` fragment saying that a continue-as-new, retry or cron successor is written with its run's close,
@@ -69,9 +73,14 @@ First show the defects, with tests that fail on the current code. Then:
   - DONE: Generated the fixed fragment with changie; the patch-release dry run passes.
   - _Requirements: 2.1_
 
-- [ ] 9. Checkpoint: the exploration tests pass, each negative control fails its test, the live test passes on an
+- [x] 9. Checkpoint: the exploration tests pass, each negative control fails its test, the live test passes on an
   ephemeral cluster, the corpus tiers for continue-as-new, retry and cron pass, and the full bar of root `AGENTS.md`
   §10.4 passes
+  - DONE (2026-10-31): The six-command bar passes, including 4,032 workspace tests (the two explicitly ignored Rust
+    SDK integration tests remain skipped). All 12 corpus cases pass without skips across continue-as-new, workflow
+    retry, cron and cron client suites, using the pinned v1.31.0 conformance corpus. The history-wrapper regression
+    fails before the forwarding fix and passes with it. The exploration and recorded negative-control evidence has
+    been reconciled with the unchanged runtime/storage implementation.
 
 ## Notes
 

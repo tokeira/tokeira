@@ -390,10 +390,13 @@ edges trimmed; it prints `kache stats` and a `df` so the reclaim is visible. Del
   `nightly-2026-06-16` — advance with local dev); `gh` only at the §10.6 PR boundary
   (never Codex). Protobuf generation uses `protox`, including SDK build scripts;
   no system `protoc` is required.
-- **Linker:** the tracked `.cargo/config.toml` links with lld (`-fuse-ld=lld` via clang)
-  on aarch64 and sets `debug = "line-tables-only"` — deliberate link-time tuning that
-  every worktree inherits. kache skips linked outputs, so link time is unaffected by the
-  cache either way; keep or benchmark lld independently of this practice.
+- **Linker:** the tracked `.cargo/config.toml` links Apple-silicon macOS builds with lld
+  (`-fuse-ld=lld` via clang, which runs the `ld64.lld` on `PATH`) and sets
+  `debug = "line-tables-only"` — deliberate link-time tuning that every worktree
+  inherits. With the macOS 27 SDKs, lld must be 23.1.3 or newer: their `.tbd` stubs list
+  an `arm64e.x1` target that older lld rejects as malformed, and every link then fails on
+  undefined libSystem symbols. kache skips linked outputs, so link time is unaffected by
+  the cache either way; keep or benchmark lld independently of this practice.
 - **Conformance runs:** `run_suite.sh` launches `target/debug/tokeirad` from whichever
   checkout runs it — per-worktree targets mean parallel suites don't collide on the
   binary, but they do share the DSQL/storage layer a suite points at; keep live-suite

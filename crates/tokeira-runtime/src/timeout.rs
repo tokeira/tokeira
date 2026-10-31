@@ -23,7 +23,7 @@ use tokeira_kernel::{Command, RetryState, WorkflowExecutionTimedOutRequest, Work
 use tokeira_types::{RunKey, ShardId};
 use tokio_util::sync::CancellationToken;
 
-use crate::successor::SuccessorPlan;
+use crate::successor::{SuccessorCause, SuccessorPlan, SuccessorTiming, load_started_event_inputs};
 
 use crate::{
     lane::LaneHandle, metrics as runtime_metrics, scanner::pick_lane_for_run_key, shard::ShardOwner,
@@ -109,7 +109,7 @@ impl WorkflowTimeoutTrackingState {
 /// Tuning for the workflow timeout scanner loop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkflowTimeoutScannerConfig {
-    /// Delay between scans of the tracking set.
+    /// Maximum delay between scans; approaching tracked deadlines shorten it.
     pub scan_interval: tokio::time::Duration,
     /// Upper bound on timeouts submitted per scan, so a large backlog of expired
     /// runs cannot monopolize a tick; the remainder is picked up on the next pass.
@@ -231,8 +231,46 @@ pub(crate) async fn scan_workflow_timeouts_once<F, Fut>(
     }
 }
 
-/// Background loop: every `scan_interval`, evaluate timeouts for each shard this
-/// node currently owns and route any firings to the run's lane.
+// A periodic wake can cross the next cron boundary even when a run's timeout
+// precedes it. Wake for known deadlines instead of backdating the successor to
+// hide that lag. Temporal schedules WorkflowRunTimeoutTask at the expiration
+// time (service/history/workflow/task_generator.go @ v1.31.0).
+fn workflow_timeout_scan_delay(
+    tracking: &WorkflowTimeoutTrackingState,
+    now: OffsetDateTime,
+    maximum: tokio::time::Duration,
+) -> tokio::time::Duration {
+    tracking
+        .inner
+        .snapshot(None)
+        .iter()
+        .filter(|tracked| tracking.inner.active(tracked))
+        .flat_map(|tracked| {
+            let entry = &tracked.value;
+            [
+                entry.workflow_execution_timeout.map(|timeout| {
+                    entry.first_run_started_at.unwrap_or(entry.started_at) + timeout
+                }),
+                entry.workflow_run_timeout.map(|timeout| {
+                    entry.started_at
+                        + entry.workflow_start_delay.unwrap_or(Duration::ZERO)
+                        + timeout
+                }),
+            ]
+            .into_iter()
+            .flatten()
+        })
+        // The existing evaluator uses a strict comparison for nonzero timeouts.
+        .map(|deadline| deadline + Duration::NANOSECOND - now)
+        // An already overdue entry may have failed its storage read. Preserve
+        // the normal retry interval instead of spinning on that failed entry.
+        .filter(|remaining| *remaining > Duration::ZERO)
+        .filter_map(|remaining| tokio::time::Duration::try_from(remaining).ok())
+        .fold(maximum, std::cmp::min)
+}
+
+/// Background loop: evaluate timeouts at approaching tracked deadlines, with
+/// `scan_interval` bounding discovery of new runs and retries of failed submissions.
 ///
 /// The active-shard set is re-read each tick (rather than captured once) so the
 /// loop tracks ownership changes: a shard handed away stops being scanned and a
@@ -249,9 +287,11 @@ pub(crate) async fn run_workflow_timeout_scanner<R: tokeira_storage::RunReposito
     cancel: CancellationToken,
 ) {
     loop {
+        let delay =
+            workflow_timeout_scan_delay(&tracking, OffsetDateTime::now_utc(), config.scan_interval);
         tokio::select! {
             _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(config.scan_interval) => {}
+            _ = tokio::time::sleep(delay) => {}
         }
 
         let active_shards: Vec<_> = shard_owner
@@ -296,102 +336,49 @@ pub(crate) async fn submit_workflow_timeout<R: tokeira_storage::RunRepository + 
     now: OffsetDateTime,
 ) -> Result<()> {
     let lane = pick_lane_for_run_key(&lanes, lane_count, entry.run_key).clone();
-    // A RUN timeout with retry attempts remaining continues
-    // the retry chain: the close carries the successor run
-    // id and commits with its successor (retryWorkflow on run-timeout,
-    // timer_queue_active_task_executor.go:713-796 @
-    // v1.31.0). Execution timeouts never retry — the
-    // chain's own deadline has passed.
-    let mut retry_successor = None;
+    let mut retry_selected = false;
+    let mut new_execution_run_id = None;
+    let mut successor_plan = None;
+    // Execution expiration ends the entire chain. For a run timeout, every
+    // metadata read is fallible: failure leaves the tracker eligible for a later
+    // scan rather than committing a terminal close from incomplete inputs.
     if matches!(violation, WorkflowTimeoutViolation::RunTimeout)
-        && entry.has_retry_policy
-        && let Ok(tokeira_kernel::LoadedRun::Existing(state)) = repo.load_run(entry.run_key).await
-        && let Some(policy) = state.retry_policy.clone()
+        && let tokeira_kernel::LoadedRun::Existing(state) = repo.load_run(entry.run_key).await?
     {
-        // `maximum_attempts == 0` means unlimited.
-        let attempts_ok = policy.maximum_attempts == 0 || state.attempt < policy.maximum_attempts;
-        let backoff = crate::runtime::workflow_task::retry_backoff(&policy, state.attempt);
-        // Next attempt must fit before the execution-level
-        // deadline, anchored on the chain's first run.
-        let within_deadline = match state.workflow_execution_timeout {
-            Some(execution_timeout) => {
-                let anchor = state.first_run_started_at.unwrap_or(state.started_at);
-                now + backoff < anchor + execution_timeout
-            }
-            None => true,
-        };
-        if attempts_ok && within_deadline {
-            retry_successor = Some((state, policy, tokeira_types::RunId::new()));
+        let started = Box::new(load_started_event_inputs(&*repo, entry.run_key).await?);
+        let retry_backoff = state.retry_policy.as_ref().and_then(|policy| {
+            let attempts_ok =
+                policy.maximum_attempts == 0 || state.attempt < policy.maximum_attempts;
+            let backoff = crate::runtime::workflow_task::retry_backoff(policy, state.attempt);
+            let within_deadline = state.workflow_execution_timeout.is_none_or(|timeout| {
+                now + backoff < state.first_run_started_at.unwrap_or(state.started_at) + timeout
+            });
+            (attempts_ok && within_deadline).then_some(backoff)
+        });
+        if let Some(backoff) = retry_backoff {
+            retry_selected = true;
+            new_execution_run_id = Some(tokeira_types::RunId::new());
+            successor_plan = Some(SuccessorPlan::Retry {
+                started,
+                timing: SuccessorTiming { now, backoff },
+                cause: SuccessorCause::RunTimeout,
+            });
+        } else if let Some(schedule) = started.cron_schedule.as_deref().filter(|s| !s.is_empty()) {
+            // The schedule anchor preserves phase; processing time controls the
+            // new start and minimum interval (timer_queue_active_task_executor.go:
+            // 743-754; mutable_state_impl.go:2675-2695 @ v1.31.0).
+            let scheduled_time =
+                state.started_at + state.workflow_start_delay.unwrap_or(Duration::ZERO);
+            let backoff =
+                crate::schedule::cron_backoff_for_next_schedule(schedule, scheduled_time, now)?;
+            new_execution_run_id = Some(tokeira_types::RunId::new());
+            successor_plan = Some(SuccessorPlan::Cron {
+                started,
+                timing: SuccessorTiming { now, backoff },
+                cause: SuccessorCause::RunTimeout,
+            });
         }
     }
-    // A RUN timeout on a cron workflow with no retry
-    // continuation restarts the cron schedule: the next cron
-    // run carries the timeout as its LastError, the same way
-    // the failure path continues cron. The cron schedule and
-    // input live on the run's start event.
-    let mut cron_successor = None;
-    if retry_successor.is_none()
-        && matches!(violation, WorkflowTimeoutViolation::RunTimeout)
-        && let Ok(events) = repo.read_history(entry.run_key, 0, 1).await
-        && let Some(
-            tokeira_kernel::HistoryEventKind::WorkflowExecutionStarted {
-                cron_schedule: Some(cron),
-                input,
-                ..
-            }
-            | tokeira_kernel::HistoryEventKind::WorkflowExecutionStartedV2 {
-                cron_schedule: Some(cron),
-                input,
-                ..
-            },
-        ) = events.first().map(|event| &event.kind)
-        && !cron.is_empty()
-        && let Ok(tokeira_kernel::LoadedRun::Existing(state)) = repo.load_run(entry.run_key).await
-    {
-        cron_successor = Some((
-            state,
-            cron.clone(),
-            input.clone(),
-            tokeira_types::RunId::new(),
-        ));
-    }
-    let new_execution_run_id = retry_successor
-        .as_ref()
-        .map(|(_, _, run_id)| *run_id)
-        .or_else(|| cron_successor.as_ref().map(|(_, _, _, run_id)| *run_id));
-    let successor_plan = if let Some((state, _, _)) = &retry_successor {
-        let events = repo.read_history(entry.run_key, 0, 1).await?;
-        let (input, started_versioning_info) = match events.first().map(|event| &event.kind) {
-            Some(tokeira_kernel::HistoryEventKind::WorkflowExecutionStarted {
-                input,
-                versioning_info,
-                ..
-            })
-            | Some(tokeira_kernel::HistoryEventKind::WorkflowExecutionStartedV2 {
-                input,
-                versioning_info,
-                ..
-            }) => (input.clone(), versioning_info.clone().map(Box::new)),
-            _ => (tokeira_types::Payloads::default(), None),
-        };
-        Some(SuccessorPlan::Retry {
-            input,
-            started_versioning_info,
-            timeout_prior_outcome: Some((state.close_failure.clone(), state.close_result.clone())),
-        })
-    } else {
-        cron_successor
-            .as_ref()
-            .map(|(_, cron, input, _)| SuccessorPlan::Cron {
-                schedule: cron.clone(),
-                input: input.clone(),
-                timeout: true,
-                // Preserve the schedule's phase rather than introducing scanner jitter.
-                now: entry.started_at
-                    + entry.workflow_start_delay.unwrap_or(Duration::ZERO)
-                    + entry.workflow_run_timeout.unwrap_or(Duration::ZERO),
-            })
-    };
     lane.submit_with_successor(
         entry.run_key,
         Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
@@ -404,7 +391,7 @@ pub(crate) async fn submit_workflow_timeout<R: tokeira_storage::RunRepository + 
             // `InProgress`, while a cron successor (or terminal)
             // reports the policy-derived state — `RetryPolicyNotSet`
             // when the cron workflow has no retry policy.
-            retry_state: if retry_successor.is_some() {
+            retry_state: if retry_selected {
                 RetryState::InProgress
             } else {
                 workflow_timeout_retry_state(&entry)
@@ -416,4 +403,73 @@ pub(crate) async fn submit_workflow_timeout<R: tokeira_storage::RunRepository + 
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod successor_scan_tests {
+    use super::*;
+
+    fn entry(started_at: OffsetDateTime) -> WorkflowTimeoutEntry {
+        WorkflowTimeoutEntry {
+            run_key: RunKey::new(),
+            shard_id: ShardId(0),
+            workflow_execution_timeout: None,
+            workflow_run_timeout: Some(Duration::seconds(5)),
+            started_at,
+            workflow_start_delay: Some(Duration::seconds(3)),
+            first_run_started_at: None,
+            has_retry_policy: false,
+        }
+    }
+
+    #[test]
+    fn successor_scan_wakes_before_cron_boundary() {
+        let start = OffsetDateTime::UNIX_EPOCH + Duration::milliseconds(20100);
+        let tracking = WorkflowTimeoutTrackingState::default();
+        let entry = entry(start);
+        tracking.insert(entry.clone());
+        let now = start + Duration::milliseconds(7800);
+        let wake = now
+            + Duration::try_from(workflow_timeout_scan_delay(
+                &tracking,
+                now,
+                tokio::time::Duration::from_secs(1),
+            ))
+            .unwrap();
+        assert_eq!(
+            evaluate_workflow_timeout(&entry, wake),
+            Some(WorkflowTimeoutViolation::RunTimeout)
+        );
+        let execution_time = start + Duration::seconds(3);
+        let backoff =
+            crate::schedule::cron_backoff_for_next_schedule("@every 3s", execution_time, wake)
+                .unwrap();
+        // A five-second timeout resumes the three-second schedule after six
+        // seconds; a full polling interval here would add 800 ms of drift.
+        assert!(wake + backoff - execution_time < Duration::milliseconds(6010));
+    }
+
+    #[test]
+    fn successor_scan_bounds_idle_and_failed_retries() {
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(20);
+        let tracking = WorkflowTimeoutTrackingState::default();
+        let interval = tokio::time::Duration::from_secs(1);
+        assert_eq!(
+            workflow_timeout_scan_delay(&tracking, now, interval),
+            interval
+        );
+        tracking.insert(entry(now - Duration::seconds(10)));
+        assert_eq!(
+            workflow_timeout_scan_delay(&tracking, now, interval),
+            interval
+        );
+        let mut future = entry(now);
+        future.first_run_started_at = Some(now - Duration::seconds(5));
+        future.workflow_execution_timeout = Some(Duration::milliseconds(5250));
+        tracking.insert(future);
+        assert_eq!(
+            workflow_timeout_scan_delay(&tracking, now, interval),
+            tokio::time::Duration::from_millis(250) + tokio::time::Duration::from_nanos(1)
+        );
+    }
 }

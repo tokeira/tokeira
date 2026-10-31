@@ -31,18 +31,22 @@ pub(crate) fn pair(
     successor.next_state.namespace_id = state.namespace_id;
     successor.next_state.workflow_id = state.workflow_id.clone();
     successor.next_state.memo = memo.clone();
+    successor.next_state.search_attributes = state.search_attributes.clone();
+    successor.next_state.links = state.links.clone();
     successor.next_state.first_execution_run_id = Some(state.run_id);
     let successor_id = successor.next_state.run_id;
     successor.history_events = vec![reset_history(&successor.next_state).remove(0)].into();
     if let HistoryEventKind::WorkflowExecutionStarted {
         input: stored_input,
         header: stored_header,
+        links,
         continued_execution_run_id,
         ..
     } = &mut successor.history_events[0].kind
     {
         *stored_input = input.clone();
         *stored_header = header.clone();
+        *links = state.links.clone();
         *continued_execution_run_id = Some(state.run_id);
     }
     successor.request_dedupe_ops.push(RequestDedupeOp {
@@ -84,6 +88,7 @@ pub(crate) fn pair(
         2 => Command::WorkflowTaskCompletedWithCron {
             request,
             cron_continuation: CronContinuation {
+                failure_retry_state: RetryState::RetryPolicyNotSet,
                 new_run_id: successor_id,
                 first_workflow_task_backoff: Duration::seconds(30),
                 input,

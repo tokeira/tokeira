@@ -1,131 +1,258 @@
-//! Successor inputs prepared before a close enters its execution lane.
-//! Builders preserve existing successor fields; this module changes when those
-//! starts are applied, not their public inheritance semantics.
+//! Immutable successor inputs prepared before a close enters its execution lane.
+//! Original metadata comes from start history; the closing transition supplies
+//! the actual outcome. Frozen evaluation and start clocks survive OCC and fallback.
 
-use anyhow::{Result, anyhow};
-use time::OffsetDateTime;
+use anyhow::{Context as _, Result, anyhow, ensure};
+use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    HistoryEvent, HistoryEventKind, StartRequest, Transition, WorkflowState, WorkflowVersioningInfo,
+    HistoryEvent, HistoryEventKind, Link, StartRequest, Transition, WorkflowState,
+    WorkflowVersioningInfo, continue_as_new_min_backoff,
 };
-use tokeira_types::{Payload, Payloads, RunKey};
+use tokeira_storage::RunRepository;
+use tokeira_types::{Headers, Memo, Payloads, RunKey, SearchAttributes};
 
 use crate::runtime::workflow_task::{
     build_cron_successor_start, build_retry_successor_start, workflow_run_timeout_failure,
 };
 
-/// Runtime-only reads that cannot be reconstructed from the closing transition.
+/// History-owned inputs, never substituted with later mutable state.
+/// `SetupNewWorkflowForRetryOrCron` copies these from the started event
+/// (`service/history/workflow/retry.go:278-345 @ v1.31.0`).
+#[derive(Clone, Debug)]
+#[cfg_attr(test, derive(Default))]
+pub(crate) struct SuccessorStartedEvent {
+    pub input: Payloads,
+    pub header: Option<Headers>,
+    pub memo: Memo,
+    pub search_attributes: SearchAttributes,
+    pub links: Vec<Link>,
+    pub cron_schedule: Option<String>,
+    pub last_completion_result: Option<Payloads>,
+    pub versioning_info: Option<WorkflowVersioningInfo>,
+}
+
+/// Both internal encodings implement the same public started-event contract.
+pub(crate) fn started_event_inputs(event: &HistoryEvent) -> Result<SuccessorStartedEvent> {
+    match &event.kind {
+        HistoryEventKind::WorkflowExecutionStarted {
+            input,
+            header,
+            memo,
+            search_attributes,
+            links,
+            cron_schedule,
+            last_completion_result,
+            versioning_info,
+            ..
+        }
+        | HistoryEventKind::WorkflowExecutionStartedV2 {
+            input,
+            header,
+            memo,
+            search_attributes,
+            links,
+            cron_schedule,
+            last_completion_result,
+            versioning_info,
+            ..
+        } => Ok(SuccessorStartedEvent {
+            input: input.clone(),
+            header: header.clone(),
+            memo: memo.clone(),
+            search_attributes: search_attributes.clone(),
+            links: links.clone(),
+            cron_schedule: cron_schedule.clone(),
+            last_completion_result: last_completion_result.clone(),
+            versioning_info: versioning_info.clone(),
+        }),
+        _ => Err(anyhow!(
+            "required successor history is not a workflow started event"
+        )),
+    }
+}
+
+/// The repository point read hydrates split history values just like its page read.
+/// A missing/corrupt start must fail before the close can commit, never fabricate metadata.
+pub(crate) async fn load_started_event_inputs<R: RunRepository>(
+    repo: &R,
+    run_key: RunKey,
+) -> Result<SuccessorStartedEvent> {
+    let event = repo
+        .read_history_event(run_key, 1)
+        .await
+        .with_context(|| format!("read successor start history for run {}", run_key.0))?
+        .ok_or_else(|| anyhow!("successor start history is missing for run {}", run_key.0))?;
+    started_event_inputs(&event)
+        .with_context(|| format!("invalid successor start history for run {}", run_key.0))
+}
+
+/// A selected delay and evaluation instant are immutable for one lane submission.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SuccessorTiming {
+    pub now: OffsetDateTime,
+    pub backoff: Duration,
+}
+
+impl SuccessorTiming {
+    /// Apply the shared minimum after selection, anchored on execution rather than wall-clock start.
+    pub(crate) fn minimum_backoff(self, state: &WorkflowState) -> Option<Duration> {
+        let execution_time =
+            state.started_at + state.workflow_start_delay.unwrap_or(Duration::ZERO);
+        continue_as_new_min_backoff(Some(self.backoff), self.now - execution_time)
+    }
+}
+
+/// Timeout and workflow-task successors deliberately carry different prior results.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SuccessorCause {
+    WorkflowTask,
+    RunTimeout,
+}
+
+/// Prepared reads and decisions; boxing keeps payload metadata out of every lane future's stack.
 #[derive(Clone, Debug)]
 pub(crate) enum SuccessorPlan {
+    ContinueAsNew {
+        links: Vec<Link>,
+    },
     Retry {
-        input: Payloads,
-        started_versioning_info: Option<Box<WorkflowVersioningInfo>>,
-        // Timeout starts historically use the pre-close outcome. Preserve that
-        // deliberately; correcting successor inheritance is a separate change.
-        timeout_prior_outcome: Option<(Option<Payload>, Option<Payloads>)>,
+        started: Box<SuccessorStartedEvent>,
+        timing: SuccessorTiming,
+        cause: SuccessorCause,
     },
     Cron {
-        schedule: String,
-        input: Payloads,
-        now: OffsetDateTime,
-        timeout: bool,
+        started: Box<SuccessorStartedEvent>,
+        timing: SuccessorTiming,
+        cause: SuccessorCause,
     },
 }
 
-/// Build the same start the separate post-commit path would have built, using
-/// the transition rather than reloading a close that could lose its successor.
+/// Build from authoritative close history and immutable prepared inputs.
+/// The caller reuses this start for the fenced pair and explicit size fallback.
 pub(crate) fn build_successor_start(
     transition: &Transition,
     plan: Option<&SuccessorPlan>,
-    now: OffsetDateTime,
+    successor_now: OffsetDateTime,
 ) -> Result<Option<StartRequest>> {
     let state = &transition.next_state;
-    if let Some(start) = build_continue_as_new_start(state, &transition.history_events, now) {
-        return Ok(Some(start));
+    if transition.history_events.iter().any(|e| {
+        matches!(
+            e.kind,
+            HistoryEventKind::WorkflowExecutionContinuedAsNew { .. }
+        )
+    }) {
+        let Some(SuccessorPlan::ContinueAsNew { links }) = plan else {
+            return Err(anyhow!(
+                "continue-as-new close is missing its matching runtime plan"
+            ));
+        };
+        return Ok(build_continue_as_new_start(
+            state,
+            &transition.history_events,
+            successor_now,
+            links.clone(),
+        ));
     }
-    let id = transition
+    let close = transition
         .history_events
         .iter()
-        .find_map(|event| match event.kind {
+        .find_map(|event| match &event.kind {
             HistoryEventKind::WorkflowExecutionFailed {
-                new_execution_run_id,
+                new_execution_run_id: Some(id),
+                failure,
                 ..
-            }
-            | HistoryEventKind::WorkflowExecutionCompleted {
-                new_execution_run_id,
+            } => Some((
+                *id,
+                SuccessorCause::WorkflowTask,
+                Some(failure.clone()),
+                None,
+            )),
+            HistoryEventKind::WorkflowExecutionCompleted {
+                new_execution_run_id: Some(id),
+                result,
                 ..
-            }
-            | HistoryEventKind::WorkflowExecutionTimedOut {
-                new_execution_run_id,
+            } => Some((
+                *id,
+                SuccessorCause::WorkflowTask,
+                None,
+                Some(result.clone()),
+            )),
+            HistoryEventKind::WorkflowExecutionTimedOut {
+                new_execution_run_id: Some(id),
                 ..
-            } => new_execution_run_id,
+            } => Some((
+                *id,
+                SuccessorCause::RunTimeout,
+                Some(workflow_run_timeout_failure()),
+                None,
+            )),
             _ => None,
         });
-    let Some(id) = id else {
+    let Some((id, actual_cause, failure, result)) = close else {
         return Ok(None);
     };
-    let mut start =
-        match plan.ok_or_else(|| anyhow!("successor close is missing its runtime plan"))? {
-            SuccessorPlan::Retry {
-                input,
-                started_versioning_info,
-                timeout_prior_outcome,
-            } => {
-                let policy = state
-                    .retry_policy
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("retry successor has no retry policy"))?;
-                let mut start = build_retry_successor_start(
-                    state,
-                    started_versioning_info.as_deref(),
-                    policy,
-                    input.clone(),
-                    id,
-                );
-                if let Some((failure, result)) = timeout_prior_outcome {
-                    start.continued_failure = failure.clone();
-                    start.last_completion_result = result.clone();
-                }
-                start
-            }
-            SuccessorPlan::Cron {
-                schedule,
-                input,
-                now: completion_time,
-                timeout,
-            } => {
-                let (failure, result, started_at) = if *timeout {
-                    (
-                        Some(workflow_run_timeout_failure()),
-                        state.last_completion_result.clone(),
-                        *completion_time,
-                    )
-                } else {
-                    (
-                        state.close_failure.clone(),
-                        state
-                            .close_result
-                            .clone()
-                            .or_else(|| state.last_completion_result.clone()),
-                        now,
-                    )
-                };
-                build_cron_successor_start(
-                    state,
-                    schedule.clone(),
-                    input.clone(),
-                    id,
-                    *completion_time,
-                    started_at,
-                    failure,
-                    result,
-                )?
-            }
-        };
-    // OCC retries keep both identity and the start clock chosen by the lane.
-    if !matches!(plan, Some(SuccessorPlan::Cron { timeout: true, .. })) {
-        start.now = now;
-        start.request.received_at = now;
-    }
+    let mut start = match plan
+        .ok_or_else(|| anyhow!("successor close is missing its runtime plan"))?
+    {
+        SuccessorPlan::Retry {
+            started,
+            timing,
+            cause,
+        } => {
+            ensure!(
+                *cause == actual_cause && failure.is_some(),
+                "retry plan does not match its closing event"
+            );
+            let policy = state
+                .retry_policy
+                .as_ref()
+                .ok_or_else(|| anyhow!("retry successor has no retry policy"))?;
+            // handleRetry supplies no result, while run-timeout retry carries the
+            // started result (service/history/api/respondworkflowtaskcompleted/
+            // workflow_task_completed_handler.go:1354-1364 and
+            // service/history/timer_queue_active_task_executor.go:743-754 @ v1.31.0).
+            let last_result = (*cause == SuccessorCause::RunTimeout)
+                .then(|| started.last_completion_result.clone())
+                .flatten();
+            build_retry_successor_start(state, started, policy, id, *timing, failure, last_result)
+        }
+        SuccessorPlan::Cron {
+            started,
+            timing,
+            cause,
+        } => {
+            ensure!(
+                *cause == actual_cause,
+                "cron plan does not match its closing event"
+            );
+            let schedule = started
+                .cron_schedule
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow!("cron successor has no original schedule"))?;
+            // A successful empty result is still this run's result. Only failure/
+            // timeout inherits the started result (handleCron @ v1.31.0).
+            let last_result = if failure.is_some() {
+                started.last_completion_result.clone()
+            } else {
+                result
+            };
+            build_cron_successor_start(state, schedule, started, id, *timing, failure, last_result)
+        }
+        SuccessorPlan::ContinueAsNew { .. } => {
+            return Err(anyhow!(
+                "successor close has a mismatched continue-as-new plan"
+            ));
+        }
+    };
+    // Delay evaluation and successor creation have separate clocks in
+    // handleRetry/handleCron (service/history/api/respondworkflowtaskcompleted/
+    // workflow_task_completed_handler.go @ v1.31.0). Preserve that separation:
+    // reusing the close timestamp would regress our timestamp-derived TaskIds
+    // when the new run's event ids restart at one. The lane freezes this clock
+    // before its OCC loop, so retries and size fallback retain the same start.
+    start.now = successor_now;
+    start.request.received_at = successor_now;
     Ok(Some(start))
 }
 
@@ -133,6 +260,7 @@ fn build_continue_as_new_start(
     new_state: &WorkflowState,
     history_events: &[HistoryEvent],
     now: OffsetDateTime,
+    links: Vec<Link>,
 ) -> Option<StartRequest> {
     let successor_event = history_events.iter().find_map(|event| match &event.kind {
         HistoryEventKind::WorkflowExecutionContinuedAsNew {
@@ -248,7 +376,7 @@ fn build_continue_as_new_start(
             // (`service/history/workflow/mutable_state_impl.go:2480,2573 @ v1.31.0`).
             completion_callbacks: new_state.completion_callbacks.clone(),
             user_metadata: new_state.user_metadata.clone(),
-            links: Vec::new(),
+            links,
             on_conflict_options: None,
             priority: new_state.priority.clone(),
             input,

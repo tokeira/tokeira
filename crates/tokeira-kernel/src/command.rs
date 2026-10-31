@@ -1312,7 +1312,11 @@ pub struct StartDeploymentTransitionRequest {
 /// (`service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:1383 @ v1.31.0`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CronContinuation {
-    /// Run ID authored into the closing run's continue-as-new event.
+    /// Retry decision retained on a failed close even when cron continues the chain.
+    /// Successful completion ignores this value; callers use `RetryPolicyNotSet`.
+    /// See `service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:779-809 @ v1.31.0`.
+    pub failure_retry_state: RetryState,
+    /// Run ID authored into the predecessor's Completed or Failed close event.
     pub new_run_id: RunId,
     /// Concrete delay before the successor's first workflow task may fire.
     pub first_workflow_task_backoff: Duration,
@@ -1334,8 +1338,8 @@ pub struct CronContinuation {
 /// The first-workflow-task backoff is deliberately absent. Unlike cron's
 /// calendar delay, the retry backoff is a pure function of the policy and the
 /// predecessor attempt (`initial × coefficient^(attempt-1)`, capped by
-/// `maximum_interval`); the runtime recomputes it deterministically when it
-/// starts the successor, so it need not be threaded through the kernel.
+/// `maximum_interval`); the runtime freezes it in its successor plan before submission, so it
+/// need not be threaded through the kernel.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RetryContinuation {
     /// The retry policy continues the chain. `new_run_id` is authored into the

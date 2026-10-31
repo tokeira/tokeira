@@ -186,8 +186,10 @@ const CONTINUE_AS_NEW_MIN_INTERVAL: time::Duration = time::Duration::seconds(1);
 /// terminated during that window shows only `WorkflowExecutionStarted` — the
 /// WFT is pending on the delay timer, not yet scheduled
 /// (`TestChildWorkflowWithContinueAsNewParentTerminate`,
-/// `TestContinueAsNewRunExecutionTimeout`).
-fn continue_as_new_min_backoff(
+/// `TestContinueAsNewRunExecutionTimeout`). Callers measure lifetime from the
+/// predecessor execution time (start plus first-task delay); negative ages clamp
+/// to zero. An absent backoff stays absent when no minimum delay is needed.
+pub fn continue_as_new_min_backoff(
     command_backoff: Option<time::Duration>,
     lifetime: time::Duration,
 ) -> Option<time::Duration> {
@@ -5679,8 +5681,8 @@ fn apply_workflow_command(
             let attempt = builder.state.attempt;
             // Precedence is resolved in the runtime, which supplies at most one
             // of {retry_continuation, cron_continuation} for a FailWorkflow —
-            // retry is evaluated before cron (`retry.go @ v1.31.0`), and the cron
-            // helper already declines when a retry policy is present. The kernel
+            // retry is evaluated before cron (`retry.go @ v1.31.0`). A declined
+            // retry can still select cron, retaining that retry state. The kernel
             // only records the already-decided outcome so replay reconstructs the
             // same close deterministically (retry evaluation is wall-clock- and
             // policy-dependent, hence a runtime concern, not pure kernel logic).
@@ -5704,8 +5706,8 @@ fn apply_workflow_command(
                 builder.close(ExecutionStatus::Failed);
             } else if let Some(cron) = cron_continuation {
                 // A failed cron run closes as WorkflowExecutionFailed carrying the
-                // successor run id (NOT ContinueAsNew); the successor is started
-                // separately by the runtime and carries this failure as its
+                // successor run id (NOT ContinueAsNew); the runtime prepares a paired
+                // successor carrying this failure as its
                 // continued_failure + the last SUCCESSFUL completion result
                 // (workflow_task_completed_handler.go:788,handleCron @ v1.31.0;
                 // TestCronWorkflowCompletionStates case 3 reads both).
@@ -5713,7 +5715,7 @@ fn apply_workflow_command(
                 builder.emit(HistoryEventKind::WorkflowExecutionFailed {
                     workflow_task_completed_event_id,
                     failure,
-                    retry_state: RetryState::InProgress,
+                    retry_state: cron.failure_retry_state.clone(),
                     attempt,
                     new_execution_run_id: Some(cron.new_run_id),
                 });

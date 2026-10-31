@@ -14,7 +14,10 @@
 //! source for each non-obvious decision.
 
 use super::*;
-use crate::successor::SuccessorPlan;
+use crate::successor::{
+    SuccessorCause, SuccessorPlan, SuccessorStartedEvent, SuccessorTiming,
+    load_started_event_inputs,
+};
 use prost::Message as _;
 use tokeira_kernel::{
     ContinueAsNewVersioningBehavior, RetryContinuation, RetryState, VersioningBehavior,
@@ -22,7 +25,7 @@ use tokeira_kernel::{
     WorkflowVersioningInfo,
 };
 use tokeira_observability::OutcomeLabel;
-use tokeira_proto::failure::{Failure, failure::FailureInfo};
+use tokeira_proto::failure::{Failure, TimeoutFailureInfo, failure::FailureInfo};
 use tokeira_storage::{
     DeploymentKey, DeploymentName, StoredRoutingConfig, WorkerDeploymentVersionKey,
 };
@@ -1216,6 +1219,10 @@ where
             &mut req.commands,
         )
         .await?;
+        // Preparation can fail on storage reads. Leave update waiters registered
+        // until every required successor input is ready, so a retry can resolve them.
+        let (retry_continuation, cron_continuation, successor_plan) =
+            self.prepare_completion_successor(run_key, &req).await?;
         req.delivered_update_ids = self.update_registry.sent_update_ids(run_key);
         // Rejections write NO history event (v1.31.0's
         // RejectWorkflowExecutionUpdate is a documented no-op), so the lane's
@@ -1252,49 +1259,6 @@ where
                     (failure, waiters)
                 })
                 .collect();
-        let cron_continuation = self.cron_continuation_for_completion(run_key, &req).await?;
-        // Retry is evaluated before cron (retry.go @ v1.31.0). The cron helper
-        // already declines when a retry policy is present on a FailWorkflow, so
-        // the two are mutually exclusive here; compute retry only when cron did
-        // not claim the completion.
-        let retry_continuation = if cron_continuation.is_none() {
-            self.retry_continuation_for_completion(run_key, &req)
-                .await?
-        } else {
-            None
-        };
-        // These reads must precede submission: a successor rejected by the kernel
-        // leaves the close unapplied (workflow_task_completed_handler.go:1354-1369
-        // @ v1.31.0), and a committed close must already own its successor.
-        let successor_plan = if matches!(retry_continuation, Some(RetryContinuation::Retry { .. }))
-        {
-            let events = self.repo.read_history(run_key, 0, 1).await?;
-            let (input, started_versioning_info) = match events.first().map(|event| &event.kind) {
-                Some(HistoryEventKind::WorkflowExecutionStarted {
-                    input,
-                    versioning_info,
-                    ..
-                })
-                | Some(HistoryEventKind::WorkflowExecutionStartedV2 {
-                    input,
-                    versioning_info,
-                    ..
-                }) => (input.clone(), versioning_info.clone().map(Box::new)),
-                _ => (Payloads::default(), None),
-            };
-            Some(SuccessorPlan::Retry {
-                input,
-                started_versioning_info,
-                timeout_prior_outcome: None,
-            })
-        } else {
-            cron_continuation.as_ref().map(|cron| SuccessorPlan::Cron {
-                schedule: cron.cron_schedule.clone(),
-                input: cron.input.clone(),
-                now: req.now,
-                timeout: false,
-            })
-        };
         // A server-decided failure of this completion is authored on behalf of
         // the same authenticated worker call. Preserve its edge-derived
         // principal before moving the request into the first kernel attempt.
@@ -1568,61 +1532,106 @@ where
         self.submit_for_owned_shard(run_key, command).await
     }
 
-    async fn cron_continuation_for_completion(
+    /// Select once before submission; original history and the clock survive lane OCC retries.
+    async fn prepare_completion_successor(
         &self,
         run_key: RunKey,
         req: &WorkflowTaskCompletedRequest,
-    ) -> Result<Option<CronContinuation>> {
-        let closes_for_cron = req.commands.iter().any(|command| {
-            matches!(command, WorkflowCommand::CompleteWorkflow { .. })
-                || matches!(command, WorkflowCommand::FailWorkflow { .. })
+    ) -> Result<(
+        Option<RetryContinuation>,
+        Option<CronContinuation>,
+        Option<SuccessorPlan>,
+    )> {
+        let close = req.commands.iter().find(|command| {
+            matches!(
+                command,
+                WorkflowCommand::CompleteWorkflow { .. }
+                    | WorkflowCommand::FailWorkflow { .. }
+                    | WorkflowCommand::ContinueAsNew { .. }
+                    | WorkflowCommand::CancelWorkflow { .. }
+            )
         });
-        if !closes_for_cron {
-            return Ok(None);
+        if !matches!(
+            close,
+            Some(
+                WorkflowCommand::CompleteWorkflow { .. }
+                    | WorkflowCommand::FailWorkflow { .. }
+                    | WorkflowCommand::ContinueAsNew { .. }
+            )
+        ) {
+            return Ok((None, None, None));
         }
-
         let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
-            return Ok(None);
+            return Ok((None, None, None));
         };
-        if state.retry_policy.is_some()
-            && req
-                .commands
-                .iter()
-                .any(|command| matches!(command, WorkflowCommand::FailWorkflow { .. }))
-        {
-            return Ok(None);
+        let started = Box::new(load_started_event_inputs(&*self.repo, run_key).await?);
+        if matches!(close, Some(WorkflowCommand::ContinueAsNew { .. })) {
+            return Ok((
+                None,
+                None,
+                Some(SuccessorPlan::ContinueAsNew {
+                    links: started.links,
+                }),
+            ));
         }
-
-        let start_event = self.repo.read_history(run_key, 0, 1).await?;
-        let (input, cron_schedule) = match start_event.first().map(|event| &event.kind) {
-            Some(HistoryEventKind::WorkflowExecutionStarted {
-                input,
-                cron_schedule: Some(cron_schedule),
-                ..
-            })
-            | Some(HistoryEventKind::WorkflowExecutionStartedV2 {
-                input,
-                cron_schedule: Some(cron_schedule),
-                ..
-            }) => (input, cron_schedule),
-            _ => return Ok(None),
+        // Retry precedes cron even when a policy exists. A declined retry is
+        // still the failed event's RetryState (workflow_task_completed_handler.go:
+        // 779-809 @ v1.31.0), not proof that the chain ends.
+        let retry = if matches!(close, Some(WorkflowCommand::FailWorkflow { .. })) {
+            self.retry_continuation_for_completion(&state, req)
+        } else {
+            None
         };
-        if cron_schedule.is_empty() {
-            return Ok(None);
+        if matches!(retry, Some(RetryContinuation::Retry { .. })) {
+            let policy = state
+                .retry_policy
+                .as_ref()
+                .expect("selected retry requires a policy");
+            let timing = SuccessorTiming {
+                now: req.now,
+                backoff: retry_backoff(policy, state.attempt),
+            };
+            return Ok((
+                retry,
+                None,
+                Some(SuccessorPlan::Retry {
+                    started,
+                    timing,
+                    cause: SuccessorCause::WorkflowTask,
+                }),
+            ));
         }
-
-        // Temporal's cron close path creates the successor immediately but
-        // records a first-WFT backoff on that successor
-        // (`service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:1383`,
-        // `service/history/workflow/mutable_state_impl.go:2601 @ v1.31.0`).
-        // Runtime owns the wall-clock cron calculation; kernel owns the
-        // durable event that makes the successor replayable.
-        Ok(Some(CronContinuation {
-            new_run_id: RunId::new(),
-            first_workflow_task_backoff: cron_initial_backoff(cron_schedule, req.now)?,
-            input: input.clone(),
-            cron_schedule: cron_schedule.clone(),
-        }))
+        if let Some(schedule) = started.cron_schedule.as_deref().filter(|s| !s.is_empty()) {
+            let scheduled_time =
+                state.started_at + state.workflow_start_delay.unwrap_or(Duration::ZERO);
+            let backoff =
+                crate::schedule::cron_backoff_for_next_schedule(schedule, scheduled_time, req.now)?;
+            let failure_retry_state = match retry {
+                Some(RetryContinuation::Terminal { retry_state }) => retry_state,
+                _ => RetryState::RetryPolicyNotSet,
+            };
+            let cron = CronContinuation {
+                failure_retry_state,
+                new_run_id: RunId::new(),
+                first_workflow_task_backoff: backoff,
+                input: started.input.clone(),
+                cron_schedule: schedule.to_owned(),
+            };
+            let timing = SuccessorTiming {
+                now: req.now,
+                backoff,
+            };
+            return Ok((
+                None,
+                Some(cron),
+                Some(SuccessorPlan::Cron {
+                    started,
+                    timing,
+                    cause: SuccessorCause::WorkflowTask,
+                }),
+            ));
+        }
+        Ok((retry, None, None))
     }
 
     /// Evaluate the workflow retry decision for a WFT completion that fails the
@@ -1637,50 +1646,43 @@ where
     /// reached, or the successor's first attempt would begin at/after the
     /// workflow-execution deadline. The evaluation (failure decoding, wall clock,
     /// backoff) is a runtime concern; the kernel only records the outcome (Req 2.1).
-    async fn retry_continuation_for_completion(
+    fn retry_continuation_for_completion(
         &self,
-        run_key: RunKey,
+        state: &WorkflowState,
         req: &WorkflowTaskCompletedRequest,
-    ) -> Result<Option<RetryContinuation>> {
-        let Some(failure) = req.commands.iter().find_map(|command| match command {
+    ) -> Option<RetryContinuation> {
+        let failure = req.commands.iter().find_map(|command| match command {
             WorkflowCommand::FailWorkflow { failure } => Some(failure.clone()),
             _ => None,
-        }) else {
-            return Ok(None);
-        };
-        let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
-            return Ok(None);
-        };
-        let Some(policy) = state.retry_policy.clone() else {
-            return Ok(None);
-        };
+        })?;
+        let policy = state.retry_policy.as_ref()?;
 
         if !workflow_failure_is_retryable(&failure, &policy.non_retryable_error_types) {
-            return Ok(Some(RetryContinuation::Terminal {
+            return Some(RetryContinuation::Terminal {
                 retry_state: RetryState::NonRetryableFailure,
-            }));
+            });
         }
         // `maximum_attempts == 0` means unlimited (v1.31.0 NoInterval semantics).
         if policy.maximum_attempts > 0 && state.attempt >= policy.maximum_attempts {
-            return Ok(Some(RetryContinuation::Terminal {
+            return Some(RetryContinuation::Terminal {
                 retry_state: RetryState::MaximumAttemptsReached,
-            }));
+            });
         }
         // Execution-expiration cap: if the next attempt could not begin before the
         // workflow-execution deadline, the chain ends as Timeout (retry.go). The
         // deadline is anchored on the first run's start so it spans the whole chain.
-        let backoff = retry_backoff(&policy, state.attempt);
+        let backoff = retry_backoff(policy, state.attempt);
         if let Some(execution_timeout) = state.workflow_execution_timeout {
             let anchor = state.first_run_started_at.unwrap_or(state.started_at);
             if req.now + backoff >= anchor + execution_timeout {
-                return Ok(Some(RetryContinuation::Terminal {
+                return Some(RetryContinuation::Terminal {
                     retry_state: RetryState::Timeout,
-                }));
+                });
             }
         }
-        Ok(Some(RetryContinuation::Retry {
+        Some(RetryContinuation::Retry {
             new_run_id: RunId::new(),
-        }))
+        })
     }
 
     /// Atomically transition a polled workflow task into the Started state.
@@ -2099,15 +2101,17 @@ fn is_withdrawn_workflow_task_start(error: &anyhow::Error) -> bool {
 /// chain, timer_queue_active_task_executor.go:713-796 @ v1.31.0). The
 /// successor inherits type/queue/input/policy/timeouts, chains its lineage
 /// (`continued_execution_run_id`, first-run identity), and delays its first
-/// workflow task by the recomputed backoff.
+/// workflow task by the selected backoff, raised to the shared minimum interval.
+/// Immutable metadata and the delay-evaluation clock were captured before lane submission.
 pub(crate) fn build_retry_successor_start(
     state: &tokeira_kernel::WorkflowState,
-    started_versioning_info: Option<&WorkflowVersioningInfo>,
+    started: &SuccessorStartedEvent,
     policy: &tokeira_types::RetryPolicy,
-    input: Payloads,
     new_run_id: RunId,
+    timing: SuccessorTiming,
+    continued_failure: Option<Payload>,
+    last_completion_result: Option<Payloads>,
 ) -> StartRequest {
-    let backoff = retry_backoff(policy, state.attempt);
     let successor_run_key = RunKey::derive(state.namespace_id, &state.workflow_id, new_run_id);
     // Chain origin propagates so execution-level timeouts and lineage queries
     // span the whole retry chain, not just this hop.
@@ -2119,7 +2123,8 @@ pub(crate) fn build_retry_successor_start(
     } else {
         (None, None)
     };
-    let inherited_versioning_info = retry_successor_versioning_info(state, started_versioning_info);
+    let inherited_versioning_info =
+        retry_successor_versioning_info(state, started.versioning_info.as_ref());
     StartRequest {
         run_key: successor_run_key,
         advice_policy: continue_as_new_advice_policy(),
@@ -2131,16 +2136,16 @@ pub(crate) fn build_retry_successor_start(
         deployment: state.deployment.clone(),
         build_id: state.build_id.clone(),
         versioning_override: state.versioning_override().cloned(),
-        workflow_start_delay: Some(backoff),
+        workflow_start_delay: timing.minimum_backoff(state),
         completion_callbacks: state.completion_callbacks.clone(),
         user_metadata: state.user_metadata.clone(),
-        links: Vec::new(),
+        links: started.links.clone(),
         on_conflict_options: None,
         priority: state.priority.clone(),
-        input,
-        header: None,
-        memo: state.memo.clone(),
-        search_attributes: state.search_attributes.clone(),
+        input: started.input.clone(),
+        header: started.header.clone(),
+        memo: started.memo.clone(),
+        search_attributes: started.search_attributes.clone(),
         workflow_execution_timeout: state.workflow_execution_timeout,
         workflow_run_timeout: state.workflow_run_timeout,
         workflow_task_timeout: state.workflow_task_timeout,
@@ -2165,8 +2170,8 @@ pub(crate) fn build_retry_successor_start(
         root_workflow_id,
         root_run_id,
         original_execution_run_id: Some(state.original_execution_run_id.unwrap_or(state.run_id)),
-        continued_failure: state.close_failure.clone(),
-        last_completion_result: state.close_result.clone(),
+        continued_failure,
+        last_completion_result,
         first_run_started_at,
         request: RequestContext {
             // Deterministic request id keyed on (predecessor, successor) so a
@@ -2178,11 +2183,11 @@ pub(crate) fn build_retry_successor_start(
             )),
             caller_identity: None,
             principal: None,
-            received_at: OffsetDateTime::now_utc(),
+            received_at: timing.now,
         },
-        now: OffsetDateTime::now_utc(),
+        now: timing.now,
         client_cron_schedule: None,
-        cron_schedule: None,
+        cron_schedule: started.cron_schedule.clone(),
         eager_execution_accepted: false,
         reserved_poller_identity: None,
         inherited_versioning_info,
@@ -2241,7 +2246,6 @@ fn retry_successor_versioning_info(
 /// workflow run timeout surfaces to the workflow-failure layer as
 /// `TIMEOUT_TYPE_START_TO_CLOSE` (retry.go / mutable_state_impl.go @ v1.31.0).
 pub(crate) fn workflow_run_timeout_failure() -> tokeira_types::Payload {
-    use tokeira_proto::failure::{Failure, TimeoutFailureInfo, failure::FailureInfo};
     tokeira_proto::conversions::common::failure_to_payload(&Failure {
         message: "workflow timeout".to_string(),
         failure_info: Some(FailureInfo::TimeoutFailureInfo(TimeoutFailureInfo {
@@ -2261,24 +2265,15 @@ pub(crate) fn workflow_run_timeout_failure() -> tokeira_types::Payload {
 /// inherits the chain deadline + parent linkage, and it carries the caller-
 /// supplied `continued_failure` (the run's failure / timeout, so `GetLastError`
 /// reports it) and `last_completion_result` (the last SUCCESSFUL result).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_cron_successor_start(
     state: &tokeira_kernel::WorkflowState,
-    cron_schedule: String,
-    input: Payloads,
+    cron_schedule: &str,
+    started: &SuccessorStartedEvent,
     new_run_id: RunId,
-    now: OffsetDateTime,
-    execution_started_at: OffsetDateTime,
+    timing: SuccessorTiming,
     continued_failure: Option<tokeira_types::Payload>,
     last_completion_result: Option<Payloads>,
-) -> Result<StartRequest, crate::schedule::ScheduleError> {
-    // v1.31.0 anchors the next cron fire on the CLOSING run's scheduled (execution)
-    // time and rounds up to the next whole second, so a run that outlived one or more
-    // intervals still lands on the schedule's phase rather than `now + interval`
-    // (`common/backoff/cron.go` `GetBackoffForNextSchedule`).
-    let scheduled_time = state.started_at + state.workflow_start_delay.unwrap_or(Duration::ZERO);
-    let backoff =
-        crate::schedule::cron_backoff_for_next_schedule(&cron_schedule, scheduled_time, now)?;
+) -> StartRequest {
     let successor_run_key = RunKey::derive(state.namespace_id, &state.workflow_id, new_run_id);
     let first_execution_run_id = Some(state.first_execution_run_id.unwrap_or(state.run_id));
     let first_run_started_at = Some(state.first_run_started_at.unwrap_or(state.started_at));
@@ -2287,7 +2282,7 @@ pub(crate) fn build_cron_successor_start(
     } else {
         (None, None)
     };
-    Ok(StartRequest {
+    StartRequest {
         run_key: successor_run_key,
         advice_policy: continue_as_new_advice_policy(),
         namespace_id: state.namespace_id,
@@ -2298,16 +2293,16 @@ pub(crate) fn build_cron_successor_start(
         deployment: state.deployment.clone(),
         build_id: state.build_id.clone(),
         versioning_override: state.versioning_override().cloned(),
-        workflow_start_delay: Some(backoff),
+        workflow_start_delay: timing.minimum_backoff(state),
         completion_callbacks: state.completion_callbacks.clone(),
         user_metadata: state.user_metadata.clone(),
-        links: Vec::new(),
+        links: started.links.clone(),
         on_conflict_options: None,
         priority: state.priority.clone(),
-        input,
-        header: None,
-        memo: state.memo.clone(),
-        search_attributes: state.search_attributes.clone(),
+        input: started.input.clone(),
+        header: started.header.clone(),
+        memo: started.memo.clone(),
+        search_attributes: started.search_attributes.clone(),
         workflow_execution_timeout: state.workflow_execution_timeout,
         workflow_run_timeout: state.workflow_run_timeout,
         workflow_task_timeout: state.workflow_task_timeout,
@@ -2337,19 +2332,15 @@ pub(crate) fn build_cron_successor_start(
             )),
             caller_identity: None,
             principal: None,
-            received_at: execution_started_at,
+            received_at: timing.now,
         },
-        // The successor's `WorkflowExecutionStarted` time — and thus its start-delay
-        // timer anchor — is the caller-provided execution start (wall-clock for a
-        // completion successor; the precise timeout deadline for a timeout successor,
-        // so the next fire lands on the schedule's phase free of scan jitter).
-        now: execution_started_at,
+        now: timing.now,
         client_cron_schedule: None,
-        cron_schedule: Some(cron_schedule),
+        cron_schedule: Some(cron_schedule.to_owned()),
         eager_execution_accepted: false,
         reserved_poller_identity: None,
         inherited_versioning_info: None,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -2681,10 +2672,12 @@ pub(crate) mod tests {
 
             let successor = build_retry_successor_start(
                 &state,
-                None,
+                &SuccessorStartedEvent::default(),
                 &policy,
-                Payloads::default(),
                 RunId::new(),
+                SuccessorTiming { now: state.started_at, backoff: Duration::seconds(1) },
+                None,
+                None,
             );
             prop_assert_eq!(&successor.completion_callbacks, &state.completion_callbacks);
             prop_assert!(successor
@@ -2758,8 +2751,10 @@ pub(crate) mod tests {
             let mut parent = open_state("accumulator-parent".into(), continue_as_new_source_info(case, 3, None, None));
             parent.used_worker_deployment_versions = Some(values.clone());
             let policy = RetryPolicy { initial_interval: Duration::seconds(1), backoff_coefficient: 1.0, maximum_interval: None, maximum_attempts: 3, non_retryable_error_types: Vec::new() };
-            let retry = build_retry_successor_start(&parent, parent.versioning_info.as_ref(), &policy, Payloads::default(), RunId::new());
-            let cron = build_cron_successor_start(&parent, "* * * * *".into(), Payloads::default(), RunId::new(), now(), now(), None, None).unwrap();
+            let started = SuccessorStartedEvent { versioning_info: parent.versioning_info.clone(), ..Default::default() };
+            let timing = SuccessorTiming { now: now(), backoff: Duration::seconds(1) };
+            let retry = build_retry_successor_start(&parent, &started, &policy, RunId::new(), timing, None, None);
+            let cron = build_cron_successor_start(&parent, "* * * * *", &started, RunId::new(), timing, None, None);
             let mut continued = retry.clone();
             continued.inherited_versioning_info = resolve_continue_as_new_versioning(&parent, &parent.task_queue, initial, true, true);
             let mut child = retry.clone();
@@ -3704,10 +3699,12 @@ pub(crate) mod tests {
             };
             let mut start = build_retry_successor_start(
                 &predecessor,
-                None,
+                &SuccessorStartedEvent::default(),
                 &policy,
-                Payloads::default(),
                 RunId::new(),
+                SuccessorTiming { now: predecessor.started_at, backoff: Duration::seconds(1) },
+                None,
+                None,
             );
             start.task_queue = successor_task_queue;
             start.versioning_override = None;

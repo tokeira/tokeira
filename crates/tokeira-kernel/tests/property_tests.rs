@@ -5,6 +5,9 @@ use std::collections::BTreeMap;
 #[path = "support/workflow_dispatch.rs"]
 mod workflow_dispatch;
 
+#[path = "support/successor_semantics.rs"]
+mod successor_semantics;
+
 use proptest::prelude::*;
 use prost::Message;
 use time::{Duration, OffsetDateTime};

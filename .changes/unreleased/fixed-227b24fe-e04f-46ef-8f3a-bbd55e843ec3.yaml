@@ -1,0 +1,5 @@
+kind: fixed
+body: Workflow successors now preserve the correct metadata, failure and last-result fields, continue cron after exhausted retries, and honor minimum start delays.
+time: 2026-10-31T15:20:57.14525Z
+custom:
+    Slice: 227b24fe-e04f-46ef-8f3a-bbd55e843ec3

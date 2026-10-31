@@ -8,8 +8,8 @@ use crate::{
     memory::projection_accumulator_tests::applied,
 };
 use std::collections::BTreeMap;
-use tokeira_kernel::{HistoryEventKind, limits::RunGrowthLimits};
-use tokeira_types::{Headers, Memo, Payload, Payloads};
+use tokeira_kernel::{HistoryEventKind, Link, limits::RunGrowthLimits};
+use tokeira_types::{Headers, Memo, Payload, Payloads, SearchAttrValue, SearchAttributes};
 
 async fn seed(repo: &dyn RunRepository) -> Result<WorkflowState> {
     let start = start();
@@ -61,8 +61,40 @@ async fn atomic_successors_live() -> Result<()> {
     };
     let repo = fixture.store.run_repository();
     for kind in 0..4 {
-        let state = seed(repo).await?;
-        let (closing, successor) = pair(&state, kind, Payloads::default(), Memo::default(), None);
+        let input = Payloads(vec![Payload::new(vec![0x53; 1100 * 1024])]);
+        let header = Some(Headers(
+            [("original".into(), Payload::new(b"header"))].into(),
+        ));
+        let memo = Memo([("original".into(), Payload::new(b"memo"))].into());
+        let search = SearchAttributes([("original".into(), SearchAttrValue::Int(7))].into());
+        let links = vec![Link::BatchJob {
+            job_id: "original-start".into(),
+        }];
+        let mut initial = start();
+        initial.next_state.memo = memo.clone();
+        initial.next_state.search_attributes = search.clone();
+        initial.next_state.links = links.clone();
+        let HistoryEventKind::WorkflowExecutionStarted {
+            input: stored_input,
+            header: stored_header,
+            memo: stored_memo,
+            search_attributes,
+            links: stored_links,
+            ..
+        } = &mut initial.history_events[0].kind
+        else {
+            panic!("fixture start")
+        };
+        *stored_input = input.clone();
+        *stored_header = header.clone();
+        *stored_memo = memo.clone();
+        *search_attributes = search.clone();
+        *stored_links = links.clone();
+        let state = applied(
+            repo.commit_transition(initial.next_state.run_key, initial, WriteFence::Unfenced)
+                .await?,
+        );
+        let (closing, successor) = pair(&state, kind, input.clone(), memo.clone(), header.clone());
         let key = successor.next_state.run_key;
         assert!(matches!(
             repo.commit_transition_pair(
@@ -76,6 +108,30 @@ async fn atomic_successors_live() -> Result<()> {
             PairCommitResult::Applied { .. }
         ));
         assert_committed(&fixture, state.run_key, key).await?;
+        // The runtime's original-start loader uses this point read; the input
+        // crosses the history part boundary and must arrive whole for both runs.
+        for run_key in [state.run_key, key] {
+            let event = repo
+                .read_history_event(run_key, 1)
+                .await?
+                .expect("persisted start");
+            let HistoryEventKind::WorkflowExecutionStarted {
+                input: actual_input,
+                header: actual_header,
+                memo: actual_memo,
+                search_attributes,
+                links: actual_links,
+                ..
+            } = event.kind
+            else {
+                panic!("fixture start")
+            };
+            assert_eq!(actual_input, input);
+            assert_eq!(actual_header, header);
+            assert_eq!(actual_memo, memo);
+            assert_eq!(search_attributes, search);
+            assert_eq!(actual_links, links);
+        }
     }
 
     let state = seed(repo).await?;

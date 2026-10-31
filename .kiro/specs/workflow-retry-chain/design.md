@@ -59,6 +59,11 @@ effect" model.
 
 ## Architecture
 
+The original delivery below is refined by [atomic-successors](../atomic-successors/design.md)
+for commit ordering and [successor-semantics](../successor-semantics/design.md) for
+field sources and retry-to-cron selection. Successor creation is part of the
+authoritative paired commit; dispatch remains a derived effect.
+
 Changes span three planes; only the first two touch the kernel.
 
 - **Kernel (Req 1.1, 1.2):** add the `new_execution_run_id` field; replace the hardcoded failure-close
@@ -73,12 +78,15 @@ flowchart TD
     Worker -->|RespondWorkflowTaskCompleted with FailWorkflowExecution| RtCWT["runtime: complete_workflow_task"]
     RtCWT --> Eval["retry_continuation_for_completion<br/>(retry.go semantics, mint successor id)"]
     Eval -->|retry| CmdR["failure-close command carrying<br/>RetryContinuation::Retry{run_id, backoff}"]
-    Eval -->|terminal| CmdT["failure-close command carrying<br/>RetryContinuation::Terminal{retry_state}"]
+    Eval -->|terminal and no cron| CmdT["failure-close command carrying<br/>RetryContinuation::Terminal{retry_state}"]
+    Eval -->|terminal with cron| CmdC["cron completion carrying evaluated retry state"]
     CmdR --> Kern["kernel: emit WorkflowExecutionFailed<br/>{retry_state, new_execution_run_id}"]
     CmdT --> Kern
-    Kern --> Commit["storage: fenced commit (authoritative close)"]
-    Commit -->|new_execution_run_id present| Succ["runtime lane: start attempt-N+1 successor<br/>(backoff-delayed first WFT)"]
-    Commit -->|terminal| Done["chain ends"]
+    CmdC --> Kern
+    Kern -->|new_execution_run_id present| Succ["runtime lane: build and apply selected retry or cron start"]
+    Succ --> Pair["storage: fenced paired commit"]
+    Kern -->|no successor| Commit["storage: fenced single-run close"]
+    Commit --> Done["chain ends"]
     Client -->|GetHistory CLOSE_EVENT, no follows-next-run capability| Fix["edge: FixFollowEvents<br/>rewrite closing event -> synthetic ContinuedAsNew"]
 ```
 
@@ -202,9 +210,9 @@ as a follow-up gated on edge client-capability plumbing.
 
 - **P1 — Retry links a successor.** Retry-eligible FailWorkflow → `WorkflowExecutionFailed` with
   `InProgress` + `Some(new_execution_run_id)`. (Req 1.2, 4.2)
-- **P2 — Max-attempts terminal.** At `MaximumAttempts` → `MaximumAttemptsReached` + `None`. (Req 4.1)
-- **P3 — Non-retryable terminal.** Non-retryable type match → `NonRetryableFailure` + `None`. (Req 4.1)
-- **P4 — No policy unchanged.** `retry_policy == None` → `RetryPolicyNotSet` + `None`. (Req 1.2)
+- **P2 — Max-attempts terminal without cron.** At `MaximumAttempts`, with no selected cron continuation → `MaximumAttemptsReached` + `None`. (Req 4.1)
+- **P3 — Non-retryable terminal without cron.** Non-retryable type match, with no selected cron continuation → `NonRetryableFailure` + `None`. (Req 4.1)
+- **P4 — No policy without cron unchanged.** `retry_policy == None`, with no selected cron continuation → `RetryPolicyNotSet` + `None`. (Req 1.2)
 - **P5 — Successor chain fields.** Successor `StartRequest` carries `attempt = N+1`,
   `continued_execution_run_id = predecessor`, inherited first-run fields, backoff-delayed WFT. (Req 2.2)
 - **P6 — Event round-trip.** `WorkflowExecutionFailed` round-trips with/without the field; absent field
@@ -216,9 +224,10 @@ as a follow-up gated on edge client-capability plumbing.
 ## Error Handling
 
 No new `Reject` variants. The failure-close continuation reuses the existing WFT-completed fencing and
-rejects. Runtime retry evaluation is total (always yields a `RetryContinuation`); a mint/start failure of
-the successor is surfaced as today for continue-as-new (predecessor close returned; successor-start error
-logged/retried by the lane), never leaving the predecessor un-closed. `FixFollowEvents` is a read-path
+rejects. Runtime retry evaluation is total (always yields a `RetryContinuation`).
+A successor preparation/apply failure rejects the pair without closing the predecessor.
+Only an explicit pair size refusal permits the existing separate-start fallback,
+whose failure is logged after the predecessor has closed. `FixFollowEvents` is a read-path
 projection and cannot mutate state.
 
 ## Testing Strategy

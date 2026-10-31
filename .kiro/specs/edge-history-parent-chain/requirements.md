@@ -68,9 +68,9 @@ The scope covers four requirement groups:
 
 #### Acceptance Criteria
 
-1. WHEN the History_Serializer serializes a Started_Event for a run whose predecessor failed before continuing-as-new, THE History_Serializer SHALL populate `continued_failure` with the failure from the Predecessor_Run.
-2. WHEN the predecessor run did not fail (completed successfully or was not a continue-as-new), THE History_Serializer SHALL leave `continued_failure` as None.
-3. WHEN the Runtime creates a StartRequest for a continue-as-new successor, THE Runtime SHALL read the Predecessor_Run's terminal failure and include it in the StartRequest as an Opaque_Failure_Payload.
+1. WHEN the History_Serializer serializes a Started_Event containing a continued failure, THE History_Serializer SHALL populate `continued_failure` from that event's stored value.
+2. WHEN the Started_Event contains no continued failure, THE History_Serializer SHALL leave `continued_failure` as None.
+3. WHEN the Runtime creates a retry or cron successor, THE Runtime SHALL set its continued failure by the cause-specific policy in [successor-semantics Requirement 2](../successor-semantics/bugfix.md), including the start-to-close failure for a run timeout.
 4. WHEN the Kernel emits a Started_Event, THE Kernel SHALL include `continued_failure: Option<Payload>` in the event data, sourced from the StartRequest.
 
 ### Requirement 4: WorkflowExecutionStarted — last_completion_result
@@ -80,8 +80,8 @@ The scope covers four requirement groups:
 #### Acceptance Criteria
 
 1. WHEN the History_Serializer serializes a Started_Event for a run that has a last completion result from a predecessor, THE History_Serializer SHALL populate `last_completion_result` with the result payloads.
-2. WHEN no predecessor run completed successfully, THE History_Serializer SHALL leave `last_completion_result` as None.
-3. WHEN the Runtime creates a StartRequest for a continue-as-new or retry successor, THE Runtime SHALL read the Predecessor_Run's terminal result (if it completed successfully) and include it in the StartRequest.
+2. WHEN the Started_Event contains no last completion result, THE History_Serializer SHALL leave `last_completion_result` as None.
+3. WHEN the Runtime creates a retry or cron successor, THE Runtime SHALL set its last completion result by the cause-specific policy in [successor-semantics Requirement 2](../successor-semantics/bugfix.md): absent for workflow-task retry, current result for successful cron, and the started event's carried result for failed cron or run-timeout retry/cron (`workflow_task_completed_handler.go:1328-1427`; `timer_queue_active_task_executor.go:743-754 @ v1.31.0`).
 4. WHEN the Kernel emits a Started_Event, THE Kernel SHALL include `last_completion_result: Option<Payloads>` in the event data, sourced from the StartRequest.
 
 ### Requirement 5: WorkflowExecutionContinuedAsNew — workflow_execution_timeout (non-goal)

@@ -52,8 +52,11 @@ This feature depends on Feature 1 (Lane OCC Retry), Feature 5 (Workflow Timeouts
 5. THE Runtime SHALL set the successor's `namespace_id` to the predecessor's `namespace_id`.
 6. THE Runtime SHALL set the successor's `continued_execution_run_id` to the predecessor's `run_id`.
 7. THE Runtime SHALL set the successor's `attempt` to 1.
-8. THE Runtime SHALL set the successor's `retry_policy` to the predecessor's `retry_policy`.
-9. THE Runtime SHALL set the successor's `parent_run_key` and `parent_workflow_id` to `None` (the successor is not a child workflow; the predecessor's parent relationship does not transfer).
+8. THE Runtime SHALL set the successor's `retry_policy` from the ContinuedAsNew_Event, where the kernel has resolved the command override with predecessor fallback (as refined by [edge-history-parent-chain](../edge-history-parent-chain/design.md)).
+9. THE Runtime SHALL preserve the predecessor's parent linkage, including `parent_run_key` and `parent_workflow_id`; a child remains in the same parent relationship across continue-as-new (`service/history/workflow/mutable_state_impl.go:5690-5754 @ v1.31.0`).
+10. WHEN building an explicit continue-as-new successor, THE Runtime SHALL set its links from
+    the predecessor's started event, excluding links attached later
+    (`service/history/workflow/mutable_state_impl.go:5738-5754 @ v1.31.0`).
 
 ---
 

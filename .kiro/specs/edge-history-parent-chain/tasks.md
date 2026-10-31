@@ -1,5 +1,10 @@
 # Tasks: Edge History Parent Chain
 
+The historical construction in completed task 6.3 is refined by the cause-specific
+[successor-semantics outcome policy](../successor-semantics/bugfix.md). Its
+[tasks 4, 7 and 14](../successor-semantics/tasks.md) carry the outstanding runtime
+and wire-history verification; serializer round-trip guarantees remain unchanged.
+
 ## Group 1: Kernel model enrichment (bottom-up foundation)
 
 - [x] 1.1 Add `ContinueAsNewInitiator` enum to `crates/tokeira-kernel/src/command.rs`

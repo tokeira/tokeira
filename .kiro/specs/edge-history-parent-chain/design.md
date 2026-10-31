@@ -641,6 +641,11 @@ StartChildWorkflow {
 
 ### Property 4: WorkflowExecutionStarted continued_failure round-trip
 
+Runtime construction follows the cause-specific
+[successor-semantics outcome policy](../successor-semantics/bugfix.md). The serializer
+preserves the already stored failure/result; it does not infer them from terminal
+status or read predecessor state. Property 5 below has the same ownership boundary.
+
 *For any* `HistoryEvent` with kind `WorkflowExecutionStarted` where `continued_failure` is `Some(payload)` containing a proto `Failure`, serializing via `history_event_to_proto` SHALL produce a `WorkflowExecutionStartedEventAttributes` where `continued_failure` is `Some` and contains a proto `Failure` with the original message preserved.
 
 **Validates:** Requirement 3 (AC 3.1, 3.2)
@@ -653,7 +658,7 @@ StartChildWorkflow {
 
 ### Property 6: WorkflowExecutionContinuedAsNew enriched fields
 
-*For any* `HistoryEvent` with kind `WorkflowExecutionContinuedAsNew` where `retry_policy` is `Some`, `initiator` is any variant, `failure` is `Some(payload)`, and `last_completion_result` is `Some(payloads)`, serializing via `history_event_to_proto` SHALL produce a `WorkflowExecutionContinuedAsNewEventAttributes` where `retry_policy` is `Some`, `initiator` is non-zero, `failure` is `Some`, and `last_completion_result` is `Some`.
+*For any* `HistoryEvent` with kind `WorkflowExecutionContinuedAsNew`, serializing via `history_event_to_proto` SHALL preserve `initiator`, `failure`, and `last_completion_result`. The internal `retry_policy` is not a wire field and SHALL be ignored, as required by Requirement 6 and `proto/upstream/temporal/api/history/v1/message.proto`.
 
 **Validates:** Requirements 6, 7, 8 (AC 6.1, 7.1, 8.3, 8.4)
 
@@ -676,7 +681,7 @@ No new error paths are introduced. All changes add data to existing success path
 - Parent metadata fields default to `None`/0 when not a child workflow — the serializer produces empty/default proto values, which is correct.
 - `original_execution_run_id` defaults to `Some(run_id)` for the first run — the kernel handles this in `apply_start`.
 - `continued_failure` and `last_completion_result` default to `None` — the serializer produces absent proto fields, which is correct.
-- `retry_policy` on `ContinuedAsNew` defaults to `None` — the serializer produces an absent proto field.
+- `retry_policy` on `ContinuedAsNew` is internal only; no corresponding proto field exists.
 - `initiator` defaults to `ContinueAsNewInitiator::Workflow` — the serializer produces the correct proto enum value.
 - `control` defaults to empty string — the serializer produces an empty proto string, which is the correct default.
 - If `payload_to_failure` receives a corrupted `Payload` for `continued_failure`, it falls back to interpreting the bytes as a UTF-8 message string (existing behavior from Feature 2).
@@ -689,7 +694,7 @@ No new error paths are introduced. All changes add data to existing success path
 
 2. **WorkflowExecutionStarted execution chain fields** — Generate arbitrary events with random `original_execution_run_id`, `continued_failure`, and `last_completion_result`. Serialize and assert the proto fields match. (Properties 3, 4, 5)
 
-3. **WorkflowExecutionContinuedAsNew enriched fields** — Generate arbitrary events with random `retry_policy`, `initiator`, `failure`, and `last_completion_result`. Serialize and assert the proto fields are populated. (Property 6)
+3. **WorkflowExecutionContinuedAsNew enriched fields** — Generate arbitrary events with random `retry_policy`, `initiator`, `failure`, and `last_completion_result`. Assert the wire fields round-trip; varying the internal retry policy must not alter the proto. (Property 6)
 
 4. **Signal/cancel-external control field** — Generate arbitrary events with random `control` strings. Serialize and assert the proto `control` field matches. (Property 7)
 
@@ -701,7 +706,7 @@ No new error paths are introduced. All changes add data to existing success path
 - History serializer: `WorkflowExecutionStarted` without parent produces proto with empty parent fields
 - History serializer: `WorkflowExecutionStarted` with `original_execution_run_id` produces proto with the field populated
 - History serializer: `WorkflowExecutionStarted` with `continued_failure` produces proto with `continued_failure` populated
-- History serializer: `WorkflowExecutionContinuedAsNew` with `retry_policy` produces proto with `retry_policy` populated
+- History serializer: varying internal `WorkflowExecutionContinuedAsNew.retry_policy` leaves the proto unchanged
 - History serializer: `WorkflowExecutionContinuedAsNew` with `initiator: Workflow` produces proto with `initiator = 1`
 - History serializer: `SignalExternalWorkflowExecutionInitiated` with `control` produces proto with `control` populated
 - Kernel: `apply_start` with parent fields produces `WorkflowExecutionStarted` event with parent fields

@@ -1,5 +1,12 @@
 # Implementation Plan: Continue-As-New
 
+The subsequent original-start links requirement (2.10) will be implemented and tested
+by the outstanding [successor-semantics tasks 2, 4, 6 and 12](../successor-semantics/tasks.md).
+Completed tasks below remain the historical delivery record.
+The current requirements/design also reconcile parent identity and resolved retry
+policy with the implemented builder and the later edge-history-parent-chain spec;
+those are preservation checks, not new runtime features.
+
 ## Overview
 
 Implement the runtime continue-as-new feature in three layers: (1) extend kernel data models with `first_run_started_at` and `first_execution_run_id` on `WorkflowState`, (2) update the runtime's timeout tracking and evaluation to be chain-aware, and (3) wire the lane post-commit path to detect `ContinuedAsNew` status, construct the successor `StartRequest`, and submit it. All property tests are required.

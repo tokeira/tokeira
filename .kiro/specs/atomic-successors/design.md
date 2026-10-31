@@ -54,7 +54,8 @@ commits after another start has taken the workflow id.
 
 - The kernel applies one command to one run (3.1).
 - A close without a successor commits alone (3.2).
-- The successor's fields are built by today's code (3.3).
+- Successor fields outside the corrections in [successor-semantics](../successor-semantics/bugfix.md)
+  retain their existing policy (3.3).
 - A repeated close is answered as today, and writes no second successor (3.4).
 - A reset materializes its run as today (3.5).
 - No migration is added and the schema contract is unchanged (3.6).
@@ -86,10 +87,12 @@ SHALL write nothing and SHALL answer a conflict.
 
 **Validates: Requirements 2.3**
 
-Property 3: The successor is today's
+Property 3: Paired and fallback starts agree
 
-_For any_ close with a successor, the successor's start in the pair commit SHALL equal the start today's separate
-command would build for the same close, apart from the wall-clock times taken when it is built.
+_For any_ close with a successor, the paired path and the size fallback SHALL use the same built
+start, including identity and corrected fields. The original legacy-builder equivalence test
+remains a preservation oracle only for fields outside
+[successor-semantics](../successor-semantics/bugfix.md).
 
 **Validates: Requirements 2.4, 3.3**
 
@@ -204,8 +207,9 @@ is committed:
   step of the pair commit, and a crash before it.
 - Property 2 runs offline over generated pointer states: absent, naming the closing run, naming another run, open or
   closed.
-- Property 3 runs offline over generated closes of each kind, building each successor both ways: from the transition
-  and plan, and from the committed state as today's code does.
+- Property 3 runs offline over generated closes of each kind, comparing the start used by normal
+  pair and explicit size fallback. Legacy-builder comparison is retained only for unchanged fields;
+  corrected fields use the independent successor-semantics oracle.
 - Property 4 runs offline with a store that refuses every pair for its size, on a node that is draining.
 - Property 5 runs offline with a kernel that rejects the successor's start.
 

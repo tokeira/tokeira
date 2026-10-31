@@ -66,7 +66,7 @@ flowchart TD
 
 **Execution timeout uses `first_run_started_at`, run timeout uses `started_at`.** The `WorkflowTimeoutEntry` gains a new `first_run_started_at: Option<OffsetDateTime>` field. The `evaluate_workflow_timeout` function uses `first_run_started_at.unwrap_or(started_at)` for execution timeout comparison, and always uses `started_at` for run timeout. This is backward-compatible: non-chain runs have `first_run_started_at = None` and fall back to `started_at`.
 
-**Parent identity does not transfer.** The successor's `parent_run_key` and `parent_workflow_id` are set to `None`. The predecessor's parent relationship (if it was a child workflow) does not carry over to the successor. This matches Temporal semantics where continue-as-new creates a new independent run.
+**Parent identity transfers.** Preserve the predecessor's parent linkage, including `parent_run_key` and `parent_workflow_id`. The child continues its existing execution chain, so its parent relationship survives (`service/history/workflow/mutable_state_impl.go:5690-5754 @ v1.31.0`). This is already implemented; successor-semantics preserves it.
 
 
 ## Components and Interfaces
@@ -194,6 +194,7 @@ if new_state.status == ExecutionStatus::ContinuedAsNew {
                 workflow_execution_timeout,
                 workflow_run_timeout,
                 workflow_task_timeout,
+                retry_policy,
             } => Some((
                 new_run_id.clone(),
                 workflow_type.clone(),
@@ -204,6 +205,7 @@ if new_state.status == ExecutionStatus::ContinuedAsNew {
                 *workflow_execution_timeout,
                 *workflow_run_timeout,
                 *workflow_task_timeout,
+                retry_policy.clone(),
             )),
             _ => None,
         }
@@ -220,6 +222,7 @@ if new_state.status == ExecutionStatus::ContinuedAsNew {
             workflow_execution_timeout,
             workflow_run_timeout,
             workflow_task_timeout,
+            retry_policy,
         )) => {
             let successor_run_key = RunKey::new();
             let first_execution_run_id = new_state
@@ -244,12 +247,12 @@ if new_state.status == ExecutionStatus::ContinuedAsNew {
                 workflow_execution_timeout,
                 workflow_run_timeout,
                 workflow_task_timeout,
-                retry_policy: new_state.retry_policy.clone(),
+                retry_policy,
                 attempt: 1,
                 continued_execution_run_id: Some(new_state.run_id),
                 first_execution_run_id: Some(first_execution_run_id),
-                parent_run_key: None,
-                parent_workflow_id: None,
+                parent_run_key: new_state.parent_run_key,
+                parent_workflow_id: new_state.parent_workflow_id.clone(),
                 first_run_started_at,
                 request: RequestContext {
                     request_id: RequestId(format!(
@@ -398,15 +401,15 @@ Predecessor WFT Completed with ContinueAsNew command
       - namespace_id: predecessor's namespace_id
       - workflow_type, task_queue, input, memo, search_attributes: from event
       - timeout config: from event
-      - retry_policy: predecessor's retry_policy
+      - retry_policy: resolved policy from the continued event
       - attempt: 1
       - continued_execution_run_id: predecessor's run_id
       - first_execution_run_id: predecessor's first_execution_run_id
                                  or predecessor's run_id
       - first_run_started_at: predecessor's first_run_started_at
                                or predecessor's started_at
-      - parent_run_key: None
-      - parent_workflow_id: None
+      - parent_run_key: predecessor's parent_run_key
+      - parent_workflow_id: predecessor's parent_workflow_id
   → Lane applies Command::Start to LoadedRun::Absent
   → On rejection: fail close, neither run committed
   → Lane commits close and successor with one fence
@@ -437,6 +440,11 @@ Successor run starts with first_run_started_at = Some(T0)
 
 ### Property 1: Successor StartRequest construction
 
+The original-start links refinement is owned by
+[successor-semantics Property 1](../successor-semantics/design.md): for any predecessor
+started event, successor links equal that event's links, independently of later
+attachments. **Validates: Requirements 2.10.** Its required PBT is tracked there.
+
 *For any* predecessor `WorkflowState` closed with `ContinuedAsNew` and any `WorkflowExecutionContinuedAsNew` history event, the successor `StartRequest` shall have:
 - `run_id` equal to the event's `new_run_id`
 - `workflow_type`, `task_queue`, `input`, `memo`, `search_attributes`, `workflow_execution_timeout`, `workflow_run_timeout`, `workflow_task_timeout` equal to the corresponding event fields
@@ -446,10 +454,10 @@ Successor run starts with first_run_started_at = Some(T0)
 - `continued_execution_run_id` equal to `Some(predecessor.run_id)`
 - `first_execution_run_id` equal to `Some(predecessor.first_execution_run_id.unwrap_or(predecessor.run_id))`
 - `first_run_started_at` equal to `Some(predecessor.first_run_started_at.unwrap_or(predecessor.started_at))`
-- `retry_policy` equal to the predecessor's `retry_policy`
+- `retry_policy` equal to the continued event's resolved `retry_policy`
 - `attempt` equal to `1`
-- `parent_run_key` equal to `None`
-- `parent_workflow_id` equal to `None`
+- `parent_run_key` equal to the predecessor's `parent_run_key`
+- `parent_workflow_id` equal to the predecessor's `parent_workflow_id`
 
 **Validates: Requirements 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 3.1, 3.2, 4.3, 4.4**
 
@@ -534,7 +542,7 @@ Each property test will:
 
 Each correctness property MUST be implemented by a SINGLE property-based test.
 
-**Property 1 (Successor StartRequest construction):** A generator produces random predecessor `WorkflowState` values (with random `workflow_id`, `namespace_id`, `run_id`, `retry_policy`, `first_execution_run_id`, `first_run_started_at`, `started_at`) and random `WorkflowExecutionContinuedAsNew` event fields (`new_run_id`, `workflow_type`, `task_queue`, `input`, `memo`, `search_attributes`, timeout config). A mock publisher captures the `Command::Start` submitted via `submit_to_run`. The test verifies all field mappings: event fields map to the corresponding `StartRequest` fields, predecessor fields map correctly, chain identity fields follow the `unwrap_or` logic, and `parent_run_key`/`parent_workflow_id` are `None`.
+**Property 1 (Successor StartRequest construction):** Generate predecessor state and continued-event fields independently, including distinct retry policies and optional parent linkage. Capture the start applied before the pair commit (or submitted after an explicit size refusal). Verify the event's resolved retry policy, predecessor parent identity, and the field mappings above. Unchanged lineage checks remain mandatory alongside the new original-start links property.
 
 **Property 2 (Chain-aware execution timeout evaluation):** A generator produces random `WorkflowTimeoutEntry` values with random `started_at`, `first_run_started_at` (including `None`), `workflow_execution_timeout`, `workflow_run_timeout`, and random `now` timestamps. The test calls `evaluate_workflow_timeout` and verifies: execution timeout uses `first_run_started_at.unwrap_or(started_at)`, run timeout uses `started_at`, execution timeout takes precedence, and `None` timeouts produce `None` result.
 

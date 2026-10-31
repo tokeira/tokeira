@@ -1,5 +1,10 @@
 # Implementation Plan
 
+Completed checkboxes below record the original atomicity delivery. The subsequent
+field-policy refinement and replacement of legacy-builder equivalence coverage are
+outstanding in [successor-semantics tasks 10 and 14](../successor-semantics/tasks.md),
+not retroactively claimed by this record.
+
 ## Overview
 
 First show the defects, with tests that fail on the current code. Then:

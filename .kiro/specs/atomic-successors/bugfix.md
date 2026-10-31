@@ -63,8 +63,10 @@ commit, or neither SHALL.
 pointer names the closing run. WHEN it names another run THEN the transaction SHALL write nothing, and the commit SHALL
 fail as a conflict.
 
-2.4 The successor's start SHALL be the start that today's separate command would commit for the same close: built by
-the same code from the same inputs, with the same run id and request id.
+2.4 THE runtime SHALL use the same successor start for the paired commit and its size fallback,
+with the same run id and request id. The field policy is refined by
+[successor-semantics](../successor-semantics/bugfix.md); preserving the original delivery's
+builders does not require preserving the defects that specification corrects.
 
 2.5 WHEN the transaction commits THEN the runtime SHALL do for the successor what it does after a successor's start
 commits today: install its workflow timeouts, its workflow-task tracking and its dispatch, before it replies to the
@@ -88,8 +90,9 @@ applications of the kernel, the second to a run that doesn't exist yet (`LoadedR
 
 3.2 A close without a successor SHALL CONTINUE TO commit alone, as today.
 
-3.3 The successor's fields SHALL CONTINUE TO be built as today, by the lane's continue-as-new block,
-`build_retry_successor_start` and `build_cron_successor_start`.
+3.3 THE runtime SHALL preserve successor fields outside the explicit corrections in
+[successor-semantics](../successor-semantics/bugfix.md), including the existing identity
+and lineage handling.
 
 3.4 A repeated close SHALL CONTINUE TO be answered as today: a close that has committed is a conflict or a duplicate on
 its retry, and no second successor is written.
@@ -100,11 +103,11 @@ its retry, and no second successor is written.
 
 ### Out of Scope
 
-- **How a successor is built.** Tokeira builds a successor differently from v1.31.0 in several ways: it drops the
-  header and links, takes a retry or cron successor's memo and search attributes from the run's current state rather
-  than its started event, loses a timeout retry's failure and last result, skips cron when a retry policy exists, and
-  ignores the minimum backoff. A specification of its own follows this one. 2.4 keeps today's successor, so this change
-  alters only when it is written.
+- **How a successor is built.** The original atomicity delivery retained existing field behaviour.
+  [Successor semantics](../successor-semantics/bugfix.md) now specifies the separate corrections:
+  original metadata and links, cron preservation across retry, timeout outcomes, retry-to-cron
+  selection and minimum delay. Explicit continue-as-new already carries its header and minimum
+  delay. These refinements do not weaken this specification's atomic persistence contract.
 - **The size fallback.** 2.6's separate start is still lost on a crash, as today. It becomes durable with the rows
   [Durable Actionable State](../../../docs/architecture/042-durable-actionable-state.md) gives the deliveries a commit
   leaves to happen later.

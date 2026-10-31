@@ -2,6 +2,12 @@
 
 Requirements: [requirements.md](./requirements.md). Design: [design.md](./design.md).
 
+The no-successor assertions for terminal retry decisions below apply when no cron
+continuation is selected. [Successor semantics](../successor-semantics/design.md)
+defines the later retry-to-cron handoff and field corrections; its required tests
+are tracked in [its task plan](../successor-semantics/tasks.md). Existing completed
+checkboxes record the original implementation, including its historical ordering.
+
 > **Requirement 0 accepted (2026-07-02, owner).** Phase 1 may proceed. Command shape: dedicated
 > `WorkflowTaskCompletedWithRetry`. `TestWorkflowRetry` / `TestWorkflowRetryFailures` stay classified
 > registry skips (Req 0.5) only until Phase 4 flips them.

@@ -141,8 +141,8 @@ history readers (and `FixFollowEvents`) can follow a retry chain exactly as v1.3
 1. THE `HistoryEventKind::WorkflowExecutionFailed` variant SHALL gain a field
    `new_execution_run_id: Option<RunId>` annotated `#[serde(default)]`, mirroring
    `WorkflowExecutionTimedOut` (`event.rs:130`).
-2. `new_execution_run_id` SHALL be `Some(run_id)` if and only if retry continues (the run is Failed and
-   an attempt-N+1 successor is being started); it SHALL be `None` on terminal failure.
+2. WHEN a failed run selects a retry or cron successor, THE kernel SHALL set
+   `new_execution_run_id` to that successor's run id; otherwise it is absent.
    (`workflow_task_completed_handler.go:788 @ v1.31.0`.)
 3. THE field SHALL serialize and deserialize without loss, and prior records lacking the field SHALL
    deserialize to `None` (round-trip property).
@@ -160,10 +160,10 @@ and the retry *evaluation* stays out of the pure kernel.
    (the derived `RetryState`).
 2. WHEN the `RetryContinuation` is "retry", THE Kernel SHALL emit `WorkflowExecutionFailed` with
    `retry_state = InProgress` and `new_execution_run_id = Some(successor)`.
-3. WHEN the `RetryContinuation` is "terminal", THE Kernel SHALL emit `WorkflowExecutionFailed` with the
+3. WHEN the `RetryContinuation` is "terminal" and no cron continuation is selected, THE Kernel SHALL emit `WorkflowExecutionFailed` with the
    supplied terminal `RetryState` (`MaximumAttemptsReached`, `NonRetryableFailure`, or
    `RetryPolicyNotSet`) and `new_execution_run_id = None`.
-4. THE existing behaviour for a run with **no** retry policy SHALL be preserved exactly: terminal,
+4. THE existing behaviour for a run with **no** retry policy and no cron continuation SHALL be preserved exactly: terminal,
    `retry_state = RetryPolicyNotSet`, `new_execution_run_id = None`.
 5. THE `RetryContinuation` is carried on a **dedicated `WorkflowTaskCompletedWithRetry` command**
    (decided 2026-07-02; design.md §"Command shape" option (a)), parallel to the existing
@@ -264,9 +264,9 @@ are reported with the right `retry_state` and no dangling successor.
 
 #### Acceptance Criteria
 
-1. WHEN `attempt` reaches `MaximumAttempts`, THE final `WorkflowExecutionFailed` SHALL carry
+1. WHEN `attempt` reaches `MaximumAttempts` and no cron continuation is selected, THE final `WorkflowExecutionFailed` SHALL carry
    `retry_state = MaximumAttemptsReached` and no `new_execution_run_id`; no successor SHALL start.
-2. WHEN the failure's type matches a `NonRetryableErrorTypes` entry, THE final
+2. WHEN the failure's type matches a `NonRetryableErrorTypes` entry and no cron continuation is selected, THE final
    `WorkflowExecutionFailed` SHALL carry `retry_state = NonRetryableFailure` and no
    `new_execution_run_id`; no successor SHALL start.
 
@@ -296,7 +296,7 @@ inspection is conformant.
 1. FOR ALL retry chains, every run except the first SHALL carry
    `continued_execution_run_id = Some(predecessor)` and all runs SHALL share one
    `first_execution_run_id`.
-2. FOR ALL terminal failures (`MaximumAttemptsReached`, `NonRetryableFailure`, `RetryPolicyNotSet`),
+2. FOR ALL terminal retry decisions (`MaximumAttemptsReached`, `NonRetryableFailure`, `RetryPolicyNotSet`) without a cron continuation,
    `WorkflowExecutionFailed.new_execution_run_id` SHALL be `None`.
 3. FOR ALL Failed-with-retry closes, exactly one successor SHALL be written with the close, retaining the same `new_execution_run_id` across conflict retries. Only the explicit size fallback SHALL write it separately, using that same identity.
 
@@ -311,21 +311,21 @@ inspection is conformant.
    `new_execution_run_id = Some(_)`.
    `// Feature: workflow-retry-chain, Property 1`
 
-### Requirement P2: Maximum-Attempts Failure Is Terminal
-1. FOR ALL open WorkflowState at `attempt == MaximumAttempts`, WHEN the failure-close is applied with a
+### Requirement P2: Maximum-Attempts Failure Without Cron Is Terminal
+1. FOR ALL open WorkflowState at `attempt == MaximumAttempts` without a selected cron continuation, WHEN the failure-close is applied with a
    "terminal(MaximumAttemptsReached)" `RetryContinuation`, THE emitted `WorkflowExecutionFailed` SHALL
    carry `retry_state = MaximumAttemptsReached` and `new_execution_run_id = None`.
    `// Feature: workflow-retry-chain, Property 2`
 
-### Requirement P3: Non-Retryable Failure Is Terminal
-1. FOR ALL open WorkflowState with a `RetryPolicy` whose `NonRetryableErrorTypes` matches the failure,
+### Requirement P3: Non-Retryable Failure Without Cron Is Terminal
+1. FOR ALL open WorkflowState with a `RetryPolicy` whose `NonRetryableErrorTypes` matches the failure and without a selected cron continuation,
    WHEN the failure-close is applied with a "terminal(NonRetryableFailure)" `RetryContinuation`, THE
    emitted `WorkflowExecutionFailed` SHALL carry `retry_state = NonRetryableFailure` and
    `new_execution_run_id = None`.
    `// Feature: workflow-retry-chain, Property 3`
 
 ### Requirement P4: No Retry Policy Preserves Existing Behaviour
-1. FOR ALL open WorkflowState with `retry_policy == None`, WHEN the failure-close is applied, THE emitted
+1. FOR ALL open WorkflowState with `retry_policy == None` and no selected cron continuation, WHEN the failure-close is applied, THE emitted
    `WorkflowExecutionFailed` SHALL carry `retry_state = RetryPolicyNotSet` and
    `new_execution_run_id = None` (unchanged from today).
    `// Feature: workflow-retry-chain, Property 4`

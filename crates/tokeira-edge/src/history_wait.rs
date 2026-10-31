@@ -15,8 +15,9 @@ use tokeira_kernel::{HistoryEvent, LoadedRun, Transition};
 use tokeira_storage::{
     AttributedHistoryEvent, BacklogEntry, BundleLease, CommitResult, DeleteRunRequest,
     DeleteRunResult, DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, LeaseOutcome,
-    LeaseRepository, RequestRecord, RunHistoryStats, RunRepository, TransitionAuditRecord,
-    WorkerDeploymentVersionKey, WorkflowRuleCreateResult, WorkflowRuleDeleteResult, WriteFence,
+    LeaseRepository, PairCommitResult, RequestRecord, RunHistoryStats, RunRepository,
+    TransitionAuditRecord, WorkerDeploymentVersionKey, WorkflowRuleCreateResult,
+    WorkflowRuleDeleteResult, WriteFence,
 };
 use tokeira_types::{
     ExecutionRef, NamespaceId, QueueKey, RequestId, RunId, RunKey, ShardEpoch, ShardId, WorkflowId,
@@ -227,6 +228,33 @@ where
             && let Some(last_event_id) = last_event_id
         {
             self.waits.notify(run_key, last_event_id).await;
+        }
+        Ok(result)
+    }
+
+    async fn commit_transition_pair(
+        &self,
+        run_key: RunKey,
+        closing: Transition,
+        successor_run_key: RunKey,
+        successor: Transition,
+        fence: WriteFence,
+    ) -> Result<PairCommitResult> {
+        let closing_last = closing.history_events.last().map(|event| event.event_id);
+        let successor_last = successor.history_events.last().map(|event| event.event_id);
+        let result = self
+            .inner
+            .commit_transition_pair(run_key, closing, successor_run_key, successor, fence)
+            .await?;
+        // Both histories are durable before either waiter wakes. Conflicts and
+        // size refusals publish nothing and must not announce uncommitted events.
+        if matches!(result, PairCommitResult::Applied { .. }) {
+            if let Some(last_event_id) = closing_last {
+                self.waits.notify(run_key, last_event_id).await;
+            }
+            if let Some(last_event_id) = successor_last {
+                self.waits.notify(successor_run_key, last_event_id).await;
+            }
         }
         Ok(result)
     }
@@ -520,8 +548,8 @@ mod tests {
     use super::*;
     use time::Duration;
     use tokeira_kernel::{
-        BasicKernel, Command, Kernel, StartRequest, WorkflowIdConflictPolicy,
-        WorkflowIdReusePolicy,
+        BasicKernel, Command, Kernel, RetryState, StartRequest, WorkflowExecutionTimedOutRequest,
+        WorkflowIdConflictPolicy, WorkflowIdReusePolicy, WorkflowTimeoutType,
         state::{VersioningOverride, WorkerDeploymentVersionRef},
     };
     use tokeira_storage::{BuildId, DeploymentName, InMemoryStore};
@@ -618,6 +646,113 @@ mod tests {
                 .expect("commit pinned start"),
             CommitResult::Applied { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn atomic_successor_commit_notifies_both_histories_only_after_application() {
+        let inner = Arc::new(InMemoryStore::default());
+        let waits = HistoryWaitRegistry::default();
+        let repo = HistoryNotifyingRepository::new(inner.clone(), waits.clone());
+        let namespace_id = NamespaceId::new();
+        let version = WorkerDeploymentVersionKey {
+            deployment_name: DeploymentName("deployment".into()),
+            build_id: BuildId("build".into()),
+        };
+        let start = pinned_start_transition(namespace_id, &version);
+        let state = start.next_state.clone();
+        let run_key = state.run_key;
+        inner
+            .commit_transition(run_key, start, WriteFence::Unfenced)
+            .await
+            .unwrap();
+        let successor = pinned_start_transition(namespace_id, &version);
+        let successor_key = successor.next_state.run_key;
+        let closing = BasicKernel
+            .apply(
+                LoadedRun::Existing(state.clone()),
+                Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
+                    timeout_type: WorkflowTimeoutType::RunTimeout,
+                    retry_state: RetryState::InProgress,
+                    new_execution_run_id: Some(successor.next_state.run_id),
+                    now: state.started_at + Duration::seconds(10),
+                }),
+            )
+            .unwrap();
+        let closing_last = closing.history_events.last().unwrap().event_id;
+        let successor_last = successor.history_events.last().unwrap().event_id;
+        let mut closing_waiter = waits.receiver(run_key, state.last_event_id).await;
+        let mut successor_waiter = waits.receiver(successor_key, 0).await;
+
+        assert!(
+            repo.commit_transition_pair(
+                run_key,
+                closing.clone(),
+                run_key,
+                successor.clone(),
+                WriteFence::Unfenced,
+            )
+            .await
+            .is_err()
+        );
+        assert!(!closing_waiter.has_changed().unwrap());
+        assert!(!successor_waiter.has_changed().unwrap());
+
+        assert!(matches!(
+            repo.commit_transition_pair(
+                run_key,
+                closing.clone(),
+                successor_key,
+                successor.clone(),
+                WriteFence::Unfenced,
+            )
+            .await
+            .unwrap(),
+            PairCommitResult::Applied { .. }
+        ));
+        assert!(closing_waiter.has_changed().unwrap());
+        assert!(successor_waiter.has_changed().unwrap());
+        assert_eq!(*closing_waiter.borrow_and_update(), closing_last);
+        assert_eq!(*successor_waiter.borrow_and_update(), successor_last);
+        assert_eq!(
+            inner
+                .find_latest_run(namespace_id, &state.workflow_id)
+                .await
+                .unwrap(),
+            Some(successor_key)
+        );
+        assert_eq!(
+            inner
+                .read_history_event(run_key, closing_last)
+                .await
+                .unwrap()
+                .unwrap()
+                .event_id,
+            closing_last
+        );
+        assert_eq!(
+            inner
+                .read_history_event(successor_key, successor_last)
+                .await
+                .unwrap()
+                .unwrap()
+                .event_id,
+            successor_last
+        );
+
+        assert!(matches!(
+            repo.commit_transition_pair(
+                run_key,
+                closing,
+                successor_key,
+                successor,
+                WriteFence::Unfenced,
+            )
+            .await
+            .unwrap(),
+            PairCommitResult::Conflict { .. }
+        ));
+        assert!(!closing_waiter.has_changed().unwrap());
+        assert!(!successor_waiter.has_changed().unwrap());
     }
 
     #[tokio::test]

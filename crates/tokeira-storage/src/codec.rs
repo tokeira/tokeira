@@ -42,15 +42,14 @@
 //! # The envelope versions
 //!
 //! This release writes [`WORKFLOW_STATE_ENVELOPE_VERSION`] and also reads
-//! [`PREVIOUS_WORKFLOW_STATE_ENVELOPE_VERSION`], which every release before it wrote.
-//! The layout is the same under both. Under the previous version, each activity's
-//! retired input and header fields may hold the activity's input and header, which
-//! decoding drops; this release writes them empty, since the input and header live
-//! only in the activity's ActivityTaskScheduled event
-//! (`activity-inputs-from-history`). The new version exists so that a release before
-//! this one, which checks for the previous version only, refuses a state this
-//! release wrote with [`BlobFormatError`], instead of delivering its activities with
-//! empty inputs.
+//! [`PREVIOUS_WORKFLOW_STATE_ENVELOPE_VERSION`] and
+//! [`PRE_OUTBOUND_WORKFLOW_STATE_ENVELOPE_VERSION`] as legacy formats. Positional
+//! state layout stays frozen; activity inputs remain in history. The current
+//! envelope establishes the required outbound-state contract, so older writers
+//! reject it instead of dropping child seeds/gates. An absent outbound section
+//! means empty metadata only under the current envelope. In a legacy envelope it
+//! means unknown preparation state, and ordinary writes refuse it until the checked
+//! cutover supplies the missing metadata. A present section has its own exact version.
 //!
 //! Section [`ACTIVITY_HEARTBEAT_SECTION`] holds each activity's last heartbeat time, and
 //! section [`SIGNAL_COUNT_SECTION`] the run's signal count (signal-update-limits,
@@ -85,17 +84,24 @@ use tokeira_types::{EventPrincipal, RunKey};
 
 use crate::{BacklogPayload, ProjectionContext};
 
-/// Magic prefix of an enveloped `workflow_hot.state_data` blob that this release
-/// writes (`"TKW2"`).
-pub const WORKFLOW_STATE_ENVELOPE_VERSION: u32 = 0x544B_5732;
+#[cfg(test)]
+mod outbound_tests;
 
-/// Magic prefix of the `workflow_hot.state_data` blobs that releases before
-/// `activity-inputs-from-history` wrote (`"TKWS"`). This release reads them; the
-/// releases that wrote them refuse a blob of [`WORKFLOW_STATE_ENVELOPE_VERSION`].
+/// Magic prefix of an enveloped `workflow_hot.state_data` blob that this release
+/// writes (`"TKW3"`). Required outbound metadata cannot be ignored by an old writer.
+pub const WORKFLOW_STATE_ENVELOPE_VERSION: u32 = 0x544B_5733;
+
+/// Original envelope (`"TKWS"`), retained for explicit legacy reads.
 pub const PREVIOUS_WORKFLOW_STATE_ENVELOPE_VERSION: u32 = 0x544B_5753;
 
-/// Magic prefix of an enveloped `history_batch.events_data` blob (`"TKHB"`).
-pub const HISTORY_BATCH_ENVELOPE_VERSION: u32 = 0x544B_4842;
+/// Pre-outbound envelope (`"TKW2"`), decoded as legacy until checked preparation.
+pub const PRE_OUTBOUND_WORKFLOW_STATE_ENVELOPE_VERSION: u32 = 0x544B_5732;
+
+/// Magic prefix of an enveloped `history_batch.events_data` blob (`"TKH2"`).
+pub const HISTORY_BATCH_ENVELOPE_VERSION: u32 = 0x544B_4832;
+
+/// History before required child reuse-policy persistence (`"TKHB"`).
+pub const PREVIOUS_HISTORY_BATCH_ENVELOPE_VERSION: u32 = 0x544B_4842;
 
 /// Magic that opens the state extension after a hot-state blob's state (`"TKWX"`).
 pub const WORKFLOW_STATE_EXTENSION_MAGIC: u32 = 0x544B_5758;
@@ -123,6 +129,9 @@ pub const HISTORY_ADMITTED_UPDATES_SECTION: u32 = 4;
 /// Written only when the run has completed an update, so any other state encodes as
 /// it did before the set existed.
 pub const COMPLETED_UPDATES_SECTION: u32 = 5;
+
+/// Required outbound-state layout, protected by the new state envelope.
+pub const OUTBOUND_STATE_SECTION: u32 = 6;
 
 /// Whether `state` lacks the ids of updates it has completed: an open run with
 /// completions but an empty set. Each completion this release applies adds its id,
@@ -306,9 +315,10 @@ const WORKFLOW_STATE_KIND: &str = "workflow_hot.state_data";
 /// Serialize the current materialized workflow state for `workflow_hot`: the
 /// envelope, the state, then its state extension when one has data.
 ///
-/// A state with nothing to carry in an extension encodes to exactly the bytes
-/// Tokeira 0.2.0–0.5.1 write for it.
+/// Empty metadata adds no extension bytes; the current envelope still prevents
+/// an older writer from accepting the new required contract.
 pub fn encode_workflow_state(state: &WorkflowState) -> Result<Vec<u8>> {
+    validate_outbound_state(state)?;
     let mut bytes = encode_enveloped(WORKFLOW_STATE_ENVELOPE_VERSION, state)?;
     bytes.extend(encode_state_extension(state)?);
     Ok(bytes)
@@ -319,14 +329,17 @@ pub fn encode_workflow_state(state: &WorkflowState) -> Result<Vec<u8>> {
 /// version.
 #[cfg(test)]
 pub(crate) fn encode_workflow_state_as_previous_release(state: &WorkflowState) -> Result<Vec<u8>> {
-    let mut bytes = encode_enveloped(PREVIOUS_WORKFLOW_STATE_ENVELOPE_VERSION, state)?;
-    bytes.extend(encode_state_extension(state)?);
+    let mut legacy = state.clone();
+    legacy.outbound = None;
+    let mut bytes = encode_enveloped(PREVIOUS_WORKFLOW_STATE_ENVELOPE_VERSION, &legacy)?;
+    bytes.extend(encode_state_extension(&legacy)?);
     Ok(bytes)
 }
 
 /// The size [`encode_workflow_state`] writes for `state`, measured without
 /// encoding the state.
 pub fn workflow_state_encoded_len(state: &WorkflowState) -> Result<usize> {
+    validate_outbound_state(state)?;
     let enveloped =
         postcard::experimental::serialized_size(&(WORKFLOW_STATE_ENVELOPE_VERSION, state))?;
     Ok(enveloped + encode_state_extension(state)?.len())
@@ -362,6 +375,7 @@ pub fn decode_workflow_state(run_key: RunKey, bytes: &[u8]) -> Result<WorkflowSt
         &[
             WORKFLOW_STATE_ENVELOPE_VERSION,
             PREVIOUS_WORKFLOW_STATE_ENVELOPE_VERSION,
+            PRE_OUTBOUND_WORKFLOW_STATE_ENVELOPE_VERSION,
         ],
         run_key,
         bytes,
@@ -374,7 +388,33 @@ pub fn decode_workflow_state(run_key: RunKey, bytes: &[u8]) -> Result<WorkflowSt
             defect,
         })?;
     }
+    let (version, _) = postcard::take_from_bytes::<u32>(bytes)?;
+    if version == WORKFLOW_STATE_ENVELOPE_VERSION {
+        // The new envelope itself distinguishes an empty prepared state from
+        // missing legacy metadata. Nonempty selections always require section 6.
+        state.outbound.get_or_insert_with(Default::default);
+        validate_outbound_state(&state)?;
+    }
     Ok(state)
+}
+
+fn validate_outbound_state(state: &WorkflowState) -> Result<()> {
+    let defect = match &state.outbound {
+        None => Some("missing required outbound state section"),
+        Some(outbound) if outbound.version != tokeira_kernel::OUTBOUND_STATE_VERSION => {
+            Some("unsupported required outbound state version")
+        }
+        Some(_) => None,
+    };
+    if let Some(defect) = defect {
+        return Err(StateExtensionError {
+            kind: WORKFLOW_STATE_KIND,
+            run_key: state.run_key,
+            defect,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// The state extension for `state`, or no bytes when no section has data.
@@ -427,6 +467,14 @@ pub(crate) fn encode_state_extension(state: &WorkflowState) -> postcard::Result<
             payload: postcard::to_allocvec(&update_ids)?,
         });
     }
+    if let Some(outbound) = &state.outbound
+        && !outbound.is_empty()
+    {
+        sections.push(ExtensionSection {
+            tag: OUTBOUND_STATE_SECTION,
+            payload: postcard::to_allocvec(outbound)?,
+        });
+    }
     encode_extension(WORKFLOW_STATE_EXTENSION_MAGIC, &sections)
 }
 
@@ -462,6 +510,14 @@ pub(crate) fn apply_state_extension(
                     return Err("completed updates out of order or listed twice");
                 }
                 state.completed_updates = update_ids.into_iter().collect();
+            }
+            OUTBOUND_STATE_SECTION => {
+                let outbound = decode_exact::<tokeira_kernel::OutboundState>(&section.payload)
+                    .ok_or("undecodable required outbound state section")?;
+                if outbound.version != tokeira_kernel::OUTBOUND_STATE_VERSION {
+                    return Err("unsupported required outbound state version");
+                }
+                state.outbound = Some(outbound);
             }
             // A later release's section: its data is safe to drop by rule.
             _ => {}
@@ -569,7 +625,10 @@ pub fn encode_history_events(events: &[HistoryEvent]) -> Result<Vec<u8>> {
 pub fn decode_history_events(run_key: RunKey, bytes: &[u8]) -> Result<Vec<HistoryEvent>> {
     decode(envelope_payload(
         "history_batch.events_data",
-        &[HISTORY_BATCH_ENVELOPE_VERSION],
+        &[
+            HISTORY_BATCH_ENVELOPE_VERSION,
+            PREVIOUS_HISTORY_BATCH_ENVELOPE_VERSION,
+        ],
         run_key,
         bytes,
     )?)
@@ -850,11 +909,12 @@ mod tests {
 
     /// A deterministic run holding one fully populated activity, a timer and a
     /// started workflow task.
-    fn layout_state() -> WorkflowState {
+    pub(super) fn layout_state() -> WorkflowState {
         WorkflowState {
             used_worker_deployment_versions: None,
             completed_update_count: 1,
             signal_count: 0,
+            outbound: Some(Default::default()),
             run_key: run_key(),
             namespace_id: NamespaceId(Uuid::from_u128(11)),
             workflow_id: WorkflowId("workflow".into()),
@@ -950,11 +1010,9 @@ mod tests {
         encode(&(WORKFLOW_STATE_ENVELOPE_VERSION, state)).expect("encodes")
     }
 
-    /// A reader that knows the envelope version and no extension section, as
-    /// Tokeira 0.2.0–0.5.1 read theirs (`decode_enveloped` at v0.5.1): the
-    /// version, then `postcard::from_bytes`, which ignores any bytes after the
-    /// state.
-    fn pre_extension_decode(bytes: &[u8]) -> WorkflowState {
+    /// Inspect only the frozen positional payload, bypassing every extension.
+    /// This is not an old reader: real old readers reject the current envelope.
+    fn positional_decode(bytes: &[u8]) -> WorkflowState {
         let (version, rest) = postcard::take_from_bytes::<u32>(bytes).expect("version");
         assert_eq!(version, WORKFLOW_STATE_ENVELOPE_VERSION);
         postcard::from_bytes(rest).expect("state")
@@ -1246,7 +1304,10 @@ mod tests {
     fn workflow_state_layout_is_frozen() {
         let state = layout_state();
         let encoded = encode_workflow_state(&state).expect("encodes");
-        assert_eq!(hex(&encoded), FROZEN_LAYOUT_HEX);
+        assert_eq!(
+            hex(&encode(&(PRE_OUTBOUND_WORKFLOW_STATE_ENVELOPE_VERSION, &state)).unwrap()),
+            FROZEN_LAYOUT_HEX
+        );
         assert_eq!(encoded, positional_encoding(&state));
         assert_eq!(
             decode_workflow_state(run_key(), &encoded).expect("decodes"),
@@ -1279,13 +1340,12 @@ mod tests {
             previous
         );
         let decoded = decode_workflow_state(run_key(), &previous).expect("decodes");
-        assert_eq!(decoded, layout_state());
-        // The run's next write holds neither the input nor the header, under this
-        // release's version.
-        assert_eq!(
-            hex(&encode_workflow_state(&decoded).expect("encodes")),
-            FROZEN_LAYOUT_HEX
-        );
+        let mut expected = layout_state();
+        expected.outbound = None;
+        assert_eq!(decoded, expected);
+        // Reading a legacy row is allowed for checked cutover, but an ordinary
+        // write cannot silently turn unknown child identities into an empty set.
+        assert!(encode_workflow_state(&decoded).is_err());
     }
 
     #[test]
@@ -1318,9 +1378,13 @@ mod tests {
             let scheduled = scheduled_inputs(&state, &generated);
             let previous = previous_release_encoding(&state, &scheduled);
             let decoded = decode_workflow_state(run_key(), &previous).expect("decodes");
-            prop_assert_eq!(&decoded, &state);
-            // The next write is this release's state, which holds no input or header.
-            let written = encode_workflow_state(&decoded).expect("encodes");
+            let mut expected = state.clone();
+            expected.outbound = None;
+            prop_assert_eq!(&decoded, &expected);
+            prop_assert!(encode_workflow_state(&decoded).is_err());
+            let mut prepared = decoded;
+            prepared.outbound = Some(Default::default());
+            let written = encode_workflow_state(&prepared).expect("encodes");
             prop_assert_eq!(&written, &encode_workflow_state(&state).expect("encodes"));
             let refused = previous_release_decode(&written)
                 .expect_err("the previous release refuses it")
@@ -1437,7 +1501,7 @@ mod tests {
         ) {
             let mut state = layout_state();
             let positional = positional_encoding(&state);
-            prop_assert_eq!(hex(&positional), FROZEN_LAYOUT_HEX);
+            prop_assert_eq!(hex(&encode(&(PRE_OUTBOUND_WORKFLOW_STATE_ENVELOPE_VERSION, &state)).unwrap()), FROZEN_LAYOUT_HEX);
             state.used_worker_deployment_versions = versions.clone();
             if heartbeat {
                 state.activities.get_mut("activity-a").unwrap().last_heartbeat_at = Some(at(7));
@@ -1445,7 +1509,7 @@ mod tests {
             let bytes = encode_workflow_state(&state).unwrap();
             prop_assert!(bytes.starts_with(&positional));
             prop_assert_eq!(decode_workflow_state(run_key(), &bytes).unwrap(), state.clone());
-            prop_assert_eq!(pre_extension_decode(&bytes).used_worker_deployment_versions, None);
+            prop_assert_eq!(positional_decode(&bytes).used_worker_deployment_versions, None);
             let extension = encode_state_extension(&state).unwrap();
             let mut sections = if extension.is_empty() { Vec::new() } else {
                 decode_extension(WORKFLOW_STATE_EXTENSION_MAGIC, &extension).unwrap()
@@ -1791,12 +1855,14 @@ mod tests {
             prop_assert_eq!(decode_workflow_state(run_key(), &encoded).expect("decodes"), state);
         }
 
-        // Feature: activity-heartbeat-time, Property 3: Pre-extension readers see the
-        // state
+        // Feature: activity-heartbeat-time, Property 3: The positional layout is
+        // unchanged; only a reader accepting the current envelope may use it.
         #[test]
-        fn property_pre_extension_readers_see_the_state(state in arb_state()) {
+        fn property_positional_payload_is_unchanged(state in arb_state()) {
             let encoded = encode_workflow_state(&state).expect("encodes");
-            prop_assert_eq!(pre_extension_decode(&encoded), without_times(state));
+            let mut positional = without_times(state);
+            positional.outbound = None;
+            prop_assert_eq!(positional_decode(&encoded), positional);
         }
 
         // Feature: signal-update-limits, Property 3: The stored count round-trips
@@ -1809,7 +1875,8 @@ mod tests {
             // A reader without the count sees the state as having recorded none.
             let mut without_count = without_times(state);
             without_count.signal_count = 0;
-            prop_assert_eq!(pre_extension_decode(&encoded), without_count);
+            without_count.outbound = None;
+            prop_assert_eq!(positional_decode(&encoded), without_count);
         }
 
         // Feature: admitted-updates-after-restart, Property 5: History admission is stored
@@ -1839,7 +1906,8 @@ mod tests {
             // A reader without the section sees the run holding none.
             let mut without = without_times(state);
             without.history_admitted_updates.clear();
-            prop_assert_eq!(pre_extension_decode(&encoded), without);
+            without.outbound = None;
+            prop_assert_eq!(positional_decode(&encoded), without);
         }
 
         // Feature: update-refusals, Property 5: A run from before this change recovers its ids
@@ -1866,7 +1934,8 @@ mod tests {
             // A reader without the section sees the run holding none.
             let mut without = state.clone();
             without.completed_updates.clear();
-            prop_assert_eq!(pre_extension_decode(&encoded), without_times(without));
+            without.outbound = None;
+            prop_assert_eq!(positional_decode(&encoded), without_times(without));
         }
 
         // Feature: activity-heartbeat-time, Property 4: Malformed extensions are
@@ -1890,9 +1959,9 @@ mod tests {
         #[test]
         fn property_unknown_sections_and_activities_are_ignored(
             state in arb_state(),
-            // Tags 1 to 5 are known; anything above is a later release's.
+            // Tags 1 to 6 are known; anything above is a later optional section.
             unknown in proptest::collection::btree_map(
-                6u32..64,
+                7u32..64,
                 proptest::collection::vec(any::<u8>(), 0..16),
                 0..3,
             ),

@@ -12,6 +12,8 @@
 //! first part of one version to the parts of another. A history batch never changes,
 //! but a purge removes it: the purge removes a run's parts only after every one of
 //! its batch rows, so a batch read in one snapshot has its parts in that snapshot.
+//! A stopped-writer upgrade can instead store a TKUP pointer with a NULL count;
+//! that pointer and its immutable pages require the same snapshot discipline.
 
 use std::collections::BTreeMap;
 
@@ -198,6 +200,13 @@ pub(super) async fn join_state(
     first: Vec<u8>,
     count: Option<i32>,
 ) -> Result<Vec<u8>> {
+    if let Some(bytes) = super::outbound_upgrade_parts::read(connection, run_key, &first).await? {
+        anyhow::ensure!(
+            count.is_none(),
+            "prepared-state pointer has canonical tail parts"
+        );
+        return Ok(bytes);
+    }
     join_value(
         connection,
         run_key,
@@ -207,33 +216,6 @@ pub(super) async fn join_state(
         count,
     )
     .await
-}
-
-/// The parts after the first of a run's state, for a reader that joins them with
-/// [`join_state_parts`] apart from reading them.
-pub(super) async fn read_state_parts(
-    connection: &mut PgConnection,
-    run_key: RunKey,
-) -> Result<NumberedParts> {
-    read_parts(connection, run_key, RunValueKind::State, STATE_VALUE_KEY).await
-}
-
-/// Join a run's state from parts already read. Fails only when the parts don't
-/// fit together.
-pub(super) fn join_state_parts(
-    run_key: RunKey,
-    first: Vec<u8>,
-    count: Option<i32>,
-    rest: NumberedParts,
-) -> Result<Vec<u8>> {
-    join(
-        run_key,
-        RunValueKind::State,
-        STATE_VALUE_KEY,
-        first,
-        count,
-        rest,
-    )
 }
 
 fn join(
@@ -257,6 +239,12 @@ fn join(
         count,
         rest,
     )?)
+}
+
+/// Whether a hot-row value requires additional reads in the same snapshot.
+/// Unknown TKUP versions still enter the strict envelope reader and fail closed.
+pub(super) fn state_needs_snapshot(first: &[u8], count: Option<i32>) -> bool {
+    count.is_some() || first.starts_with(b"TKUP")
 }
 
 /// Read a run's state whole in a read-only snapshot of its own, or `None` when the
@@ -293,10 +281,10 @@ pub(super) async fn whole_states(
 ) -> Result<Vec<(Uuid, Option<Vec<u8>>)>> {
     let mut states = Vec::with_capacity(rows.len());
     for (run_key, first, count) in rows {
-        let state = if count.is_none() {
-            Some(first)
-        } else {
+        let state = if state_needs_snapshot(&first, count) {
             read_state_in_snapshot(connection, RunKey(run_key)).await?
+        } else {
+            Some(first)
         };
         states.push((run_key, state));
     }

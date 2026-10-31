@@ -11,6 +11,9 @@ pub(super) struct PreparedTransition {
     context: ProjectionContext,
     history_size_bytes: i64,
     workflow_dispatch: Option<WorkflowDispatchRow>,
+    operations: Vec<crate::OperationRow>,
+    intents: Vec<crate::IntentRow>,
+    pub(super) outbound_origin: Option<tokeira_kernel::OutboundOrigin>,
 }
 
 pub(super) fn prepare(
@@ -38,6 +41,9 @@ pub(super) fn prepare(
         InMemoryStore::effective_shard_count(store),
     );
     let workflow_dispatch = derive_workflow_dispatch(&state, execution_home);
+    let operations = crate::derive_operations(&state, execution_home)?;
+    let intents =
+        crate::derive_close_intents(store.runs.get(&run_key), &transition, execution_home)?;
     if let Some(row) = &workflow_dispatch {
         row.validate()?;
     }
@@ -65,6 +71,9 @@ pub(super) fn prepare(
         context,
         history_size_bytes,
         workflow_dispatch,
+        operations,
+        intents,
+        outbound_origin: None,
     })
 }
 
@@ -79,7 +88,19 @@ pub(super) fn write(
         context,
         history_size_bytes,
         workflow_dispatch,
+        operations,
+        intents,
+        outbound_origin,
     } = prepared;
+    store
+        .outbound_operations
+        .retain(|key, _| key.source_run != run_key);
+    for row in operations {
+        store.outbound_operations.insert(row.incarnation.key, row);
+    }
+    for row in intents {
+        store.outbound_intents.insert(row.key, row);
+    }
     let workflow_key = (state.namespace_id, state.workflow_id.0.clone());
     // The History Size advances with the batch it accounts for, under the
     // same lock acquisition, exactly as the DSQL commit writes the column
@@ -125,6 +146,7 @@ pub(super) fn write(
                 run_key,
                 request_id: op.request_id.clone(),
                 first_seen_transition_seq: state.transition_seq,
+                outbound_origin,
             },
         );
     }
@@ -323,6 +345,11 @@ impl InMemoryStore {
         fence.ensure_home(home)?;
         store.check_fence(&fence)?;
         pair_checkpoint(&mut store, 1)?;
+        if super::preparation::target_is_preparing(&store, successor_run_key) {
+            return Err(
+                crate::RecoveryError::InvalidPreparation("successor is being prepared").into(),
+            );
+        }
         if let Some(result) = check_run(&mut store, run_key, &closing, false) {
             return Ok(result);
         }
@@ -343,6 +370,7 @@ impl InMemoryStore {
                 reason: "current execution no longer names closing run".into(),
             });
         }
+        super::successor::guard_pointer(&store, &successor.next_state)?;
         pair_checkpoint(&mut store, 4)?;
         let closing = prepare(&store, run_key, closing)?;
         pair_checkpoint(&mut store, 5)?;

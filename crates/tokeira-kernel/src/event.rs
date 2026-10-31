@@ -900,9 +900,117 @@ pub enum HistoryEventKind {
         workflow_task_completed_event_id: i64,
         patch: SearchAttributesPatch,
     },
+    /// Child initiation with its accepted reuse policy, appended to preserve all
+    /// older postcard discriminants. Both variants map to the existing upstream event.
+    StartChildWorkflowExecutionInitiatedV2 {
+        workflow_task_completed_event_id: i64,
+        child_workflow_id: WorkflowId,
+        workflow_type: WorkflowType,
+        task_queue: TaskQueueName,
+        input: Payloads,
+        namespace_id: NamespaceId,
+        namespace: Option<String>,
+        header: Option<Headers>,
+        memo: Memo,
+        search_attributes: SearchAttributes,
+        workflow_execution_timeout: Option<Duration>,
+        workflow_run_timeout: Option<Duration>,
+        workflow_task_timeout: Duration,
+        retry_policy: Option<RetryPolicy>,
+        cron_schedule: Option<String>,
+        parent_close_policy: ParentClosePolicy,
+        /// Raw child-level Priority override.
+        #[serde(default)]
+        priority: Option<Priority>,
+        /// Accepted reuse policy; legacy initiation events did not persist it.
+        reuse_policy: crate::WorkflowIdReusePolicy,
+    },
+    /// Resolution retaining the accepted control value and completion identity.
+    ExternalWorkflowExecutionSignaledV2 {
+        initiated_event_id: i64,
+        namespace_id: NamespaceId,
+        namespace: Option<String>,
+        target_workflow_id: WorkflowId,
+        target_run_id: Option<RunId>,
+        metadata: crate::ExternalResolutionMetadata,
+    },
+    /// Resolution retaining the accepted control value and completion identity.
+    SignalExternalWorkflowExecutionFailedV2 {
+        initiated_event_id: i64,
+        namespace_id: NamespaceId,
+        namespace: Option<String>,
+        target_workflow_id: WorkflowId,
+        target_run_id: Option<RunId>,
+        cause: String,
+        metadata: crate::ExternalResolutionMetadata,
+    },
+    /// Resolution retaining the accepted control value and completion identity.
+    RequestCancelExternalWorkflowExecutionFailedV2 {
+        initiated_event_id: i64,
+        namespace_id: NamespaceId,
+        namespace: Option<String>,
+        target_workflow_id: WorkflowId,
+        target_run_id: Option<RunId>,
+        cause: String,
+        metadata: crate::ExternalResolutionMetadata,
+    },
+    /// Child terminal event retaining the actual final run identity.
+    ChildWorkflowExecutionTerminatedV2 {
+        child_workflow_id: WorkflowId,
+        namespace_id: NamespaceId,
+        namespace: Option<String>,
+        child_run_id: Option<RunId>,
+        workflow_type: WorkflowType,
+        initiated_event_id: i64,
+        started_event_id: i64,
+    },
+
+    /// Child terminal event retaining the actual final run identity.
+    ChildWorkflowExecutionTimedOutV2 {
+        child_workflow_id: WorkflowId,
+        namespace_id: NamespaceId,
+        namespace: Option<String>,
+        child_run_id: Option<RunId>,
+        workflow_type: WorkflowType,
+        retry_state: RetryState,
+        initiated_event_id: i64,
+        started_event_id: i64,
+    },
 }
 
 impl HistoryEventKind {
+    /// Actual terminal child run on formats that persisted this identity.
+    pub fn child_terminal_run_id(&self) -> Option<RunId> {
+        match self {
+            Self::ChildWorkflowExecutionTerminatedV2 { child_run_id, .. }
+            | Self::ChildWorkflowExecutionTimedOutV2 { child_run_id, .. } => *child_run_id,
+            _ => None,
+        }
+    }
+
+    /// Full resolution metadata carried only by the new envelope variants.
+    pub fn external_resolution_metadata(&self) -> Option<&crate::ExternalResolutionMetadata> {
+        match self {
+            Self::ExternalWorkflowExecutionSignaledV2 { metadata, .. }
+            | Self::SignalExternalWorkflowExecutionFailedV2 { metadata, .. }
+            | Self::RequestCancelExternalWorkflowExecutionFailedV2 { metadata, .. } => {
+                Some(metadata)
+            }
+            _ => None,
+        }
+    }
+    /// Accepted child reuse policy, or `None` when this event carries no policy.
+    /// Legacy child initiations must not be recovered by guessing a default.
+    #[must_use]
+    pub fn child_reuse_policy(&self) -> Option<crate::WorkflowIdReusePolicy> {
+        match self {
+            Self::StartChildWorkflowExecutionInitiatedV2 { reuse_policy, .. } => {
+                Some(*reuse_policy)
+            }
+            _ => None,
+        }
+    }
+
     /// Return whether this event durably records accepted eager workflow start.
     ///
     /// The legacy started-event variant predates the field and therefore maps

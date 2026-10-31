@@ -48,7 +48,7 @@ const TRANSACTION_ATTEMPTS: usize = 5;
 /// selected as text, and the delete binds them in order and casts them back.
 pub(super) struct PurgeTable {
     pub(super) table: &'static str,
-    select_page: &'static str,
+    pub(super) select_page: &'static str,
     delete_page: &'static str,
 }
 
@@ -62,7 +62,17 @@ pub(super) struct PurgeTable {
 /// finds a batch in its snapshot finds the batch's parts there too
 /// (`large-value-parts`). The parts left without their row meanwhile, the
 /// state's and those of batches already purged, are read by no one.
-pub(super) const PURGE_TABLES: [PurgeTable; 6] = [
+pub(super) const PURGE_TABLES: [PurgeTable; 8] = [
+    PurgeTable {
+        table: "outbound_upgrade_state_part",
+        select_page: "SELECT generation::text,part_no::text FROM outbound_upgrade_state_part WHERE run_key = $1 ORDER BY generation,part_no LIMIT $2",
+        delete_page: "DELETE FROM outbound_upgrade_state_part WHERE run_key = $1 AND (generation,part_no) <= ($2::uuid,$3::integer)",
+    },
+    PurgeTable {
+        table: "run_operation",
+        select_page: "SELECT kind::text,initiating_event_id::text FROM run_operation WHERE source_run_key = $1 ORDER BY kind,initiating_event_id LIMIT $2",
+        delete_page: "DELETE FROM run_operation WHERE source_run_key = $1 AND (kind,initiating_event_id) <= ($2::smallint,$3::bigint)",
+    },
     PurgeTable {
         table: "request_dedupe",
         select_page: "SELECT key::text FROM request_dedupe WHERE run_key = $1 ORDER BY key LIMIT $2",
@@ -100,7 +110,7 @@ pub(super) const PURGE_TABLES: [PurgeTable; 6] = [
 
 /// Delete the run's rows of `table` up to and including the key `last`, a row of
 /// its select statement.
-async fn delete_through(
+pub(super) async fn delete_through(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_key: RunKey,
     table: &PurgeTable,
@@ -196,7 +206,7 @@ impl DsqlRunRepository {
                 // materialization reads `FOR UPDATE`: once it commits, none of
                 // them can commit a write after it.
                 sqlx::query(
-                    "UPDATE run_bulk_write SET phase = $2 WHERE run_key = $1 AND phase = $3",
+                    "UPDATE run_bulk_write SET phase = $2 WHERE run_key = $1 AND phase = $3 AND NOT EXISTS (SELECT 1 FROM run_preparation WHERE target_run_key = $1)",
                 )
                 .bind(run_key.0)
                 .bind(BulkWritePhase::Purging.to_db_smallint())
@@ -232,10 +242,10 @@ impl DsqlRunRepository {
                 .expect("the purge has a last table");
             for table in tables {
                 while retry_on_conflict(|| {
-                    self.purge_page(run_key, table, MAX_ROWS_PER_TRANSACTION)
+                    self.purge_page(run_key, table, MAX_ROWS_PER_TRANSACTION - 2)
                 })
                 .await?
-                    == MAX_ROWS_PER_TRANSACTION
+                    == MAX_ROWS_PER_TRANSACTION - 2
                 {}
             }
             // The parts last, and the record with their last page: the record
@@ -256,6 +266,9 @@ impl DsqlRunRepository {
     ) -> Result<usize> {
         let mut permit = self.director.acquire(DbClass::Commit).await?;
         let mut tx = permit.connection()?.begin().await?;
+        if !ordinary_purge_valid(&mut tx, run_key).await? {
+            return Ok(0);
+        }
         let keys = sqlx::query(table.select_page)
             .bind(run_key.0)
             .bind(i64::try_from(limit)?)
@@ -282,9 +295,12 @@ impl DsqlRunRepository {
     /// last page. Returns whether it was.
     async fn purge_last_page(&self, run_key: RunKey, table: &PurgeTable) -> Result<bool> {
         // A page leaves one row of the budget for the record.
-        let page = MAX_ROWS_PER_TRANSACTION - 1;
+        let page = MAX_ROWS_PER_TRANSACTION - 5;
         let mut permit = self.director.acquire(DbClass::Commit).await?;
         let mut tx = permit.connection()?.begin().await?;
+        if !ordinary_purge_valid(&mut tx, run_key).await? {
+            return Ok(true);
+        }
         let keys = sqlx::query(table.select_page)
             .bind(run_key.0)
             .bind(i64::try_from(page + 1)?)
@@ -296,13 +312,21 @@ impl DsqlRunRepository {
             delete_through(&mut tx, run_key, table, &keys[deleted - 1]).await?;
         }
         if last {
+            sqlx::query("DELETE FROM run_preparation WHERE target_run_key=$1 AND phase=5")
+                .bind(run_key.0)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM run_creation_claim WHERE run_key=$1")
+                .bind(run_key.0)
+                .execute(&mut *tx)
+                .await?;
             sqlx::query("DELETE FROM run_bulk_write WHERE run_key = $1")
                 .bind(run_key.0)
                 .execute(&mut *tx)
                 .await?;
         }
         tx.commit().await?;
-        metrics::record_dsql_rows_written("purge_run", (deleted + usize::from(last)) as u64);
+        metrics::record_dsql_rows_written("purge_run", (deleted + 3 * usize::from(last)) as u64);
         #[cfg(all(test, feature = "dsql-integration"))]
         super::pause_point::reached(super::pause_point::PauseKey::Purge(run_key)).await;
         Ok(last)
@@ -565,6 +589,7 @@ impl DsqlRunRepository {
             tx.rollback().await?;
             return Err(lost.into());
         }
+        super::preparation::claim_creation(&mut tx, run_key, run_key.0).await?;
         let existing = sqlx::query_as::<_, (i32,)>("SELECT 1 FROM workflow_hot WHERE run_key = $1")
             .bind(run_key.0)
             .fetch_optional(&mut *tx)
@@ -725,6 +750,63 @@ impl DsqlRunRepository {
     }
 }
 
+// Every purge page joins the visibility guard's OCC domain. In particular, a
+// purger paused before an earlier generation finished cannot delete a new one.
+async fn ordinary_purge_valid(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run: RunKey,
+) -> Result<bool> {
+    let phase = sqlx::query_as::<_, (i16,)>(SELECT_RECORD_FOR_UPDATE)
+        .bind(run.0)
+        .fetch_optional(&mut **tx)
+        .await?;
+    if phase != Some((BulkWritePhase::Purging.to_db_smallint(),)) {
+        return Ok(false);
+    }
+    let (protected,) = sqlx::query_as::<_, (bool,)>("SELECT EXISTS(SELECT 1 FROM workflow_hot WHERE run_key=$1) OR EXISTS(SELECT 1 FROM run_preparation WHERE target_run_key=$1 AND phase<>5)")
+        .bind(run.0).fetch_one(&mut **tx).await?;
+    if protected {
+        return Ok(false);
+    }
+    let (source_pinned,) = sqlx::query_as::<_, (bool,)>(
+        "SELECT EXISTS(SELECT 1 FROM run_intent WHERE source_run_key=$1)",
+    )
+    .bind(run.0)
+    .fetch_one(&mut **tx)
+    .await?;
+    if source_pinned {
+        return Ok(false);
+    }
+    let identity = sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT namespace_id,workflow_id FROM outbound_retained_run WHERE run_key=$1 FOR UPDATE",
+    )
+    .bind(run.0)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some((namespace, workflow)) = identity {
+        // Logical deletion cancels ordinary source operations. Live operations
+        // still pin target proof, and open children pin every reset ancestor in
+        // their parent's workflow until their terminal intent takes over.
+        let (pinned,) = sqlx::query_as::<_, (bool,)>("SELECT \
+            EXISTS(SELECT 1 FROM run_operation o JOIN workflow_hot h ON h.run_key=o.source_run_key WHERE o.target_namespace=$1 AND o.target_workflow_id=$2) OR \
+            EXISTS(SELECT 1 FROM run_intent WHERE target_namespace=$1 AND target_workflow_id=$2) OR \
+            EXISTS(SELECT 1 FROM outbound_parent_reference WHERE parent_namespace_id=$1 AND parent_workflow_id=$2)")
+            .bind(namespace).bind(workflow).fetch_one(&mut **tx).await?;
+        if pinned {
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM outbound_retained_run WHERE run_key=$1")
+            .bind(run.0)
+            .execute(&mut **tx)
+            .await?;
+    }
+    sqlx::query("DELETE FROM outbound_parent_reference WHERE child_run_key=$1")
+        .bind(run.0)
+        .execute(&mut **tx)
+        .await?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CopyItem, PURGE_TABLES};
@@ -771,6 +853,8 @@ mod tests {
         assert_eq!(
             tables,
             [
+                "outbound_upgrade_state_part",
+                "run_operation",
                 "request_dedupe",
                 "timer_bucket",
                 "activity_dispatch",
@@ -780,16 +864,20 @@ mod tests {
             ]
         );
         for table in &PURGE_TABLES {
+            let run_column = if table.table == "run_operation" {
+                "source_run_key"
+            } else {
+                "run_key"
+            };
             assert!(
                 table
                     .select_page
-                    .contains(&format!("FROM {} WHERE run_key = $1", table.table))
+                    .contains(&format!("FROM {} WHERE {run_column} = $1", table.table))
             );
-            assert!(
-                table
-                    .delete_page
-                    .starts_with(&format!("DELETE FROM {} WHERE run_key = $1", table.table))
-            );
+            assert!(table.delete_page.starts_with(&format!(
+                "DELETE FROM {} WHERE {run_column} = $1",
+                table.table
+            )));
         }
     }
 }

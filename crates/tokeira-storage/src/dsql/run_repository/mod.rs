@@ -97,11 +97,18 @@ mod large_value_tests;
 mod lease_fence_tests;
 mod leases;
 mod load;
+mod outbound;
+#[cfg(all(test, feature = "dsql-integration"))]
+mod outbound_live_tests;
+mod outbound_upgrade;
+mod outbound_upgrade_parts;
 mod pair;
 mod placement;
 #[cfg(all(test, feature = "dsql-integration"))]
 mod placement_tests;
+mod preparation;
 mod run_value_parts;
+mod successor;
 mod timers;
 #[cfg(all(test, feature = "dsql-integration"))]
 mod update_refusals_tests;
@@ -224,6 +231,7 @@ pub struct DsqlRunRepository {
     /// prove routing and zero-limit behavior without opening SQL connections.
     director: Arc<dyn DsqlConnectionAcquirer>,
     placement_ready: std::sync::atomic::AtomicBool,
+    outbound_ready: std::sync::atomic::AtomicBool,
     /// Non-zero runtime shard count used to map run keys to shard ownership.
     shard_count: u32,
     /// Non-zero projection partition count used when writing projection logs.
@@ -254,6 +262,7 @@ impl DsqlRunRepository {
         }
         Ok(Self {
             placement_ready: std::sync::atomic::AtomicBool::new(false),
+            outbound_ready: std::sync::atomic::AtomicBool::new(false),
             director: director as Arc<dyn DsqlConnectionAcquirer>,
             shard_count,
             projection_partition_count,
@@ -281,6 +290,7 @@ impl DsqlRunRepository {
         }
         Ok(Self {
             placement_ready: std::sync::atomic::AtomicBool::new(false),
+            outbound_ready: std::sync::atomic::AtomicBool::new(false),
             director,
             shard_count,
             projection_partition_count,
@@ -557,20 +567,169 @@ fn classify_connection_error(error: &anyhow::Error) -> Option<&'static str> {
 
 #[async_trait]
 impl RunRepository for DsqlRunRepository {
-    async fn commit_transition_pair(
+    async fn read_published_preparations(
         &self,
+        home: tokeira_types::ShardId,
+        bound: crate::ScanBound<uuid::Uuid>,
+        after: Option<uuid::Uuid>,
+        limit: usize,
+    ) -> anyhow::Result<crate::OutboundPage<uuid::Uuid, crate::PreparationToken>> {
+        self.do_published_preparations(home, bound, after, limit)
+            .await
+    }
+
+    async fn complete_run_preparation(
+        &self,
+        token: crate::PreparationToken,
+        fence: crate::WriteFence,
+    ) -> anyhow::Result<bool> {
+        self.do_complete_preparation(token, fence).await
+    }
+
+    async fn commit_successor_fallback(
+        &self,
+        run: tokeira_types::RunKey,
+        closing: tokeira_kernel::Transition,
+        start: Box<tokeira_kernel::StartRequest>,
+        fence: crate::WriteFence,
+    ) -> anyhow::Result<crate::CommitResult> {
+        Box::pin(self.do_commit_successor_fallback(run, closing, start, fence)).await
+    }
+
+    async fn find_run_preparation(
+        &self,
+        request_key: &str,
+    ) -> Result<Option<crate::PreparationToken>> {
+        self.do_find_run_preparation(request_key).await
+    }
+    async fn prepare_run_publication(
+        &self,
+        preparation: Box<crate::RunPreparation>,
+        fence: WriteFence,
+    ) -> Result<crate::PreparationToken> {
+        Box::pin(self.do_prepare_publication(preparation, fence)).await
+    }
+    async fn publish_prepared_run(
+        &self,
+        token: crate::PreparationToken,
+        fence: WriteFence,
+    ) -> Result<crate::PublicationResult> {
+        Box::pin(self.do_publish_preparation(token, fence)).await
+    }
+    async fn abandon_prepared_run(
+        &self,
+        token: crate::PreparationToken,
+        fence: WriteFence,
+    ) -> Result<bool> {
+        self.do_abandon_preparation(token, fence).await
+    }
+
+    async fn read_operation_page(
+        &self,
+        home: ShardId,
+        kind: tokeira_kernel::OperationKind,
+        bound: crate::ScanBound<tokeira_kernel::OperationKey>,
+        after: Option<tokeira_kernel::OperationKey>,
+        limit: usize,
+    ) -> Result<crate::OutboundPage<tokeira_kernel::OperationKey, crate::OperationRow>> {
+        self.do_read_operation_page(home, kind, bound, after, limit)
+            .await
+    }
+    async fn read_intent_page(
+        &self,
+        home: ShardId,
+        bound: crate::ScanBound<crate::IntentKey>,
+        after: Option<crate::IntentKey>,
+        limit: usize,
+    ) -> Result<crate::OutboundPage<crate::IntentKey, crate::IntentDescriptor>> {
+        self.do_read_intent_page(home, bound, after, limit).await
+    }
+    async fn load_intent(&self, key: crate::IntentKey) -> Result<Option<crate::IntentRow>> {
+        self.do_load_intent(key).await
+    }
+    async fn reconcile_outbound_run(
+        &self,
+        home: ShardId,
+        run: RunKey,
+        fence: WriteFence,
+    ) -> Result<()> {
+        self.do_reconcile_outbound_run(home, run, fence).await
+    }
+    async fn retire_intent(
+        &self,
+        proof: crate::IntentRetirement,
+        fence: WriteFence,
+    ) -> Result<bool> {
+        self.do_retire_intent(proof, fence).await
+    }
+    async fn commit_outbound_transition(
+        &self,
+        run: RunKey,
+        transition: Transition,
+        guard: crate::DeliveryGuard,
+        source_fence: WriteFence,
+        fence: WriteFence,
+    ) -> Result<CommitResult> {
+        Box::pin(self.do_commit_guarded(run, transition, Some((guard, source_fence)), fence)).await
+    }
+
+    // Allocate before constructing the erased future. An async-trait body would
+    // first capture two large inline transitions in its own outer allocation.
+    fn commit_transition_pair<'life0, 'async_trait>(
+        &'life0 self,
         run_key: RunKey,
         closing: Transition,
         successor_run_key: RunKey,
         successor: Transition,
         fence: WriteFence,
-    ) -> Result<crate::PairCommitResult> {
-        self.do_commit_transition_pair(run_key, closing, successor_run_key, successor, fence)
-            .await
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<crate::PairCommitResult>> + Send + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.do_commit_transition_pair(
+            run_key,
+            closing,
+            successor_run_key,
+            successor,
+            fence,
+        ))
     }
     fn placement_ready(&self) -> bool {
         self.placement_ready
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn outbound_ready(&self) -> bool {
+        self.outbound_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+    async fn ensure_outbound_prepared(&self) -> Result<()> {
+        self.do_ensure_outbound_prepared().await
+    }
+    async fn outbound_upgrade_status(
+        &self,
+    ) -> Result<crate::outbound_upgrade::OutboundUpgradeStatus> {
+        self.do_outbound_upgrade_status().await
+    }
+    async fn read_outbound_upgrade_run(
+        &self,
+        after: Option<RunKey>,
+    ) -> Result<Option<WorkflowState>> {
+        self.do_read_outbound_upgrade_run(after).await
+    }
+    async fn commit_outbound_upgrade_page(
+        &self,
+        expected: Option<crate::outbound_upgrade::OutboundUpgradeProgress>,
+        next: crate::outbound_upgrade::OutboundUpgradeProgress,
+        write: Option<crate::outbound_upgrade::OutboundUpgradeWrite>,
+    ) -> Result<()> {
+        self.do_commit_outbound_upgrade_page(expected, next, write)
+            .await
     }
 
     async fn prepare_placement_page(&self) -> Result<crate::PlacementPage> {
@@ -595,6 +754,34 @@ impl RunRepository for DsqlRunRepository {
 
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
         self.do_load_run(run_key).await
+    }
+
+    async fn load_outbound_source(&self, run: RunKey) -> Result<LoadedRun> {
+        match self.do_load_run(run).await? {
+            LoadedRun::Existing(state) => Ok(LoadedRun::Existing(state)),
+            LoadedRun::Absent => {
+                let mut permit = self.director.acquire(DbClass::Read).await?;
+                let mut tx = permit
+                    .connection()?
+                    .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    .await?;
+                let row = sqlx::query_as::<_, (Vec<u8>, Option<i32>)>(
+                    "SELECT state_data,state_parts FROM outbound_retained_run WHERE run_key=$1",
+                )
+                .bind(run.0)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let result = match row {
+                    Some((first, parts)) => LoadedRun::Existing(codec::decode_workflow_state(
+                        run,
+                        &run_value_parts::join_state(&mut tx, run, first, parts).await?,
+                    )?),
+                    None => LoadedRun::Absent,
+                };
+                tx.commit().await?;
+                Ok(result)
+            }
+        }
     }
 
     async fn load_run_with_stats(&self, run_key: RunKey) -> Result<(LoadedRun, RunHistoryStats)> {
@@ -1471,9 +1658,11 @@ mod tests {
     #[test]
     fn serialization_failure_detection_matches_sqlstate_40001() {
         let retryable = sqlx::Error::Database(Box::new(TestDatabaseError {
+            message: "test database error",
             code: Some("40001"),
         }));
         let other = sqlx::Error::Database(Box::new(TestDatabaseError {
+            message: "test database error",
             code: Some("23505"),
         }));
 
@@ -1487,6 +1676,7 @@ mod tests {
         let generic_error: Result<()> = Err(anyhow!("boom"));
         let serialization_error: Result<()> =
             Err(sqlx::Error::Database(Box::new(TestDatabaseError {
+                message: "test database error",
                 code: Some("40001"),
             }))
             .into());
@@ -1499,6 +1689,7 @@ mod tests {
     #[test]
     fn sqlstate_extraction_returns_database_error_code() {
         let error = anyhow!(sqlx::Error::Database(Box::new(TestDatabaseError {
+            message: "test database error",
             code: Some("23505"),
         })));
 
@@ -1905,6 +2096,7 @@ mod tests {
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,
+            outbound: Some(Default::default()),
             run_key,
             namespace_id: NamespaceId::new(),
             workflow_id: WorkflowId("workflow".to_owned()),
@@ -2055,12 +2247,13 @@ mod tests {
 
     #[derive(Debug)]
     pub(super) struct TestDatabaseError {
+        pub(super) message: &'static str,
         pub(super) code: Option<&'static str>,
     }
 
     impl fmt::Display for TestDatabaseError {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("test database error")
+            formatter.write_str(self.message)
         }
     }
 
@@ -2068,7 +2261,7 @@ mod tests {
 
     impl sqlx::error::DatabaseError for TestDatabaseError {
         fn message(&self) -> &str {
-            "test database error"
+            self.message
         }
 
         fn code(&self) -> Option<Cow<'_, str>> {

@@ -351,6 +351,7 @@ impl WorkflowRuntimeApi for RecordingRuntime {
         _run_key: RunKey,
         _operation_id: String,
         _scheduled_event_id: i64,
+        _expected_attempt: Option<u32>,
         _resolution: NexusResolution,
     ) -> Result<bool> {
         Ok(false)
@@ -362,6 +363,7 @@ impl WorkflowRuntimeApi for RecordingRuntime {
         _operation_id: String,
         _scheduled_event_id: i64,
         _requested_event_id: i64,
+        _expected_attempt: u32,
         _outcome: tokeira_kernel::NexusCancellationAttemptOutcome,
     ) -> Result<bool> {
         Ok(false)

@@ -260,6 +260,7 @@ fn make_open_state() -> WorkflowState {
         used_worker_deployment_versions: Some(Vec::new()),
         completed_update_count: 0,
         signal_count: 0,
+        outbound: Some(Default::default()),
         run_key: RunKey::new(),
         namespace_id: NamespaceId::new(),
         workflow_id: WorkflowId("workflow".into()),
@@ -6281,6 +6282,7 @@ fn start_child_workflow_happy_path() {
     assert!(matches!(
         transition.history_events[1].kind,
         HistoryEventKind::StartChildWorkflowExecutionInitiated { .. }
+            | HistoryEventKind::StartChildWorkflowExecutionInitiatedV2 { .. }
     ));
     assert!(matches!(
         transition.dispatch_ops[0],
@@ -8066,6 +8068,7 @@ fn cancel_nexus_operation_before_start_dispatches_after_started_resolution() {
         .apply(
             LoadedRun::Existing(requested.next_state),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::Started {
@@ -8110,6 +8113,7 @@ fn nexus_cancellation_retry_is_internal_until_acknowledged() {
         .apply(
             LoadedRun::Existing(requested.next_state),
             Command::NexusCancellationAttempted(NexusCancellationAttemptedRequest {
+                expected_attempt: 0,
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
                 requested_event_id,
@@ -8172,6 +8176,7 @@ fn nexus_cancellation_retry_is_internal_until_acknowledged() {
         .apply(
             LoadedRun::Existing(retried.next_state),
             Command::NexusCancellationAttempted(NexusCancellationAttemptedRequest {
+                expected_attempt: 1,
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
                 requested_event_id,
@@ -8218,6 +8223,7 @@ fn nexus_cancellation_non_retryable_failure_records_terminal_child_event() {
         .apply(
             LoadedRun::Existing(requested.next_state),
             Command::NexusCancellationAttempted(NexusCancellationAttemptedRequest {
+                expected_attempt: 0,
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
                 requested_event_id,
@@ -8299,6 +8305,7 @@ fn nexus_operation_resolved_started() {
         .apply(
             LoadedRun::Existing(state),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::Started {
@@ -8346,6 +8353,7 @@ fn nexus_operation_resolved_started_duplicate() {
         .apply(
             LoadedRun::Existing(state),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::Started {
@@ -8367,6 +8375,7 @@ fn nexus_operation_resolved_completed() {
         .apply(
             LoadedRun::Existing(state),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::Completed {
@@ -8401,6 +8410,7 @@ fn nexus_completion_before_start_records_token_before_empty_result() {
         .apply(
             LoadedRun::Existing(state),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::CompletionReceived {
@@ -8456,6 +8466,7 @@ fn nexus_completion_after_start_does_not_duplicate_started_event() {
         .apply(
             LoadedRun::Existing(state),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::CompletionReceived {
@@ -8489,6 +8500,7 @@ fn nexus_operation_resolved_completed_with_pending_wft() {
         .apply(
             LoadedRun::Existing(state),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::Completed {
@@ -8517,6 +8529,7 @@ fn nexus_operation_resolved_failed() {
         .apply(
             LoadedRun::Existing(state),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::Failed {
@@ -8548,6 +8561,7 @@ fn nexus_operation_resolved_attempt_failed_stays_pending() {
         .apply(
             LoadedRun::Existing(state),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::AttemptFailed {
@@ -8583,6 +8597,7 @@ fn nexus_operation_resolved_attempt_failed_stale_rejected() {
     let result = kernel().apply(
         LoadedRun::Existing(state),
         Command::NexusOperationResolved(NexusOperationResolvedRequest {
+            expected_attempt: None,
             operation_id: "op-1".into(),
             scheduled_event_id: 999,
             resolution: NexusResolution::AttemptFailed {
@@ -8655,6 +8670,7 @@ fn nexus_operation_resolved_canceled() {
         .apply(
             LoadedRun::Existing(state),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::Canceled,
@@ -8679,6 +8695,7 @@ fn nexus_operation_resolved_timed_out() {
         .apply(
             LoadedRun::Existing(state),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::TimedOut {
@@ -8704,6 +8721,7 @@ fn nexus_operation_resolved_unknown_operation() {
         .apply(
             LoadedRun::Existing(make_open_state()),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: "missing".into(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::Started {
@@ -8724,6 +8742,7 @@ fn nexus_operation_resolved_stale() {
         .apply(
             LoadedRun::Existing(state),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: "op-1".into(),
                 scheduled_event_id: 99,
                 resolution: NexusResolution::Started {
@@ -8749,6 +8768,7 @@ fn nexus_operation_resolved_absent_run() {
         .apply(
             LoadedRun::Absent,
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::Started {
@@ -8768,6 +8788,7 @@ fn nexus_operation_resolved_closed_run() {
         .apply(
             LoadedRun::Existing(make_closed_state()),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: "op-1".into(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::Started {

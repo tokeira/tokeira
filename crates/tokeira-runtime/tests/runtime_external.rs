@@ -83,7 +83,7 @@ async fn external_signal_delivery_signals_target_and_resolves_originator() -> Re
         history.iter().any(|event| {
             matches!(
                 &event.kind,
-                HistoryEventKind::ExternalWorkflowExecutionSignaled { target_workflow_id, .. }
+                HistoryEventKind::ExternalWorkflowExecutionSignaledV2 { target_workflow_id, .. }
                     if target_workflow_id == &target_id
             )
         })
@@ -242,7 +242,7 @@ async fn external_signal_cross_namespace_uses_target_namespace() -> Result<()> {
         history.iter().any(|event| {
             matches!(
                 &event.kind,
-                HistoryEventKind::ExternalWorkflowExecutionSignaled { target_workflow_id, .. }
+                HistoryEventKind::ExternalWorkflowExecutionSignaledV2 { target_workflow_id, .. }
                     if target_workflow_id == &target_id
             )
         })
@@ -305,7 +305,7 @@ async fn external_signal_not_found_delivers_failed_resolution() -> Result<()> {
         history.iter().any(|event| {
             matches!(
                 &event.kind,
-                HistoryEventKind::SignalExternalWorkflowExecutionFailed {
+                HistoryEventKind::SignalExternalWorkflowExecutionFailedV2 {
                     target_workflow_id,
                     cause,
                     ..

@@ -29,6 +29,7 @@ pub mod buffered_queries;
 #[cfg(test)]
 mod bug_condition_exploration_tests;
 pub mod chasm;
+#[cfg(test)]
 mod child_start;
 #[cfg(feature = "conformance")]
 pub mod conformance;
@@ -44,6 +45,11 @@ pub mod membership;
 pub mod metrics;
 pub mod nexus;
 pub mod nexus_http;
+mod outbound;
+pub use outbound::delivery::{
+    DeliveryPhase, OutboundDeliveryOutcome, OutboundDeliveryReference, OutboundDeliveryTransport,
+    OutboundTerminalCause,
+};
 pub mod publisher;
 mod purge;
 pub mod query;

@@ -113,6 +113,7 @@ pub enum PlacementPage {
 pub async fn prepare_execution_placement<R: RunRepository + ?Sized>(
     repo: &R,
 ) -> Result<PlacementProgress> {
+    repo.ensure_outbound_prepared().await?;
     let mut attempt = 0u64;
     loop {
         match repo.prepare_placement_page().await? {

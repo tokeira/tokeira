@@ -17,9 +17,9 @@ use anyhow::Result;
 use proptest::prelude::*;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    HistoryEvent, HistoryEventKind, LoadedRun, Reject, SignalRequest, SignalWithStartRequest,
-    StartRequest, TerminateRequest, Transition, UpdateProtocolBody, WorkflowCommand, WorkflowState,
-    WorkflowTaskCompletedRequest,
+    BasicKernel, Command, HistoryEvent, HistoryEventKind, Kernel, LoadedRun, Reject, SignalRequest,
+    SignalWithStartRequest, StartRequest, TerminateRequest, Transition, UpdateProtocolBody,
+    WorkflowCommand, WorkflowState, WorkflowTaskCompletedRequest,
     limits::{MAXIMUM_SIGNALS_PER_EXECUTION, UpdateLimit, UpdateLimitExceeded},
 };
 use tokeira_runtime::{
@@ -450,9 +450,9 @@ proptest! {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             let store = Arc::new(InMemoryStore::default());
-            let runtime = runtime(store.clone());
+            let initial = runtime(store.clone());
             let namespace_id = NamespaceId::new();
-            let sender = start(&runtime, namespace_id, "sender", "sender-queue").await.unwrap();
+            let sender = start(&initial, namespace_id, "sender", "sender-queue").await.unwrap();
             // 0: open; 1: at the limit; 2: closed; 3: missing; 4: the sender itself.
             let target_id = match target {
                 3 => "missing",
@@ -460,7 +460,7 @@ proptest! {
                 _ => "target",
             };
             let target_run = if target < 3 {
-                Some(start(&runtime, namespace_id, "target", QUEUE).await.unwrap())
+                Some(start(&initial, namespace_id, "target", QUEUE).await.unwrap())
             } else {
                 None
             };
@@ -469,28 +469,13 @@ proptest! {
             let initiated_event_id = 5;
             let delivery_request_id = format!("ext-signal-{sender:?}-{initiated_event_id}");
             let applied = already_applied && target_run.is_some();
-            if let Some(target_run) = target_run {
-                if applied {
-                    // An earlier delivery of this very signal reached the target.
-                    let result = runtime
-                        .signal_workflow(execution(namespace_id, "target"), signal(&delivery_request_id))
-                        .await;
-                    assert_eq!(answer(result), Answer::Recorded);
-                }
-                if target == 1 {
-                    seed(&store, target_run, |state| {
-                        state.signal_count = MAXIMUM_SIGNALS_PER_EXECUTION;
-                    })
-                    .await
-                    .unwrap();
-                }
-                if target == 2 {
-                    terminate(&runtime, execution(namespace_id, "target")).await.unwrap();
-                }
-            }
-            let task = poll(&runtime, namespace_id, "sender-queue").await.unwrap();
-            runtime
-                .complete_workflow_task(completion(
+            let task = poll(&initial, namespace_id, "sender-queue").await.unwrap();
+            let shutdown = initial.shutdown_handle();
+            shutdown.begin_shutdown();
+            drop(initial);
+            shutdown.wait(Instant::now() + std::time::Duration::from_secs(5)).await.unwrap();
+            let transition = BasicKernel.apply(store.load_run(sender).await.unwrap(),
+                Command::WorkflowTaskCompleted(completion(
                     task,
                     vec![WorkflowCommand::SignalExternalWorkflowExecution {
                         target_namespace_id: namespace_id,
@@ -502,9 +487,34 @@ proptest! {
                         header: None,
                         control: String::new(),
                     }],
-                ))
-                .await
-                .unwrap();
+                ))).unwrap();
+            let source = transition.next_state.clone();
+            store.commit_transition(sender, transition, WriteFence::Unfenced).await.unwrap();
+            if let Some(target_run) = target_run {
+                if applied {
+                    let row = tokeira_storage::derive_operations(&source, tokeira_types::ShardId(0)).unwrap()
+                        .into_iter().find(|row| row.incarnation.key.kind == tokeira_kernel::OperationKind::ExternalSignal).unwrap();
+                    let transition = BasicKernel.apply(store.load_run(target_run).await.unwrap(),
+                        Command::Signal(signal(&delivery_request_id))).unwrap();
+                    assert!(matches!(store.commit_outbound_transition(target_run, transition,
+                        tokeira_storage::DeliveryGuard::Operation {
+                            incarnation: row.incarnation, source_seq: source.transition_seq,
+                        }, WriteFence::Unfenced, WriteFence::Unfenced).await.unwrap(), CommitResult::Applied { .. }));
+                }
+                if target == 1 {
+                    seed(&store, target_run, |state| { state.signal_count = MAXIMUM_SIGNALS_PER_EXECUTION; })
+                        .await.unwrap();
+                }
+                if target == 2 {
+                    let transition = BasicKernel.apply(store.load_run(target_run).await.unwrap(),
+                        Command::Terminate(TerminateRequest {
+                            reason: "done".into(), details: None, identity: "tester".into(),
+                            links: Vec::new(), request: context("terminate"), now: OffsetDateTime::now_utc(),
+                        })).unwrap();
+                    store.commit_transition(target_run, transition, WriteFence::Unfenced).await.unwrap();
+                }
+            }
+            let _restarted = runtime(store.clone());
             let expected_failure = match target {
                 0 => None,
                 1 if applied => None,
@@ -514,11 +524,11 @@ proptest! {
             };
             wait_for_history(&store, sender, |history| {
                 history.iter().any(|event| match (&event.kind, expected_failure) {
-                    (HistoryEventKind::ExternalWorkflowExecutionSignaled { initiated_event_id: id, .. }, None) => {
+                    (HistoryEventKind::ExternalWorkflowExecutionSignaledV2 { initiated_event_id: id, .. }, None) => {
                         *id == initiated_event_id
                     }
                     (
-                        HistoryEventKind::SignalExternalWorkflowExecutionFailed { initiated_event_id: id, cause, .. },
+                        HistoryEventKind::SignalExternalWorkflowExecutionFailedV2 { initiated_event_id: id, cause, .. },
                         Some(expected),
                     ) => *id == initiated_event_id && cause == expected,
                     _ => false,

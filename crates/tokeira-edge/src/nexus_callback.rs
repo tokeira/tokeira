@@ -182,6 +182,7 @@ pub async fn handle_nexus_callback(
             token.originator_run_key,
             token.operation_id,
             token.scheduled_event_id,
+            None,
             resolution,
         )
         .await

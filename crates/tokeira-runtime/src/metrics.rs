@@ -147,7 +147,15 @@ pub const WORKER_COMPUTE_METRIC_LABEL_KEYS: &[(&str, &[&str])] = &[
 pub const NEXUS_OUTBOUND_REQUESTS_TOTAL: &str = "tokeira_runtime_nexus_outbound_requests_total";
 pub const NEXUS_OUTBOUND_LATENCY_SECONDS: &str = "tokeira_runtime_nexus_outbound_latency_seconds";
 
+/// Discovery observations, including repeated observations of unresolved work.
+pub const OUTBOUND_PENDING_OBSERVATIONS_TOTAL: &str =
+    "tokeira_runtime_outbound_pending_observations_total";
+/// Attempt outcomes: advanced, retrying, blocked_by_data or obsolete only.
+pub const OUTBOUND_ATTEMPTS_TOTAL: &str = "tokeira_runtime_outbound_attempts_total";
+
 pub const METRIC_NAMES: &[(&str, MetricType)] = &[
+    (OUTBOUND_PENDING_OBSERVATIONS_TOTAL, MetricType::Counter),
+    (OUTBOUND_ATTEMPTS_TOTAL, MetricType::Counter),
     (WORKFLOW_DISPATCH_READS_TOTAL, MetricType::Counter),
     (WORKFLOW_DISPATCH_SKIPS_TOTAL, MetricType::Counter),
     (WORKFLOW_DISPATCH_ADMISSIONS_TOTAL, MetricType::Counter),
@@ -668,6 +676,16 @@ pub fn set_workers_observed(namespace: NamespaceId, count: usize) {
 
 pub fn set_workers_total(count: usize) {
     gauge!(WORKERS_TOTAL).set(count as f64);
+}
+
+/// Count pending descriptors without putting run identities or transport errors in labels.
+pub(crate) fn record_outbound_pending(count: usize) {
+    counter!(OUTBOUND_PENDING_OBSERVATIONS_TOTAL).increment(count as u64);
+}
+
+/// The driver supplies one of its four fixed outcome labels.
+pub(crate) fn record_outbound_attempt(outcome: &'static str) {
+    counter!(OUTBOUND_ATTEMPTS_TOTAL, "outcome" => outcome).increment(1);
 }
 
 #[cfg(test)]

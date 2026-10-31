@@ -350,6 +350,139 @@ async fn acquisition_drains_an_admitted_lane_commit_before_reading_repair_pages(
 
 #[async_trait]
 impl RunRepository for Repo {
+    async fn read_published_preparations(
+        &self,
+        home: tokeira_types::ShardId,
+        bound: tokeira_storage::ScanBound<uuid::Uuid>,
+        after: Option<uuid::Uuid>,
+        limit: usize,
+    ) -> anyhow::Result<tokeira_storage::OutboundPage<uuid::Uuid, tokeira_storage::PreparationToken>>
+    {
+        self.inner
+            .read_published_preparations(home, bound, after, limit)
+            .await
+    }
+
+    async fn complete_run_preparation(
+        &self,
+        token: tokeira_storage::PreparationToken,
+        fence: tokeira_storage::WriteFence,
+    ) -> anyhow::Result<bool> {
+        self.inner.complete_run_preparation(token, fence).await
+    }
+
+    async fn commit_successor_fallback(
+        &self,
+        run: tokeira_types::RunKey,
+        closing: tokeira_kernel::Transition,
+        start: Box<tokeira_kernel::StartRequest>,
+        fence: tokeira_storage::WriteFence,
+    ) -> anyhow::Result<tokeira_storage::CommitResult> {
+        self.inner
+            .commit_successor_fallback(run, closing, start, fence)
+            .await
+    }
+
+    async fn find_run_preparation(
+        &self,
+        request_key: &str,
+    ) -> anyhow::Result<Option<tokeira_storage::PreparationToken>> {
+        self.inner.find_run_preparation(request_key).await
+    }
+
+    async fn prepare_run_publication(
+        &self,
+        preparation: Box<tokeira_storage::RunPreparation>,
+        fence: tokeira_storage::WriteFence,
+    ) -> anyhow::Result<tokeira_storage::PreparationToken> {
+        self.inner.prepare_run_publication(preparation, fence).await
+    }
+
+    async fn publish_prepared_run(
+        &self,
+        token: tokeira_storage::PreparationToken,
+        fence: tokeira_storage::WriteFence,
+    ) -> anyhow::Result<tokeira_storage::PublicationResult> {
+        self.inner.publish_prepared_run(token, fence).await
+    }
+
+    async fn abandon_prepared_run(
+        &self,
+        token: tokeira_storage::PreparationToken,
+        fence: tokeira_storage::WriteFence,
+    ) -> anyhow::Result<bool> {
+        self.inner.abandon_prepared_run(token, fence).await
+    }
+
+    async fn read_operation_page(
+        &self,
+        home: tokeira_types::ShardId,
+        kind: tokeira_kernel::OperationKind,
+        bound: tokeira_storage::ScanBound<tokeira_kernel::OperationKey>,
+        after: Option<tokeira_kernel::OperationKey>,
+        limit: usize,
+    ) -> anyhow::Result<
+        tokeira_storage::OutboundPage<tokeira_kernel::OperationKey, tokeira_storage::OperationRow>,
+    > {
+        self.inner
+            .read_operation_page(home, kind, bound, after, limit)
+            .await
+    }
+    async fn read_intent_page(
+        &self,
+        home: tokeira_types::ShardId,
+        bound: tokeira_storage::ScanBound<tokeira_storage::IntentKey>,
+        after: Option<tokeira_storage::IntentKey>,
+        limit: usize,
+    ) -> anyhow::Result<
+        tokeira_storage::OutboundPage<
+            tokeira_storage::IntentKey,
+            tokeira_storage::IntentDescriptor,
+        >,
+    > {
+        self.inner.read_intent_page(home, bound, after, limit).await
+    }
+    async fn load_intent(
+        &self,
+        key: tokeira_storage::IntentKey,
+    ) -> anyhow::Result<Option<tokeira_storage::IntentRow>> {
+        self.inner.load_intent(key).await
+    }
+    async fn reconcile_outbound_run(
+        &self,
+        home: tokeira_types::ShardId,
+        run: tokeira_types::RunKey,
+        fence: tokeira_storage::WriteFence,
+    ) -> anyhow::Result<()> {
+        self.inner.reconcile_outbound_run(home, run, fence).await
+    }
+    async fn retire_intent(
+        &self,
+        proof: tokeira_storage::IntentRetirement,
+        fence: tokeira_storage::WriteFence,
+    ) -> anyhow::Result<bool> {
+        self.inner.retire_intent(proof, fence).await
+    }
+    async fn load_outbound_source(
+        &self,
+        run: tokeira_types::RunKey,
+    ) -> anyhow::Result<tokeira_kernel::LoadedRun> {
+        self.inner.load_outbound_source(run).await
+    }
+
+    async fn commit_outbound_transition(
+        &self,
+        run: tokeira_types::RunKey,
+        transition: tokeira_kernel::Transition,
+        guard: tokeira_storage::DeliveryGuard,
+        source_fence: tokeira_storage::WriteFence,
+        fence: tokeira_storage::WriteFence,
+    ) -> anyhow::Result<tokeira_storage::CommitResult> {
+        self.inner
+            .commit_outbound_transition(run, transition, guard, source_fence, fence)
+            .await
+    }
+
     async fn commit_transition_pair(
         &self,
         run_key: RunKey,
@@ -366,6 +499,34 @@ impl RunRepository for Repo {
     fn recovery_is_empty(&self) -> bool {
         self.inner.recovery_is_empty()
     }
+    fn outbound_ready(&self) -> bool {
+        self.inner.outbound_ready()
+    }
+    async fn ensure_outbound_prepared(&self) -> anyhow::Result<()> {
+        self.inner.ensure_outbound_prepared().await
+    }
+    async fn outbound_upgrade_status(
+        &self,
+    ) -> anyhow::Result<tokeira_storage::outbound_upgrade::OutboundUpgradeStatus> {
+        self.inner.outbound_upgrade_status().await
+    }
+    async fn read_outbound_upgrade_run(
+        &self,
+        after: Option<tokeira_types::RunKey>,
+    ) -> anyhow::Result<Option<tokeira_kernel::WorkflowState>> {
+        self.inner.read_outbound_upgrade_run(after).await
+    }
+    async fn commit_outbound_upgrade_page(
+        &self,
+        expected: Option<tokeira_storage::outbound_upgrade::OutboundUpgradeProgress>,
+        next: tokeira_storage::outbound_upgrade::OutboundUpgradeProgress,
+        write: Option<tokeira_storage::outbound_upgrade::OutboundUpgradeWrite>,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .commit_outbound_upgrade_page(expected, next, write)
+            .await
+    }
+
     fn placement_ready(&self) -> bool {
         self.inner.placement_ready()
     }

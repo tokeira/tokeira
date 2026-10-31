@@ -56,14 +56,58 @@ pub struct Cli {
     pub json: bool,
 }
 
-/// Daemon operator commands; none starts the runtime or resolves server config.
+/// Daemon operator commands; none starts the runtime. Storage maintenance
+/// resolves its explicitly selected connection configuration.
 #[derive(clap::Subcommand, Debug)]
 pub enum CliCommand {
+    /// Inspect and prepare durable storage without activating runtime homes.
+    Storage {
+        /// Explicit storage maintenance operation.
+        #[command(subcommand)]
+        command: StorageCommand,
+    },
     /// Manage the protected credential shared by controller-managed runtimes.
     PeerCredential {
         /// Explicit credential operation.
         #[command(subcommand)]
         command: PeerCredentialCommand,
+    },
+}
+
+/// Review-before-action storage maintenance commands.
+#[derive(clap::Subcommand, Debug)]
+pub enum StorageCommand {
+    /// Prepare legacy outbound work during a stopped-cluster cutover.
+    OutboundRecovery {
+        /// Ordinary server configuration locator, used only for its storage connection.
+        #[arg(long)]
+        config: Option<String>,
+        /// Plan is read-only; apply requires the exact reviewed digest.
+        #[command(subcommand)]
+        command: OutboundRecoveryCommand,
+    },
+}
+
+/// Checked legacy preparation. No command starts listeners or acquires a home.
+#[derive(clap::Subcommand, Debug)]
+pub enum OutboundRecoveryCommand {
+    /// Print a bounded JSON inventory, missing evidence and an approval digest.
+    Plan {
+        /// Optional JSON array of original policy or verified child repair evidence.
+        #[arg(long)]
+        repairs: Option<PathBuf>,
+    },
+    /// Apply or resume the exact reviewed inventory with all writers stopped.
+    Apply {
+        /// SHA-256 digest from plan, retained when resuming an interrupted apply.
+        #[arg(long)]
+        plan_digest: String,
+        /// Explicitly assert that every old and current writer process is stopped.
+        #[arg(long, required = true)]
+        confirm_stopped_writers: bool,
+        /// The same JSON repair evidence used to produce the reviewed plan.
+        #[arg(long)]
+        repairs: Option<PathBuf>,
     },
 }
 
@@ -1678,6 +1722,65 @@ mod tests {
     use std::{path::PathBuf, sync::Mutex};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn outbound_storage_cli_requires_review_digest_and_stopped_writer_confirmation() {
+        let prefix = [
+            "tokeirad",
+            "storage",
+            "outbound-recovery",
+            "--config",
+            "file:maintenance.toml",
+        ];
+        let plan = Cli::try_parse_from(prefix.into_iter().chain(["plan"])).unwrap();
+        assert!(matches!(
+            plan.command,
+            Some(CliCommand::Storage {
+                command: StorageCommand::OutboundRecovery {
+                    config: Some(_),
+                    command: OutboundRecoveryCommand::Plan { repairs: None }
+                }
+            })
+        ));
+        assert!(
+            Cli::try_parse_from(
+                prefix
+                    .into_iter()
+                    .chain(["apply", "--plan-digest", "digest"])
+            )
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(
+                prefix
+                    .into_iter()
+                    .chain(["apply", "--confirm-stopped-writers"])
+            )
+            .is_err()
+        );
+        let apply = Cli::try_parse_from(prefix.into_iter().chain([
+            "apply",
+            "--plan-digest",
+            "digest",
+            "--confirm-stopped-writers",
+            "--repairs",
+            "repairs.json",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            apply.command,
+            Some(CliCommand::Storage {
+                command: StorageCommand::OutboundRecovery {
+                    command: OutboundRecoveryCommand::Apply {
+                        confirm_stopped_writers: true,
+                        repairs: Some(_),
+                        ..
+                    },
+                    ..
+                }
+            })
+        ));
+    }
 
     #[test]
     fn standalone_callbacks_require_standalone_activities() {

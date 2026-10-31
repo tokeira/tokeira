@@ -79,6 +79,7 @@ pub struct ShardOwner {
     shards: HashMap<ShardId, OwnedShard>,
     shard_count: u32,
     next_generation: u64,
+    cache_generation: u64,
     write_barriers: HashMap<ShardId, Arc<tokio::sync::RwLock<()>>>,
     /// The lease owner this node's writes are fenced with, under
     /// controller-managed placement (`bundle-lease-fence`).
@@ -167,6 +168,7 @@ impl ShardOwner {
             shards: HashMap::new(),
             shard_count,
             next_generation: 0,
+            cache_generation: 0,
             write_barriers: HashMap::new(),
             lease_owner: None,
         }
@@ -177,6 +179,20 @@ impl ShardOwner {
         self.shard_count
     }
 
+    pub(crate) fn cache_generation(&self) -> u64 {
+        self.cache_generation
+    }
+
+    /// Call under the exclusive home writer barrier after multi-run publication.
+    /// Lanes check this generation after admission, before even a kernel no-op;
+    /// invalidation therefore requires no cross-lane request or deadlock-prone wait.
+    pub(crate) fn invalidate_published_states(&mut self) {
+        self.cache_generation = self
+            .cache_generation
+            .checked_add(1)
+            .expect("local cache generation exhausted");
+    }
+
     /// Record that a shard lease was acquired with the given
     /// epoch. The shard enters `Sweeping` state.
     ///
@@ -184,6 +200,7 @@ impl ShardOwner {
     /// cancel shard-scoped background tasks when the shard
     /// is relinquished.
     pub fn record_acquired(&mut self, shard_id: ShardId, epoch: ShardEpoch) -> CancellationToken {
+        self.invalidate_published_states();
         self.write_barriers.entry(shard_id).or_default();
         if let Some(previous) = self.shards.get(&shard_id) {
             previous.cancel.cancel();

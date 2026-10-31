@@ -1,0 +1,61 @@
+{
+  "baseline": "e057750774e38776019bb6c8e7043ebde902a1d5",
+  "command": "cargo nextest run -p tokeira-runtime --lib --locked --no-fail-fast -E 'test(outbound::bug_condition_exploration_tests)'",
+  "configured_cases_per_property": 100,
+  "result": "12 expected assertion failures; shrinking stops each property at its first failure, so this is not 1200 successful cases",
+  "counterexamples": [
+    {
+      "test": "child_first_task_waits_for_parent_confirmation",
+      "minimum": "seed = 0"
+    },
+    {
+      "test": "child_confirmation_is_idempotent",
+      "minimum": "seed = 0, copies = 2"
+    },
+    {
+      "test": "oversized_successor_survives_lost_separate_start",
+      "minimum": "seed = 0"
+    },
+    {
+      "test": "external_cancel_survives_lost_publication",
+      "minimum": "seed = 0"
+    },
+    {
+      "test": "external_signal_survives_lost_publication",
+      "minimum": "seed = 0"
+    },
+    {
+      "test": "refused_reset_preserves_current_base",
+      "minimum": "seed = 0"
+    },
+    {
+      "test": "refused_reset_preserves_distinct_current",
+      "minimum": "seed = 0"
+    },
+    {
+      "test": "parent_close_survives_lost_publication",
+      "minimum": "seed = 0"
+    },
+    {
+      "test": "child_result_survives_lost_publication",
+      "minimum": "seed = 0"
+    },
+    {
+      "test": "untimed_nexus_start_survives_lost_publication",
+      "minimum": "seed = 0"
+    },
+    {
+      "test": "untimed_nexus_cancel_survives_lost_publication",
+      "minimum": "seed = 0"
+    },
+    {
+      "test": "child_start_survives_lost_publication",
+      "minimum": "seed = 0, bytes = []"
+    }
+  ],
+  "preservation": {
+    "successor_semantics_lib": 16,
+    "callback_lib": 2,
+    "callback_integration": 8
+  }
+}

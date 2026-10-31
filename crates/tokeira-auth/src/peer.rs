@@ -1,4 +1,4 @@
-//! Cluster-scoped offer credentials, independent of public Worker/Admin grants.
+//! Cluster-scoped internal credentials, independent of public Worker/Admin grants.
 //!
 //! Operators supply protected files; this module generates and validates the
 //! bounded document and renews tokens locally. A peer proves cluster membership,
@@ -193,6 +193,7 @@ impl PeerMaterial {
             profile: expected.clone(),
             key: EncodingKey::from_ec_der(&private),
             cached: Mutex::new(None),
+            cached_outbound: Mutex::new(None),
         })
     }
 }
@@ -224,6 +225,7 @@ pub struct PeerSigner {
     profile: PeerProfile,
     key: EncodingKey,
     cached: Mutex<Option<PeerToken>>,
+    cached_outbound: Mutex<Option<PeerToken>>,
 }
 
 impl fmt::Debug for PeerSigner {
@@ -258,7 +260,26 @@ impl PeerSigner {
     /// Reuse only with at least one minute remaining. Clock regression forces a
     /// new token so a cached future-issued token is never sent.
     pub fn token_at(&self, now: u64) -> Result<PeerToken, PeerError> {
-        let mut cached = self.cached.lock().map_err(|_| PeerError::Signing)?;
+        self.sign_at(now, &self.profile.audience, &self.cached)
+    }
+
+    /// Sign only for reference-based outbound delivery. Offer credentials cannot
+    /// authorize this route; both purposes reuse the validated startup key.
+    pub fn outbound_token_at(&self, now: u64) -> Result<PeerToken, PeerError> {
+        self.sign_at(
+            now,
+            &outbound_audience(self.profile.cluster_id),
+            &self.cached_outbound,
+        )
+    }
+
+    fn sign_at(
+        &self,
+        now: u64,
+        audience: &str,
+        cache: &Mutex<Option<PeerToken>>,
+    ) -> Result<PeerToken, PeerError> {
+        let mut cached = cache.lock().map_err(|_| PeerError::Signing)?;
         if let Some(token) = cached
             .as_ref()
             .filter(|token| now >= token.issued_at && token.expires_at.saturating_sub(now) >= 60)
@@ -272,7 +293,7 @@ impl PeerSigner {
         };
         let claims = TokenClaims {
             iss: self.profile.issuer.clone(),
-            aud: self.profile.audience.clone().into(),
+            aud: audience.into(),
             sub: PEER_SUBJECT.into(),
             iat: now,
             exp,
@@ -348,6 +369,27 @@ impl PeerVerifier {
     /// are mandatory; public mapper defaults never apply. Thirty seconds is the
     /// sole clock leeway, and the signed lifetime cannot exceed one hour.
     pub fn verify_at(&self, authorization: &str, now: u64) -> Result<(), PeerError> {
+        self.verify_for(authorization, now, &self.profile.audience, true)
+    }
+
+    /// Require the exact cluster-scoped outbound audience. Public grants and
+    /// workflow-offer tokens are insufficient even when signed by the same key.
+    pub fn verify_outbound_at(&self, authorization: &str, now: u64) -> Result<(), PeerError> {
+        self.verify_for(
+            authorization,
+            now,
+            &outbound_audience(self.profile.cluster_id),
+            false,
+        )
+    }
+
+    fn verify_for(
+        &self,
+        authorization: &str,
+        now: u64,
+        audience: &str,
+        allow_array: bool,
+    ) -> Result<(), PeerError> {
         if authorization.len() > MAX_AUTHORIZATION_BYTES {
             return Err(PeerError::TooLarge);
         }
@@ -378,12 +420,10 @@ impl PeerVerifier {
             return Err(PeerError::Unauthenticated);
         }
         let audience_matches = match &claims.aud {
-            serde_json::Value::String(value) => value == &self.profile.audience,
-            serde_json::Value::Array(values) => {
+            serde_json::Value::String(value) => value == audience,
+            serde_json::Value::Array(values) if allow_array => {
                 values.iter().all(|value| value.is_string())
-                    && values
-                        .iter()
-                        .any(|value| value.as_str() == Some(&self.profile.audience))
+                    && values.iter().any(|value| value.as_str() == Some(audience))
             }
             _ => false,
         };
@@ -392,6 +432,10 @@ impl PeerVerifier {
         }
         Ok(())
     }
+}
+
+fn outbound_audience(cluster: Uuid) -> String {
+    format!("urn:tokeira:outbound-delivery:{cluster}")
 }
 
 #[cfg(test)]
@@ -419,6 +463,26 @@ mod tests {
     // Only the separate signed peer grant with bounded validity is accepted.
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
+        // Feature: outbound-dispatch-recovery, Property 18: Remote delivery grants no extra authority
+        #[test]
+        fn outbound_credentials_are_purpose_and_cluster_scoped(now in 10_000u64..1_000_000_000, renew in 0u64..900) {
+            let material = fixture_material();
+            let signer = material.signer(material.profile()).unwrap();
+            let verifier = PeerVerifier::new(material.profile().clone()).unwrap();
+            let offer = signer.token_at(now).unwrap();
+            let outbound = signer.outbound_token_at(now).unwrap();
+            prop_assert!(verifier.verify_outbound_at(outbound.authorization(), now).is_ok());
+            prop_assert!(verifier.verify_at(outbound.authorization(), now).is_err());
+            prop_assert!(verifier.verify_outbound_at(offer.authorization(), now).is_err());
+            let other = fixture_material();
+            prop_assert!(PeerVerifier::new(other.profile().clone()).unwrap().verify_outbound_at(outbound.authorization(), now).is_err());
+            let later = signer.outbound_token_at(now + renew).unwrap();
+            prop_assert!(verifier.verify_outbound_at(later.authorization(), now + renew).is_ok());
+            prop_assert!(verifier.verify_outbound_at(later.authorization(), now + renew + 3600).is_err());
+            let diagnostic = format!("{signer:?} {outbound:?}");
+            prop_assert!(!diagnostic.contains(outbound.authorization()));
+        }
+
         #[test]
         fn generated_peer_policy(now in 10_000u64..1_000_000_000, mutation in 0u8..15) {
             let material = fixture_material();

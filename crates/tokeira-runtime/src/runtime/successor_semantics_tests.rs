@@ -109,10 +109,15 @@ async fn seed_history(
             transition.event_principals.remove(0);
         }
         3 => {
-            transition.history_events[0].kind = HistoryEventKind::WorkflowExecutionCompleted {
-                workflow_task_completed_event_id: 0,
-                result: Payloads::default(),
-                new_execution_run_id: None,
+            // A non-start event exercises the malformed history read without
+            // violating storage's independent open-to-closed invariant.
+            transition.history_events[0].kind = HistoryEventKind::WorkflowExecutionSignaled {
+                signal_name: "malformed-start".into(),
+                input: Payloads::default(),
+                header: None,
+                links: Vec::new(),
+                request_id: "malformed-start".into(),
+                identity: None,
             };
         }
         _ => {}

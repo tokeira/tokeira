@@ -254,6 +254,93 @@
             "number": 3
           }
         ]
+      },
+      {
+        "enum": "tokeira.internal.runtime.v1.OutboundDeliveryOutcome",
+        "values": [
+          {
+            "name": "OUTBOUND_DELIVERY_OUTCOME_UNSPECIFIED",
+            "number": 0
+          },
+          {
+            "name": "OUTBOUND_DELIVERY_OUTCOME_APPLIED",
+            "number": 1
+          },
+          {
+            "name": "OUTBOUND_DELIVERY_OUTCOME_DUPLICATE_VERIFIED",
+            "number": 2
+          },
+          {
+            "name": "OUTBOUND_DELIVERY_OUTCOME_TERMINAL",
+            "number": 3
+          },
+          {
+            "name": "OUTBOUND_DELIVERY_OUTCOME_OBSOLETE",
+            "number": 4
+          },
+          {
+            "name": "OUTBOUND_DELIVERY_OUTCOME_NOT_OWNER",
+            "number": 5
+          },
+          {
+            "name": "OUTBOUND_DELIVERY_OUTCOME_RETRYABLE",
+            "number": 6
+          }
+        ]
+      },
+      {
+        "enum": "tokeira.internal.runtime.v1.OutboundDeliveryPhase",
+        "values": [
+          {
+            "name": "OUTBOUND_DELIVERY_PHASE_UNSPECIFIED",
+            "number": 0
+          },
+          {
+            "name": "OUTBOUND_DELIVERY_PHASE_CHILD_START",
+            "number": 1
+          },
+          {
+            "name": "OUTBOUND_DELIVERY_PHASE_CHILD_REPLACE",
+            "number": 2
+          },
+          {
+            "name": "OUTBOUND_DELIVERY_PHASE_CHILD_RELEASE",
+            "number": 3
+          },
+          {
+            "name": "OUTBOUND_DELIVERY_PHASE_EXTERNAL",
+            "number": 4
+          },
+          {
+            "name": "OUTBOUND_DELIVERY_PHASE_PARENT_CLOSE",
+            "number": 5
+          },
+          {
+            "name": "OUTBOUND_DELIVERY_PHASE_CHILD_RESULT",
+            "number": 6
+          }
+        ]
+      },
+      {
+        "enum": "tokeira.internal.runtime.v1.OutboundTerminalCause",
+        "values": [
+          {
+            "name": "OUTBOUND_TERMINAL_CAUSE_UNSPECIFIED",
+            "number": 0
+          },
+          {
+            "name": "OUTBOUND_TERMINAL_CAUSE_MISSING_EXECUTION",
+            "number": 1
+          },
+          {
+            "name": "OUTBOUND_TERMINAL_CAUSE_CLOSED_EXECUTION",
+            "number": 2
+          },
+          {
+            "name": "OUTBOUND_TERMINAL_CAUSE_SIGNAL_LIMIT",
+            "number": 3
+          }
+        ]
       }
     ],
     "fields": [
@@ -335,6 +422,16 @@
         "oneof": 2,
         "proto3_optional": true,
         "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "attempt",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundOperationReference",
+        "number": 4,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_UINT32",
         "type_name": ""
       },
       {
@@ -432,6 +529,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.internal.runtime.v1.OfferVersionDirective",
         "number": 3,
+        "oneof": 1,
+        "proto3_optional": true,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "build_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "number": 6,
         "oneof": 1,
         "proto3_optional": true,
         "type": "TYPE_STRING",
@@ -548,6 +655,16 @@
         "type_name": ""
       },
       {
+        "field": "closing_transition_seq",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundIntentReference",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_UINT64",
+        "type_name": ""
+      },
+      {
         "field": "conformance_disposition",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.compatibility.v1.FeatureEntry",
@@ -586,6 +703,16 @@
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".google.protobuf.Timestamp"
+      },
+      {
+        "field": "decorations_proto",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskResponse",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BYTES",
+        "type_name": ""
       },
       {
         "field": "delta",
@@ -628,6 +755,16 @@
         "type_name": ""
       },
       {
+        "field": "deployment",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "number": 5,
+        "oneof": 0,
+        "proto3_optional": true,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
         "field": "desired_placement",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.internal.controller.v1.ControllerDirective",
@@ -645,6 +782,26 @@
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_UINT32",
+        "type_name": ""
+      },
+      {
+        "field": "destination_home",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundDeliveryRequest",
+        "number": 5,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_UINT32",
+        "type_name": ""
+      },
+      {
+        "field": "destination_run_key",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundDeliveryRequest",
+        "number": 4,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BYTES",
         "type_name": ""
       },
       {
@@ -765,6 +922,16 @@
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_UINT32",
+        "type_name": ""
+      },
+      {
+        "field": "expected_current_run_key",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundDeliveryRequest",
+        "number": 7,
+        "oneof": 1,
+        "proto3_optional": true,
+        "type": "TYPE_BYTES",
         "type_name": ""
       },
       {
@@ -948,6 +1115,16 @@
         "type_name": ""
       },
       {
+        "field": "initiating_event_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundOperationReference",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_INT64",
+        "type_name": ""
+      },
+      {
         "field": "int_value",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.conformance.v1.DynamicConfigValue",
@@ -956,6 +1133,16 @@
         "proto3_optional": false,
         "type": "TYPE_INT64",
         "type_name": ""
+      },
+      {
+        "field": "intent",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundDeliveryRequest",
+        "number": 3,
+        "oneof": 0,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".tokeira.internal.runtime.v1.OutboundIntentReference"
       },
       {
         "field": "json_value",
@@ -1006,6 +1193,26 @@
         "proto3_optional": false,
         "type": "TYPE_ENUM",
         "type_name": ".tokeira.compatibility.v1.CompatibilitySurfaceKind"
+      },
+      {
+        "field": "kind",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundIntentReference",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_UINT32",
+        "type_name": ""
+      },
+      {
+        "field": "kind",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundOperationReference",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_UINT32",
+        "type_name": ""
       },
       {
         "field": "known",
@@ -1088,6 +1295,16 @@
         "type_name": ""
       },
       {
+        "field": "logical_seq",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_UINT64",
+        "type_name": ""
+      },
+      {
         "field": "max_reservoir_size",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.internal.controller.v1.ConnectionBudgetDirective",
@@ -1152,6 +1369,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.compatibility.v1.GetCompatibilityRequest",
         "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "namespace",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "number": 3,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
@@ -1268,6 +1495,16 @@
         "type_name": ".tokeira.internal.runtime.v1.OfferQueue"
       },
       {
+        "field": "normal_task_queue",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "number": 9,
+        "oneof": 2,
+        "proto3_optional": true,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
         "field": "notes",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.compatibility.v1.FeatureEntry",
@@ -1275,6 +1512,26 @@
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "operation",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundDeliveryRequest",
+        "number": 2,
+        "oneof": 0,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".tokeira.internal.runtime.v1.OutboundOperationReference"
+      },
+      {
+        "field": "ordinal",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundIntentReference",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_UINT32",
         "type_name": ""
       },
       {
@@ -1296,6 +1553,16 @@
         "proto3_optional": false,
         "type": "TYPE_ENUM",
         "type_name": ".tokeira.internal.runtime.v1.OfferOutcome"
+      },
+      {
+        "field": "outcome",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundDeliveryResponse",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_ENUM",
+        "type_name": ".tokeira.internal.runtime.v1.OutboundDeliveryOutcome"
       },
       {
         "field": "owned_bundle_count",
@@ -1356,6 +1623,16 @@
         "proto3_optional": false,
         "type": "TYPE_UINT32",
         "type_name": ""
+      },
+      {
+        "field": "phase",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundDeliveryRequest",
+        "number": 6,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_ENUM",
+        "type_name": ".tokeira.internal.runtime.v1.OutboundDeliveryPhase"
       },
       {
         "field": "placement_config",
@@ -1528,6 +1805,26 @@
         "type_name": ""
       },
       {
+        "field": "requested_event_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundOperationReference",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_INT64",
+        "type_name": ""
+      },
+      {
+        "field": "reset_redirect_run_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundDeliveryResponse",
+        "number": 5,
+        "oneof": 3,
+        "proto3_optional": true,
+        "type": "TYPE_BYTES",
+        "type_name": ""
+      },
+      {
         "field": "routing",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.internal.runtime.v1.OfferWorkflowTaskRequest",
@@ -1561,6 +1858,16 @@
         "field": "run_key",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.internal.runtime.v1.OfferWorkflowTaskRequest",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BYTES",
+        "type_name": ""
+      },
+      {
+        "field": "run_key",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
         "number": 1,
         "oneof": null,
         "proto3_optional": false,
@@ -1616,6 +1923,16 @@
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".google.protobuf.Timestamp"
+      },
+      {
+        "field": "scoped_versioned",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "number": 10,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
       },
       {
         "field": "sdk_matrix",
@@ -1688,6 +2005,56 @@
         "type_name": ""
       },
       {
+        "field": "source_epoch",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundDeliveryRequest",
+        "number": 10,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_UINT64",
+        "type_name": ""
+      },
+      {
+        "field": "source_home",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundDeliveryRequest",
+        "number": 8,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_UINT32",
+        "type_name": ""
+      },
+      {
+        "field": "source_owner",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundDeliveryRequest",
+        "number": 9,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "source_run_key",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundDeliveryRequest",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BYTES",
+        "type_name": ""
+      },
+      {
+        "field": "source_transition_seq",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundOperationReference",
+        "number": 5,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_UINT64",
+        "type_name": ""
+      },
+      {
         "field": "source_tree_hash",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.compatibility.v1.BuildInfo",
@@ -1695,6 +2062,16 @@
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "started_task_json",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskResponse",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BYTES",
         "type_name": ""
       },
       {
@@ -1716,6 +2093,16 @@
         "proto3_optional": false,
         "type": "TYPE_ENUM",
         "type_name": ".tokeira.internal.controller.v1.NodeDrainState"
+      },
+      {
+        "field": "sticky",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "number": 8,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
       },
       {
         "field": "sticky_origin",
@@ -1778,6 +2165,36 @@
         "type_name": ".tokeira.compatibility.v1.CompatibilitySurface"
       },
       {
+        "field": "target_run_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundDeliveryResponse",
+        "number": 2,
+        "oneof": 0,
+        "proto3_optional": true,
+        "type": "TYPE_BYTES",
+        "type_name": ""
+      },
+      {
+        "field": "target_transition_seq",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundDeliveryResponse",
+        "number": 3,
+        "oneof": 1,
+        "proto3_optional": true,
+        "type": "TYPE_UINT64",
+        "type_name": ""
+      },
+      {
+        "field": "task_queue",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "number": 4,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
         "field": "temporal_default",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.compatibility.v1.FeatureEntry",
@@ -1816,6 +2233,16 @@
         "proto3_optional": false,
         "type": "TYPE_STRING",
         "type_name": ""
+      },
+      {
+        "field": "terminal_cause",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OutboundDeliveryResponse",
+        "number": 4,
+        "oneof": 2,
+        "proto3_optional": true,
+        "type": "TYPE_ENUM",
+        "type_name": ".tokeira.internal.runtime.v1.OutboundTerminalCause"
       },
       {
         "field": "tokeira_default",
@@ -1938,6 +2365,16 @@
         "type_name": ""
       },
       {
+        "field": "worker_identity",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "number": 7,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
         "field": "zone",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.internal.controller.v1.RuntimeRegistration",
@@ -1946,126 +2383,6 @@
         "proto3_optional": false,
         "type": "TYPE_STRING",
         "type_name": ""
-      },
-      {
-        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
-        "field": "build_id",
-        "number": 6,
-        "type": "TYPE_STRING",
-        "type_name": "",
-        "label": "LABEL_OPTIONAL",
-        "oneof": 1,
-        "proto3_optional": true
-      },
-      {
-        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskResponse",
-        "field": "decorations_proto",
-        "number": 2,
-        "type": "TYPE_BYTES",
-        "type_name": "",
-        "label": "LABEL_OPTIONAL",
-        "oneof": null,
-        "proto3_optional": false
-      },
-      {
-        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
-        "field": "deployment",
-        "number": 5,
-        "type": "TYPE_STRING",
-        "type_name": "",
-        "label": "LABEL_OPTIONAL",
-        "oneof": 0,
-        "proto3_optional": true
-      },
-      {
-        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
-        "field": "logical_seq",
-        "number": 2,
-        "type": "TYPE_UINT64",
-        "type_name": "",
-        "label": "LABEL_OPTIONAL",
-        "oneof": null,
-        "proto3_optional": false
-      },
-      {
-        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
-        "field": "namespace",
-        "number": 3,
-        "type": "TYPE_STRING",
-        "type_name": "",
-        "label": "LABEL_OPTIONAL",
-        "oneof": null,
-        "proto3_optional": false
-      },
-      {
-        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
-        "field": "normal_task_queue",
-        "number": 9,
-        "type": "TYPE_STRING",
-        "type_name": "",
-        "label": "LABEL_OPTIONAL",
-        "oneof": 2,
-        "proto3_optional": true
-      },
-      {
-        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
-        "field": "run_key",
-        "number": 1,
-        "type": "TYPE_BYTES",
-        "type_name": "",
-        "label": "LABEL_OPTIONAL",
-        "oneof": null,
-        "proto3_optional": false
-      },
-      {
-        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
-        "field": "scoped_versioned",
-        "number": 10,
-        "type": "TYPE_BOOL",
-        "type_name": "",
-        "label": "LABEL_OPTIONAL",
-        "oneof": null,
-        "proto3_optional": false
-      },
-      {
-        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskResponse",
-        "field": "started_task_json",
-        "number": 1,
-        "type": "TYPE_BYTES",
-        "type_name": "",
-        "label": "LABEL_OPTIONAL",
-        "oneof": null,
-        "proto3_optional": false
-      },
-      {
-        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
-        "field": "sticky",
-        "number": 8,
-        "type": "TYPE_BOOL",
-        "type_name": "",
-        "label": "LABEL_OPTIONAL",
-        "oneof": null,
-        "proto3_optional": false
-      },
-      {
-        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
-        "field": "task_queue",
-        "number": 4,
-        "type": "TYPE_STRING",
-        "type_name": "",
-        "label": "LABEL_OPTIONAL",
-        "oneof": null,
-        "proto3_optional": false
-      },
-      {
-        "message": "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
-        "field": "worker_identity",
-        "number": 7,
-        "type": "TYPE_STRING",
-        "type_name": "",
-        "label": "LABEL_OPTIONAL",
-        "oneof": null,
-        "proto3_optional": false
       }
     ],
     "files": [
@@ -2134,6 +2451,10 @@
       "tokeira.internal.runtime.v1.OfferVersionDirective",
       "tokeira.internal.runtime.v1.OfferWorkflowTaskRequest",
       "tokeira.internal.runtime.v1.OfferWorkflowTaskResponse",
+      "tokeira.internal.runtime.v1.OutboundDeliveryRequest",
+      "tokeira.internal.runtime.v1.OutboundDeliveryResponse",
+      "tokeira.internal.runtime.v1.OutboundIntentReference",
+      "tokeira.internal.runtime.v1.OutboundOperationReference",
       "tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
       "tokeira.internal.runtime.v1.StartWorkflowTaskResponse"
     ],
@@ -2243,20 +2564,28 @@
         "service": "tokeira.internal.runtime.v1.WorkflowTaskDispatch"
       },
       {
+        "client_streaming": false,
+        "input": ".tokeira.internal.runtime.v1.OutboundDeliveryRequest",
+        "method": "Deliver",
+        "output": ".tokeira.internal.runtime.v1.OutboundDeliveryResponse",
+        "server_streaming": false,
+        "service": "tokeira.internal.runtime.v1.OutboundDelivery"
+      },
+      {
+        "client_streaming": false,
+        "input": ".tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
+        "method": "StartWorkflowTask",
+        "output": ".tokeira.internal.runtime.v1.StartWorkflowTaskResponse",
+        "server_streaming": false,
+        "service": "tokeira.internal.runtime.v1.WorkflowTaskDispatch"
+      },
+      {
         "client_streaming": true,
         "input": ".tokeira.internal.controller.v1.RuntimeMembershipRequest",
         "method": "RuntimeMembership",
         "output": ".tokeira.internal.controller.v1.ControllerDirective",
         "server_streaming": true,
         "service": "tokeira.internal.controller.v1.PlacementController"
-      },
-      {
-        "service": "tokeira.internal.runtime.v1.WorkflowTaskDispatch",
-        "method": "StartWorkflowTask",
-        "input": ".tokeira.internal.runtime.v1.StartWorkflowTaskRequest",
-        "output": ".tokeira.internal.runtime.v1.StartWorkflowTaskResponse",
-        "client_streaming": false,
-        "server_streaming": false
       }
     ]
   },
@@ -2270,10 +2599,6 @@
             "number": 0
           },
           {
-            "name": "EDITION_LEGACY",
-            "number": 900
-          },
-          {
             "name": "EDITION_PROTO2",
             "number": 998
           },
@@ -2284,10 +2609,6 @@
           {
             "name": "EDITION_2023",
             "number": 1000
-          },
-          {
-            "name": "EDITION_2024",
-            "number": 1001
           },
           {
             "name": "EDITION_1_TEST_ONLY",
@@ -2308,10 +2629,6 @@
           {
             "name": "EDITION_99999_TEST_ONLY",
             "number": 99999
-          },
-          {
-            "name": "EDITION_MAX",
-            "number": 2147483647
           }
         ]
       },
@@ -8650,16 +8967,6 @@
         "type_name": ""
       },
       {
-        "field": "deprecation_warning",
-        "label": "LABEL_OPTIONAL",
-        "message": "google.protobuf.FieldOptions.FeatureSupport",
-        "number": 3,
-        "oneof": null,
-        "proto3_optional": false,
-        "type": "TYPE_STRING",
-        "type_name": ""
-      },
-      {
         "field": "description",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.namespace.v1.NamespaceInfo",
@@ -9118,36 +9425,6 @@
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
         "type_name": ".google.protobuf.FieldOptions.EditionDefault"
-      },
-      {
-        "field": "edition_deprecated",
-        "label": "LABEL_OPTIONAL",
-        "message": "google.protobuf.FieldOptions.FeatureSupport",
-        "number": 2,
-        "oneof": null,
-        "proto3_optional": false,
-        "type": "TYPE_ENUM",
-        "type_name": ".google.protobuf.Edition"
-      },
-      {
-        "field": "edition_introduced",
-        "label": "LABEL_OPTIONAL",
-        "message": "google.protobuf.FieldOptions.FeatureSupport",
-        "number": 1,
-        "oneof": null,
-        "proto3_optional": false,
-        "type": "TYPE_ENUM",
-        "type_name": ".google.protobuf.Edition"
-      },
-      {
-        "field": "edition_removed",
-        "label": "LABEL_OPTIONAL",
-        "message": "google.protobuf.FieldOptions.FeatureSupport",
-        "number": 4,
-        "oneof": null,
-        "proto3_optional": false,
-        "type": "TYPE_ENUM",
-        "type_name": ".google.protobuf.Edition"
       },
       {
         "field": "effective_rate_limit",
@@ -10610,26 +10887,6 @@
         "type_name": ".temporal.api.taskqueue.v1.TaskQueueConfig.FairnessWeightOverridesEntry"
       },
       {
-        "field": "feature_support",
-        "label": "LABEL_OPTIONAL",
-        "message": "google.protobuf.EnumValueOptions",
-        "number": 4,
-        "oneof": null,
-        "proto3_optional": false,
-        "type": "TYPE_MESSAGE",
-        "type_name": ".google.protobuf.FieldOptions.FeatureSupport"
-      },
-      {
-        "field": "feature_support",
-        "label": "LABEL_OPTIONAL",
-        "message": "google.protobuf.FieldOptions",
-        "number": 22,
-        "oneof": null,
-        "proto3_optional": false,
-        "type": "TYPE_MESSAGE",
-        "type_name": ".google.protobuf.FieldOptions.FeatureSupport"
-      },
-      {
         "field": "features",
         "label": "LABEL_OPTIONAL",
         "message": "google.protobuf.EnumOptions",
@@ -10654,6 +10911,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "google.protobuf.ExtensionRangeOptions",
         "number": 50,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.FeatureSet"
+      },
+      {
+        "field": "features",
+        "label": "LABEL_OPTIONAL",
+        "message": "google.protobuf.FeatureSetDefaults.FeatureSetEditionDefault",
+        "number": 2,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_MESSAGE",
@@ -10888,16 +11155,6 @@
         "proto3_optional": false,
         "type": "TYPE_INT64",
         "type_name": ""
-      },
-      {
-        "field": "fixed_features",
-        "label": "LABEL_OPTIONAL",
-        "message": "google.protobuf.FeatureSetDefaults.FeatureSetEditionDefault",
-        "number": 5,
-        "oneof": null,
-        "proto3_optional": false,
-        "type": "TYPE_MESSAGE",
-        "type_name": ".google.protobuf.FeatureSet"
       },
       {
         "field": "force",
@@ -19670,16 +19927,6 @@
         "type_name": ""
       },
       {
-        "field": "overridable_features",
-        "label": "LABEL_OPTIONAL",
-        "message": "google.protobuf.FeatureSetDefaults.FeatureSetEditionDefault",
-        "number": 4,
-        "oneof": null,
-        "proto3_optional": false,
-        "type": "TYPE_MESSAGE",
-        "type_name": ".google.protobuf.FeatureSet"
-      },
-      {
         "field": "owner_email",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.namespace.v1.NamespaceInfo",
@@ -20237,6 +20484,16 @@
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "php_generic_services",
+        "label": "LABEL_OPTIONAL",
+        "message": "google.protobuf.FileOptions",
+        "number": 42,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
         "type_name": ""
       },
       {
@@ -32651,7 +32908,6 @@
       "google.protobuf.FieldMask",
       "google.protobuf.FieldOptions",
       "google.protobuf.FieldOptions.EditionDefault",
-      "google.protobuf.FieldOptions.FeatureSupport",
       "google.protobuf.FileDescriptorProto",
       "google.protobuf.FileDescriptorSet",
       "google.protobuf.FileOptions",

@@ -12,7 +12,8 @@
 //! the purge in `bulk_write` removes them in pages, history after the rows
 //! derived from it and the parts of the run's values last
 //! (`bounded-bulk-writes`, `large-value-parts`). This transaction leaves the
-//! parts of the run's state to the purge too, so it stays at most five rows.
+//! parts of the run's state to the purge too. The additional retained-state row
+//! keeps recovery evidence internal until the last outbound dependency settles.
 
 use super::*;
 
@@ -116,6 +117,12 @@ impl DsqlRunRepository {
                     });
                 }
 
+                super::successor::guard_pointer(&mut tx, &state).await?;
+                // Preserve immutable recovery evidence while making every public
+                // lookup absent. Existing state parts remain in place until the
+                // bounded purge proves that no source or target pin needs them.
+                sqlx::query("INSERT INTO outbound_retained_run (run_key,namespace_id,workflow_id,state_data,state_parts) SELECT run_key,namespace_id,workflow_id,state_data,state_parts FROM workflow_hot WHERE run_key=$1")
+                    .bind(run_key.0).execute(&mut *tx).await?;
                 let tombstone_seq = durable_seq.next();
                 let mut tombstone_state = state.clone();
                 tombstone_state.transition_seq = tombstone_seq;

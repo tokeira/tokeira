@@ -10,7 +10,8 @@
 //! can free, and the lane stops for good.
 //!
 //! A close and its successor are applied separately by the pure kernel, then
-//! committed together. Only a storage size refusal permits a separate start. The successor
+//! committed together. A recognized size refusal instead atomically reserves a
+//! durable successor for owned recovery. The successor
 //! inherits the predecessor's execution chain metadata (`first_execution_run_id`,
 //! `first_run_started_at`) so the server can enforce execution-level timeouts
 //! across the entire chain, not just the current run.
@@ -31,12 +32,9 @@ use tokeira_observability::{
     ChannelTraceContext, ErrorBiasedSamplingReason, NotShardOwnerOperationLabel, RetryOutcomeLabel,
     mark_error_biased_sample,
 };
-use tokeira_proto::{
-    conversions::common::failure_to_payload, public::temporal::api::failure::v1 as failure_proto,
-};
 use tokeira_storage::{CommitResult, PairCommitResult, RunRepository, metrics as storage_metrics};
 use tokeira_types::{
-    NamespaceId, QueueKey, RunKey, ShardEpoch, ShardId, TaskKind, WorkflowId, execution_home_bundle,
+    NamespaceId, QueueKey, RunKey, ShardId, TaskKind, WorkflowId, execution_home_bundle,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
@@ -138,8 +136,25 @@ pub struct LaneHandle {
     lane_id: usize,
     tx: mpsc::Sender<LaneMessage>,
     identity_tx: mpsc::Sender<IdentityRequest>,
+    metadata_tx: mpsc::Sender<OutboundMetadataRequest>,
     #[cfg(test)]
     pub(crate) identity_requests: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Original destination acquisition plus committed source authority. A delayed
+/// outcome cannot borrow a replacement acquisition, even at the same lease epoch.
+#[derive(Clone, Debug)]
+pub(crate) struct OutboundSubmission {
+    pub(crate) attempt: crate::outbound::driver::Attempt,
+    pub(crate) source_fence: tokeira_storage::WriteFence,
+    pub(crate) authority: tokeira_storage::DeliveryGuard,
+}
+
+#[derive(Debug)]
+struct OutboundMetadataRequest {
+    transition: Box<tokeira_kernel::Transition>,
+    attempt: crate::outbound::driver::Attempt,
+    reply: oneshot::Sender<Result<CommitResult>>,
 }
 
 #[derive(Debug)]
@@ -149,6 +164,37 @@ struct IdentityRequest {
 }
 
 impl LaneHandle {
+    /// Serialize a source outcome or destination effect with its captured fence.
+    pub(crate) async fn submit_outbound(
+        &self,
+        run_key: RunKey,
+        command: Command,
+        submission: OutboundSubmission,
+    ) -> Result<CommitResult> {
+        let (reply, received) = oneshot::channel();
+        let mut message = LaneMessage::new(self.lane_id, run_key, command, reply);
+        message.outbound = Some(submission);
+        self.tx.send(message).await?;
+        received.await?
+    }
+
+    /// Persist runtime observations without inventing kernel commands or history.
+    /// The caller's sequence fences all reads used to select these metadata.
+    pub(crate) async fn commit_outbound_metadata(
+        &self,
+        transition: Box<tokeira_kernel::Transition>,
+        attempt: crate::outbound::driver::Attempt,
+    ) -> Result<CommitResult> {
+        let (reply, received) = oneshot::channel();
+        self.metadata_tx
+            .send(OutboundMetadataRequest {
+                transition,
+                attempt,
+                reply,
+            })
+            .await?;
+        received.await?
+    }
     /// Carry runtime reads alongside a close, without adding I/O or plans to the kernel.
     pub(crate) async fn submit_with_successor(
         &self,
@@ -222,7 +268,6 @@ impl LaneHandle {
 /// Only committed pairs and explicit size fallbacks can produce successor effects.
 enum SuccessorEffect {
     Committed(Box<CommittedSuccessor>),
-    Deferred(Box<StartRequest>),
 }
 
 struct CommittedSuccessor {
@@ -241,6 +286,7 @@ struct LaneMessage {
     /// A start asking its lane for a parked poll (`reserved-poll-handoff`).
     reserve_poller: bool,
     successor_plan: Option<SuccessorPlan>,
+    outbound: Option<OutboundSubmission>,
 }
 
 impl LaneMessage {
@@ -263,6 +309,7 @@ impl LaneMessage {
             trace_context: ChannelTraceContext::capture_current(),
             reserve_poller: false,
             successor_plan: None,
+            outbound: None,
         }
     }
 }
@@ -279,6 +326,7 @@ struct LaneCache {
     idle_timeout: std::time::Duration,
     entries: HashMap<RunKey, CachedRun>,
     order: VecDeque<RunKey>,
+    generation: u64,
 }
 
 #[derive(Clone)]
@@ -294,7 +342,22 @@ impl LaneCache {
             idle_timeout: config.cache_idle_timeout,
             entries: HashMap::new(),
             order: VecDeque::new(),
+            generation: 0,
         }
+    }
+
+    fn synchronize_generation(&mut self, owner: &Arc<RwLock<ShardOwner>>) -> bool {
+        let generation = owner
+            .read()
+            .expect("shard owner lock poisoned")
+            .cache_generation();
+        if self.generation == generation {
+            return false;
+        }
+        self.entries.clear();
+        self.order.clear();
+        self.generation = generation;
+        true
     }
 
     fn get(&mut self, run_key: RunKey) -> Option<LoadedRun> {
@@ -362,12 +425,14 @@ fn loaded_execution_identity(loaded: &LoadedRun) -> Result<(NamespaceId, Workflo
 
 async fn resolve_identity_request<R: RunRepository>(
     repo: &R,
+    owner: &Arc<RwLock<ShardOwner>>,
     cache: &mut LaneCache,
     request: IdentityRequest,
 ) {
     if request.reply.is_closed() {
         return;
     }
+    cache.synchronize_generation(owner);
     let result = async {
         match cache.get_with(request.run_key, loaded_execution_identity) {
             Some(identity) => identity,
@@ -450,6 +515,7 @@ where
 {
     let (tx, mut rx) = mpsc::channel::<LaneMessage>(1024);
     let (identity_tx, mut identity_rx) = mpsc::channel::<IdentityRequest>(1024);
+    let (metadata_tx, mut metadata_rx) = mpsc::channel::<OutboundMetadataRequest>(64);
     tokio::spawn(async move {
         // One lane-local cache shared across activations: a run's loaded state
         // survives between commands so repeated work on the same run avoids a
@@ -464,6 +530,14 @@ where
         // slot that only this task can free.
         let mut carry_over: Option<LaneMessage> = None;
         loop {
+            // A bounded metadata batch shares the lane's serialization and cache
+            // with normal commands; neither stream may starve the other.
+            for _ in 0..config.max_drain_per_activation.max(1) {
+                let Ok(request) = metadata_rx.try_recv() else {
+                    break;
+                };
+                commit_outbound_metadata(&repo, &shard_owner, &mut cache, request).await;
+            }
             // A perpetually nonempty command queue can retain a carry-over
             // forever. Serve a bounded batch of immutable identity reads between
             // activations so admission cannot starve, without reordering writes.
@@ -471,7 +545,7 @@ where
                 let Ok(request) = identity_rx.try_recv() else {
                     break;
                 };
-                resolve_identity_request(&repo, &mut cache, request).await;
+                resolve_identity_request(&repo, &shard_owner, &mut cache, request).await;
             }
             let message = match carry_over.take() {
                 Some(message) => message,
@@ -481,7 +555,11 @@ where
                         None => break,
                     },
                     Some(request) = identity_rx.recv() => {
-                        resolve_identity_request(&repo, &mut cache, request).await;
+                        resolve_identity_request(&repo, &shard_owner, &mut cache, request).await;
+                        continue;
+                    }
+                    Some(request) = metadata_rx.recv() => {
+                        commit_outbound_metadata(&repo, &shard_owner, &mut cache, request).await;
                         continue;
                     }
                 },
@@ -518,9 +596,43 @@ where
         lane_id,
         tx,
         identity_tx,
+        metadata_tx,
         #[cfg(test)]
         identity_requests: Arc::default(),
     }
+}
+
+async fn commit_outbound_metadata<R: RunRepository>(
+    repo: &R,
+    owner: &Arc<RwLock<ShardOwner>>,
+    cache: &mut LaneCache,
+    request: OutboundMetadataRequest,
+) {
+    let run = request.transition.next_state.run_key;
+    let result = async {
+        let transition = *request.transition;
+        anyhow::ensure!(
+            transition.history_events.is_empty()
+                && transition.event_principals.is_empty()
+                && transition.request_dedupe_ops.is_empty()
+                && transition.activity_ops.is_empty()
+                && transition.timer_ops.is_empty()
+                && transition.dispatch_ops.is_empty(),
+            "outbound metadata transition contains semantic effects"
+        );
+        request.attempt.validate(owner)?;
+        let _permit =
+            crate::serving_gate::admit(owner, request.attempt.acquisition.shard_id).await?;
+        request.attempt.validate(owner)?;
+        repo.commit_transition(run, transition, request.attempt.fence)
+            .await
+    }
+    .await;
+    // Even an ambiguous commit may have written. Reload before the next command
+    // instead of allowing a cached no-op to hide that committed observation.
+    cache.entries.remove(&run);
+    cache.order.retain(|key| *key != run);
+    let _ = request.reply.send(result);
 }
 
 #[cfg(test)]
@@ -627,6 +739,7 @@ where
             message.run_key,
             message.command,
             message.successor_plan.as_ref(),
+            message.outbound.as_ref(),
             &mut successor_effect,
             config.max_occ_retries,
             cache,
@@ -724,7 +837,6 @@ where
                     )),
                     _ => None,
                 };
-                let mut reset_materialization_error = None;
                 if let CommitResult::Applied { new_state } = &commit_result {
                     let shard_id = shard_id.expect("applied transition has an execution home");
                     track_committed_run(
@@ -835,310 +947,6 @@ where
                             close_continues_into_successor(&history_events),
                         );
                     }
-                    if new_state.closed_at.is_some()
-                        && let Some((successor_run_id, fork_event_id)) =
-                            extract_reset_metadata(&history_events)
-                    {
-                        // The reapply exclude bits ride the committed Reset
-                        // command (the marker event's persisted shape is
-                        // frozen). A reset close always originates from
-                        // Command::Reset, so missing bits (defensive arm)
-                        // mean "exclude nothing".
-                        let (
-                            exclude_signal,
-                            exclude_update,
-                            reset_request_context,
-                            post_reset_versioning_overrides,
-                            expected_current,
-                        ) = match &committed_command {
-                            Command::Reset(reset_request) => (
-                                reset_request.reapply_exclude_signal,
-                                reset_request.reapply_exclude_update,
-                                reset_request.request.clone(),
-                                reset_request.post_reset_versioning_overrides.clone(),
-                                reset_request.expected_current_run_key,
-                            ),
-                            _ => (
-                                false,
-                                false,
-                                tokeira_types::RequestContext::unattributed(
-                                    time::OffsetDateTime::now_utc(),
-                                ),
-                                Vec::new(),
-                                None,
-                            ),
-                        };
-                        // A reset closes the predecessor and forks a successor
-                        // run at `fork_event_id`. The successor is materialized
-                        // here rather than through the normal start path, so
-                        // its timeout tracking has to be re-seeded explicitly
-                        // below — nothing else will register it.
-                        let successor_run_key = RunKey::derive(
-                            new_state.namespace_id,
-                            &new_state.workflow_id,
-                            successor_run_id,
-                        );
-                        // The resetter reapplies the base run's eligible post-fork
-                        // events onto the successor branch. Read them from the base
-                        // (predecessor) history now — the successor's authored
-                        // WFTFailed command below carries them so the kernel emits
-                        // them between the failure and the fresh scheduled task.
-                        // Paged: the DSQL store clamps an unbounded limit to its
-                        // default page size, which would silently truncate reapply
-                        // on a long post-fork tail. A read error FAILS the reset
-                        // (same posture as a materialization failure below) —
-                        // degrading to an empty reapply would silently drop
-                        // durably-recorded post-fork signals/updates while the
-                        // RPC reports success.
-                        let reset_reapply = {
-                            const REAPPLY_READ_PAGE: usize = 1024;
-                            let mut base_post_fork = Vec::new();
-                            let mut cursor = fork_event_id;
-                            loop {
-                                match repo
-                                    .read_history(message.run_key, cursor, REAPPLY_READ_PAGE)
-                                    .await
-                                {
-                                    Ok(page) => {
-                                        let page_len = page.len();
-                                        if let Some(last) = page.last() {
-                                            cursor = last.event_id;
-                                        }
-                                        base_post_fork.extend(page);
-                                        if page_len < REAPPLY_READ_PAGE {
-                                            break Ok(collect_reset_reapply(
-                                                &base_post_fork,
-                                                fork_event_id,
-                                                exclude_signal,
-                                                exclude_update,
-                                            ));
-                                        }
-                                    }
-                                    Err(error) => break Err(error),
-                                }
-                            }
-                        };
-                        let reset_reapply = match reset_reapply {
-                            Ok(reset_reapply) => Some(reset_reapply),
-                            Err(error) => {
-                                tracing::error!(
-                                    ?error,
-                                    base_run_key = ?message.run_key,
-                                    "failed to read base history for reset reapply"
-                                );
-                                reset_materialization_error = Some(error);
-                                None
-                            }
-                        };
-                        if reset_reapply.is_none() {
-                            // Reapply extraction failed: surface the error to the
-                            // reset RPC and do NOT materialize a successor missing
-                            // its reapplied events.
-                        } else if let Err(error) = async {
-                            // The materialization is fenced by the home's lease,
-                            // as the reset's commit was (`bundle-lease-fence`).
-                            let fence = {
-                                let owner = shard_owner.read().expect("shard_owner lock poisoned");
-                                let home = execution_home_bundle(
-                                    new_state.namespace_id.0.as_bytes(),
-                                    new_state.workflow_id.0.as_bytes(),
-                                    owner.shard_count(),
-                                );
-                                owner.write_fence(home).ok_or_else(|| {
-                                    crate::errors::NotShardOwner::local(home, ShardEpoch::ZERO)
-                                })?
-                            };
-                            repo.materialize_reset_successor(
-                                message.run_key,
-                                fork_event_id,
-                                successor_run_id,
-                                expected_current,
-                                fence,
-                            )
-                            .await
-                            .map_err(|error| crate::errors::lease_loss(error, shard_owner))
-                        }
-                        .await
-                        {
-                            tracing::error!(
-                                ?error,
-                                predecessor_run_key = ?message.run_key,
-                                successor_run_key = ?successor_run_key,
-                                "failed to materialize reset successor"
-                            );
-                            // The attempt has stopped, so its record and the
-                            // rows it wrote can go now (`bounded-bulk-writes`).
-                            // A purge that fails here is retried by the
-                            // runtime's purger, or by the shard's next owner.
-                            if let Err(purge_error) = repo.purge_run(successor_run_key).await {
-                                tracing::warn!(
-                                    error = ?purge_error,
-                                    successor_run_key = ?successor_run_key,
-                                    "failed to purge an abandoned reset successor"
-                                );
-                            }
-                            reset_materialization_error = Some(error);
-                        } else if let Ok((LoadedRun::Existing(successor_state), successor_stats)) =
-                            repo.load_run_with_stats(successor_run_key).await
-                        {
-                            let shard_id = {
-                                let owner = shard_owner.read().expect("shard_owner lock poisoned");
-                                tokeira_types::execution_home_bundle(
-                                    successor_state.namespace_id.0.as_bytes(),
-                                    successor_state.workflow_id.0.as_bytes(),
-                                    owner.shard_count(),
-                                )
-                            };
-                            if successor_state.workflow_execution_timeout.is_some()
-                                || successor_state.workflow_run_timeout.is_some()
-                            {
-                                workflow_timeout_tracking.insert(
-                                    crate::timeout::WorkflowTimeoutEntry {
-                                        run_key: successor_state.run_key,
-                                        shard_id,
-                                        workflow_execution_timeout: successor_state
-                                            .workflow_execution_timeout,
-                                        workflow_run_timeout: successor_state.workflow_run_timeout,
-                                        started_at: successor_state.started_at,
-                                        workflow_start_delay: successor_state.workflow_start_delay,
-                                        first_run_started_at: successor_state.first_run_started_at,
-                                        has_retry_policy: successor_state.retry_policy.is_some(),
-                                    },
-                                );
-                            }
-                            for activity in successor_state.activities.values() {
-                                activity_tracking.insert(
-                                    crate::activity_timeout::ActivityTrackingEntry {
-                                        run_key: successor_state.run_key,
-                                        shard_id,
-                                        activity_id: activity.activity_id.clone(),
-                                        original_scheduled_at: activity.scheduled_at,
-                                        last_dispatched_at: activity.scheduled_at,
-                                        started_at: activity.started_at,
-                                        last_heartbeat_at: activity.last_heartbeat_at,
-                                        cancel_requested: false,
-                                    },
-                                );
-                            }
-                            for nexus in successor_state.pending_nexus_operations.values() {
-                                if nexus.schedule_to_close_timeout.is_some()
-                                    || nexus.schedule_to_start_timeout.is_some()
-                                    || nexus.start_to_close_timeout.is_some()
-                                {
-                                    nexus_timeout_tracking.insert(
-                                        crate::nexus::NexusTimeoutEntry {
-                                            run_key: successor_state.run_key,
-                                            shard_id,
-                                            operation_id: nexus.operation_id.clone(),
-                                            scheduled_event_id: nexus.scheduled_event_id,
-                                            scheduled_at: nexus.scheduled_at,
-                                        },
-                                    );
-                                }
-                            }
-                            // v1.31.0's resetter fails the fork-point WFT on the
-                            // successor branch with cause ResetWorkflow and
-                            // schedules a fresh task (`AddWorkflowTaskFailedEvent`
-                            // with RESET_WORKFLOW, workflow_resetter.go @ v1.31.0).
-                            // The replayed successor ends with that WFT still
-                            // STARTED (its finish event is the fork point, cut
-                            // from the copied prefix), so the ordinary WFT-failed
-                            // path authors the failure and re-dispatches a fresh
-                            // task. Submitted off-lane: the successor may hash to
-                            // the very lane running this activation.
-                            if let Some(pending) = successor_state.pending_workflow_task.as_ref() {
-                                // The fork-point WFT may be scheduled-not-started
-                                // (the copied prefix ended at its Scheduled event) —
-                                // pass 0 and let the kernel synthesize its Started
-                                // before failing it (reset_synthesize_started).
-                                let started_event_id = pending.started_event_id.unwrap_or(0);
-                                let command = tokeira_kernel::Command::WorkflowTaskFailed(
-                                    tokeira_kernel::WorkflowTaskFailedRequest {
-                                        logical_seq: pending.logical_seq,
-                                        started_event_id,
-                                        failure_cause:
-                                            tokeira_kernel::WorkflowTaskFailedCause::ResetWorkflow,
-                                        failure_details: None,
-                                        worker_identity: tokeira_types::WorkerIdentity(
-                                            "reset".into(),
-                                        ),
-                                        request: reset_request_context.clone(),
-                                        now: time::OffsetDateTime::now_utc(),
-                                        // Guarded above: this branch is reached only
-                                        // when the reapply extraction succeeded.
-                                        reset_reapply: reset_reapply.clone().unwrap_or_default(),
-                                        // A scheduled-not-started fork task gets a
-                                        // freshly derived Advice from the successor's
-                                        // own History Size, the copied prefix's size
-                                        // (continue-as-new-advice, Requirement 2.10).
-                                        history_size_bytes: successor_stats.history_size_bytes,
-                                        advice_policy:
-                                            crate::runtime::continue_as_new_advice_policy(),
-                                        terminate_reason: None,
-                                    },
-                                );
-                                let publisher = publisher.clone();
-                                tokio::spawn(async move {
-                                    // Post-reset options are committed on the
-                                    // successor before the reset-boundary failure
-                                    // schedules its first fresh WFT. This preserves
-                                    // v1.31.0's `performPostResetOperations` ordering
-                                    // without coupling storage materialization to
-                                    // public option semantics
-                                    // (`service/history/ndc/workflow_resetter.go @
-                                    // v1.31.0`).
-                                    for (index, versioning_override) in
-                                        post_reset_versioning_overrides.into_iter().enumerate()
-                                    {
-                                        let mut request = reset_request_context.clone();
-                                        request.request_id = tokeira_types::RequestId(format!(
-                                            "post-reset-options:{}:{index}",
-                                            request.request_id.0
-                                        ));
-                                        // v1.31.0 supplies an empty identity to
-                                        // MergeAndApply for post-reset operations.
-                                        request.caller_identity = None;
-                                        let command =
-                                            tokeira_kernel::Command::UpdateExecutionOptions(
-                                                tokeira_kernel::UpdateExecutionOptionsRequest {
-                                                    versioning_override,
-                                                    completion_callbacks:
-                                                        tokeira_kernel::FieldChange::Unchanged,
-                                                    priority:
-                                                        tokeira_kernel::FieldChange::Unchanged,
-                                                    attached_completion_callbacks: Vec::new(),
-                                                    attached_links: Vec::new(),
-                                                    attached_request_id: None,
-                                                    request,
-                                                    now: time::OffsetDateTime::now_utc(),
-                                                    completion_callback_limit: None,
-                                                },
-                                            );
-                                        if let Err(error) = publisher
-                                            .submit_to_run(successor_run_key, command)
-                                            .await
-                                        {
-                                            tracing::error!(
-                                                ?error,
-                                                successor_run_key = ?successor_run_key,
-                                                "failed to apply post-reset workflow options"
-                                            );
-                                            return;
-                                        }
-                                    }
-                                    if let Err(error) =
-                                        publisher.submit_to_run(successor_run_key, command).await
-                                    {
-                                        tracing::error!(
-                                            ?error,
-                                            successor_run_key = ?successor_run_key,
-                                            "failed to fail the reset successor's fork-point workflow task"
-                                        );
-                                    }
-                                });
-                            }
-                        }
-                    }
                 }
                 if reserved_start_has_direct_delivery(&committed_command) {
                     // A start that reserved a waiting poller will hand the
@@ -1158,9 +966,7 @@ where
                     // reconstructs dispatchable work from committed state.
                     tracing::warn!(?error, run_key = ?message.run_key, "failed to publish dispatch ops");
                 }
-                if let Some(error) = reset_materialization_error {
-                    Err(error)
-                } else {
+                {
                     if let CommitResult::Applied { new_state } = &commit_result {
                         let shard_id = shard_id.expect("applied transition has an execution home");
                         if let Command::NexusOperationResolved(request) = &committed_command
@@ -1175,10 +981,9 @@ where
                         {
                             nexus_timeout_tracking.remove(message.run_key, &request.operation_id);
                         }
-                        // A retryable attempt failure leaves the op pending and backing off:
-                        // ensure it is tracked so the nexus timeout/retry scanner re-fires the
-                        // next attempt at `next_attempt_at` (an op with no schedule-to-close was
-                        // not otherwise tracked). Terminal resolutions above already removed it.
+                        // Retry authority lives in durable operation discovery. Keep
+                        // timeout tracking aligned with the original deadline while
+                        // the operation is backing off.
                         if let Command::NexusOperationResolved(request) = &committed_command
                             && matches!(
                                 request.resolution,
@@ -1195,148 +1000,6 @@ where
                                 scheduled_event_id: request.scheduled_event_id,
                                 scheduled_at: op.scheduled_at,
                             });
-                        }
-                        if new_state.closed_at.is_some() && close_authored_by(&history_events) {
-                            // A child run closing must notify its parent so the
-                            // parent can resolve the pending child future. Skip
-                            // when the close is a reset fork (handled above) —
-                            // that is a new lineage, not a child completion — and
-                            // skip when the close continues into a successor
-                            // (retry/cron/CaN, new_execution_run_id set): the
-                            // parent is notified only when the chain finally ends
-                            // with NewExecutionRunId=="" (MaximumAttemptsReached),
-                            // so a retrying child's non-final failure does not
-                            // resolve the parent's future early
-                            // (transfer_queue_active_task_executor.go:387,422 @
-                            // v1.31.0; TestRetryFailChildWorkflowExecution).
-                            if let Some(parent_run_key) = new_state.parent_run_key
-                                && extract_reset_metadata(&history_events).is_none()
-                                && !close_continues_into_successor(&history_events)
-                            {
-                                let maybe_resolution = match new_state.status {
-                                    tokeira_types::ExecutionStatus::Completed => {
-                                        Some(tokeira_kernel::ChildResolution::Completed {
-                                            result: new_state
-                                                .close_result
-                                                .clone()
-                                                .unwrap_or_default(),
-                                        })
-                                    }
-                                    tokeira_types::ExecutionStatus::Failed => {
-                                        Some(tokeira_kernel::ChildResolution::Failed {
-                                            failure: new_state
-                                                .close_failure
-                                                .clone()
-                                                .unwrap_or_else(|| {
-                                                    failure_to_payload(&failure_proto::Failure {
-                                                        message: "child workflow failed"
-                                                            .to_string(),
-                                                        ..Default::default()
-                                                    })
-                                                }),
-                                        })
-                                    }
-                                    tokeira_types::ExecutionStatus::Cancelled => {
-                                        Some(tokeira_kernel::ChildResolution::Canceled)
-                                    }
-                                    tokeira_types::ExecutionStatus::Terminated => {
-                                        Some(tokeira_kernel::ChildResolution::Terminated)
-                                    }
-                                    tokeira_types::ExecutionStatus::TimedOut => {
-                                        Some(tokeira_kernel::ChildResolution::TimedOut)
-                                    }
-                                    _ => None,
-                                };
-                                if let Some(resolution) = maybe_resolution {
-                                    let command = tokeira_kernel::Command::ChildResolved(
-                                        tokeira_kernel::ChildResolvedRequest {
-                                            child_workflow_id: new_state.workflow_id.clone(),
-                                            // The run that actually closed — the
-                                            // final continue-as-new generation,
-                                            // which the parent's resolution event
-                                            // must reference.
-                                            resolved_run_id: Some(new_state.run_id),
-                                            resolution,
-                                            now: time::OffsetDateTime::now_utc(),
-                                        },
-                                    );
-                                    let publisher = publisher.clone();
-                                    let repo = repo.clone();
-                                    let child_run_key = message.run_key;
-                                    // Deliver to the parent off this lane: the
-                                    // parent may hash to the very lane running
-                                    // this activation, and submitting inline
-                                    // would deadlock waiting on a lane that is
-                                    // busy with us. The spawned submit routes
-                                    // through the parent's own lane.
-                                    tokio::spawn(async move {
-                                        // A parent terminated/superseded by reset
-                                        // records its successor in `reset_run_id`;
-                                        // the resolution follows that lineage until
-                                        // an open run accepts it — v1.31.0 redirects
-                                        // RecordChildExecutionCompleted the same way
-                                        // (recordchildworkflowcompleted/api.go:47-54
-                                        // @ v1.31.0, maxResetRedirectCount = 100).
-                                        // The successor's replayed prefix still holds
-                                        // the pending child, so the redirected
-                                        // resolution lands as an ordinary child
-                                        // completion there.
-                                        const MAX_RESET_REDIRECTS: usize = 100;
-                                        let mut target = parent_run_key;
-                                        let mut redirects = 0;
-                                        loop {
-                                            let Err(error) = publisher
-                                                .submit_to_run(target, command.clone())
-                                                .await
-                                            else {
-                                                return;
-                                            };
-                                            let redirected = if redirects < MAX_RESET_REDIRECTS {
-                                                match repo.load_run(target).await {
-                                                    Ok(LoadedRun::Existing(parent_state))
-                                                        if !parent_state.is_open() =>
-                                                    {
-                                                        parent_state.reset_run_id.map(
-                                                            |reset_run_id| {
-                                                                RunKey::derive(
-                                                                    parent_state.namespace_id,
-                                                                    &parent_state.workflow_id,
-                                                                    reset_run_id,
-                                                                )
-                                                            },
-                                                        )
-                                                    }
-                                                    _ => None,
-                                                }
-                                            } else {
-                                                None
-                                            };
-                                            match redirected {
-                                                Some(next) if next != target => {
-                                                    redirects += 1;
-                                                    target = next;
-                                                }
-                                                _ => {
-                                                    let error_message = error.to_string();
-                                                    // A parent that already moved on
-                                                    // (kernel rejects the resolution) or
-                                                    // no longer exists is an expected
-                                                    // race, not an operational fault —
-                                                    // log it quietly.
-                                                    if error_message.contains("kernel rejected")
-                                                        || error_message.contains("not found")
-                                                    {
-                                                        tracing::debug!(?error, parent_run_key = ?target, child_run_key = ?child_run_key, "failed to deliver child resolution to parent");
-                                                    } else {
-                                                        tracing::warn!(?error, parent_run_key = ?target, child_run_key = ?child_run_key, "failed to deliver child resolution to parent");
-                                                    }
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                    });
-                                }
-                            }
                         }
                     }
                     if let Some(effect) = successor_effect.take() {
@@ -1360,28 +1023,6 @@ where
                                 {
                                     tracing::warn!(?error, run_key = ?state.run_key, "failed to publish successor dispatch");
                                 }
-                            }
-                            SuccessorEffect::Deferred(start) => {
-                                // The size fallback alone uses a separate start. Submit off
-                                // this lane to avoid self-deadlock, past external drain admission.
-                                let publisher = publisher.clone();
-                                let predecessor_run_key = message.run_key;
-                                let successor_run_key = start.run_key;
-                                tokio::spawn(async move {
-                                    let result = publisher
-                                        .submit_to_run(start.run_key, Command::Start(*start))
-                                        .await;
-                                    // Duplicate is a request-dedupe collision, not proof
-                                    // that the successor exists (requirement 6.4).
-                                    if !matches!(result, Ok(CommitResult::Applied { .. })) {
-                                        tracing::error!(
-                                            ?result,
-                                            ?predecessor_run_key,
-                                            ?successor_run_key,
-                                            "size-fallback successor start failed"
-                                        );
-                                    }
-                                });
                             }
                         }
                     }
@@ -1567,6 +1208,7 @@ where
         run_key,
         command,
         None,
+        None,
         &mut None,
         max_retries,
         cache,
@@ -1584,6 +1226,7 @@ async fn handle_message_with_successor<K, R>(
     run_key: RunKey,
     command: Command,
     successor_plan: Option<&SuccessorPlan>,
+    outbound: Option<&OutboundSubmission>,
     successor_effect: &mut Option<SuccessorEffect>,
     max_retries: u32,
     cache: &mut LaneCache,
@@ -1597,10 +1240,24 @@ where
     K: Kernel + Send + Sync + 'static,
     R: RunRepository + 'static,
 {
+    if matches!(command, Command::Reset(_)) {
+        return Err(
+            crate::KernelRejected(tokeira_kernel::Reject::ResetConstraintViolation {
+                reason: "reset must use the atomic runtime reset coordinator".into(),
+            })
+            .into(),
+        );
+    }
     // Start timing is frozen across OCC retries, independently of the retry/cron
     // delay evaluation clock carried in the plan (see successor::build_successor_start).
     let successor_now = OffsetDateTime::now_utc();
     let mut attempts = 0u32;
+    let mut original_acquisition = outbound.map(|submission| {
+        (
+            submission.attempt.acquisition.clone(),
+            submission.attempt.fence.clone(),
+        )
+    });
     loop {
         let transition_span = tracing::info_span!(
             "kernel.transition",
@@ -1611,7 +1268,8 @@ where
             tokeira.transition_number = tracing::field::Empty,
             transition_seq = tracing::field::Empty,
         );
-        let loaded = match cache.get(run_key) {
+        cache.synchronize_generation(shard_owner);
+        let mut loaded = match cache.get(run_key) {
             Some(loaded) => loaded,
             None => {
                 let loaded = tokeira_storage::read_probe::scope(
@@ -1623,6 +1281,74 @@ where
                 loaded
             }
         };
+        let (namespace, workflow) = match (&loaded, &command) {
+            (LoadedRun::Existing(state), _) => (state.namespace_id, state.workflow_id.clone()),
+            (LoadedRun::Absent, Command::Start(start)) => {
+                (start.namespace_id, start.workflow_id.clone())
+            }
+            (LoadedRun::Absent, Command::StartAndUpdate(request)) => (
+                request.start.namespace_id,
+                request.start.workflow_id.clone(),
+            ),
+            (LoadedRun::Absent, Command::SignalWithStart(start)) => {
+                (start.namespace_id, start.workflow_id.clone())
+            }
+            _ => {
+                return Err(anyhow::Error::new(KernelRejected(
+                    tokeira_kernel::Reject::MissingRun,
+                )));
+            }
+        };
+        let execution_home_bundle = {
+            let owner = shard_owner.read().expect("shard owner lock poisoned");
+            execution_home_bundle(
+                namespace.0.as_bytes(),
+                workflow.0.as_bytes(),
+                owner.shard_count(),
+            )
+        };
+        if original_acquisition.is_none() {
+            let owner = shard_owner.read().expect("shard owner lock poisoned");
+            let Some(acquisition) = owner.acquisition(execution_home_bundle) else {
+                return Ok((
+                    CommitResult::Conflict {
+                        reason: format!(
+                            "not owner of execution-home shard {execution_home_bundle:?}"
+                        ),
+                    },
+                    SmallVec::new(),
+                    SmallVec::new(),
+                ));
+            };
+            let fence = owner.fence_at(execution_home_bundle, acquisition.epoch);
+            original_acquisition = Some((acquisition, fence));
+        }
+        if write_admission.is_none() {
+            *write_admission =
+                crate::serving_gate::admit(shard_owner, execution_home_bundle).await?;
+        }
+        let (acquisition, fence) = original_acquisition
+            .as_ref()
+            .expect("acquisition selected above");
+        crate::serving_gate::validate(shard_owner, acquisition)?;
+        anyhow::ensure!(
+            acquisition.shard_id == execution_home_bundle,
+            "outbound destination home mismatch"
+        );
+        if let Some(submission) = outbound {
+            submission.attempt.validate(shard_owner)?;
+        }
+        let fence = fence.clone();
+        // A reset may publish while this command waits for the home barrier.
+        // Refresh after admission, before applying the kernel: stale state can
+        // otherwise return a false no-op or rejection without any OCC check.
+        if cache.synchronize_generation(shard_owner) {
+            loaded = repo.load_run(run_key).await?;
+            cache.insert(run_key, loaded.clone());
+        }
+        let processing_span = tracing::Span::current();
+        processing_span.record("tokeira.shard_id", execution_home_bundle.0);
+        processing_span.record("tokeira.bundle_id", execution_home_bundle.0);
         let (loaded, attempt_command) =
             reconcile_held_updates(loaded, command.clone(), update_registry, run_key);
         let mut transition = transition_span.in_scope(|| {
@@ -1642,42 +1368,11 @@ where
             "tokeira.transition_number",
             transition.next_state.transition_seq.0 as i64,
         );
-        let (execution_home_bundle, fence) = {
-            let owner = shard_owner.read().expect("shard_owner lock poisoned");
-            let bundle_id = execution_home_bundle(
-                transition.next_state.namespace_id.0.as_bytes(),
-                transition.next_state.workflow_id.0.as_bytes(),
-                owner.shard_count(),
-            );
-            // The processing span starts before identity is available. Record
-            // the actual execution home once, using this already-loaded state.
-            let processing_span = tracing::Span::current();
-            processing_span.record("tokeira.shard_id", bundle_id.0);
-            processing_span.record("tokeira.bundle_id", bundle_id.0);
-            // Fast local reject if we plainly don't hold the bundle. This is an
-            // optimization, not the safety boundary: a stale owner that still
-            // believes it owns the bundle is refused by the fence carried into
-            // the storage commit below, which is the only authoritative check.
-            let Some(local_epoch) = owner.epoch_of(bundle_id) else {
-                return Ok((
-                    CommitResult::Conflict {
-                        reason: format!("not owner of execution-home shard {bundle_id:?}"),
-                    },
-                    SmallVec::new(),
-                    SmallVec::new(),
-                ));
-            };
-            // Under controller-managed placement the fence carries the home's
-            // lease at the epoch this node holds it, so storage refuses a
-            // superseded owner's write (`bundle-lease-fence`). With no
-            // placement controller there is no lease to fence against.
-            (bundle_id, owner.fence_at(bundle_id, local_epoch))
-        };
         transition_span.record(
             "transition_seq",
             transition.next_state.transition_seq.0 as i64,
         );
-        if transition.is_noop() {
+        if transition.is_noop() && outbound.is_none() {
             // A state-equivalent options update is linearized by this lane
             // load/apply turn but has no durable write set. Temporal returns
             // `Noop=true` without persisting mutable state in the equivalent
@@ -1692,14 +1387,20 @@ where
                 SmallVec::new(),
             ));
         }
-        if write_admission.is_none() {
-            *write_admission =
-                crate::serving_gate::admit(shard_owner, execution_home_bundle).await?;
-        }
         let dispatch_ops = transition.dispatch_ops.clone();
         let history_events = transition.history_events.clone();
 
-        let commit_result = if let Some(start) =
+        let commit_result = if let Some(submission) = outbound {
+            repo.commit_outbound_transition(
+                run_key,
+                transition,
+                submission.authority,
+                submission.source_fence.clone(),
+                fence,
+            )
+            .await
+            .map_err(|error| crate::errors::lease_loss(error, shard_owner))?
+        } else if let Some(start) =
             build_successor_start(&transition, successor_plan, successor_now)?
         {
             // Temporal rejects a completion whose new run cannot be set up:
@@ -1738,21 +1439,10 @@ where
                 }
                 PairCommitResult::Conflict { reason } => CommitResult::Conflict { reason },
                 PairCommitResult::Duplicate => CommitResult::Duplicate,
-                PairCommitResult::SizeRefused => {
-                    let result = repo
-                        .commit_transition_for_bundle(
-                            run_key,
-                            execution_home_bundle,
-                            transition,
-                            fence,
-                        )
-                        .await
-                        .map_err(|error| crate::errors::lease_loss(error, shard_owner))?;
-                    if matches!(result, CommitResult::Applied { .. }) {
-                        *successor_effect = Some(SuccessorEffect::Deferred(Box::new(start)));
-                    }
-                    result
-                }
+                PairCommitResult::SizeRefused => repo
+                    .commit_successor_fallback(run_key, transition, Box::new(start), fence)
+                    .await
+                    .map_err(|error| crate::errors::lease_loss(error, shard_owner))?,
             }
         } else {
             repo.commit_transition_for_bundle(run_key, execution_home_bundle, transition, fence)
@@ -1890,9 +1580,14 @@ fn command_type_name(command: &Command) -> &'static str {
         Command::WorkflowTaskTimedOut(_) => "WorkflowTaskTimedOut",
         Command::ActivityResolved(_) => "ActivityResolved",
         Command::ChildStartConfirmed(_) => "ChildStartConfirmed",
-        Command::ChildResolved(_) => "ChildResolved",
-        Command::ExternalSignalResolved(_) => "ExternalSignalResolved",
-        Command::ExternalCancelResolved(_) => "ExternalCancelResolved",
+        Command::ParentChildStartRecorded(_) => "ParentChildStartRecorded",
+        Command::ChildResolved(_) | Command::ChildResolvedV2 { .. } => "ChildResolved",
+        Command::ExternalSignalResolved(_) | Command::ExternalSignalResolvedV2 { .. } => {
+            "ExternalSignalResolved"
+        }
+        Command::ExternalCancelResolved(_) | Command::ExternalCancelResolvedV2 { .. } => {
+            "ExternalCancelResolved"
+        }
         Command::NexusOperationResolved(_) => "NexusOperationResolved",
         Command::NexusOperationRetry(_) => "NexusOperationRetry",
         Command::NexusCancellationAttempted(_) => "NexusCancellationAttempted",
@@ -2042,7 +1737,8 @@ fn history_event_type_name(event: &HistoryEvent) -> &'static str {
         HistoryEventKind::TimerCanceled { .. } => "TimerCanceled",
         HistoryEventKind::TimerFired { .. } => "TimerFired",
         HistoryEventKind::ActivityTaskCancelRequested { .. } => "ActivityTaskCancelRequested",
-        HistoryEventKind::StartChildWorkflowExecutionInitiated { .. } => {
+        HistoryEventKind::StartChildWorkflowExecutionInitiated { .. }
+        | HistoryEventKind::StartChildWorkflowExecutionInitiatedV2 { .. } => {
             "StartChildWorkflowExecutionInitiated"
         }
         HistoryEventKind::ChildWorkflowExecutionStarted { .. } => "ChildWorkflowExecutionStarted",
@@ -2054,17 +1750,23 @@ fn history_event_type_name(event: &HistoryEvent) -> &'static str {
         }
         HistoryEventKind::ChildWorkflowExecutionFailed { .. } => "ChildWorkflowExecutionFailed",
         HistoryEventKind::ChildWorkflowExecutionCanceled { .. } => "ChildWorkflowExecutionCanceled",
-        HistoryEventKind::ChildWorkflowExecutionTerminated { .. } => {
+        HistoryEventKind::ChildWorkflowExecutionTerminated { .. }
+        | HistoryEventKind::ChildWorkflowExecutionTerminatedV2 { .. } => {
             "ChildWorkflowExecutionTerminated"
         }
-        HistoryEventKind::ChildWorkflowExecutionTimedOut { .. } => "ChildWorkflowExecutionTimedOut",
+        HistoryEventKind::ChildWorkflowExecutionTimedOut { .. }
+        | HistoryEventKind::ChildWorkflowExecutionTimedOutV2 { .. } => {
+            "ChildWorkflowExecutionTimedOut"
+        }
         HistoryEventKind::SignalExternalWorkflowExecutionInitiated { .. } => {
             "SignalExternalWorkflowExecutionInitiated"
         }
-        HistoryEventKind::ExternalWorkflowExecutionSignaled { .. } => {
+        HistoryEventKind::ExternalWorkflowExecutionSignaled { .. }
+        | HistoryEventKind::ExternalWorkflowExecutionSignaledV2 { .. } => {
             "ExternalWorkflowExecutionSignaled"
         }
-        HistoryEventKind::SignalExternalWorkflowExecutionFailed { .. } => {
+        HistoryEventKind::SignalExternalWorkflowExecutionFailed { .. }
+        | HistoryEventKind::SignalExternalWorkflowExecutionFailedV2 { .. } => {
             "SignalExternalWorkflowExecutionFailed"
         }
         HistoryEventKind::RequestCancelExternalWorkflowExecutionInitiated { .. } => {
@@ -2073,7 +1775,8 @@ fn history_event_type_name(event: &HistoryEvent) -> &'static str {
         HistoryEventKind::ExternalWorkflowExecutionCancelRequested { .. } => {
             "ExternalWorkflowExecutionCancelRequested"
         }
-        HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed { .. } => {
+        HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed { .. }
+        | HistoryEventKind::RequestCancelExternalWorkflowExecutionFailedV2 { .. } => {
             "RequestCancelExternalWorkflowExecutionFailed"
         }
         HistoryEventKind::NexusOperationScheduled { .. } => "NexusOperationScheduled",
@@ -2147,56 +1850,9 @@ fn close_continues_into_successor(history_events: &[HistoryEvent]) -> bool {
     })
 }
 
-/// Whether THIS transition authored the run's close — it appended a terminal
-/// workflow event. The parent child-resolution notify must key on this, not
-/// on `new_state.closed_at`: a success-noop commit against an already-closed
-/// run (e.g. a repeat cancel, requestcancelworkflow/api.go:44-53 @ v1.31.0)
-/// carries the closed state but no terminal event, and re-firing the notify
-/// would deliver a duplicate `ChildResolved` — matching the wrong incarnation
-/// when the parent reused the child workflow id.
-fn close_authored_by(history_events: &[HistoryEvent]) -> bool {
-    history_events.iter().any(|event| {
-        matches!(
-            event.kind,
-            HistoryEventKind::WorkflowExecutionCompleted { .. }
-                | HistoryEventKind::WorkflowExecutionFailed { .. }
-                | HistoryEventKind::WorkflowExecutionCanceled { .. }
-                | HistoryEventKind::WorkflowExecutionTerminated { .. }
-                | HistoryEventKind::WorkflowExecutionTimedOut { .. }
-                | HistoryEventKind::WorkflowExecutionContinuedAsNew { .. }
-        )
-    })
-}
-
-/// Detect a reset from a committed close: a `WorkflowTaskFailed` carrying the
-/// `ResetWorkflow` cause names the successor run and the fork point. Returns
-/// `(new_run_id, fork_event_id)` so the lane can materialize the forked run.
-/// Distinguishes a reset close from an ordinary close (which delivers a child
-/// resolution to the parent instead). The reapply exclude bits are NOT on the
-/// marker — the persisted `WorkflowTaskFailed` shape is postcard-positional and
-/// frozen — they ride the committed `Command::Reset` the lane already holds.
-fn extract_reset_metadata(history_events: &[HistoryEvent]) -> Option<(tokeira_types::RunId, i64)> {
-    history_events.iter().find_map(|event| match &event.kind {
-        HistoryEventKind::WorkflowTaskFailed {
-            failure_cause: tokeira_kernel::WorkflowTaskFailedCause::ResetWorkflow,
-            new_run_id: Some(new_run_id),
-            fork_event_id: Some(fork_event_id),
-            ..
-        } => Some((*new_run_id, *fork_event_id)),
-        _ => None,
-    })
-}
-
-/// Walk the base run's post-fork history `[fork_event_id+1 .. end]` and collect
-/// the events the resetter must reapply onto the successor branch, in original
-/// order. v1.31.0's `reapplyEvents` (workflow_resetter.go): signals are
-/// reapplied as-is (unless excluded), execution-options updates are ALWAYS
-/// reapplied (even under `RESET_REAPPLY_TYPE_NONE`), accepted/admitted updates
-/// are re-authored as `WorkflowExecutionUpdateAdmitted` (unless excluded), and
-/// task/lifecycle/cancel events are skipped. The successor's WFT is never
-/// processed by these leaves — they assert only the post-reset history shape —
-/// so reapply just re-emits the eligible event kinds.
-fn collect_reset_reapply(
+/// Select eligible reapply events from a captured lineage segment. The caller
+/// retains attribution alongside these kinds; this selection performs no I/O.
+pub(crate) fn collect_reset_reapply(
     base_history: &[HistoryEvent],
     fork_event_id: i64,
     exclude_signal: bool,
@@ -2242,7 +1898,9 @@ fn collect_reset_reapply(
             | HistoryEventKind::ChildWorkflowExecutionFailed { .. }
             | HistoryEventKind::ChildWorkflowExecutionCanceled { .. }
             | HistoryEventKind::ChildWorkflowExecutionTerminated { .. }
+            | HistoryEventKind::ChildWorkflowExecutionTerminatedV2 { .. }
             | HistoryEventKind::ChildWorkflowExecutionTimedOut { .. }
+            | HistoryEventKind::ChildWorkflowExecutionTimedOutV2 { .. }
                 if !(exclude_signal && exclude_update) =>
             {
                 Some(event.kind.clone())
@@ -2254,7 +1912,7 @@ fn collect_reset_reapply(
 
 /// Install durable-run deadlines before a start's reply or dispatch. Paired
 /// successors use the same path as ordinary starts, with the same execution home.
-fn track_committed_run(
+pub(crate) fn track_committed_run(
     new_state: &tokeira_kernel::WorkflowState,
     history_events: &[HistoryEvent],
     shard_id: ShardId,
@@ -2372,6 +2030,7 @@ fn track_committed_run(
 #[cfg(test)]
 mod tests {
     mod atomic_successors;
+    mod outbound_publication;
     use std::{
         collections::{BTreeMap, HashMap, VecDeque},
         future::poll_fn,
@@ -2514,32 +2173,6 @@ mod tests {
         }
     }
 
-    struct SuccessorFailureEvent {
-        level: tracing::Level,
-        fields: HashMap<String, String>,
-    }
-
-    struct SuccessorFailureCapture(mpsc::UnboundedSender<SuccessorFailureEvent>);
-
-    impl<S: Subscriber> Layer<S> for SuccessorFailureCapture {
-        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-            let mut recorder = FieldRecorder {
-                values: HashMap::new(),
-            };
-            event.record(&mut recorder);
-            if recorder
-                .values
-                .get("message")
-                .is_some_and(|message| message.contains("size-fallback successor start failed"))
-            {
-                let _ = self.0.send(SuccessorFailureEvent {
-                    level: *event.metadata().level(),
-                    fields: recorder.values,
-                });
-            }
-        }
-    }
-
     struct MockKernelState {
         applied_commands: Vec<Command>,
         loaded_runs: Vec<LoadedRun>,
@@ -2662,6 +2295,7 @@ mod tests {
         commit_gate: Option<CommitGate>,
         pair_behaviors: VecDeque<PairBehavior>,
         pairs: Vec<(Transition, Transition)>,
+        fallbacks: Vec<StartRequest>,
     }
 
     struct CommitGate {
@@ -2697,6 +2331,7 @@ mod tests {
                     commit_gate: None,
                     pair_behaviors: VecDeque::new(),
                     pairs: Vec::new(),
+                    fallbacks: Vec::new(),
                 })),
             }
         }
@@ -2721,6 +2356,20 @@ mod tests {
 
     #[async_trait]
     impl RunRepository for MockRepo {
+        async fn commit_successor_fallback(
+            &self,
+            run: RunKey,
+            closing: Transition,
+            start: Box<StartRequest>,
+            fence: WriteFence,
+        ) -> Result<CommitResult> {
+            let result = self.commit_transition(run, closing, fence).await?;
+            if matches!(result, CommitResult::Applied { .. }) {
+                self.state.lock().await.fallbacks.push(*start);
+            }
+            Ok(result)
+        }
+
         async fn commit_transition_pair(
             &self,
             _run_key: RunKey,
@@ -3126,24 +2775,6 @@ mod tests {
                 submits: state.submits.clone(),
             }
         }
-
-        async fn wait_for_submits(&self, expected: usize) {
-            loop {
-                // Register before the re-check (broker.rs module-doc TOCTOU
-                // invariant): `notify_waiters` stores no permit and signals
-                // only already-enabled waiters, so a check-first loop can lose
-                // the sole wakeup from the spawned successor submit and park
-                // forever — which is exactly how this helper once wedged a
-                // full-suite run for 2h21m.
-                let notified = self.wake.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                if self.state.lock().await.submits.len() >= expected {
-                    return;
-                }
-                notified.await;
-            }
-        }
     }
 
     #[derive(Debug, PartialEq)]
@@ -3338,6 +2969,7 @@ mod tests {
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,
+            outbound: Some(Default::default()),
             run_key,
             namespace_id,
             workflow_id: WorkflowId("workflow".to_string()),
@@ -3809,10 +3441,12 @@ mod tests {
     fn queued_depth_reflects_bounded_channel_occupancy() {
         let (tx, _rx) = mpsc::channel(4);
         let (identity_tx, _) = mpsc::channel(1);
+        let (metadata_tx, _) = mpsc::channel(1);
         let handle = LaneHandle {
             lane_id: 0,
             tx,
             identity_tx,
+            metadata_tx,
             identity_requests: Arc::default(),
         };
         assert_eq!(handle.queued_depth(), 0);
@@ -4478,7 +4112,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_activation_delivers_child_resolution_to_parent_on_child_close() {
+    async fn run_activation_leaves_child_close_delivery_to_committed_intents() {
         let child_run_key = RunKey::new();
         let parent_run_key = RunKey::new();
         let mut state = sample_state(child_run_key);
@@ -4526,24 +4160,9 @@ mod tests {
             CommitResult::Applied { .. }
         ));
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
         let snapshot = publisher.snapshot().await;
-        assert_eq!(snapshot.publishes.len(), 0);
-        assert_eq!(snapshot.submits.len(), 1);
-        assert_eq!(snapshot.submits[0].0, parent_run_key);
-        match &snapshot.submits[0].1 {
-            Command::ChildResolved(request) => {
-                assert_eq!(
-                    request.child_workflow_id,
-                    WorkflowId("child-workflow".to_string())
-                );
-                assert!(matches!(
-                    request.resolution,
-                    tokeira_kernel::ChildResolution::Completed { .. }
-                ));
-            }
-            other => panic!("expected ChildResolved command, got {other:?}"),
-        }
+        assert!(snapshot.publishes.is_empty());
+        assert!(snapshot.submits.is_empty());
     }
 
     #[tokio::test]
@@ -4595,7 +4214,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn size_fallback_submits_continue_as_new_successor_with_chain_fields() {
+    async fn size_fallback_persists_continue_as_new_successor_with_chain_fields() {
         let run_key = RunKey::new();
         let mut state = sample_state(run_key);
         let chain_start = OffsetDateTime::now_utc() - Duration::hours(2);
@@ -4699,37 +4318,35 @@ mod tests {
             CommitResult::Applied { .. }
         ));
 
-        publisher.wait_for_submits(1).await;
-        let snapshot = publisher.snapshot().await;
-        assert_eq!(snapshot.submits.len(), 1);
-        match &snapshot.submits[0].1 {
-            Command::Start(request) => {
-                assert_eq!(request.workflow_id, state.workflow_id);
-                assert_eq!(request.namespace_id, state.namespace_id);
-                assert_eq!(request.continued_execution_run_id, Some(state.run_id));
-                assert_eq!(request.first_execution_run_id, Some(first_run_id));
-                assert_eq!(request.first_run_started_at, Some(chain_start));
-                assert_eq!(request.retry_policy, successor_retry_policy);
-                assert_eq!(request.attempt, 1);
-                assert_eq!(
-                    request.workflow_execution_timeout,
-                    Some(Duration::minutes(30))
-                );
-                assert_eq!(request.workflow_run_timeout, Some(Duration::minutes(5)));
-                assert_eq!(request.completion_callbacks, vec![callback]);
-                assert_eq!(
-                    request.inherited_versioning_info,
-                    Some(inherited_versioning_info)
-                );
-                assert_eq!(request.versioning_override, None);
-                assert!(
-                    request
-                        .completion_callbacks
-                        .iter()
-                        .all(|callback| callback.state == CallbackState::Standby)
-                );
-            }
-            other => panic!("expected successor Start request, got {other:?}"),
+        assert!(publisher.snapshot().await.submits.is_empty());
+        let recorded = repo.state.lock().await;
+        assert_eq!(recorded.fallbacks.len(), 1);
+        let request = &recorded.fallbacks[0];
+        {
+            assert_eq!(request.workflow_id, state.workflow_id);
+            assert_eq!(request.namespace_id, state.namespace_id);
+            assert_eq!(request.continued_execution_run_id, Some(state.run_id));
+            assert_eq!(request.first_execution_run_id, Some(first_run_id));
+            assert_eq!(request.first_run_started_at, Some(chain_start));
+            assert_eq!(request.retry_policy, successor_retry_policy);
+            assert_eq!(request.attempt, 1);
+            assert_eq!(
+                request.workflow_execution_timeout,
+                Some(Duration::minutes(30))
+            );
+            assert_eq!(request.workflow_run_timeout, Some(Duration::minutes(5)));
+            assert_eq!(request.completion_callbacks, vec![callback]);
+            assert_eq!(
+                request.inherited_versioning_info,
+                Some(inherited_versioning_info)
+            );
+            assert_eq!(request.versioning_override, None);
+            assert!(
+                request
+                    .completion_callbacks
+                    .iter()
+                    .all(|callback| callback.state == CallbackState::Standby)
+            );
         }
 
         assert!(tracking.snapshot().is_empty());
@@ -4783,22 +4400,15 @@ mod tests {
                 ).await;
 
                 let _ = first_reply.await.unwrap().unwrap();
-                if is_continued_as_new {
-                    publisher.wait_for_submits(1).await;
-                }
-                let snapshot = publisher.snapshot().await;
-                if is_continued_as_new {
-                    prop_assert_eq!(snapshot.submits.len(), 1);
-                } else {
-                    prop_assert!(snapshot.submits.is_empty());
-                }
+                prop_assert!(publisher.snapshot().await.submits.is_empty());
+                prop_assert_eq!(repo.state.lock().await.fallbacks.len(), usize::from(is_continued_as_new));
                 Ok::<(), proptest::test_runner::TestCaseError>(())
             })?;
         }
     }
 
     #[tokio::test]
-    async fn size_fallback_keeps_close_when_successor_start_fails() {
+    async fn size_fallback_remains_durable_when_publisher_fails() {
         let run_key = RunKey::new();
         let state = sample_state(run_key);
         let repo = MockRepo::new(
@@ -4837,24 +4447,18 @@ mod tests {
             first_reply.await.unwrap().unwrap(),
             CommitResult::Applied { .. }
         ));
-        publisher.wait_for_submits(1).await;
+        assert!(publisher.snapshot().await.submits.is_empty());
+        assert_eq!(repo.state.lock().await.fallbacks.len(), 1);
         assert!(tracking.snapshot().is_empty());
     }
 
-    #[tokio::test(start_paused = true)]
-    // Keep the dispatcher installed until the spawned fallback logs its result.
-    #[allow(clippy::await_holding_lock)]
-    async fn size_fallback_logs_duplicate_as_failure() {
-        let _tracing = tracing_dispatch_guard();
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let subscriber = tracing_subscriber::registry().with(SuccessorFailureCapture(event_tx));
-        let dispatch = tracing::Dispatch::new(subscriber);
-        let _guard = tracing::dispatcher::set_default(&dispatch);
+    #[tokio::test]
+    async fn size_fallback_commit_failure_leaves_close_unpublished() {
         let run_key = RunKey::new();
         let state = sample_state(run_key);
         let repo = MockRepo::new(
             LoadedRun::Existing(state.clone()),
-            vec![CommitBehavior::Applied],
+            vec![CommitBehavior::Error],
         );
         let kernel = ContinueAsNewKernel::continued_as_new();
         let publisher = MockPublisher::new()
@@ -4886,21 +4490,10 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            first_reply.await.unwrap().unwrap(),
-            CommitResult::Applied { .. }
-        ));
-        let event = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
-            .await
-            .expect("a duplicate fallback start must log a failure")
-            .expect("failure capture must stay connected");
-        assert_eq!(event.level, tracing::Level::ERROR);
-        assert_eq!(
-            event.fields.get("result").map(String::as_str),
-            Some("Ok(Duplicate)")
-        );
-        assert_eq!(publisher.snapshot().await.submits.len(), 1);
-        assert_eq!(repo.snapshot().await.1, 1);
+        assert!(first_reply.await.unwrap().is_err());
+        assert!(publisher.snapshot().await.submits.is_empty());
+        assert!(repo.state.lock().await.fallbacks.is_empty());
+        assert_eq!(repo.snapshot().await.2, LoadedRun::Existing(state));
         assert!(tracking.snapshot().is_empty());
     }
 

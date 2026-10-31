@@ -882,6 +882,93 @@ where
         }
     }
 
+    /// Persist a worker outcome using the acquisition that published its task.
+    /// A stale, expired or consumed incarnation is acknowledged without changing
+    /// history; a transient repository error leaves discovery responsible for retry.
+    pub async fn resolve_nexus_worker_result(
+        &self,
+        authority: crate::NexusDeliveryAuthority,
+        result: crate::NexusWorkerResult,
+    ) -> Result<bool> {
+        if !authority.active() {
+            return Ok(false);
+        }
+        authority.attempt.validate(&self.shard_owner)?;
+        let row = &authority.row;
+        let LoadedRun::Existing(state) = self.repo.load_run(row.incarnation.key.source_run).await?
+        else {
+            return Ok(false);
+        };
+        if !tokeira_storage::derive_operations(&state, row.source_home)?
+            .iter()
+            .any(|pending| pending.incarnation == row.incarnation)
+        {
+            return Ok(false);
+        }
+        let Some(pending) = state
+            .pending_nexus_operations
+            .values()
+            .find(|p| p.scheduled_event_id == row.incarnation.key.initiating_event)
+        else {
+            return Ok(false);
+        };
+        let command = match (row.incarnation.key.kind, result) {
+            (
+                tokeira_kernel::OperationKind::NexusStart,
+                crate::NexusWorkerResult::Start(resolution),
+            ) => Command::NexusOperationResolved(tokeira_kernel::NexusOperationResolvedRequest {
+                expected_attempt: Some(row.incarnation.attempt),
+                operation_id: pending.operation_id.clone(),
+                scheduled_event_id: pending.scheduled_event_id,
+                resolution,
+                now: OffsetDateTime::now_utc(),
+            }),
+            (
+                tokeira_kernel::OperationKind::NexusCancel,
+                crate::NexusWorkerResult::Cancel(outcome),
+            ) => Command::NexusCancellationAttempted(
+                tokeira_kernel::NexusCancellationAttemptedRequest {
+                    expected_attempt: row.incarnation.attempt,
+                    operation_id: pending.operation_id.clone(),
+                    scheduled_event_id: pending.scheduled_event_id,
+                    requested_event_id: row.incarnation.requested_event,
+                    outcome,
+                    now: OffsetDateTime::now_utc(),
+                },
+            ),
+            _ => return Ok(false),
+        };
+        let lane =
+            crate::scanner::pick_lane_for_run_key(&self.lanes, self.lanes.len(), state.run_key);
+        let result = lane
+            .submit_outbound(
+                state.run_key,
+                command,
+                crate::lane::OutboundSubmission {
+                    source_fence: authority.attempt.fence.clone(),
+                    attempt: authority.attempt,
+                    authority: tokeira_storage::DeliveryGuard::Operation {
+                        incarnation: row.incarnation,
+                        source_seq: state.transition_seq,
+                    },
+                },
+            )
+            .await;
+        match result {
+            Ok(CommitResult::Applied { .. } | CommitResult::Duplicate) => Ok(true),
+            Ok(_) => Ok(false),
+            Err(error)
+                if error.downcast_ref::<KernelRejected>().is_some()
+                    || error
+                        .downcast_ref::<tokeira_storage::RecoveryError>()
+                        .is_some_and(|e| matches!(e, tokeira_storage::RecoveryError::Obsolete)) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Resolve a Nexus operation back into its originator workflow.
     ///
     /// Returns `Ok(false)` when the kernel rejects the resolution as stale or
@@ -892,12 +979,14 @@ where
         run_key: RunKey,
         operation_id: String,
         scheduled_event_id: i64,
+        expected_attempt: Option<u32>,
         resolution: tokeira_kernel::NexusResolution,
     ) -> Result<bool> {
         match self
             .submit_for_owned_shard(
                 run_key,
                 Command::NexusOperationResolved(tokeira_kernel::NexusOperationResolvedRequest {
+                    expected_attempt,
                     operation_id,
                     scheduled_event_id,
                     resolution,
@@ -907,7 +996,13 @@ where
             .await
         {
             Ok(_) => Ok(true),
-            Err(error) if error.to_string().contains("kernel rejected command") => Ok(false),
+            Err(error)
+                if error
+                    .downcast_ref::<crate::lane::KernelRejected>()
+                    .is_some() =>
+            {
+                Ok(false)
+            }
             Err(error) => Err(error),
         }
     }
@@ -921,6 +1016,7 @@ where
         operation_id: String,
         scheduled_event_id: i64,
         requested_event_id: i64,
+        expected_attempt: u32,
         outcome: tokeira_kernel::NexusCancellationAttemptOutcome,
     ) -> Result<bool> {
         match self
@@ -928,6 +1024,7 @@ where
                 run_key,
                 Command::NexusCancellationAttempted(
                     tokeira_kernel::NexusCancellationAttemptedRequest {
+                        expected_attempt,
                         operation_id,
                         scheduled_event_id,
                         requested_event_id,
@@ -939,7 +1036,13 @@ where
             .await
         {
             Ok(_) => Ok(true),
-            Err(error) if error.to_string().contains("kernel rejected command") => Ok(false),
+            Err(error)
+                if error
+                    .downcast_ref::<crate::lane::KernelRejected>()
+                    .is_some() =>
+            {
+                Ok(false)
+            }
             Err(error) => Err(error),
         }
     }
@@ -2256,6 +2359,7 @@ mod tests {
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,
+            outbound: Some(Default::default()),
             run_key: RunKey::new(),
             namespace_id: NamespaceId::new(),
             workflow_id: WorkflowId("workflow".into()),

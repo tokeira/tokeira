@@ -1,0 +1,5 @@
+kind: fixed
+body: Workflow outbound work survives restarts and ownership changes; resets publish complete state, and oversized successors retain their execution chain.
+time: 2026-10-31T18:25:00Z
+custom:
+    Slice: 1be77393-0162-4a6d-af2c-f9b06800f710

@@ -96,11 +96,15 @@ mod dsql_tests;
 mod lease_fence_tests;
 mod lifecycle;
 mod membership;
+mod outbound_delivery;
+#[cfg(test)]
+mod outbound_tests;
 mod query;
 #[cfg(test)]
 mod queue_home_delivery_exploration_tests;
 #[cfg(test)]
 mod repair_tests;
+mod reset;
 #[cfg(test)]
 mod successor_semantics_tests;
 pub(crate) mod workflow_task;
@@ -225,6 +229,8 @@ pub struct PartitionHome {
 pub struct TokeiraRuntime<R> {
     /// Shared handle to the durable run repository.
     repo: Arc<R>,
+    /// Shared publisher for atomic reset completion and durable recovery wakeups.
+    outbound_publisher: RuntimeDispatchPublisher<R>,
     /// In-memory workflow-task broker.
     broker: InMemoryBroker,
     discovery: (
@@ -761,8 +767,8 @@ where
         namespace_resolver: Option<Arc<dyn NexusNamespaceResolver>>,
     ) -> Self {
         assert!(
-            repo.placement_ready(),
-            "prepare_execution_placement must complete before runtime construction"
+            repo.placement_ready() && repo.outbound_ready(),
+            "prepare_execution_placement and outbound-recovery preparation must complete before runtime construction"
         );
         let shard_count = shard_count.max(1);
         let shard_owner = Arc::new(RwLock::new(ShardOwner::new(shard_count)));
@@ -827,6 +833,7 @@ where
             shared_lanes.clone(),
             lane_count,
         ));
+        let outbound_wake = Arc::new(tokio::sync::Notify::new());
         let lanes: Vec<_> = (0..lane_count)
             .map(|lane_id| {
                 let publisher = RuntimeDispatchPublisher::new(
@@ -845,6 +852,7 @@ where
                     activity_tracking.clone(),
                     delivery_metrics.clone(),
                 )
+                .with_outbound_wake(outbound_wake.clone())
                 .with_namespace_resolver(namespace_resolver.clone())
                 .with_worker_deployment_registry(worker_deployment_registry.clone());
                 spawn_lane_with_id(
@@ -875,6 +883,7 @@ where
             owner.mark_active(shard_id);
         }
         let runtime_shutdown = RuntimeShutdownHandle::new();
+        completion_callback_tracking.set_shutdown(runtime_shutdown.clone());
         let timer_scanner_cancel = CancellationToken::new();
         runtime_shutdown.register_cancellation(timer_scanner_cancel.clone());
         let timer_scanner_handle = Some(runtime_shutdown.spawn(run_timer_scanner(
@@ -999,15 +1008,25 @@ where
             activity_tracking.clone(),
             delivery_metrics.clone(),
         )
+        .with_outbound_wake(outbound_wake.clone())
         .with_namespace_resolver(namespace_resolver.clone())
         .with_worker_deployment_registry(worker_deployment_registry.clone());
+        let _successor_recovery = runtime_shutdown.spawn(crate::outbound::successor::run(
+            repo.clone(),
+            completion_scanner_publisher.clone(),
+            shard_owner.clone(),
+            workflow_timeout_tracking.clone(),
+            wft_timeout_tracking.clone(),
+            runtime_shutdown.cancellation_token(),
+            runtime_shutdown.clone(),
+        ));
         let completion_callback_scanner_cancel = CancellationToken::new();
         runtime_shutdown.register_cancellation(completion_callback_scanner_cancel.clone());
         let completion_callback_scanner_handle =
             Some(runtime_shutdown.spawn(run_completion_callback_scanner(
                 repo.clone(),
                 completion_callback_tracking.clone(),
-                completion_scanner_publisher,
+                completion_scanner_publisher.clone(),
                 shard_owner.clone(),
                 completion_callback_scanner_config,
                 completion_callback_scanner_cancel.clone(),
@@ -1036,6 +1055,7 @@ where
         runtime_shutdown.close_registration();
         let runtime = Self {
             repo,
+            outbound_publisher: completion_scanner_publisher,
             broker,
             discovery,
             startup,

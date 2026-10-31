@@ -1,5 +1,11 @@
 # Design: Runtime Reset Replay Support
 
+The [outbound-recovery refinement](../outbound-dispatch-recovery/design.md) now owns
+the publication protocol. Replay and suffix construction finish before staging;
+source/current/new-run changes and the pointer publish atomically after validation.
+The older post-commit orchestration sketch below is historical, while its history
+and reapply correctness requirements remain binding.
+
 ## Overview
 
 Reset already commits correctly in the kernel. The missing piece is what happens after commit.

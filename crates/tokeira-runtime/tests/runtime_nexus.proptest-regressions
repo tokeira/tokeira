@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f57181bc8479c16427eb95b4326cb4bf439c0f30a6ac99acb72ac35efd28a8bd # shrinks to namespace_seed = 15173303765826070553, service = "hs", operation = "gglfrn", operation_id = "501o_-23r--2p_l", input_bytes = [117, 221, 227]

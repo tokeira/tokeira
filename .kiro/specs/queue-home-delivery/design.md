@@ -1,5 +1,17 @@
 # Design Document
 
+## Approved outbound-recovery refinement
+
+[Outbound dispatch recovery](../outbound-dispatch-recovery/design.md) reuses the
+protected cluster peer material and validated bootstrap mode for a separate,
+reference-only delivery RPC. Its exact audience is
+`urn:tokeira:outbound-delivery:<cluster-uuid>`; workflow-offer credentials cannot
+authorize it, and outbound credentials cannot authorize offers. Public credentials
+authorize neither route. The receiver validates bounded references before runtime
+hydration and validates both original ownership fences at the destination commit.
+No-peer startup modes install neither remote delivery route nor sender. The existing
+offer protocol and worker-start authorization contract below remain unchanged.
+
 ## Overview and dependencies
 
 Scheduling commits durable intent before publication. Publication submits a bounded hint to the queue home, which

@@ -208,12 +208,17 @@ pub(crate) fn legacy_step(
 async fn memory_legacy_step(store: &InMemoryStore, key: RunKey, observation: &Observation) {
     let mut durable = store.inner.lock().await;
     let previous = durable.latest_image(key).map(|record| &record.context);
-    let (state, context) = legacy_step(
+    let (mut state, context) = legacy_step(
         &durable.runs[&key],
         previous,
         observation,
         durable.history_size.get(&key).copied().unwrap_or(0),
     );
+    // Exercise the old projection algorithm within the current writer contract.
+    // Actual old binaries are now excluded by the outbound envelope/cutover;
+    // this projection oracle must not erase unrelated required runtime facts.
+    assert!(state.outbound.is_none());
+    state.outbound = durable.runs[&key].outbound.clone();
     durable
         .transition_audit
         .entry(key)
@@ -617,9 +622,9 @@ proptest! {
     }
 
     // Feature: projection-accumulator, Property 6: restart legacy writers and pruning
-    // Eviction, old writers and restart preserve images while retained; pruning needs both prerequisites.
+    // Eviction, the legacy projection algorithm and restart preserve retained images.
     #[test]
-    fn projection_accumulator_survives_restart_and_mixed_writers(
+    fn projection_accumulator_survives_restart_and_legacy_projection(
         steps in observations(),
         old_on_even in any::<bool>(),
         boundary in 0u8..3,

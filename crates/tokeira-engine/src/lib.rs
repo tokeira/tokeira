@@ -79,6 +79,7 @@ pub mod observability;
 mod peer;
 #[cfg(all(test, feature = "dsql-integration"))]
 mod single_node_claim_live_tests;
+mod storage_maintenance;
 
 pub use listener::{EngineListenError, EngineListener, EngineListenerShutdownError};
 
@@ -410,14 +411,14 @@ struct CacheNexusNamespaceResolver {
 
 #[async_trait]
 impl NexusNamespaceResolver for CacheNexusNamespaceResolver {
-    async fn name_for_id(&self, namespace_id: NamespaceId) -> Option<String> {
-        self.namespaces
+    async fn name_for_id(&self, namespace_id: NamespaceId) -> Result<Option<String>> {
+        Ok(self
+            .namespaces
             .list_all()
-            .await
-            .ok()?
+            .await?
             .into_iter()
             .map(|namespace| namespace.name)
-            .find(|name| namespace_id_for(name) == namespace_id)
+            .find(|name| namespace_id_for(name) == namespace_id))
     }
 }
 
@@ -2440,12 +2441,16 @@ fn dsql_coordination_table_names(config: &TokeiraConfig) -> (String, String) {
 // CLI output is intentional for --version, --dump-config and generated path config.
 #[allow(clippy::print_stdout)]
 pub async fn run_from_cli(cli: Cli) -> Result<()> {
-    if let Some(CliCommand::PeerCredential {
-        command: PeerCredentialCommand::Generate { out },
-    }) = cli.command
-    {
-        println!("{}", peer::generate(&out)?);
-        return Ok(());
+    if let Some(command) = cli.command {
+        return match command {
+            CliCommand::PeerCredential {
+                command: PeerCredentialCommand::Generate { out },
+            } => {
+                println!("{}", peer::generate(&out)?);
+                Ok(())
+            }
+            CliCommand::Storage { command } => storage_maintenance::run(command).await,
+        };
     }
     if cli.version {
         println!("{}", render_build_info(cli.verbose, cli.json));
@@ -3825,6 +3830,14 @@ where
                 routing_cache.clone(),
             ),
         ));
+        if let Some(peer) = &peer {
+            runtime.set_outbound_delivery_transport(Arc::new(
+                tokeira_edge::grpc::outbound_delivery::RemoteOutboundDelivery::new(
+                    routing_cache.clone(),
+                    peer.clone(),
+                ),
+            ));
+        }
         Arc::new(CacheBackedRouter::new(routing_cache, node_id))
     } else {
         Arc::new(LocalOnlyRouter)
@@ -3937,7 +3950,9 @@ where
         interceptors.clone(),
         workflow_service.clone(),
     )
-    .with_peer(peer);
+    .with_peer(peer.clone());
+    let outbound_grpc =
+        tokeira_edge::grpc::outbound_delivery::OutboundDeliveryGrpc::new(runtime.clone(), peer);
     let operator_service = OperatorService::new(operator_api, interceptors)
         .with_nexus_endpoints(nexus_endpoint_admin)
         .with_namespace_deletion(namespaces.clone(), Arc::new(workflow_service.clone()));
@@ -4253,6 +4268,7 @@ where
                     .add_service(operator_grpc.into_service())
                     .add_service(admin_grpc.into_service())
                     .add_service(dispatch_grpc.into_service())
+                    .add_service(outbound_grpc.into_service())
                     .add_service(reflection_v1)
                     .add_service(reflection_v1alpha)
                     .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal)
@@ -4269,6 +4285,7 @@ where
                     .add_service(operator_grpc.into_service())
                     .add_service(admin_grpc.into_service())
                     .add_service(dispatch_grpc.into_service())
+                    .add_service(outbound_grpc.into_service())
                     .add_service(reflection_v1)
                     .add_service(reflection_v1alpha)
                     .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal)

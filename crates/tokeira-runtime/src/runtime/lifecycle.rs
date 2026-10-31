@@ -1420,157 +1420,6 @@ where
         Ok(options)
     }
 
-    /// Reset a workflow execution and synchronously materialize the replayed successor.
-    pub async fn reset_workflow(
-        &self,
-        execution: ExecutionRef,
-        mut request: tokeira_kernel::ResetRequest,
-    ) -> Result<ResetWorkflowResult> {
-        let run_key = self
-            .repo
-            .resolve_execution(&execution)
-            .await?
-            .ok_or_else(|| anyhow!("execution not found"))?;
-        // v1.31.0 resets the BASE run but supersedes and terminates the chain's
-        // CURRENT run when it is a DIFFERENT, still-running run
-        // (`workflow_resetter.go` terminateWorkflow, identity=IdentityResetter). The
-        // base==current-running case is already handled by `apply_reset` terminating
-        // the base. The running current is the pointer resolved without a run id,
-        // which names a run only while it is open. Resolve it BEFORE the fork so the
-        // freshly materialized successor does not become the pointer first.
-        let current_run_key = self
-            .repo
-            .resolve_execution(&ExecutionRef {
-                namespace_id: execution.namespace_id,
-                workflow_id: execution.workflow_id.clone(),
-                run_id: None,
-            })
-            .await?;
-        // The run the pointer names, open or closed: the successor replaces it
-        // as current only while the pointer still names it, so a start that
-        // lands after the reset's commit on its base keeps the pointer
-        // (`bounded-bulk-writes` criterion 2.13). `find_latest_run` reads the
-        // pointer itself; the open-only run above reads a closed current run as
-        // none, which would fail every reset of a closed workflow.
-        request.expected_current_run_key = self
-            .repo
-            .find_latest_run(execution.namespace_id, &execution.workflow_id)
-            .await?;
-        let successor_run_key = RunKey::derive(
-            execution.namespace_id,
-            &execution.workflow_id,
-            request.new_run_id,
-        );
-        let reset_reason = request.reason.clone();
-        let reset_now = request.now;
-        let reset_principal = request.request.principal.clone();
-        let successor_run_id = request.new_run_id;
-        let fork_event_id = request.fork_event_id;
-        let committed = self.submit(run_key, Command::Reset(request)).await;
-        if committed.is_err() {
-            // A failed materialization can leave its record and the rows it
-            // wrote. The lane purges them at once; queueing the successor
-            // retries that purge if it failed. A successor without a record is
-            // a no-op purge.
-            self.purger.enqueue(successor_run_key);
-        }
-        match committed? {
-            CommitResult::Applied { .. } => {}
-            CommitResult::Duplicate => {
-                return Err(anyhow!(
-                    "unexpected duplicate reset commit for {:?}",
-                    run_key
-                ));
-            }
-            CommitResult::Conflict { reason } => return Err(anyhow!("conflict: {reason}")),
-            CommitResult::CurrentExecutionConflict {
-                existing_run_key, ..
-            } => {
-                return Err(anyhow!(
-                    "current execution already exists: {existing_run_key:?}"
-                ));
-            }
-        }
-        // Terminate the current run iff it is distinct from the base and still open.
-        if let Some(current_run_key) = current_run_key
-            && current_run_key != run_key
-            && let tokeira_kernel::LoadedRun::Existing(current) =
-                self.repo.load_run(current_run_key).await?
-            && current.is_open()
-        {
-            let terminate = tokeira_kernel::TerminateRequest {
-                reason: reset_reason,
-                details: None,
-                identity: "reset".to_string(),
-                links: Vec::new(),
-                request: RequestContext {
-                    request_id: tokeira_types::RequestId(format!(
-                        "reset-terminate:{}",
-                        successor_run_id.0
-                    )),
-                    caller_identity: None,
-                    principal: reset_principal,
-                    received_at: reset_now,
-                },
-                now: reset_now,
-            };
-            self.submit(current_run_key, Command::Terminate(terminate))
-                .await?;
-        }
-        // v1.31.0's reset RPC is synchronous: fork, WFTFailed(RESET), reapply,
-        // and the fresh WorkflowTaskScheduled are all durable before it returns,
-        // and callers assert the successor's history immediately. Tokeira's lane
-        // materializes the successor inline with the base commit (done by the
-        // time submit() replies) but authors the fork-point WFT failure via an
-        // off-lane task — wait until the successor's history holds a
-        // `WorkflowTaskFailed(ResetWorkflow)` at or after the fork point. The
-        // copied prefix ends before `fork_event_id` (any earlier reset marker
-        // from a prior reset sits strictly inside the prefix), so this
-        // condition is unique to the boundary; raw event-id growth is NOT
-        // sufficient — when the fork WFT was scheduled-not-started, a
-        // concurrent signal can take `fork_event_id` before the failure lands.
-        // Once present, the marker persists (monotone), which keeps the wait
-        // robust against a fast worker consuming the fresh task concurrently.
-        const RESET_BOUNDARY_WAIT_ATTEMPTS: usize = 250;
-        const RESET_BOUNDARY_WAIT_INTERVAL: std::time::Duration =
-            std::time::Duration::from_millis(20);
-        const RESET_BOUNDARY_SCAN_PAGE: usize = 64;
-        for _ in 0..RESET_BOUNDARY_WAIT_ATTEMPTS {
-            let boundary_window = self
-                .repo
-                .read_history(
-                    successor_run_key,
-                    fork_event_id - 1,
-                    RESET_BOUNDARY_SCAN_PAGE,
-                )
-                .await?;
-            let boundary_landed = boundary_window.iter().any(|event| {
-                matches!(
-                    &event.kind,
-                    tokeira_kernel::HistoryEventKind::WorkflowTaskFailed {
-                        failure_cause: tokeira_kernel::WorkflowTaskFailedCause::ResetWorkflow,
-                        ..
-                    }
-                )
-            });
-            if boundary_landed {
-                return Ok(ResetWorkflowResult {
-                    successor_run_key,
-                    successor_run_id,
-                });
-            }
-            tokio::time::sleep(RESET_BOUNDARY_WAIT_INTERVAL).await;
-        }
-        tracing::warn!(
-            successor_run_key = ?successor_run_key,
-            "reset successor's fork-point workflow task failure did not land before the RPC deadline; returning anyway"
-        );
-        Ok(ResetWorkflowResult {
-            successor_run_key,
-            successor_run_id,
-        })
-    }
-
     /// Decide how a start/signal-with-start should proceed given the target
     /// WorkflowId's current and historical runs.
     ///
@@ -1797,6 +1646,16 @@ fn asks_lane_for_poller(request: &StartRequest) -> bool {
 }
 
 fn prepare_start_request(request: &mut StartRequest, allow_eager_response: bool) -> Result<()> {
+    // Callback links already carry their correlation onto the started event's
+    // callback attributes. Temporal removes equal outer links at admission,
+    // before retries/continue-as-new inherit the accepted original inputs
+    // (service/frontend/workflow_handler.go:dedupLinksFromCallbacks @ v1.31.0).
+    request.links.retain(|link| {
+        !request.completion_callbacks.iter().any(|callback| {
+            matches!(callback.spec, tokeira_kernel::CallbackSpec::Nexus { .. })
+                && callback.links.contains(link)
+        })
+    });
     apply_client_cron_start_backoff(request)?;
     request.eager_execution_accepted = eager_workflow_start_is_accepted(
         request.eager_execution_accepted,
@@ -1876,6 +1735,7 @@ fn patched_retry_policy(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use tokeira_kernel::Kernel;
     use tokeira_storage::WriteFence;
 
     use super::*;
@@ -1885,6 +1745,49 @@ mod tests {
         ExecutionRef, Memo, NamespaceId, Payloads, RequestContext, RequestId, RunId, RunKey,
         SearchAttributes, TaskQueueName, WorkflowId, WorkflowType,
     };
+
+    #[test]
+    fn callback_links_are_not_repeated_on_the_started_event() {
+        let mut request = deletion_start_request();
+        let linked = tokeira_kernel::Link::BatchJob {
+            job_id: "callback".into(),
+        };
+        let independent = tokeira_kernel::Link::BatchJob {
+            job_id: "independent".into(),
+        };
+        request.links = vec![
+            linked.clone(),
+            independent.clone(),
+            linked.clone(),
+            independent.clone(),
+        ];
+        request.completion_callbacks = vec![tokeira_kernel::CompletionCallback {
+            spec: tokeira_kernel::CallbackSpec::Nexus {
+                url: "https://callback.example".into(),
+                header: Default::default(),
+            },
+            links: vec![linked],
+            trigger: tokeira_kernel::CallbackTrigger::WorkflowClosed,
+            registration_time: Some(request.now),
+            state: tokeira_kernel::CallbackState::Standby,
+            attempt: 0,
+            last_attempt_failure: None,
+            last_attempt_complete_time: None,
+            next_attempt_at: None,
+        }];
+        let callbacks = request.completion_callbacks.clone();
+        for _ in 0..2 {
+            prepare_start_request(&mut request, false).unwrap();
+            let transition = BasicKernel
+                .apply(LoadedRun::Absent, Command::Start(request.clone()))
+                .unwrap();
+            assert_eq!(
+                transition.next_state.links,
+                vec![independent.clone(), independent.clone()]
+            );
+            assert_eq!(transition.next_state.completion_callbacks, callbacks);
+        }
+    }
 
     // Feature: reserved-poll-handoff, Property 3. Only a start with a first
     // workflow task to hand over, and no worker of its own, asks for a poll.

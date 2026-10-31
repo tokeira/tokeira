@@ -1,5 +1,14 @@
 # Design Document: Nexus Operation Dispatch
 
+## Approved recovery refinement
+
+[Outbound recovery](../outbound-dispatch-recovery/design.md) replaces the original
+spawn-only orchestration sketches below. Persisted scheduled/start and cancellation
+incarnations are continuously rediscovered independently of timeout tracking. Original
+ownership, scheduled/requested event IDs and attempt generation fence outcomes. The
+persisted Nexus retry/backoff state remains the lifecycle authority; timeout scanners
+do not independently dispatch a second start/cancellation attempt.
+
 ## Overview
 
 This design wires the runtime's `DispatchPublisher` to handle `DispatchOp::ScheduleNexusOperation` and `DispatchOp::CancelNexusOperation`, replacing the current stub logging in `RuntimeDispatchPublisher` (the `other =>` catch-all arm) with working implementations. It introduces outbound HTTP I/O from the runtime for the first time — all previous dispatch ops (child workflows, external signals, external cancels) target internal runs via lane submission.
@@ -64,7 +73,9 @@ flowchart TD
 
 **NexusEndpointRegistry as an in-memory map.** An `Arc<HashMap<String, NexusEndpointConfig>>` maps endpoint names to network addresses. Configured at runtime construction time. Unknown endpoints produce an immediate `NexusResolution::Failed` for schedule ops and a no-op for cancel ops.
 
-**Async, fire-and-forget dispatch via `tokio::spawn`.** Each Nexus dispatch op is processed in a spawned task, consistent with child workflow and external signal patterns. This ensures one slow or failing HTTP call does not block other dispatch ops in the same batch.
+**Bounded owned dispatch.** The outbound driver invokes the Nexus adapter under the
+captured acquisition and exact persisted attempt, so one slow HTTP call cannot block
+unrelated work and a late outcome cannot borrow a replacement owner's authority.
 
 **Resolution always delivered for schedule ops.** Regardless of whether the HTTP call succeeds or fails (transient error, unknown endpoint), the publisher always delivers a `NexusOperationResolved` command back to the originator. This ensures the originator's `PendingNexusOperation` entry is resolved.
 
@@ -751,7 +762,8 @@ If the lane submission returns an `Err` (lane channel closed, OCC exhaustion), t
 
 ### Async dispatch isolation
 
-Each Nexus dispatch op is processed in a `tokio::spawn` task. Failure in one dispatch does not block or affect other dispatch ops in the same batch. This is consistent with the child workflow and external signal dispatch patterns.
+Each Nexus operation or cancellation is processed by a bounded owned attempt. Durable
+eligibility and persisted retry deadlines survive loss of every local task.
 
 ## Testing Strategy
 

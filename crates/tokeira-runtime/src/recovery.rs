@@ -194,6 +194,10 @@ impl RepairAcquisition {
                 }
             }
             metrics::counter!(crate::metrics::WORKFLOW_DISPATCH_REPAIRS_TOTAL).increment(1);
+            self.validate()?;
+            repo.reconcile_outbound_run(self.acquisition.shard_id, run_key, self.fence.clone())
+                .await
+                .with_context(|| format!("repair outbound operations for {run_key:?}"))?;
             return self.validate();
         }
         unreachable!("last repair attempt returns")
@@ -675,6 +679,7 @@ mod tests {
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,
+            outbound: Some(Default::default()),
             run_key,
             namespace_id: NamespaceId::new(),
             workflow_id: WorkflowId("wf".into()),

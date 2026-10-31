@@ -75,7 +75,11 @@ pub const DSQL_CONNECTION_CHECKOUT_OVERDUE_SECONDS: &str =
 pub const MIGRATION_APPLIED_TOTAL: &str = "tokeira_storage_migration_applied_total";
 pub const MIGRATION_DURATION_SECONDS: &str = "tokeira_storage_migration_duration_seconds";
 
+/// Committed pages of stopped-cluster outbound preparation.
+pub const OUTBOUND_UPGRADE_PAGES_TOTAL: &str = "tokeira_storage_outbound_upgrade_pages_total";
+
 pub const METRIC_NAMES: &[(&str, MetricType)] = &[
+    (OUTBOUND_UPGRADE_PAGES_TOTAL, MetricType::Counter),
     (
         COMMIT_TRANSITION_DURATION_SECONDS,
         MetricType::DurationHistogram,
@@ -453,6 +457,11 @@ pub fn record_migration_applied(status: OutcomeLabel) {
 pub fn record_migration_duration(status: OutcomeLabel, duration: std::time::Duration) {
     histogram!(MIGRATION_DURATION_SECONDS, "status" => status.as_str())
         .record(duration.as_secs_f64());
+}
+
+/// Count only committed metadata/continuation pages; uncertain replies are not successes.
+pub(crate) fn record_outbound_upgrade_page() {
+    counter!(OUTBOUND_UPGRADE_PAGES_TOTAL).increment(1);
 }
 
 #[cfg(test)]

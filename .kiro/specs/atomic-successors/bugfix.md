@@ -72,9 +72,12 @@ builders does not require preserving the defects that specification corrects.
 commits today: install its workflow timeouts, its workflow-task tracking and its dispatch, before it replies to the
 close's caller.
 
-2.6 WHEN DSQL refuses the transaction for its size (SQLSTATE 54000), which writes nothing, THEN the runtime SHALL commit
-the close alone and then start the successor with a separate command, as today. It SHALL start the successor only if
-the close applied, and a drain SHALL NOT refuse that start.
+2.6 WHEN DSQL explicitly refuses the pair for its row/value/transaction size, writing
+nothing, THEN the runtime SHALL commit the close with a frozen successor obligation
+and execution-chain reservation. Recovery SHALL publish that exact successor through
+the fenced internal path and retire the obligation atomically, including across drain
+and restart, as refined by [outbound recovery](../outbound-dispatch-recovery/bugfix.md).
+An unclassified SQLSTATE 54000 is not sufficient to select this fallback.
 
 2.7 A drain SHALL NOT stop a close's successor: a successor written by 2.1 needs no command of its own.
 
@@ -97,9 +100,13 @@ and lineage handling.
 3.4 A repeated close SHALL CONTINUE TO be answered as today: a close that has committed is a conflict or a duplicate on
 its retry, and no second successor is written.
 
-3.5 A reset SHALL CONTINUE TO materialize its new run as it does today.
+3.5 A reset SHALL publish its complete new run and participating source changes
+atomically under [outbound recovery](../outbound-dispatch-recovery/bugfix.md), preserving
+the approved reset/reapply semantics without post-success detached follow-up work.
 
-3.6 This change SHALL add no migration and change no version in the schema contract.
+3.6 The original atomic-successors delivery added no migration or schema-contract
+version change. The later outbound-recovery delivery explicitly authorizes the
+versioned metadata, forward migrations and checked cutover required by that design.
 
 ### Out of Scope
 
@@ -108,9 +115,10 @@ its retry, and no second successor is written.
   original metadata and links, cron preservation across retry, timeout outcomes, retry-to-cron
   selection and minimum delay. Explicit continue-as-new already carries its header and minimum
   delay. These refinements do not weaken this specification's atomic persistence contract.
-- **The size fallback.** 2.6's separate start is still lost on a crash, as today. It becomes durable with the rows
-  [Durable Actionable State](../../../docs/architecture/042-durable-actionable-state.md) gives the deliveries a commit
-  leaves to happen later.
+- **The size fallback's delivery.** Now covered by the approved
+  [outbound-recovery specification](../outbound-dispatch-recovery/design.md).
+  Architecture 042's unrelated proposals remain proposed.
 - **Closes by earlier releases.** A run whose successor an earlier release lost stays without one.
-- **Reset's follow-up, a child's resolution and the dispatch operations.** Each is a delivery after the commit, and each
-  has a change of its own.
+- **Reset and outbound relationships.** The combined outbound-recovery delivery now
+  owns complete reset publication, child results and the specified outbound operations.
+  General workflow/activity dispatch reconciliation remains a separate item.

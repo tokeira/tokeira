@@ -293,13 +293,9 @@ async fn nexus_async_started_times_out_via_scanner() -> Result<()> {
                 service: "charge".to_string(),
                 operation: "authorize".to_string(),
                 input: payloads("input"),
-                // A non-zero schedule-to-close that elapses almost immediately:
-                // v1.31.0 treats a zero timeout as "no deadline" (it only emits the
-                // timeout task when the duration is non-zero), so the deadline must
-                // be a real, small interval for the scanner to fire.
-                schedule_to_close_timeout: Some(time::Duration::milliseconds(1)),
+                schedule_to_close_timeout: None,
                 schedule_to_start_timeout: None,
-                start_to_close_timeout: None,
+                start_to_close_timeout: Some(time::Duration::milliseconds(1)),
             }],
             force_new_workflow_task: false,
             limits: Default::default(),
@@ -857,6 +853,7 @@ async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
                 run_key,
                 "op-1".to_string(),
                 scheduled_event_id,
+                None,
                 tokeira_kernel::NexusResolution::Started {
                     operation_token: "handler-token".to_string(),
                     links: Vec::new(),
@@ -1118,6 +1115,7 @@ async fn worker_targeted_cancel_before_start_is_delivered_after_started_resoluti
                 run_key,
                 "op-1".to_string(),
                 scheduled_event_id,
+                None,
                 tokeira_kernel::NexusResolution::Started {
                     operation_token: "handler-token".to_string(),
                     links: Vec::new(),
@@ -1313,7 +1311,7 @@ proptest! {
                 .resolve_nexus_operation(
                     run_key,
                     expected_operation_id.clone(),
-                    scheduled_event_id,
+                    scheduled_event_id,None,
                     tokeira_kernel::NexusResolution::Started {
                         operation_token: handler_token.clone(),
                         links: Vec::new(),
@@ -1646,6 +1644,7 @@ async fn cross_namespace_async_nexus_completes_back_to_originator() -> Result<()
                 parent_run_key,
                 "op-agent".to_string(),
                 scheduled_event_id,
+                None,
                 tokeira_kernel::NexusResolution::Started {
                     operation_token: String::new(),
                     links: Vec::new()
@@ -1676,6 +1675,7 @@ async fn cross_namespace_async_nexus_completes_back_to_originator() -> Result<()
                 parent_run_key,
                 "op-agent".to_string(),
                 scheduled_event_id,
+                None,
                 tokeira_kernel::NexusResolution::Completed {
                     result: payloads("agent-turn-result"),
                     links: Vec::new(),

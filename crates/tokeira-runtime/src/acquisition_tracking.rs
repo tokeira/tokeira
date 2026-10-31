@@ -182,6 +182,16 @@ impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
             .map(|entry| entry.value.clone())
     }
 
+    /// Fetch one descriptor with its acquisition, without scanning other homes.
+    pub(crate) fn tracked(&self, key: &K) -> Option<Tracked<V>> {
+        self.entries
+            .lock()
+            .expect("tracking lock poisoned")
+            .values
+            .get(key)
+            .cloned()
+    }
+
     pub(crate) fn remove(&self, key: &K) {
         let mut inner = self.entries.lock().expect("tracking lock poisoned");
         if self.submitted_revision.is_none_or(|revision| {
@@ -229,6 +239,23 @@ impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
             (None, _) => true,
             _ => false,
         }
+    }
+
+    /// Capture the entry's original acquisition, never a replacement observed
+    /// after a scanner await. Callback outcomes use this through lane commit.
+    pub(crate) fn outbound_attempt(
+        &self,
+        entry: &Tracked<V>,
+    ) -> Option<crate::outbound::driver::Attempt> {
+        let owner = self.owner.get()?.read().expect("shard owner lock poisoned");
+        let acquisition = entry.acquisition.clone()?;
+        if !owner.acquisition_active(&acquisition) {
+            return None;
+        }
+        Some(crate::outbound::driver::Attempt {
+            fence: owner.fence_at(entry.home, acquisition.epoch),
+            acquisition,
+        })
     }
 
     pub(crate) fn remove_submitted(&self, key: &K, submitted: &Tracked<V>) {

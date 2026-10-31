@@ -15,6 +15,12 @@ use tokeira_types::{BundleId, IncarnationId, RunKey, ShardEpoch};
 
 use crate::shard::ShardOwner;
 
+/// Atomic reset publication lost its captured base/current snapshot. No partial
+/// reset was exposed; retrying must load the current execution again.
+#[derive(Clone, Debug, Error)]
+#[error("reset publication conflicted with another workflow transition; retry the reset")]
+pub struct ResetPublicationConflict;
+
 /// Runtime rejected a mutation because the local node is not the active bundle owner.
 ///
 /// Surfaced when a request reaches a node that does not currently hold the

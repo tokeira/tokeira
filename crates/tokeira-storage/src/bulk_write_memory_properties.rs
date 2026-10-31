@@ -95,6 +95,7 @@ async fn closed_run(
                 format!("request-{index}"),
             ),
             RequestRecord {
+                outbound_origin: None,
                 namespace_id: state.namespace_id,
                 workflow_id: state.workflow_id.clone(),
                 run_id: state.run_id,
@@ -577,14 +578,15 @@ async fn the_first_transaction_changes_the_pointer_state_and_record() {
     assert_eq!(
         inner.modeled_transactions,
         [crate::write_budget::WriteCost {
-            // The tombstone, the pointer, the run's state and the record; the
-            // closed run has no dispatch row.
-            rows: 4,
+            // Logical deletion also preserves the encoded source for unresolved
+            // outbound obligations; the closed run has no dispatch row.
+            rows: 5,
             bytes: crate::codec::encode_projection_context(
                 &inner.latest_image(run.run_key).unwrap().context
             )
             .unwrap()
-            .len(),
+            .len()
+                + inner.retained_runs[&run.run_key].len(),
         }]
     );
     assert_eq!(

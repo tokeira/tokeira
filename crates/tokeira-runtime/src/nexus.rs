@@ -6,7 +6,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
 };
 
 use anyhow::{Result, anyhow, bail};
@@ -16,9 +16,8 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    Command, Link, LoadedRun, NexusCancellationRetryRequest, NexusOperationResolvedRequest,
-    NexusOperationRetryRequest, NexusResolution, NexusTimeoutType, PendingNexusOperation,
-    WorkerDeploymentVersionRef,
+    Command, Link, LoadedRun, NexusOperationResolvedRequest, NexusResolution, NexusTimeoutType,
+    PendingNexusOperation, WorkerDeploymentVersionRef,
 };
 use tokeira_storage::RunRepository;
 use tokeira_types::{
@@ -220,8 +219,9 @@ pub struct NexusHttpFailureBody {
 /// name.
 #[async_trait]
 pub trait NexusNamespaceResolver: Send + Sync {
-    /// The namespace name for `namespace_id`, or `None` when it is unknown.
-    async fn name_for_id(&self, namespace_id: NamespaceId) -> Option<String>;
+    /// A successful absence is definitive; lookup errors remain retryable and
+    /// must never author a namespace-not-found workflow event.
+    async fn name_for_id(&self, namespace_id: NamespaceId) -> Result<Option<String>>;
 }
 
 #[async_trait]
@@ -689,6 +689,12 @@ pub enum NexusTaskCorrelation {
         operation_id: String,
         /// Scheduled-event fence for stale-result rejection.
         scheduled_event_id: i64,
+        /// Exact generation captured before queue publication. Public task tokens
+        /// remain wire-compatible; this private route fences late worker replies.
+        attempt: NexusWorkflowAttempt,
+        /// Original source ownership for durable recovery dispatches. This opaque
+        /// local capability is never encoded into a worker-visible token.
+        authority: Option<NexusDeliveryAuthority>,
         /// Whether this delivery attempts to start or cancel the operation. Failed
         /// worker responses do not echo a response variant, so the private route
         /// retains this distinction for correct lifecycle handling.
@@ -722,6 +728,64 @@ pub enum NexusWorkflowTaskKind {
     StartOperation,
     /// `CancelOperation` invocation.
     CancelOperation,
+}
+
+/// Identity of one workflow-originated invocation, retained with its task ID.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NexusWorkflowAttempt {
+    /// Completed-attempt count observed before this invocation.
+    pub generation: u32,
+    /// Cancellation request identity; absent for a start invocation.
+    pub requested_event_id: Option<i64>,
+}
+
+/// Opaque ownership captured before a workflow-originated worker invocation.
+/// A reply may use this acquisition only; it cannot borrow a replacement owner's
+/// fence. The private fields prevent the edge from constructing authority.
+#[derive(Clone, Debug)]
+pub struct NexusDeliveryAuthority {
+    pub(crate) row: tokeira_storage::OperationRow,
+    pub(crate) attempt: crate::outbound::driver::Attempt,
+    expires_at: tokio::time::Instant,
+}
+
+impl NexusDeliveryAuthority {
+    pub(crate) fn new(
+        row: tokeira_storage::OperationRow,
+        attempt: crate::outbound::driver::Attempt,
+    ) -> Self {
+        Self {
+            row,
+            attempt,
+            expires_at: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        }
+    }
+
+    pub(crate) fn active(&self) -> bool {
+        self.attempt.acquisition.valid() && tokio::time::Instant::now() < self.expires_at
+    }
+}
+
+impl PartialEq for NexusDeliveryAuthority {
+    fn eq(&self, other: &Self) -> bool {
+        self.row.incarnation == other.row.incarnation
+            && self.attempt.acquisition.shard_id == other.attempt.acquisition.shard_id
+            && self.attempt.acquisition.epoch == other.attempt.acquisition.epoch
+            && self.attempt.acquisition.generation == other.attempt.acquisition.generation
+            && self.expires_at == other.expires_at
+    }
+}
+
+impl Eq for NexusDeliveryAuthority {}
+
+/// An observed worker reply. Runtime hydration supplies its workflow identity;
+/// the edge translates only the response payload.
+#[derive(Clone, Debug)]
+pub enum NexusWorkerResult {
+    /// Outcome of a StartOperation invocation.
+    Start(NexusResolution),
+    /// Outcome of cancellation delivery, independent of operation completion.
+    Cancel(tokeira_kernel::NexusCancellationAttemptOutcome),
 }
 
 /// Routes an async Nexus completion back to the originator's pending operation.
@@ -1277,6 +1341,7 @@ impl NexusTaskBroker {
         run_key: RunKey,
         operation_id: String,
         scheduled_event_id: i64,
+        attempt: NexusWorkflowAttempt,
         request: NexusTaskRequest,
     ) {
         self.publish_workflow_versioned(
@@ -1284,6 +1349,7 @@ impl NexusTaskBroker {
             run_key,
             operation_id,
             scheduled_event_id,
+            attempt,
             request,
         )
         .await;
@@ -1299,7 +1365,52 @@ impl NexusTaskBroker {
         run_key: RunKey,
         operation_id: String,
         scheduled_event_id: i64,
+        attempt: NexusWorkflowAttempt,
         request: NexusTaskRequest,
+    ) {
+        self.publish_workflow_with_authority(
+            key,
+            run_key,
+            operation_id,
+            scheduled_event_id,
+            attempt,
+            request,
+            None,
+        )
+        .await;
+    }
+
+    pub(crate) async fn publish_recoverable_workflow(
+        &self,
+        key: NexusQueueKey,
+        run_key: RunKey,
+        operation_id: String,
+        scheduled_event_id: i64,
+        attempt: NexusWorkflowAttempt,
+        request: NexusTaskRequest,
+        authority: NexusDeliveryAuthority,
+    ) {
+        self.publish_workflow_with_authority(
+            key,
+            run_key,
+            operation_id,
+            scheduled_event_id,
+            attempt,
+            request,
+            Some(authority),
+        )
+        .await;
+    }
+
+    async fn publish_workflow_with_authority(
+        &self,
+        key: NexusQueueKey,
+        run_key: RunKey,
+        operation_id: String,
+        scheduled_event_id: i64,
+        attempt: NexusWorkflowAttempt,
+        request: NexusTaskRequest,
+        authority: Option<NexusDeliveryAuthority>,
     ) {
         let task_kind = match &request {
             NexusTaskRequest::StartOperation { .. } => NexusWorkflowTaskKind::StartOperation,
@@ -1322,6 +1433,28 @@ impl NexusTaskBroker {
             .unwrap_or(0)
             > 0;
         let mut inner = self.inner.lock().await;
+        if let Some(authority) = &authority {
+            // Local suppression lasts only for a bounded worker attempt. Losing
+            // the broker or its reply route leaves the durable operation intact.
+            let mut expired = HashSet::new();
+            for (id, correlation) in &inner.outstanding {
+                if let NexusTaskCorrelation::Workflow {
+                    authority: Some(existing),
+                    ..
+                } = correlation
+                {
+                    if !existing.active() {
+                        expired.insert(id.clone());
+                    } else if existing.row.incarnation == authority.row.incarnation {
+                        return;
+                    }
+                }
+            }
+            inner.outstanding.retain(|id, _| !expired.contains(id));
+            for queue in inner.ready.values_mut() {
+                queue.retain(|task| !expired.contains(&task.token.task_id));
+            }
+        }
         let task_id = loop {
             let candidate = uuid::Uuid::new_v4().to_string();
             if !inner.outstanding.contains_key(&candidate) {
@@ -1339,6 +1472,8 @@ impl NexusTaskBroker {
                 run_key,
                 operation_id,
                 scheduled_event_id,
+                attempt,
+                authority,
                 task_kind,
                 origin: key.worker_task_origin(),
             },
@@ -2077,6 +2212,25 @@ pub struct CompletionCallbackTrackingState {
         (RunKey, usize),
         CompletionCallbackTrackingEntry,
     >,
+    in_flight: Arc<Mutex<HashSet<(RunKey, usize, u64)>>>,
+    shutdown: Arc<OnceLock<crate::RuntimeShutdownHandle>>,
+}
+
+/// One callback HTTP attempt per acquisition. Cancellation drops the permit;
+/// an old permit cannot release a replacement generation's admission.
+#[derive(Debug)]
+pub(crate) struct CallbackAttemptPermit {
+    key: (RunKey, usize, u64),
+    in_flight: Arc<Mutex<HashSet<(RunKey, usize, u64)>>>,
+}
+
+impl Drop for CallbackAttemptPermit {
+    fn drop(&mut self) {
+        self.in_flight
+            .lock()
+            .expect("callback admission lock poisoned")
+            .remove(&self.key);
+    }
 }
 
 impl CompletionCallbackTrackingState {
@@ -2086,7 +2240,43 @@ impl CompletionCallbackTrackingState {
     pub(crate) fn for_acquisition(&self, acquisition: crate::shard::ShardAcquisition) -> Self {
         Self {
             inner: self.inner.for_acquisition(acquisition),
+            ..self.clone()
         }
+    }
+    pub(crate) fn set_shutdown(&self, shutdown: crate::RuntimeShutdownHandle) {
+        let _ = self.shutdown.set(shutdown);
+    }
+    pub(crate) fn shutdown(&self) -> Option<crate::RuntimeShutdownHandle> {
+        self.shutdown.get().cloned()
+    }
+    pub(crate) fn begin_attempt(
+        &self,
+        run: RunKey,
+        index: usize,
+    ) -> Option<(crate::outbound::driver::Attempt, CallbackAttemptPermit)> {
+        if self
+            .shutdown()
+            .is_some_and(|shutdown| shutdown.cancellation_token().is_cancelled())
+        {
+            return None;
+        }
+        let tracked = self.inner.tracked(&(run, index))?;
+        let attempt = self.inner.outbound_attempt(&tracked)?;
+        let key = (run, index, attempt.acquisition.generation);
+        let mut pending = self
+            .in_flight
+            .lock()
+            .expect("callback admission lock poisoned");
+        if pending.len() >= 32 || !pending.insert(key) {
+            return None;
+        }
+        Some((
+            attempt,
+            CallbackAttemptPermit {
+                key,
+                in_flight: self.in_flight.clone(),
+            },
+        ))
     }
     /// Install only for the current acquisition; recovery may install before activation.
     pub fn insert(&self, entry: CompletionCallbackTrackingEntry) {
@@ -2375,63 +2565,6 @@ pub(crate) async fn scan_nexus_timeouts_once<R>(
         };
 
         let Some(timeout_type) = evaluate_nexus_timeout(operation, now) else {
-            // Not timed out. If the operation is backing off and its next attempt is
-            // due, re-dispatch it. Schedule-to-close (checked just above) dominates: had
-            // it fired we would have taken the timeout branch instead (Invariant 3). The
-            // kernel fences against a double re-dispatch, so this is fire-and-forget and
-            // the entry stays tracked (the op is still pending until a terminal outcome).
-            if operation.next_attempt_at.is_some_and(|next| now >= next) {
-                runtime_metrics::record_scanner_dispatched(
-                    "nexus_retry",
-                    shard_id.map(|s| s.0).unwrap_or(0),
-                );
-                let lane = pick_lane_for_run_key(lanes, lane_count, entry.run_key).clone();
-                let _ = lane
-                    .submit(
-                        entry.run_key,
-                        Command::NexusOperationRetry(NexusOperationRetryRequest {
-                            operation_id: entry.operation_id.clone(),
-                            scheduled_event_id: entry.scheduled_event_id,
-                            now,
-                        }),
-                    )
-                    .await;
-                submitted += 1;
-            }
-            if operation
-                .cancellation
-                .as_ref()
-                .and_then(|cancellation| {
-                    cancellation
-                        .next_attempt_at
-                        .map(|next| (cancellation.requested_event_id, next))
-                })
-                .is_some_and(|(_, next)| now >= next)
-                && submitted < config.max_timeouts_per_scan
-            {
-                let requested_event_id = operation
-                    .cancellation
-                    .as_ref()
-                    .map(|cancellation| cancellation.requested_event_id)
-                    .unwrap_or_default();
-                runtime_metrics::record_scanner_dispatched(
-                    "nexus_cancel_retry",
-                    shard_id.map(|s| s.0).unwrap_or(0),
-                );
-                let lane = pick_lane_for_run_key(lanes, lane_count, entry.run_key).clone();
-                let _ = lane
-                    .submit(
-                        entry.run_key,
-                        Command::NexusCancellationRetry(NexusCancellationRetryRequest {
-                            operation_id: entry.operation_id.clone(),
-                            scheduled_event_id: entry.scheduled_event_id,
-                            requested_event_id,
-                            now,
-                        }),
-                    )
-                    .await;
-                submitted += 1;
-            }
             continue;
         };
 
@@ -2444,6 +2577,7 @@ pub(crate) async fn scan_nexus_timeouts_once<R>(
             .submit(
                 entry.run_key,
                 Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                    expected_attempt: None,
                     operation_id: entry.operation_id.clone(),
                     scheduled_event_id: entry.scheduled_event_id,
                     resolution: NexusResolution::TimedOut { timeout_type },
@@ -2458,11 +2592,10 @@ pub(crate) async fn scan_nexus_timeouts_once<R>(
                 .inner
                 .remove_submitted(&(entry.run_key, entry.operation_id.clone()), &tracked),
             Err(error) => {
-                let message = error.to_string();
                 // Kernel rejection means the operation already resolved or advanced
                 // past the state this timeout was computed against, so the entry is
                 // stale: drop it. Other errors are transient and keep the entry.
-                if message.contains("kernel rejected") {
+                if error.downcast_ref::<crate::KernelRejected>().is_some() {
                     tracing::debug!(
                         ?error,
                         run_key = ?entry.run_key,
@@ -2600,6 +2733,7 @@ mod tests {
                 RunKey::new(),
                 "operation".to_owned(),
                 7,
+                Default::default(),
                 cancel_request("operation"),
             )
             .await;
@@ -2661,6 +2795,7 @@ mod tests {
                 RunKey::new(),
                 "operation".to_owned(),
                 7,
+                Default::default(),
                 cancel_request("operation"),
             )
             .await;
@@ -2822,7 +2957,7 @@ mod tests {
                         key.clone(),
                         run_key,
                         operation_id.clone(),
-                        11,
+                        11,Default::default(),
                         cancel_request(&operation_id),
                     )
                     .await;
@@ -2844,6 +2979,8 @@ mod tests {
                 prop_assert_eq!(
                     broker.consume(&decoded.task_id).await,
                     Some(NexusTaskCorrelation::Workflow {
+                        authority: None,
+                        attempt: Default::default(),
                         run_key,
                         operation_id,
                         scheduled_event_id: 11,
@@ -2882,7 +3019,7 @@ mod tests {
                         task_queue.clone(),
                         first_run,
                         first_operation.clone(),
-                        1,
+                        1,Default::default(),
                         NexusTaskRequest::CancelOperation {
                             service: "svc".to_owned(),
                             operation: "cancel".to_owned(),
@@ -2897,7 +3034,7 @@ mod tests {
                         task_queue.clone(),
                         second_run,
                         second_operation.clone(),
-                        2,
+                        2,Default::default(),
                         NexusTaskRequest::CancelOperation {
                             service: "svc".to_owned(),
                             operation: "cancel".to_owned(),
@@ -2919,6 +3056,8 @@ mod tests {
                 prop_assert_eq!(
                     broker.consume(&first.token.task_id).await,
                     Some(NexusTaskCorrelation::Workflow {
+                        authority: None,
+                        attempt: Default::default(),
                         run_key: first_run,
                         operation_id: first_operation,
                         scheduled_event_id: 1,
@@ -2930,6 +3069,8 @@ mod tests {
                 prop_assert_eq!(
                     broker.consume(&second.token.task_id).await,
                     Some(NexusTaskCorrelation::Workflow {
+                        authority: None,
+                        attempt: Default::default(),
                         run_key: second_run,
                         operation_id: second_operation,
                         scheduled_event_id: 2,
@@ -2967,7 +3108,7 @@ mod tests {
                         task_queue.clone(),
                         run_key,
                         operation_id.clone(),
-                        7,
+                        7,Default::default(),
                         NexusTaskRequest::CancelOperation {
                             service: "svc".to_owned(),
                             operation: "cancel".to_owned(),
@@ -3001,6 +3142,8 @@ mod tests {
                 prop_assert_eq!(
                     broker.consume(&workflow.token.task_id).await,
                     Some(NexusTaskCorrelation::Workflow {
+                        authority: None,
+                        attempt: Default::default(),
                         run_key,
                         operation_id,
                         scheduled_event_id: 7,

@@ -37,6 +37,10 @@ pub const MAX_OFFER_HANDLERS: usize = 64;
 pub const OFFER_TIMEOUT: Duration = Duration::from_millis(500);
 /// Exact internal route, absent from no-peer deployments.
 pub const OFFER_PATH: &str = "/tokeira.internal.runtime.v1.WorkflowTaskDispatch/OfferWorkflowTask";
+/// Reference-only delivery has a separate credential purpose and handler budget.
+pub const OUTBOUND_PATH: &str = "/tokeira.internal.runtime.v1.OutboundDelivery/Deliver";
+/// Fixed end-to-end budget, including bounded authoritative recipe reads.
+pub const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Validated bootstrap capability. Construction is restricted to peer startup.
 pub struct PeerOfferEndpoint {
@@ -45,6 +49,7 @@ pub struct PeerOfferEndpoint {
     // or renewal task is activated by installing the wire contract.
     signer: PeerSigner,
     handlers: Arc<Semaphore>,
+    outbound_handlers: Arc<Semaphore>,
 }
 
 impl fmt::Debug for PeerOfferEndpoint {
@@ -60,17 +65,27 @@ impl PeerOfferEndpoint {
             verifier,
             signer,
             handlers: Arc::new(Semaphore::new(MAX_OFFER_HANDLERS)),
+            outbound_handlers: Arc::new(Semaphore::new(32)),
         }
     }
 
-    /// The validated local signer, reserved for offer delivery only.
+    /// Validated local signer; each internal purpose uses its distinct audience.
     pub fn signer(&self) -> &PeerSigner {
         &self.signer
     }
 
     fn enter(&self, headers: &HeaderMap, now: u64) -> Result<OwnedSemaphorePermit, Status> {
+        self.enter_purpose(headers, now, false)
+    }
+
+    fn enter_purpose(
+        &self,
+        headers: &HeaderMap,
+        now: u64,
+        outbound: bool,
+    ) -> Result<OwnedSemaphorePermit, Status> {
         let permit = self
-            .handlers
+            .handlers_for(outbound)
             .clone()
             .try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("offer handler limit exceeded"))?;
@@ -92,8 +107,21 @@ impl PeerOfferEndpoint {
         if values.next().is_some() {
             return Err(Status::unauthenticated("ambiguous peer authentication"));
         }
-        self.verifier.verify_at(value, now).map_err(peer_status)?;
+        if outbound {
+            self.verifier.verify_outbound_at(value, now)
+        } else {
+            self.verifier.verify_at(value, now)
+        }
+        .map_err(peer_status)?;
         Ok(permit)
+    }
+
+    fn handlers_for(&self, outbound: bool) -> &Arc<Semaphore> {
+        if outbound {
+            &self.outbound_handlers
+        } else {
+            &self.handlers
+        }
     }
 }
 
@@ -101,7 +129,7 @@ fn peer_status(error: PeerError) -> Status {
     match error {
         PeerError::TooLarge => Status::resource_exhausted("offer authentication limit exceeded"),
         PeerError::PermissionDenied => {
-            Status::permission_denied("identity has no workflow-offer peer grant")
+            Status::permission_denied("identity has no grant for this peer purpose")
         }
         _ => Status::unauthenticated("invalid peer authentication"),
     }
@@ -140,16 +168,28 @@ where
     }
 
     fn call(&mut self, request: Request<B>) -> Self::Future {
-        if request.uri().path() != OFFER_PATH {
+        let outbound = request.uri().path() == OUTBOUND_PATH;
+        if request.uri().path() != OFFER_PATH && !outbound {
             return Box::pin(self.inner.call(request));
         }
-        let deadline = tokio::time::Instant::now() + OFFER_TIMEOUT;
+        let deadline = tokio::time::Instant::now()
+            + if outbound {
+                OUTBOUND_TIMEOUT
+            } else {
+                OFFER_TIMEOUT
+            };
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|v| v.as_secs());
         let entered = match (&self.peer, now) {
             (None, _) => Err(Status::unimplemented("unknown method")),
-            (Some(peer), Ok(now)) => peer.enter(request.headers(), now),
+            (Some(peer), Ok(now)) => {
+                if outbound {
+                    peer.enter_purpose(request.headers(), now, true)
+                } else {
+                    peer.enter(request.headers(), now)
+                }
+            }
             _ => Err(Status::unavailable("peer clock unavailable")),
         };
         let permit = match entered {
@@ -196,6 +236,12 @@ pub fn offer_client(
 #[derive(Clone, Debug)]
 pub struct OfferResponseLimit<S>(S);
 
+impl<S> OfferResponseLimit<S> {
+    pub(crate) fn new(inner: S) -> Self {
+        Self(inner)
+    }
+}
+
 impl<S> Service<Request<Body>> for OfferResponseLimit<S>
 where
     S: Service<Request<Body>, Response = Response<Body>>,
@@ -211,7 +257,7 @@ where
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
-        let offer = request.uri().path() == OFFER_PATH;
+        let offer = matches!(request.uri().path(), OFFER_PATH | OUTBOUND_PATH);
         let response = self.0.call(request);
         Box::pin(async move {
             let response = response.await?;
@@ -422,6 +468,32 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn outbound_route_rejects_offer_credentials_and_absent_peer_before_decode() {
+        let peer = Arc::new(endpoint());
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let offer = peer.signer().token_at(now).unwrap();
+        for (configured, authorization, expected) in [
+            (None, None, "12"),
+            (Some(peer.clone()), None, "16"),
+            (Some(peer.clone()), Some(offer.authorization()), "7"),
+        ] {
+            let mut gate = OfferGate::new(ReplyFixture(0, false), configured);
+            let mut request = Request::builder().uri(OUTBOUND_PATH);
+            if let Some(value) = authorization {
+                request = request.header("authorization", value);
+            }
+            let response = gate
+                .call(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.headers()["grpc-status"], expected);
+        }
+    }
+
     // Feature: queue-home-delivery, Property 7
     // The receive budget includes unknown wire fields, even when the decoded
     // response would fit in a few bytes. This fixture is not an offer handler.
@@ -535,6 +607,28 @@ mod tests {
     // Unknown enums and malformed combinations never reach volatile admission.
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: outbound-dispatch-recovery, Property 18: Remote delivery grants no extra authority.
+        #[test]
+        fn outbound_admission_has_separate_purpose_and_capacity(release in 1usize..=32) {
+            let endpoint = endpoint();
+            let mut outbound = HeaderMap::new();
+            outbound.insert(http::header::AUTHORIZATION, endpoint.signer().outbound_token_at(10_000).unwrap().authorization().parse().unwrap());
+            prop_assert!(endpoint.enter(&outbound, 10_000).is_err());
+            let mut permits = (0..32).map(|_| endpoint.enter_purpose(&outbound, 10_000, true).unwrap()).collect::<Vec<_>>();
+            prop_assert_eq!(endpoint.enter_purpose(&outbound, 10_000, true).unwrap_err().code(), tonic::Code::ResourceExhausted);
+            let mut offer = HeaderMap::new();
+            offer.insert(http::header::AUTHORIZATION, endpoint.signer().token_at(10_000).unwrap().authorization().parse().unwrap());
+            prop_assert!(endpoint.enter(&offer, 10_000).is_ok());
+            permits.truncate(32 - release);
+            for _ in 0..release { permits.push(endpoint.enter_purpose(&outbound, 10_000, true).unwrap()); }
+            drop(permits);
+            let used: usize = outbound.iter().map(|(name, value)| name.as_str().len() + value.len()).sum();
+            outbound.insert("padding", "x".repeat(MAX_AUTHORIZATION_BYTES - used - 7).parse().unwrap());
+            prop_assert!(endpoint.enter_purpose(&outbound, 10_000, true).is_ok());
+            outbound.insert("padding", "x".repeat(MAX_AUTHORIZATION_BYTES - used - 6).parse().unwrap());
+            prop_assert_eq!(endpoint.enter_purpose(&outbound, 10_000, true).unwrap_err().code(), tonic::Code::ResourceExhausted);
+        }
         #[test]
         fn generated_wire_shapes(unknown in 4i32..i32::MAX, mutation in 0u8..9) {
             let mut value = request();

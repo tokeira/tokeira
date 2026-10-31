@@ -109,6 +109,12 @@ fn failure_len(failure: &Payload) -> usize {
 /// measured here.
 pub fn buffered_event_payload_size(kind: &HistoryEventKind) -> usize {
     match kind {
+        HistoryEventKind::ExternalWorkflowExecutionSignaledV2 { metadata, .. }
+        | HistoryEventKind::SignalExternalWorkflowExecutionFailedV2 { metadata, .. }
+        | HistoryEventKind::RequestCancelExternalWorkflowExecutionFailedV2 { metadata, .. } => {
+            metadata.control.len()
+        }
+
         HistoryEventKind::WorkflowExecutionSignaled { input, header, .. } => {
             payloads_encoded_len(input) + header.as_ref().map_or(0, headers_encoded_len)
         }
@@ -141,7 +147,9 @@ pub fn buffered_event_payload_size(kind: &HistoryEventKind) -> usize {
         | HistoryEventKind::WorkflowExecutionCancelRequested { .. }
         | HistoryEventKind::StartChildWorkflowExecutionFailed { .. }
         | HistoryEventKind::ChildWorkflowExecutionTerminated { .. }
+        | HistoryEventKind::ChildWorkflowExecutionTerminatedV2 { .. }
         | HistoryEventKind::ChildWorkflowExecutionTimedOut { .. }
+        | HistoryEventKind::ChildWorkflowExecutionTimedOutV2 { .. }
         | HistoryEventKind::ExternalWorkflowExecutionSignaled { .. }
         | HistoryEventKind::SignalExternalWorkflowExecutionFailed { .. }
         | HistoryEventKind::ExternalWorkflowExecutionCancelRequested { .. }
@@ -173,6 +181,7 @@ pub fn buffered_event_payload_size(kind: &HistoryEventKind) -> usize {
         | HistoryEventKind::TimerCanceled { .. }
         | HistoryEventKind::MarkerRecorded { .. }
         | HistoryEventKind::StartChildWorkflowExecutionInitiated { .. }
+        | HistoryEventKind::StartChildWorkflowExecutionInitiatedV2 { .. }
         | HistoryEventKind::SignalExternalWorkflowExecutionInitiated { .. }
         | HistoryEventKind::RequestCancelExternalWorkflowExecutionInitiated { .. }
         | HistoryEventKind::UpsertWorkflowSearchAttributes { .. }

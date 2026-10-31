@@ -53,6 +53,7 @@ impl DsqlRunRepository {
                         "SELECT run_key, timer_id, fire_at
                  FROM timer_bucket
                  WHERE shard_id = $1 AND fire_at <= $2
+                   AND NOT EXISTS (SELECT 1 FROM run_preparation WHERE target_run_key = timer_bucket.run_key AND phase < 4)
                  ORDER BY fire_at ASC, run_key ASC, timer_id ASC
                  LIMIT $3",
                     )
@@ -67,6 +68,7 @@ impl DsqlRunRepository {
                         "SELECT run_key, timer_id, fire_at
                  FROM timer_bucket
                  WHERE shard_id = $1 AND fire_at <= $2
+                   AND NOT EXISTS (SELECT 1 FROM run_preparation WHERE target_run_key = timer_bucket.run_key AND phase < 4)
                    AND (fire_at > $3
                         OR (fire_at = $3
                             AND (run_key > $4 OR (run_key = $4 AND timer_id > $5))))

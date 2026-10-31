@@ -1777,8 +1777,14 @@ mod tests {
         let plans = MigrationRunner::embedded()
             .dry_run()
             .expect("embedded migrations are valid");
-        assert_eq!(plans.len(), 100);
-        assert!(plans.iter().all(|plan| migration_is_idempotent(&plan.sql)));
+        assert_eq!(plans.len(), 127);
+        for plan in plans {
+            assert!(
+                migration_is_idempotent(&plan.sql),
+                "V{} must be replayable after a lost migration acknowledgment",
+                plan.version
+            );
+        }
     }
 
     #[test]

@@ -39,9 +39,21 @@ use tokio::sync::Mutex;
 #[cfg(test)]
 use crate::DeliveryOrder;
 
+mod outbound;
+#[cfg(test)]
+mod outbound_tests;
+mod outbound_upgrade;
+#[cfg(test)]
+mod outbound_upgrade_tests;
 mod placement;
 #[cfg(test)]
 mod placement_tests;
+mod preparation;
+#[cfg(test)]
+mod preparation_tests;
+mod successor;
+#[cfg(test)]
+pub(crate) mod successor_tests;
 mod transition;
 
 #[cfg(test)]
@@ -141,8 +153,18 @@ struct StoreState {
     execution_index: HashMap<(NamespaceId, String, RunId), RunKey>,
     /// Materialized hot state by run key.
     runs: HashMap<RunKey, WorkflowState>,
+    /// Deleted immutable state retained only for outstanding outbound proof.
+    retained_runs: HashMap<RunKey, Vec<u8>>,
+    outbound_upgrade: Option<crate::outbound_upgrade::OutboundUpgradeProgress>,
     /// Updated under the run-write lock; snapshots rebuild this derived view.
     workflow_dispatch: HashMap<RunKey, WorkflowDispatchRow>,
+    /// Reconstructible source operations, maintained with every run write.
+    outbound_operations: BTreeMap<tokeira_kernel::OperationKey, crate::OperationRow>,
+    /// Immutable close obligations; retirement is durable and never reconstructed.
+    outbound_intents: BTreeMap<crate::IntentKey, crate::IntentRow>,
+    preparations: BTreeMap<uuid::Uuid, crate::outbound::preparation::PreparationRecord>,
+    successor_reservations:
+        HashMap<(NamespaceId, String), crate::outbound::successor::SuccessorReservation>,
     /// Persisted History Size by run key: the sum of
     /// [`crate::codec::history_batch_encoded_len`] over every committed batch,
     /// maintained in the same lock acquisition as the batch so it mirrors the
@@ -630,6 +652,15 @@ impl InMemoryStore {
     pub async fn snapshot(&self) -> Result<Vec<u8>, SnapshotError> {
         let (doc, extension) = {
             let store = self.inner.lock().await;
+            if store.runs.values().any(|run| {
+                run.outbound.as_ref().is_some_and(|outbound| {
+                    outbound.version != tokeira_kernel::OUTBOUND_STATE_VERSION
+                })
+            }) {
+                return Err(SnapshotError::Extension(
+                    "unsupported outbound state version",
+                ));
+            }
             (SnapshotDoc::capture(&store), snapshot_extension(&store)?)
         };
         let mut bytes =
@@ -678,7 +709,13 @@ impl InMemoryStore {
         }
         let (doc, trailing) =
             postcard::take_from_bytes::<SnapshotDoc>(rest).map_err(SnapshotError::Decode)?;
+        let legacy_runs = doc.legacy_runs.clone();
         let mut state = doc.into_state();
+        if legacy_runs.windows(2).any(|keys| keys[0] >= keys[1])
+            || legacy_runs.iter().any(|key| !state.runs.contains_key(key))
+        {
+            return Err(SnapshotError::Extension("invalid legacy source inventory"));
+        }
         if !trailing.is_empty() {
             let opens_extension = matches!(
                 postcard::take_from_bytes::<u32>(trailing),
@@ -688,6 +725,45 @@ impl InMemoryStore {
                 return Err(SnapshotError::TrailingBytes(trailing.len()));
             }
             apply_snapshot_extension(&mut state, trailing).map_err(SnapshotError::Extension)?;
+        }
+        for (key, bytes) in &state.retained_runs {
+            let retained = crate::codec::decode_workflow_state(*key, bytes)
+                .map_err(|_| SnapshotError::Extension("invalid retained outbound source"))?;
+            if retained.is_open()
+                || state.runs.contains_key(key)
+                || !state
+                    .bulk_writes
+                    .get(key)
+                    .is_some_and(|record| record.phase == BulkWritePhase::Purging)
+            {
+                return Err(SnapshotError::Extension(
+                    "retained source is not logically deleted",
+                ));
+            }
+        }
+        // This snapshot version establishes the compatible-writer boundary. Empty
+        // outbound metadata needs no extension; an older snapshot is rejected above.
+        for run in state.runs.values_mut() {
+            if legacy_runs.contains(&run.run_key) && run.outbound.is_some() {
+                return Err(SnapshotError::Extension(
+                    "legacy run has current outbound metadata",
+                ));
+            }
+            if !legacy_runs.contains(&run.run_key) {
+                run.outbound.get_or_insert_with(Default::default);
+            }
+        }
+        for run in state.runs.values().filter(|run| run.outbound.is_some()) {
+            let home = tokeira_types::execution_home_bundle(
+                run.namespace_id.0.as_bytes(),
+                run.workflow_id.0.as_bytes(),
+                Self::effective_shard_count(&state),
+            );
+            for row in crate::derive_operations(run, home)
+                .map_err(|_| SnapshotError::Extension("invalid outbound operation metadata"))?
+            {
+                state.outbound_operations.insert(row.incarnation.key, row);
+            }
         }
         // Reconstruct after applying every extension; the frozen snapshot layout
         // contains all authoritative inputs and needs no redundant row payload.
@@ -734,7 +810,10 @@ impl InMemoryStore {
 // last heartbeat time) does not change the document and needs no bump; releases
 // without the extension refuse it as trailing bytes (activity-heartbeat-time,
 // Requirement 7).
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 5;
+// v6: required outbound identities and child gates. A v5 reader would ignore the
+// unknown state-extension tag and could release children or lose selected identities.
+// v7: retained deleted sources and intent target lineage pins.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 7;
 
 /// Magic that opens the snapshot extension after a snapshot's document (`"TKSX"`).
 pub const SNAPSHOT_EXTENSION_MAGIC: u32 = 0x544B_5358;
@@ -798,10 +877,19 @@ pub enum SnapshotError {
 /// counterpart here and are reset to defaults on restore.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SnapshotDoc {
+    legacy_runs: Vec<RunKey>,
+    outbound_upgrade: Option<crate::outbound_upgrade::OutboundUpgradeProgress>,
+    successor_reservations: Vec<(
+        (NamespaceId, String),
+        crate::outbound::successor::SuccessorReservation,
+    )>,
+    preparations: Vec<(uuid::Uuid, crate::outbound::preparation::PreparationRecord)>,
+    outbound_intents: Vec<(crate::IntentKey, crate::IntentRow)>,
     current_open: Vec<((NamespaceId, String), RunKey)>,
     current_execution: Vec<((NamespaceId, String), RunKey)>,
     execution_index: Vec<((NamespaceId, String, RunId), RunKey)>,
     runs: Vec<(RunKey, WorkflowState)>,
+    retained_runs: Vec<(RunKey, Vec<u8>)>,
     history_size: Vec<(RunKey, i64)>,
     worker_deployments: Vec<(DeploymentKey, StoredWorkerDeployment)>,
     workflow_rules: Vec<(NamespaceId, Vec<(String, WorkflowRuleRecord)>)>,
@@ -922,7 +1010,13 @@ impl SnapshotDoc {
             current_execution,
             execution_index,
             runs,
+            retained_runs,
+            outbound_upgrade,
             workflow_dispatch: _,
+            outbound_operations: _,
+            outbound_intents,
+            preparations,
+            successor_reservations,
             history_size,
             worker_deployments,
             workflow_rules,
@@ -961,10 +1055,30 @@ impl SnapshotDoc {
                 modeled_transactions: _,
         } = state;
         Self {
+            legacy_runs: {
+                let mut keys = runs
+                    .values()
+                    .filter(|run| run.outbound.is_none())
+                    .map(|run| run.run_key)
+                    .collect::<Vec<_>>();
+                keys.sort();
+                keys
+            },
+            outbound_upgrade: outbound_upgrade.clone(),
+            successor_reservations: sorted_pairs(successor_reservations),
+            preparations: preparations
+                .iter()
+                .map(|(key, row)| (*key, row.clone()))
+                .collect(),
+            outbound_intents: outbound_intents
+                .iter()
+                .map(|(key, row)| (*key, row.clone()))
+                .collect(),
             current_open: sorted_pairs(current_open),
             current_execution: sorted_pairs(current_execution),
             execution_index: sorted_pairs(execution_index),
             runs: sorted_pairs(runs),
+            retained_runs: sorted_pairs(retained_runs),
             history_size: sorted_pairs(history_size),
             worker_deployments: sorted_pairs(worker_deployments),
             workflow_rules: {
@@ -1025,7 +1139,12 @@ impl SnapshotDoc {
             current_execution: self.current_execution.into_iter().collect(),
             execution_index: self.execution_index.into_iter().collect(),
             runs: self.runs.into_iter().collect(),
+            retained_runs: self.retained_runs.into_iter().collect(),
             workflow_dispatch: HashMap::new(),
+            outbound_operations: BTreeMap::new(),
+            outbound_intents: self.outbound_intents.into_iter().collect(),
+            preparations: self.preparations.into_iter().collect(),
+            successor_reservations: self.successor_reservations.into_iter().collect(),
             history_size: self.history_size.into_iter().collect(),
             worker_deployments: self.worker_deployments.into_iter().collect(),
             workflow_rules: self
@@ -1063,6 +1182,7 @@ impl SnapshotDoc {
             // `self.activity_state_table` is discarded: entries there come from
             // earlier releases, and nothing reads them.
             timer_bucket,
+            outbound_upgrade: self.outbound_upgrade,
             placement_progress: None,
             placement_columns: BTreeMap::new(),
             run_shard_map,
@@ -1086,6 +1206,133 @@ impl SnapshotDoc {
 
 #[async_trait]
 impl RunRepository for InMemoryStore {
+    async fn load_outbound_source(&self, run: RunKey) -> Result<LoadedRun> {
+        let store = self.inner.lock().await;
+        if let Some(state) = store.runs.get(&run) {
+            return Ok(LoadedRun::Existing(state.clone()));
+        }
+        store
+            .retained_runs
+            .get(&run)
+            .map(|bytes| crate::codec::decode_workflow_state(run, bytes).map(LoadedRun::Existing))
+            .unwrap_or(Ok(LoadedRun::Absent))
+    }
+    async fn read_published_preparations(
+        &self,
+        home: tokeira_types::ShardId,
+        bound: crate::ScanBound<uuid::Uuid>,
+        after: Option<uuid::Uuid>,
+        limit: usize,
+    ) -> anyhow::Result<crate::OutboundPage<uuid::Uuid, crate::PreparationToken>> {
+        self.published_preparations(home, bound, after, limit).await
+    }
+
+    async fn complete_run_preparation(
+        &self,
+        token: crate::PreparationToken,
+        fence: crate::WriteFence,
+    ) -> anyhow::Result<bool> {
+        self.complete_preparation(token, fence).await
+    }
+
+    async fn commit_successor_fallback(
+        &self,
+        run: tokeira_types::RunKey,
+        closing: tokeira_kernel::Transition,
+        start: Box<tokeira_kernel::StartRequest>,
+        fence: crate::WriteFence,
+    ) -> anyhow::Result<crate::CommitResult> {
+        self.commit_fallback(run, closing, start, fence).await
+    }
+
+    async fn find_run_preparation(
+        &self,
+        request_key: &str,
+    ) -> Result<Option<crate::PreparationToken>> {
+        Ok(self
+            .inner
+            .lock()
+            .await
+            .preparations
+            .values()
+            .find(|row| row.request_key == request_key)
+            .map(|row| row.token.clone()))
+    }
+
+    async fn prepare_run_publication(
+        &self,
+        preparation: Box<crate::RunPreparation>,
+        fence: WriteFence,
+    ) -> anyhow::Result<crate::PreparationToken> {
+        self.prepare_publication(preparation, fence).await
+    }
+
+    async fn publish_prepared_run(
+        &self,
+        token: crate::PreparationToken,
+        fence: WriteFence,
+    ) -> anyhow::Result<crate::PublicationResult> {
+        self.publish_preparation(token, fence).await
+    }
+
+    async fn abandon_prepared_run(
+        &self,
+        token: crate::PreparationToken,
+        fence: WriteFence,
+    ) -> anyhow::Result<bool> {
+        self.abandon_preparation(token, fence).await
+    }
+
+    async fn read_operation_page(
+        &self,
+        home: ShardId,
+        kind: tokeira_kernel::OperationKind,
+        bound: crate::ScanBound<tokeira_kernel::OperationKey>,
+        after: Option<tokeira_kernel::OperationKey>,
+        limit: usize,
+    ) -> Result<crate::OutboundPage<tokeira_kernel::OperationKey, crate::OperationRow>> {
+        self.outbound_operation_page(home, kind, bound, after, limit)
+            .await
+    }
+    async fn read_intent_page(
+        &self,
+        home: ShardId,
+        bound: crate::ScanBound<crate::IntentKey>,
+        after: Option<crate::IntentKey>,
+        limit: usize,
+    ) -> Result<crate::OutboundPage<crate::IntentKey, crate::IntentDescriptor>> {
+        self.outbound_intent_page(home, bound, after, limit).await
+    }
+    async fn load_intent(&self, key: crate::IntentKey) -> Result<Option<crate::IntentRow>> {
+        Ok(self.inner.lock().await.outbound_intents.get(&key).cloned())
+    }
+    async fn reconcile_outbound_run(
+        &self,
+        home: ShardId,
+        run: RunKey,
+        fence: WriteFence,
+    ) -> Result<()> {
+        self.repair_outbound(home, run, fence).await
+    }
+    async fn retire_intent(
+        &self,
+        proof: crate::IntentRetirement,
+        fence: WriteFence,
+    ) -> Result<bool> {
+        self.retire_outbound_intent(proof, fence).await
+    }
+    async fn commit_outbound_transition(
+        &self,
+        run: RunKey,
+        transition: Transition,
+        guard: crate::DeliveryGuard,
+        source_fence: WriteFence,
+        fence: WriteFence,
+    ) -> Result<CommitResult> {
+        self.commit_guarded(run, transition, Some((guard, source_fence)), fence)
+            .await
+    }
+
     async fn commit_transition_pair(
         &self,
         run_key: RunKey,
@@ -1104,6 +1351,45 @@ impl RunRepository for InMemoryStore {
                 && state.timer_bucket.is_empty()
                 && state.bulk_writes.is_empty()
         })
+    }
+
+    fn outbound_ready(&self) -> bool {
+        self.inner
+            .try_lock()
+            .is_ok_and(|store| outbound_upgrade::ready(&store))
+    }
+    async fn ensure_outbound_prepared(&self) -> Result<()> {
+        anyhow::ensure!(
+            outbound_upgrade::ready(&*self.inner.lock().await),
+            "outbound recovery is unprepared; run tokeirad storage outbound-recovery plan/apply with every writer stopped"
+        );
+        Ok(())
+    }
+    async fn outbound_upgrade_status(
+        &self,
+    ) -> Result<crate::outbound_upgrade::OutboundUpgradeStatus> {
+        self.memory_outbound_upgrade_status().await
+    }
+    async fn read_outbound_upgrade_run(
+        &self,
+        after: Option<RunKey>,
+    ) -> Result<Option<WorkflowState>> {
+        let store = self.inner.lock().await;
+        Ok(store
+            .runs
+            .iter()
+            .filter(|(key, _)| after.is_none_or(|after| **key > after))
+            .min_by_key(|(key, _)| **key)
+            .map(|(_, state)| state.clone()))
+    }
+    async fn commit_outbound_upgrade_page(
+        &self,
+        expected: Option<crate::outbound_upgrade::OutboundUpgradeProgress>,
+        next: crate::outbound_upgrade::OutboundUpgradeProgress,
+        write: Option<crate::outbound_upgrade::OutboundUpgradeWrite>,
+    ) -> Result<()> {
+        self.memory_outbound_upgrade_page(expected, next, write)
+            .await
     }
 
     fn placement_ready(&self) -> bool {
@@ -1408,148 +1694,13 @@ impl RunRepository for InMemoryStore {
             .unwrap_or_default())
     }
 
-    #[tracing::instrument(name = "storage.commit_transition", skip(self, transition), fields(run_key = %run_key.0, expected_seq = transition.expected_seq.0, epoch = fence.epoch().0))]
     async fn commit_transition(
         &self,
         run_key: RunKey,
         transition: Transition,
         fence: WriteFence,
     ) -> Result<CommitResult> {
-        if crate::read_probe::reject_commit(run_key) {
-            return Ok(CommitResult::Conflict {
-                reason: "read-baseline injected OCC conflict".into(),
-            });
-        }
-        let started = Instant::now();
-        if transition.history_events.len() != transition.event_principals.len() {
-            anyhow::bail!(
-                "history/principal sidecar length mismatch: {} events, {} principals",
-                transition.history_events.len(),
-                transition.event_principals.len()
-            );
-        }
-        let state = transition.next_state.clone();
-        let namespace = Some(state.namespace_id.0.to_string());
-        let mut store = self.inner.lock().await;
-        let home = tokeira_types::execution_home_bundle(
-            state.namespace_id.0.as_bytes(),
-            state.workflow_id.0.as_bytes(),
-            Self::effective_shard_count(&store),
-        );
-        fence.ensure_home(home)?;
-        if let Err(lost) = store.check_fence(&fence) {
-            storage_metrics::record_commit_transition_duration(
-                namespace.clone(),
-                "lease_lost",
-                started.elapsed(),
-            );
-            storage_metrics::record_storage_operation("commit_transition", "lease_lost");
-            return Err(lost.into());
-        }
-        if let Some(remaining) = store.conflict_injections.get_mut(&run_key)
-            && *remaining > 0
-        {
-            *remaining -= 1;
-            storage_metrics::record_commit_transition_duration(
-                namespace.clone(),
-                "conflict",
-                started.elapsed(),
-            );
-            storage_metrics::record_storage_operation("commit_transition", "conflict");
-            return Ok(CommitResult::Conflict {
-                reason: format!("injected conflict for run {:?}", run_key),
-            });
-        }
-
-        let current_seq = store
-            .runs
-            .get(&run_key)
-            .map(|state| state.transition_seq)
-            .unwrap_or(tokeira_types::TransitionSeq::ZERO);
-        if current_seq != transition.expected_seq {
-            storage_metrics::record_commit_transition_duration(
-                namespace.clone(),
-                "conflict",
-                started.elapsed(),
-            );
-            storage_metrics::record_storage_operation("commit_transition", "conflict");
-            return Ok(CommitResult::Conflict {
-                reason: format!(
-                    "expected seq {:?}, found {:?}",
-                    transition.expected_seq, current_seq
-                ),
-            });
-        }
-
-        let workflow_key = (state.namespace_id, state.workflow_id.0.clone());
-
-        for op in &transition.request_dedupe_ops {
-            let dedupe_key = (
-                workflow_key.0,
-                workflow_key.1.clone(),
-                op.request_id.0.clone(),
-            );
-            // Request-id dedupe is scoped to the RUN, mirroring v1.31.0 where
-            // request ids live in the run's mutable state: a request id reused
-            // against a NEW run (e.g. signal-with-start after the prior run
-            // closed) is fresh, not a duplicate
-            // (`pendingSignalRequestedIDs` / `request_id_infos` are per-run,
-            // mutable_state_impl.go:2361-2398 @ v1.31.0; start-retry dedup is
-            // the conflict-resolution layer's job, not this table's).
-            if store
-                .request_dedupe
-                .get(&dedupe_key)
-                .is_some_and(|record| record.run_id == state.run_id)
-            {
-                storage_metrics::record_commit_transition_duration(
-                    namespace.clone(),
-                    "duplicate",
-                    started.elapsed(),
-                );
-                storage_metrics::record_storage_operation("commit_transition", "duplicate");
-                return Ok(CommitResult::Duplicate);
-            }
-        }
-
-        if transition.expected_seq == tokeira_types::TransitionSeq::ZERO && state.status.is_open() {
-            match store.conflict_policy {
-                CurrentExecutionConflictPolicy::Reject
-                | CurrentExecutionConflictPolicy::AllowAfterClose => {
-                    if let Some(existing_run) = store.current_open.get(&workflow_key)
-                        && *existing_run != run_key
-                        && let Some(existing_state) = store.runs.get(existing_run)
-                        && existing_state.status.is_open()
-                    {
-                        storage_metrics::record_commit_transition_duration(
-                            namespace.clone(),
-                            "conflict",
-                            started.elapsed(),
-                        );
-                        storage_metrics::record_storage_operation("commit_transition", "conflict");
-                        // Report the current-execution collision (not deny): the
-                        // runtime resolves it by the request's
-                        // WorkflowIdConflictPolicy. Distinct from a transient
-                        // `Conflict` so the lane does not OCC-retry it.
-                        return Ok(CommitResult::CurrentExecutionConflict {
-                            existing_run_key: *existing_run,
-                            existing_status: existing_state.status,
-                            request_ids: existing_state
-                                .request_id_infos
-                                .iter()
-                                .map(|(id, info)| (id.clone(), info.clone()))
-                                .collect(),
-                        });
-                    }
-                }
-            }
-        }
-
-        let prepared = transition::prepare(&store, run_key, transition)?;
-        let state = transition::write(&mut store, run_key, prepared);
-
-        storage_metrics::record_commit_transition_duration(namespace, "applied", started.elapsed());
-        storage_metrics::record_storage_operation("commit_transition", "success");
-        Ok(CommitResult::Applied { new_state: state })
+        self.commit_guarded(run_key, transition, None, fence).await
     }
 
     async fn commit_transition_for_bundle(
@@ -1618,6 +1769,8 @@ impl RunRepository for InMemoryStore {
             });
         }
 
+        successor::guard_pointer(&store, &state)?;
+        let retained = crate::codec::encode_workflow_state(&state)?;
         let tombstone_seq = state.transition_seq.next();
         let mut tombstone_state = state.clone();
         tombstone_state.transition_seq = tombstone_seq;
@@ -1645,6 +1798,11 @@ impl RunRepository for InMemoryStore {
                 + 1
                 + usize::from(store.workflow_dispatch.contains_key(&run_key)),
         );
+        // DSQL moves only the inline state part; existing overflow parts stay
+        // in place. The value ceiling conservatively bounds that first part.
+        model.write(&[retained
+            .len()
+            .min(crate::write_budget::DSQL_MAX_VALUE_BYTES)]);
         model.write(&[]);
         store.commit_bulk_transaction(&model);
 
@@ -1664,6 +1822,7 @@ impl RunRepository for InMemoryStore {
             state.workflow_id.0.clone(),
             state.run_id,
         ));
+        store.retained_runs.insert(run_key, retained);
         store.runs.remove(&run_key);
         store.history_size.remove(&run_key);
         store.run_shard_map.remove(&run_key);
@@ -1819,6 +1978,10 @@ impl RunRepository for InMemoryStore {
                 !store.bulk_writes.contains_key(&successor_run_key),
                 "successor run {successor_run_key:?} already has a bulk-write record"
             );
+            anyhow::ensure!(
+                !preparation::target_is_preparing(&store, successor_run_key),
+                "successor has a preparation generation"
+            );
             let mut model = store.begin_bulk_transaction()?;
             model.write(&[]);
             store.commit_bulk_transaction(&model);
@@ -1898,6 +2061,7 @@ impl RunRepository for InMemoryStore {
             successor_state.namespace_id,
             successor_state.workflow_id.0.clone(),
         );
+        successor::guard_pointer(&store, &successor_state)?;
         let current = store.current_execution.get(&workflow_key).copied();
         anyhow::ensure!(
             current == expected_current,
@@ -1988,6 +2152,13 @@ impl RunRepository for InMemoryStore {
     async fn abandon_materialization(&self, run_key: RunKey, fence: WriteFence) -> Result<()> {
         let mut store = self.inner.lock().await;
         store.check_fence(&fence)?;
+        if store
+            .preparations
+            .values()
+            .any(|record| record.token.target_run == run_key)
+        {
+            return Ok(());
+        }
         if !store
             .bulk_writes
             .get(&run_key)
@@ -2008,13 +2179,47 @@ impl RunRepository for InMemoryStore {
         // A purge runs from any node, so its own switch is unfenced.
         self.abandon_materialization(run_key, WriteFence::Unfenced)
             .await?;
-        let budget = WriteBudget::TRANSACTION.rows;
+        let budget = WriteBudget::TRANSACTION.rows - 1;
         loop {
             // Let other operations run between transactions, as they can on DSQL.
             tokio::task::yield_now().await;
             let mut store = self.inner.lock().await;
-            if !store.bulk_writes.contains_key(&run_key) {
+            if !store
+                .bulk_writes
+                .get(&run_key)
+                .is_some_and(|record| record.phase == BulkWritePhase::Purging)
+                || store.runs.contains_key(&run_key)
+                || outbound::purge_pinned(&store, run_key)?
+                || store.preparations.values().any(|record| {
+                    record.token.target_run == run_key
+                        && record.phase
+                            != crate::outbound::preparation::PreparationPhase::Reconciled
+                })
+            {
                 return Ok(());
+            }
+            if store.retained_runs.contains_key(&run_key) {
+                let mut model = store.begin_bulk_transaction()?;
+                model.delete(1);
+                store.commit_bulk_transaction(&model);
+                store.retained_runs.remove(&run_key);
+                continue;
+            }
+            let operations: Vec<_> = store
+                .outbound_operations
+                .keys()
+                .filter(|key| key.source_run == run_key)
+                .take(budget)
+                .copied()
+                .collect();
+            if !operations.is_empty() {
+                let mut model = store.begin_bulk_transaction()?;
+                model.delete(operations.len());
+                store.commit_bulk_transaction(&model);
+                for key in operations {
+                    store.outbound_operations.remove(&key);
+                }
+                continue;
             }
             // One table per transaction, in DSQL's order. History is last here:
             // DSQL removes the parts of a run's values after it, and this store
@@ -2094,7 +2299,7 @@ impl RunRepository for InMemoryStore {
             let last = rows < budget;
             let page = if last { rows } else { budget };
             let mut model = store.begin_bulk_transaction()?;
-            model.delete(page + usize::from(last));
+            model.delete(page + 2 * usize::from(last));
             store.commit_bulk_transaction(&model);
             store.purge_history_batches(run_key, page);
             if last {
@@ -2102,6 +2307,9 @@ impl RunRepository for InMemoryStore {
                 store.history.remove(&run_key);
                 store.history_principals.remove(&run_key);
                 store.bulk_writes.remove(&run_key);
+                store
+                    .preparations
+                    .retain(|_, record| record.token.target_run != run_key);
                 return Ok(());
             }
         }
@@ -3572,6 +3780,7 @@ mod tests {
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,
+            outbound: Some(Default::default()),
             run_key,
             namespace_id: NamespaceId::new(),
             workflow_id: WorkflowId("workflow".into()),
@@ -8310,12 +8519,12 @@ mod tests {
     /// (`activity-inputs-from-history`).
     #[test]
     fn from_snapshot_refuses_v4_whose_entries_carry_inputs() {
-        assert_eq!(SNAPSHOT_FORMAT_VERSION, 5);
+        assert_eq!(SNAPSHOT_FORMAT_VERSION, 7);
         let bytes = postcard::to_allocvec(&4_u32).unwrap();
         match InMemoryStore::from_snapshot(&bytes) {
             Err(SnapshotError::VersionMismatch { found, supported }) => {
                 assert_eq!(found, 4);
-                assert_eq!(supported, 5);
+                assert_eq!(supported, SNAPSHOT_FORMAT_VERSION);
             }
             other => panic!("expected VersionMismatch, got {other:?}"),
         }

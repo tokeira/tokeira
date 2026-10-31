@@ -311,7 +311,7 @@ fn production_sources(dir: &Path, files: &mut Vec<PathBuf>) {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         if path.is_dir() {
             production_sources(&path, files);
-        } else if name.ends_with(".rs") && !name.ends_with("tests.rs") && name != "test_support.rs"
+        } else if name.ends_with(".rs") && !name.ends_with("tests.rs") && !name.starts_with("test_")
         {
             files.push(path);
         }
@@ -348,12 +348,15 @@ fn before_tests(text: &str) -> &str {
 /// commit and reset materialization, the activity paths that commit directly,
 /// a deletion's first transaction, and a takeover's recovery switch. A new
 /// writer fails the audit until its fence is checked and it is listed here.
-const FENCED_WRITERS: [(&str, usize); 5] = [
-    ("lane.rs", 4),
+const FENCED_WRITERS: [(&str, usize); 8] = [
+    ("lane.rs", 5),
+    ("outbound/successor.rs", 4),
+    ("publisher/outbound/close.rs", 1),
     ("runtime/activity.rs", 5),
     ("runtime/lifecycle.rs", 1),
+    ("runtime/reset.rs", 5),
     ("purge.rs", 1),
-    ("recovery.rs", 1),
+    ("recovery.rs", 2),
 ];
 
 /// No runtime writer passes `WriteFence::Unfenced` itself: every fence comes
@@ -383,6 +386,14 @@ fn every_runtime_write_takes_its_fence_from_the_ownership_state() {
             ".materialize_reset_successor(",
             ".abandon_materialization(",
             ".reconcile_workflow_dispatch_run(",
+            ".commit_outbound_transition(",
+            ".commit_successor_fallback(",
+            ".prepare_run_publication(",
+            ".publish_prepared_run(",
+            ".abandon_prepared_run(",
+            ".complete_run_preparation(",
+            ".retire_intent(",
+            ".reconcile_outbound_run(",
         ]
         .iter()
         .map(|method| code.matches(method).count())
@@ -391,7 +402,13 @@ fn every_runtime_write_takes_its_fence_from_the_ownership_state() {
             writers.insert(relative.clone(), count);
         }
         for (index, line) in code.lines().enumerate() {
-            if line.contains("WriteFence::Unfenced") && relative != "shard.rs" {
+            // Hydration inspects a supplied fence to derive an operation's home;
+            // this match arm cannot construct or substitute an unfenced write.
+            let inspected_pattern = relative == "publisher/outbound/delivery.rs"
+                && line.trim()
+                    == "tokeira_storage::WriteFence::Unfenced => tokeira_types::ShardId(0),";
+            if line.contains("WriteFence::Unfenced") && relative != "shard.rs" && !inspected_pattern
+            {
                 offenders.push(format!("{relative}:{}: {}", index + 1, line.trim()));
             }
         }

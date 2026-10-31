@@ -8,6 +8,9 @@ mod workflow_dispatch;
 #[path = "support/successor_semantics.rs"]
 mod successor_semantics;
 
+#[path = "support/outbound.rs"]
+mod outbound;
+
 use proptest::prelude::*;
 use prost::Message;
 use time::{Duration, OffsetDateTime};
@@ -138,6 +141,7 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         used_worker_deployment_versions: Some(Vec::new()),
         completed_update_count: 0,
         signal_count: 0,
+        outbound: Some(Default::default()),
         run_key: RunKey::new(),
         namespace_id: NamespaceId::new(),
         workflow_id: WorkflowId("workflow".into()),
@@ -1936,6 +1940,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
         (arb_small_string(), arb_nexus_resolution()).prop_map(move |(operation_id, resolution)| {
             let state = with_pending_nexus_operation(make_open_state(now), &operation_id);
             let req = NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id,
                 scheduled_event_id: 12,
                 resolution,
@@ -4255,6 +4260,7 @@ proptest! {
         let nexus_transition = kernel().apply(
             LoadedRun::Existing(with_pending_nexus_operation(paused, "nexus-op-1")),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: "nexus-op-1".into(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::Completed {
@@ -4654,7 +4660,8 @@ proptest! {
             .unwrap();
         let child_event_priority = child_transition.history_events.iter().find_map(|event| {
             match &event.kind {
-                HistoryEventKind::StartChildWorkflowExecutionInitiated { priority, .. } => {
+                HistoryEventKind::StartChildWorkflowExecutionInitiated { priority, .. }
+                | HistoryEventKind::StartChildWorkflowExecutionInitiatedV2 { priority, .. } => {
                     Some(priority)
                 }
                 _ => None,
@@ -5207,6 +5214,7 @@ proptest! {
         prop_assert_eq!(transition.history_events.iter().any(|event| matches!(
             event.kind,
             HistoryEventKind::StartChildWorkflowExecutionInitiated { .. }
+        | HistoryEventKind::StartChildWorkflowExecutionInitiatedV2 { .. }
         )), true);
         prop_assert_eq!(transition.dispatch_ops.iter().any(|op| matches!(
             op,
@@ -7100,6 +7108,7 @@ proptest! {
         let transition = kernel().apply(
             LoadedRun::Existing(with_pending_nexus_operation(make_open_state(now), &operation_id)),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: operation_id.clone(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::Started { operation_token: String::new(), links: Vec::new() },
@@ -7136,6 +7145,7 @@ proptest! {
         let transition = kernel().apply(
             LoadedRun::Existing(with_pending_nexus_operation(make_open_state(now), &operation_id)),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: operation_id.clone(),
                 scheduled_event_id: 12,
                 resolution,
@@ -7157,6 +7167,7 @@ proptest! {
         let transition = kernel().apply(
             LoadedRun::Existing(with_pending_nexus_operation(make_open_state(now), &operation_id)),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: operation_id.clone(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::CompletionReceived {
@@ -7195,6 +7206,7 @@ proptest! {
         let unknown = kernel().apply(
             LoadedRun::Existing(make_open_state(now)),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: operation_id.clone(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::Started { operation_token: String::new(), links: Vec::new() },
@@ -7206,6 +7218,7 @@ proptest! {
         let stale = kernel().apply(
             LoadedRun::Existing(with_pending_nexus_operation(make_open_state(now), &operation_id)),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: operation_id.clone(),
                 scheduled_event_id: 99,
                 resolution: NexusResolution::Started { operation_token: String::new(), links: Vec::new() },
@@ -7765,6 +7778,8 @@ proptest! {
         prop_assert_eq!(decoded.signal_count, 0);
         state.used_worker_deployment_versions = None;
         state.signal_count = 0;
+        prop_assert_eq!(&decoded.outbound, &None);
+        state.outbound = None;
         prop_assert_eq!(decoded, state);
     }
 }
@@ -9095,6 +9110,7 @@ fn step_input(
                 .values()
                 .find(|operation| !operation.started)?;
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: operation.operation_id.clone(),
                 scheduled_event_id: operation.scheduled_event_id,
                 resolution: NexusResolution::Started {
@@ -9107,6 +9123,7 @@ fn step_input(
         RunStep::NexusCompleted => {
             let operation = state.pending_nexus_operations.values().next()?;
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: operation.operation_id.clone(),
                 scheduled_event_id: operation.scheduled_event_id,
                 resolution: NexusResolution::Completed {

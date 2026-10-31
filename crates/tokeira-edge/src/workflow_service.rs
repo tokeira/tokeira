@@ -1069,11 +1069,21 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         update_id: String,
     ) -> Result<Option<(String, Payloads)>>;
 
+    /// Pass an observed worker reply back under its original dispatch ownership.
+    async fn resolve_nexus_worker_result(
+        &self,
+        _authority: tokeira_runtime::NexusDeliveryAuthority,
+        _result: tokeira_runtime::NexusWorkerResult,
+    ) -> Result<bool> {
+        anyhow::bail!("runtime does not support guarded Nexus worker outcomes")
+    }
+
     async fn resolve_nexus_operation(
         &self,
         run_key: RunKey,
         operation_id: String,
         scheduled_event_id: i64,
+        expected_attempt: Option<u32>,
         resolution: NexusResolution,
     ) -> Result<bool>;
 
@@ -1085,6 +1095,7 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         operation_id: String,
         scheduled_event_id: i64,
         requested_event_id: i64,
+        expected_attempt: u32,
         outcome: tokeira_kernel::NexusCancellationAttemptOutcome,
     ) -> Result<bool>;
 }
@@ -2812,7 +2823,7 @@ impl WorkflowService {
                     Action::RespondNexusTaskCompleted,
                 )
                 .await;
-                let (run_key, operation_id, scheduled_event_id, task_kind) = match correlation {
+                let (run_key, operation_id, scheduled_event_id, task_kind, attempt, authority) = match correlation {
                     NexusTaskCorrelation::Http { waiter_id, .. } => {
                         // Consuming the delivery correlation acknowledges the worker.
                         // A concurrent caller disconnect may remove the edge waiter after
@@ -2844,8 +2855,9 @@ impl WorkflowService {
                         operation_id,
                         scheduled_event_id,
                         task_kind,
+                        attempt, authority,
                         ..
-                    } => (run_key, operation_id, scheduled_event_id, task_kind),
+                    } => (run_key, operation_id, scheduled_event_id, task_kind, attempt, authority),
                 };
 
                 // Workflow-originated worker tasks are outbound Nexus attempts. HTTP
@@ -2885,20 +2897,26 @@ impl WorkflowService {
                     let Some(pending) = pending else {
                         return Ok(());
                     };
-                    let Some(cancellation) = pending.cancellation.as_ref() else {
+                    let Some(cancellation) = pending.cancellation.as_ref().filter(|cancellation| {
+                        Some(cancellation.requested_event_id) == attempt.requested_event_id
+                            && cancellation.attempt == attempt.generation
+                    }) else {
                         return Ok(());
                     };
-                    let applied = self
+                    let applied = if let Some(authority) = authority {
+                        self.runtime.resolve_nexus_worker_result(authority,
+                            tokeira_runtime::NexusWorkerResult::Cancel(NexusCancellationAttemptOutcome::Succeeded)).await.map_err(EdgeError::from)?
+                    } else { self
                         .runtime
                         .record_nexus_cancellation_attempt(
                             run_key,
                             operation_id,
                             scheduled_event_id,
-                            cancellation.requested_event_id,
+                            cancellation.requested_event_id,attempt.generation,
                             NexusCancellationAttemptOutcome::Succeeded,
                         )
                         .await
-                        .map_err(EdgeError::from)?;
+                        .map_err(EdgeError::from)? };
                     if applied {
                         self.notify_history_run_key(
                             run_key,
@@ -2947,11 +2965,14 @@ impl WorkflowService {
                     return Ok(());
                 };
 
-                let applied = self
+                let applied = if let Some(authority) = authority {
+                        self.runtime.resolve_nexus_worker_result(authority,
+                            tokeira_runtime::NexusWorkerResult::Start(resolution)).await.map_err(EdgeError::from)?
+                    } else { self
                     .runtime
-                    .resolve_nexus_operation(run_key, operation_id, scheduled_event_id, resolution)
+                    .resolve_nexus_operation(run_key, operation_id, scheduled_event_id,Some(attempt.generation), resolution)
                     .await
-                    .map_err(EdgeError::from)?;
+                    .map_err(EdgeError::from)? };
                 if applied {
                     self.notify_history_run_key(
                         run_key,
@@ -3026,7 +3047,7 @@ impl WorkflowService {
                     Action::RespondNexusTaskFailed,
                 )
                 .await;
-                let (run_key, operation_id, scheduled_event_id, task_kind) = match correlation {
+                let (run_key, operation_id, scheduled_event_id, task_kind, attempt, authority) = match correlation {
                     NexusTaskCorrelation::Http { waiter_id, .. } => {
                         let _ = self.nexus_http_waiters.complete(
                             &waiter_id,
@@ -3066,8 +3087,9 @@ impl WorkflowService {
                         operation_id,
                         scheduled_event_id,
                         task_kind,
+                        attempt, authority,
                         ..
-                    } => (run_key, operation_id, scheduled_event_id, task_kind),
+                    } => (run_key, operation_id, scheduled_event_id, task_kind, attempt, authority),
                 };
                 // A failed worker response is the terminal result of an outbound
                 // StartOperation (a worker-reported handler error); capture its
@@ -3092,7 +3114,10 @@ impl WorkflowService {
                     let Some(pending) = pending else {
                         return Ok(());
                     };
-                    let Some(cancellation) = pending.cancellation.as_ref() else {
+                    let Some(cancellation) = pending.cancellation.as_ref().filter(|cancellation| {
+                        Some(cancellation.requested_event_id) == attempt.requested_event_id
+                            && cancellation.attempt == attempt.generation
+                    }) else {
                         return Ok(());
                     };
                     let failure = if let Some(failure) = req.failure {
@@ -3120,17 +3145,20 @@ impl WorkflowService {
                         outbound_tags.failure_source,
                         &outbound_tags.outcome,
                     );
-                    let applied = self
+                    let applied = if let Some(authority) = authority {
+                        self.runtime.resolve_nexus_worker_result(authority,
+                            tokeira_runtime::NexusWorkerResult::Cancel(outcome)).await.map_err(EdgeError::from)?
+                    } else { self
                         .runtime
                         .record_nexus_cancellation_attempt(
                             run_key,
                             operation_id,
                             scheduled_event_id,
-                            cancellation.requested_event_id,
+                            cancellation.requested_event_id,attempt.generation,
                             outcome,
                         )
                         .await
-                        .map_err(EdgeError::from)?;
+                        .map_err(EdgeError::from)? };
                     if applied {
                         self.notify_history_run_key(
                             run_key,
@@ -3218,16 +3246,19 @@ impl WorkflowService {
                     &outbound_tags.outcome,
                 );
 
-                let applied = self
+                let applied = if let Some(authority) = authority {
+                        self.runtime.resolve_nexus_worker_result(authority,
+                            tokeira_runtime::NexusWorkerResult::Start(resolution)).await.map_err(EdgeError::from)?
+                    } else { self
                     .runtime
                     .resolve_nexus_operation(
                         run_key,
                         operation_id,
-                        scheduled_event_id,
+                        scheduled_event_id,Some(attempt.generation),
                         resolution,
                     )
                     .await
-                    .map_err(EdgeError::from)?;
+                    .map_err(EdgeError::from)? };
                 if applied {
                     self.notify_history_run_key(
                         run_key,

@@ -303,6 +303,21 @@ impl From<anyhow::Error> for EdgeError {
         if let Some(error) = value.downcast_ref::<tokeira_runtime::RetryableWorkflowTaskStart>() {
             return Self::ServiceUnavailable(error.to_string());
         }
+        if value
+            .downcast_ref::<tokeira_runtime::ResetPublicationConflict>()
+            .is_some()
+        {
+            return Self::ServiceUnavailable(value.to_string());
+        }
+        // A committed close reserves the current pointer until its frozen
+        // successor is published. This Tokeira recovery state is temporary;
+        // callers must retry instead of treating the reservation as corruption
+        // or attempting to replace the selected execution.
+        if let Some(error @ tokeira_storage::RecoveryError::SuccessorReserved { .. }) =
+            value.downcast_ref::<tokeira_storage::RecoveryError>()
+        {
+            return Self::ServiceUnavailable(error.to_string());
+        }
         // A failed activity-token revalidation surfaces as v1.31.0's
         // `ErrActivityTaskNotFound`: code NotFound with this exact message,
         // asserted verbatim by clients (`service/history/consts/const.go:44-45
@@ -529,6 +544,16 @@ impl From<anyhow::Error> for EdgeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_successor_publication_is_retryable() {
+        let error = anyhow::Error::new(tokeira_storage::RecoveryError::SuccessorReserved {
+            successor: tokeira_types::RunKey(uuid::Uuid::from_u128(71)),
+        })
+        .context("starting workflow");
+        let status = tonic::Status::from(EdgeError::from(error));
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+    }
 
     #[test]
     fn callback_limit_rejection_is_a_failed_precondition() {

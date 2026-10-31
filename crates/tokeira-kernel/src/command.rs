@@ -124,6 +124,39 @@ pub enum Command {
     /// callback's durable lifecycle. Applies to a *closed* run (callbacks fire after
     /// close), unlike most commands which require an open run.
     CompletionCallbackAttempted(CompletionCallbackAttemptedRequest),
+    /// The runtime verified the parent's durable confirmation of this child.
+    ParentChildStartRecorded(ParentChildStartRecordedRequest),
+    /// External signal outcome with the exact accepted initiation metadata.
+    ExternalSignalResolvedV2 {
+        /// Definitive target outcome for this pending source initiation.
+        request: ExternalSignalResolvedRequest,
+        /// Accepted source fields retained on the resolving event.
+        metadata: ExternalResolutionMetadata,
+    },
+    /// External cancellation outcome with the exact accepted initiation metadata.
+    ExternalCancelResolvedV2 {
+        /// Definitive target outcome for this pending source initiation.
+        request: ExternalCancelResolvedRequest,
+        /// Accepted source fields retained on the resolving event.
+        metadata: ExternalResolutionMetadata,
+    },
+    /// A verified final child outcome, including the full initiation/chain fence.
+    ChildResolvedV2 {
+        /// Observed terminal outcome and final run.
+        request: ChildResolvedRequest,
+        /// Lineage and terminal attributes verified from the committed child.
+        metadata: ChildOutcomeMetadata,
+    },
+}
+
+/// Source-event fields needed on external resolution history, hydrated by runtime
+/// and fenced against the source sequence in the resolution commit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalResolutionMetadata {
+    /// Completion that accepted the external command.
+    pub workflow_task_completed_event_id: i64,
+    /// Deprecated opaque SDK control value, preserved without interpretation.
+    pub control: String,
 }
 
 /// Outcome of one completion-callback delivery attempt, recorded durably so retries
@@ -1775,6 +1808,22 @@ pub struct ChildStartConfirmedRequest {
     pub now: OffsetDateTime,
 }
 
+/// Verified parent history fact permitting a child's first workflow task.
+/// Runtime/storage must validate this fact against the source in the same commit.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ParentChildStartRecordedRequest {
+    /// Parent execution that initiated this child.
+    pub parent_run_key: RunKey,
+    /// Exact initiation within that parent.
+    pub initiating_event: i64,
+    /// First child execution, independent of subsequent chain successors.
+    pub first_child_run_id: RunId,
+    /// Positive, committed parent Started event; a buffered event is not proof.
+    pub parent_started_event_id: i64,
+    /// Observation clock; existing start-delay and timeout anchors are preserved.
+    pub now: OffsetDateTime,
+}
+
 /// Outcome of a child workflow start attempt.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ChildStartResult {
@@ -1785,6 +1834,18 @@ pub enum ChildStartResult {
     },
     /// The child could not be started (e.g. already exists).
     Failed { cause: String },
+}
+
+/// Additional proof and attributes required by durable child-result delivery.
+/// Kept separate from the original request's frozen serialized layout.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChildOutcomeMetadata {
+    /// Initiation, first child run and actual terminal run.
+    pub identity: crate::ChildOutcomeIdentity,
+    /// Exact failed/timed-out terminal retry state, when applicable.
+    pub retry_state: Option<crate::RetryState>,
+    /// Cancellation details from the child's terminal event.
+    pub cancellation_details: Option<Payloads>,
 }
 
 /// Request from the runtime when a child workflow reaches a
@@ -1955,6 +2016,10 @@ pub struct NexusOperationResolvedRequest {
     /// Event ID of the `NexusOperationScheduled` event (used
     /// for staleness checks).
     pub scheduled_event_id: i64,
+    /// Invocation generation captured before dispatch. `None` is reserved for
+    /// asynchronous completion callbacks and authoritative timeout observations,
+    /// which resolve the operation rather than a particular start attempt.
+    pub expected_attempt: Option<u32>,
     /// How the operation was resolved.
     pub resolution: NexusResolution,
     /// Wall-clock time the command was accepted.
@@ -2008,6 +2073,9 @@ pub struct NexusCancellationAttemptedRequest {
     /// Cancel-request event fence, preventing an old attempt from advancing a newer
     /// cancellation lifecycle.
     pub requested_event_id: i64,
+    /// Completed-attempt count captured before this delivery began. Reloading it
+    /// after I/O would let a late response acknowledge a newer retry.
+    pub expected_attempt: u32,
     /// Runtime-classified attempt outcome.
     pub outcome: NexusCancellationAttemptOutcome,
     /// Wall-clock completion time supplied by the runtime.

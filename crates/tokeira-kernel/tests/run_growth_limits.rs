@@ -55,6 +55,7 @@ fn open_state() -> WorkflowState {
         used_worker_deployment_versions: Some(Vec::new()),
         completed_update_count: 0,
         signal_count: 0,
+        outbound: Some(Default::default()),
         run_key: RunKey::new(),
         namespace_id: NamespaceId::new(),
         workflow_id: WorkflowId("workflow".into()),
@@ -427,6 +428,7 @@ fn a_nexus_operation_result_schedules_its_task_at_close() {
         .apply(
             LoadedRun::Existing(state),
             Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                expected_attempt: None,
                 operation_id: "operation".into(),
                 scheduled_event_id: 12,
                 resolution: NexusResolution::Completed {

@@ -39,9 +39,9 @@ pub struct Split<'a> {
     pub count: Option<i32>,
 }
 
-impl Split<'_> {
+impl<'a> Split<'a> {
     /// The parts after the first, each with its part number.
-    pub fn numbered(&self) -> impl Iterator<Item = (i32, &[u8])> {
+    pub fn numbered(&self) -> impl Iterator<Item = (i32, &'a [u8])> {
         (1..).zip(self.rest.iter().copied())
     }
 

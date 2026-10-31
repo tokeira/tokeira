@@ -68,6 +68,7 @@ impl WorkflowRuntimeApi for FakeRuntime {
         run_key: RunKey,
         operation_id: String,
         scheduled_event_id: i64,
+        _expected_attempt: Option<u32>,
         resolution: NexusResolution,
     ) -> Result<bool> {
         self.calls
@@ -87,6 +88,7 @@ impl WorkflowRuntimeApi for FakeRuntime {
         _operation_id: String,
         _scheduled_event_id: i64,
         _requested_event_id: i64,
+        _expected_attempt: u32,
         _outcome: tokeira_kernel::NexusCancellationAttemptOutcome,
     ) -> Result<bool> {
         unreachable!("callback handler never records cancellation attempts")

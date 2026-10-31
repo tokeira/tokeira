@@ -704,15 +704,32 @@ where
             .peek_update_info(run_key, &update_id))
     }
 
+    async fn resolve_nexus_worker_result(
+        &self,
+        authority: tokeira_runtime::NexusDeliveryAuthority,
+        result: tokeira_runtime::NexusWorkerResult,
+    ) -> Result<bool> {
+        self.runtime
+            .resolve_nexus_worker_result(authority, result)
+            .await
+    }
+
     async fn resolve_nexus_operation(
         &self,
         run_key: tokeira_types::RunKey,
         operation_id: String,
         scheduled_event_id: i64,
+        expected_attempt: Option<u32>,
         resolution: NexusResolution,
     ) -> Result<bool> {
         self.runtime
-            .resolve_nexus_operation(run_key, operation_id, scheduled_event_id, resolution)
+            .resolve_nexus_operation(
+                run_key,
+                operation_id,
+                scheduled_event_id,
+                expected_attempt,
+                resolution,
+            )
             .await
     }
 
@@ -722,6 +739,7 @@ where
         operation_id: String,
         scheduled_event_id: i64,
         requested_event_id: i64,
+        expected_attempt: u32,
         outcome: tokeira_kernel::NexusCancellationAttemptOutcome,
     ) -> Result<bool> {
         self.runtime
@@ -730,6 +748,7 @@ where
                 operation_id,
                 scheduled_event_id,
                 requested_event_id,
+                expected_attempt,
                 outcome,
             )
             .await

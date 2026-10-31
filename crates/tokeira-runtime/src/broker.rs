@@ -4751,7 +4751,7 @@ mod tests {
                         nexus_queue.clone(),
                         RunKey::new(),
                         "operation".to_owned(),
-                        7,
+                        7,Default::default(),
                         NexusTaskRequest::CancelOperation {
                             service: "service".to_owned(),
                             operation: "cancel".to_owned(),

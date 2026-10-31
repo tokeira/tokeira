@@ -41,6 +41,7 @@ mod tests {
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,
+            outbound: Some(Default::default()),
             run_key,
             namespace_id: NamespaceId::new(),
             workflow_id: WorkflowId("workflow".into()),

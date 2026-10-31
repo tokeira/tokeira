@@ -1,5 +1,5 @@
 //! A close and its successor share one DSQL transaction and one lease read.
-//! SQLSTATE 54000 alone permits the runtime's size fallback. Classification
+//! Only recognized DSQL size refusals permit the runtime's fallback. Classification
 //! surrounds the whole transaction, including statements and COMMIT.
 
 use super::*;
@@ -41,21 +41,41 @@ async fn execute_pair<T: PairTransaction>(mut transaction: T) -> Result<PairComm
 fn classify(result: Result<PairCommitResult>) -> Result<PairCommitResult> {
     match result {
         Err(error) => {
-            let code = error
+            let database = error
                 .chain()
                 .find_map(|cause| cause.downcast_ref::<sqlx::Error>())
-                .and_then(sqlx::Error::as_database_error)
-                .and_then(|error| error.code());
-            match code.as_deref() {
-                Some("54000") => Ok(PairCommitResult::SizeRefused),
-                Some("40001") => Ok(PairCommitResult::Conflict {
-                    reason: "DSQL pair serialization conflict".into(),
-                }),
-                _ => Err(error),
+                .and_then(sqlx::Error::as_database_error);
+            if let Some(database) = database {
+                if is_size_refusal(database.code().as_deref(), database.message()) {
+                    return Ok(PairCommitResult::SizeRefused);
+                }
+                if database.code().as_deref() == Some("40001") {
+                    return Ok(PairCommitResult::Conflict {
+                        reason: "DSQL pair serialization conflict".into(),
+                    });
+                }
             }
+            Err(error)
         }
         result => result,
     }
+}
+
+// SQLSTATE 54000 also covers transaction age, keys and schema-object limits.
+// Only AWS's explicit data/row-size messages justify closing before a staged
+// successor. Unknown messages remain errors, even under the same SQLSTATE.
+// https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html
+fn is_size_refusal(code: Option<&str>, message: &str) -> bool {
+    code == Some("54000")
+        && matches!(
+            message,
+            "transaction size limit 10mb exceeded"
+                | "transaction size limit"
+                | "transaction row limit exceeded"
+                | "transaction row limit"
+                | "maximum row size exceeded"
+                | "maximum column size exceeded"
+        )
 }
 
 struct SqlPair<'a> {
@@ -72,20 +92,21 @@ struct SqlPair<'a> {
 }
 
 impl DsqlRunRepository {
-    pub(super) async fn do_commit_transition_pair(
+    pub(super) fn do_commit_transition_pair(
         &self,
         run_key: RunKey,
         closing: Transition,
         successor_run_key: RunKey,
         successor: Transition,
         fence: WriteFence,
-    ) -> Result<PairCommitResult> {
+    ) -> impl std::future::Future<Output = Result<PairCommitResult>> + Send + '_ {
         let span = tracing::info_span!(
             "dsql.commit_transition_pair",
             run_key = %run_key.0,
             successor_run_key = %successor_run_key.0,
         );
-        // Each Transition contains inline history/dispatch buffers. Keep both
+        // This function must remain synchronous: an async function captures both
+        // inline transitions before executing its first allocation. Keep both
         // the traced body and the transaction executor behind allocation
         // boundaries, so constructing/polling them does not stack their owned
         // transitions in this future or in the runtime awaiting the pair.
@@ -116,7 +137,6 @@ impl DsqlRunRepository {
             .await
         })
         .instrument(span)
-        .await
     }
 }
 
@@ -164,6 +184,12 @@ impl PairTransaction for SqlPair<'_> {
                 reason: "successor run already exists".into(),
             }));
         }
+        super::preparation::claim_creation(
+            &mut self.tx,
+            self.successor_state.run_key,
+            self.successor_state.run_key.0,
+        )
+        .await?;
         check_dedupe(&mut self.tx, &self.successor).await
     }
 
@@ -253,18 +279,43 @@ mod tests {
     use super::{super::tests::TestDatabaseError, *};
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn size_fallback_requires_a_recognized_data_limit_and_sqlstate() {
+        for message in [
+            "transaction size limit 10mb exceeded",
+            "transaction size limit",
+            "transaction row limit exceeded",
+            "transaction row limit",
+            "maximum row size exceeded",
+            "maximum column size exceeded",
+        ] {
+            assert!(is_size_refusal(Some("54000"), message));
+            assert!(!is_size_refusal(Some("08006"), message));
+        }
+        for message in [
+            "key size too large",
+            "transaction age limit of 300s exceeded",
+            "more than 24 indexes per table are not allowed",
+            "unknown limit",
+            "",
+        ] {
+            assert!(!is_size_refusal(Some("54000"), message));
+        }
+    }
+
     struct RecordingPair {
         steps: Arc<Mutex<Vec<&'static str>>>,
-        failure: Option<(&'static str, &'static str)>,
+        failure: Option<(&'static str, &'static str, &'static str)>,
     }
     impl RecordingPair {
         fn step(&self, name: &'static str) -> Result<()> {
             self.steps.lock().unwrap().push(name);
-            if let Some((step, code)) = self.failure
+            if let Some((step, code, message)) = self.failure
                 && step == name
             {
                 return Err(sqlx::Error::Database(Box::new(TestDatabaseError {
                     code: Some(code),
+                    message,
                 }))
                 .into());
             }
@@ -332,14 +383,21 @@ mod tests {
             "successor writes",
             "commit",
         ] {
-            for code in ["54000", "40001", "08006"] {
+            for (code, message, size) in [
+                ("54000", "transaction row limit exceeded", true),
+                ("54000", "transaction age limit of 300s exceeded", false),
+                ("40001", "serialization failure", false),
+                ("08006", "connection lost", false),
+            ] {
                 let result = execute_pair(RecordingPair {
                     steps: Arc::new(Mutex::new(Vec::new())),
-                    failure: Some((step, code)),
+                    failure: Some((step, code, message)),
                 })
                 .await;
                 match code {
-                    "54000" => assert_eq!(result.unwrap(), PairCommitResult::SizeRefused, "{step}"),
+                    "54000" if size => {
+                        assert_eq!(result.unwrap(), PairCommitResult::SizeRefused, "{step}")
+                    }
                     "40001" => assert!(
                         matches!(result.unwrap(), PairCommitResult::Conflict { .. }),
                         "{step}"

@@ -78,12 +78,8 @@ impl DsqlRunRepository {
             let state = match row {
                 None => Ok(None),
                 Some((first, count)) => {
-                    let rest = if count.is_some() {
-                        super::run_value_parts::read_state_parts(&mut tx, RunKey(*run)).await?
-                    } else {
-                        Vec::new()
-                    };
-                    super::run_value_parts::join_state_parts(RunKey(*run), first, count, rest)
+                    super::run_value_parts::join_state(&mut tx, RunKey(*run), first, count)
+                        .await
                         .and_then(|bytes| codec::decode_workflow_state(RunKey(*run), &bytes))
                         .map(Some)
                 }

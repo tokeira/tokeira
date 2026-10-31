@@ -8,6 +8,7 @@ pub mod tracing_interceptor;
 pub mod translate;
 pub mod workflow_service;
 
+pub mod outbound_delivery;
 pub mod workflow_dispatch;
 pub mod workflow_offer;
 

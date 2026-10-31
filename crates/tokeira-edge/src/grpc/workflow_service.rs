@@ -4624,6 +4624,7 @@ mod tests {
             _run_key: tokeira_types::RunKey,
             _operation_id: String,
             _scheduled_event_id: i64,
+            __expected_attempt: Option<u32>,
             _resolution: NexusResolution,
         ) -> Result<bool> {
             Ok(false)
@@ -4635,6 +4636,7 @@ mod tests {
             _operation_id: String,
             _scheduled_event_id: i64,
             _requested_event_id: i64,
+            _expected_attempt: u32,
             _outcome: tokeira_kernel::NexusCancellationAttemptOutcome,
         ) -> Result<bool> {
             Ok(false)
@@ -4816,6 +4818,7 @@ mod tests {
             _run_key: tokeira_types::RunKey,
             _operation_id: String,
             _scheduled_event_id: i64,
+            __expected_attempt: Option<u32>,
             _resolution: NexusResolution,
         ) -> Result<bool> {
             Ok(false)
@@ -4827,6 +4830,7 @@ mod tests {
             _operation_id: String,
             _scheduled_event_id: i64,
             _requested_event_id: i64,
+            _expected_attempt: u32,
             _outcome: tokeira_kernel::NexusCancellationAttemptOutcome,
         ) -> Result<bool> {
             Ok(false)
@@ -5007,6 +5011,7 @@ mod tests {
             run_key: tokeira_types::RunKey,
             operation_id: String,
             scheduled_event_id: i64,
+            _expected_attempt: Option<u32>,
             resolution: NexusResolution,
         ) -> Result<bool> {
             self.resolutions.lock().unwrap().push((
@@ -5024,6 +5029,7 @@ mod tests {
             _operation_id: String,
             _scheduled_event_id: i64,
             _requested_event_id: i64,
+            _expected_attempt: u32,
             _outcome: tokeira_kernel::NexusCancellationAttemptOutcome,
         ) -> Result<bool> {
             Ok(false)
@@ -7907,6 +7913,7 @@ mod tests {
                 RunKey::new(),
                 "operation".to_owned(),
                 7,
+                Default::default(),
                 NexusTaskRequest::CancelOperation {
                     service: "service".to_owned(),
                     operation: "cancel".to_owned(),
@@ -8389,6 +8396,7 @@ mod tests {
                 run_key,
                 "op-1".to_string(),
                 1,
+                Default::default(),
                 NexusTaskRequest::StartOperation {
                     service: "svc".to_string(),
                     operation: "op".to_string(),

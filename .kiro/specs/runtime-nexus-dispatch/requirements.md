@@ -46,7 +46,10 @@ The authoritative specification is [010-history-as-authority](../../../docs/arch
 3. WHEN the Nexus HTTP response indicates synchronous completion, THE RuntimeDispatchPublisher SHALL submit a `Command::NexusOperationResolved` with a `NexusResolution::Completed` containing the result payload to the originating run.
 4. WHEN the Nexus HTTP response indicates synchronous failure, THE RuntimeDispatchPublisher SHALL submit a `Command::NexusOperationResolved` with a `NexusResolution::Failed` containing the failure message to the originating run.
 5. WHEN the Nexus HTTP response indicates asynchronous acceptance, THE RuntimeDispatchPublisher SHALL submit a `Command::NexusOperationResolved` with a `NexusResolution::Started` to the originating run.
-6. THE RuntimeDispatchPublisher SHALL process each `ScheduleNexusOperation` dispatch op in a spawned async task, so that one slow or failing Nexus call does not block other dispatch ops in the same batch.
+6. THE runtime SHALL continuously rediscover eligible persisted Nexus starts,
+including starts without timeouts, and execute bounded owned attempts so one slow
+call cannot block unrelated work. The [outbound-recovery contract](../outbound-dispatch-recovery/bugfix.md)
+owns attempt fencing and restart behaviour.
 
 ### Requirement 2: Originator Identity Propagation for Schedule
 
@@ -69,7 +72,9 @@ The authoritative specification is [010-history-as-authority](../../../docs/arch
 1. WHEN a committed transition contains a `DispatchOp::CancelNexusOperation`, THE RuntimeDispatchPublisher SHALL send a cancellation HTTP request to the Nexus endpoint for the identified operation via the Nexus_HTTP_Client.
 2. IF the cancellation HTTP request fails or the Nexus endpoint reports that the operation has already completed, THEN THE RuntimeDispatchPublisher SHALL treat the failure as a harmless no-op and log at debug level.
 3. IF the cancellation HTTP request succeeds, THEN THE RuntimeDispatchPublisher SHALL submit a `Command::NexusOperationResolved` with a `NexusResolution::Canceled` to the originating run.
-4. THE RuntimeDispatchPublisher SHALL process each `CancelNexusOperation` dispatch op in a spawned async task.
+4. THE runtime SHALL continuously rediscover the persisted cancellation incarnation
+and execute bounded owned attempts under its original acquisition, preserving its
+token, attempt and deadline independently of operation completion.
 
 ### Requirement 4: Originator Identity Propagation for Cancel
 

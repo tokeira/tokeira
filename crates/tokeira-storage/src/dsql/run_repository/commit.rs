@@ -21,6 +21,16 @@ impl DsqlRunRepository {
         transition: Transition,
         fence: WriteFence,
     ) -> Result<CommitResult> {
+        Box::pin(self.do_commit_guarded(run_key, transition, None, fence)).await
+    }
+
+    pub(super) async fn do_commit_guarded(
+        &self,
+        run_key: RunKey,
+        transition: Transition,
+        guard: Option<(crate::DeliveryGuard, WriteFence)>,
+        fence: WriteFence,
+    ) -> Result<CommitResult> {
         let shard_id = self.shard_for_run_key(run_key);
         let span = tracing::info_span!(
             "dsql.commit_transition",
@@ -62,6 +72,8 @@ impl DsqlRunRepository {
                     return Err(lost.into());
                 }
 
+                if let Some((guard, source_fence)) = &guard { super::outbound::validate_guard(&mut tx, *guard, source_fence, self.shard_count, &state).await?; }
+
                 let started = Instant::now();
                 // The History Size is read under the same FOR UPDATE lock as the
                 // OCC fence, so the value added to in this transaction is the one
@@ -101,6 +113,19 @@ impl DsqlRunRepository {
                             transition.expected_seq, current_seq
                         ),
                     });
+                }
+
+                if transition.is_noop() {
+                    // Commit the locked source/target/fence reads to validate
+                    // the observation. Rewriting a no-op would collide with the
+                    // projection image already stored at this sequence.
+                    return match tx.commit().await {
+                        Ok(()) => Ok(CommitResult::Applied { new_state: state }),
+                        Err(error) if Self::is_serialization_failure(&error) => Ok(CommitResult::Conflict {
+                            reason: "DSQL serialization conflict validating outbound observation".into(),
+                        }),
+                        Err(error) => Err(error.into()),
+                    };
                 }
 
                 for op in &transition.request_dedupe_ops {
@@ -180,6 +205,9 @@ impl DsqlRunRepository {
                     }
                 }
 
+                if transition.expected_seq == TransitionSeq::ZERO {
+                    super::preparation::claim_creation(&mut tx, run_key, run_key.0).await?;
+                }
                 write_transition(
                     &mut tx,
                     run_key,
@@ -191,6 +219,14 @@ impl DsqlRunRepository {
                     prior_state_parts,
                 )
                 .await?;
+                if let Some(incarnation) = guard.as_ref().and_then(|(guard, _)| guard.operation()) {
+                    for op in &transition.request_dedupe_ops {
+                        let key = Self::request_dedupe_key(state.namespace_id, &state.workflow_id, &op.request_id);
+                        sqlx::query("UPDATE request_dedupe SET outbound_source_run_key=$2,outbound_kind=$3,outbound_initiating_event_id=$4,outbound_requested_event_id=$5,outbound_attempt=$6 WHERE key=$1")
+                            .bind(key).bind(incarnation.key.source_run.0).bind(incarnation.key.kind as i16).bind(incarnation.key.initiating_event)
+                            .bind(incarnation.requested_event).bind(i64::from(incarnation.attempt)).execute(&mut *tx).await?;
+                    }
+                }
                 match tx.commit().await {
                     Ok(()) => {
                         metrics::record_dsql_commit_retries(0);
@@ -266,6 +302,55 @@ pub(super) async fn write_transition(
     prior_history_size_bytes: i64,
     prior_state_parts: Option<i32>,
 ) -> Result<()> {
+    write_transition_mode(
+        tx,
+        run_key,
+        shard_id,
+        projection_partition_count,
+        transition,
+        state,
+        prior_history_size_bytes,
+        prior_state_parts,
+        false,
+    )
+    .await
+}
+
+/// Publish the already-verified staged parts/history/timers of an absent run.
+/// The hot row, dispatch, dedupe, projection and pointer still share this commit.
+pub(super) async fn write_prepared_transition(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_key: RunKey,
+    shard_id: ShardId,
+    projection_partition_count: u32,
+    transition: &Transition,
+    state: &mut WorkflowState,
+) -> Result<()> {
+    write_transition_mode(
+        tx,
+        run_key,
+        shard_id,
+        projection_partition_count,
+        transition,
+        state,
+        0,
+        None,
+        true,
+    )
+    .await
+}
+
+async fn write_transition_mode(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_key: RunKey,
+    shard_id: ShardId,
+    projection_partition_count: u32,
+    transition: &Transition,
+    state: &mut WorkflowState,
+    prior_history_size_bytes: i64,
+    prior_state_parts: Option<i32>,
+    staged: bool,
+) -> Result<()> {
     if transition.history_events.len() != transition.event_principals.len() {
         bail!(
             "history/principal sidecar length mismatch: {} events, {} principals",
@@ -273,6 +358,9 @@ pub(super) async fn write_transition(
             transition.event_principals.len()
         );
     }
+    // Read the prior source before replacing hot state. This is also called by
+    // paired commits, so every publication authors its obligations atomically.
+    super::outbound::maintain(tx, transition, shard_id).await?;
     // The batch is encoded once: the same bytes are inserted and counted, so the
     // History Size is the persisted size by construction (Requirement 1.1).
     let events_data = (!transition.history_events.is_empty())
@@ -319,27 +407,29 @@ pub(super) async fn write_transition(
         history_size_bytes,
     )
     .await?;
-    run_value_parts::write_parts(
-        tx,
-        run_key,
-        RunValueKind::State,
-        STATE_VALUE_KEY,
-        &state_split,
-        OnConflict::Replace,
-    )
-    .await?;
-    if prior_state_parts.unwrap_or(1) > state_split.parts() {
-        run_value_parts::delete_parts_from(
+    if !staged {
+        run_value_parts::write_parts(
             tx,
             run_key,
             RunValueKind::State,
             STATE_VALUE_KEY,
-            state_split.parts(),
+            &state_split,
+            OnConflict::Replace,
         )
         .await?;
+        if prior_state_parts.unwrap_or(1) > state_split.parts() {
+            run_value_parts::delete_parts_from(
+                tx,
+                run_key,
+                RunValueKind::State,
+                STATE_VALUE_KEY,
+                state_split.parts(),
+            )
+            .await?;
+        }
     }
     super::workflow_dispatch::maintain(tx, state, shard_id).await?;
-    if let Some(events_data) = events_data {
+    if !staged && let Some(events_data) = events_data {
         insert_history_batch(
             tx,
             run_key,
@@ -368,7 +458,10 @@ pub(super) async fn write_transition(
                  run_key = EXCLUDED.run_key,
                  run_id = EXCLUDED.run_id,
                  first_seen_transition_seq = EXCLUDED.first_seen_transition_seq,
-                 created_at = EXCLUDED.created_at",
+                 created_at = EXCLUDED.created_at,
+                 outbound_source_run_key = NULL, outbound_kind = NULL,
+                 outbound_initiating_event_id = NULL, outbound_requested_event_id = NULL,
+                 outbound_attempt = NULL",
         )
         .bind(key)
         .bind(state.namespace_id.0)
@@ -438,15 +531,17 @@ pub(super) async fn write_transition(
         // state table still carries activities for later unpause/retry logic.
         delete_activity_dispatch_for_run(tx, run_key).await?;
     }
-    for op in &transition.timer_ops {
-        match op {
-            TimerOp::Upsert(timer) => upsert_timer(tx, run_key, shard_id, timer).await?,
-            TimerOp::Delete { timer_id } => {
-                sqlx::query("DELETE FROM timer_bucket WHERE run_key = $1 AND timer_id = $2")
-                    .bind(run_key.0)
-                    .bind(timer_id)
-                    .execute(&mut **tx)
-                    .await?;
+    if !staged {
+        for op in &transition.timer_ops {
+            match op {
+                TimerOp::Upsert(timer) => upsert_timer(tx, run_key, shard_id, timer).await?,
+                TimerOp::Delete { timer_id } => {
+                    sqlx::query("DELETE FROM timer_bucket WHERE run_key = $1 AND timer_id = $2")
+                        .bind(run_key.0)
+                        .bind(timer_id)
+                        .execute(&mut **tx)
+                        .await?;
+                }
             }
         }
     }
@@ -839,6 +934,7 @@ pub(super) async fn upsert_current_execution_start(
     state: &WorkflowState,
 ) -> Result<()> {
     let key = DsqlRunRepository::current_execution_key(state.namespace_id, &state.workflow_id);
+    super::successor::guard_pointer(tx, state).await?;
     // This row is a workflow-level pointer, so the primary key is derived from
     // namespace/workflow_id rather than run_id. Explicit run lookup goes
     // through `workflow_hot`.

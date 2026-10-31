@@ -36,8 +36,8 @@ struct Names(BTreeMap<NamespaceId, String>);
 
 #[async_trait]
 impl NexusNamespaceResolver for Names {
-    async fn name_for_id(&self, namespace_id: NamespaceId) -> Option<String> {
-        self.0.get(&namespace_id).cloned()
+    async fn name_for_id(&self, namespace_id: NamespaceId) -> anyhow::Result<Option<String>> {
+        Ok(self.0.get(&namespace_id).cloned())
     }
 }
 
@@ -252,8 +252,8 @@ fn signaled(target: &WorkflowId) -> impl Fn(&HistoryEvent) -> bool + '_ {
     move |event| {
         matches!(
             &event.kind,
-            HistoryEventKind::ExternalWorkflowExecutionSignaled { target_workflow_id, .. }
-                | HistoryEventKind::SignalExternalWorkflowExecutionFailed { target_workflow_id, .. }
+            HistoryEventKind::ExternalWorkflowExecutionSignaledV2 { target_workflow_id, .. }
+                | HistoryEventKind::SignalExternalWorkflowExecutionFailedV2 { target_workflow_id, .. }
                 if target_workflow_id == target
         )
     }
@@ -291,7 +291,7 @@ async fn a_signal_naming_no_namespace_reaches_its_workflow() -> Result<()> {
     let resolved = history
         .iter()
         .find_map(|event| match &event.kind {
-            HistoryEventKind::ExternalWorkflowExecutionSignaled {
+            HistoryEventKind::ExternalWorkflowExecutionSignaledV2 {
                 namespace_id,
                 namespace,
                 ..
@@ -329,7 +329,7 @@ async fn a_cancel_request_naming_no_namespace_names_its_namespace() -> Result<()
         matches!(
             &event.kind,
             HistoryEventKind::ExternalWorkflowExecutionCancelRequested { .. }
-                | HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed { .. }
+                | HistoryEventKind::RequestCancelExternalWorkflowExecutionFailedV2 { .. }
         )
     })
     .await?;
@@ -378,7 +378,7 @@ async fn without_a_resolver_the_resolving_event_has_no_name() -> Result<()> {
     assert!(
         history.iter().any(|event| matches!(
             &event.kind,
-            HistoryEventKind::ExternalWorkflowExecutionSignaled { namespace_id: id, namespace: None, .. }
+            HistoryEventKind::ExternalWorkflowExecutionSignaledV2 { namespace_id: id, namespace: None, .. }
                 if *id == namespace_id
         )),
         "{history:?}"
@@ -428,7 +428,7 @@ proptest! {
             // A workflow can't signal itself (`transfer_queue_active_task_executor.go:683-697 @ v1.31.0`).
             anyhow::ensure!(history.iter().any(|event| matches!(
                 &event.kind,
-                HistoryEventKind::SignalExternalWorkflowExecutionFailed {
+                HistoryEventKind::SignalExternalWorkflowExecutionFailedV2 {
                     target_workflow_id, namespace_id: id, namespace, cause, ..
                 } if *target_workflow_id == sender
                     && *id == namespace_id
@@ -437,7 +437,7 @@ proptest! {
             )), "the signal to itself: {history:?}");
             anyhow::ensure!(history.iter().any(|event| matches!(
                 &event.kind,
-                HistoryEventKind::ExternalWorkflowExecutionSignaled {
+                HistoryEventKind::ExternalWorkflowExecutionSignaledV2 {
                     target_workflow_id, namespace_id: id, namespace, ..
                 } if *target_workflow_id == receiver
                     && *id == namespace_id

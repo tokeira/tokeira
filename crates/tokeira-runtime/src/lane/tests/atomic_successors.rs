@@ -98,6 +98,49 @@ fn policy() -> RetryPolicy {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
+
+    // Feature: outbound-dispatch-recovery, Property 17: Unaffected semantics and pure transitions are preserved.
+    #[test]
+    fn recovery_metadata_preserves_successor_clocks_payloads_and_deadlines(kind in 1u8..5, delta in 1i64..5000, bytes in prop::collection::vec(any::<u8>(), 0..128)) {
+        let mut state = sample_state(RunKey::new());
+        state.started_at = OffsetDateTime::UNIX_EPOCH + Duration::seconds(20);
+        state.first_run_started_at = Some(state.started_at - Duration::seconds(10));
+        state.workflow_execution_timeout = Some(Duration::hours(2));
+        state.workflow_run_timeout = Some(Duration::minutes(5));
+        state.retry_policy = Some(policy());
+        state.memo = Memo([("mutable".into(), Payload::new("different"))].into());
+        let evaluation = state.started_at + Duration::seconds(60);
+        let created = evaluation + Duration::milliseconds(delta);
+        let payload = Payloads(vec![Payload::new(bytes.clone())]);
+        let header = Some(tokeira_types::Headers([("accepted".into(), Payload::new(bytes.clone()))].into()));
+        let memo = Memo([("accepted".into(), Payload::new(bytes))].into());
+        let search = SearchAttributes([("field".into(), tokeira_types::SearchAttrValue::Int(13))].into());
+        let mut plan = plan(&state, kind, payload.clone(), None, evaluation).unwrap();
+        match &mut plan {
+            SuccessorPlan::Retry { started, .. } | SuccessorPlan::Cron { started, .. } => {
+                started.header = header.clone(); started.memo = memo.clone(); started.search_attributes = search.clone();
+            }
+            _ => unreachable!(),
+        }
+        let transition = closing(&state, kind);
+        let start = build_successor_start(&transition, Some(&plan), created).unwrap().unwrap();
+        let mut unrelated_metadata = transition.clone();
+        unrelated_metadata.next_state.outbound.as_mut().unwrap().reset_request_id = Some(tokeira_types::RequestId("unrelated-recovery-metadata".into()));
+        prop_assert_eq!(build_successor_start(&unrelated_metadata, Some(&plan), created).unwrap(), Some(start.clone()));
+        prop_assert_eq!(&start.input, &payload); prop_assert_eq!(&start.header, &header);
+        prop_assert_eq!(&start.memo, &memo); prop_assert_eq!(&start.search_attributes, &search);
+        prop_assert_eq!(start.now, created); prop_assert_eq!(start.request.received_at, created);
+        prop_assert_eq!(start.workflow_start_delay, Some(Duration::seconds(2)));
+        prop_assert_eq!(start.first_run_started_at, state.first_run_started_at);
+        prop_assert_eq!(start.workflow_execution_timeout, state.workflow_execution_timeout);
+        prop_assert_eq!(start.workflow_run_timeout, state.workflow_run_timeout);
+        prop_assert_eq!(start.workflow_task_timeout, state.workflow_task_timeout);
+        let expected = tokeira_kernel::BasicKernel.apply(LoadedRun::Absent, Command::Start(start.clone())).unwrap();
+        prop_assert_eq!(&expected, &tokeira_kernel::BasicKernel.apply(LoadedRun::Absent, Command::Start(start)).unwrap());
+        prop_assert_eq!(expected.next_state.started_at, created);
+        prop_assert_eq!(expected.next_state.workflow_start_delay, Some(Duration::seconds(2)));
+    }
+
     // Feature: successor-semantics, Property 5: corrected starts keep their identity and fields across OCC and fallback.
     #[test]
     fn corrected_start_retains_commit_safety(kind in 0u8..5, conflicts in 0usize..4, outcome in 0u8..4, bytes in prop::collection::vec(any::<u8>(), 0..48)) {
@@ -121,7 +164,7 @@ proptest! {
             let repo = MockRepo::new(LoadedRun::Existing(state.clone()), vec![CommitBehavior::Applied]);
             repo.state.lock().await.pair_behaviors = std::iter::repeat_n(PairBehavior::Conflict, conflicts).chain([match outcome { 0 => PairBehavior::Applied, 1 => PairBehavior::SizeRefused, 2 => PairBehavior::Duplicate, _ => PairBehavior::Error }]).collect();
             let mut effect = None;
-            let result = handle_message_with_successor(&kernel, &repo, &test_shard_owner(), &UpdateRegistry::new(), state.run_key, sample_command("close"), plan.as_ref(), &mut effect, 5, &mut LaneCache::new(&LaneConfig::default()), &mut None).await;
+            let result = handle_message_with_successor(&kernel, &repo, &test_shard_owner(), &UpdateRegistry::new(), state.run_key, sample_command("close"), plan.as_ref(), None, &mut effect, 5, &mut LaneCache::new(&LaneConfig::default()), &mut None).await;
             let recorded = repo.state.lock().await;
             prop_assert_eq!(recorded.pairs.len(), conflicts + 1);
             let first = &recorded.pairs[0].1;
@@ -138,8 +181,9 @@ proptest! {
                 }
                 1 => {
                     prop_assert!(matches!(result, Ok((CommitResult::Applied { .. }, _, _))), "applied close");
-                    let Some(SuccessorEffect::Deferred(start)) = effect else { panic!("fallback start") };
-                    let fallback = tokeira_kernel::BasicKernel.apply(LoadedRun::Absent, Command::Start(*start)).unwrap();
+                    prop_assert!(effect.is_none());
+                    let start = recorded.fallbacks.first().expect("persisted fallback start").clone();
+                    let fallback = tokeira_kernel::BasicKernel.apply(LoadedRun::Absent, Command::Start(start)).unwrap();
                     prop_assert_eq!(&fallback.next_state, &first.next_state);
                     prop_assert_eq!(&fallback.history_events, &first.history_events);
                     prop_assert_eq!(&fallback.timer_ops, &first.timer_ops);
@@ -203,7 +247,7 @@ proptest! {
             let repo = MockRepo::new(LoadedRun::Existing(state.clone()), vec![CommitBehavior::Applied]);
             let kernel = RejectSuccessor { kind };
             let plan = plan(&state, kind, Payloads::default(), None, state.started_at);
-            let result = Box::pin(handle_message_with_successor(&kernel, &repo, &test_shard_owner(), &UpdateRegistry::new(), run_key, sample_command("close"), plan.as_ref(), &mut None, 5, &mut LaneCache::new(&LaneConfig::default()), &mut None)).await;
+            let result = Box::pin(handle_message_with_successor(&kernel, &repo, &test_shard_owner(), &UpdateRegistry::new(), run_key, sample_command("close"), plan.as_ref(), None, &mut None, 5, &mut LaneCache::new(&LaneConfig::default()), &mut None)).await;
             prop_assert!(result.is_err(), "a rejected successor must fail the close command");
             let (_, commits, loaded) = repo.snapshot().await;
             prop_assert_eq!(commits, 0);

@@ -1,5 +1,10 @@
 # Nexus Outbound Operation Retry — Design
 
+The [outbound-recovery refinement](../outbound-dispatch-recovery/design.md) supplies
+restart discovery and original-acquisition fencing around this persisted retry state
+machine. Its owned executor replaces the historical fire-and-forget resolution path
+described below; accepted attempt/deadline and protocol classification remain unchanged.
+
 ## Why this is a kernel feature (and a stop-and-raise)
 
 Surfacing `PendingNexusOperations[].LastAttemptFailure` and honouring retry classification

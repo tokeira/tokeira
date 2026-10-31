@@ -1,11 +1,9 @@
 //! `bounded-bulk-writes` through the runtime's reset on the in-memory store.
 //!
-//! A reset materializes its successor in several transactions behind a
-//! bulk-write record. A materialization that stops part way leaves no visible
-//! successor, and the runtime removes the record and the rows it wrote; a node
-//! that takes the shard over switches a materialization another node left
-//! before the shard admits commands. A reset of a closed workflow names the
-//! closed run as the one its successor replaces, so it succeeds.
+//! New resets use complete atomic publication. A node taking over still switches
+//! legacy bulk-write materializations left by an older owner before admitting
+//! commands, so upgrading does not expose a partially copied successor. A reset
+//! of a closed workflow names the closed run as the one its successor replaces.
 // Integration test: unwrap is idiomatic in test code (root AGENTS.md §1).
 #![allow(clippy::unwrap_used)]
 
@@ -78,7 +76,7 @@ fn start_request(namespace_id: NamespaceId) -> StartRequest {
     StartRequest {
         advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
         initiator: None,
-        run_key: RunKey::new(),
+        run_key: RunKey::derive(namespace_id, &WorkflowId(WORKFLOW.to_string()), run_id),
         namespace_id,
         workflow_id: WorkflowId(WORKFLOW.to_string()),
         run_id,
@@ -236,35 +234,10 @@ async fn reset(
         .await
 }
 
-/// A reset whose materialization stops after it has copied the history leaves
-/// no successor, no record and none of the rows it wrote (criteria 2.8, 2.9).
-#[tokio::test]
-async fn a_failed_materialization_leaves_nothing_behind() -> Result<()> {
-    let store = Arc::new(InMemoryStore::default());
-    let runtime = runtime(store.clone());
-    let namespace_id = NamespaceId::new();
-    let (_, base_run_id) = start_and_answer(&runtime, namespace_id, Vec::new()).await?;
-
-    // The record's transaction and the copy's commit; the final one fails.
-    store.fail_bulk_write_after(2).await;
-    let new_run_id = RunId::new();
-    let refused = reset(&runtime, namespace_id, base_run_id, new_run_id).await;
-    assert!(refused.is_err(), "the materialization was stopped");
-
-    let successor = RunKey::derive(namespace_id, &WorkflowId(WORKFLOW.to_string()), new_run_id);
-    assert!(matches!(
-        store.load_run(successor).await?,
-        LoadedRun::Absent
-    ));
-    assert!(store.read_history_to_end(successor, 0).await?.is_empty());
-    assert!(
-        store
-            .list_run_bulk_writes(ShardId(0), None, 10)
-            .await?
-            .is_empty()
-    );
-    Ok(())
-}
+// Interrupted reset publication is exercised by the runtime's
+// outbound::bug_condition_exploration_tests through the current preparation API.
+// The old bulk-write failure hook applies only to legacy materializations, which
+// the takeover test below still preserves for upgrade recovery.
 
 /// A reset of a closed workflow replaces the closed run, which the pointer
 /// still names (criteria 2.13, 3.5).

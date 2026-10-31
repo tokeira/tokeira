@@ -40,6 +40,8 @@ mod large_value_tests;
 mod lease_fence_tests;
 pub mod memory;
 pub mod metrics;
+pub mod outbound;
+pub mod outbound_upgrade;
 pub mod placement_upgrade;
 #[cfg(test)]
 mod placement_upgrade_tests;
@@ -62,6 +64,7 @@ pub use api::*;
 pub use chasm::*;
 pub use memory::*;
 pub use metrics::*;
+pub use outbound::*;
 pub use placement_upgrade::*;
 pub use recovery_index::*;
 pub use worker_compute::*;

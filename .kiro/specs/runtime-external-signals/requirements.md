@@ -128,7 +128,10 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 
 1. IF `resolve_execution` encounters a transient error (storage unavailable), THEN THE Runtime SHALL deliver a `Command::ExternalSignalResolved` or `Command::ExternalCancelResolved` with a `Failed` result to the originating run.
 2. IF the `Command::Signal` or `Command::Cancel` submission to the target run encounters a transient error (lane channel closed, OCC exhaustion), THEN THE Runtime SHALL deliver a resolution with a `Failed` result to the originating run.
-3. THE Runtime SHALL process external signal and cancel dispatch ops asynchronously (via `tokio::spawn`); failure in one dispatch SHALL NOT block processing of other dispatch ops in the same batch.
+3. THE Runtime SHALL process committed external signal/cancel obligations through
+bounded, independently scheduled owned attempts; failure in one attempt SHALL NOT
+prevent unrelated progress. Eligibility, original request identity and confirmation
+survive restart under [outbound recovery](../outbound-dispatch-recovery/bugfix.md).
 4. IF the resolution delivery to the originator fails, THEN THE Runtime SHALL log the failure at warn level and continue processing remaining dispatch ops.
 
 ---

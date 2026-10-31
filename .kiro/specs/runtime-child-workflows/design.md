@@ -58,7 +58,12 @@ The alternative (runtime-local parent-child mapping) was rejected because it wou
 
 **Child resolution detection in the lane.** After a committed transition closes a child run (i.e., `new_state.closed_at.is_some()` and `new_state.parent_run_key.is_some()`), the lane's post-commit hook delivers a `Command::ChildResolved` to the parent. This is done in the lane's `run_activation` after a successful commit, alongside dispatch op publication. The lane already has access to the committed `new_state` and the `DispatchPublisher`.
 
-**Async, fire-and-forget dispatch for parent close policy.** `TerminateChild` and `CancelChild` dispatch ops are processed by the publisher like any other dispatch op. Failures are logged at warn level and do not block the parent's close commit. The sweeper (Feature 11) can reconcile any missed dispatches.
+**Durable parent-close dispatch.** The close transaction establishes immutable intents
+for owed termination/cancellation. The owned outbound driver retries them after
+restart and retires only the exact intent after a definitive lineage-checked outcome.
+The [outbound-recovery design](../outbound-dispatch-recovery/design.md) also supersedes
+the earlier child start/result orchestration sketches below with persisted seeds,
+parent confirmation, first-task gates and fenced result delivery.
 
 **Publisher handles child start as a two-phase operation.** The publisher:
 1. Constructs a `StartRequest` for the child with parent identity fields populated.

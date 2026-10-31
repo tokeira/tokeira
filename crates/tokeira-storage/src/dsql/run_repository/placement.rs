@@ -236,12 +236,7 @@ impl DsqlRunRepository {
                         // The update rewrites the row, which holds a split state's
                         // first part; the other parts stay where they are.
                         let row_bytes = first.len();
-                        let rest = if parts.is_some() {
-                            super::run_value_parts::read_state_parts(&mut tx, key).await?
-                        } else {
-                            Vec::new()
-                        };
-                        let state = super::run_value_parts::join_state_parts(key, first, parts, rest)
+                        let state = super::run_value_parts::join_state(&mut tx, key, first, parts).await
                             .and_then(|bytes| codec::decode_workflow_state(key, &bytes))
                             .with_context(||
                             format!("placement upgrade run={key:?} stored_shard={stored} computed_home={target:?}: cannot decode relocation identity"))?;
@@ -312,12 +307,7 @@ impl DsqlRunRepository {
                                 .bind(key.0)
                                 .fetch_one(&mut *tx)
                                 .await?;
-                                let rest = if parts.is_some() {
-                                    super::run_value_parts::read_state_parts(&mut tx, key).await?
-                                } else {
-                                    Vec::new()
-                                };
-                                let state = super::run_value_parts::join_state_parts(key, first, parts, rest)
+                                let state = super::run_value_parts::join_state(&mut tx, key, first, parts).await
                                     .and_then(|bytes| codec::decode_workflow_state(key, &bytes))
                                     .with_context(||
                                     format!("placement upgrade run={key:?} stored_shard={stored} computed_home={target:?}: cannot decode timer relocation identity"))?;

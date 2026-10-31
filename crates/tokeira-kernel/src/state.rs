@@ -99,6 +99,11 @@ pub struct WorkflowState {
     /// state stored before the count existed reads it as zero.
     #[serde(skip)]
     pub signal_count: u64,
+    /// Required outbound identities persisted outside the positional state layout.
+    /// `None` identifies legacy state requiring checked preparation, never an empty
+    /// set of outstanding obligations. Old writers must reject the new envelope.
+    #[serde(skip)]
+    pub outbound: Option<crate::OutboundState>,
     /// Next logical task sequence to assign when scheduling a
     /// workflow task.
     pub next_workflow_task_seq: LogicalTaskSeq,
@@ -1602,6 +1607,7 @@ pub(crate) mod tests {
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,
+            outbound: Some(Default::default()),
             run_key: RunKey::new(),
             namespace_id: NamespaceId::new(),
             workflow_id: WorkflowId("workflow".into()),

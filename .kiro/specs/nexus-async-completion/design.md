@@ -282,11 +282,14 @@ in state.rs) becomes load-bearing:
   - `NonRetryableFailure { failure }` → `state = Failed` (terminal), `last_attempt_failure = failure`.
   `schedule_completion_callbacks` continues to set `Standby → Scheduled` on close and emit the dispatch
   op; the scanner re-emits for `BackingOff` callbacks past `next_attempt_at`.
-- **Runtime scanner** (`scan_completion_callbacks_once`, mirroring `scan_nexus_timeouts_once`): a
-  volatile index of `(run_key, callback_index)` with `BackingOff` callbacks; on each tick, reload the
-  run (history is authority), re-fire `DispatchCompletionCallback` for callbacks whose
-  `next_attempt_at` has passed, bounded by `max_per_scan`. The index is rebuilt from durable state on
-  shard takeover (like the Nexus timeout index).
+- **Runtime scanner** (`scan_completion_callbacks_once`): reconstruct the index of
+  scheduled and backing-off callbacks from durable state, including closed runs.
+  Reload the accepted callback and terminal payload before each due invocation.
+  First delivery and the scanner share bounded attempt admission; the original
+  acquisition fences the outcome. Concurrent callback outcomes retry their metadata
+  CAS without repeating the HTTP invocation. Runtime shutdown owns and joins attempts.
+  This preserves one callback lifecycle authority under
+  [outbound recovery](../outbound-dispatch-recovery/design.md).
 - **`next_attempt_at`** and `attempt` persist on `CompletionCallback` (serde; build-phase fold, no
   ALTER).
 

@@ -1,5 +1,13 @@
 # Atomic Successors — Bugfix Design
 
+## Approved recovery refinement
+
+[Outbound recovery](../outbound-dispatch-recovery/design.md) supersedes this original
+delivery's separate-start fallback, reset preservation and no-migration boundary.
+Its frozen intent plus reservation replaces the detached fallback task; full reset
+preparation precedes atomic publication. The original implementation sketches and
+completed task evidence below describe the earlier delivery where not yet reconciled.
+
 ## Overview
 
 A close that continues into a successor commits with it, in one storage transaction, as v1.31.0's
@@ -12,8 +20,9 @@ A close that continues into a successor commits with it, in one storage transact
   current-run pointer moved from the closing run to the successor only while it names the closing run.
 - **After the commit.** The lane does the closing run's post-commit work, then the successor's, as it does after a
   successor's start today, and replies.
-- **The size fallback.** If DSQL refuses the transaction for its size, which writes nothing, the lane commits the close
-  alone and starts the successor separately, as today.
+- **The size fallback.** An explicit size refusal commits the close, frozen successor
+  intent and chain reservation together; the owned recovery driver publishes the
+  successor and retires the reservation/intent atomically.
 
 ## Glossary
 
@@ -45,8 +54,9 @@ commits after another start has taken the workflow id.
   lands. Today the client's run takes the id, and the cron successor's start fails. After the fix, the cron successor
   is current from the close on, and the client's start meets it under the client's own conflict policy.
 - **A large successor.** A continue-as-new carries an input and memo so large that the close and the successor together
-  pass 10 MiB, though each fits alone. After the fix, DSQL refuses the pair, the close commits alone, and the successor
-  starts separately, as today.
+  pass 10 MiB, though each fits alone. DSQL refuses the pair; the close, frozen successor
+  intent and chain reservation commit together. Owned recovery stages and publishes
+  that same successor, including after process loss or drain.
 
 ## Expected Behavior
 
@@ -57,8 +67,9 @@ commits after another start has taken the workflow id.
 - Successor fields outside the corrections in [successor-semantics](../successor-semantics/bugfix.md)
   retain their existing policy (3.3).
 - A repeated close is answered as today, and writes no second successor (3.4).
-- A reset materializes its run as today (3.5).
-- No migration is added and the schema contract is unchanged (3.6).
+- Complete reset publication follows the approved outbound-recovery refinement (3.5).
+- The original change added no migrations; outbound recovery has its own versioned
+  schema and stopped-writer cutover (3.6).
 
 ## Root Cause
 
@@ -96,10 +107,13 @@ remains a preservation oracle only for fields outside
 
 **Validates: Requirements 2.4, 3.3**
 
-Property 4: The fallback keeps the close
+Property 4: The fallback keeps the close and its successor obligation
 
-_For any_ pair commit that DSQL refuses for its size, the close SHALL commit alone, and the successor's separate start
-SHALL be submitted only once the close has applied, and SHALL NOT be refused by a drain.
+_For any_ pair commit that DSQL refuses explicitly for its size, the close SHALL commit
+with the frozen successor intent and reservation, or none of them SHALL commit. The
+successor SHALL become current through fenced staged publication after that commit;
+drain or process loss SHALL NOT erase the obligation. See outbound-recovery Property 14
+for its stronger crash and competing-writer contract.
 
 **Validates: Requirements 2.6**
 
@@ -153,12 +167,13 @@ fail with the rejection.
 - **After the commit.** The lane does the close's post-commit work, as today, then the successor's, as it does after
   committing a start: workflow timeout tracking, workflow-task tracking and dispatch. Then it replies to the close's
   caller. A crash before that work leaves it to the sweep, which recovers the successor like any committed start.
-- **The size fallback.** On a size refusal, the lane commits the close alone through `commit_transition`. If that
-  applies, it submits the successor's start, as built, to the successor's lane in a spawned task, as continue-as-new
-  does today, past the runtime's drain check.
+- **The size fallback.** `commit_successor_fallback` stores the close with its frozen
+  start and chain reservation. Publication uses the owned, fenced preparation path,
+  and remains discoverable after loss of the original caller or notifications.
 - **What goes.** The spawned continue-as-new start, `start_retry_successor`, `start_cron_successor`,
   `start_timeout_retry_successor` and `start_timeout_cron_successor` no longer run after a close. The fallback's
-  separate start is the one place a successor is still started on its own.
+  staged publication is the one place a successor is materialized after its close,
+  protected by the durable reservation and frozen intent.
 
 ### Specs this changes
 
@@ -230,7 +245,8 @@ One test, on an ephemeral cluster:
 3. **The pointer.** The pointer moved to another run key with SQL before a close. The pair commit answers a conflict
    and writes nothing.
 4. **A large successor.** A continue-as-new whose input, memo and header make the pair pass DSQL's transaction limit,
-   though the close fits alone. The close commits, and the successor starts separately. If no values within the
+   though the close fits alone. The close commits with its durable successor obligation,
+   and recovery publishes the successor. If no values within the
    payload limits can do that today, the test records why, and Property 4 is checked offline only.
 
 ### Negative controls

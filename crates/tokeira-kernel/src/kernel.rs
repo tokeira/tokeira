@@ -58,6 +58,10 @@ use crate::{
     },
 };
 
+#[path = "reset.rs"]
+mod reset;
+pub use reset::ResetFork;
+
 /// Pinned schedule-to-start timeout for a SPECULATIVE workflow task dispatched
 /// on the normal task queue — v1.31.0's `SpeculativeWorkflowTaskScheduleToStart
 /// Timeout = 5 * time.Second` (chosen to match the sticky queue's 5s default so
@@ -305,12 +309,24 @@ impl BasicKernel {
             Command::ResetSticky(req) => self.apply_reset_sticky(loaded, req),
             Command::ActivityResolved(req) => self.apply_activity_resolved(loaded, req),
             Command::ChildStartConfirmed(req) => self.apply_child_start_confirmed(loaded, req),
-            Command::ChildResolved(req) => self.apply_child_resolved(loaded, req),
+            Command::ExternalSignalResolvedV2 { request, metadata } => {
+                self.apply_external_signal_resolved(loaded, request, Some(metadata))
+            }
+            Command::ExternalCancelResolvedV2 { request, metadata } => {
+                self.apply_external_cancel_resolved(loaded, request, Some(metadata))
+            }
+            Command::ParentChildStartRecorded(req) => {
+                self.apply_parent_child_start_recorded(loaded, req)
+            }
+            Command::ChildResolved(req) => self.apply_child_resolved(loaded, req, None),
+            Command::ChildResolvedV2 { request, metadata } => {
+                self.apply_child_resolved(loaded, request, Some(metadata))
+            }
             Command::ExternalSignalResolved(req) => {
-                self.apply_external_signal_resolved(loaded, req)
+                self.apply_external_signal_resolved(loaded, req, None)
             }
             Command::ExternalCancelResolved(req) => {
-                self.apply_external_cancel_resolved(loaded, req)
+                self.apply_external_cancel_resolved(loaded, req, None)
             }
             Command::NexusOperationResolved(req) => {
                 self.apply_nexus_operation_resolved(loaded, req)
@@ -419,6 +435,7 @@ impl BasicKernel {
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,
+            outbound: Some(Default::default()),
             run_key: ctx.run_key,
             namespace_id: ctx.namespace_id,
             workflow_id: ctx.workflow_id,
@@ -536,6 +553,7 @@ impl BasicKernel {
         // (`startworkflow/api.go:144-157` and `create_workflow_util.go`
         // @ v1.31.0).
         let eager_execution_accepted = req.eager_execution_accepted
+            && !(req.parent_run_key.is_some() && req.continued_execution_run_id.is_none())
             && positive_start_delay(req.workflow_start_delay).is_none()
             && req.reserved_poller_identity.is_some();
 
@@ -558,6 +576,7 @@ impl BasicKernel {
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,
+            outbound: Some(Default::default()),
             run_key: req.run_key,
             namespace_id: req.namespace_id,
             workflow_id: req.workflow_id,
@@ -628,6 +647,25 @@ impl BasicKernel {
         };
 
         let mut builder = TransitionBuilder::new(initial, req.now, req.request.principal.clone());
+        // Transfer confirms Started in the parent before creating the child's
+        // first task (processStartChildExecution,
+        // service/history/transfer_queue_active_task_executor.go @ v1.31.0).
+        // Successors already belong to a confirmed chain and need no new gate.
+        if let Some(parent_run_key) = req.parent_run_key
+            && req.continued_execution_run_id.is_none()
+        {
+            builder
+                .state
+                .outbound
+                .as_mut()
+                .expect("new state has outbound metadata")
+                .child_gate = Some(crate::ChildStartGate {
+                parent_run_key,
+                initiating_event: req.parent_initiated_event_id,
+                first_child_run_id: req.run_id,
+                released: false,
+            });
+        }
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
@@ -695,7 +733,9 @@ impl BasicKernel {
             builder.timer_ops.push(TimerOp::Upsert(timer));
         } else {
             builder.schedule_workflow_task();
-            if let Some(identity) = req.reserved_poller_identity {
+            if let Some(identity) = req.reserved_poller_identity
+                && builder.state.pending_workflow_task.is_some()
+            {
                 builder.start_pending_workflow_task(identity, req.advice_policy);
             }
         }
@@ -727,6 +767,7 @@ impl BasicKernel {
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,
+            outbound: Some(Default::default()),
             run_key: req.run_key,
             namespace_id: req.namespace_id,
             workflow_id: req.workflow_id,
@@ -2586,6 +2627,19 @@ impl BasicKernel {
             });
         }
 
+        if let Some(confirmed_run) = child.child_run_id {
+            // A retried transfer must not append a second Started or replace a
+            // confirmed outcome with failure (recordChildExecutionStarted and
+            // recordStartChildExecutionFailed, transfer_queue_active_task_executor.go
+            // @ v1.31.0). The runtime may still owe first-task release.
+            return match req.result {
+                ChildStartResult::Started { child_run_id, .. } if child_run_id == confirmed_run => {
+                    Ok(builder.finish_noop())
+                }
+                _ => Err(Reject::ChildStartAlreadyConfirmed(child.child_workflow_id)),
+            };
+        }
+
         match req.result {
             ChildStartResult::Started {
                 child_run_id,
@@ -2605,6 +2659,20 @@ impl BasicKernel {
                 if let Some(current) = builder.state.children.get_mut(&child.child_workflow_id) {
                     current.child_run_id = Some(child_run_id_for_state);
                     current.started_event_id = Some(started_event_id);
+                }
+                if let Some(outbound) = &mut builder.state.outbound {
+                    outbound.child_releases.insert(
+                        child.initiated_event_id,
+                        crate::ChildReleaseState {
+                            namespace_id: child.namespace_id,
+                            workflow_id: child.child_workflow_id.clone(),
+                            initiating_event: child.initiated_event_id,
+                            child_run_id,
+                            parent_started_event_id: (started_event_id > 0)
+                                .then_some(started_event_id),
+                            parent_close_policy: child.parent_close_policy,
+                        },
+                    );
                 }
             }
             ChildStartResult::Failed { cause } => {
@@ -2633,15 +2701,51 @@ impl BasicKernel {
         &self,
         loaded: LoadedRun,
         req: ChildResolvedRequest,
+        metadata: Option<crate::ChildOutcomeMetadata>,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         let mut builder = TransitionBuilder::new(state, req.now, None);
-        let child = builder
+        let mut child = builder
             .state
             .children
             .get(&req.child_workflow_id)
             .cloned()
             .ok_or_else(|| Reject::UnknownChild(req.child_workflow_id.clone()))?;
+
+        if let Some(metadata) = &metadata {
+            let identity = metadata.identity;
+            let prepared = builder
+                .state
+                .outbound
+                .as_ref()
+                .and_then(|outbound| outbound.child_seeds.get(&child.initiated_event_id));
+            if identity.parent_initiated_event != child.initiated_event_id
+                || child
+                    .child_run_id
+                    .is_some_and(|run| run != identity.child_first_run)
+                || prepared.is_some_and(|seed| seed.child_run_id != identity.child_first_run)
+                || req.resolved_run_id != Some(identity.child_final_run)
+            {
+                return Err(Reject::StaleChildResult);
+            }
+            // Completion can outrun start confirmation, including after parent
+            // reset. Record Started first using the original first run, then the
+            // actual terminal run (recordchildworkflowcompleted/api.go @ v1.31.0).
+            if child.child_run_id.is_none() {
+                child.started_event_id = Some(builder.append_external(
+                    HistoryEventKind::ChildWorkflowExecutionStarted {
+                        child_workflow_id: child.child_workflow_id.clone(),
+                        child_run_id: identity.child_first_run,
+                        workflow_type: child.workflow_type.clone(),
+                        initiated_event_id: child.initiated_event_id,
+                        namespace_id: Some(child.namespace_id),
+                        namespace: child.namespace.clone(),
+                        header: child.header.clone(),
+                    },
+                ));
+                child.child_run_id = Some(identity.child_first_run);
+            }
+        }
 
         // The run that actually resolved — the final run of a continue-as-new
         // chain when the child continued before closing, else the started run.
@@ -2667,7 +2771,10 @@ impl BasicKernel {
                     namespace: child.namespace.clone(),
                     child_run_id: resolved_run_id,
                     workflow_type: child.workflow_type.clone(),
-                    retry_state: RetryState::RetryPolicyNotSet,
+                    retry_state: metadata
+                        .as_ref()
+                        .and_then(|meta| meta.retry_state.clone())
+                        .unwrap_or(RetryState::RetryPolicyNotSet),
                     failure,
                     initiated_event_id: child.initiated_event_id,
                     started_event_id: child.started_event_id.unwrap_or(0),
@@ -2680,35 +2787,68 @@ impl BasicKernel {
                     namespace: child.namespace.clone(),
                     child_run_id: resolved_run_id,
                     workflow_type: child.workflow_type.clone(),
-                    details: None,
+                    details: metadata
+                        .as_ref()
+                        .and_then(|meta| meta.cancellation_details.clone()),
                     initiated_event_id: child.initiated_event_id,
                     started_event_id: child.started_event_id.unwrap_or(0),
                 });
             }
             ChildResolution::Terminated => {
-                builder.append_external(HistoryEventKind::ChildWorkflowExecutionTerminated {
-                    child_workflow_id: child.child_workflow_id.clone(),
-                    namespace_id: child.namespace_id,
-                    namespace: child.namespace.clone(),
-                    workflow_type: child.workflow_type.clone(),
-                    initiated_event_id: child.initiated_event_id,
-                    started_event_id: child.started_event_id.unwrap_or(0),
-                });
+                if metadata.is_some() {
+                    builder.append_external(HistoryEventKind::ChildWorkflowExecutionTerminatedV2 {
+                        child_workflow_id: child.child_workflow_id.clone(),
+                        namespace_id: child.namespace_id,
+                        namespace: child.namespace.clone(),
+                        child_run_id: resolved_run_id,
+                        workflow_type: child.workflow_type.clone(),
+                        initiated_event_id: child.initiated_event_id,
+                        started_event_id: child.started_event_id.unwrap_or(0),
+                    });
+                } else {
+                    builder.append_external(HistoryEventKind::ChildWorkflowExecutionTerminated {
+                        child_workflow_id: child.child_workflow_id.clone(),
+                        namespace_id: child.namespace_id,
+                        namespace: child.namespace.clone(),
+                        workflow_type: child.workflow_type.clone(),
+                        initiated_event_id: child.initiated_event_id,
+                        started_event_id: child.started_event_id.unwrap_or(0),
+                    });
+                }
             }
             ChildResolution::TimedOut => {
-                builder.append_external(HistoryEventKind::ChildWorkflowExecutionTimedOut {
-                    child_workflow_id: child.child_workflow_id.clone(),
-                    namespace_id: child.namespace_id,
-                    namespace: child.namespace.clone(),
-                    workflow_type: child.workflow_type.clone(),
-                    retry_state: RetryState::Timeout,
-                    initiated_event_id: child.initiated_event_id,
-                    started_event_id: child.started_event_id.unwrap_or(0),
-                });
+                if metadata.is_some() {
+                    builder.append_external(HistoryEventKind::ChildWorkflowExecutionTimedOutV2 {
+                        child_workflow_id: child.child_workflow_id.clone(),
+                        namespace_id: child.namespace_id,
+                        namespace: child.namespace.clone(),
+                        child_run_id: resolved_run_id,
+                        workflow_type: child.workflow_type.clone(),
+                        retry_state: metadata
+                            .as_ref()
+                            .and_then(|meta| meta.retry_state.clone())
+                            .unwrap_or(RetryState::Timeout),
+                        initiated_event_id: child.initiated_event_id,
+                        started_event_id: child.started_event_id.unwrap_or(0),
+                    });
+                } else {
+                    builder.append_external(HistoryEventKind::ChildWorkflowExecutionTimedOut {
+                        child_workflow_id: child.child_workflow_id.clone(),
+                        namespace_id: child.namespace_id,
+                        namespace: child.namespace.clone(),
+                        workflow_type: child.workflow_type.clone(),
+                        retry_state: RetryState::Timeout,
+                        initiated_event_id: child.initiated_event_id,
+                        started_event_id: child.started_event_id.unwrap_or(0),
+                    });
+                }
             }
         }
 
         builder.state.children.remove(&child.child_workflow_id);
+        if let Some(outbound) = &mut builder.state.outbound {
+            outbound.child_releases.remove(&child.initiated_event_id);
+        }
 
         if builder.state.pending_workflow_task.is_none() {
             builder.schedule_workflow_task();
@@ -2722,6 +2862,7 @@ impl BasicKernel {
         &self,
         loaded: LoadedRun,
         req: ExternalSignalResolvedRequest,
+        metadata: Option<crate::ExternalResolutionMetadata>,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         let mut builder = TransitionBuilder::new(state, req.now, None);
@@ -2740,22 +2881,45 @@ impl BasicKernel {
         let namespace = pending.target_namespace.clone().or(req.target_namespace);
         match req.result {
             ExternalSignalResult::Signaled => {
-                builder.append_external(HistoryEventKind::ExternalWorkflowExecutionSignaled {
-                    initiated_event_id: pending.initiated_event_id,
-                    namespace_id: pending.target_namespace_id,
-                    namespace,
-                    target_workflow_id: pending.target_workflow_id,
-                    target_run_id: pending.target_run_id,
+                builder.append_external(if let Some(metadata) = metadata {
+                    HistoryEventKind::ExternalWorkflowExecutionSignaledV2 {
+                        initiated_event_id: pending.initiated_event_id,
+                        namespace_id: pending.target_namespace_id,
+                        namespace,
+                        target_workflow_id: pending.target_workflow_id,
+                        target_run_id: pending.target_run_id,
+                        metadata,
+                    }
+                } else {
+                    HistoryEventKind::ExternalWorkflowExecutionSignaled {
+                        initiated_event_id: pending.initiated_event_id,
+                        namespace_id: pending.target_namespace_id,
+                        namespace,
+                        target_workflow_id: pending.target_workflow_id,
+                        target_run_id: pending.target_run_id,
+                    }
                 });
             }
             ExternalSignalResult::Failed { cause } => {
-                builder.append_external(HistoryEventKind::SignalExternalWorkflowExecutionFailed {
-                    initiated_event_id: pending.initiated_event_id,
-                    namespace_id: pending.target_namespace_id,
-                    namespace,
-                    target_workflow_id: pending.target_workflow_id,
-                    target_run_id: pending.target_run_id,
-                    cause,
+                builder.append_external(if let Some(metadata) = metadata {
+                    HistoryEventKind::SignalExternalWorkflowExecutionFailedV2 {
+                        initiated_event_id: pending.initiated_event_id,
+                        namespace_id: pending.target_namespace_id,
+                        namespace,
+                        target_workflow_id: pending.target_workflow_id,
+                        target_run_id: pending.target_run_id,
+                        cause,
+                        metadata,
+                    }
+                } else {
+                    HistoryEventKind::SignalExternalWorkflowExecutionFailed {
+                        initiated_event_id: pending.initiated_event_id,
+                        namespace_id: pending.target_namespace_id,
+                        namespace,
+                        target_workflow_id: pending.target_workflow_id,
+                        target_run_id: pending.target_run_id,
+                        cause,
+                    }
                 });
             }
         }
@@ -2777,6 +2941,7 @@ impl BasicKernel {
         &self,
         loaded: LoadedRun,
         req: ExternalCancelResolvedRequest,
+        metadata: Option<crate::ExternalResolutionMetadata>,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         let mut builder = TransitionBuilder::new(state, req.now, None);
@@ -2803,7 +2968,17 @@ impl BasicKernel {
                 );
             }
             ExternalCancelResult::Failed { cause } => {
-                builder.append_external(
+                builder.append_external(if let Some(metadata) = metadata {
+                    HistoryEventKind::RequestCancelExternalWorkflowExecutionFailedV2 {
+                        initiated_event_id: pending.initiated_event_id,
+                        namespace_id: pending.target_namespace_id,
+                        namespace,
+                        target_workflow_id: pending.target_workflow_id,
+                        target_run_id: pending.target_run_id,
+                        cause,
+                        metadata,
+                    }
+                } else {
                     HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed {
                         initiated_event_id: pending.initiated_event_id,
                         namespace_id: pending.target_namespace_id,
@@ -2811,8 +2986,8 @@ impl BasicKernel {
                         target_workflow_id: pending.target_workflow_id,
                         target_run_id: pending.target_run_id,
                         cause,
-                    },
-                );
+                    }
+                });
             }
         }
 
@@ -2847,6 +3022,19 @@ impl BasicKernel {
             return Err(Reject::StaleNexusResolution {
                 operation_id: req.operation_id,
                 expected_scheduled_event_id: pending.scheduled_event_id,
+            });
+        }
+
+        // A scheduled-event fence alone cannot distinguish retries of the same
+        // operation. Start outcomes must still name the in-flight generation;
+        // callbacks and timeouts are independently authorized operation outcomes.
+        // See components/nexusoperations/tasks.go @ v1.31.0 (InvocationTask.Validate).
+        if let Some(attempt) = req.expected_attempt
+            && (attempt != pending.attempt || pending.next_attempt_at.is_some() || pending.started)
+        {
+            return Err(Reject::StaleNexusAttempt {
+                operation_id: req.operation_id,
+                expected_attempt: pending.attempt,
             });
         }
 
@@ -3175,6 +3363,12 @@ impl BasicKernel {
         if cancellation.state != NexusOperationCancellationState::Scheduled {
             return Err(Reject::NexusCancellationNotScheduled(req.operation_id));
         }
+        if cancellation.attempt != req.expected_attempt {
+            return Err(Reject::StaleNexusAttempt {
+                operation_id: req.operation_id,
+                expected_attempt: cancellation.attempt,
+            });
+        }
 
         let mut builder = TransitionBuilder::new(state, req.now, None);
         let mut history_kind = None;
@@ -3287,6 +3481,15 @@ impl BasicKernel {
         &self,
         loaded: LoadedRun,
         req: WorkflowTaskFailedRequest,
+    ) -> Result<Transition, Reject> {
+        self.apply_workflow_task_failed_for_reset(loaded, req, None)
+    }
+
+    fn apply_workflow_task_failed_for_reset(
+        &self,
+        loaded: LoadedRun,
+        req: WorkflowTaskFailedRequest,
+        reset: Option<&ResetFork>,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         let pending = state
@@ -3446,10 +3649,10 @@ impl BasicKernel {
                 failure_cause: req.failure_cause,
                 failure_details: req.failure_details,
                 identity: req.worker_identity,
-                base_run_id: None,
-                new_run_id: None,
-                fork_event_version: None,
-                fork_event_id: None,
+                base_run_id: reset.map(|fork| fork.base_run_id),
+                new_run_id: reset.map(|fork| fork.request.new_run_id),
+                fork_event_version: reset.map(|_| 0),
+                fork_event_id: reset.map(|fork| fork.request.fork_event_id),
             });
             // The persisted (non-transient) failure records the problem
             // identity — v1.31.0 sets `LastWorkflowTaskFailure` only when the
@@ -3479,8 +3682,15 @@ impl BasicKernel {
         // (workflow_resetter.go): execution-options updates, signals, and
         // re-admitted updates, in original order, filtered by the reapply
         // exclude bits at the lane. Empty for a normal (non-reset) failure.
+        if let Some(reset) = reset {
+            // The fork task has failed. Activity failures and post-reset options
+            // must be real events before the fresh task is scheduled, never
+            // buffered behind that old task (workflow_resetter.go @ v1.31.0).
+            builder.state.pending_workflow_task = None;
+            reset.fail_inflight_activities(&mut builder)?;
+        }
         if is_reset {
-            for kind in req.reset_reapply {
+            for (index, kind) in req.reset_reapply.into_iter().enumerate() {
                 // A child event reapplies only while the successor still holds
                 // the matching pending child — its Initiated event lies inside
                 // the copied prefix. A missing entry means the child was
@@ -3514,8 +3724,16 @@ impl BasicKernel {
                         child_workflow_id,
                         ..
                     }
+                    | HistoryEventKind::ChildWorkflowExecutionTerminatedV2 {
+                        child_workflow_id,
+                        ..
+                    }
                     | HistoryEventKind::ChildWorkflowExecutionTimedOut {
                         child_workflow_id, ..
+                    }
+                    | HistoryEventKind::ChildWorkflowExecutionTimedOutV2 {
+                        child_workflow_id,
+                        ..
                     } => !builder.state.children.contains_key(child_workflow_id),
                     _ => false,
                 };
@@ -3546,8 +3764,16 @@ impl BasicKernel {
                         child_workflow_id,
                         ..
                     }
+                    | HistoryEventKind::ChildWorkflowExecutionTerminatedV2 {
+                        child_workflow_id,
+                        ..
+                    }
                     | HistoryEventKind::ChildWorkflowExecutionTimedOut {
                         child_workflow_id, ..
+                    }
+                    | HistoryEventKind::ChildWorkflowExecutionTimedOutV2 {
+                        child_workflow_id,
+                        ..
                     } => {
                         builder.state.children.remove(child_workflow_id);
                     }
@@ -3628,7 +3854,12 @@ impl BasicKernel {
                     } => Some((child_workflow_id.clone(), *child_run_id)),
                     _ => None,
                 };
+                let principal = builder.principal.clone();
+                if let Some(reset) = reset {
+                    builder.principal = reset.reapply[index].1.clone();
+                }
                 let event_id = builder.emit(kind);
+                builder.principal = principal;
                 if let Some((child_workflow_id, child_run_id)) = started_child
                     && let Some(child) = builder.state.children.get_mut(&child_workflow_id)
                 {
@@ -3685,6 +3916,11 @@ impl BasicKernel {
         if let Some(reason) = req.terminate_reason {
             builder.state.pending_workflow_task = None;
             builder.terminate_run(reason, None, "history-service".to_string(), Vec::new());
+            return builder.finish();
+        }
+        if reset.is_some() {
+            // The atomic reset constructor applies options before scheduling.
+            // No intermediate transition from this helper is published.
             return builder.finish();
         }
         let paused = builder.state.status == ExecutionStatus::Paused;
@@ -4081,6 +4317,51 @@ impl BasicKernel {
             builder.schedule_workflow_task();
         }
 
+        builder.finish()
+    }
+
+    fn apply_parent_child_start_recorded(
+        &self,
+        loaded: LoadedRun,
+        req: crate::ParentChildStartRecordedRequest,
+    ) -> Result<Transition, Reject> {
+        let LoadedRun::Existing(state) = loaded else {
+            return Err(Reject::MissingRun);
+        };
+        let mut builder = TransitionBuilder::new(state, req.now, None);
+        let gate = builder
+            .state
+            .outbound
+            .as_mut()
+            .and_then(|outbound| outbound.child_gate.as_mut())
+            .ok_or(Reject::StaleChildRelease)?;
+        if gate.parent_run_key != req.parent_run_key
+            || gate.initiating_event != req.initiating_event
+            || gate.first_child_run_id != req.first_child_run_id
+            || req.parent_started_event_id <= 0
+        {
+            return Err(Reject::StaleChildRelease);
+        }
+        if gate.released {
+            return Ok(builder.finish_noop());
+        }
+        gate.released = true;
+        if builder.state.is_open() && builder.state.pending_workflow_task.is_none() {
+            let delay = builder.state.timers.get(WORKFLOW_START_DELAY_TIMER_ID);
+            if delay.is_none_or(|timer| timer.fire_at <= req.now) {
+                if builder
+                    .state
+                    .timers
+                    .remove(WORKFLOW_START_DELAY_TIMER_ID)
+                    .is_some()
+                {
+                    builder.timer_ops.push(TimerOp::Delete {
+                        timer_id: WORKFLOW_START_DELAY_TIMER_ID.to_string(),
+                    });
+                }
+                builder.schedule_workflow_task();
+            }
+        }
         builder.finish()
     }
 
@@ -4535,6 +4816,15 @@ impl BasicKernel {
                 header,
                 parent_close_policy,
                 ..
+            }
+            | HistoryEventKind::StartChildWorkflowExecutionInitiatedV2 {
+                child_workflow_id,
+                namespace_id,
+                namespace,
+                workflow_type,
+                header,
+                parent_close_policy,
+                ..
             } => {
                 state.children.insert(
                     child_workflow_id.clone(),
@@ -4576,7 +4866,13 @@ impl BasicKernel {
             | HistoryEventKind::ChildWorkflowExecutionTerminated {
                 child_workflow_id, ..
             }
+            | HistoryEventKind::ChildWorkflowExecutionTerminatedV2 {
+                child_workflow_id, ..
+            }
             | HistoryEventKind::ChildWorkflowExecutionTimedOut {
+                child_workflow_id, ..
+            }
+            | HistoryEventKind::ChildWorkflowExecutionTimedOutV2 {
                 child_workflow_id, ..
             } => {
                 state.children.remove(child_workflow_id);
@@ -4604,8 +4900,15 @@ impl BasicKernel {
             HistoryEventKind::ExternalWorkflowExecutionSignaled {
                 initiated_event_id, ..
             }
+            | HistoryEventKind::ExternalWorkflowExecutionSignaledV2 {
+                initiated_event_id, ..
+            }
             | HistoryEventKind::SignalExternalWorkflowExecutionFailed {
                 initiated_event_id, ..
+            }
+            | HistoryEventKind::SignalExternalWorkflowExecutionFailedV2 {
+                initiated_event_id,
+                ..
             } => {
                 state.pending_external_signals.remove(initiated_event_id);
             }
@@ -4632,6 +4935,10 @@ impl BasicKernel {
                 ..
             }
             | HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed {
+                initiated_event_id,
+                ..
+            }
+            | HistoryEventKind::RequestCancelExternalWorkflowExecutionFailedV2 {
                 initiated_event_id,
                 ..
             } => {
@@ -6120,7 +6427,7 @@ fn apply_workflow_command(
             let dispatch_priority =
                 merge_priority(builder.state.priority.as_ref(), priority.as_ref());
             let initiated_event_id =
-                builder.emit(HistoryEventKind::StartChildWorkflowExecutionInitiated {
+                builder.emit(HistoryEventKind::StartChildWorkflowExecutionInitiatedV2 {
                     workflow_task_completed_event_id,
                     child_workflow_id: child_workflow_id.clone(),
                     workflow_type: workflow_type.clone(),
@@ -6138,6 +6445,7 @@ fn apply_workflow_command(
                     cron_schedule,
                     parent_close_policy,
                     priority,
+                    reuse_policy,
                 });
             builder.state.children.insert(
                 child_workflow_id.clone(),
@@ -6947,6 +7255,7 @@ fn is_externally_originated(kind: &HistoryEventKind) -> bool {
         | HistoryEventKind::TimerCanceled { .. }
         | HistoryEventKind::MarkerRecorded { .. }
         | HistoryEventKind::StartChildWorkflowExecutionInitiated { .. }
+        | HistoryEventKind::StartChildWorkflowExecutionInitiatedV2 { .. }
         | HistoryEventKind::SignalExternalWorkflowExecutionInitiated { .. }
         | HistoryEventKind::RequestCancelExternalWorkflowExecutionInitiated { .. }
         | HistoryEventKind::UpsertWorkflowSearchAttributes { .. }
@@ -6975,12 +7284,15 @@ fn is_externally_originated(kind: &HistoryEventKind) -> bool {
         | HistoryEventKind::ChildWorkflowExecutionCompleted { .. }
         | HistoryEventKind::ChildWorkflowExecutionFailed { .. }
         | HistoryEventKind::ChildWorkflowExecutionCanceled { .. }
-        | HistoryEventKind::ChildWorkflowExecutionTerminated { .. }
-        | HistoryEventKind::ChildWorkflowExecutionTimedOut { .. }
+        | HistoryEventKind::ChildWorkflowExecutionTerminated { .. } | HistoryEventKind::ChildWorkflowExecutionTerminatedV2 { .. }
+        | HistoryEventKind::ChildWorkflowExecutionTimedOut { .. } | HistoryEventKind::ChildWorkflowExecutionTimedOutV2 { .. }
         | HistoryEventKind::ExternalWorkflowExecutionSignaled { .. }
+        | HistoryEventKind::ExternalWorkflowExecutionSignaledV2 { .. }
         | HistoryEventKind::SignalExternalWorkflowExecutionFailed { .. }
+        | HistoryEventKind::SignalExternalWorkflowExecutionFailedV2 { .. }
         | HistoryEventKind::ExternalWorkflowExecutionCancelRequested { .. }
         | HistoryEventKind::RequestCancelExternalWorkflowExecutionFailed { .. }
+        | HistoryEventKind::RequestCancelExternalWorkflowExecutionFailedV2 { .. }
         | HistoryEventKind::NexusOperationStarted { .. }
         | HistoryEventKind::NexusOperationCompleted { .. }
         | HistoryEventKind::NexusOperationFailed { .. }
@@ -7031,7 +7343,9 @@ fn is_buffered_resolution_class(kind: &HistoryEventKind) -> bool {
             | HistoryEventKind::ChildWorkflowExecutionFailed { .. }
             | HistoryEventKind::ChildWorkflowExecutionCanceled { .. }
             | HistoryEventKind::ChildWorkflowExecutionTerminated { .. }
+            | HistoryEventKind::ChildWorkflowExecutionTerminatedV2 { .. }
             | HistoryEventKind::ChildWorkflowExecutionTimedOut { .. }
+            | HistoryEventKind::ChildWorkflowExecutionTimedOutV2 { .. }
             | HistoryEventKind::NexusOperationCompleted { .. }
             | HistoryEventKind::NexusOperationFailed { .. }
             | HistoryEventKind::NexusOperationCanceled { .. }
@@ -7356,6 +7670,13 @@ impl TransitionBuilder {
                     {
                         child.started_event_id = Some(event_id);
                     }
+                    if let Some(release) =
+                        self.state.outbound.as_mut().and_then(|outbound| {
+                            outbound.child_releases.get_mut(initiated_event_id)
+                        })
+                    {
+                        release.parent_started_event_id = Some(event_id);
+                    }
                 }
                 HistoryEventKind::ChildWorkflowExecutionCompleted {
                     initiated_event_id,
@@ -7377,7 +7698,17 @@ impl TransitionBuilder {
                     started_event_id,
                     ..
                 }
+                | HistoryEventKind::ChildWorkflowExecutionTerminatedV2 {
+                    initiated_event_id,
+                    started_event_id,
+                    ..
+                }
                 | HistoryEventKind::ChildWorkflowExecutionTimedOut {
+                    initiated_event_id,
+                    started_event_id,
+                    ..
+                }
+                | HistoryEventKind::ChildWorkflowExecutionTimedOutV2 {
                     initiated_event_id,
                     started_event_id,
                     ..
@@ -7847,6 +8178,18 @@ impl TransitionBuilder {
     }
 
     fn schedule_workflow_task_typed(&mut self, task_type: WorkflowTaskType) {
+        // Signals, queries and elapsed delay timers cannot bypass the child's
+        // parent-confirmation barrier. Release later schedules their accumulated
+        // history using the original start clock.
+        if self
+            .state
+            .outbound
+            .as_ref()
+            .and_then(|outbound| outbound.child_gate.as_ref())
+            .is_some_and(|gate| !gate.released)
+        {
+            return;
+        }
         if self.state.status == ExecutionStatus::Paused {
             return;
         }
@@ -8095,6 +8438,13 @@ impl TransitionBuilder {
     /// Emits `TerminateChild` or `CancelChild` dispatch ops
     /// as appropriate; `Abandon` children are left alone.
     fn apply_parent_close_policy(&mut self) {
+        if let Some(outbound) = &mut self.state.outbound {
+            // Only already-confirmed ABANDON children may still execute after
+            // their parent closes (processStartChildExecution @ v1.31.0).
+            outbound
+                .child_releases
+                .retain(|_, release| release.parent_close_policy == ParentClosePolicy::Abandon);
+        }
         let children = std::mem::take(&mut self.state.children);
         for (_, child) in children {
             let Some(child_run_id) = child.child_run_id else {
@@ -8413,6 +8763,16 @@ pub enum Reject {
         child_workflow_id: tokeira_types::WorkflowId,
         expected_initiated_event_id: i64,
     },
+    /// A later start result attempted to replace an already-confirmed child.
+    #[error("child start is already confirmed: {0:?}")]
+    ChildStartAlreadyConfirmed(tokeira_types::WorkflowId),
+    /// A first-task release did not identify this child's committed relationship.
+    #[error("stale child first-task release")]
+    StaleChildRelease,
+    /// The result names a different initiation or first child run.
+    #[error("stale child result identity")]
+    StaleChildResult,
+
     /// An external signal resolution referenced an unknown
     /// initiated event ID.
     #[error("unknown external signal: initiated_event_id={0}")]
@@ -8458,6 +8818,12 @@ pub enum Reject {
     StaleNexusResolution {
         operation_id: String,
         expected_scheduled_event_id: i64,
+    },
+    /// A delayed transport outcome belongs to an older invocation generation.
+    #[error("stale nexus attempt for {operation_id}: current attempt is {expected_attempt}")]
+    StaleNexusAttempt {
+        operation_id: String,
+        expected_attempt: u32,
     },
     /// A Nexus operation was already marked as started.
     #[error("nexus operation already started: {0}")]

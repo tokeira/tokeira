@@ -1,5 +1,13 @@
 # Design Document: External Signal and Cancel Delivery
 
+## Approved recovery refinement
+
+[Outbound recovery](../outbound-dispatch-recovery/design.md) replaces the original
+one-shot orchestration sketches below. Source state and initiation history supply the
+accepted payload and stable request identity; bounded owned discovery retries target
+delivery and source confirmation. Only the specified definitive outcomes become
+terminal source events. The existing public payload and namespace rules remain binding.
+
 ## Overview
 
 This design wires the runtime's `DispatchPublisher` to handle the two external workflow dispatch ops (`SignalExternalWorkflow`, `RequestCancelExternalWorkflow`) and delivers resolution results back to the originating workflow. It replaces the current stub logging in `RuntimeDispatchPublisher` (the `other =>` catch-all arm) with working implementations.
@@ -56,7 +64,9 @@ flowchart TD
 
 **Namespace on the dispatch op is the target namespace.** The `namespace_id` field on the dispatch op identifies the namespace of the target workflow, not the originator. This is needed for `resolve_execution` to look up the target in the correct namespace. The `WorkflowCommand::SignalExternalWorkflowExecution` and `RequestCancelExternalWorkflowExecution` are extended with a `target_namespace_id: NamespaceId` field, which the kernel propagates into the dispatch op's `namespace_id`. A command that names no namespace targets the workflow's own, as in v1.31.0 (`workflow_task_completed_handler.go:870-881, 1155-1168 @ v1.31.0`): the edge gives it the nil id, and the kernel replaces a nil `target_namespace_id` with the workflow's namespace id before it records the initiated event. A command that names a namespace carries that namespace's id.
 
-**Async, fire-and-forget dispatch via `tokio::spawn`.** Each external signal/cancel dispatch op is processed in a spawned task, consistent with the child workflow pattern. This ensures one slow or failing dispatch does not block other dispatch ops in the same batch.
+**Bounded owned dispatch.** Each persisted external operation is independently
+scheduled by the outbound driver. Its original acquisition and source incarnation
+fence destination effects and source resolution; loss of an attempt retains the work.
 
 **Resolution always delivered.** Regardless of whether the signal/cancel succeeds or fails (target not found, target closed, transient error), the publisher always delivers a resolution command back to the originator. This ensures the originator's `PendingExternalSignal` or `PendingExternalCancel` entry is resolved and a history event is emitted.
 
@@ -569,7 +579,8 @@ If the `Command::Signal` or `Command::Cancel` returns `CommitResult::Duplicate`,
 
 ### Async dispatch isolation
 
-Each external signal/cancel dispatch op is processed in a `tokio::spawn` task. Failure in one dispatch does not block or affect other dispatch ops in the same batch. This is consistent with the child workflow dispatch pattern.
+Each external operation is processed by a bounded owned attempt. Finite discovery
+rounds and per-record backoff prevent a failing operation from blocking unrelated work.
 
 ## Testing Strategy
 

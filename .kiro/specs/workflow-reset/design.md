@@ -1,5 +1,12 @@
 # Design: Workflow Reset
 
+The [outbound-recovery refinement](../outbound-dispatch-recovery/design.md) replaces
+the storage/orchestration sequence below with complete preparation before atomic
+publication. The fork task outcome, reapply events, ordered options and fresh task
+already exist when the current pointer and participating runs publish together.
+Child reconnection uses verified original-parent lineage; no post-success detached
+step is required. This document's public reset semantics remain binding.
+
 This design realizes the reset model of `requirements.md` across edge → kernel → runtime → storage.
 It reworks tokeira's current **structural fork-and-replay** (which terminates the reset run and
 copies only the prefix) into v1.31.0's **base/current fork + terminal-WFT + reapply + relink** model.

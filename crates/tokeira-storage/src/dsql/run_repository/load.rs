@@ -54,7 +54,7 @@ pub(super) const READ_HISTORY_BATCHES_SQL: &str = "
     SELECT first_event_id, last_event_id, transition_seq, events_data, events_parts,
         principals_data, principals_parts
     FROM history_batch
-    WHERE run_key = $1 AND last_event_id > $2
+    WHERE run_key = $1 AND NOT EXISTS (SELECT 1 FROM run_preparation WHERE target_run_key = history_batch.run_key AND phase < 4) AND last_event_id > $2
     ORDER BY first_event_id ASC
     LIMIT $3";
 
@@ -75,7 +75,7 @@ pub(super) const READ_HISTORY_EVENT_BATCH_SQL: &str = "
     SELECT first_event_id, last_event_id, transition_seq, events_data, events_parts,
         principals_data, principals_parts
     FROM history_batch
-    WHERE run_key = $1 AND first_event_id <= $2
+    WHERE run_key = $1 AND NOT EXISTS (SELECT 1 FROM run_preparation WHERE target_run_key = history_batch.run_key AND phase < 4) AND first_event_id <= $2
     ORDER BY first_event_id DESC
     LIMIT 1";
 
@@ -84,7 +84,7 @@ pub(super) const READ_ALL_HISTORY_BATCHES_SQL: &str = "
     SELECT first_event_id, last_event_id, transition_seq, events_data, events_parts,
         principals_data, principals_parts
     FROM history_batch
-    WHERE run_key = $1
+    WHERE run_key = $1 AND NOT EXISTS (SELECT 1 FROM run_preparation WHERE target_run_key = history_batch.run_key AND phase < 4)
     ORDER BY first_event_id ASC";
 
 /// One of the reads of a run's history batches.
@@ -267,9 +267,12 @@ impl DsqlRunRepository {
                 .bind(run_key.0)
                 .fetch_optional(&mut *connection)
                 .await?;
-            // A split state's parts must come from the snapshot that read its first
-            // part, so the fast read can't join them (`large-value-parts`).
-            let split = row.as_ref().is_some_and(|(_, _, parts)| parts.is_some());
+            // Both canonical parts and prepared-state pages must come from the
+            // snapshot that read their pointer. TKUP stores a NULL parts count,
+            // so that count alone cannot authorize the inline fast path.
+            let split = row.as_ref().is_some_and(|(first, _, parts)| {
+                run_value_parts::state_needs_snapshot(first, *parts)
+            });
             if split {
                 #[cfg(all(test, feature = "dsql-integration"))]
                 super::pause_point::reached(super::pause_point::PauseKey::StateParts(run_key))
@@ -547,8 +550,9 @@ impl DsqlRunRepository {
                 &execution.workflow_id,
                 request_id,
             );
-            let row = sqlx::query_as::<_, (Uuid, String, i64, Uuid)>(
-                "SELECT run_key, request_id, first_seen_transition_seq, run_id
+            let row = sqlx::query_as::<_, (Uuid, String, i64, Uuid, Option<Uuid>, Option<i16>, Option<i64>, Option<i64>, Option<i64>)>(
+                "SELECT run_key, request_id, first_seen_transition_seq, run_id, outbound_source_run_key,
+                 outbound_kind, outbound_initiating_event_id, outbound_requested_event_id, outbound_attempt
              FROM request_dedupe
              WHERE key = $1",
             )
@@ -556,7 +560,18 @@ impl DsqlRunRepository {
             .fetch_optional(permit.connection()?)
             .await?;
 
-            let Some((run_key, stored_request_id, transition_seq, stored_run_id)) = row else {
+            let Some((
+                run_key,
+                stored_request_id,
+                transition_seq,
+                stored_run_id,
+                source,
+                kind,
+                initiation,
+                requested,
+                attempt,
+            )) = row
+            else {
                 return Ok(None);
             };
             let run_id = RunId(stored_run_id);
@@ -571,6 +586,27 @@ impl DsqlRunRepository {
             }
 
             Ok(Some(RequestRecord {
+                outbound_origin: match (source, kind, initiation, requested, attempt) {
+                    (None, None, None, None, None) => None,
+                    (
+                        Some(source),
+                        Some(kind),
+                        Some(initiation),
+                        Some(requested),
+                        Some(attempt),
+                    ) => Some(tokeira_kernel::OutboundOrigin {
+                        incarnation: tokeira_kernel::OperationIncarnation {
+                            key: tokeira_kernel::OperationKey {
+                                source_run: RunKey(source),
+                                kind: super::outbound::operation_kind(kind)?,
+                                initiating_event: initiation,
+                            },
+                            requested_event: requested,
+                            attempt: u32::try_from(attempt)?,
+                        },
+                    }),
+                    _ => bail!("partial outbound dedupe provenance"),
+                },
                 namespace_id: execution.namespace_id,
                 workflow_id: execution.workflow_id.clone(),
                 run_id,

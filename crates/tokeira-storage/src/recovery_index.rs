@@ -42,7 +42,14 @@ pub fn recovery_needed(state: &WorkflowState) -> bool {
             && (state.workflow_execution_timeout.is_some()
                 || state.workflow_run_timeout.is_some()
                 || !state.activities.is_empty()
-                || !state.pending_nexus_operations.is_empty()))
+                || !state.pending_nexus_operations.is_empty()
+                || !state.children.is_empty()
+                || !state.pending_external_signals.is_empty()
+                || !state.pending_external_cancels.is_empty()))
+        || state
+            .outbound
+            .as_ref()
+            .is_some_and(|outbound| !outbound.child_releases.is_empty())
         || state
             .completion_callbacks
             .iter()
@@ -308,6 +315,7 @@ mod tests {
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,
+            outbound: Some(Default::default()),
             run_key,
             namespace_id: NamespaceId::new(),
             workflow_id: WorkflowId("workflow".into()),

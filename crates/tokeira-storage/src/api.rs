@@ -178,7 +178,8 @@ pub enum PairCommitResult {
     Conflict { reason: String },
     /// A request was already committed for its run.
     Duplicate,
-    /// DSQL refused the transaction for size (SQLSTATE 54000), writing nothing.
+    /// DSQL refused the transaction with a recognized size/row-count message
+    /// and SQLSTATE 54000, writing nothing. Other 54000 errors are not size refusals.
     /// This is the only outcome that permits a separate close/start fallback.
     SizeRefused,
 }
@@ -867,6 +868,9 @@ pub struct RequestRecord {
     pub request_id: RequestId,
     /// Transition that first persisted this request.
     pub first_seen_transition_seq: TransitionSeq,
+    /// Internal source identity, persisted atomically with destination dedupe.
+    /// Retention keeps this evidence while that source operation remains owed.
+    pub outbound_origin: Option<tokeira_kernel::OutboundOrigin>,
 }
 
 /// Development/test view of one persisted transition.
@@ -929,6 +933,168 @@ pub const HISTORY_READ_PAGE: usize = 1024;
 /// table X with join Y".
 #[async_trait]
 pub trait RunRepository: Send + Sync {
+    /// Discover published generations still owed local timeout reconstruction.
+    /// This durable handoff covers a lost publication reply after intent retirement.
+    async fn read_published_preparations(
+        &self,
+        home: tokeira_types::ShardId,
+        bound: crate::ScanBound<uuid::Uuid>,
+        after: Option<uuid::Uuid>,
+        limit: usize,
+    ) -> anyhow::Result<crate::OutboundPage<uuid::Uuid, crate::PreparationToken>> {
+        let _ = (home, bound, after, limit);
+        Err(anyhow!("published preparation discovery is unsupported"))
+    }
+
+    /// After reconstruction, reclaim manifest parts in bounded fenced pages.
+    /// Keep compact generation/request proof until the published run is purged.
+    async fn complete_run_preparation(
+        &self,
+        token: crate::PreparationToken,
+        fence: crate::WriteFence,
+    ) -> anyhow::Result<bool> {
+        let _ = (token, fence);
+        Err(anyhow!("publication completion is unsupported"))
+    }
+
+    /// After a recognized atomic-pair size refusal, close the predecessor and
+    /// atomically retain its complete frozen successor plus a workflow pointer
+    /// reservation. A failed smaller commit must expose none of these writes.
+    async fn commit_successor_fallback(
+        &self,
+        run: tokeira_types::RunKey,
+        closing: tokeira_kernel::Transition,
+        start: Box<tokeira_kernel::StartRequest>,
+        fence: crate::WriteFence,
+    ) -> anyhow::Result<crate::CommitResult> {
+        let _ = (run, closing, start, fence);
+        Err(anyhow!(
+            "successor fallback is unsupported by this repository"
+        ))
+    }
+
+    /// Load the selected identity before rebuilding an interrupted reset upload.
+    async fn find_run_preparation(
+        &self,
+        request_key: &str,
+    ) -> Result<Option<crate::PreparationToken>> {
+        let _ = request_key;
+        Err(anyhow!(
+            "run preparation lookup is unsupported by this repository"
+        ))
+    }
+
+    /// Stage an immutable complete publication in bounded invisible pages. A
+    /// repeated request selects its original manifest and target identity.
+    async fn prepare_run_publication(
+        &self,
+        preparation: Box<crate::RunPreparation>,
+        fence: WriteFence,
+    ) -> Result<crate::PreparationToken> {
+        let _ = (preparation, fence);
+        Err(anyhow!("run preparation is unsupported by this repository"))
+    }
+
+    /// Atomically publish all participants after checking the original fence,
+    /// sequences, pointer and preparation generation.
+    async fn publish_prepared_run(
+        &self,
+        token: crate::PreparationToken,
+        fence: WriteFence,
+    ) -> Result<crate::PublicationResult> {
+        let _ = (token, fence);
+        Err(anyhow!("run preparation is unsupported by this repository"))
+    }
+
+    /// Purge only this unpublished generation; a published or newer generation
+    /// is never deleted by an old cleanup attempt.
+    async fn abandon_prepared_run(
+        &self,
+        token: crate::PreparationToken,
+        fence: WriteFence,
+    ) -> Result<bool> {
+        let _ = (token, fence);
+        Err(anyhow!("run preparation is unsupported by this repository"))
+    }
+
+    /// Bounded source-operation discovery within one home and kind. `Capture`
+    /// fixes a finite upper key; subsequent pages retain it despite new inserts.
+    /// An absent implementation is an error, never an empty successful sweep.
+    async fn read_operation_page(
+        &self,
+        home: ShardId,
+        kind: tokeira_kernel::OperationKind,
+        bound: crate::ScanBound<tokeira_kernel::OperationKey>,
+        after: Option<tokeira_kernel::OperationKey>,
+        limit: usize,
+    ) -> Result<crate::OutboundPage<tokeira_kernel::OperationKey, crate::OperationRow>> {
+        let _ = (home, kind, bound, after, limit);
+        Err(anyhow!("outbound operation discovery is not implemented"))
+    }
+
+    /// Bounded immutable-intent discovery. Retired intents are never recreated.
+    async fn read_intent_page(
+        &self,
+        home: ShardId,
+        bound: crate::ScanBound<crate::IntentKey>,
+        after: Option<crate::IntentKey>,
+        limit: usize,
+    ) -> Result<crate::OutboundPage<crate::IntentKey, crate::IntentDescriptor>> {
+        let _ = (home, bound, after, limit);
+        Err(anyhow!("outbound intent discovery is not implemented"))
+    }
+
+    /// Read one immutable obligation for hydration or verified remote delivery.
+    async fn load_intent(&self, key: crate::IntentKey) -> Result<Option<crate::IntentRow>> {
+        let _ = key;
+        Err(anyhow!("outbound intent reads are not implemented"))
+    }
+
+    /// Replace a run's operation index under the captured home fence. Never
+    /// constructs close intents, including when a closed run is repaired.
+    async fn reconcile_outbound_run(
+        &self,
+        home: ShardId,
+        run: RunKey,
+        fence: WriteFence,
+    ) -> Result<()> {
+        let _ = (home, run, fence);
+        Err(anyhow!("outbound reconciliation is not implemented"))
+    }
+
+    /// Retire only the exact verified obligation under its original source fence.
+    /// Returns false for an already-retired key; that is idempotent success.
+    async fn retire_intent(
+        &self,
+        proof: crate::IntentRetirement,
+        fence: WriteFence,
+    ) -> Result<bool> {
+        let _ = (proof, fence);
+        Err(anyhow!("outbound intent retirement is not implemented"))
+    }
+
+    /// Internal recovery read including a logically deleted source retained for
+    /// close obligations or lineage proof. Never use this for a public lookup.
+    async fn load_outbound_source(&self, run: RunKey) -> Result<LoadedRun> {
+        self.load_run(run).await
+    }
+
+    /// Destination commit with source-incarnation validation in the SAME storage
+    /// transaction as its effect/dedupe. A hydrate-before-submit check is insufficient.
+    async fn commit_outbound_transition(
+        &self,
+        run: RunKey,
+        transition: Transition,
+        guard: crate::DeliveryGuard,
+        source_fence: WriteFence,
+        fence: WriteFence,
+    ) -> Result<CommitResult> {
+        let _ = (run, transition, guard, source_fence, fence);
+        Err(anyhow!(
+            "guarded outbound destination commits are not implemented"
+        ))
+    }
+
     /// Commit a closed run and its new successor with one execution-home fence.
     ///
     /// Both transitions must belong to the same workflow, with distinct keys.
@@ -949,6 +1115,46 @@ pub trait RunRepository: Send + Sync {
             "atomic successor commits are not implemented by this repository"
         ))
     }
+    /// Required outbound-format gate, checked before runtime construction.
+    fn outbound_ready(&self) -> bool {
+        true
+    }
+
+    /// Accept a completed preparation, or initialize an empty database only.
+    /// Existing unprepared data requires explicit maintenance plan/apply.
+    async fn ensure_outbound_prepared(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Read the exclusive maintenance revision and live-lease count.
+    async fn outbound_upgrade_status(
+        &self,
+    ) -> Result<crate::outbound_upgrade::OutboundUpgradeStatus> {
+        Err(anyhow!("outbound upgrade status is not implemented"))
+    }
+
+    /// Read the next hot source in UUID order, including closed and legacy rows.
+    async fn read_outbound_upgrade_run(
+        &self,
+        after: Option<RunKey>,
+    ) -> Result<Option<WorkflowState>> {
+        let _ = after;
+        Err(anyhow!("outbound upgrade scan is not implemented"))
+    }
+
+    /// Commit one stopped-cluster metadata page and its exclusive continuation.
+    /// Validate marker, source fingerprint, live leases and sequential cursor in
+    /// the same transaction; never reconstruct old close intents here.
+    async fn commit_outbound_upgrade_page(
+        &self,
+        expected: Option<crate::outbound_upgrade::OutboundUpgradeProgress>,
+        next: crate::outbound_upgrade::OutboundUpgradeProgress,
+        write: Option<crate::outbound_upgrade::OutboundUpgradeWrite>,
+    ) -> Result<()> {
+        let _ = (expected, next, write);
+        Err(anyhow!("outbound upgrade apply is not implemented"))
+    }
+
     /// Whether startup preparation has completed for this repository handle.
     /// Runtime construction must check this before spawning any tasks. Defaults
     /// serve test doubles; authoritative stores and wrappers implement it.
@@ -2915,6 +3121,129 @@ impl<T> RunRepository for std::sync::Arc<T>
 where
     T: RunRepository + ?Sized,
 {
+    async fn read_published_preparations(
+        &self,
+        home: tokeira_types::ShardId,
+        bound: crate::ScanBound<uuid::Uuid>,
+        after: Option<uuid::Uuid>,
+        limit: usize,
+    ) -> anyhow::Result<crate::OutboundPage<uuid::Uuid, crate::PreparationToken>> {
+        (**self)
+            .read_published_preparations(home, bound, after, limit)
+            .await
+    }
+
+    async fn complete_run_preparation(
+        &self,
+        token: crate::PreparationToken,
+        fence: crate::WriteFence,
+    ) -> anyhow::Result<bool> {
+        (**self).complete_run_preparation(token, fence).await
+    }
+
+    async fn commit_successor_fallback(
+        &self,
+        run: tokeira_types::RunKey,
+        closing: tokeira_kernel::Transition,
+        start: Box<tokeira_kernel::StartRequest>,
+        fence: crate::WriteFence,
+    ) -> anyhow::Result<crate::CommitResult> {
+        (**self)
+            .commit_successor_fallback(run, closing, start, fence)
+            .await
+    }
+
+    async fn find_run_preparation(
+        &self,
+        request_key: &str,
+    ) -> Result<Option<crate::PreparationToken>> {
+        (**self).find_run_preparation(request_key).await
+    }
+
+    async fn prepare_run_publication(
+        &self,
+        preparation: Box<crate::RunPreparation>,
+        fence: WriteFence,
+    ) -> Result<crate::PreparationToken> {
+        (**self).prepare_run_publication(preparation, fence).await
+    }
+
+    async fn publish_prepared_run(
+        &self,
+        token: crate::PreparationToken,
+        fence: WriteFence,
+    ) -> Result<crate::PublicationResult> {
+        (**self).publish_prepared_run(token, fence).await
+    }
+
+    async fn abandon_prepared_run(
+        &self,
+        token: crate::PreparationToken,
+        fence: WriteFence,
+    ) -> Result<bool> {
+        (**self).abandon_prepared_run(token, fence).await
+    }
+
+    async fn read_operation_page(
+        &self,
+        home: tokeira_types::ShardId,
+        kind: tokeira_kernel::OperationKind,
+        bound: crate::ScanBound<tokeira_kernel::OperationKey>,
+        after: Option<tokeira_kernel::OperationKey>,
+        limit: usize,
+    ) -> anyhow::Result<crate::OutboundPage<tokeira_kernel::OperationKey, crate::OperationRow>>
+    {
+        (**self)
+            .read_operation_page(home, kind, bound, after, limit)
+            .await
+    }
+    async fn read_intent_page(
+        &self,
+        home: tokeira_types::ShardId,
+        bound: crate::ScanBound<crate::IntentKey>,
+        after: Option<crate::IntentKey>,
+        limit: usize,
+    ) -> anyhow::Result<crate::OutboundPage<crate::IntentKey, crate::IntentDescriptor>> {
+        (**self).read_intent_page(home, bound, after, limit).await
+    }
+    async fn load_intent(&self, key: crate::IntentKey) -> anyhow::Result<Option<crate::IntentRow>> {
+        (**self).load_intent(key).await
+    }
+    async fn reconcile_outbound_run(
+        &self,
+        home: tokeira_types::ShardId,
+        run: tokeira_types::RunKey,
+        fence: crate::WriteFence,
+    ) -> anyhow::Result<()> {
+        (**self).reconcile_outbound_run(home, run, fence).await
+    }
+    async fn retire_intent(
+        &self,
+        proof: crate::IntentRetirement,
+        fence: crate::WriteFence,
+    ) -> anyhow::Result<bool> {
+        (**self).retire_intent(proof, fence).await
+    }
+    async fn load_outbound_source(
+        &self,
+        run: tokeira_types::RunKey,
+    ) -> anyhow::Result<tokeira_kernel::LoadedRun> {
+        (**self).load_outbound_source(run).await
+    }
+
+    async fn commit_outbound_transition(
+        &self,
+        run: tokeira_types::RunKey,
+        transition: tokeira_kernel::Transition,
+        guard: crate::DeliveryGuard,
+        source_fence: crate::WriteFence,
+        fence: crate::WriteFence,
+    ) -> anyhow::Result<crate::CommitResult> {
+        (**self)
+            .commit_outbound_transition(run, transition, guard, source_fence, fence)
+            .await
+    }
+
     async fn commit_transition_pair(
         &self,
         run_key: RunKey,
@@ -2933,6 +3262,34 @@ where
     fn recovery_is_empty(&self) -> bool {
         (**self).recovery_is_empty()
     }
+    fn outbound_ready(&self) -> bool {
+        (**self).outbound_ready()
+    }
+    async fn ensure_outbound_prepared(&self) -> Result<()> {
+        (**self).ensure_outbound_prepared().await
+    }
+    async fn outbound_upgrade_status(
+        &self,
+    ) -> Result<crate::outbound_upgrade::OutboundUpgradeStatus> {
+        (**self).outbound_upgrade_status().await
+    }
+    async fn read_outbound_upgrade_run(
+        &self,
+        after: Option<RunKey>,
+    ) -> Result<Option<WorkflowState>> {
+        (**self).read_outbound_upgrade_run(after).await
+    }
+    async fn commit_outbound_upgrade_page(
+        &self,
+        expected: Option<crate::outbound_upgrade::OutboundUpgradeProgress>,
+        next: crate::outbound_upgrade::OutboundUpgradeProgress,
+        write: Option<crate::outbound_upgrade::OutboundUpgradeWrite>,
+    ) -> Result<()> {
+        (**self)
+            .commit_outbound_upgrade_page(expected, next, write)
+            .await
+    }
+
     async fn prepare_placement_page(&self) -> Result<crate::PlacementPage> {
         (**self).prepare_placement_page().await
     }

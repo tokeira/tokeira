@@ -1,2 +1,72 @@
 syntax = "proto3";
 package tokeira.internal.runtime.v1;
+
+// Committed references only. The receiver hydrates and validates the recipe;
+// this service can neither accept commands nor resolve the source operation.
+service OutboundDelivery {
+  rpc Deliver(OutboundDeliveryRequest) returns (OutboundDeliveryResponse);
+}
+
+message OutboundOperationReference {
+  uint32 kind = 1;
+  int64 initiating_event_id = 2;
+  int64 requested_event_id = 3;
+  uint32 attempt = 4;
+  uint64 source_transition_seq = 5;
+}
+
+message OutboundIntentReference {
+  uint32 kind = 1;
+  uint64 closing_transition_seq = 2;
+  uint32 ordinal = 3;
+}
+
+enum OutboundDeliveryPhase {
+  OUTBOUND_DELIVERY_PHASE_UNSPECIFIED = 0;
+  OUTBOUND_DELIVERY_PHASE_CHILD_START = 1;
+  OUTBOUND_DELIVERY_PHASE_CHILD_REPLACE = 2;
+  OUTBOUND_DELIVERY_PHASE_CHILD_RELEASE = 3;
+  OUTBOUND_DELIVERY_PHASE_EXTERNAL = 4;
+  OUTBOUND_DELIVERY_PHASE_PARENT_CLOSE = 5;
+  OUTBOUND_DELIVERY_PHASE_CHILD_RESULT = 6;
+}
+
+message OutboundDeliveryRequest {
+  bytes source_run_key = 1;
+  oneof reference {
+    OutboundOperationReference operation = 2;
+    OutboundIntentReference intent = 3;
+  }
+  bytes destination_run_key = 4;
+  uint32 destination_home = 5;
+  OutboundDeliveryPhase phase = 6;
+  optional bytes expected_current_run_key = 7;
+  uint32 source_home = 8;
+  string source_owner = 9;
+  uint64 source_epoch = 10;
+}
+
+enum OutboundDeliveryOutcome {
+  OUTBOUND_DELIVERY_OUTCOME_UNSPECIFIED = 0;
+  OUTBOUND_DELIVERY_OUTCOME_APPLIED = 1;
+  OUTBOUND_DELIVERY_OUTCOME_DUPLICATE_VERIFIED = 2;
+  OUTBOUND_DELIVERY_OUTCOME_TERMINAL = 3;
+  OUTBOUND_DELIVERY_OUTCOME_OBSOLETE = 4;
+  OUTBOUND_DELIVERY_OUTCOME_NOT_OWNER = 5;
+  OUTBOUND_DELIVERY_OUTCOME_RETRYABLE = 6;
+}
+
+enum OutboundTerminalCause {
+  OUTBOUND_TERMINAL_CAUSE_UNSPECIFIED = 0;
+  OUTBOUND_TERMINAL_CAUSE_MISSING_EXECUTION = 1;
+  OUTBOUND_TERMINAL_CAUSE_CLOSED_EXECUTION = 2;
+  OUTBOUND_TERMINAL_CAUSE_SIGNAL_LIMIT = 3;
+}
+
+message OutboundDeliveryResponse {
+  OutboundDeliveryOutcome outcome = 1;
+  optional bytes target_run_id = 2;
+  optional uint64 target_transition_seq = 3;
+  optional OutboundTerminalCause terminal_cause = 4;
+  optional bytes reset_redirect_run_id = 5;
+}

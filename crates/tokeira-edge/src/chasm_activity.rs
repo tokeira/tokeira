@@ -2019,7 +2019,8 @@ mod tests {
 
     const SEC: i64 = 1_000_000_000;
     #[cfg(feature = "conformance")]
-    static CONFORMANCE_OVERRIDE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static CONFORMANCE_OVERRIDE_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     fn engine() -> Arc<ChasmEngine> {
         let mut builder = Registry::builder();
@@ -2243,9 +2244,7 @@ mod tests {
     #[tokio::test]
     async fn gate_off_returns_unimplemented() {
         #[cfg(feature = "conformance")]
-        let _override_guard = CONFORMANCE_OVERRIDE_TEST_LOCK
-            .lock()
-            .expect("conformance override test lock");
+        let _override_guard = CONFORMANCE_OVERRIDE_TEST_LOCK.lock().await;
         #[cfg(feature = "conformance")]
         {
             crate::conformance::overrides::install_registry_reads();
@@ -2259,11 +2258,9 @@ mod tests {
     }
 
     #[cfg(feature = "conformance")]
-    #[test]
-    fn conformance_overrides_control_activity_policy_live() {
-        let _override_guard = CONFORMANCE_OVERRIDE_TEST_LOCK
-            .lock()
-            .expect("conformance override test lock");
+    #[tokio::test]
+    async fn conformance_overrides_control_activity_policy_live() {
+        let _override_guard = CONFORMANCE_OVERRIDE_TEST_LOCK.lock().await;
         crate::conformance::overrides::install_registry_reads();
         let overrides = tokeira_conformance::overrides();
         overrides.clear(STANDALONE_ACTIVITIES_KEY);

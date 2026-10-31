@@ -90,7 +90,7 @@ fn start_request(namespace_id: NamespaceId) -> StartRequest {
     StartRequest {
         advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
         initiator: None,
-        run_key: RunKey::new(),
+        run_key: RunKey::derive(namespace_id, &WorkflowId(WORKFLOW.to_string()), run_id),
         namespace_id,
         workflow_id: WorkflowId(WORKFLOW.to_string()),
         run_id,

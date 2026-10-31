@@ -72,7 +72,6 @@ struct SqlPair<'a> {
 }
 
 impl DsqlRunRepository {
-    #[tracing::instrument(name = "dsql.commit_transition_pair", skip_all, fields(run_key = %run_key.0, successor_run_key = %successor_run_key.0))]
     pub(super) async fn do_commit_transition_pair(
         &self,
         run_key: RunKey,
@@ -81,29 +80,42 @@ impl DsqlRunRepository {
         successor: Transition,
         fence: WriteFence,
     ) -> Result<PairCommitResult> {
-        validate_transition_pair(run_key, &closing, successor_run_key, &successor)?;
-        let home = tokeira_types::execution_home_bundle(
-            closing.next_state.namespace_id.0.as_bytes(),
-            closing.next_state.workflow_id.0.as_bytes(),
-            self.shard_count,
+        let span = tracing::info_span!(
+            "dsql.commit_transition_pair",
+            run_key = %run_key.0,
+            successor_run_key = %successor_run_key.0,
         );
-        fence.ensure_home(home)?;
-        convert::i64_from_u64(closing.next_state.transition_seq.0, "transition_seq")?;
-        convert::i64_from_u64(successor.next_state.transition_seq.0, "transition_seq")?;
-        let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let tx = permit.connection()?.begin().await?;
-        execute_pair(SqlPair {
-            tx,
-            closing_state: closing.next_state.clone(),
-            successor_state: successor.next_state.clone(),
-            closing,
-            successor,
-            home,
-            fence,
-            partitions: self.projection_partition_count,
-            prior_history_size: 0,
-            prior_state_parts: None,
+        // Each Transition contains inline history/dispatch buffers. Keep both
+        // the traced body and the transaction executor behind allocation
+        // boundaries, so constructing/polling them does not stack their owned
+        // transitions in this future or in the runtime awaiting the pair.
+        Box::pin(async move {
+            validate_transition_pair(run_key, &closing, successor_run_key, &successor)?;
+            let home = tokeira_types::execution_home_bundle(
+                closing.next_state.namespace_id.0.as_bytes(),
+                closing.next_state.workflow_id.0.as_bytes(),
+                self.shard_count,
+            );
+            fence.ensure_home(home)?;
+            convert::i64_from_u64(closing.next_state.transition_seq.0, "transition_seq")?;
+            convert::i64_from_u64(successor.next_state.transition_seq.0, "transition_seq")?;
+            let mut permit = self.director.acquire(DbClass::Commit).await?;
+            let tx = permit.connection()?.begin().await?;
+            Box::pin(execute_pair(SqlPair {
+                tx,
+                closing_state: closing.next_state.clone(),
+                successor_state: successor.next_state.clone(),
+                closing,
+                successor,
+                home,
+                fence,
+                partitions: self.projection_partition_count,
+                prior_history_size: 0,
+                prior_state_parts: None,
+            }))
+            .await
         })
+        .instrument(span)
         .await
     }
 }

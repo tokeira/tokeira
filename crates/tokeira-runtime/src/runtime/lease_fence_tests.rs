@@ -349,7 +349,7 @@ fn before_tests(text: &str) -> &str {
 /// a deletion's first transaction, and a takeover's recovery switch. A new
 /// writer fails the audit until its fence is checked and it is listed here.
 const FENCED_WRITERS: [(&str, usize); 5] = [
-    ("lane.rs", 2),
+    ("lane.rs", 4),
     ("runtime/activity.rs", 5),
     ("runtime/lifecycle.rs", 1),
     ("purge.rs", 1),
@@ -377,6 +377,7 @@ fn every_runtime_write_takes_its_fence_from_the_ownership_state() {
             .replace('\\', "/");
         let count = [
             ".commit_transition(",
+            ".commit_transition_pair(",
             ".commit_transition_for_bundle(",
             ".delete_run_for_bundle(",
             ".materialize_reset_successor(",

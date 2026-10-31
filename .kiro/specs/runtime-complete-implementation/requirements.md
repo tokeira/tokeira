@@ -401,7 +401,7 @@ The implementation is organized into 15 incremental features with explicit depen
 #### Acceptance Criteria
 
 1. WHEN a committed transition closes a run with ExecutionStatus::ContinuedAsNew, THE Runtime SHALL read the WorkflowExecutionContinuedAsNew event from the committed history events.
-2. THE Runtime SHALL issue a `Command::Start` for the successor run using the new_run_id, workflow_type, task_queue, input, memo, search_attributes, and timeout configuration from the continued-as-new event.
+2. THE Runtime SHALL apply a `Command::Start` for the successor and commit it with the close in one fenced transaction, using the new_run_id, workflow_type, task_queue, input, memo, search_attributes, and timeout configuration from the continued-as-new event.
 3. THE successor Start command SHALL carry `continued_execution_run_id` set to the current run's run_id.
 
 ### Requirement 8.2: Execution Chain Identity
@@ -416,6 +416,8 @@ The implementation is organized into 15 incremental features with explicit depen
 ### Requirement 8.3: Successor Start Failure Handling
 
 **User Story:** As a Tokeira developer, I want the runtime to handle successor start failures gracefully, so that continue-as-new failures do not leave the execution chain in an inconsistent state.
+
+These criteria apply only to the separate start after an explicit storage size refusal. The close must apply before that start is spawned directly to its lane, past drain admission. All other pair errors fail the close without a fallback.
 
 #### Acceptance Criteria
 

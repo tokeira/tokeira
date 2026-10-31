@@ -163,6 +163,51 @@ pub enum CommitResult {
     Duplicate,
 }
 
+/// Outcome of committing a close and its successor in one transaction.
+/// Every outcome except `Applied` leaves both runs and the current pointer unchanged.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PairCommitResult {
+    /// Both write sets committed; these are the authoritative folded states.
+    Applied {
+        /// The closed predecessor.
+        closing_state: WorkflowState,
+        /// The newly started successor.
+        successor_state: WorkflowState,
+    },
+    /// A sequence, successor-absence, pointer, or serialization check failed.
+    Conflict { reason: String },
+    /// A request was already committed for its run.
+    Duplicate,
+    /// DSQL refused the transaction for size (SQLSTATE 54000), writing nothing.
+    /// This is the only outcome that permits a separate close/start fallback.
+    SizeRefused,
+}
+
+/// Reject malformed pairs before a backend acquires its transaction.
+pub(crate) fn validate_transition_pair(
+    run_key: RunKey,
+    closing: &Transition,
+    successor_run_key: RunKey,
+    successor: &Transition,
+) -> Result<()> {
+    let old = &closing.next_state;
+    let new = &successor.next_state;
+    if run_key != old.run_key
+        || successor_run_key != new.run_key
+        || run_key == successor_run_key
+        || old.run_id == new.run_id
+        || old.namespace_id != new.namespace_id
+        || old.workflow_id != new.workflow_id
+        || old.status.is_open()
+        || !new.status.is_open()
+        || closing.expected_seq == TransitionSeq::ZERO
+        || successor.expected_seq != TransitionSeq::ZERO
+    {
+        return Err(anyhow!("invalid closing-run/successor transition pair"));
+    }
+    Ok(())
+}
+
 /// Inputs to one authoritative workflow-run deletion.
 ///
 /// Deletion is operational cleanup rather than a kernel transition, but it is
@@ -884,6 +929,26 @@ pub const HISTORY_READ_PAGE: usize = 1024;
 /// table X with join Y".
 #[async_trait]
 pub trait RunRepository: Send + Sync {
+    /// Commit a closed run and its new successor with one execution-home fence.
+    ///
+    /// Both transitions must belong to the same workflow, with distinct keys.
+    /// The successor must be absent and its expected sequence zero. The current
+    /// pointer must still name `run_key`, whether open or closed. Backends check
+    /// the fence before run state and write both sets or neither. Implementations
+    /// must never emulate this by calling `commit_transition` twice.
+    async fn commit_transition_pair(
+        &self,
+        run_key: RunKey,
+        closing: Transition,
+        successor_run_key: RunKey,
+        successor: Transition,
+        fence: WriteFence,
+    ) -> Result<PairCommitResult> {
+        let _ = (run_key, closing, successor_run_key, successor, fence);
+        Err(anyhow!(
+            "atomic successor commits are not implemented by this repository"
+        ))
+    }
     /// Whether startup preparation has completed for this repository handle.
     /// Runtime construction must check this before spawning any tasks. Defaults
     /// serve test doubles; authoritative stores and wrappers implement it.
@@ -2850,6 +2915,18 @@ impl<T> RunRepository for std::sync::Arc<T>
 where
     T: RunRepository + ?Sized,
 {
+    async fn commit_transition_pair(
+        &self,
+        run_key: RunKey,
+        closing: Transition,
+        successor_run_key: RunKey,
+        successor: Transition,
+        fence: WriteFence,
+    ) -> Result<PairCommitResult> {
+        (**self)
+            .commit_transition_pair(run_key, closing, successor_run_key, successor, fence)
+            .await
+    }
     fn placement_ready(&self) -> bool {
         (**self).placement_ready()
     }

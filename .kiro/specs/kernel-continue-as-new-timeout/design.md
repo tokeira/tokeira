@@ -4,7 +4,7 @@
 
 This feature adds the `ContinueAsNew` workflow command, the `WorkflowExecutionTimedOut` top-level command, and retry metadata emission to `tokeira-kernel`. It also extends `ExecutionStatus` with two new terminal variants.
 
-- **ContinueAsNew** is a workflow command within `WorkflowTaskCompleted`. It emits `WorkflowExecutionContinuedAsNew`, calls `close(ContinuedAsNew)`, and returns `true`. The kernel does NOT create the successor run; the runtime reads the event and issues a `Start`.
+- **ContinueAsNew** is a workflow command within `WorkflowTaskCompleted`. It emits `WorkflowExecutionContinuedAsNew`, calls `close(ContinuedAsNew)`, and returns `true`. The kernel does NOT create the successor run; the runtime reads the event, applies a `Start` to `LoadedRun::Absent`, and commits that transition with the close. Each kernel application still concerns one run.
 - **WorkflowExecutionTimedOut** is a top-level command following the same pattern as `apply_terminate`: `expect_open` → emit event → `close(TimedOut)`, which deletes the open timers; pending activities stay, as v1.31.0 keeps a timed-out run's activity infos (Requirement 3.2). No request dedup, no WFT dispatch.
 - **Retry metadata** is added to `WorkflowExecutionFailed`: the event gains `retry_state` and `attempt` fields. The kernel sets `retry_state` based on retry policy presence but does NOT evaluate retry logic.
 

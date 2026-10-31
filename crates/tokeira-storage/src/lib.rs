@@ -22,6 +22,8 @@
 
 pub mod api;
 #[cfg(test)]
+mod atomic_successors_test_support;
+#[cfg(test)]
 mod bug_condition_exploration_tests;
 #[cfg(test)]
 mod bulk_write_tests;

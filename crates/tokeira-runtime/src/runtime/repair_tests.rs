@@ -350,6 +350,19 @@ async fn acquisition_drains_an_admitted_lane_commit_before_reading_repair_pages(
 
 #[async_trait]
 impl RunRepository for Repo {
+    async fn commit_transition_pair(
+        &self,
+        run_key: RunKey,
+        closing: Transition,
+        successor_run_key: RunKey,
+        successor: Transition,
+        fence: WriteFence,
+    ) -> Result<tokeira_storage::PairCommitResult> {
+        self.inner
+            .commit_transition_pair(run_key, closing, successor_run_key, successor, fence)
+            .await
+    }
+
     fn recovery_is_empty(&self) -> bool {
         self.inner.recovery_is_empty()
     }

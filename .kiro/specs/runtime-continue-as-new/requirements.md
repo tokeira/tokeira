@@ -90,9 +90,9 @@ This feature depends on Feature 1 (Lane OCC Retry), Feature 5 (Workflow Timeouts
 
 #### Acceptance Criteria
 
-1. THE Runtime SHALL submit the successor's `Command::Start` to the lane determined by the successor's `RunKey`.
+1. THE Runtime SHALL apply the successor's `Command::Start` to `LoadedRun::Absent` in the closing run's lane and commit both transitions in one fenced transaction.
 2. WHEN the successor `Command::Start` succeeds (returns `CommitResult::Applied`), THE Runtime SHALL consider the continue-as-new chain link complete.
-3. THE Runtime SHALL execute successor start asynchronously after the predecessor's transition is committed; successor start failure SHALL NOT affect the predecessor's committed close.
+3. THE Runtime SHALL reject the close without committing either run if the successor cannot be applied; only a storage size refusal SHALL permit committing the close alone and spawning the successor start on its lane, past drain admission.
 
 ---
 
@@ -102,10 +102,10 @@ This feature depends on Feature 1 (Lane OCC Retry), Feature 5 (Workflow Timeouts
 
 #### Acceptance Criteria
 
-1. IF the successor `Command::Start` fails, THEN THE Runtime SHALL log the failure at error level with the predecessor's `run_key`, `workflow_id`, `run_id`, the successor's `new_run_id`, and the error details.
-2. IF the successor `Command::Start` fails, THEN THE Runtime SHALL NOT attempt to reopen or modify the already-closed predecessor run.
-3. THE Runtime SHALL retry the successor `Command::Start` with bounded retries (reusing the lane's OCC retry mechanism) before giving up.
-4. IF the successor `Command::Start` returns `CommitResult::Duplicate` (request-dedupe collision), THEN THE Runtime SHALL treat it as a failure and log at error level. Note: `Duplicate` from the current storage contract indicates a request-dedupe collision, not "successor already exists." A retried continue-as-new start uses a fresh `RunKey` and would not normally hit this path.
+1. IF the size fallback's successor `Command::Start` fails, THEN THE Runtime SHALL log the failure at error level with the predecessor's `run_key`, `workflow_id`, `run_id`, the successor's `new_run_id`, and the error details.
+2. IF the size fallback's successor `Command::Start` fails, THEN THE Runtime SHALL NOT attempt to reopen or modify the already-closed predecessor run.
+3. THE Runtime SHALL retry the size fallback's successor `Command::Start` with bounded retries (reusing the lane's OCC retry mechanism) before giving up.
+4. IF the size fallback's successor `Command::Start` returns `CommitResult::Duplicate` (request-dedupe collision), THEN THE Runtime SHALL treat it as a failure and log at error level. Note: `Duplicate` from the current storage contract indicates a request-dedupe collision, not "successor already exists." A retried continue-as-new start uses a fresh `RunKey` and would not normally hit this path.
 
 ---
 
@@ -115,6 +115,6 @@ This feature depends on Feature 1 (Lane OCC Retry), Feature 5 (Workflow Timeouts
 
 #### Acceptance Criteria
 
-1. WHEN the successor `Command::Start` is committed and the successor has a non-None `workflow_execution_timeout` or `workflow_run_timeout`, THE Runtime SHALL insert a `WorkflowTimeoutEntry` into the `WorkflowTimeoutTrackingState` for the successor.
+1. WHEN the close and successor pair commits (or the size-fallback start commits) and the successor has a non-None `workflow_execution_timeout` or `workflow_run_timeout`, THE Runtime SHALL insert a `WorkflowTimeoutEntry` into the `WorkflowTimeoutTrackingState` for the successor.
 2. THE `WorkflowTimeoutEntry` for the successor SHALL use the committed successor's `new_state.started_at` for run timeout measurement, and `first_run_started_at` (if present) for execution timeout measurement.
 3. WHEN the predecessor run closes with `ContinuedAsNew`, THE Lane SHALL remove the predecessor's `WorkflowTimeoutEntry` from the `WorkflowTimeoutTrackingState` (this is already handled by the existing post-commit `closed_at` check).

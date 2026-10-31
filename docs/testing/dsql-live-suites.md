@@ -390,3 +390,23 @@ The connector migration needs this lifecycle run as well as the endpoint test an
 URL-gated test. They run on a credentialed operator host; the managed runbook adds a
 longer override for its lifecycle test to the `dsql-live` profile, because cluster
 lifecycle operations take longer still.
+
+## Atomic successors
+
+`dsql::run_repository::atomic_successors_live_tests::atomic_successors_live` is gated by
+`TOKEIRA_DSQL_TEST_DATABASE_URL` and `dsql-integration`. It returns early when the URL is unset.
+Run it on a disposable cluster:
+
+```bash
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --offline --profile dsql-live -E 'test(atomic_successors_live)'
+```
+
+The four parts check workflow-task continue-as-new, retry and cron closes plus run-timeout retry;
+rollback when a successor key already exists; refusal when SQL has moved the current pointer;
+and an oversized pair whose close and successor each fit separately. The large fixture keeps input,
+memo and header below their payload limits and history below its per-transition limit. Its combined
+write set repeats the memo in successor state and projection. The offline property separately checks
+that runtime size fallback reaches the successor lane while the node drains.
+
+The missing-successor-write control must fail the first part. The skipped-pointer-condition control
+must fail the third part. No live success is implied by compilation or the URL-unset early return.

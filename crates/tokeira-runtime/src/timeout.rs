@@ -23,6 +23,8 @@ use tokeira_kernel::{Command, RetryState, WorkflowExecutionTimedOutRequest, Work
 use tokeira_types::{RunKey, ShardId};
 use tokio_util::sync::CancellationToken;
 
+use crate::successor::SuccessorPlan;
+
 use crate::{
     lane::LaneHandle, metrics as runtime_metrics, scanner::pick_lane_for_run_key, shard::ShardOwner,
 };
@@ -296,8 +298,7 @@ pub(crate) async fn submit_workflow_timeout<R: tokeira_storage::RunRepository + 
     let lane = pick_lane_for_run_key(&lanes, lane_count, entry.run_key).clone();
     // A RUN timeout with retry attempts remaining continues
     // the retry chain: the close carries the successor run
-    // id and the successor starts as a derived effect of
-    // the committed close (retryWorkflow on run-timeout,
+    // id and commits with its successor (retryWorkflow on run-timeout,
     // timer_queue_active_task_executor.go:713-796 @
     // v1.31.0). Execution timeouts never retry — the
     // chain's own deadline has passed.
@@ -358,7 +359,40 @@ pub(crate) async fn submit_workflow_timeout<R: tokeira_storage::RunRepository + 
         .as_ref()
         .map(|(_, _, run_id)| *run_id)
         .or_else(|| cron_successor.as_ref().map(|(_, _, _, run_id)| *run_id));
-    lane.submit(
+    let successor_plan = if let Some((state, _, _)) = &retry_successor {
+        let events = repo.read_history(entry.run_key, 0, 1).await?;
+        let (input, started_versioning_info) = match events.first().map(|event| &event.kind) {
+            Some(tokeira_kernel::HistoryEventKind::WorkflowExecutionStarted {
+                input,
+                versioning_info,
+                ..
+            })
+            | Some(tokeira_kernel::HistoryEventKind::WorkflowExecutionStartedV2 {
+                input,
+                versioning_info,
+                ..
+            }) => (input.clone(), versioning_info.clone().map(Box::new)),
+            _ => (tokeira_types::Payloads::default(), None),
+        };
+        Some(SuccessorPlan::Retry {
+            input,
+            started_versioning_info,
+            timeout_prior_outcome: Some((state.close_failure.clone(), state.close_result.clone())),
+        })
+    } else {
+        cron_successor
+            .as_ref()
+            .map(|(_, cron, input, _)| SuccessorPlan::Cron {
+                schedule: cron.clone(),
+                input: input.clone(),
+                timeout: true,
+                // Preserve the schedule's phase rather than introducing scanner jitter.
+                now: entry.started_at
+                    + entry.workflow_start_delay.unwrap_or(Duration::ZERO)
+                    + entry.workflow_run_timeout.unwrap_or(Duration::ZERO),
+            })
+    };
+    lane.submit_with_successor(
         entry.run_key,
         Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
             timeout_type: match violation {
@@ -378,164 +412,8 @@ pub(crate) async fn submit_workflow_timeout<R: tokeira_storage::RunRepository + 
             new_execution_run_id,
             now,
         }),
+        successor_plan,
     )
     .await?;
-    if let Some((state, policy, new_run_id)) = retry_successor {
-        start_timeout_retry_successor(
-            repo,
-            &lanes,
-            lane_count,
-            entry.run_key,
-            state,
-            policy,
-            new_run_id,
-        )
-        .await;
-    } else if let Some((state, cron, input, new_run_id)) = cron_successor {
-        // Anchor the cron continuation on the precise run-timeout
-        // deadline (execution start + run timeout) rather than the
-        // periodic scan instant, so the next fire lands on the
-        // schedule's phase free of up-to-`scan_interval` jitter.
-        let run_timeout_deadline = entry.started_at
-            + entry.workflow_start_delay.unwrap_or(Duration::ZERO)
-            + entry.workflow_run_timeout.unwrap_or(Duration::ZERO);
-        start_timeout_cron_successor(
-            &lanes,
-            lane_count,
-            state,
-            cron,
-            input,
-            new_run_id,
-            run_timeout_deadline,
-        )
-        .await;
-    }
     Ok(())
-}
-
-/// Start the retry successor after a run-timeout close committed — the same
-/// derived-effect posture as the WFT-completion failure path (`Req 2.2`): the
-/// close stands even if the successor start fails, and a re-driven close
-/// dedupes on the deterministic request id.
-#[allow(clippy::too_many_arguments)]
-async fn start_timeout_retry_successor<R: tokeira_storage::RunRepository + 'static>(
-    repo: Arc<R>,
-    lanes: &[LaneHandle],
-    lane_count: usize,
-    predecessor_run_key: RunKey,
-    state: tokeira_kernel::WorkflowState,
-    policy: tokeira_types::RetryPolicy,
-    new_run_id: tokeira_types::RunId,
-) {
-    let (input, started_versioning_info) = match repo
-        .read_history(predecessor_run_key, 0, 1)
-        .await
-        .ok()
-        .and_then(|events| events.first().map(|event| event.kind.clone()))
-    {
-        Some(tokeira_kernel::HistoryEventKind::WorkflowExecutionStarted {
-            input,
-            versioning_info,
-            ..
-        })
-        | Some(tokeira_kernel::HistoryEventKind::WorkflowExecutionStartedV2 {
-            input,
-            versioning_info,
-            ..
-        }) => (input, versioning_info),
-        _ => (tokeira_types::Payloads::default(), None),
-    };
-    let start_request = crate::runtime::workflow_task::build_retry_successor_start(
-        &state,
-        started_versioning_info.as_ref(),
-        &policy,
-        input,
-        new_run_id,
-    );
-    let successor_run_key = start_request.run_key;
-    let successor_lane = pick_lane_for_run_key(lanes, lane_count, successor_run_key).clone();
-    match successor_lane
-        .submit(successor_run_key, Command::Start(start_request))
-        .await
-    {
-        // The lane installs timeout tracking before replying. Installing again
-        // here could overwrite recovery performed after this awaited reply.
-        Ok(
-            tokeira_storage::CommitResult::Applied { .. }
-            | tokeira_storage::CommitResult::Duplicate,
-        ) => {}
-        Ok(other) => {
-            tracing::warn!(
-                ?other,
-                predecessor_run_key = ?predecessor_run_key,
-                "timeout retry successor start not applied"
-            );
-        }
-        Err(error) => {
-            tracing::warn!(
-                ?error,
-                predecessor_run_key = ?predecessor_run_key,
-                "failed to start timeout retry successor"
-            );
-        }
-    }
-}
-
-/// Start the cron successor after a cron run's RUN timeout committed — the same
-/// derived-effect posture as the retry successor: the close stands even if the
-/// successor start fails, and a re-driven close dedupes on the deterministic
-/// `cron-timeout:*` request id.
-#[allow(clippy::too_many_arguments)]
-async fn start_timeout_cron_successor(
-    lanes: &[LaneHandle],
-    lane_count: usize,
-    state: tokeira_kernel::WorkflowState,
-    cron_schedule: String,
-    input: tokeira_types::Payloads,
-    new_run_id: tokeira_types::RunId,
-    now: OffsetDateTime,
-) {
-    let start_request = match crate::runtime::workflow_task::build_cron_successor_start(
-        &state,
-        cron_schedule,
-        input,
-        new_run_id,
-        now,
-        now,
-        Some(crate::runtime::workflow_task::workflow_run_timeout_failure()),
-        state.last_completion_result.clone(),
-    ) {
-        Ok(request) => request,
-        Err(error) => {
-            tracing::warn!(?error, run_id = ?state.run_id, "invalid cron schedule on timeout continuation");
-            return;
-        }
-    };
-    let successor_run_key = start_request.run_key;
-    let successor_lane = pick_lane_for_run_key(lanes, lane_count, successor_run_key).clone();
-    match successor_lane
-        .submit(successor_run_key, Command::Start(start_request))
-        .await
-    {
-        // The lane installs timeout tracking before replying. Installing again
-        // here could overwrite recovery performed after this awaited reply.
-        Ok(
-            tokeira_storage::CommitResult::Applied { .. }
-            | tokeira_storage::CommitResult::Duplicate,
-        ) => {}
-        Ok(other) => {
-            tracing::warn!(
-                ?other,
-                ?new_run_id,
-                "timeout cron successor start not applied"
-            );
-        }
-        Err(error) => {
-            tracing::warn!(
-                ?error,
-                ?new_run_id,
-                "failed to start timeout cron successor"
-            );
-        }
-    }
 }

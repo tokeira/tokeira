@@ -2,13 +2,13 @@
 
 ## Overview
 
-This design wires the runtime's lane post-commit path to detect when a run closes with `ExecutionStatus::ContinuedAsNew`, extract the successor parameters from the `WorkflowExecutionContinuedAsNew` history event, and issue a `Command::Start` for the successor run. It also completes the chain-aware execution timeout story deferred by Feature 5 (Workflow Timeouts) by propagating `first_run_started_at` through the `StartRequest`, `WorkflowState`, and `WorkflowTimeoutTrackingState`.
+This design wires the runtime's lane to detect when a run closes with `ExecutionStatus::ContinuedAsNew`, extract the successor parameters from the `WorkflowExecutionContinuedAsNew` history event, and apply a `Command::Start` for the successor run before committing both transitions together. It also completes the chain-aware execution timeout story deferred by Feature 5 (Workflow Timeouts) by propagating `first_run_started_at` through the `StartRequest`, `WorkflowState`, and `WorkflowTimeoutTrackingState`.
 
-The kernel already handles the authoritative close: `WorkflowCommand::ContinueAsNew` emits a `WorkflowExecutionContinuedAsNew` history event carrying the successor's `new_run_id`, `workflow_type`, `task_queue`, `input`, `memo`, `search_attributes`, and timeout configuration, then closes the run with `ExecutionStatus::ContinuedAsNew` and applies parent close policy. The runtime's job is purely orchestration: detect this close, construct the successor `StartRequest`, and submit it.
+The kernel already handles the authoritative close: `WorkflowCommand::ContinueAsNew` emits a `WorkflowExecutionContinuedAsNew` history event carrying the successor's `new_run_id`, `workflow_type`, `task_queue`, `input`, `memo`, `search_attributes`, and timeout configuration, then closes the run with `ExecutionStatus::ContinuedAsNew` and applies parent close policy. The runtime's job is purely orchestration: detect this close, construct the successor `StartRequest`, apply it to `LoadedRun::Absent`, and commit the pair.
 
 The feature has three parts:
 
-1. **Successor detection and start.** The lane's post-commit path (in `run_activation`) already detects child workflow closure and delivers `ChildResolved` to the parent. A new branch detects `ExecutionStatus::ContinuedAsNew`, extracts the `WorkflowExecutionContinuedAsNew` event from the committed transition's `history_events`, constructs a `StartRequest`, and submits it via `publisher.submit_to_run`. This is fire-and-forget — successor start failure does not affect the predecessor's committed close.
+1. **Successor detection and start.** Before committing the close, the lane detects `ExecutionStatus::ContinuedAsNew`, extracts the `WorkflowExecutionContinuedAsNew` event from the transition's `history_events`, constructs a `StartRequest`, and applies it to `LoadedRun::Absent`. The close and successor commit together under the close's fence. The close's post-commit work runs first, then the successor's tracking and dispatch, then the reply. Only a storage size refusal permits committing the close alone and spawning the built start through `publisher.submit_to_run`, past drain admission.
 
 2. **Chain identity propagation.** The successor's `StartRequest` carries `continued_execution_run_id` (the predecessor's `run_id`) and `first_execution_run_id` (the very first run in the chain). If the predecessor already has a `first_execution_run_id`, it is forwarded; otherwise the predecessor's `run_id` becomes the chain origin.
 
@@ -25,17 +25,22 @@ flowchart TD
         EVENT -->|kernel closes run| CLOSE[ExecutionStatus::ContinuedAsNew<br/>+ parent close policy]
     end
 
-    subgraph "Lane Post-Commit Detection"
-        CLOSE -->|committed transition| DETECT[Lane detects<br/>status == ContinuedAsNew]
+    subgraph "Lane Pre-Commit Detection"
+        CLOSE -->|uncommitted transition| DETECT[Lane detects<br/>status == ContinuedAsNew]
         DETECT -->|extract event| EXTRACT[Extract ContinuedAsNew event<br/>from history_events]
         EXTRACT -->|build StartRequest| BUILD[Construct successor StartRequest<br/>with chain identity + timeout fields]
     end
 
     subgraph "Successor Start"
-        BUILD -->|submit_to_run| START[Command::Start<br/>→ successor lane]
-        START -->|Applied| TRACK[Insert WorkflowTimeoutEntry<br/>if timeout configured]
-        START -->|Duplicate| OK[Treat as success]
-        START -->|Error| LOG[Log error at error level<br/>predecessor unaffected]
+        BUILD -->|apply to LoadedRun::Absent| START[Command::Start]
+        START -->|accepted| PAIR[Commit close + successor<br/>with one fence]
+        START -->|rejected| REJECT[Fail close<br/>neither run committed]
+        PAIR -->|Applied| EFFECTS[Close post-commit work]
+        EFFECTS --> TRACK[Successor tracking + dispatch<br/>then reply]
+        PAIR -->|size refusal only| FALLBACK[Commit close alone]
+        FALLBACK -->|Applied| SPAWN[Spawn built start to successor lane<br/>past drain admission]
+        SPAWN -->|Applied| TRACK
+        SPAWN -->|Duplicate or Error| LOG[Log failure at error level<br/>committed predecessor unaffected]
     end
 
     subgraph "Chain-Aware Timeout"
@@ -45,15 +50,17 @@ flowchart TD
 
 ### Key design decisions
 
-**Detection in the lane post-commit path.** The lane's `run_activation` already has a post-commit hook that checks `new_state.closed_at.is_some()` for child resolution delivery and workflow timeout tracking cleanup. Continue-as-new detection is added as a new branch in this same path, checking `new_state.status == ExecutionStatus::ContinuedAsNew`. This keeps all post-commit orchestration in one place.
+**Detection before the pair commit.** The lane detects `new_state.status == ExecutionStatus::ContinuedAsNew` after the kernel applies the close, before either run commits. The existing post-commit path still handles child resolution and predecessor timeout cleanup; successor tracking and dispatch follow that work.
 
-**Event extraction from committed transition's history_events.** The `WorkflowExecutionContinuedAsNew` event carries all successor parameters (`new_run_id`, `workflow_type`, `task_queue`, `input`, `memo`, `search_attributes`, timeout config). The lane has access to the committed transition's `history_events` (via the `Transition` struct returned from `handle_message`). The detection code scans `history_events` for the `WorkflowExecutionContinuedAsNew` variant and extracts the fields. If the status is `ContinuedAsNew` but no matching event is found, this is an anomaly logged at error level.
+**Event extraction from the transition's history_events.** The `WorkflowExecutionContinuedAsNew` event carries all successor parameters (`new_run_id`, `workflow_type`, `task_queue`, `input`, `memo`, `search_attributes`, timeout config). The lane scans these uncommitted events and builds the successor with the same field mappings. If the status is `ContinuedAsNew` but no matching event is found, this is an anomaly logged at error level.
 
-**Successor start via `publisher.submit_to_run`.** The `DispatchPublisher::submit_to_run` method (added in Feature 6) submits a command to a specific run's lane. The successor's `RunKey` is freshly generated, so it routes to a lane determined by `hash(successor_run_key) mod lane_count`. This is the same mechanism used for child resolution delivery.
+**Apply and commit together.** The lane applies the built start to `LoadedRun::Absent`. A rejected start fails the close without committing either run, matching `service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:1029-1039,1354-1369 @ v1.31.0`. Storage commits both transitions under the close's fence, as `common/persistence/sql/execution.go:401-439 @ v1.31.0` does. A conflict retries the close and successor together with the same successor identity. See [atomic-successors](../atomic-successors/design.md) for the pair checks and rollback contract.
 
-**Fire-and-forget with bounded retries.** The successor start is submitted through the lane, which already has OCC retry logic (`max_occ_retries`). The lane's `handle_message` retries OCC conflicts internally and surfaces exhaustion as `Err`. It does not return `CommitResult::Conflict` to callers — only `Applied`, `Duplicate`, or `Err`. If the start fails after retry exhaustion, the error is logged at error level. The predecessor's committed close is not affected. The sweeper (Feature 11) can reconcile orphaned continue-as-new chains.
+**Only the size fallback uses `publisher.submit_to_run`.** An explicit storage size refusal writes nothing. The lane then commits the close alone and, only if it applies, spawns the already-built successor start to its own lane, past drain admission. The spawned submission avoids waiting on another command in the closing lane.
 
-**No duplicate-as-success path.** The current storage contract returns `CommitResult::Duplicate` only for request-dedupe collisions, not for "successor already exists." A retried continue-as-new start uses a fresh `RunKey` and would not normally hit `Duplicate`. All non-`Applied` outcomes (`Err` from retry exhaustion, `Duplicate` from unexpected dedupe collision) are treated as failures and logged at error level.
+**Fallback failure handling with bounded retries.** The separate start uses the successor lane's OCC retry logic (`max_occ_retries`). The lane retries conflicts internally and surfaces exhaustion as `Err`. Failure is logged at error level and does not affect the predecessor's committed close. Other pair errors fail the close; they do not select this fallback.
+
+**No duplicate-as-success path in the size fallback.** The storage contract returns `CommitResult::Duplicate` for request-dedupe collisions, not proof that the successor exists. All non-`Applied` fallback outcomes, including `Duplicate`, are treated as failures and logged at error level.
 
 **`first_run_started_at` as a kernel-level field.** Adding `first_run_started_at` to `StartRequest` and `WorkflowState` makes the chain origin timestamp durable and available to any component that reads the workflow state. The kernel's `apply_start` populates `WorkflowState.first_run_started_at` from `StartRequest.first_run_started_at`. For the first run in a chain (no continue-as-new predecessor), this field is `None`.
 
@@ -168,180 +175,164 @@ self.workflow_timeout_tracking.insert(WorkflowTimeoutEntry {
 });
 ```
 
-### Lane post-commit: continue-as-new detection
+### Lane pre-commit: continue-as-new detection
 
-In `run_activation`, after the existing child resolution and timeout tracking cleanup, a new branch handles continue-as-new:
+After the kernel applies the close, the lane extracts the event and builds the successor before calling storage. The field construction is unchanged; the built successor identity is retained across conflict retries.
 
 ```rust
-// In run_activation, after successful commit:
-if let CommitResult::Applied { new_state } = &commit_result {
-    if new_state.closed_at.is_some() {
-        workflow_timeout_tracking.remove(message.run_key);
-
-        // Existing: child resolution delivery
-        if let Some(parent_run_key) = new_state.parent_run_key {
-            // ... existing child resolution code ...
+let new_state = &transition.next_state;
+if new_state.status == ExecutionStatus::ContinuedAsNew {
+    let maybe_event = transition.history_events.iter().find_map(|e| {
+        match &e.kind {
+            HistoryEventKind::WorkflowExecutionContinuedAsNew {
+                new_run_id,
+                workflow_type,
+                task_queue,
+                input,
+                memo,
+                search_attributes,
+                workflow_execution_timeout,
+                workflow_run_timeout,
+                workflow_task_timeout,
+            } => Some((
+                new_run_id.clone(),
+                workflow_type.clone(),
+                task_queue.clone(),
+                input.clone(),
+                memo.clone(),
+                search_attributes.clone(),
+                *workflow_execution_timeout,
+                *workflow_run_timeout,
+                *workflow_task_timeout,
+            )),
+            _ => None,
         }
+    });
 
-        // New: continue-as-new successor creation
-        if new_state.status == ExecutionStatus::ContinuedAsNew {
-            let maybe_event = transition.history_events.iter().find_map(|e| {
-                match &e.kind {
-                    HistoryEventKind::WorkflowExecutionContinuedAsNew {
-                        new_run_id,
-                        workflow_type,
-                        task_queue,
-                        input,
-                        memo,
-                        search_attributes,
-                        workflow_execution_timeout,
-                        workflow_run_timeout,
-                        workflow_task_timeout,
-                    } => Some((
-                        new_run_id.clone(),
-                        workflow_type.clone(),
-                        task_queue.clone(),
-                        input.clone(),
-                        memo.clone(),
-                        search_attributes.clone(),
-                        *workflow_execution_timeout,
-                        *workflow_run_timeout,
-                        *workflow_task_timeout,
+    match maybe_event {
+        Some((
+            new_run_id,
+            workflow_type,
+            task_queue,
+            input,
+            memo,
+            search_attributes,
+            workflow_execution_timeout,
+            workflow_run_timeout,
+            workflow_task_timeout,
+        )) => {
+            let successor_run_key = RunKey::new();
+            let first_execution_run_id = new_state
+                .first_execution_run_id
+                .unwrap_or(new_state.run_id);
+            let first_run_started_at = Some(
+                new_state
+                    .first_run_started_at
+                    .unwrap_or(new_state.started_at),
+            );
+
+            let start_request = StartRequest {
+                run_key: successor_run_key,
+                namespace_id: new_state.namespace_id,
+                workflow_id: new_state.workflow_id.clone(),
+                run_id: new_run_id,
+                workflow_type,
+                task_queue,
+                input,
+                memo,
+                search_attributes,
+                workflow_execution_timeout,
+                workflow_run_timeout,
+                workflow_task_timeout,
+                retry_policy: new_state.retry_policy.clone(),
+                attempt: 1,
+                continued_execution_run_id: Some(new_state.run_id),
+                first_execution_run_id: Some(first_execution_run_id),
+                parent_run_key: None,
+                parent_workflow_id: None,
+                first_run_started_at,
+                request: RequestContext {
+                    request_id: RequestId(format!(
+                        "continue-as-new-{:?}",
+                        message.run_key
                     )),
-                    _ => None,
-                }
-            });
+                    caller_identity: Some(
+                        "runtime-continue-as-new-orchestrator"
+                            .to_string(),
+                    ),
+                    received_at: OffsetDateTime::now_utc(),
+                },
+                now: OffsetDateTime::now_utc(),
+            };
 
-            match maybe_event {
-                Some((
-                    new_run_id,
-                    workflow_type,
-                    task_queue,
-                    input,
-                    memo,
-                    search_attributes,
-                    workflow_execution_timeout,
-                    workflow_run_timeout,
-                    workflow_task_timeout,
-                )) => {
-                    let successor_run_key = RunKey::new();
-                    let first_execution_run_id = new_state
-                        .first_execution_run_id
-                        .unwrap_or(new_state.run_id);
-                    let first_run_started_at = Some(
-                        new_state
-                            .first_run_started_at
-                            .unwrap_or(new_state.started_at),
-                    );
-
-                    let start_request = StartRequest {
-                        run_key: successor_run_key,
-                        namespace_id: new_state.namespace_id,
-                        workflow_id: new_state.workflow_id.clone(),
-                        run_id: new_run_id,
-                        workflow_type,
-                        task_queue,
-                        input,
-                        memo,
-                        search_attributes,
-                        workflow_execution_timeout,
-                        workflow_run_timeout,
-                        workflow_task_timeout,
-                        retry_policy: new_state.retry_policy.clone(),
-                        attempt: 1,
-                        continued_execution_run_id: Some(new_state.run_id),
-                        first_execution_run_id: Some(first_execution_run_id),
-                        parent_run_key: None,
-                        parent_workflow_id: None,
-                        first_run_started_at,
-                        request: RequestContext {
-                            request_id: RequestId(format!(
-                                "continue-as-new-{:?}",
-                                message.run_key
-                            )),
-                            caller_identity: Some(
-                                "runtime-continue-as-new-orchestrator"
-                                    .to_string(),
-                            ),
-                            received_at: OffsetDateTime::now_utc(),
-                        },
-                        now: OffsetDateTime::now_utc(),
-                    };
-
-                    let command = Command::Start(start_request.clone());
-                    match publisher
-                        .submit_to_run(successor_run_key, command)
-                        .await
-                    {
-                        Ok(CommitResult::Applied { new_state: successor_state }) => {
-                            // Insert timeout tracking using committed state
-                            if start_request.workflow_execution_timeout.is_some()
-                                || start_request.workflow_run_timeout.is_some()
-                            {
-                                workflow_timeout_tracking.insert(
-                                    WorkflowTimeoutEntry {
-                                        run_key: successor_run_key,
-                                        workflow_execution_timeout: start_request
-                                            .workflow_execution_timeout,
-                                        workflow_run_timeout: start_request
-                                            .workflow_run_timeout,
-                                        started_at: successor_state.started_at,
-                                        first_run_started_at: successor_state
-                                            .first_run_started_at,
-                                        has_retry_policy: successor_state
-                                            .retry_policy
-                                            .is_some(),
-                                    },
-                                );
-                            }
-                        }
-                        Ok(CommitResult::Duplicate) => {
-                            // Unexpected: request-dedupe collision with fresh RunKey.
-                            // Treat as failure — sweeper will reconcile.
-                            tracing::error!(
-                                predecessor_run_key = ?message.run_key,
-                                successor_run_key = ?successor_run_key,
-                                "continue-as-new successor start returned Duplicate (unexpected)"
-                            );
-                        }
-                        Ok(CommitResult::Conflict { reason }) => {
-                            // Note: the lane retries OCC conflicts internally.
-                            // This branch should not be reached in practice.
-                            tracing::error!(
-                                predecessor_run_key = ?message.run_key,
-                                workflow_id = ?new_state.workflow_id,
-                                predecessor_run_id = ?new_state.run_id,
-                                successor_run_key = ?successor_run_key,
-                                reason,
-                                "continue-as-new successor start conflict"
-                            );
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                ?error,
-                                predecessor_run_key = ?message.run_key,
-                                workflow_id = ?new_state.workflow_id,
-                                predecessor_run_id = ?new_state.run_id,
-                                successor_run_key = ?successor_run_key,
-                                "continue-as-new successor start failed"
-                            );
-                        }
-                    }
-                }
-                None => {
-                    tracing::error!(
-                        run_key = ?message.run_key,
-                        workflow_id = ?new_state.workflow_id,
-                        "ContinuedAsNew status but no WorkflowExecutionContinuedAsNew event found"
-                    );
-                }
-            }
+            Some(start_request)
+        }
+        None => {
+            tracing::error!(
+                run_key = ?message.run_key,
+                workflow_id = ?new_state.workflow_id,
+                "ContinuedAsNew status but no WorkflowExecutionContinuedAsNew event found"
+            );
+            None
         }
     }
+} else {
+    None
 }
 ```
 
-Note: the lane needs access to the committed transition's `history_events` in the post-commit path. Currently `handle_message` returns `(CommitResult, SmallVec<[DispatchOp; 4]>)`. This must be extended to also return the `history_events` from the committed transition so the post-commit code can extract the `ContinuedAsNew` event. The simplest approach is to return the full `SmallVec<[HistoryEvent; 8]>` alongside the dispatch ops.
+The lane applies that start to `LoadedRun::Absent` before the pair commit. Rejection returns an error without writing the close:
+
+```rust
+let successor = kernel
+    .apply(LoadedRun::Absent, Command::Start(start_request.clone()))
+    .map_err(|reject| anyhow::Error::new(KernelRejected(reject)))?;
+let result = repo
+    .commit_transition_pair(
+        message.run_key,
+        transition.clone(),
+        start_request.run_key,
+        successor,
+        fence.clone(),
+    )
+    .await?;
+```
+
+On `PairCommitResult::Applied`, the lane performs the close's post-commit work, then the successor's tracking and dispatch, then replies. The successor's timeout tracking still uses its committed state:
+
+```rust
+if start_request.workflow_execution_timeout.is_some()
+    || start_request.workflow_run_timeout.is_some()
+{
+    workflow_timeout_tracking.insert(WorkflowTimeoutEntry {
+        run_key: successor_run_key,
+        workflow_execution_timeout: start_request.workflow_execution_timeout,
+        workflow_run_timeout: start_request.workflow_run_timeout,
+        started_at: successor_state.started_at,
+        first_run_started_at: successor_state.first_run_started_at,
+        has_retry_policy: successor_state.retry_policy.is_some(),
+    });
+}
+```
+
+A conflict retries both transitions together; a duplicate close is answered as before without writing a second successor. Only `PairCommitResult::SizeRefused` takes the fallback: commit the close alone, and only on `Applied` spawn the built start through `publisher.submit_to_run`. That start's lane installs its tracking and publishes its dispatch after its own commit. Its failure leaves the committed close unchanged:
+
+```rust
+// Spawned only after the size fallback's close has applied.
+let result = publisher
+    .submit_to_run(successor_run_key, Command::Start(start_request))
+    .await;
+if !matches!(result, Ok(CommitResult::Applied { .. })) {
+    tracing::error!(
+        ?result,
+        ?predecessor_run_key,
+        ?successor_run_key,
+        "size-fallback successor start failed"
+    );
+}
+```
+
+The lane retains both transitions' history and dispatch effects through the commit. The close's effects run first and the committed successor's effects follow; only the size fallback carries a deferred start instead.
 
 ### Modified handle_message return type
 
@@ -355,7 +346,7 @@ async fn handle_message<K, R>(
 ) -> Result<(CommitResult, SmallVec<[DispatchOp; 4]>, SmallVec<[HistoryEvent; 8]>)>
 ```
 
-The history events are captured from the transition before commit and returned alongside the dispatch ops. The lane's `run_activation` uses them for continue-as-new event extraction.
+The history events are captured from the transition before commit and returned alongside the dispatch ops. Successor event extraction now happens before the commit. The lane also carries the committed successor's state, history and dispatch, or the size fallback's deferred start, into `run_activation` for post-commit work.
 
 
 ## Data Models
@@ -370,7 +361,7 @@ The history events are captured from the transition before commit and returned a
 | `WorkflowTimeoutEntry` | `tokeira-runtime` | Add `first_run_started_at: Option<OffsetDateTime>` |
 | `evaluate_workflow_timeout` | `tokeira-runtime` | Use `first_run_started_at.unwrap_or(started_at)` for execution timeout |
 | `handle_message` return type | `tokeira-runtime` | Return `SmallVec<[HistoryEvent; 8]>` alongside dispatch ops |
-| `run_activation` | `tokeira-runtime` | Add continue-as-new detection branch in post-commit path |
+| `run_activation` | `tokeira-runtime` | Apply successor post-commit effects after the close's; spawn a separate start only for the size fallback |
 | `start_workflow` | `tokeira-runtime` | Pass `first_run_started_at` to `WorkflowTimeoutEntry` |
 
 ### New types
@@ -398,8 +389,7 @@ Predecessor WFT Completed with ContinueAsNew command
   → Kernel emits WorkflowExecutionContinuedAsNew history event
   → Kernel closes run with ExecutionStatus::ContinuedAsNew
   → Kernel applies parent close policy
-  → Lane commits predecessor transition
-  → Lane post-commit detects: status == ContinuedAsNew
+  → Lane detects before commit: status == ContinuedAsNew
   → Lane extracts ContinuedAsNew event from history_events
   → Lane constructs successor StartRequest:
       - run_key: fresh RunKey
@@ -417,10 +407,15 @@ Predecessor WFT Completed with ContinueAsNew command
                                or predecessor's started_at
       - parent_run_key: None
       - parent_workflow_id: None
-  → publisher.submit_to_run(successor_run_key, Command::Start)
-  → On Applied: insert WorkflowTimeoutEntry if timeout configured
-  → On Duplicate: treat as success
-  → On Error: log at error level, predecessor unaffected
+  → Lane applies Command::Start to LoadedRun::Absent
+  → On rejection: fail close, neither run committed
+  → Lane commits close and successor with one fence
+  → On Applied: close's post-commit work, successor tracking and dispatch, then reply
+  → On conflict: retry both with the same successor identity
+  → On size refusal only: commit close alone
+      → If Applied: spawn publisher.submit_to_run with the built start, past drain admission
+      → On fallback Applied: successor lane installs tracking and publishes dispatch
+      → On fallback Duplicate or error: log failure at error level, predecessor unaffected
 ```
 
 ### Data flow: Chain-aware execution timeout
@@ -481,15 +476,15 @@ Successor run starts with first_run_started_at = Some(T0)
 
 **Validates: Requirements 4.2**
 
-### Property 5: Predecessor unaffected by successor outcome
+### Property 5: Atomic successor with a size-only fallback
 
-*For any* predecessor run that closes with `ContinuedAsNew`, and any outcome of the successor `Command::Start` (success, conflict, duplicate, error), the predecessor's committed `CommitResult::Applied` shall be returned to the caller before the successor start is attempted. No commands shall be submitted to the predecessor's `RunKey` as a result of successor start failure.
+*For any* predecessor run that closes with `ContinuedAsNew`, the successor shall be built and applied before either run commits, and both transitions shall commit together. A rejected successor shall fail the close without committing either run. Only a storage size refusal shall permit committing the close alone and spawning the built start; any failure of that fallback start, including `Duplicate`, shall be logged at error level and shall not reopen or modify the committed predecessor.
 
 **Validates: Requirements 5.3, 6.2**
 
 ### Property 6: Successor timeout tracking entry
 
-*For any* successor `StartRequest` with a non-None `workflow_execution_timeout` or `workflow_run_timeout`, when the successor `Command::Start` returns `CommitResult::Applied`, the `WorkflowTimeoutTrackingState` shall contain an entry for the successor's `RunKey` with:
+*For any* successor `StartRequest` with a non-None `workflow_execution_timeout` or `workflow_run_timeout`, when the pair commits, the lane shall install tracking after the close's post-commit work and before replying. When the size fallback's start commits, its lane shall install the same tracking. The `WorkflowTimeoutTrackingState` shall contain an entry for the successor's `RunKey` with:
 - `workflow_execution_timeout` and `workflow_run_timeout` matching the `StartRequest`
 - `started_at` equal to the `StartRequest`'s `now`
 - `first_run_started_at` equal to the `StartRequest`'s `first_run_started_at`
@@ -503,19 +498,19 @@ When the `StartRequest` has neither `workflow_execution_timeout` nor `workflow_r
 
 ### Successor start failure
 
-If the successor `Command::Start` fails for any reason (storage error, lane channel closed, OCC exhaustion after bounded retries), the error is logged at `error` level with the predecessor's `run_key`, `workflow_id`, `run_id`, the successor's `new_run_id`, and the error details. The predecessor's committed close is not affected. The sweeper (Feature 11) can reconcile orphaned continue-as-new chains by scanning for runs closed with `ContinuedAsNew` whose successor does not exist.
+If the kernel rejects the successor's `Command::Start`, the close's command fails with that rejection and neither run commits. A pair storage error fails the close, and conflicts retry both transitions together within the bounded OCC retry mechanism. Only a size refusal permits the separate start. If that fallback start fails (storage error, lane channel closed, OCC exhaustion), the failure is logged at `error` level with the predecessor's `run_key`, `workflow_id`, `run_id`, the successor's `new_run_id`, and the error details; the committed predecessor is not modified.
 
 ### Duplicate successor start
 
-If `submit_to_run` returns `CommitResult::Duplicate`, this is unexpected — the current storage contract returns `Duplicate` only for request-dedupe collisions, and a retried continue-as-new start uses a fresh `RunKey`. This is logged at `error` level. The sweeper (Feature 11) can reconcile.
+If the size fallback's `submit_to_run` returns `CommitResult::Duplicate`, this is a failure — the current storage contract returns `Duplicate` only for request-dedupe collisions, and a retried continue-as-new start uses a fresh `RunKey`. This is logged at `error` level. The sweeper (Feature 11) can reconcile.
 
 ### Missing ContinuedAsNew event
 
 If the committed transition has `ExecutionStatus::ContinuedAsNew` but no `WorkflowExecutionContinuedAsNew` event is found in `history_events`, this is an internal consistency anomaly. It is logged at `error` level and successor creation is skipped. This should never happen in normal operation because the kernel always emits the event before setting the status.
 
-### Successor start does not block predecessor reply
+### Successor commit and predecessor reply
 
-The predecessor's `CommitResult::Applied` is returned to the caller (the lane message's `reply_tx`) before the successor start is attempted. The successor start happens in the post-commit path, after the reply is sent. This ensures the predecessor's workflow task completion is not delayed by successor creation.
+Normally, the pair commits and the close's post-commit work runs, followed by the successor's tracking and dispatch, before replying through the lane message's `reply_tx`. Only the size fallback submits a separate start in a spawned task after the close applies; the reply does not wait for that start. A fallback start failure cannot change the committed close's result.
 
 ### Predecessor timeout tracking cleanup
 
@@ -547,17 +542,17 @@ Each correctness property MUST be implemented by a SINGLE property-based test.
 
 **Property 4 (apply_start populates first_run_started_at):** A generator produces random `StartRequest` values with random `first_run_started_at` (including `None`). The test calls `BasicKernel::apply_start` and verifies the resulting `WorkflowState.first_run_started_at` equals the request's value.
 
-**Property 5 (Predecessor unaffected by successor outcome):** A generator produces random predecessor states and random successor start outcomes (success, conflict, duplicate, error). A mock publisher is configured to return the generated outcome. The test verifies the predecessor's `CommitResult::Applied` is returned to the caller regardless of the successor outcome, and no commands are submitted to the predecessor's `RunKey` after the close.
+**Property 5 (Atomic successor with a size-only fallback):** Generate predecessor states and successor outcomes. Verify that accepted starts commit with the close and rejected starts leave both uncommitted. With an explicit size refusal, verify that the close applies before the separate start and that failed fallback outcomes, including `Duplicate`, are logged without modifying the committed predecessor.
 
-**Property 6 (Successor timeout tracking entry):** A generator produces random successor `StartRequest` values with random timeout configurations (including `None` for both timeouts). A mock `WorkflowTimeoutTrackingState` captures insertions. The test verifies: when either timeout is configured, an entry is inserted with matching fields; when neither is configured, no entry is inserted.
+**Property 6 (Successor timeout tracking entry):** A generator produces random successor `StartRequest` values with random timeout configurations (including `None` for both timeouts). A mock `WorkflowTimeoutTrackingState` captures insertions. After a pair commit, verify that tracking follows the close's post-commit work and precedes the reply; after a size-fallback start commit, verify the same entry is installed by the successor lane. When either timeout is configured, the entry has matching fields; when neither is configured, no entry is inserted.
 
 ### Unit tests
 
 Unit tests complement property tests for specific examples and edge cases:
 
 - **Missing ContinuedAsNew event:** Verify that when status is `ContinuedAsNew` but no matching event exists in `history_events`, no successor start is attempted and the anomaly is handled gracefully.
-- **Duplicate successor start:** Verify that `CommitResult::Duplicate` from the successor lane is treated as success (no error logged).
-- **Successor start conflict:** Verify that `CommitResult::Conflict` is logged at error level with all required context fields.
+- **Duplicate successor start:** Verify that `CommitResult::Duplicate` from the size fallback's successor lane is treated as a failure and logged at error level.
+- **Successor start conflict:** Verify that an exhausted size-fallback start conflict is logged at error level with all required context fields.
 - **Chain identity across 3 runs:** Integration test creating a chain of 3 runs via continue-as-new, verifying `first_execution_run_id` and `first_run_started_at` are consistent across the chain.
 - **Execution timeout fires from chain origin:** Integration test starting a chain of 2 runs where the execution timeout is set to a short duration. Verify the timeout fires based on the first run's `started_at`, not the successor's.
 - **Run timeout fires from current run:** Integration test verifying run timeout uses the current run's `started_at`, not the chain origin.

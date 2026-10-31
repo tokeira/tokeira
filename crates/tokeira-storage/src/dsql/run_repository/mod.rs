@@ -81,6 +81,8 @@ macro_rules! record_dsql_commit_operation {
 }
 
 mod activity;
+#[cfg(all(test, feature = "dsql-integration"))]
+mod atomic_successors_live_tests;
 mod bulk_write;
 #[cfg(all(test, feature = "dsql-integration"))]
 mod bulk_write_tests;
@@ -95,6 +97,7 @@ mod large_value_tests;
 mod lease_fence_tests;
 mod leases;
 mod load;
+mod pair;
 mod placement;
 #[cfg(all(test, feature = "dsql-integration"))]
 mod placement_tests;
@@ -554,6 +557,17 @@ fn classify_connection_error(error: &anyhow::Error) -> Option<&'static str> {
 
 #[async_trait]
 impl RunRepository for DsqlRunRepository {
+    async fn commit_transition_pair(
+        &self,
+        run_key: RunKey,
+        closing: Transition,
+        successor_run_key: RunKey,
+        successor: Transition,
+        fence: WriteFence,
+    ) -> Result<crate::PairCommitResult> {
+        self.do_commit_transition_pair(run_key, closing, successor_run_key, successor, fence)
+            .await
+    }
     fn placement_ready(&self) -> bool {
         self.placement_ready
             .load(std::sync::atomic::Ordering::Acquire)
@@ -1808,6 +1822,58 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn pair_commit_future_is_no_larger_than_single_commit() {
+        let recorder = Arc::new(RecordingAcquirer::default());
+        let repo = test_repo(recorder.clone());
+        let closing = sample_transition(RunKey::new());
+        let successor = sample_transition(RunKey::new());
+        let single = repo.do_commit_transition(
+            closing.next_state.run_key,
+            closing.clone(),
+            WriteFence::Unfenced,
+        );
+        let single_bytes = std::mem::size_of_val(&single);
+        drop(single);
+        let pair = repo.do_commit_transition_pair(
+            closing.next_state.run_key,
+            closing.clone(),
+            successor.next_state.run_key,
+            successor.clone(),
+            WriteFence::Unfenced,
+        );
+        let pair_bytes = std::mem::size_of_val(&pair);
+        drop(pair);
+        assert!(
+            pair_bytes <= single_bytes,
+            "pair implementation future ({pair_bytes} bytes) exceeds single commit ({single_bytes} bytes)"
+        );
+
+        // async_trait already returns a box: measure its allocation, not the
+        // pointer. Constructing these futures must not poll or acquire a connection.
+        let single = repo.commit_transition(
+            closing.next_state.run_key,
+            closing.clone(),
+            WriteFence::Unfenced,
+        );
+        let single_bytes = std::mem::size_of_val(single.as_ref().get_ref());
+        drop(single);
+        let pair = repo.commit_transition_pair(
+            closing.next_state.run_key,
+            closing,
+            successor.next_state.run_key,
+            successor,
+            WriteFence::Unfenced,
+        );
+        let pair_bytes = std::mem::size_of_val(pair.as_ref().get_ref());
+        drop(pair);
+        assert!(
+            pair_bytes <= single_bytes,
+            "pair trait future ({pair_bytes} bytes) exceeds single commit ({single_bytes} bytes)"
+        );
+        assert!(recorder.classes().is_empty());
+    }
+
     fn fixed_now() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
     }
@@ -1988,8 +2054,8 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct TestDatabaseError {
-        code: Option<&'static str>,
+    pub(super) struct TestDatabaseError {
+        pub(super) code: Option<&'static str>,
     }
 
     impl fmt::Display for TestDatabaseError {

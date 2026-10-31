@@ -22,6 +22,7 @@
 //! writes additionally consume the transaction-local lease fence. Integrating that
 //! fence into acquisition repair remains separate from runtime admission.
 use super::*;
+use crate::successor::SuccessorPlan;
 use tokeira_observability::{
     ErrorBiasedSamplingReason, NotShardOwnerOperationLabel, mark_error_biased_sample,
 };
@@ -119,8 +120,20 @@ where
         run_key: RunKey,
         command: Command,
     ) -> Result<CommitResult> {
+        self.submit_for_owned_shard_with_successor(run_key, command, None)
+            .await
+    }
+
+    /// Submit a close and its runtime-only successor inputs under owned-home admission.
+    pub(super) async fn submit_for_owned_shard_with_successor(
+        &self,
+        run_key: RunKey,
+        command: Command,
+        successor_plan: Option<SuccessorPlan>,
+    ) -> Result<CommitResult> {
         let shard_id = self.command_home(run_key, &command).await?;
-        self.submit_for_owned_home(run_key, shard_id, command).await
+        self.submit_for_owned_home_with_successor(run_key, shard_id, command, successor_plan)
+            .await
     }
 
     /// Submit using identity already validated from the run's state. The lane
@@ -131,6 +144,17 @@ where
         run_key: RunKey,
         shard_id: ShardId,
         command: Command,
+    ) -> Result<CommitResult> {
+        self.submit_for_owned_home_with_successor(run_key, shard_id, command, None)
+            .await
+    }
+
+    async fn submit_for_owned_home_with_successor(
+        &self,
+        run_key: RunKey,
+        shard_id: ShardId,
+        command: Command,
+        successor_plan: Option<SuccessorPlan>,
     ) -> Result<CommitResult> {
         {
             let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
@@ -145,7 +169,9 @@ where
         let lane = self.pick_lane(run_key);
         let lane_id = lane_index_for_run_key(run_key, self.lanes.len());
         let started = std::time::Instant::now();
-        let result = lane.submit(run_key, command).await?;
+        let result = lane
+            .submit_with_successor(run_key, command, successor_plan)
+            .await?;
         runtime_metrics::record_lane_submit_duration(lane_id, started.elapsed());
         self.handle_post_commit(run_key, &result);
         Ok(result)

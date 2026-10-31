@@ -9,8 +9,8 @@
 //! the channel is full, such a send waits for a slot that only the lane itself
 //! can free, and the lane stops for good.
 //!
-//! When a run closes via continue-as-new, the lane is responsible for
-//! constructing and submitting the successor `StartRequest`. The successor
+//! A close and its successor are applied separately by the pure kernel, then
+//! committed together. Only a storage size refusal permits a separate start. The successor
 //! inherits the predecessor's execution chain metadata (`first_execution_run_id`,
 //! `first_run_started_at`) so the server can enforce execution-level timeouts
 //! across the entire chain, not just the current run.
@@ -34,18 +34,20 @@ use tokeira_observability::{
 use tokeira_proto::{
     conversions::common::failure_to_payload, public::temporal::api::failure::v1 as failure_proto,
 };
-use tokeira_storage::{CommitResult, RunRepository, metrics as storage_metrics};
+use tokeira_storage::{CommitResult, PairCommitResult, RunRepository, metrics as storage_metrics};
 use tokeira_types::{
-    ExecutionStatus, NamespaceId, QueueKey, RunKey, ShardEpoch, ShardId, TaskKind, WorkflowId,
-    execution_home_bundle,
+    NamespaceId, QueueKey, RunKey, ShardEpoch, ShardId, TaskKind, WorkflowId, execution_home_bundle,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::{
-    UpdateRegistry, UpdateResolution, broker::ReservedPoller, metrics as runtime_metrics,
+    UpdateRegistry, UpdateResolution,
+    broker::ReservedPoller,
+    metrics as runtime_metrics,
     shard::ShardOwner,
+    successor::{SuccessorPlan, build_successor_start},
 };
 
 /// Configuration knobs for a single lane executor.
@@ -147,6 +149,19 @@ struct IdentityRequest {
 }
 
 impl LaneHandle {
+    /// Carry runtime reads alongside a close, without adding I/O or plans to the kernel.
+    pub(crate) async fn submit_with_successor(
+        &self,
+        run_key: RunKey,
+        command: Command,
+        successor_plan: Option<SuccessorPlan>,
+    ) -> Result<CommitResult> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut message = LaneMessage::new(self.lane_id, run_key, command, reply_tx);
+        message.successor_plan = successor_plan;
+        self.tx.send(message).await?;
+        reply_rx.await?
+    }
     /// Submit a command for `run_key` and wait for the
     /// commit result.
     ///
@@ -204,6 +219,18 @@ impl LaneHandle {
     }
 }
 
+/// Only committed pairs and explicit size fallbacks can produce successor effects.
+enum SuccessorEffect {
+    Committed(Box<CommittedSuccessor>),
+    Deferred(Box<StartRequest>),
+}
+
+struct CommittedSuccessor {
+    state: tokeira_kernel::WorkflowState,
+    dispatch: SmallVec<[DispatchOp; 4]>,
+    history: SmallVec<[HistoryEvent; 8]>,
+}
+
 struct LaneMessage {
     lane_id: usize,
     run_key: RunKey,
@@ -213,6 +240,7 @@ struct LaneMessage {
     trace_context: Option<ChannelTraceContext>,
     /// A start asking its lane for a parked poll (`reserved-poll-handoff`).
     reserve_poller: bool,
+    successor_plan: Option<SuccessorPlan>,
 }
 
 impl LaneMessage {
@@ -234,6 +262,7 @@ impl LaneMessage {
             // span back to the caller.
             trace_context: ChannelTraceContext::capture_current(),
             reserve_poller: false,
+            successor_plan: None,
         }
     }
 }
@@ -285,6 +314,12 @@ impl LaneCache {
     }
 
     fn insert(&mut self, run_key: RunKey, loaded: LoadedRun) {
+        // Another run's lane can now create this run in a pair commit. An
+        // earlier missing-run lookup must not hide that start until cache expiry.
+        if matches!(loaded, LoadedRun::Absent) {
+            self.evict(run_key);
+            return;
+        }
         if self.max_entries == 0 {
             return;
         }
@@ -451,7 +486,7 @@ where
                     }
                 },
             };
-            carry_over = run_activation_with_cache(
+            carry_over = Box::pin(run_activation_with_cache(
                 &kernel,
                 &repo,
                 &publisher,
@@ -466,7 +501,7 @@ where
                 message,
                 &config,
                 &mut cache,
-            )
+            ))
             .await;
             if carry_over.is_some() {
                 runtime_metrics::record_lane_carry_over(lane_id);
@@ -509,7 +544,7 @@ where
     P: DispatchPublisher + Clone + 'static,
 {
     let mut cache = LaneCache::new(config);
-    run_activation_with_cache(
+    Box::pin(run_activation_with_cache(
         kernel,
         repo,
         publisher,
@@ -524,7 +559,7 @@ where
         first_message,
         config,
         &mut cache,
-    )
+    ))
     .await
 }
 
@@ -583,17 +618,20 @@ where
         let processing_start = std::time::Instant::now();
         let processing_span = lane_processing_span(&message, command_type);
         let mut write_admission = None;
-        let result = handle_message_with_cache(
+        let mut successor_effect = None;
+        let result = Box::pin(handle_message_with_successor(
             kernel,
             repo,
             shard_owner,
             update_registry,
             message.run_key,
             message.command,
+            message.successor_plan.as_ref(),
+            &mut successor_effect,
             config.max_occ_retries,
             cache,
             &mut write_admission,
-        )
+        ))
         .instrument(processing_span.clone())
         .await;
         // A commit refused for a limit that terminates the run: terminate the
@@ -689,128 +727,13 @@ where
                 let mut reset_materialization_error = None;
                 if let CommitResult::Applied { new_state } = &commit_result {
                     let shard_id = shard_id.expect("applied transition has an execution home");
-                    if history_events.iter().any(|event| {
-                        matches!(
-                            event.kind,
-                            HistoryEventKind::WorkflowExecutionStarted { .. }
-                                | HistoryEventKind::WorkflowExecutionStartedV2 { .. }
-                        )
-                    }) && (new_state.workflow_execution_timeout.is_some()
-                        || new_state.workflow_run_timeout.is_some())
-                    {
-                        // All starts, including folded starts and successors, install
-                        // before replying and while holding write admission. A lost
-                        // reply must not lose the deadline, and a caller resuming
-                        // after reacquisition must not replace recovered tracking.
-                        workflow_timeout_tracking.insert(crate::timeout::WorkflowTimeoutEntry {
-                            run_key: new_state.run_key,
-                            shard_id,
-                            workflow_execution_timeout: new_state.workflow_execution_timeout,
-                            workflow_run_timeout: new_state.workflow_run_timeout,
-                            started_at: new_state.started_at,
-                            workflow_start_delay: new_state.workflow_start_delay,
-                            first_run_started_at: new_state.first_run_started_at,
-                            has_retry_policy: new_state.retry_policy.is_some(),
-                        });
-                    }
-                    // Workflow-task timeout tracking, split by task type:
-                    //
-                    // A SPECULATIVE task's deadlines are enforced by PRECISE
-                    // in-memory timers (spec speculative-wft R.2) — the coarse
-                    // 1s sweep cannot meet the corpus's ~100ms firing margin.
-                    // Schedule-to-start while unstarted, start-to-close once a
-                    // worker starts it. Deadlines are absolute, so re-arming on
-                    // an unrelated commit for the same run is idempotent.
-                    //
-                    // A NON-speculative sticky task keeps the coarse sweep
-                    // (durable, long timeout, no tight race): its
-                    // schedule-to-start deadline is tracked so the scanner can
-                    // reroute it to the normal queue (sticky raise S2/S3). Any
-                    // non-speculative pending (or none) also DISARMS a stale
-                    // speculative timer left by a prior task on the run
-                    // (completion / conversion-to-normal / failure).
-                    match &new_state.pending_workflow_task {
-                        Some(pending)
-                            if pending.task_type
-                                == tokeira_kernel::WorkflowTaskType::Speculative =>
-                        {
-                            if let Some(started_at) = pending.started_at {
-                                wft_timeout_tracking.arm_speculative(
-                                    message.run_key,
-                                    shard_id,
-                                    pending.logical_seq,
-                                    pending.started_event_id.unwrap_or(0),
-                                    started_at + new_state.workflow_task_timeout,
-                                    crate::wft_timeout::WftTimeoutKind::StartToClose,
-                                );
-                            } else if let Some(deadline) = pending.schedule_to_start_deadline {
-                                wft_timeout_tracking.arm_speculative(
-                                    message.run_key,
-                                    shard_id,
-                                    pending.logical_seq,
-                                    0,
-                                    deadline,
-                                    crate::wft_timeout::WftTimeoutKind::ScheduleToStart,
-                                );
-                            }
-                        }
-                        Some(pending) => {
-                            wft_timeout_tracking.disarm_speculative(message.run_key);
-                            // Timeout ownership follows the execution home used by
-                            // storage and acquisition, not the lane's run-key hash.
-                            let home = {
-                                let owner = shard_owner.read().expect("shard_owner lock poisoned");
-                                tokeira_types::execution_home_bundle(
-                                    new_state.namespace_id.0.as_bytes(),
-                                    new_state.workflow_id.0.as_bytes(),
-                                    owner.shard_count(),
-                                )
-                            };
-                            let deadline = if let (Some(started_event_id), Some(started_at)) =
-                                (pending.started_event_id, pending.started_at)
-                            {
-                                Some((
-                                    crate::wft_timeout::WftTimeoutKind::StartToClose,
-                                    started_event_id,
-                                    started_at,
-                                    new_state.workflow_task_timeout,
-                                ))
-                            } else {
-                                pending.schedule_to_start_deadline.map(|deadline| {
-                                    (
-                                        crate::wft_timeout::WftTimeoutKind::ScheduleToStart,
-                                        0,
-                                        deadline,
-                                        time::Duration::ZERO,
-                                    )
-                                })
-                            };
-                            if let Some((
-                                kind,
-                                started_event_id,
-                                started_at,
-                                workflow_task_timeout,
-                            )) = deadline
-                            {
-                                // Install before returning the commit result: loss
-                                // of a successful start reply must still leave its
-                                // start-to-close recovery path. Response assembly
-                                // must never reinstall an older state afterwards.
-                                wft_timeout_tracking.insert(crate::wft_timeout::WftTimeoutEntry {
-                                    run_key: message.run_key,
-                                    shard_id: home,
-                                    logical_seq: pending.logical_seq,
-                                    started_event_id,
-                                    started_at,
-                                    workflow_task_timeout,
-                                    kind,
-                                });
-                            }
-                        }
-                        _ => {
-                            wft_timeout_tracking.disarm_speculative(message.run_key);
-                        }
-                    }
+                    track_committed_run(
+                        new_state,
+                        &history_events,
+                        shard_id,
+                        workflow_timeout_tracking,
+                        wft_timeout_tracking,
+                    );
                     for event in &history_events {
                         match &event.kind {
                             HistoryEventKind::ActivityTaskCancelRequested {
@@ -1414,266 +1337,51 @@ where
                                     });
                                 }
                             }
-                            if new_state.status == ExecutionStatus::ContinuedAsNew {
-                                let successor_event =
-                                    history_events.iter().find_map(|event| match &event.kind {
-                                        HistoryEventKind::WorkflowExecutionContinuedAsNew {
-                                            new_run_id,
-                                            workflow_type,
-                                            task_queue,
-                                            input,
-                                            memo,
-                                            search_attributes,
-                                            workflow_execution_timeout,
-                                            workflow_run_timeout,
-                                            workflow_task_timeout,
-                                            retry_policy,
-                                            backoff_start_interval,
-                                            cron_schedule,
-                                            header,
-                                            initiator,
-                                            last_completion_result,
-                                            successor_versioning_info,
-                                            ..
-                                        } => Some((
-                                            *new_run_id,
-                                            workflow_type.clone(),
-                                            task_queue.clone(),
-                                            input.clone(),
-                                            memo.clone(),
-                                            search_attributes.clone(),
-                                            *workflow_execution_timeout,
-                                            *workflow_run_timeout,
-                                            *workflow_task_timeout,
-                                            retry_policy.clone(),
-                                            *backoff_start_interval,
-                                            cron_schedule.clone(),
-                                            header.clone(),
-                                            *initiator,
-                                            last_completion_result.clone(),
-                                            successor_versioning_info.clone(),
-                                        )),
-                                        _ => None,
-                                    });
-                                if let Some((
-                                    successor_run_id,
-                                    workflow_type,
-                                    task_queue,
-                                    input,
-                                    memo,
-                                    search_attributes,
-                                    workflow_execution_timeout,
-                                    workflow_run_timeout,
-                                    workflow_task_timeout,
-                                    retry_policy,
-                                    backoff_start_interval,
-                                    cron_schedule,
-                                    header,
-                                    initiator,
-                                    successor_last_completion_result,
-                                    successor_versioning_info,
-                                )) = successor_event
+                        }
+                    }
+                    if let Some(effect) = successor_effect.take() {
+                        match effect {
+                            SuccessorEffect::Committed(committed) => {
+                                let CommittedSuccessor {
+                                    state,
+                                    dispatch,
+                                    history,
+                                } = *committed;
+                                let home = shard_id.expect("paired close has an execution home");
+                                track_committed_run(
+                                    &state,
+                                    &history,
+                                    home,
+                                    workflow_timeout_tracking,
+                                    wft_timeout_tracking,
+                                );
+                                if let Err(error) =
+                                    publisher.publish(state.run_key, home, &dispatch).await
                                 {
-                                    // Carry the chain's origin forward: the
-                                    // successor inherits the first run's id and
-                                    // start time so execution-level timeouts and
-                                    // lineage queries span the whole
-                                    // continue-as-new chain, not just this hop.
-                                    // `unwrap_or(self)` seeds these on the first
-                                    // run, which has no predecessor to inherit
-                                    // from.
-                                    let first_execution_run_id = Some(
-                                        new_state
-                                            .first_execution_run_id
-                                            .unwrap_or(new_state.run_id),
-                                    );
-                                    let first_run_started_at = Some(
-                                        new_state
-                                            .first_run_started_at
-                                            .unwrap_or(new_state.started_at),
-                                    );
-                                    let successor_run_key = RunKey::derive(
-                                        new_state.namespace_id,
-                                        &new_state.workflow_id,
-                                        successor_run_id,
-                                    );
-                                    // Root identity only propagates within a
-                                    // child lineage; a top-level run is its own
-                                    // root, so the successor carries no root ref.
-                                    let (root_workflow_id, root_run_id) = if new_state
-                                        .parent_run_key
-                                        .is_some()
-                                    {
-                                        (new_state.root_workflow_id.clone(), new_state.root_run_id)
-                                    } else {
-                                        (None, None)
-                                    };
-                                    let start_request = StartRequest {
-                                        run_key: successor_run_key,
-                                        advice_policy:
-                                            crate::runtime::continue_as_new_advice_policy(),
-                                        namespace_id: new_state.namespace_id,
-                                        workflow_id: new_state.workflow_id.clone(),
-                                        run_id: successor_run_id,
-                                        workflow_type,
-                                        // Empty task_queue means "reuse the predecessor's queue"
-                                        task_queue: if task_queue.0.is_empty() {
-                                            new_state.task_queue.clone()
-                                        } else {
-                                            task_queue
-                                        },
-                                        deployment: new_state.deployment.clone(),
-                                        build_id: new_state.build_id.clone(),
-                                        // Runtime already resolved whether an
-                                        // override is compatible with the
-                                        // successor queue and committed it in
-                                        // `successor_versioning_info`.
-                                        versioning_override: None,
-                                        workflow_start_delay: backoff_start_interval,
-                                        // Temporal carries completion callbacks
-                                        // and priority into continue-as-new start
-                                        // requests so run-chain completion and
-                                        // scheduling intent survive the hop
-                                        // (`service/history/workflow/mutable_state_impl.go:2480,2573 @ v1.31.0`).
-                                        completion_callbacks: new_state
-                                            .completion_callbacks
-                                            .clone(),
-                                        user_metadata: new_state.user_metadata.clone(),
-                                        links: Vec::new(),
-                                        on_conflict_options: None,
-                                        priority: new_state.priority.clone(),
-                                        input,
-                                        header,
-                                        memo,
-                                        search_attributes,
-                                        workflow_execution_timeout,
-                                        workflow_run_timeout,
-                                        workflow_task_timeout,
-                                        retry_policy,
-                                        conflict_policy:
-                                            tokeira_kernel::WorkflowIdConflictPolicy::Fail,
-                                        reuse_policy:
-                                            tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
-                                        // The successor's Initiator is carried from
-                                        // its close event: WORKFLOW for an explicit
-                                        // continue-as-new, CRON_SCHEDULE for a cron
-                                        // restart.
-                                        initiator: Some(initiator),
-                                        attempt: 1,
-                                        continued_execution_run_id: Some(new_state.run_id),
-                                        first_execution_run_id,
-                                        // A child that retries / continues-as-new /
-                                        // cron-restarts is still a child of the same
-                                        // parent: propagate the parent linkage so the
-                                        // successor's own WorkflowExecutionStarted event
-                                        // authors ParentWorkflowNamespace/Execution and
-                                        // the parent is notified only once the whole
-                                        // chain ends (NewExecutionRunId==""). A top-level
-                                        // run carries None here and stays parentless.
-                                        parent_run_key: new_state.parent_run_key,
-                                        parent_workflow_id: new_state.parent_workflow_id.clone(),
-                                        parent_run_id: new_state.parent_run_id,
-                                        parent_namespace_id: new_state.parent_namespace_id,
-                                        parent_namespace_name: new_state
-                                            .parent_namespace_name
-                                            .clone(),
-                                        parent_initiated_event_id: new_state
-                                            .parent_initiated_event_id,
-                                        root_workflow_id,
-                                        root_run_id,
-                                        original_execution_run_id: Some(
-                                            new_state
-                                                .original_execution_run_id
-                                                .unwrap_or(new_state.run_id),
-                                        ),
-                                        continued_failure: new_state.close_failure.clone(),
-                                        // Cron carries the last SUCCESSFUL result
-                                        // forward even across a failed run; the
-                                        // authoritative value is on the CaN event
-                                        // (this run's result on complete, the
-                                        // carried-forward result on failure), not
-                                        // `close_result` (None on failure).
-                                        last_completion_result: successor_last_completion_result,
-                                        first_run_started_at,
-                                        request: tokeira_types::RequestContext {
-                                            // Deterministic request id keyed on
-                                            // (predecessor, successor) so a
-                                            // replayed continue-as-new dedupes
-                                            // to the same successor start instead
-                                            // of forking a duplicate run.
-                                            request_id: tokeira_types::RequestId(format!(
-                                                "continue-as-new:{}:{}",
-                                                new_state.run_id.0, successor_run_id.0
-                                            )),
-                                            caller_identity: None,
-                                            principal: None,
-                                            received_at: OffsetDateTime::now_utc(),
-                                        },
-                                        now: OffsetDateTime::now_utc(),
-                                        client_cron_schedule: None,
-                                        cron_schedule,
-                                        eager_execution_accepted: false,
-                                        reserved_poller_identity: None,
-                                        inherited_versioning_info: successor_versioning_info,
-                                    };
-                                    let publisher = publisher.clone();
-                                    let predecessor_run_key = message.run_key;
-                                    // Start the successor off-lane for the same
-                                    // reason as child delivery: it may route to
-                                    // this lane, and an inline submit would
-                                    // self-deadlock. The successor lane installs
-                                    // its deadlines before returning the reply.
-                                    tokio::spawn(async move {
-                                        match publisher
-                                            .submit_to_run(
-                                                successor_run_key,
-                                                Command::Start(start_request),
-                                            )
-                                            .await
-                                        {
-                                            Ok(CommitResult::Applied { .. }) => {}
-                                            Ok(CommitResult::Duplicate) => {
-                                                tracing::error!(
-                                                    predecessor_run_key = ?predecessor_run_key,
-                                                    successor_run_key = ?successor_run_key,
-                                                    "unexpected duplicate when starting continue-as-new successor"
-                                                );
-                                            }
-                                            Ok(CommitResult::Conflict { reason }) => {
-                                                tracing::error!(
-                                                    predecessor_run_key = ?predecessor_run_key,
-                                                    successor_run_key = ?successor_run_key,
-                                                    %reason,
-                                                    "unexpected conflict when starting continue-as-new successor"
-                                                );
-                                            }
-                                            Ok(CommitResult::CurrentExecutionConflict {
-                                                existing_run_key,
-                                                ..
-                                            }) => {
-                                                tracing::error!(
-                                                    predecessor_run_key = ?predecessor_run_key,
-                                                    successor_run_key = ?successor_run_key,
-                                                    ?existing_run_key,
-                                                    "unexpected current-execution conflict when starting continue-as-new successor"
-                                                );
-                                            }
-                                            Err(error) => {
-                                                tracing::error!(
-                                                    ?error,
-                                                    predecessor_run_key = ?predecessor_run_key,
-                                                    successor_run_key = ?successor_run_key,
-                                                    "failed to start continue-as-new successor"
-                                                );
-                                            }
-                                        }
-                                    });
-                                } else {
-                                    tracing::error!(
-                                        predecessor_run_key = ?message.run_key,
-                                        "continued-as-new close missing WorkflowExecutionContinuedAsNew history event"
-                                    );
+                                    tracing::warn!(?error, run_key = ?state.run_key, "failed to publish successor dispatch");
                                 }
+                            }
+                            SuccessorEffect::Deferred(start) => {
+                                // The size fallback alone uses a separate start. Submit off
+                                // this lane to avoid self-deadlock, past external drain admission.
+                                let publisher = publisher.clone();
+                                let predecessor_run_key = message.run_key;
+                                let successor_run_key = start.run_key;
+                                tokio::spawn(async move {
+                                    let result = publisher
+                                        .submit_to_run(start.run_key, Command::Start(*start))
+                                        .await;
+                                    // Duplicate is a request-dedupe collision, not proof
+                                    // that the successor exists (requirement 6.4).
+                                    if !matches!(result, Ok(CommitResult::Applied { .. })) {
+                                        tracing::error!(
+                                            ?result,
+                                            ?predecessor_run_key,
+                                            ?successor_run_key,
+                                            "size-fallback successor start failed"
+                                        );
+                                    }
+                                });
                             }
                         }
                     }
@@ -1851,6 +1559,45 @@ where
     K: Kernel + Send + Sync + 'static,
     R: RunRepository + 'static,
 {
+    Box::pin(handle_message_with_successor(
+        kernel,
+        repo,
+        shard_owner,
+        update_registry,
+        run_key,
+        command,
+        None,
+        &mut None,
+        max_retries,
+        cache,
+        write_admission,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_message_with_successor<K, R>(
+    kernel: &K,
+    repo: &R,
+    shard_owner: &Arc<RwLock<ShardOwner>>,
+    update_registry: &UpdateRegistry,
+    run_key: RunKey,
+    command: Command,
+    successor_plan: Option<&SuccessorPlan>,
+    successor_effect: &mut Option<SuccessorEffect>,
+    max_retries: u32,
+    cache: &mut LaneCache,
+    write_admission: &mut Option<crate::serving_gate::WritePermit>,
+) -> Result<(
+    CommitResult,
+    SmallVec<[DispatchOp; 4]>,
+    SmallVec<[HistoryEvent; 8]>,
+)>
+where
+    K: Kernel + Send + Sync + 'static,
+    R: RunRepository + 'static,
+{
+    let successor_now = OffsetDateTime::now_utc();
     let mut attempts = 0u32;
     loop {
         let transition_span = tracing::info_span!(
@@ -1950,16 +1697,72 @@ where
         let dispatch_ops = transition.dispatch_ops.clone();
         let history_events = transition.history_events.clone();
 
-        match repo
-            .commit_transition_for_bundle(run_key, execution_home_bundle, transition, fence)
-            .instrument(storage_commit_span(
-                execution_home_bundle,
-                "commit_transition_for_bundle",
-                attempts,
-            ))
-            .await
-            .map_err(|error| crate::errors::lease_loss(error, shard_owner))?
+        let commit_result = if let Some(start) =
+            build_successor_start(&transition, successor_plan, successor_now)?
         {
+            // Temporal rejects a completion whose new run cannot be set up:
+            // workflow_task_completed_handler.go:1029-1039, 1354-1369 @ v1.31.0.
+            // Apply before committing either run, so rejection cannot strand a close.
+            let mut successor = kernel
+                .apply(LoadedRun::Absent, Command::Start(start.clone()))
+                .map_err(|reject| anyhow::Error::new(KernelRejected(reject)))?;
+            successor.growth_limits = transition.growth_limits;
+            let successor_dispatch = successor.dispatch_ops.clone();
+            let successor_history = successor.history_events.clone();
+            match repo
+                .commit_transition_pair(
+                    run_key,
+                    transition.clone(),
+                    start.run_key,
+                    successor,
+                    fence.clone(),
+                )
+                .await
+                .map_err(|error| crate::errors::lease_loss(error, shard_owner))?
+            {
+                PairCommitResult::Applied {
+                    closing_state,
+                    successor_state,
+                } => {
+                    *successor_effect =
+                        Some(SuccessorEffect::Committed(Box::new(CommittedSuccessor {
+                            state: successor_state,
+                            dispatch: successor_dispatch,
+                            history: successor_history,
+                        })));
+                    CommitResult::Applied {
+                        new_state: closing_state,
+                    }
+                }
+                PairCommitResult::Conflict { reason } => CommitResult::Conflict { reason },
+                PairCommitResult::Duplicate => CommitResult::Duplicate,
+                PairCommitResult::SizeRefused => {
+                    let result = repo
+                        .commit_transition_for_bundle(
+                            run_key,
+                            execution_home_bundle,
+                            transition,
+                            fence,
+                        )
+                        .await
+                        .map_err(|error| crate::errors::lease_loss(error, shard_owner))?;
+                    if matches!(result, CommitResult::Applied { .. }) {
+                        *successor_effect = Some(SuccessorEffect::Deferred(Box::new(start)));
+                    }
+                    result
+                }
+            }
+        } else {
+            repo.commit_transition_for_bundle(run_key, execution_home_bundle, transition, fence)
+                .instrument(storage_commit_span(
+                    execution_home_bundle,
+                    "commit_transition_for_bundle",
+                    attempts,
+                ))
+                .await
+                .map_err(|error| crate::errors::lease_loss(error, shard_owner))?
+        };
+        match commit_result {
             CommitResult::Applied { new_state } => {
                 cache.insert(run_key, LoadedRun::Existing(new_state.clone()));
                 if attempts > 0 {
@@ -2447,8 +2250,126 @@ fn collect_reset_reapply(
         .collect()
 }
 
+/// Install durable-run deadlines before a start's reply or dispatch. Paired
+/// successors use the same path as ordinary starts, with the same execution home.
+fn track_committed_run(
+    new_state: &tokeira_kernel::WorkflowState,
+    history_events: &[HistoryEvent],
+    shard_id: ShardId,
+    workflow_timeout_tracking: &crate::timeout::WorkflowTimeoutTrackingState,
+    wft_timeout_tracking: &crate::wft_timeout::WftTimeoutTrackingState,
+) {
+    if history_events.iter().any(|event| {
+        matches!(
+            event.kind,
+            HistoryEventKind::WorkflowExecutionStarted { .. }
+                | HistoryEventKind::WorkflowExecutionStartedV2 { .. }
+        )
+    }) && (new_state.workflow_execution_timeout.is_some()
+        || new_state.workflow_run_timeout.is_some())
+    {
+        // All starts, including folded starts and successors, install
+        // before replying and while holding write admission. A lost
+        // reply must not lose the deadline, and a caller resuming
+        // after reacquisition must not replace recovered tracking.
+        workflow_timeout_tracking.insert(crate::timeout::WorkflowTimeoutEntry {
+            run_key: new_state.run_key,
+            shard_id,
+            workflow_execution_timeout: new_state.workflow_execution_timeout,
+            workflow_run_timeout: new_state.workflow_run_timeout,
+            started_at: new_state.started_at,
+            workflow_start_delay: new_state.workflow_start_delay,
+            first_run_started_at: new_state.first_run_started_at,
+            has_retry_policy: new_state.retry_policy.is_some(),
+        });
+    }
+    // Workflow-task timeout tracking, split by task type:
+    //
+    // A SPECULATIVE task's deadlines are enforced by PRECISE
+    // in-memory timers (spec speculative-wft R.2) — the coarse
+    // 1s sweep cannot meet the corpus's ~100ms firing margin.
+    // Schedule-to-start while unstarted, start-to-close once a
+    // worker starts it. Deadlines are absolute, so re-arming on
+    // an unrelated commit for the same run is idempotent.
+    //
+    // A NON-speculative sticky task keeps the coarse sweep
+    // (durable, long timeout, no tight race): its
+    // schedule-to-start deadline is tracked so the scanner can
+    // reroute it to the normal queue (sticky raise S2/S3). Any
+    // non-speculative pending (or none) also DISARMS a stale
+    // speculative timer left by a prior task on the run
+    // (completion / conversion-to-normal / failure).
+    match &new_state.pending_workflow_task {
+        Some(pending) if pending.task_type == tokeira_kernel::WorkflowTaskType::Speculative => {
+            if let Some(started_at) = pending.started_at {
+                wft_timeout_tracking.arm_speculative(
+                    new_state.run_key,
+                    shard_id,
+                    pending.logical_seq,
+                    pending.started_event_id.unwrap_or(0),
+                    started_at + new_state.workflow_task_timeout,
+                    crate::wft_timeout::WftTimeoutKind::StartToClose,
+                );
+            } else if let Some(deadline) = pending.schedule_to_start_deadline {
+                wft_timeout_tracking.arm_speculative(
+                    new_state.run_key,
+                    shard_id,
+                    pending.logical_seq,
+                    0,
+                    deadline,
+                    crate::wft_timeout::WftTimeoutKind::ScheduleToStart,
+                );
+            }
+        }
+        Some(pending) => {
+            wft_timeout_tracking.disarm_speculative(new_state.run_key);
+            // Timeout ownership follows the execution home used by
+            // storage and acquisition, not the lane's run-key hash.
+            let home = shard_id;
+            let deadline = if let (Some(started_event_id), Some(started_at)) =
+                (pending.started_event_id, pending.started_at)
+            {
+                Some((
+                    crate::wft_timeout::WftTimeoutKind::StartToClose,
+                    started_event_id,
+                    started_at,
+                    new_state.workflow_task_timeout,
+                ))
+            } else {
+                pending.schedule_to_start_deadline.map(|deadline| {
+                    (
+                        crate::wft_timeout::WftTimeoutKind::ScheduleToStart,
+                        0,
+                        deadline,
+                        time::Duration::ZERO,
+                    )
+                })
+            };
+            if let Some((kind, started_event_id, started_at, workflow_task_timeout)) = deadline {
+                // Install before returning the commit result: loss
+                // of a successful start reply must still leave its
+                // start-to-close recovery path. Response assembly
+                // must never reinstall an older state afterwards.
+                wft_timeout_tracking.insert(crate::wft_timeout::WftTimeoutEntry {
+                    run_key: new_state.run_key,
+                    shard_id: home,
+                    logical_seq: pending.logical_seq,
+                    started_event_id,
+                    started_at,
+                    workflow_task_timeout,
+                    kind,
+                });
+            }
+        }
+        _ => {
+            wft_timeout_tracking.disarm_speculative(new_state.run_key);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    mod atomic_successors;
     use std::{
         collections::{BTreeMap, HashMap, VecDeque},
         future::poll_fn,
@@ -2588,6 +2509,32 @@ mod tests {
 
         fn on_record(&self, id: &Id, values: &tracing::span::Record<'_>, _ctx: Context<'_, S>) {
             self.capture_record(id, values);
+        }
+    }
+
+    struct SuccessorFailureEvent {
+        level: tracing::Level,
+        fields: HashMap<String, String>,
+    }
+
+    struct SuccessorFailureCapture(mpsc::UnboundedSender<SuccessorFailureEvent>);
+
+    impl<S: Subscriber> Layer<S> for SuccessorFailureCapture {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut recorder = FieldRecorder {
+                values: HashMap::new(),
+            };
+            event.record(&mut recorder);
+            if recorder
+                .values
+                .get("message")
+                .is_some_and(|message| message.contains("size-fallback successor start failed"))
+            {
+                let _ = self.0.send(SuccessorFailureEvent {
+                    level: *event.metadata().level(),
+                    fields: recorder.values,
+                });
+            }
         }
     }
 
@@ -2759,6 +2706,19 @@ mod tests {
 
     #[async_trait]
     impl RunRepository for MockRepo {
+        // This single-run mock exercises the retained size fallback. Atomic
+        // publication is tested separately against the real memory repository.
+        async fn commit_transition_pair(
+            &self,
+            _run_key: RunKey,
+            _closing: Transition,
+            _successor_run_key: RunKey,
+            _successor: Transition,
+            _fence: WriteFence,
+        ) -> Result<PairCommitResult> {
+            Ok(PairCommitResult::SizeRefused)
+        }
+
         async fn resolve_execution(&self, _execution: &ExecutionRef) -> Result<Option<RunKey>> {
             Ok(None)
         }
@@ -3233,7 +3193,10 @@ mod tests {
     }
 
     impl Kernel for ContinueAsNewKernel {
-        fn apply(&self, loaded: LoadedRun, _command: Command) -> Result<Transition, Reject> {
+        fn apply(&self, loaded: LoadedRun, command: Command) -> Result<Transition, Reject> {
+            if matches!(&command, Command::Start(_)) {
+                return tokeira_kernel::BasicKernel.apply(loaded, command);
+            }
             let LoadedRun::Existing(current) = loaded else {
                 panic!("tests expect an existing run");
             };
@@ -4599,7 +4562,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_activation_submits_continue_as_new_successor_with_chain_fields() {
+    async fn size_fallback_submits_continue_as_new_successor_with_chain_fields() {
         let run_key = RunKey::new();
         let mut state = sample_state(run_key);
         let chain_start = OffsetDateTime::now_utc() - Duration::hours(2);
@@ -4740,7 +4703,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn property_continue_as_new_detection_triggers_only_for_continued_as_new(
+        fn property_size_fallback_detects_continue_as_new(
             is_continued_as_new in any::<bool>(),
         ) {
             let rt = Runtime::new().unwrap();
@@ -4800,7 +4763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_activation_returns_predecessor_commit_even_when_successor_start_fails() {
+    async fn size_fallback_keeps_close_when_successor_start_fails() {
         let run_key = RunKey::new();
         let state = sample_state(run_key);
         let repo = MockRepo::new(
@@ -4838,7 +4801,69 @@ mod tests {
             first_reply.await.unwrap().unwrap(),
             CommitResult::Applied { .. }
         ));
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        publisher.wait_for_submits(1).await;
+        assert!(tracking.snapshot().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    // Keep the dispatcher installed until the spawned fallback logs its result.
+    #[allow(clippy::await_holding_lock)]
+    async fn size_fallback_logs_duplicate_as_failure() {
+        let _tracing = tracing_dispatch_guard();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let subscriber = tracing_subscriber::registry().with(SuccessorFailureCapture(event_tx));
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let run_key = RunKey::new();
+        let state = sample_state(run_key);
+        let repo = MockRepo::new(
+            LoadedRun::Existing(state.clone()),
+            vec![CommitBehavior::Applied],
+        );
+        let kernel = ContinueAsNewKernel::continued_as_new();
+        let publisher = MockPublisher::new()
+            .with_submit_result(CommitResult::Duplicate)
+            .await;
+        let (first, first_reply) = lane_message(run_key, "continue");
+        let (_tx, mut rx) = mpsc::channel(8);
+        let activity_tracking = crate::activity_timeout::ActivityTrackingState::default();
+        let tracking = crate::timeout::WorkflowTimeoutTrackingState::default();
+        let wft_tracking = crate::wft_timeout::WftTimeoutTrackingState::default();
+        let nexus_tracking = crate::nexus::NexusTimeoutTrackingState::default();
+        let update_registry = crate::UpdateRegistry::new();
+        let shard_owner = test_shard_owner();
+
+        let _ = run_activation(
+            &kernel,
+            &repo,
+            &publisher,
+            &shard_owner,
+            &activity_tracking,
+            &tracking,
+            &wft_tracking,
+            &nexus_tracking,
+            &update_registry,
+            &mut rx,
+            first,
+            &LaneConfig::default(),
+        )
+        .await;
+
+        assert!(matches!(
+            first_reply.await.unwrap().unwrap(),
+            CommitResult::Applied { .. }
+        ));
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("a duplicate fallback start must log a failure")
+            .expect("failure capture must stay connected");
+        assert_eq!(event.level, tracing::Level::ERROR);
+        assert_eq!(
+            event.fields.get("result").map(String::as_str),
+            Some("Ok(Duplicate)")
+        );
+        assert_eq!(publisher.snapshot().await.submits.len(), 1);
+        assert_eq!(repo.snapshot().await.1, 1);
         assert!(tracking.snapshot().is_empty());
     }
 

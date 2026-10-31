@@ -201,18 +201,14 @@ mirroring the continue-as-new successor path, so the chain is durable and observ
 
 #### Acceptance Criteria
 
-1. WHEN a Failed-with-retry close commits, THE runtime lane SHALL start the successor run, mirroring the
-   continue-as-new / cron successor block (`crates/tokeira-runtime/src/lane.rs`), with: same
+1. WHEN a Failed-with-retry close is applied by the kernel, THE runtime lane SHALL apply its successor start and commit both transitions in one fenced transaction, with: same
    `workflow_id`, `workflow_type`, `task_queue`, `input`, `retry_policy`, and timeouts;
    `attempt = predecessor.attempt + 1`; `continued_execution_run_id = Some(predecessor run id)`;
    inherited `first_execution_run_id` and `first_run_started_at`; the predecessor's close failure carried
    as the successor's `continued_failure`.
 2. THE successor's first workflow task SHALL be delayed by the computed backoff interval (the successor
    starts in a backoff state, first WFT scheduled after the delay), matching v1.31.0.
-3. IF the successor start fails, THE predecessor's committed Failed close SHALL still be returned (the
-   successor start is a derived effect after the authoritative close, mirroring the existing
-   continue-as-new "predecessor commit returned even when successor start fails" behaviour in
-   `lane.rs`).
+3. IF the successor start is rejected, THE runtime SHALL fail the close without committing either run. Only an explicit storage size refusal SHALL permit committing the close alone and spawning the already-built successor directly on its lane; a failed fallback start SHALL leave that close unchanged.
 
 ---
 
@@ -302,9 +298,7 @@ inspection is conformant.
    `first_execution_run_id`.
 2. FOR ALL terminal failures (`MaximumAttemptsReached`, `NonRetryableFailure`, `RetryPolicyNotSet`),
    `WorkflowExecutionFailed.new_execution_run_id` SHALL be `None`.
-3. FOR ALL Failed-with-retry closes, exactly one successor run SHALL be started (no duplicate successors
-   on retry of the close command — the successor start is idempotent on the predecessor's committed
-   `new_execution_run_id`).
+3. FOR ALL Failed-with-retry closes, exactly one successor SHALL be written with the close, retaining the same `new_execution_run_id` across conflict retries. Only the explicit size fallback SHALL write it separately, using that same identity.
 
 ---
 

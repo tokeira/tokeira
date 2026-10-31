@@ -155,7 +155,7 @@ Downstream breakage: `WorkflowCommand` gains a `ContinueAsNew` variant (breaks e
 1. WHEN a ContinueAsNew workflow command is received within WorkflowTaskCompleted, THE Kernel SHALL emit a WorkflowExecutionContinuedAsNew event carrying the new_run_id, workflow_type, task_queue, input, memo, search_attributes, workflow_execution_timeout, workflow_run_timeout, and workflow_task_timeout from the command.
 2. WHEN a ContinueAsNew workflow command is received, THE Kernel SHALL close the current run with ExecutionStatus::ContinuedAsNew by calling the TransitionBuilder's `close` method (set terminal status, clear pending WFT, clear StickyAffinity, emit ProjectionOp::CloseExecution).
 3. WHEN a ContinueAsNew workflow command is received, THE apply_workflow_command function SHALL return `true` (indicating the run is closed), so that subsequent workflow commands in the same WFT completion are rejected with CommandsAfterClose.
-4. THE Kernel SHALL NOT create the successor run; the runtime reads the WorkflowExecutionContinuedAsNew event and issues a Start command for the successor.
+4. THE Kernel SHALL NOT create the successor run; the runtime reads the WorkflowExecutionContinuedAsNew event, applies a Start command to an absent run, and commits both transitions together.
 5. THE Kernel SHALL NOT emit any DispatchOp for ContinueAsNew (no WFT is scheduled for the current run).
 6. THE Kernel SHALL NOT emit any RequestDedupeOp for ContinueAsNew (it is a workflow command, not an external API command).
 

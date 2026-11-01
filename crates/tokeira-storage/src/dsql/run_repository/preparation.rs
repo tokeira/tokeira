@@ -201,7 +201,7 @@ impl DsqlRunRepository {
         let split = value_parts::split(&bytes);
         let selected = {
             let mut permit = self.director.acquire(DbClass::Commit).await?;
-            let mut tx = permit.connection()?.begin().await?;
+            let mut tx = permit.begin().await?;
             if let Some(lost) = Self::check_fence(&mut tx, &fence, state.run_key).await? {
                 return Err(lost.into());
             }
@@ -265,7 +265,7 @@ impl DsqlRunRepository {
                 .collect();
             for page in pages(&costs, WriteBudget::TRANSACTION) {
                 let mut permit = self.director.acquire(DbClass::Commit).await?;
-                let mut tx = permit.connection()?.begin().await?;
+                let mut tx = permit.begin().await?;
                 if let Some(lost) = Self::check_fence(&mut tx, fence, token.target_run).await? {
                     return Err(lost.into());
                 }
@@ -288,7 +288,7 @@ impl DsqlRunRepository {
             }
         }
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         if let Some(lost) = Self::check_fence(&mut tx, fence, token.target_run).await? {
             return Err(lost.into());
         }

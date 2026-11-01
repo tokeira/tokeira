@@ -44,7 +44,7 @@ impl DsqlRunRepository {
         after: Option<Uuid>,
     ) -> Result<crate::WorkflowBacklogDisposal> {
         let mut permit = self.director.acquire(DbClass::Maintenance).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let sql = if after.is_some() {
             DISPOSAL_NEXT_KEYS_SQL
         } else {
@@ -225,7 +225,7 @@ impl DsqlRunRepository {
             .await?;
             metrics::record_dsql_rows_read("list_dispatchable_workflow_tasks", rows.len());
             // A run deleted since the scan read it has nothing to dispatch.
-            let rows = super::run_value_parts::whole_states(permit.connection()?, rows)
+            let rows = super::run_value_parts::whole_states(&mut permit, rows)
                 .await?
                 .into_iter()
                 .filter_map(|(run_key, state_data)| Some((run_key, state_data?)))
@@ -275,7 +275,7 @@ impl DsqlRunRepository {
             .collect::<Vec<_>>();
         for page in pages(&costs, WriteBudget::TRANSACTION) {
             let mut permit = self.director.acquire(DbClass::Commit).await?;
-            let mut tx = permit.connection()?.begin().await?;
+            let mut tx = permit.begin().await?;
             let mut page_rows = 0;
             for (entry, payload) in &rows[page.clone()] {
                 let partition_id = partition_for(entry.run_key, self.projection_partition_count);
@@ -336,7 +336,7 @@ impl DsqlRunRepository {
             }
 
             let mut permit = self.director.acquire(DbClass::Commit).await?;
-            let mut tx = permit.connection()?.begin().await?;
+            let mut tx = permit.begin().await?;
             let deployment = queue.deployment.as_ref().map(|value| value.0.as_str());
             let build_id = queue.build_id.as_ref().map(|value| value.0.as_str());
             let rows = sqlx::query_as::<

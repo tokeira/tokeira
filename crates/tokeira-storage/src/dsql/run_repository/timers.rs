@@ -106,7 +106,7 @@ impl DsqlRunRepository {
     ) -> Result<bool> {
         record_dsql_operation!(self, "delete_due_timer_if_matches", None, {
             let mut permit = self.director.acquire(DbClass::Commit).await?;
-            let mut tx = permit.connection()?.begin().await?;
+            let mut tx = permit.begin().await?;
             if reason == crate::StaleTimer::RunMissing {
                 // A reset's successor holds its timer rows before its final
                 // transaction makes it visible (`bounded-bulk-writes`). Plain

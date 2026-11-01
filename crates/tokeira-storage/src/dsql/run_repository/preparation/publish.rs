@@ -11,7 +11,7 @@ impl DsqlRunRepository {
     ) -> Result<PublicationResult> {
         fence.ensure_home(token.home)?;
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         if let Some(lost) = Self::check_fence(&mut tx, &fence, token.target_run).await? {
             return Err(lost.into());
         }

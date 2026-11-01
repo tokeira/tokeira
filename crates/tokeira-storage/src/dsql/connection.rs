@@ -8,6 +8,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    future::Future,
     sync::{
         Arc, Mutex, RwLock as StdRwLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -17,7 +18,7 @@ use std::{
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
-use sqlx::PgConnection;
+use sqlx::{Connection, PgConnection, Postgres, Transaction};
 use tokeira_observability::DbClassLabel;
 use tokio::{
     sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore},
@@ -40,6 +41,9 @@ const LEAK_SCAN_INTERVAL: StdDuration = StdDuration::from_secs(5);
 const EMBEDDED_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const CLASS_BUDGET_PRESSURE_AFTER: StdDuration = StdDuration::from_secs(5);
 const CLASS_BUDGET_WARNING_COOLDOWN: StdDuration = StdDuration::from_secs(60);
+
+#[cfg(test)]
+mod transaction_tests;
 
 #[derive(Debug, Default)]
 struct ClassPressure {
@@ -767,6 +771,9 @@ impl CheckoutLeakTracker {
     }
 }
 
+/// An admitted reservoir connection, returned or retired when the permit drops.
+/// Start transactions through this permit so interrupted startup cannot expose
+/// an untracked server transaction to the next borrower.
 #[derive(Debug)]
 pub struct DsqlPermit {
     /// Operation class that consumed this permit.
@@ -882,6 +889,9 @@ impl DsqlPermit {
         }
     }
 
+    /// Borrow the connection for statements outside a new transaction.
+    /// Use [`Self::begin`] or [`Self::begin_read_only`] for transaction startup;
+    /// starting through the raw connection bypasses cancellation retirement.
     pub fn connection(&mut self) -> Result<&mut PgConnection> {
         let Some(connection) = self.connection.as_mut() else {
             bail!("DSQL permit connection already returned");
@@ -889,12 +899,53 @@ impl DsqlPermit {
         Ok(&mut *connection)
     }
 
+    /// Start a write transaction, retiring this connection if startup fails or
+    /// is cancelled. A returned transaction retains SQLx's rollback-on-drop.
+    pub async fn begin(&mut self) -> Result<Transaction<'_, Postgres>> {
+        let connection = self
+            .connection
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("DSQL permit connection already returned"))?;
+        Ok(guard_transaction_start(&mut self.marked_bad, connection.begin()).await?)
+    }
+
+    /// Start a repeatable-read, read-only snapshot with the same cancellation
+    /// retirement guarantee as [`Self::begin`].
+    pub async fn begin_read_only(&mut self) -> Result<Transaction<'_, Postgres>> {
+        let connection = self
+            .connection
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("DSQL permit connection already returned"))?;
+        Ok(guard_transaction_start(
+            &mut self.marked_bad,
+            connection.begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"),
+        )
+        .await?)
+    }
+
+    /// Retire this connection through the existing return path, even if a later
+    /// statement succeeds. The slot remains owned until retirement.
     pub fn mark_bad(&mut self) {
         // Consumers call this when SQL usage indicates the connection should
         // not be reused. The actual discard happens in `Drop`/return
         // processing so callers keep a simple RAII API.
         self.marked_bad = true;
     }
+}
+
+async fn guard_transaction_start<T, E>(
+    marked_bad: &mut bool,
+    start: impl Future<Output = std::result::Result<T, E>>,
+) -> std::result::Result<T, E> {
+    // SQLx 0.9.0 postgres/transaction.rs records transaction depth only after
+    // BEGIN completes. Its cancellation rollback is a no-op at depth zero, so
+    // an interrupted BEGIN can leave server state SQLx cannot roll back. Mark
+    // before polling, and restore only on success; Drop/return still does no I/O.
+    let previously_bad = *marked_bad;
+    *marked_bad = true;
+    let transaction = start.await?;
+    *marked_bad = previously_bad;
+    Ok(transaction)
 }
 
 impl Drop for DsqlPermit {

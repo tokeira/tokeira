@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use sqlx::{Connection, Row};
+use sqlx::Row;
 use tokeira_types::NamespaceId;
 
 use crate::{
@@ -98,7 +98,7 @@ impl WorkerDeploymentRepository for DsqlWorkerDeploymentRepository {
         expected: Option<ConflictToken>,
     ) -> Result<DeploymentCasResult> {
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let row = sqlx::query(
             "SELECT conflict_token
              FROM worker_deployments
@@ -177,7 +177,7 @@ impl WorkerDeploymentRepository for DsqlWorkerDeploymentRepository {
         expected: ConflictToken,
     ) -> Result<DeploymentCasResult> {
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let row = sqlx::query(
             "SELECT conflict_token
              FROM worker_deployments

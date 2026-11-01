@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
-use sqlx::{AssertSqlSafe, Connection, Row, postgres::PgRow};
+use sqlx::{AssertSqlSafe, Row, postgres::PgRow};
 use time::OffsetDateTime;
 use tokeira_types::{
     BuildId, ConfigurationFingerprint, ControllerInstanceKey, DeploymentId, IncarnationId,
@@ -492,7 +492,7 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
     ) -> Result<Option<WorkerComputeControllerRecord>> {
         for _ in 0..32 {
             let mut permit = self.director.acquire(DbClass::Commit).await?;
-            let mut tx = permit.connection()?.begin().await?;
+            let mut tx = permit.begin().await?;
             let row = sqlx::query(
                 "SELECT revision, lease_epoch, record_data
                  FROM worker_compute_controller
@@ -573,7 +573,7 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
         now: OffsetDateTime,
     ) -> Result<WorkerComputeControllerAdmission> {
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let existing = sqlx::query(
             "SELECT revision, lease_epoch, record_data
              FROM worker_compute_controller
@@ -683,7 +683,7 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
             return Ok(None);
         }
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let row = sqlx::query(
             "SELECT revision, lease_epoch, record_data
              FROM worker_compute_controller
@@ -766,7 +766,7 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
             return Ok(WorkerComputeControllerCommitResult::Conflict);
         }
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         if let Some(action) = action.as_ref()
             && Self::insert_action(&mut tx, action).await? != 1
         {
@@ -931,7 +931,7 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
             return Ok(Vec::new());
         }
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let start_bucket = owner.0.as_bytes()[0] >> 2;
         let mut claimed = Vec::with_capacity(limit.min(WORKER_COMPUTE_ACTION_BUCKETS as usize));
 
@@ -1015,7 +1015,7 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
         now: OffsetDateTime,
     ) -> Result<WorkerComputeActionAttemptStart> {
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let query =
             format!("SELECT {ACTION_COLUMNS} FROM worker_compute_action WHERE action_id = $1");
         // SQL safety: the only interpolation is the `ACTION_COLUMNS` constant;
@@ -1069,7 +1069,7 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
         result: WorkerComputeActionFinalization,
     ) -> Result<WorkerComputeActionFinalizeResult> {
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let query =
             format!("SELECT {ACTION_COLUMNS} FROM worker_compute_action WHERE action_id = $1");
         // SQL safety: the only interpolation is the `ACTION_COLUMNS` constant;

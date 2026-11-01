@@ -250,12 +250,10 @@ pub(super) fn state_needs_snapshot(first: &[u8], count: Option<i32>) -> bool {
 /// Read a run's state whole in a read-only snapshot of its own, or `None` when the
 /// run has no state. For a reader that met the state split outside a transaction.
 pub(super) async fn read_state_in_snapshot(
-    connection: &mut PgConnection,
+    permit: &mut DsqlPermit,
     run_key: RunKey,
 ) -> Result<Option<Vec<u8>>> {
-    let mut tx = connection
-        .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        .await?;
+    let mut tx = permit.begin_read_only().await?;
     let row = sqlx::query_as::<_, (Vec<u8>, Option<i32>)>(
         "SELECT state_data, state_parts FROM workflow_hot WHERE run_key = $1",
     )
@@ -276,13 +274,13 @@ pub(super) async fn read_state_in_snapshot(
 /// the row stays in the result, so a caller that pages by rows read keeps its
 /// count.
 pub(super) async fn whole_states(
-    connection: &mut PgConnection,
+    permit: &mut DsqlPermit,
     rows: Vec<(Uuid, Vec<u8>, Option<i32>)>,
 ) -> Result<Vec<(Uuid, Option<Vec<u8>>)>> {
     let mut states = Vec::with_capacity(rows.len());
     for (run_key, first, count) in rows {
         let state = if state_needs_snapshot(&first, count) {
-            read_state_in_snapshot(connection, RunKey(run_key)).await?
+            read_state_in_snapshot(permit, RunKey(run_key)).await?
         } else {
             Some(first)
         };

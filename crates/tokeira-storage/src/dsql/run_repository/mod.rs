@@ -10,7 +10,6 @@ use std::{sync::Arc, time::Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use sqlx::Connection;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     ActivityOp, BasicKernel, DispatchOp, HistoryEvent, LoadedRun, ReplayContext, TimerOp,
@@ -36,7 +35,7 @@ use crate::{
     workflow_is_open_and_pinned_to_version,
 };
 
-use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert};
+use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, DsqlPermit, codec, convert};
 use crate::recovery_index::{
     RecoveryCursor, RecoveryPage, RecoveryPhase, read_candidate_page, recovery_needed,
 };
@@ -87,6 +86,8 @@ mod bulk_write;
 #[cfg(all(test, feature = "dsql-integration"))]
 mod bulk_write_tests;
 mod commit;
+#[cfg(all(test, feature = "dsql-integration"))]
+mod contract_tests;
 mod delete;
 mod dispatch;
 #[cfg(all(test, feature = "dsql-integration"))]
@@ -761,10 +762,7 @@ impl RunRepository for DsqlRunRepository {
             LoadedRun::Existing(state) => Ok(LoadedRun::Existing(state)),
             LoadedRun::Absent => {
                 let mut permit = self.director.acquire(DbClass::Read).await?;
-                let mut tx = permit
-                    .connection()?
-                    .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                    .await?;
+                let mut tx = permit.begin_read_only().await?;
                 let row = sqlx::query_as::<_, (Vec<u8>, Option<i32>)>(
                     "SELECT state_data,state_parts FROM outbound_retained_run WHERE run_key=$1",
                 )

@@ -52,7 +52,7 @@ impl DsqlRunRepository {
                 }
 
                 let mut permit = self.director.acquire(DbClass::Commit).await?;
-                let mut tx = permit.connection()?.begin().await?;
+                let mut tx = permit.begin().await?;
                 let mut state = transition.next_state.clone();
                 let shard_id = tokeira_types::execution_home_bundle(
                     state.namespace_id.0.as_bytes(),

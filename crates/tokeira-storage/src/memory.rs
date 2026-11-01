@@ -3290,6 +3290,8 @@ fn principals_len(principals: &[Option<tokeira_types::EventPrincipal>]) -> Resul
 }
 
 #[cfg(test)]
+mod contract_tests;
+#[cfg(test)]
 #[path = "projection_accumulator_tests.rs"]
 pub(crate) mod projection_accumulator_tests;
 

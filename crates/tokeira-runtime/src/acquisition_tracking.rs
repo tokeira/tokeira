@@ -192,6 +192,12 @@ impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
             .cloned()
     }
 
+    #[cfg(all(test, feature = "dsql-integration"))]
+    pub(crate) fn generation(&self, key: &K) -> Option<u64> {
+        self.tracked(key)
+            .and_then(|entry| entry.acquisition.map(|acquisition| acquisition.generation))
+    }
+
     pub(crate) fn remove(&self, key: &K) {
         let mut inner = self.entries.lock().expect("tracking lock poisoned");
         if self.submitted_revision.is_none_or(|revision| {

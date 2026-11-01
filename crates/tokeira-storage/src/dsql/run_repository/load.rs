@@ -140,22 +140,20 @@ impl BatchRead {
     /// batch row of the run, so a batch in the snapshot has its parts there too.
     async fn whole(
         self,
-        connection: &mut PgConnection,
+        permit: &mut DsqlPermit,
         run_key: RunKey,
     ) -> Result<(usize, Vec<WholeBatch>)> {
-        let rows = self.rows(connection, run_key).await?;
+        let rows = self.rows(permit.connection()?, run_key).await?;
         if !run_value_parts::any_split(&rows) {
             let read = rows.len();
             return Ok((
                 read,
-                run_value_parts::join_batches(connection, run_key, rows).await?,
+                run_value_parts::join_batches(permit.connection()?, run_key, rows).await?,
             ));
         }
         #[cfg(all(test, feature = "dsql-integration"))]
         super::pause_point::reached(super::pause_point::PauseKey::HistoryParts(run_key)).await;
-        let mut tx = connection
-            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .await?;
+        let mut tx = permit.begin_read_only().await?;
         let rows = self.rows(&mut tx, run_key).await?;
         let read = rows.len();
         let batches = run_value_parts::join_batches(&mut tx, run_key, rows).await?;
@@ -301,9 +299,7 @@ impl DsqlRunRepository {
             )
             .await;
             crate::read_probe::sql(run_key, "sql/begin-read-snapshot");
-            let mut tx = connection
-                .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                .await?;
+            let mut tx = permit.begin_read_only().await?;
             crate::read_probe::sql(run_key, "sql/hot-state-snapshot");
             let row = sqlx::query_as::<_, (Vec<u8>, Option<i64>, Option<i32>)>(READ_HOT_STATE)
                 .bind(run_key.0)
@@ -453,7 +449,7 @@ impl DsqlRunRepository {
             {
                 let mut permit = self.director.acquire(DbClass::Read).await?;
                 let (read, batches) = BatchRead::Event(event_id)
-                    .whole(permit.connection()?, run_key)
+                    .whole(&mut permit, run_key)
                     .await?;
                 metrics::record_dsql_rows_read("read_history_event", read);
                 let Some(batch) = batches.into_iter().next() else {
@@ -502,7 +498,7 @@ impl DsqlRunRepository {
                         after_event_id: batch_cursor,
                         limit: batch_page,
                     }
-                    .whole(permit.connection()?, run_key)
+                    .whole(&mut permit, run_key)
                     .await?;
                     rows_read += read;
                     let more_batches = read == HISTORY_BATCH_PAGE;
@@ -631,7 +627,7 @@ impl DsqlRunRepository {
             Some(self.shard_for_run_key(run_key)),
             {
                 let mut permit = self.director.acquire(DbClass::Read).await?;
-                let (_, batches) = BatchRead::All.whole(permit.connection()?, run_key).await?;
+                let (_, batches) = BatchRead::All.whole(&mut permit, run_key).await?;
 
                 batches
                     .into_iter()

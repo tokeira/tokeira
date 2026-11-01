@@ -43,7 +43,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
-use sqlx::{Connection, PgConnection, Row, postgres::PgRow};
+use sqlx::{PgConnection, Row, postgres::PgRow};
 use tokeira_chasm::{ChasmNode, ExecutionKey, LifecycleState, VersionedTransition};
 use uuid::Uuid;
 
@@ -53,7 +53,7 @@ use crate::{
 };
 
 use super::{
-    DsqlConnectionAcquirer, DsqlConnectionDirector, DsqlRunRepository, codec,
+    DsqlConnectionAcquirer, DsqlConnectionDirector, DsqlPermit, DsqlRunRepository, codec,
     value_parts::{self, Split},
 };
 
@@ -278,32 +278,30 @@ impl DsqlChasmNodeRepository {
     /// read and a read of the parts would replace them, and the parts of one
     /// version of the data would join the first part of another.
     async fn read_nodes(
-        connection: &mut PgConnection,
+        permit: &mut DsqlPermit,
         ids: ExecutionIds<'_>,
         nodes: Nodes<'_>,
     ) -> Result<Vec<(Vec<u8>, ChasmNode)>> {
-        let rows = Self::select_nodes(connection, ids, nodes).await?;
+        let rows = Self::select_nodes(permit.connection()?, ids, nodes).await?;
         if !Self::any_split(&rows)? {
-            return Self::join_nodes(connection, ids, &rows).await;
+            return Self::join_nodes(permit.connection()?, ids, &rows).await;
         }
         #[cfg(all(test, feature = "dsql-integration"))]
         super::run_repository::pause_point::reached(
             super::run_repository::pause_point::PauseKey::NodeParts(ids.2),
         )
         .await;
-        Self::read_nodes_in_snapshot(connection, ids, nodes).await
+        Self::read_nodes_in_snapshot(permit, ids, nodes).await
     }
 
     /// Read the nodes `nodes` selects and their parts in one read-only snapshot
     /// of its own, each with its data whole.
     async fn read_nodes_in_snapshot(
-        connection: &mut PgConnection,
+        permit: &mut DsqlPermit,
         ids: ExecutionIds<'_>,
         nodes: Nodes<'_>,
     ) -> Result<Vec<(Vec<u8>, ChasmNode)>> {
-        let mut tx = connection
-            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .await?;
+        let mut tx = permit.begin_read_only().await?;
         let rows = Self::select_nodes(&mut tx, ids, nodes).await?;
         let nodes = Self::join_nodes(&mut tx, ids, &rows).await?;
         tx.commit().await?;
@@ -318,7 +316,7 @@ impl DsqlChasmNodeRepository {
     ) -> Result<Vec<(Vec<u8>, ChasmNode)>> {
         let ids = Self::key_parts(key)?;
         let mut permit = self.director.acquire(DbClass::Read).await?;
-        Self::read_nodes(permit.connection()?, ids, nodes).await
+        Self::read_nodes(&mut permit, ids, nodes).await
     }
 
     fn current_from_row(row: &sqlx::postgres::PgRow) -> Result<CurrentRun> {
@@ -552,7 +550,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
     ) -> Result<NodePersistOutcome> {
         let ids = Self::key_parts(key)?;
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
 
         // Phase 1 — check every fence before mutating anything (all-or-nothing).
         let stored_parts = match Self::check_fences(&mut tx, ids, &batch).await? {
@@ -591,7 +589,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         let ids = Self::key_parts(key)?;
         let (namespace_id, business_id, _) = ids;
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
 
         // Admission may have observed a legacy pointer before backfill. Use the
         // same effective lookup here; a new scoped pointer must not erase it just
@@ -763,7 +761,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
     async fn backfill_current_executions(&self, archetype_id: u32, batch: usize) -> Result<usize> {
         anyhow::ensure!(batch > 0, "CHASM backfill batch must be nonzero");
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         // Copied keys are durable progress: exclude them before LIMIT, otherwise a
         // full first page would make the next call return zero prematurely. This
         // ordered remaining-key scan resumes after crashes without an in-memory
@@ -853,7 +851,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
     async fn delete_execution(&self, key: &ExecutionKey) -> Result<()> {
         let (namespace_id, business_id, run_id) = Self::key_parts(key)?;
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         sqlx::query(
             "DELETE FROM chasm_node
              WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3",
@@ -921,7 +919,7 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
                 // the others'. An execution deleted since the scan's read is left
                 // out, as if the scan had come a moment later.
                 Self::read_nodes_in_snapshot(
-                    connection,
+                    &mut permit,
                     (namespace_id, &business_id, run_id),
                     Nodes::At(""),
                 )

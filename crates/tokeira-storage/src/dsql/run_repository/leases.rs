@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use sqlx::Connection;
 use time::OffsetDateTime;
 use tokeira_types::{GenerationCounter, ShardEpoch, ShardId};
 use tracing::instrument;
@@ -82,7 +81,7 @@ impl LeaseRepository for DsqlRunRepository {
             let new_expiry = app_now + self.lease_duration;
 
             let mut permit = self.director.acquire(DbClass::Control).await?;
-            let mut tx = permit.connection()?.begin().await?;
+            let mut tx = permit.begin().await?;
 
             // Each statement writes the epoch only when ownership changes: the
             // owner's refresh conflicts with none of its fenced writes, and a
@@ -187,7 +186,7 @@ impl LeaseRepository for DsqlRunRepository {
             let new_expiry = OffsetDateTime::now_utc() + self.lease_duration;
 
             let mut permit = self.director.acquire(DbClass::Control).await?;
-            let mut tx = permit.connection()?.begin().await?;
+            let mut tx = permit.begin().await?;
 
             // One conditional update, which writes no key column and reads
             // nothing `FOR UPDATE`, so it aborts none of the owner's fenced
@@ -300,7 +299,7 @@ impl LeaseRepository for DsqlRunRepository {
             let shard_uuid = Self::shard_id_to_uuid(bundle);
             let caller_epoch = epoch_to_sql(epoch)?;
             let mut permit = self.director.acquire(DbClass::Control).await?;
-            let mut tx = permit.connection()?.begin().await?;
+            let mut tx = permit.begin().await?;
             let row = sqlx::query_as::<_, (i64,)>(RELEASE_LEASE)
                 .bind(shard_uuid)
                 .bind(&owner)

@@ -19,7 +19,7 @@ impl DsqlRunRepository {
             .await?;
             metrics::record_dsql_rows_read("has_open_pinned_workflows", rows.len());
 
-            for (run_key, state_data) in whole_states(permit.connection()?, rows).await? {
+            for (run_key, state_data) in whole_states(&mut permit, rows).await? {
                 // A run deleted since the scan read it pins nothing.
                 let Some(state_data) = state_data else {
                     continue;
@@ -109,7 +109,7 @@ impl DsqlRunRepository {
                         // Every row read stays in the page, a run deleted since as
                         // `None`, because the page's count of rows decides whether
                         // its phase has more.
-                        whole_states(permit.connection()?, rows)
+                        whole_states(&mut permit, rows)
                             .await?
                             .into_iter()
                             .map(|(run_key, state_data)| {

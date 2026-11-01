@@ -59,6 +59,75 @@ async fn stop<R: RunRepository + 'static>(runtime: &TokeiraRuntime<R>) {
         .unwrap();
 }
 
+fn assert_start_reads(
+    report: &ReadReport,
+    sticky: bool,
+    warm: bool,
+    conflict: bool,
+) -> BTreeMap<(&'static str, &'static str), usize> {
+    let mut expected = BTreeMap::from([
+        (("queue-home/resolve", "logical"), 1),
+        (("execution-owner/metadata", "logical"), 1),
+        (("execution-owner/resolve", "logical"), 1),
+    ]);
+    for (phase, present) in [
+        ("execution-owner/sticky-binding", sticky),
+        ("execution-owner/admission-cache", !warm),
+        ("execution-owner/lane-cache-or-retry", conflict),
+    ] {
+        if present {
+            expected.insert((phase, "logical"), 1);
+        }
+    }
+    // The probe follows a run across tasks, so discovery hydration can overlap
+    // a slow remote start. Keep those unscoped reads in the reported evidence,
+    // but outside the start metric (queue-home-delivery design, counting method).
+    // Compare every scoped phase, rather than a total that can hide a missing
+    // read in one phase behind an extra read in another.
+    let actual = report
+        .counts
+        .iter()
+        .filter(|((phase, kind), _)| *kind == "logical" && *phase != "outside-start")
+        .map(|(key, count)| (*key, *count))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(actual, expected, "{report:?}");
+    actual
+}
+
+#[test]
+fn read_baseline_separates_background_reads_and_rejects_extra_start_reads() {
+    let report = ReadReport {
+        attempt: "overlapping-discovery".into(),
+        counts: BTreeMap::from([
+            (("queue-home/resolve", "logical"), 1),
+            (("execution-owner/metadata", "logical"), 1),
+            (("execution-owner/resolve", "logical"), 1),
+            (("execution-owner/admission-cache", "logical"), 1),
+            (("outside-start", "logical"), 1),
+        ]),
+    };
+    let measured = assert_start_reads(&report, false, false, false);
+    assert_eq!(measured.values().sum::<usize>(), 4);
+    assert_eq!(report.counts[&("outside-start", "logical")], 1);
+    for phase in ["execution-owner/resolve", "unexpected-start-phase"] {
+        let mut extra = report.clone();
+        *extra.counts.entry((phase, "logical")).or_default() += 1;
+        assert!(
+            std::panic::catch_unwind(|| assert_start_reads(&extra, false, false, false)).is_err()
+        );
+    }
+    let mut misplaced = report.clone();
+    misplaced
+        .counts
+        .remove(&("execution-owner/resolve", "logical"));
+    misplaced
+        .counts
+        .insert(("execution-owner/metadata", "logical"), 2);
+    assert!(
+        std::panic::catch_unwind(|| assert_start_reads(&misplaced, false, false, false)).is_err()
+    );
+}
+
 async fn case<R: RunRepository + LeaseRepository + 'static>(
     repo: Arc<R>,
     sticky: bool,
@@ -346,30 +415,7 @@ async fn queue_home_delivery_exploration_read_baseline() {
                     false,
                 )
                 .await;
-                let mut expected = BTreeMap::from([
-                    (("queue-home/resolve", "logical"), 1),
-                    (("execution-owner/metadata", "logical"), 1),
-                    (("execution-owner/resolve", "logical"), 1),
-                ]);
-                for (phase, present) in [
-                    ("execution-owner/sticky-binding", sticky),
-                    ("execution-owner/admission-cache", !warm),
-                    ("execution-owner/lane-cache-or-retry", conflict),
-                ] {
-                    if present {
-                        expected.insert((phase, "logical"), 1);
-                    }
-                }
-                assert_eq!(
-                    report
-                        .counts
-                        .iter()
-                        .filter(|((_, kind), _)| *kind == "logical")
-                        .map(|(key, count)| (*key, *count))
-                        .collect::<BTreeMap<_, _>>(),
-                    expected,
-                    "{report:?}"
-                );
+                assert_start_reads(&report, sticky, warm, conflict);
                 let owner_loads: usize = report
                     .counts
                     .iter()
@@ -453,21 +499,8 @@ async fn queue_home_delivery_live_read_baseline() -> Result<()> {
             for warm in [false, true] {
                 for conflict in [false, true] {
                     let report = case(repo.clone(), sticky, warm, conflict, split).await;
-                    let logical: usize = report
-                        .counts
-                        .iter()
-                        .filter(|((_, kind), _)| *kind == "logical")
-                        .map(|(_, n)| *n)
-                        .sum();
-                    assert_eq!(
-                        logical,
-                        3 + usize::from(sticky) + usize::from(!warm) + usize::from(conflict),
-                        "{report:?}"
-                    );
-                    for ((purpose, kind), count) in &report.counts {
-                        if *kind != "logical" {
-                            continue;
-                        }
+                    let logical = assert_start_reads(&report, sticky, warm, conflict);
+                    for ((purpose, _), count) in &logical {
                         assert_eq!(
                             report.counts.get(&(*purpose, "sql/hot-state-fast")),
                             Some(count),

@@ -1,0 +1,5 @@
+kind: internal
+body: Add shared memory and DSQL storage contract tests for pagination, projection retirement, atomic commits and lease fencing, with replayable case receipts and multi-page controller-managed acquisition coverage. Retire reservoir connections after cancelled transaction startup so a later writer cannot inherit an unfinished read-only transaction. Repair the interrupted-purge fixture's stale table-order assumption and distinguish remote-start reads from overlapping background hydration in the read baseline.
+time: 2026-10-31T21:16:00Z
+custom:
+    Slice: c5bfe536-5b52-44c6-aad6-34c91a14c787

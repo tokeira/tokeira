@@ -34,10 +34,7 @@ impl DsqlRunRepository {
     ) -> Result<OutboundPage<Uuid, PreparationToken>> {
         crate::outbound::validate_page_limit(limit)?;
         let mut permit = self.director.acquire(DbClass::Read).await?;
-        let mut tx = permit
-            .connection()?
-            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .await?;
+        let mut tx = permit.begin_read_only().await?;
         let through = match bound {
             ScanBound::Through(id) => Some(id),
             ScanBound::Capture => sqlx::query_scalar::<_, Uuid>("SELECT preparation_id FROM run_preparation WHERE source_home=$1 AND phase=4 ORDER BY preparation_id DESC LIMIT 1")
@@ -62,7 +59,7 @@ impl DsqlRunRepository {
         fence.ensure_home(token.home)?;
         loop {
             let mut permit = self.director.acquire(DbClass::Maintenance).await?;
-            let mut tx = permit.connection()?.begin().await?;
+            let mut tx = permit.begin().await?;
             if let Some(lost) = Self::check_fence(&mut tx, &fence, token.target_run).await? {
                 return Err(lost.into());
             }

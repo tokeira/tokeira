@@ -137,7 +137,7 @@ impl DsqlRunRepository {
     ) -> Result<()> {
         fence.ensure_home(home)?;
         let mut permit = self.director.acquire(DbClass::Maintenance).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         // The lease read must share the repair transaction: takeover/release
         // changes a key column, so even an otherwise uncontended derived write
         // conflicts at commit. Non-key renewal stays compatible.
@@ -198,7 +198,7 @@ impl DsqlRunRepository {
     ) -> Result<WorkflowDispatchPage> {
         let mut query = queue_page_query(range, after, limit);
         let mut permit = self.director.acquire(DbClass::Read).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let candidates = query
             .build()
             .fetch_all(&mut *tx)
@@ -228,7 +228,7 @@ impl DsqlRunRepository {
             query = query.bind(after.0);
         }
         let mut permit = self.director.acquire(DbClass::Read).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let keys = query.fetch_all(&mut *tx).await?;
         tx.commit().await?;
         Ok(keys.into_iter().map(RunKey).collect())

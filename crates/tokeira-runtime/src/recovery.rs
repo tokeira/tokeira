@@ -80,7 +80,7 @@ pub struct SweepResult {
 
 /// Runs the sweep decodes per page of recovery candidates; it holds one page
 /// of states at a time.
-const RECOVERY_PAGE: usize = 100;
+pub(crate) const RECOVERY_PAGE: usize = 100;
 
 /// Rows the sweep reads per page of due timers. A timer row is a few dozen
 /// bytes.

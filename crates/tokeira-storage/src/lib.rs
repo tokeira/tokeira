@@ -29,6 +29,8 @@ mod bug_condition_exploration_tests;
 mod bulk_write_tests;
 pub mod chasm;
 pub mod codec;
+#[cfg(test)]
+mod contract_tests;
 #[cfg(feature = "dsql")]
 pub mod dsql;
 mod growth;

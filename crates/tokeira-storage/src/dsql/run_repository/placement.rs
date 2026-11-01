@@ -7,7 +7,7 @@
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result, ensure};
-use sqlx::{Connection, Postgres, QueryBuilder};
+use sqlx::{Postgres, QueryBuilder};
 use time::OffsetDateTime;
 use tokeira_types::{NamespaceId, RunKey, ShardId, WorkflowId, execution_home_bundle};
 use uuid::Uuid;
@@ -165,7 +165,7 @@ impl DsqlRunRepository {
 
     async fn placement_page(&self) -> Result<PlacementProgress> {
         let mut permit = self.director.acquire(DbClass::Maintenance).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let marker = sqlx::query_as::<_, (i64, i64, Vec<u8>)>(
             "SELECT shard_count, revision, progress_data FROM workflow_placement_upgrade WHERE name=$1",
         ).bind(PLACEMENT_UPGRADE).fetch_optional(&mut *tx).await?;

@@ -121,7 +121,7 @@ impl DsqlRunRepository {
             convert::i64_from_u64(closing.next_state.transition_seq.0, "transition_seq")?;
             convert::i64_from_u64(successor.next_state.transition_seq.0, "transition_seq")?;
             let mut permit = self.director.acquire(DbClass::Commit).await?;
-            let tx = permit.connection()?.begin().await?;
+            let tx = permit.begin().await?;
             Box::pin(execute_pair(SqlPair {
                 tx,
                 closing_state: closing.next_state.clone(),

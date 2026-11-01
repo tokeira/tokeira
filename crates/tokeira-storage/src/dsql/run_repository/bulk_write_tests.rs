@@ -249,8 +249,12 @@ async fn dsql_bulk_interrupted_deletion() -> Result<()> {
     let before = fixture.owned_rows(state.run_key).await?;
     assert_eq!((before.hot, before.workflow_dispatch), (0, 0));
 
-    let request_dedupe = &PURGE_TABLES[0];
-    assert_eq!(request_dedupe.table, "request_dedupe");
+    // Other purge tables may precede dedupe; this interruption needs the
+    // fixture's many request rows, not the production table ordering.
+    let request_dedupe = PURGE_TABLES
+        .iter()
+        .find(|table| table.table == "request_dedupe")
+        .expect("run purging includes request deduplication records");
     let purged = repo
         .purge_page(state.run_key, request_dedupe, MAX_ROWS_PER_TRANSACTION)
         .await?;

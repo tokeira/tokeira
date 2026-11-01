@@ -9,7 +9,7 @@ use std::{sync::Arc, time::Instant};
 
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
-use sqlx::{Connection, PgConnection, Postgres, QueryBuilder};
+use sqlx::{PgConnection, Postgres, QueryBuilder};
 use time::OffsetDateTime;
 use tokeira_types::{RunKey, TransitionSeq};
 use tracing::instrument;
@@ -107,9 +107,7 @@ impl ProjectionLog for DsqlProjectionLog {
         let (images, oldest_written_at) = if image_page_needs_snapshot(&rows) {
             // Throw away the first read. A deletion commits the image and its parts
             // together, so only a snapshot that rereads both can return it whole.
-            let mut tx = connection
-                .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                .await?;
+            let mut tx = permit.begin_read_only().await?;
             rows = read.rows(&mut tx).await?;
             let oldest = rows.iter().map(|row| row.3).min();
             let images = decode_projection_rows(&mut tx, partition_id, fanout, rows).await?;
@@ -149,7 +147,7 @@ impl ProjectionLog for DsqlProjectionLog {
         let mut chunk_len = DELETE_STATEMENT_KEYS.min(keys.len());
         while offset < keys.len() {
             let chunk = &keys[offset..offset + chunk_len];
-            let mut tx = permit.connection()?.begin().await?;
+            let mut tx = permit.begin().await?;
             let mut query = QueryBuilder::new("");
             push_delete_images(&mut query, db_partition_id, db_fanout, chunk)?;
             query.push(" RETURNING run_key, transition_seq, context_parts");

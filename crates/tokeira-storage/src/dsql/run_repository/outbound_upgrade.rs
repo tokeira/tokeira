@@ -143,7 +143,7 @@ impl DsqlRunRepository {
             let pointer = super::outbound_upgrade_parts::StatePointer::new(&bytes)?;
             loop {
                 let mut permit = self.director.acquire(DbClass::Maintenance).await?;
-                let mut tx = permit.connection()?.begin().await?;
+                let mut tx = permit.begin().await?;
                 validate_stage(&mut tx, expected, write).await?;
                 let obsolete: Vec<(Uuid, i32)> = sqlx::query_as("SELECT generation,part_no FROM outbound_upgrade_state_part WHERE run_key=$1 AND generation <> $2 ORDER BY generation,part_no LIMIT 900")
                     .bind(key.0).bind(pointer.generation).fetch_all(&mut *tx).await?;
@@ -157,7 +157,7 @@ impl DsqlRunRepository {
             }
             for (page, chunk) in bytes.chunks(4 * value_parts::PART_BYTES).enumerate() {
                 let mut permit = self.director.acquire(DbClass::Maintenance).await?;
-                let mut tx = permit.connection()?.begin().await?;
+                let mut tx = permit.begin().await?;
                 validate_stage(&mut tx, expected, write).await?;
                 for (index, part) in chunk.chunks(value_parts::PART_BYTES).enumerate() {
                     let number = i32::try_from(page * 4 + index)?;
@@ -181,7 +181,7 @@ impl DsqlRunRepository {
         // thousands of pending operations; no page guesses a close obligation.
         loop {
             let mut permit = self.director.acquire(DbClass::Maintenance).await?;
-            let mut tx = permit.connection()?.begin().await?;
+            let mut tx = permit.begin().await?;
             validate_stage(&mut tx, expected, write).await?;
             let keys: Vec<(i16, i64)> = sqlx::query_as("SELECT kind,initiating_event_id FROM run_operation WHERE source_run_key=$1 ORDER BY kind,initiating_event_id LIMIT 900")
                 .bind(key.0).fetch_all(&mut *tx).await?;
@@ -201,7 +201,7 @@ impl DsqlRunRepository {
         let operations = crate::derive_operations(&write.state, home)?;
         for page in operations.chunks(100) {
             let mut permit = self.director.acquire(DbClass::Maintenance).await?;
-            let mut tx = permit.connection()?.begin().await?;
+            let mut tx = permit.begin().await?;
             validate_stage(&mut tx, expected, write).await?;
             ensure!(
                 postcard::to_allocvec(page)?.len() + 8192
@@ -218,10 +218,7 @@ impl DsqlRunRepository {
 
     pub(super) async fn do_outbound_upgrade_status(&self) -> Result<OutboundUpgradeStatus> {
         let mut permit = self.director.acquire(DbClass::Read).await?;
-        let mut tx = permit
-            .connection()?
-            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .await?;
+        let mut tx = permit.begin_read_only().await?;
         let (pending_intents, oldest_intent_at): (i64, Option<OffsetDateTime>) =
             sqlx::query_as("SELECT count(*),min(created_at) FROM run_intent")
                 .fetch_one(&mut *tx)
@@ -241,7 +238,7 @@ impl DsqlRunRepository {
         after: Option<RunKey>,
     ) -> Result<Option<WorkflowState>> {
         let mut permit = self.director.acquire(DbClass::Read).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let state = match next_key(&mut tx, after).await? {
             Some(key) => super::outbound::read_source(&mut tx, key).await?,
             None => None,
@@ -252,7 +249,7 @@ impl DsqlRunRepository {
 
     pub(super) async fn do_ensure_outbound_prepared(&self) -> Result<()> {
         let mut permit = self.director.acquire(DbClass::Maintenance).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let existing = marker(&mut tx, true).await?;
         if let Some(progress) = existing {
             ensure!(
@@ -294,7 +291,7 @@ impl DsqlRunRepository {
             None
         };
         let mut permit = self.director.acquire(DbClass::Maintenance).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         ensure!(
             marker(&mut tx, true).await? == expected,
             "maintenance revision changed; review or resume the owning plan"

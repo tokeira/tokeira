@@ -331,10 +331,7 @@ impl DsqlRunRepository {
     ) -> Result<OutboundPage<OperationKey, OperationRow>> {
         crate::outbound::validate_page_limit(limit)?;
         let mut permit = self.director.acquire(DbClass::Read).await?;
-        let mut tx = permit
-            .connection()?
-            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .await?;
+        let mut tx = permit.begin_read_only().await?;
         let through = match bound {
             ScanBound::Through(key) => Some(key),
             ScanBound::Capture => sqlx::query_as::<_, (Uuid, i64)>("SELECT source_run_key,initiating_event_id FROM run_operation WHERE source_home=$1 AND kind=$2 AND EXISTS(SELECT 1 FROM workflow_hot WHERE run_key=run_operation.source_run_key) ORDER BY source_run_key DESC,initiating_event_id DESC LIMIT 1")
@@ -390,10 +387,7 @@ impl DsqlRunRepository {
     ) -> Result<OutboundPage<IntentKey, IntentDescriptor>> {
         crate::outbound::validate_page_limit(limit)?;
         let mut permit = self.director.acquire(DbClass::Read).await?;
-        let mut tx = permit
-            .connection()?
-            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .await?;
+        let mut tx = permit.begin_read_only().await?;
         let through = match bound {
             ScanBound::Through(key) => Some(key),
             ScanBound::Capture => sqlx::query("SELECT source_run_key,intent_id,source_home,close_seq,kind,created_at FROM run_intent WHERE source_home=$1 ORDER BY source_run_key DESC,intent_id DESC LIMIT 1")
@@ -438,10 +432,7 @@ impl DsqlRunRepository {
 
     pub(super) async fn do_load_intent(&self, key: IntentKey) -> Result<Option<IntentRow>> {
         let mut permit = self.director.acquire(DbClass::Read).await?;
-        let mut tx = permit
-            .connection()?
-            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .await?;
+        let mut tx = permit.begin_read_only().await?;
         let row = load_intent(&mut tx, key).await?;
         tx.commit().await?;
         Ok(row)
@@ -455,7 +446,7 @@ impl DsqlRunRepository {
     ) -> Result<()> {
         fence.ensure_home(home)?;
         let mut permit = self.director.acquire(DbClass::Maintenance).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         if let Some(lost) = Self::check_fence(&mut tx, &fence, run).await? {
             return Err(lost.into());
         }
@@ -492,7 +483,7 @@ impl DsqlRunRepository {
             .into());
         }
         let mut permit = self.director.acquire(DbClass::Maintenance).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         if let Some(lost) = Self::check_fence(&mut tx, &fence, proof.key.source_run).await? {
             return Err(lost.into());
         }

@@ -197,7 +197,7 @@ impl DsqlRunRepository {
         record_dsql_operation!(self, "abandon_materialization", None, {
             retry_on_conflict(|| async {
                 let mut permit = self.director.acquire(DbClass::Commit).await?;
-                let mut tx = permit.connection()?.begin().await?;
+                let mut tx = permit.begin().await?;
                 if let Some(lost) = Self::check_fence(&mut tx, fence, run_key).await? {
                     tx.rollback().await?;
                     return Err(lost.into());
@@ -265,7 +265,7 @@ impl DsqlRunRepository {
         limit: usize,
     ) -> Result<usize> {
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         if !ordinary_purge_valid(&mut tx, run_key).await? {
             return Ok(0);
         }
@@ -297,7 +297,7 @@ impl DsqlRunRepository {
         // A page leaves one row of the budget for the record.
         let page = MAX_ROWS_PER_TRANSACTION - 5;
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         if !ordinary_purge_valid(&mut tx, run_key).await? {
             return Ok(true);
         }
@@ -523,7 +523,7 @@ impl DsqlRunRepository {
     )> {
         // The commit class, as for every step of this write operation.
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let base_row = sqlx::query_as::<_, (Vec<u8>, Option<i32>)>(
             "SELECT state_data, state_parts FROM workflow_hot WHERE run_key = $1",
         )
@@ -584,7 +584,7 @@ impl DsqlRunRepository {
         fence: &WriteFence,
     ) -> Result<()> {
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         if let Some(lost) = Self::check_fence(&mut tx, fence, run_key).await? {
             tx.rollback().await?;
             return Err(lost.into());
@@ -644,7 +644,7 @@ impl DsqlRunRepository {
         #[cfg(all(test, feature = "dsql-integration"))]
         super::pause_point::reached(super::pause_point::PauseKey::Page(run_key)).await;
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         if let Some(lost) = Self::check_fence(&mut tx, fence, run_key).await? {
             tx.rollback().await?;
             return Err(lost.into());
@@ -707,7 +707,7 @@ impl DsqlRunRepository {
         fence: &WriteFence,
     ) -> Result<()> {
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         if let Some(lost) = Self::check_fence(&mut tx, fence, run_key).await? {
             tx.rollback().await?;
             return Err(lost.into());

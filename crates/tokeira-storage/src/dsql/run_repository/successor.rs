@@ -67,7 +67,7 @@ impl DsqlRunRepository {
         let key = Self::current_execution_key(state.namespace_id, &state.workflow_id);
         let result: Result<CommitResult> = async {
             let mut permit = self.director.acquire(DbClass::Commit).await?;
-            let mut tx = permit.connection()?.begin().await?;
+            let mut tx = permit.begin().await?;
             if let Some(lost) = Self::check_fence(&mut tx, &fence, run).await? {
                 return Err(lost.into());
             }

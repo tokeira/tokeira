@@ -97,6 +97,17 @@ struct TimeoutEntries {
 }
 
 impl WftTimeoutTrackingState {
+    #[cfg(all(test, feature = "dsql-integration"))]
+    pub(crate) fn generation(&self, run_key: RunKey) -> Option<u64> {
+        self.inner
+            .lock()
+            .expect("inner lock poisoned")
+            .entries
+            .get(&run_key)
+            .and_then(|tracked| tracked.acquisition.as_ref())
+            .map(|acquisition| acquisition.generation)
+    }
+
     #[cfg(test)]
     pub(crate) fn pause_next_recovery(
         &self,

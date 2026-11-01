@@ -5,7 +5,7 @@
 //! API calls cannot overfill the namespace or silently replace a rule.
 
 use anyhow::{Result, anyhow};
-use sqlx::{Connection, Row};
+use sqlx::Row;
 use tokeira_types::{NamespaceId, WorkflowRuleRecord};
 
 use crate::{DbClass, WorkflowRuleCreateResult, WorkflowRuleDeleteResult};
@@ -22,7 +22,7 @@ impl DsqlRunRepository {
         let max_rules = i64::try_from(max_rules)
             .map_err(|_| anyhow!("workflow rule limit {max_rules} exceeds i64 range"))?;
         let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
 
         let duplicate =
             sqlx::query("SELECT 1 FROM workflow_rules WHERE namespace_id = $1 AND rule_id = $2")

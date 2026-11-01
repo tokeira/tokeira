@@ -59,7 +59,7 @@ impl DsqlRunRepository {
                 fence.ensure_home(execution_home_bundle)?;
 
                 let mut permit = self.director.acquire(DbClass::Commit).await?;
-                let mut tx = permit.connection()?.begin().await?;
+                let mut tx = permit.begin().await?;
 
                 // The fence read is the transaction's first statement
                 // (`bundle-lease-fence`).

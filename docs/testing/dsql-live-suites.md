@@ -16,6 +16,18 @@ minutes, longer than the default profile's three-minute ceiling.
 
 ## Shared-cluster order and isolation
 
+The [storage contract suite](storage-contract-tests.md) adds paired generated
+memory/DSQL assertions, strict ignored live entries and multi-page acquisition.
+On its disposable database, run its commit-generated projection cases first,
+then its other new storage cases and
+`storage_contract_live_acquisition_spans_recovery_pages`, with owned-row/lease
+cleanup, before the preparation-sensitive sequence below. The new fixtures
+prepare 4096 homes; the existing placement fixtures then reset their marker to
+eight homes. The new acquisition must precede that reset. Use immutable nextest
+archives and retain per-property case
+receipts as described in that matrix; a default pass does not establish live
+coverage.
+
 Run the preparation-sensitive suites in these separate commands, in this order,
 before any suite that acquires a shard lease. A nextest filter does not specify
 execution order. Placement preparation rejects every live lease, including the
@@ -23,17 +35,35 @@ lease left by `dsql_shard_leasing::stale_epoch_is_fenced_after_expired_takeover`
 The activity-input runtime fixture also prepares placement and belongs before
 lease-taking suites. Its repository and runtime use the same eight homes as
 the placement and acquisition fixtures.
-The queue-home remote-start read baseline also prepares placement before acquiring
-its two homes. Run it in this preparation-sensitive group; it closes and deletes
-each fixture run and releases both leases before the next case.
 
 ```bash
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_generated_complete_repair)'
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(placement_live_)'
 cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --test dsql_activity_inputs --test-threads 1
 cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs)'
+```
+
+Run the queue-home remote-start read baseline against a **separate freshly
+migrated disposable database**, selected through `TOKEIRA_DSQL_TEST_DATABASE_URL`.
+Its two runtimes acquire eight-home shards and recover every eligible run in
+those homes. Placement tests retain work there, which can exhaust this fixture's
+four-connection reservoir before the measured start. Database isolation preserves
+all 16 scenarios, exact read assertions and production admission behavior. The
+baseline closes and deletes each run and releases both leases between scenarios.
+Its report retains unscoped `outside-start` reads, including discovery hydration;
+assertions compare the exact logical counts of every scoped start phase and its
+physical SQL. Background reads do not enter the start metric, and unexpected
+scoped phases still fail.
+This isolated check may also run after the shared-database campaign; keep the
+live test processes serial.
+
+```bash
 cargo nextest run -p tokeira-edge --features dsql-integration --locked --profile dsql-live --lib -E 'test(queue_home_delivery_live_read_baseline)'
 ```
+
+Restore the shared-suite database selection before the remaining commands.
+Retain any failed shared-cluster attempt separately from the isolated baseline's
+source/archive identity, actual scenario count and cleanup evidence.
 
 Then run the remaining suites below. The generated complete-repair contract uses
 1024 logical homes and selects identities that derive to reserved home 1023; other

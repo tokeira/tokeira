@@ -231,7 +231,8 @@ pub(crate) async fn commit(backend: &impl Backend, transition: Transition) -> Re
     unreachable!("last attempt returns")
 }
 
-fn reference(state: &WorkflowState) -> Option<WorkflowDispatchRow> {
+/// Fixture-only dispatch oracle shared with the broader storage contract suite.
+pub(crate) fn reference(state: &WorkflowState) -> Option<WorkflowDispatchRow> {
     let pending = state.pending_workflow_task.as_ref()?;
     match (state.status, pending.started_event_id, pending.task_type) {
         (ExecutionStatus::Running, None, WorkflowTaskType::Normal) => {}

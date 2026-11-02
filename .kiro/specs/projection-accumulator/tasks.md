@@ -344,7 +344,7 @@ This graph describes implementation dependencies, not permission to delegate wor
 - Requirements, design and this task plan are approved. Completed checkboxes record
   implementation and executed validation, rather than design-only approval.
 
-## Execution evidence (2026-10-07)
+## Execution evidence
 
 - The unfixed Property 1 shrank to `versions = [None]`: one ordinary commit made
   one previous-image lookup when the assertion required zero. The same no-read
@@ -353,7 +353,7 @@ This graph describes implementation dependencies, not permission to delegate wor
   kernel/storage tests. Checkpoint 10 passed focused kernel/storage/runtime clippy
   and all 1,205 tests. All builds used the native `protoc` selected through the
   per-command `PROTOC` environment variable; no shared toolchain configuration changed.
-- Seven accumulator contracts passed on a fresh Aurora DSQL cluster in `eu-west-1`:
+- Seven accumulator contracts passed on a fresh Aurora DSQL cluster:
   100 generated cases for each applicable repository property, both commit entry
   points, actual SQLx statement observation, persisted blobs and full projection
   comparisons, plus six deterministic reader/writer schedules. The command was:

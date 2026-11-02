@@ -37,15 +37,15 @@
     - Done: `execute_migration_step` still checks idempotency first, and its tests pass. The retry tests
       run a migration that check refuses (`the_retried_migration_is_one_the_guarded_step_refuses`).
     - _Requirements: 3.1_
-  - [x] 3.4 Live run on an ephemeral DSQL cluster (profile `default`, `eu-west-1`, no deletion
+  - [x] 3.4 Live run on an ephemeral DSQL cluster (no deletion
     protection, tagged `purpose=tokeira-test`, deleted when the run ends):
     - `apply_connection` and `apply` each migrate the full corpus on a new cluster;
     - a second run applies nothing.
 
-    Record when the cluster was created and deleted, without identifiers.
-    - Done with `dsql_migration_runner` on 7 October 2026, one new cluster per path:
-      - `apply_connection` first: created 21:02:38Z, passed in 371.69 s, deleted 21:10:27Z;
-      - `apply` first: created 21:20:07Z, passed in 397.82 s, deleted 21:28:27Z.
+    Record that the cluster was created and deleted, without identifiers.
+    - Done with `dsql_migration_runner`, one new cluster per path, each deleted after its run:
+      - `apply_connection` first: passed in 371.69 s;
+      - `apply` first: passed in 397.82 s.
     - _Requirements: 2.1, 2.2, 3.4_
 
 - [x] 4. Checkpoint: run the full `AGENTS.md` §10.4 bar, then the live run in 3.4.

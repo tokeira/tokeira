@@ -273,7 +273,7 @@ may retire a recovery mechanism before its replacement is verified.
 
 ## Notes
 
-- Implementation and verification completed on 2 November 2026. The
+- Implementation and verification are complete. The
   [verification receipt](../../../docs/testing/activity-dispatch-verification.md)
   records the final 4,194-test workspace bar, all 18 property tags, nine shared
   100-case live properties, three 100-case physical race entries, transaction
@@ -306,7 +306,7 @@ may retire a recovery mechanism before its replacement is verified.
   user's approval of the final exact head under root §10.7.
 
 
-### Verification checkpoint — 2 November 2026
+### Verification checkpoint
 
 The shared scheduler and broker policy preservation properties pass 100 cases
 apiece. The real loopback gRPC read-count fixture passes fresh start, same-request

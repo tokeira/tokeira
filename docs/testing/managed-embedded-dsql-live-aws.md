@@ -26,7 +26,7 @@ Do not run it against an account or Region where creating and deleting a cluster
 authorized. Aurora DSQL meters compute, reads, writes, and storage; see AWS's current
 [billing description](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/billing-metering.html).
 
-## Preserved upstream schema-bootstrap reproduction — 26 August 2026
+## Preserved upstream schema-bootstrap reproduction
 
 This is an upstream Tokeira recovery defect, not an Odori integration defect. The live
 cluster and its private managed descriptor are the reproduction fixture. Preserve both:

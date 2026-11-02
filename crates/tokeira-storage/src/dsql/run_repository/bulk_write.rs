@@ -160,6 +160,8 @@ pub(super) enum CopyItem<'a> {
     },
     /// A timer row.
     Timer(&'a tokeira_kernel::TimerState),
+    /// Complete derived row staged while the successor remains unpublished.
+    Activity(crate::ActivityDispatchRow),
     /// A part after the first of the successor's state. The final transaction
     /// writes the state's row, with the first part and the count; until then no
     /// reader reads the part.
@@ -184,6 +186,7 @@ impl CopyItem<'_> {
             },
             Self::Timer(timer) => WriteCost::write(codec::encode_timer_state(timer)?.len()),
             Self::StatePart { data, .. } => WriteCost::write(data.len()),
+            Self::Activity(row) => row.write_cost()?,
         })
     }
 }
@@ -461,6 +464,11 @@ impl DsqlRunRepository {
                     });
                 }
                 items.extend(successor_state.timers.values().map(CopyItem::Timer));
+                items.extend(
+                    crate::derive_activity_dispatch(&successor_state, successor_shard)?
+                        .into_values()
+                        .map(CopyItem::Activity),
+                );
                 // A state over the part size has its other parts copied ahead of
                 // its row, which the final transaction writes, so that one stays
                 // as small as a whole state's.
@@ -480,6 +488,11 @@ impl DsqlRunRepository {
                     self.record_materialization(successor_run_key, successor_shard, &fence)
                 })
                 .await?;
+                while retry_on_conflict(|| {
+                    self.clear_materialization_activity_page(successor_run_key, &fence)
+                })
+                .await?
+                {}
                 for page in pages(&costs, WriteBudget::TRANSACTION) {
                     let page_items = &items[page];
                     retry_on_conflict(|| {
@@ -633,6 +646,38 @@ impl DsqlRunRepository {
         }
     }
 
+    async fn clear_materialization_activity_page(
+        &self,
+        run: RunKey,
+        fence: &WriteFence,
+    ) -> Result<bool> {
+        let mut permit = self.director.acquire(DbClass::Commit).await?;
+        let mut tx = permit.begin().await?;
+        if let Some(lost) = Self::check_fence(&mut tx, fence, run).await? {
+            tx.rollback().await?;
+            return Err(lost.into());
+        }
+        Self::ensure_materializing(&mut tx, run).await?;
+        // The target has no hot state and its materialization guard excludes
+        // writers. Raw run binding prevents cleanup of another hash slot; the
+        // fixed key page keeps orphan cleanup out of final publication's budget.
+        let keys: Vec<(Uuid,)> = sqlx::query_as(
+            "SELECT key FROM activity_dispatch WHERE run_key=$1 ORDER BY key LIMIT 64",
+        )
+        .bind(run.0)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (key,) in &keys {
+            sqlx::query("DELETE FROM activity_dispatch WHERE key=$1 AND run_key=$2")
+                .bind(key)
+                .bind(run.0)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(!keys.is_empty())
+    }
+
     pub(super) async fn copy_materialization_page(
         &self,
         run_key: RunKey,
@@ -672,6 +717,9 @@ impl DsqlRunRepository {
                         OnConflict::Keep,
                     )
                     .await?;
+                }
+                CopyItem::Activity(row) => {
+                    super::activity_dispatch::upsert(&mut tx, row).await?;
                 }
                 CopyItem::Timer(timer) => {
                     commit::upsert_timer(&mut tx, run_key, shard_id, timer).await?;
@@ -740,6 +788,9 @@ impl DsqlRunRepository {
         commit::insert_workflow_hot(&mut tx, run_key, shard_id, state, state_data, history_size)
             .await?;
         super::workflow_dispatch::maintain(&mut tx, state, shard_id).await?;
+        // Bounded cleanup and staging wrote exactly the desired activity set
+        // under this same bulk-write guard. No activity fanout belongs in the
+        // final visibility transaction, even for a reset with thousands of slots.
         commit::upsert_current_execution_start(&mut tx, run_key, state).await?;
         sqlx::query("DELETE FROM run_bulk_write WHERE run_key = $1")
             .bind(run_key.0)

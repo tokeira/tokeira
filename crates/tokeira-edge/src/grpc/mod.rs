@@ -1,3 +1,4 @@
+pub mod activity_dispatch;
 pub mod admin_service;
 pub mod errors;
 pub mod metadata;

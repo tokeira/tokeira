@@ -12,9 +12,9 @@ use tokeira_kernel::{
     WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    ActivityTimeoutScannerConfig, BacklogConfig, LaneConfig, NexusCompletionDeps,
-    NexusEndpointRegistry, NexusTimeoutScannerConfig, NoopNexusHttpClient, TimerScannerConfig,
-    TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    ActivityTimeoutScannerConfig, LaneConfig, NexusCompletionDeps, NexusEndpointRegistry,
+    NexusTimeoutScannerConfig, NoopNexusHttpClient, TimerScannerConfig, TokeiraRuntime,
+    WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -35,7 +35,6 @@ async fn start_and_signal_publish_workflow_tasks() -> Result<()> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("workflow-1".to_string());
@@ -120,7 +119,6 @@ async fn signal_with_start_existing_run_preserves_signal_metadata() -> Result<()
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("workflow-signal-with-start-existing".to_string());
@@ -173,7 +171,6 @@ async fn workflow_dispatch_paused_poll_is_empty_then_resume_mints_renewed_sequen
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("resumed-generation".into());
@@ -287,7 +284,6 @@ async fn occ_conflicts_are_retried_for_signals() -> Result<()> {
         },
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     ));
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("workflow-conflict".to_string());
@@ -337,7 +333,6 @@ async fn delayed_start_persists_due_timer_without_publishing_wft() -> Result<()>
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("delayed-workflow".to_string());
@@ -381,7 +376,6 @@ async fn client_cron_start_uses_durable_first_wft_backoff() -> Result<()> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("cron-workflow".to_string());
@@ -428,7 +422,6 @@ async fn cron_terminal_completion_authors_delayed_successor_run() -> Result<()> 
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("cron-successor-workflow".to_string());
@@ -875,12 +868,6 @@ async fn late_poller_rediscovers_workflow_task_after_offer_expiry() -> Result<()
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig {
-            activity_grace_window: tokio::time::Duration::from_millis(100),
-            grace_scan_interval: tokio::time::Duration::from_millis(25),
-            drain_interval: tokio::time::Duration::from_millis(50),
-            drain_batch_limit: 100,
-        },
     );
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("workflow-late-poller".to_string());
@@ -928,7 +915,6 @@ async fn burst_signals_produce_complete_history() -> Result<()> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     ));
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("workflow-burst".to_string());
@@ -983,7 +969,6 @@ async fn retryable_failure_starts_attempt_two_successor() -> Result<()> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("retry-successor-workflow".to_string());
@@ -1083,7 +1068,6 @@ async fn non_retryable_failure_is_terminal_without_successor() -> Result<()> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("retry-terminal-workflow".to_string());
@@ -1186,7 +1170,6 @@ fn runtime_with_store(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     )
 }
 
@@ -1197,7 +1180,6 @@ fn recovering_runtime_with_store(store: Arc<InMemoryStore>) -> TokeiraRuntime<In
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         ActivityTimeoutScannerConfig::default(),
         NexusTimeoutScannerConfig::default(),
         NexusEndpointRegistry::default(),

@@ -20,6 +20,9 @@
 // boxing is a deliberate decision, not a style fix (`large_enum_variant`).
 #![allow(clippy::too_many_arguments, clippy::large_enum_variant)]
 
+pub mod activity_dispatch;
+#[cfg(test)]
+mod activity_dispatch_tests;
 pub mod api;
 #[cfg(test)]
 mod atomic_successors_test_support;
@@ -31,6 +34,7 @@ pub mod chasm;
 pub mod codec;
 #[cfg(test)]
 mod contract_tests;
+mod dispatch_key;
 #[cfg(feature = "dsql")]
 pub mod dsql;
 mod growth;
@@ -62,6 +66,7 @@ pub mod workflow_dispatch;
 mod workflow_dispatch_tests;
 pub mod write_budget;
 
+pub use activity_dispatch::*;
 pub use api::*;
 pub use chasm::*;
 pub use memory::*;

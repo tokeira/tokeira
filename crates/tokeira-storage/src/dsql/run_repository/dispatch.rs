@@ -1,5 +1,20 @@
+//! Legacy backlog inspection and bounded, conditional disposal; never runtime delivery.
+
+use std::collections::BTreeMap;
+
+use sqlx::Row;
+
 use super::*;
 use crate::write_budget::{WriteBudget, WriteCost, pages};
+
+#[derive(Debug)]
+struct LegacyDisposalCopy<'a> {
+    key: Uuid,
+    run: Uuid,
+    kind: i16,
+    payload: &'a [u8],
+    activity_id: Option<String>,
+}
 
 const BACKLOG_STATS_BY_PRIORITY_SQL: &str = "
     SELECT priority_key, COUNT(*), MIN(scheduled_at)
@@ -34,9 +49,8 @@ const DRAIN_BACKLOG_SQL: &str = "
     LIMIT $6";
 
 pub(super) const DISPOSAL_FIRST_KEYS_SQL: &str =
-    "SELECT key, run_key, task_kind FROM dispatch_backlog ORDER BY key LIMIT $1";
-pub(super) const DISPOSAL_NEXT_KEYS_SQL: &str =
-    "SELECT key, run_key, task_kind FROM dispatch_backlog WHERE key>$1 ORDER BY key LIMIT $2";
+    "SELECT key, run_key, task_kind, payload_data FROM dispatch_backlog ORDER BY key LIMIT $1";
+pub(super) const DISPOSAL_NEXT_KEYS_SQL: &str = "SELECT key, run_key, task_kind, payload_data FROM dispatch_backlog WHERE key>$1 ORDER BY key LIMIT $2";
 
 impl DsqlRunRepository {
     pub(super) async fn do_dispose_workflow_backlog_page(
@@ -52,7 +66,7 @@ impl DsqlRunRepository {
         };
         // LIMIT bounds physical keys, including activities. Filtering first
         // would scan an arbitrarily long activity prefix to find 64 workflows.
-        let mut query = sqlx::query_as::<_, (Uuid, Uuid, i16)>(sql);
+        let mut query = sqlx::query_as::<_, (Uuid, Uuid, i16, Vec<u8>)>(sql);
         if let Some(after) = after {
             query = query.bind(after);
         }
@@ -60,13 +74,43 @@ impl DsqlRunRepository {
             .bind(crate::LEGACY_WORKFLOW_KEYS as i64)
             .fetch_all(&mut *tx)
             .await?;
-        let mut deleted = 0;
-        let mut workflows = 0;
-        for (key, run, kind) in &keys {
-            if *kind != TaskKind::Workflow.to_db_smallint() {
+        let mut copies = Vec::new();
+        for (key, run, kind, payload) in &keys {
+            let activity_id = if *kind == TaskKind::Activity.to_db_smallint() {
+                match codec::decode_backlog_payload(payload) {
+                    Ok((
+                        BacklogPayload::Activity {
+                            activity_id,
+                            schedule_event_id,
+                            attempt,
+                            ..
+                        },
+                        _,
+                    )) if !activity_id.is_empty() && schedule_event_id > 0 && attempt > 0 => {
+                        Some(activity_id)
+                    }
+                    _ => continue,
+                }
+            } else if *kind == TaskKind::Workflow.to_db_smallint() {
+                None
+            } else {
                 continue;
-            }
-            workflows += 1;
+            };
+            copies.push(LegacyDisposalCopy {
+                key: *key,
+                run: *run,
+                kind: *kind,
+                payload,
+                activity_id,
+            });
+        }
+        // The cursor remains the physical key page, but inspect copies of one
+        // run together. One transaction snapshot permits sharing its decoded
+        // authority and one bounded slot read without retaining 64 large states.
+        copies.sort_by_key(|copy| copy.run);
+        let mut deleted = 0;
+        for group in copies.chunk_by(|left, right| left.run == right.run) {
+            let run = group[0].run;
             let row = sqlx::query_as::<_, (Vec<u8>, Option<i32>)>(
                 "SELECT state_data, state_parts FROM workflow_hot WHERE run_key=$1",
             )
@@ -78,54 +122,125 @@ impl DsqlRunRepository {
             let state = match row {
                 None => Ok(None),
                 Some((first, count)) => {
-                    super::run_value_parts::join_state(&mut tx, RunKey(*run), first, count)
+                    super::run_value_parts::join_state(&mut tx, RunKey(run), first, count)
                         .await
-                        .and_then(|bytes| codec::decode_workflow_state(RunKey(*run), &bytes))
+                        .and_then(|bytes| codec::decode_workflow_state(RunKey(run), &bytes))
                         .map(Some)
                 }
             };
             let state = match state {
                 Ok(state) => state,
                 Err(error) => {
-                    tracing::warn!(%key, run_key=%run, ?error, "legacy workflow copy deferred: invalid state");
+                    // An unavailable database is not corrupt derived data. Abort
+                    // the transaction so a transient parts read cannot count as
+                    // a successfully inspected (and silently deferred) page.
+                    if error.downcast_ref::<sqlx::Error>().is_some() {
+                        return Err(error);
+                    }
+                    tracing::warn!(run_key=%run, ?error, "legacy copies deferred: invalid state");
                     continue;
                 }
             };
-            let expected = state.as_ref().and_then(|state| {
-                crate::derive_workflow_dispatch(
-                    state,
-                    tokeira_types::execution_home_bundle(
-                        state.namespace_id.0.as_bytes(),
-                        state.workflow_id.0.as_bytes(),
-                        self.shard_count,
-                    ),
-                )
-            });
-            let mut current =
-                sqlx::QueryBuilder::<sqlx::Postgres>::new(super::workflow_dispatch::SELECT_ROW);
-            current.push(" WHERE run_key=").push_bind(*run);
-            let current = current
-                .build()
-                .fetch_optional(&mut *tx)
-                .await?
-                .map(super::workflow_dispatch::decode)
-                .transpose();
-            let current = match current {
-                Ok(current) => current,
-                Err(error) => {
-                    tracing::warn!(%key, run_key=%run, ?error, "legacy workflow copy deferred: invalid dispatch row");
-                    continue;
-                }
+            let slots: Vec<_> = group
+                .iter()
+                .filter_map(|copy| copy.activity_id.as_ref())
+                .map(|id| crate::activity_dispatch_key(RunKey(run), id))
+                .collect();
+            let mut current_slots = BTreeMap::new();
+            let desired = if slots.is_empty() {
+                Ok(None)
+            } else {
+                state
+                    .as_ref()
+                    .map(|state| {
+                        let home = tokeira_types::execution_home_bundle(
+                            state.namespace_id.0.as_bytes(),
+                            state.workflow_id.0.as_bytes(),
+                            self.shard_count,
+                        );
+                        crate::derive_activity_dispatch(state, home)
+                    })
+                    .transpose()
             };
-            // Old writers are stopped. Every new transition preserves equality
-            // atomically and never relies on this copy, even after this snapshot.
-            if expected == current {
-                deleted += sqlx::query("DELETE FROM dispatch_backlog WHERE key=$1 AND task_kind=$2")
-                    .bind(key)
-                    .bind(TaskKind::Workflow.to_db_smallint())
-                    .execute(&mut *tx)
-                    .await?
-                    .rows_affected() as usize;
+            if state.is_some() && !slots.is_empty() {
+                let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
+                query
+                    .push(super::activity_dispatch::COLUMNS)
+                    .push(" FROM activity_dispatch WHERE key=ANY(")
+                    .push_bind(slots)
+                    .push(")");
+                for row in query.build().fetch_all(&mut *tx).await? {
+                    current_slots.insert(
+                        row.try_get::<Uuid, _>("key")?,
+                        super::activity_dispatch::decode(&row),
+                    );
+                }
+            }
+            for copy in group {
+                let key = copy.key;
+                let covered = if let Some(activity_id) = &copy.activity_id {
+                    match state.as_ref() {
+                        None => true,
+                        Some(_) => {
+                            let desired = match &desired {
+                                Ok(Some(desired)) => desired,
+                                Ok(None) => unreachable!(
+                                    "activity group with existing authority derives a set"
+                                ),
+                                Err(error) => {
+                                    tracing::warn!(%key, ?error, "legacy activity copy deferred: invalid authority");
+                                    continue;
+                                }
+                            };
+                            let slot = crate::activity_dispatch_key(RunKey(run), activity_id);
+                            let current = match current_slots.get(&slot) {
+                                None => None,
+                                Some(Ok(current)) => Some(current),
+                                Some(Err(error)) => {
+                                    tracing::warn!(%key, ?error, "legacy activity copy deferred: invalid dispatch row");
+                                    continue;
+                                }
+                            };
+                            desired.get(&slot) == current
+                        }
+                    }
+                } else {
+                    let expected = state.as_ref().and_then(|state| {
+                        crate::derive_workflow_dispatch(
+                            state,
+                            tokeira_types::execution_home_bundle(
+                                state.namespace_id.0.as_bytes(),
+                                state.workflow_id.0.as_bytes(),
+                                self.shard_count,
+                            ),
+                        )
+                    });
+                    let mut current = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+                        super::workflow_dispatch::SELECT_ROW,
+                    );
+                    current.push(" WHERE run_key=").push_bind(run);
+                    let current = current
+                        .build()
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .map(super::workflow_dispatch::decode)
+                        .transpose();
+                    let current = match current {
+                        Ok(current) => current,
+                        Err(error) => {
+                            tracing::warn!(%key, run_key=%run, ?error, "legacy workflow copy deferred: invalid dispatch row");
+                            continue;
+                        }
+                    };
+                    expected == current
+                };
+                // Current writers maintain the canonical set atomically. Match the
+                // observed physical copy too: disposal never consumes a replacement.
+                if covered {
+                    deleted += sqlx::query("DELETE FROM dispatch_backlog WHERE key=$1 AND run_key=$2 AND task_kind=$3 AND payload_data=$4")
+                    .bind(key).bind(run).bind(copy.kind).bind(copy.payload)
+                    .execute(&mut *tx).await?.rows_affected() as usize;
+                }
             }
         }
         // Deletion changes no value bytes, and the physical page is below
@@ -134,10 +249,10 @@ impl DsqlRunRepository {
         super::pause_point::reached(super::pause_point::PauseKey::Disposal).await;
         tx.commit().await?;
         Ok(crate::WorkflowBacklogDisposal {
-            last_examined: keys.last().map(|(key, _, _)| *key),
+            last_examined: keys.last().map(|(key, _, _, _)| *key),
             examined: keys.len(),
             deleted,
-            deferred: workflows - deleted,
+            deferred: keys.len() - deleted,
             exhausted: keys.len() < crate::LEGACY_WORKFLOW_KEYS,
         })
     }

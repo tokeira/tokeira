@@ -26,7 +26,7 @@ use tokeira_proto::{
     },
 };
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{InMemoryStore, RunRepository, WorkerDeploymentRepository};
 use tokeira_types::{ExecutionRef, NamespaceId, WorkflowId};
@@ -262,7 +262,6 @@ async fn build_grpc_with_namespaces(
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         )
         .with_worker_deployment_repository(worker_deployments),
     );

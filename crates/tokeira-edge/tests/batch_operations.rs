@@ -23,13 +23,13 @@ use tokeira_kernel::{
     WorkflowIdConflictPolicy, WorkflowIdReusePolicy, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    BacklogConfig, BatchOperationEntry, BatchOperationParams, BatchOperationState,
-    BatchOperationStore, BatchOperationType, BatchProgressCounters, BatchResetTarget,
-    BufferedQueryRegistry, DeleteWorkflowRequest, InMemoryBroker, JobId, LaneConfig,
-    PendingUpdateTransport, QueryResult, ResetWorkflowResult, ScheduleStore, SignalWithStartResult,
-    StartWorkflowResult, TimerScannerConfig, TokeiraRuntime, UpdateLifecycleSnapshot,
-    UpdateTransportResolution, UpdateWaitPolicy, WorkerRegistry, WorkflowDeletion,
-    WorkflowExecutionRef, WorkflowTimeoutScannerConfig,
+    BatchOperationEntry, BatchOperationParams, BatchOperationState, BatchOperationStore,
+    BatchOperationType, BatchProgressCounters, BatchResetTarget, BufferedQueryRegistry,
+    DeleteWorkflowRequest, InMemoryBroker, JobId, LaneConfig, PendingUpdateTransport, QueryResult,
+    ResetWorkflowResult, ScheduleStore, SignalWithStartResult, StartWorkflowResult,
+    TimerScannerConfig, TokeiraRuntime, UpdateLifecycleSnapshot, UpdateTransportResolution,
+    UpdateWaitPolicy, WorkerRegistry, WorkflowDeletion, WorkflowExecutionRef,
+    WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{InMemoryStore, ProjectionContext, ProjectionRecord};
 use tokeira_types::{
@@ -438,6 +438,7 @@ impl VisibilityApi for ScriptedVisibility {
 
 fn outcome() -> WorkflowMutationOutcome {
     WorkflowMutationOutcome {
+        scheduled_activity_event_ids: Default::default(),
         transition_seq: 1,
         last_event_id: 1,
         was_duplicate: false,
@@ -503,7 +504,6 @@ async fn seed_workflow(
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     ));
     let namespace_id = namespace_id_for("default");
     let run_key = RunKey::new();

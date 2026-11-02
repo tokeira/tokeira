@@ -6083,8 +6083,9 @@ pub fn poll_activity_response_to_proto(
 
     workflowservice::PollActivityTaskQueueResponse {
         task_token: resp.task_token,
+        priority: resp.priority.as_ref().map(priority_from_kernel),
         workflow_namespace: resp.workflow_namespace,
-        workflow_type: Some(tokeira_proto::common::WorkflowType {
+        workflow_type: (!resp.replayed).then_some(tokeira_proto::common::WorkflowType {
             name: resp.workflow_type,
         }),
         activity_id: resp.activity_id,
@@ -9357,6 +9358,8 @@ mod tests {
 
         let proto =
             poll_activity_response_to_proto(crate::translate::PollActivityTaskQueueResponse {
+                replayed: false,
+                priority: None,
                 task_token: b"token".to_vec(),
                 activity_id: "activity-1".to_string(),
                 run_id: RunId(Uuid::from_u128(9)),

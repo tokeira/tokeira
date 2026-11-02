@@ -11,9 +11,59 @@ pub(super) struct PreparedTransition {
     context: ProjectionContext,
     history_size_bytes: i64,
     workflow_dispatch: Option<WorkflowDispatchRow>,
+    activity_dispatch: BTreeMap<String, ActivityDispatchEntry>,
     operations: Vec<crate::OperationRow>,
     intents: Vec<crate::IntentRow>,
     pub(super) outbound_origin: Option<tokeira_kernel::OutboundOrigin>,
+}
+
+pub(super) fn validate_activity_slots(
+    store: &StoreState,
+    run_key: RunKey,
+    wanted: &BTreeMap<uuid::Uuid, crate::ActivityDispatchRow>,
+) -> Result<()> {
+    // Memory keys its map by raw identity, whereas DSQL uses the physical hash.
+    // Check both coordinates before publishing so injected collisions/corruption
+    // have the same all-or-nothing outcome in either repository.
+    for ((stored_run, id), existing) in &store.activity_dispatch {
+        if *stored_run != run_key && !wanted.contains_key(&existing.key) {
+            continue;
+        }
+        anyhow::ensure!(
+            existing.task.run_key == *stored_run
+                && existing.task.activity_id == *id
+                && existing.key == crate::activity_dispatch_key(*stored_run, id),
+            "activity dispatch slot disagrees with raw identity"
+        );
+        if let Some(desired) = wanted.get(&existing.key) {
+            anyhow::ensure!(
+                desired.incarnation.run_key == *stored_run
+                    && desired.incarnation.activity_id == *id,
+                "activity dispatch slot hash collision"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Separate prepared runs must also agree on the physical keys they will write.
+/// Existing-row checks alone cannot catch two new colliding slots in one batch.
+pub(super) fn validate_activity_batch<'a>(
+    prepared: impl Iterator<Item = &'a PreparedTransition>,
+) -> Result<()> {
+    let mut slots = BTreeMap::new();
+    for prepared in prepared {
+        for row in prepared.activity_dispatch.values() {
+            let identity = (row.task.run_key, row.task.activity_id.as_str());
+            if let Some(previous) = slots.insert(row.key, identity) {
+                anyhow::ensure!(
+                    previous == identity,
+                    "activity dispatch slot hash collision within publication"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn prepare(
@@ -25,6 +75,13 @@ pub(super) fn prepare(
         anyhow::bail!("history/principal sidecar length mismatch");
     }
     let state = transition.next_state.clone();
+    crate::codec::validate_activity_receipts(&state).map_err(|defect| {
+        crate::codec::StateExtensionError {
+            kind: "workflow_hot.state_data",
+            run_key,
+            defect,
+        }
+    })?;
     let prior_history_size = store.history_size.get(&run_key).copied().unwrap_or(0);
     let appended = if transition.history_events.is_empty() {
         0
@@ -41,6 +98,18 @@ pub(super) fn prepare(
         InMemoryStore::effective_shard_count(store),
     );
     let workflow_dispatch = derive_workflow_dispatch(&state, execution_home);
+    let wanted = crate::derive_activity_dispatch(&state, execution_home)?;
+    validate_activity_slots(store, run_key, &wanted)?;
+    let activity_dispatch = wanted
+        .into_values()
+        .map(|row| {
+            let activity = &state.activities[&row.incarnation.activity_id];
+            (
+                activity.activity_id.clone(),
+                ActivityDispatchEntry::from_row(&row, activity),
+            )
+        })
+        .collect();
     let operations = crate::derive_operations(&state, execution_home)?;
     let intents =
         crate::derive_close_intents(store.runs.get(&run_key), &transition, execution_home)?;
@@ -71,6 +140,7 @@ pub(super) fn prepare(
         context,
         history_size_bytes,
         workflow_dispatch,
+        activity_dispatch,
         operations,
         intents,
         outbound_origin: None,
@@ -88,6 +158,7 @@ pub(super) fn write(
         context,
         history_size_bytes,
         workflow_dispatch,
+        activity_dispatch,
         operations,
         intents,
         outbound_origin,
@@ -151,57 +222,15 @@ pub(super) fn write(
         );
     }
 
-    // The activity itself lives only in the run's state; an activity op
-    // maintains its dispatch entry and records nothing else, as on DSQL
-    // (`activity-state-writes` criterion 2.1).
-    for op in &transition.activity_ops {
-        match op {
-            ActivityOp::Upsert(activity) => {
-                // Dispatch entries only survive while the activity remains
-                // eligible to be offered to a worker.
-                if activity.started_at.is_some() || activity.pause_info.is_some() {
-                    store
-                        .activity_dispatch
-                        .remove(&(run_key, activity.activity_id.clone()));
-                } else if let Some(entry) = store
-                    .activity_dispatch
-                    .get_mut(&(run_key, activity.activity_id.clone()))
-                {
-                    entry.task.queue = QueueKey {
-                        namespace_id: state.namespace_id,
-                        task_queue: activity.task_queue.clone(),
-                        task_kind: TaskKind::Activity,
-                        deployment: activity
-                            .deployment
-                            .clone()
-                            .or_else(|| state.deployment.clone()),
-                        build_id: activity.build_id.clone().or_else(|| state.build_id.clone()),
-                    };
-                    entry.task.schedule_event_id = activity.schedule_event_id;
-                    entry.task.attempt = activity.attempt;
-                    // Keep the dispatch row's stamp in step with the activity
-                    // so a recovery-reconstructed task is never spuriously
-                    // fenced at start.
-                    entry.task.stamp = activity.stamp;
-                    entry.task.priority =
-                        merge_priority(state.priority.as_ref(), activity.priority.as_ref());
-                    // Options/retry updates re-anchor eligibility from the
-                    // authoritative attempt schedule; a state without one
-                    // (legacy/initial) keeps the row's existing time.
-                    entry.dispatch_at = activity
-                        .current_attempt_scheduled_at
-                        .unwrap_or(entry.dispatch_at);
-                    entry.schedule_to_close_timeout = activity.schedule_to_close_timeout;
-                    entry.schedule_to_start_timeout = activity.schedule_to_start_timeout;
-                    entry.start_to_close_timeout = activity.start_to_close_timeout;
-                    entry.heartbeat_timeout = activity.heartbeat_timeout;
-                }
-            }
-            ActivityOp::Delete { activity_id } => {
-                store
-                    .activity_dispatch
-                    .remove(&(run_key, activity_id.clone()));
-            }
+    // Prepare derived rows before changing any map. Unchanged activities are
+    // included because workflow-level priority/routing/pause can change them.
+    store
+        .activity_dispatch
+        .retain(|(key, id), _| *key != run_key || activity_dispatch.contains_key(id));
+    for (id, desired) in activity_dispatch {
+        let key = (run_key, id);
+        if store.activity_dispatch.get(&key) != Some(&desired) {
+            store.activity_dispatch.insert(key, desired);
         }
     }
 
@@ -224,56 +253,6 @@ pub(super) fn write(
                     .retain(|key, _| key.run_key != run_key || key.timer_id != *timer_id);
             }
         }
-    }
-
-    for op in &transition.dispatch_ops {
-        if let DispatchOp::EnqueueActivityTask {
-            queue,
-            activity_id,
-            schedule_event_id,
-            attempt,
-            dispatch_revision,
-            stamp,
-            dispatch_at,
-            schedule_to_close_timeout,
-            schedule_to_start_timeout,
-            start_to_close_timeout,
-            heartbeat_timeout,
-            priority,
-        } = op
-        {
-            // Enqueue is the only state transition effect that creates an
-            // activity dispatch entry. Later ActivityOp::Upsert values may
-            // update or remove this entry, but they cannot create it.
-            store.activity_dispatch.insert(
-                (run_key, activity_id.clone()),
-                ActivityDispatchEntry {
-                    task: DispatchableActivityTask {
-                        run_key,
-                        queue: queue.clone(),
-                        activity_id: activity_id.clone(),
-                        schedule_event_id: *schedule_event_id,
-                        attempt: *attempt,
-                        dispatch_revision: *dispatch_revision,
-                        stamp: *stamp,
-                        priority: priority.clone(),
-                        order: None,
-                    },
-                    dispatch_at: *dispatch_at,
-                    schedule_to_close_timeout: *schedule_to_close_timeout,
-                    schedule_to_start_timeout: *schedule_to_start_timeout,
-                    start_to_close_timeout: *start_to_close_timeout,
-                    heartbeat_timeout: *heartbeat_timeout,
-                },
-            );
-        }
-    }
-    if state.status == ExecutionStatus::Paused {
-        // Workflow pause suppresses all queued activity dispatch for this
-        // run; its activities stay in run state for the unpause to re-enqueue.
-        store
-            .activity_dispatch
-            .retain(|(entry_run_key, _), _| entry_run_key != &run_key);
     }
 
     // Every fallible preparation completed before either map changes. The
@@ -375,6 +354,7 @@ impl InMemoryStore {
         let closing = prepare(&store, run_key, closing)?;
         pair_checkpoint(&mut store, 5)?;
         let successor = prepare(&store, successor_run_key, successor)?;
+        validate_activity_batch([&closing, &successor].into_iter())?;
         pair_checkpoint(&mut store, 6)?;
         // Publication cannot fail or yield. Both complete write sets have been
         // prepared, and readers cannot acquire the lock between these writes.

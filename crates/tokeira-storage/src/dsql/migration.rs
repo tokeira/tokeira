@@ -1174,19 +1174,20 @@ fn migration_is_idempotent(sql: &str) -> bool {
         || (normalized.contains("INSERT INTO")
             && normalized.contains("ON CONFLICT")
             && normalized.contains("DO NOTHING"))
-        || is_whole_table_drop(&normalized)
+        || is_whole_drop(&normalized, "DROP TABLE IF EXISTS ")
+        || is_whole_drop(&normalized, "DROP INDEX IF EXISTS ")
 }
 
-/// Whether a migration's whole statement is `DROP TABLE IF EXISTS` and one
-/// table name. A drop that finds no table does nothing, so replaying one after
+/// Whether a migration's whole statement is the permitted drop and one
+/// object name. A drop that finds no object does nothing, so replaying one after
 /// a crash between it and its ledger row is safe; a file with another statement
 /// beside the drop would not replay as nothing, so it doesn't count.
-fn is_whole_table_drop(normalized: &str) -> bool {
+fn is_whole_drop(normalized: &str, prefix: &str) -> bool {
     normalized
         .trim()
         .trim_end_matches(';')
         .trim_end()
-        .strip_prefix("DROP TABLE IF EXISTS ")
+        .strip_prefix(prefix)
         .map(str::trim)
         .is_some_and(|table| {
             !table.is_empty()
@@ -1777,7 +1778,7 @@ mod tests {
         let plans = MigrationRunner::embedded()
             .dry_run()
             .expect("embedded migrations are valid");
-        assert_eq!(plans.len(), 127);
+        assert_eq!(plans.len(), 132);
         for plan in plans {
             assert!(
                 migration_is_idempotent(&plan.sql),
@@ -1798,6 +1799,20 @@ mod tests {
         assert!(!migration_is_idempotent(
             "ALTER TABLE workflow_hot DROP COLUMN IF EXISTS history_size_bytes;"
         ));
+    }
+
+    #[test]
+    fn an_index_drop_is_idempotent_only_with_if_exists_and_alone() {
+        assert!(migration_is_idempotent(
+            "DROP INDEX IF EXISTS idx_activity_dispatch_queue;"
+        ));
+        assert!(!migration_is_idempotent(
+            "DROP INDEX idx_activity_dispatch_queue;"
+        ));
+        assert!(!migration_is_idempotent(
+            "DROP INDEX IF EXISTS a; DROP INDEX b;"
+        ));
+        assert!(!migration_is_idempotent("DROP INDEX IF EXISTS a CASCADE;"));
     }
 
     #[test]

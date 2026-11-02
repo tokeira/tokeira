@@ -619,9 +619,7 @@ mod tests {
             workflow_service_server::WorkflowService as PublicWorkflowService,
         },
     };
-    use tokeira_runtime::{
-        BacklogConfig, LaneConfig, TimerScannerConfig, WorkflowTimeoutScannerConfig,
-    };
+    use tokeira_runtime::{LaneConfig, TimerScannerConfig, WorkflowTimeoutScannerConfig};
     use tokeira_storage::InMemoryStore;
     use tokeira_types::{
         BundleOwner, IncarnationId, NodeEndpoint, PlacementConfig, RoutingSnapshot, ShardEpoch,
@@ -747,7 +745,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         ));
         let context = EdgeContext {
             request_id: crate::request_id::RequestId::new("forwarded-start"),
@@ -1018,7 +1015,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
             Default::default(),
             Default::default(),
             Default::default(),

@@ -28,7 +28,6 @@ fn receiver(repo: Arc<InMemoryStore>, home: ShardId) -> TokeiraRuntime<InMemoryS
         },
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         ActivityTimeoutScannerConfig::default(),
         NexusTimeoutScannerConfig::default(),
         NexusEndpointRegistry::default(),

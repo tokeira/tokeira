@@ -3575,7 +3575,6 @@ where
         runtime_config.lane,
         runtime_config.timer_scanner,
         runtime_config.workflow_timeout_scanner,
-        runtime_config.backlog,
         runtime_config.activity_timeout_scanner,
         runtime_config.nexus_timeout_scanner,
         nexus_registry.clone(),
@@ -3831,6 +3830,12 @@ where
             ),
         ));
         if let Some(peer) = &peer {
+            runtime.set_activity_task_starter(Arc::new(
+                tokeira_edge::grpc::activity_dispatch::RemoteActivityTaskStarter::new(
+                    routing_cache.clone(),
+                    peer.clone(),
+                ),
+            ));
             runtime.set_outbound_delivery_transport(Arc::new(
                 tokeira_edge::grpc::outbound_delivery::RemoteOutboundDelivery::new(
                     routing_cache.clone(),
@@ -3951,6 +3956,12 @@ where
         workflow_service.clone(),
     )
     .with_peer(peer.clone());
+    let activity_dispatch_grpc =
+        tokeira_edge::grpc::activity_dispatch::ActivityTaskDispatchGrpc::new(
+            runtime.clone(),
+            interceptors.clone(),
+            peer.clone(),
+        );
     let outbound_grpc =
         tokeira_edge::grpc::outbound_delivery::OutboundDeliveryGrpc::new(runtime.clone(), peer);
     let operator_service = OperatorService::new(operator_api, interceptors)
@@ -4268,6 +4279,7 @@ where
                     .add_service(operator_grpc.into_service())
                     .add_service(admin_grpc.into_service())
                     .add_service(dispatch_grpc.into_service())
+                    .add_service(activity_dispatch_grpc.into_service())
                     .add_service(outbound_grpc.into_service())
                     .add_service(reflection_v1)
                     .add_service(reflection_v1alpha)
@@ -4285,6 +4297,7 @@ where
                     .add_service(operator_grpc.into_service())
                     .add_service(admin_grpc.into_service())
                     .add_service(dispatch_grpc.into_service())
+                    .add_service(activity_dispatch_grpc.into_service())
                     .add_service(outbound_grpc.into_service())
                     .add_service(reflection_v1)
                     .add_service(reflection_v1alpha)
@@ -6310,7 +6323,6 @@ mod tests {
             tokeira_runtime::LaneConfig::default(),
             tokeira_runtime::TimerScannerConfig::default(),
             tokeira_runtime::WorkflowTimeoutScannerConfig::default(),
-            tokeira_runtime::BacklogConfig::default(),
             tokeira_runtime::ActivityTimeoutScannerConfig::default(),
             tokeira_runtime::NexusTimeoutScannerConfig::default(),
             NexusEndpointRegistry::default(),

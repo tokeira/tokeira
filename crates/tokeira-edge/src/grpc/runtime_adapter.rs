@@ -246,8 +246,33 @@ where
         &self,
         req: WorkflowTaskCompletedRequest,
     ) -> Result<WorkflowMutationOutcome> {
+        let schedules: Vec<_> = req
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                tokeira_kernel::WorkflowCommand::ScheduleActivity { activity_id, .. } => {
+                    Some(activity_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let started_event_id = req.token.started_event_id;
         let result = self.runtime.complete_workflow_task(req).await?;
-        commit_result_to_outcome(result)
+        let mut scheduled_activity_event_ids = std::collections::BTreeMap::new();
+        if let CommitResult::Applied { new_state } = &result {
+            for id in schedules {
+                if let Some(activity) = new_state.activities.get(&id)
+                    && activity.schedule_event_id > started_event_id
+                    && activity.attempt == 1
+                    && activity.stamp == 0
+                {
+                    scheduled_activity_event_ids.insert(id, activity.schedule_event_id);
+                }
+            }
+        }
+        let mut outcome = commit_result_to_outcome(result)?;
+        outcome.scheduled_activity_event_ids = scheduled_activity_event_ids;
+        Ok(outcome)
     }
 
     async fn poll_activity_task(
@@ -390,12 +415,21 @@ where
         queue: tokeira_types::QueueKey,
         run_key: tokeira_types::RunKey,
         activity_id: String,
+        schedule_event_id: i64,
         worker_identity: tokeira_types::WorkerIdentity,
         input: tokeira_types::Payloads,
         header: Option<tokeira_types::Headers>,
     ) -> Result<Option<StartedActivityTask>> {
         self.runtime
-            .try_claim_activity_task(queue, run_key, activity_id, worker_identity, input, header)
+            .try_claim_activity_task(
+                queue,
+                run_key,
+                activity_id,
+                schedule_event_id,
+                worker_identity,
+                input,
+                header,
+            )
             .await
     }
 
@@ -1065,6 +1099,7 @@ pub fn commit_result_to_outcome(result: CommitResult) -> Result<WorkflowMutation
                 None
             };
             Ok(WorkflowMutationOutcome {
+                scheduled_activity_event_ids: Default::default(),
                 transition_seq: new_state.transition_seq.0,
                 last_event_id: new_state.last_event_id,
                 was_duplicate: false,
@@ -1073,6 +1108,7 @@ pub fn commit_result_to_outcome(result: CommitResult) -> Result<WorkflowMutation
             })
         }
         CommitResult::Duplicate => Ok(WorkflowMutationOutcome {
+            scheduled_activity_event_ids: Default::default(),
             transition_seq: 0,
             last_event_id: 0,
             was_duplicate: true,

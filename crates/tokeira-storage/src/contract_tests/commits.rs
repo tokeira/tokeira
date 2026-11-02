@@ -231,26 +231,30 @@ async fn verify(
     let activity = &state.activities["contract-activity"];
     equal(
         &activities,
-        &vec![crate::DueActivityDispatch {
-            task: crate::DispatchableActivityTask {
-                run_key: state.run_key,
-                queue: QueueKey {
-                    namespace_id: state.namespace_id,
-                    task_queue: activity.task_queue.clone(),
-                    task_kind: TaskKind::Activity,
-                    deployment: None,
-                    build_id: None,
+        &if state.status == ExecutionStatus::Running {
+            vec![crate::DueActivityDispatch {
+                task: crate::DispatchableActivityTask {
+                    run_key: state.run_key,
+                    queue: QueueKey {
+                        namespace_id: state.namespace_id,
+                        task_queue: activity.task_queue.clone(),
+                        task_kind: TaskKind::Activity,
+                        deployment: None,
+                        build_id: None,
+                    },
+                    activity_id: "contract-activity".into(),
+                    schedule_event_id: activity.schedule_event_id,
+                    attempt: u32::from(marker) + 1,
+                    dispatch_revision: 0,
+                    stamp: u64::from(marker),
+                    priority: None,
+                    order: None,
                 },
-                activity_id: "contract-activity".into(),
-                schedule_event_id: activity.schedule_event_id,
-                attempt: u32::from(marker) + 1,
-                dispatch_revision: 0,
-                stamp: u64::from(marker),
-                priority: None,
-                order: None,
-            },
-            dispatch_at: now(),
-        }],
+                dispatch_at: now(),
+            }]
+        } else {
+            Vec::new()
+        },
         "complete activity dispatch identity",
     )?;
     let workflow = backend

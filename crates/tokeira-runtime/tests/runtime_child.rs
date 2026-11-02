@@ -7,7 +7,7 @@ use tokeira_kernel::{
     WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -24,7 +24,6 @@ async fn child_workflow_happy_path_delivers_start_and_completion_back_to_parent(
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let parent_workflow_id = WorkflowId("parent-happy".to_string());
@@ -161,7 +160,6 @@ async fn parent_close_policy_terminate_closes_started_child() -> Result<()> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let parent_workflow_id = WorkflowId("parent-terminate".to_string());
@@ -233,7 +231,6 @@ async fn parent_close_policy_request_cancel_requests_cancel_on_child() -> Result
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let parent_workflow_id = WorkflowId("parent-cancel".to_string());
@@ -306,7 +303,6 @@ async fn duplicate_child_start_delivers_failed_confirmation_to_parent() -> Resul
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let parent_workflow_id = WorkflowId("parent-duplicate".to_string());

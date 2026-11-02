@@ -1,5 +1,8 @@
 //! Fault and synchronization fixtures exercise the actual acquisition lifecycle.
 
+mod activity_starts_tests;
+mod discovery_scheduler_tests;
+
 use super::*;
 use async_trait::async_trait;
 use std::{
@@ -31,7 +34,13 @@ enum Point {
     Candidates,
     Repair,
     Home,
+    ActivityRepair,
+    ActivityRepairFinished,
+    ActivityHome,
+    ActivityHomeFinished,
     Commit,
+    Committed,
+    ActivityObservation,
 }
 
 #[derive(Debug)]
@@ -49,6 +58,8 @@ struct Repo {
     repair_attempts: AtomicUsize,
     repair_fences: Mutex<Vec<WriteFence>>,
     loads: AtomicUsize,
+    legacy_delivery_calls: AtomicUsize,
+    discovery_gate: Mutex<Option<Arc<discovery_scheduler_tests::Gate>>>,
     preparation_retries: AtomicUsize,
     preparation_attempts: AtomicUsize,
     pause: Mutex<Option<Pause>>,
@@ -56,6 +67,18 @@ struct Repo {
 }
 
 impl Repo {
+    async fn discovery_query(
+        &self,
+        kind: TaskKind,
+        queue: &TaskQueueName,
+    ) -> Option<discovery_scheduler_tests::Guard> {
+        let gate = self.discovery_gate.lock().unwrap().clone();
+        match gate {
+            Some(gate) => Some(gate.enter(kind, queue.clone()).await),
+            None => None,
+        }
+    }
+
     fn pause(&self, point: Point) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (entered, observed) = oneshot::channel();
         let (resume, waiting) = oneshot::channel();
@@ -118,7 +141,6 @@ fn runtime(repo: Arc<Repo>) -> Arc<TokeiraRuntime<Repo>> {
             ..Default::default()
         },
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         ActivityTimeoutScannerConfig::default(),
         NexusTimeoutScannerConfig::default(),
         NexusEndpointRegistry::default(),
@@ -163,6 +185,154 @@ async fn stop(runtime: &TokeiraRuntime<Repo>) {
         .wait(std::time::Instant::now() + std::time::Duration::from_secs(10))
         .await
         .unwrap();
+}
+
+async fn seed_activity_repair(repo: &Repo, count: usize) -> WorkflowState {
+    let queue = QueueKey {
+        namespace_id: NamespaceId::new(),
+        task_queue: TaskQueueName("activity-acquisition".into()),
+        task_kind: TaskKind::Workflow,
+        deployment: None,
+        build_id: None,
+    };
+    let mut transition = crate::discovery::tests::transition(&queue, 0);
+    let scheduled_at = time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(19_000);
+    for index in 0..count {
+        let id = format!("activity-{index}");
+        transition.next_state.activities.insert(
+            id.clone(),
+            ActivityState {
+                activity_id: id,
+                activity_type: "work".into(),
+                schedule_event_id: index as i64 + 3,
+                task_queue: queue.task_queue.clone(),
+                deployment: None,
+                build_id: None,
+                retired_input: Default::default(),
+                retired_header: Default::default(),
+                attempt: 2,
+                retry_policy: None,
+                schedule_to_close_timeout: None,
+                schedule_to_start_timeout: None,
+                start_to_close_timeout: None,
+                heartbeat_timeout: None,
+                scheduled_at,
+                current_attempt_scheduled_at: Some(scheduled_at + time::Duration::hours(1)),
+                started_at: None,
+                started_event_id: None,
+                last_failure: None,
+                started_identity: None,
+                retry_last_worker_identity: None,
+                heartbeat_details: None,
+                cancel_requested: false,
+                pause_info: None,
+                stamp: 1,
+                activity_reset: false,
+                reset_heartbeats: false,
+                priority: None,
+                last_attempt_complete_time: Some(scheduled_at),
+                last_heartbeat_at: None,
+            },
+        );
+    }
+    let CommitResult::Applied { new_state } = repo
+        .inner
+        .commit_transition(
+            transition.next_state.run_key,
+            transition,
+            WriteFence::Unfenced,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("seed")
+    };
+    let activity_queue = QueueKey {
+        task_kind: TaskKind::Activity,
+        ..queue
+    };
+    for task in repo
+        .inner
+        .list_all_dispatchable_activity_tasks(&activity_queue, count)
+        .await
+        .unwrap()
+    {
+        repo.inner
+            .delete_activity_dispatch_if_matches(&ActivityDispatchIdentity {
+                run_key: task.run_key,
+                activity_id: task.activity_id,
+                schedule_event_id: task.schedule_event_id,
+                attempt: task.attempt,
+                stamp: task.stamp,
+                dispatch_revision: task.dispatch_revision,
+                dispatch_at: new_state
+                    .activities
+                    .values()
+                    .next()
+                    .unwrap()
+                    .current_attempt_scheduled_at
+                    .unwrap(),
+            })
+            .await
+            .unwrap();
+    }
+    new_state
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config::with_cases(100))]
+
+    // Feature: activity-dispatch, Property 15
+    // Failure, cancellation, expiry or replacement at either walk's await boundary cannot activate a partial home.
+    #[test]
+    fn activity_acquisition_never_serves_after_interruption(point in 0usize..4, interruption in 0u8..4, count in 65usize..85) {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let point = [Point::ActivityRepair, Point::ActivityRepairFinished, Point::ActivityHome, Point::ActivityHomeFinished][point];
+            let repo = Arc::new(Repo::default());
+            let state = seed_activity_repair(&repo, count).await;
+            let runtime = runtime(repo.clone());
+            if interruption == 0 {
+                *repo.fail.lock().unwrap() = Some(point);
+                assert!(runtime.recover_self_assigned_shard(ShardId(0), ShardEpoch::ZERO).await.is_err());
+            } else {
+                let (entered, resume) = repo.pause(point);
+                let acquiring = runtime.clone();
+                let acquisition = tokio::spawn(async move { acquiring.recover_self_assigned_shard(ShardId(0), ShardEpoch::ZERO).await });
+                entered.await.unwrap();
+                let current = runtime.shard_owner.read().unwrap().acquisition(ShardId(0)).unwrap();
+                match interruption {
+                    1 => current.cancel.cancel(),
+                    2 => *current.deadline.lock().unwrap() = Some(tokio::time::Instant::now()),
+                    _ => { runtime.shard_owner.write().unwrap().record_acquired(ShardId(0), ShardEpoch::ZERO); }
+                }
+                let _ = resume.send(());
+                assert!(acquisition.await.unwrap().is_err());
+            }
+            assert!(runtime.active_shards().is_empty());
+            runtime.recover_self_assigned_shard(ShardId(0), ShardEpoch::ZERO).await.unwrap();
+            assert_eq!(runtime.active_shards(), vec![ShardId(0)]);
+            let tracking = runtime.activity_tracking.snapshot();
+            assert_eq!(tracking.len(), count);
+            for entry in tracking {
+                let activity = &state.activities[&entry.activity_id];
+                assert_eq!(entry.original_scheduled_at, activity.scheduled_at);
+                assert_eq!(Some(entry.last_dispatched_at), activity.current_attempt_scheduled_at);
+            }
+            let range = ActivityDiscoveryRange { namespace_id: state.namespace_id, queue_name: state.task_queue.clone() };
+            let mut after = None;
+            let mut found = 0;
+            loop {
+                let page = repo.inner.list_activity_dispatch_page(&range, time::OffsetDateTime::now_utc(), after, std::num::NonZeroU32::new(13).unwrap()).await.unwrap();
+                found += page.candidates.len();
+                assert!(page.candidates.iter().all(|candidate| candidate.row.is_ok()));
+                after = page.last_examined;
+                if page.exhausted { break; }
+            }
+            assert_eq!(found, count);
+            assert_eq!(repo.inner.load_run(state.run_key).await.unwrap(), LoadedRun::Existing(state));
+            stop(&runtime).await;
+        });
+    }
 }
 
 #[tokio::test]
@@ -267,7 +437,6 @@ async fn acquisition_drains_an_admitted_lane_commit_before_reading_repair_pages(
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         ActivityTimeoutScannerConfig::default(),
         NexusTimeoutScannerConfig::default(),
         NexusEndpointRegistry::default(),
@@ -669,9 +838,12 @@ impl RunRepository for Repo {
         fence: WriteFence,
     ) -> Result<CommitResult> {
         self.hit(Point::Commit).await?;
-        self.inner
+        let result = self
+            .inner
             .commit_transition_for_bundle(run_key, execution_home_bundle, transition, fence)
-            .await
+            .await?;
+        self.hit(Point::Committed).await?;
+        Ok(result)
     }
 
     async fn delete_run_for_bundle(
@@ -734,6 +906,35 @@ impl RunRepository for Repo {
             .await
     }
 
+    async fn validate_activity_start_observation(
+        &self,
+        observed: &tokeira_kernel::WorkflowState,
+        activity_id: &str,
+        home: ShardId,
+        fence: WriteFence,
+    ) -> Result<bool> {
+        self.hit(Point::ActivityObservation).await?;
+        self.inner
+            .validate_activity_start_observation(observed, activity_id, home, fence)
+            .await
+    }
+
+    async fn reconcile_activity_dispatch_page(
+        &self,
+        home: ShardId,
+        run_key: RunKey,
+        after: Option<tokeira_storage::ActivityRepairCursor>,
+        fence: WriteFence,
+    ) -> Result<tokeira_storage::ActivityRepairPage> {
+        self.hit(Point::ActivityRepair).await?;
+        let page = self
+            .inner
+            .reconcile_activity_dispatch_page(home, run_key, after, fence)
+            .await?;
+        self.hit(Point::ActivityRepairFinished).await?;
+        Ok(page)
+    }
+
     async fn reconcile_workflow_dispatch_run(
         &self,
         home: ShardId,
@@ -759,12 +960,48 @@ impl RunRepository for Repo {
         Ok(())
     }
 
+    /// Read one fixed-cutoff queue-family page without claiming or mutating work.
+    /// Per-row payload errors retain their position; SQL/key errors fail the page.
+    async fn list_activity_dispatch_page(
+        &self,
+        range: &tokeira_storage::ActivityDiscoveryRange,
+        cutoff: time::OffsetDateTime,
+        after: Option<tokeira_storage::ActivityDispatchPosition>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<tokeira_storage::ActivityDispatchPage> {
+        let _guard = self
+            .discovery_query(TaskKind::Activity, &range.queue_name)
+            .await;
+        self.inner
+            .list_activity_dispatch_page(range, cutoff, after, limit)
+            .await
+    }
+
+    /// Enumerate every physical activity slot for a home, including legacy/orphan rows.
+    async fn list_activity_dispatch_home_page(
+        &self,
+        home: tokeira_types::ShardId,
+        after: Option<tokeira_storage::ActivityHomePosition>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<tokeira_storage::ActivityHomePage> {
+        self.hit(Point::ActivityHome).await?;
+        let page = self
+            .inner
+            .list_activity_dispatch_home_page(home, after, limit)
+            .await?;
+        self.hit(Point::ActivityHomeFinished).await?;
+        Ok(page)
+    }
+
     async fn list_workflow_dispatch_page(
         &self,
         range: &WorkflowDiscoveryRange,
         after: Option<WorkflowDispatchPosition>,
         limit: std::num::NonZeroU32,
     ) -> Result<WorkflowDispatchPage> {
+        let _guard = self
+            .discovery_query(TaskKind::Workflow, &range.queue_name)
+            .await;
         self.inner
             .list_workflow_dispatch_page(range, after, limit)
             .await
@@ -824,13 +1061,15 @@ impl RunRepository for Repo {
 
     async fn persist_to_backlog(
         &self,
-        entries: Vec<BacklogEntry>,
+        _entries: Vec<BacklogEntry>,
     ) -> std::result::Result<(), tokeira_storage::BacklogPersistError> {
-        self.inner.persist_to_backlog(entries).await
+        self.legacy_delivery_calls.fetch_add(1, Ordering::SeqCst);
+        panic!("retired backlog producer reached")
     }
 
-    async fn drain_backlog(&self, queue: &QueueKey, limit: usize) -> Result<Vec<BacklogEntry>> {
-        self.inner.drain_backlog(queue, limit).await
+    async fn drain_backlog(&self, _queue: &QueueKey, _limit: usize) -> Result<Vec<BacklogEntry>> {
+        self.legacy_delivery_calls.fetch_add(1, Ordering::SeqCst);
+        panic!("retired backlog consumer reached")
     }
 
     async fn backlog_stats_by_priority(
@@ -914,7 +1153,6 @@ pub(super) fn home_runtime<R: RunRepository + 'static>(
             scan_interval: std::time::Duration::from_secs(86400),
             ..Default::default()
         },
-        BacklogConfig::default(),
         ActivityTimeoutScannerConfig::default(),
         NexusTimeoutScannerConfig::default(),
         NexusEndpointRegistry::default(),
@@ -1385,7 +1623,6 @@ async fn restored_store_requires_preparation_before_any_runtime_construction() {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         )
     }));
     assert!(
@@ -1401,7 +1638,6 @@ async fn restored_store_requires_preparation_before_any_runtime_construction() {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     runtime.runtime_shutdown.begin_shutdown();
     runtime
@@ -1469,7 +1705,6 @@ async fn seeded_default_constructor_repairs_missing_and_stale_rows_before_activa
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     assert!(runtime.active_shards().is_empty());
     candidates.await.unwrap();

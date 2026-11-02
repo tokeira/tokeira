@@ -478,6 +478,7 @@ fn sample_transition(run_key: RunKey) -> Transition {
 
 fn sample_state(run_key: RunKey) -> WorkflowState {
     WorkflowState {
+        activity_start_receipts: std::collections::BTreeMap::new(),
         used_worker_deployment_versions: Some(Vec::new()),
         completed_update_count: 0,
         signal_count: 0,

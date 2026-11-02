@@ -12,8 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    ActivityOp, BasicKernel, DispatchOp, HistoryEvent, LoadedRun, ReplayContext, TimerOp,
-    Transition, WorkflowState, merge_priority,
+    BasicKernel, HistoryEvent, LoadedRun, ReplayContext, TimerOp, Transition, WorkflowState,
 };
 use tokeira_types::{
     BuildId, DeploymentId, ExecutionRef, ExecutionStatus, NamespaceId, QueueKey, RequestId, RunId,
@@ -80,6 +79,10 @@ macro_rules! record_dsql_commit_operation {
 }
 
 mod activity;
+mod activity_dispatch;
+#[cfg(all(test, feature = "dsql-integration"))]
+mod activity_dispatch_tests;
+mod activity_repair;
 #[cfg(all(test, feature = "dsql-integration"))]
 mod atomic_successors_live_tests;
 mod bulk_write;
@@ -146,7 +149,11 @@ pub(crate) mod pause_point {
         Release(ShardId),
         /// A copy page of this materialized run, before its transaction.
         Page(RunKey),
-        /// Legacy workflow backlog deletes before the page commits.
+        /// Activity repair after all reads/writes, before its commit.
+        ActivityRepair(RunKey),
+        /// Receipt replay after validation, before its read transaction commits.
+        ActivityObservation(RunKey),
+        /// Legacy backlog deletes before the page commits.
         Disposal,
         /// A load of this run's split state, after its first read and before it
         /// reads the state again with its parts (`large-value-parts`).
@@ -422,11 +429,7 @@ impl DsqlRunRepository {
     }
 
     pub(crate) fn activity_dispatch_key(run_key: RunKey, activity_id: &str) -> Uuid {
-        dsql_spread_uuid(&[
-            b"activity-dispatch",
-            run_key.0.as_bytes(),
-            activity_id.as_bytes(),
-        ])
+        crate::activity_dispatch_key(run_key, activity_id)
     }
 
     pub(crate) fn is_serialization_failure(err: &sqlx::Error) -> bool {
@@ -757,6 +760,30 @@ impl RunRepository for DsqlRunRepository {
         self.do_load_run(run_key).await
     }
 
+    async fn validate_activity_start_observation(
+        &self,
+        observed: &WorkflowState,
+        activity_id: &str,
+        home: ShardId,
+        fence: WriteFence,
+    ) -> Result<bool> {
+        match self
+            .do_validate_activity_start_observation(observed, activity_id, home, &fence)
+            .await
+        {
+            // Resolution or takeover changed the read set: ask the bounded
+            // owner loop to reread authority, never return an unvalidated replay.
+            Err(error)
+                if error
+                    .downcast_ref::<sqlx::Error>()
+                    .is_some_and(Self::is_serialization_failure) =>
+            {
+                Ok(false)
+            }
+            result => result,
+        }
+    }
+
     async fn load_outbound_source(&self, run: RunKey) -> Result<LoadedRun> {
         match self.do_load_run(run).await? {
             LoadedRun::Existing(state) => Ok(LoadedRun::Existing(state)),
@@ -961,6 +988,51 @@ impl RunRepository for DsqlRunRepository {
                     error
                 }
             })
+    }
+
+    async fn reconcile_activity_dispatch_page(
+        &self,
+        home: ShardId,
+        run_key: RunKey,
+        after: Option<crate::ActivityRepairCursor>,
+        fence: WriteFence,
+    ) -> Result<crate::ActivityRepairPage> {
+        self.do_reconcile_activity_dispatch_page(home, run_key, after, &fence)
+            .await
+            .map_err(|error| {
+                if error
+                    .downcast_ref::<sqlx::Error>()
+                    .is_some_and(Self::is_serialization_failure)
+                {
+                    crate::ActivityDispatchRepairConflict.into()
+                } else {
+                    error
+                }
+            })
+    }
+
+    /// Read one fixed-cutoff queue-family page without claiming or mutating work.
+    /// Per-row payload errors retain their position; SQL/key errors fail the page.
+    async fn list_activity_dispatch_page(
+        &self,
+        range: &crate::ActivityDiscoveryRange,
+        cutoff: time::OffsetDateTime,
+        after: Option<crate::ActivityDispatchPosition>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<crate::ActivityDispatchPage> {
+        self.do_list_activity_dispatch_page(range, cutoff, after, limit)
+            .await
+    }
+
+    /// Enumerate every physical activity slot for a home, including legacy/orphan rows.
+    async fn list_activity_dispatch_home_page(
+        &self,
+        home: tokeira_types::ShardId,
+        after: Option<crate::ActivityHomePosition>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<crate::ActivityHomePage> {
+        self.do_list_activity_dispatch_home_page(home, after, limit)
+            .await
     }
 
     async fn list_workflow_dispatch_page(
@@ -2091,6 +2163,7 @@ mod tests {
 
     fn sample_state(run_key: RunKey) -> WorkflowState {
         WorkflowState {
+            activity_start_receipts: std::collections::BTreeMap::new(),
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,

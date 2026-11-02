@@ -46,7 +46,7 @@ impl DsqlRunRepository {
                AND deployment IS NOT DISTINCT FROM $4
                AND build_id IS NOT DISTINCT FROM $5
                AND dispatch_at <= $6
-             ORDER BY dispatch_at ASC, created_at ASC
+             ORDER BY dispatch_at ASC, key ASC
              LIMIT $7",
             )
             .bind(queue.namespace_id.0)
@@ -91,7 +91,7 @@ impl DsqlRunRepository {
                AND task_kind = $3
                AND deployment IS NOT DISTINCT FROM $4
                AND build_id IS NOT DISTINCT FROM $5
-             ORDER BY dispatch_at ASC, created_at ASC
+             ORDER BY dispatch_at ASC, key ASC
              LIMIT $6",
             )
             .bind(queue.namespace_id.0)
@@ -204,14 +204,17 @@ impl DsqlRunRepository {
                AND attempt = $3
                AND stamp = $4
                AND dispatch_revision = $5
-               AND dispatch_at = $6",
+               AND dispatch_at = $6
+               AND run_key = $7 AND activity_id = $8",
             )
             .bind(key)
             .bind(candidate.schedule_event_id)
             .bind(i32::try_from(candidate.attempt)?)
-            .bind(i64::try_from(candidate.stamp).unwrap_or(i64::MAX))
+            .bind(i64::try_from(candidate.stamp)?)
             .bind(candidate.dispatch_revision)
             .bind(candidate.dispatch_at)
+            .bind(candidate.run_key.0)
+            .bind(&candidate.activity_id)
             .execute(permit.connection()?)
             .await?;
             Ok(result.rows_affected() > 0)
@@ -249,7 +252,7 @@ pub(super) fn activity_dispatch_from_row(row: ActivityDispatchRow) -> Result<Due
             schedule_event_id,
             attempt: convert::u32_from_i32(attempt, "activity_dispatch.attempt")?,
             dispatch_revision,
-            stamp: u64::try_from(stamp).unwrap_or_default(),
+            stamp: u64::try_from(stamp)?,
             priority: priority_data
                 .as_deref()
                 .map(codec::decode_priority)

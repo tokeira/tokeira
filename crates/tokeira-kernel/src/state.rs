@@ -1,3 +1,7 @@
+//! Durable run summaries consumed by pure transitions.
+//! Positional state fields are frozen; required extensions are protected by
+//! storage envelope versions and never inferred from volatile delivery state.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
@@ -104,6 +108,11 @@ pub struct WorkflowState {
     /// set of outstanding obligations. Old writers must reject the new envelope.
     #[serde(skip)]
     pub outbound: Option<crate::OutboundState>,
+    /// Identity consumed by the current started activity attempt, keyed by activity
+    /// ID. Persisted in a required versioned extension, outside positional state.
+    /// A legacy start without a receipt remains valid but cannot replay a new ID.
+    #[serde(skip)]
+    pub activity_start_receipts: BTreeMap<String, ActivityStartReceipt>,
     /// Next logical task sequence to assign when scheduling a
     /// workflow task.
     pub next_workflow_task_seq: LogicalTaskSeq,
@@ -1043,6 +1052,44 @@ pub struct ActivityPauseInfo {
     pub rule_id: Option<String>,
 }
 
+/// Durable identity and binding of one accepted activity start request.
+///
+/// This records no response payload or credentials. Control stamp changes after
+/// start do not erase it; resolution, retry, replacement and reset forks do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivityStartReceipt {
+    /// Queue owner's stable request identity across transport/OCC retries.
+    pub request_id: tokeira_types::Uuid,
+    /// Schedule identity distinguishing activity-ID reuse.
+    pub schedule_event_id: i64,
+    /// Attempt originally started by this request.
+    pub attempt: u32,
+    /// Consumed offer stamp, before start advanced the current control stamp.
+    pub offered_stamp: u64,
+    /// Admitted worker identity, including the legitimate empty identity.
+    pub worker_identity: WorkerIdentity,
+    /// Selected target after live deployment resolution.
+    pub selected_queue: tokeira_types::QueueKey,
+    /// Routing revision accepted with the selected target.
+    pub dispatch_revision: i64,
+}
+
+impl WorkflowState {
+    /// Remove receipts whose started incarnation no longer exists. Deliberately
+    /// ignore the current stamp: pause/options edits cannot invalidate the
+    /// identity of a still-started attempt's original request.
+    pub fn retain_activity_start_receipts(&mut self) {
+        self.activity_start_receipts.retain(|id, receipt| {
+            self.activities.get(id).is_some_and(|activity| {
+                activity.schedule_event_id == receipt.schedule_event_id
+                    && activity.attempt == receipt.attempt
+                    && activity.started_event_id.is_some()
+                    && activity.started_at.is_some()
+            })
+        });
+    }
+}
+
 /// Durable state for a single open timer.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TimerState {
@@ -1604,6 +1651,7 @@ pub(crate) mod tests {
 
     pub(crate) fn open_state() -> WorkflowState {
         WorkflowState {
+            activity_start_receipts: std::collections::BTreeMap::new(),
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,

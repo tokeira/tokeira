@@ -18,7 +18,6 @@ fn runtime(store: Arc<InMemoryStore>, _home: QueueHome) -> TokeiraRuntime<InMemo
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         ActivityTimeoutScannerConfig::default(),
         NexusTimeoutScannerConfig::default(),
         NexusEndpointRegistry::default(),

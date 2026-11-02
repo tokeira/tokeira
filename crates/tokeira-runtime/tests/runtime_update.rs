@@ -6,8 +6,8 @@ use tokeira_kernel::{
     StartRequest, UpdateProtocolBody, WorkflowCommand, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, UpdateLifecycleError,
-    UpdateLifecycleStage, UpdateOutcome, UpdateWaitPolicy, WorkflowTimeoutScannerConfig,
+    LaneConfig, TimerScannerConfig, TokeiraRuntime, UpdateLifecycleError, UpdateLifecycleStage,
+    UpdateOutcome, UpdateWaitPolicy, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -870,7 +870,6 @@ fn make_runtime(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     )
 }
 

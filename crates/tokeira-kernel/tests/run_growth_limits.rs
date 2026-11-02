@@ -52,6 +52,7 @@ fn request(id: &str) -> RequestContext {
 fn open_state() -> WorkflowState {
     let now = now();
     WorkflowState {
+        activity_start_receipts: std::collections::BTreeMap::new(),
         used_worker_deployment_versions: Some(Vec::new()),
         completed_update_count: 0,
         signal_count: 0,
@@ -244,6 +245,7 @@ fn start_activity(state: WorkflowState, index: usize) -> Transition {
         .apply_activity_started(
             LoadedRun::Existing(state),
             ActivityStartRequest {
+                request_id: None,
                 activity_id: format!("activity-{index}"),
                 identity: WorkerIdentity("worker".into()),
                 principal: None,

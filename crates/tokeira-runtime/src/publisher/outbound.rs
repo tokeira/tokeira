@@ -29,6 +29,7 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
             .activity_tracking
             .for_acquisition(attempt.acquisition.clone());
         activity.remove_all_for_run(state.run_key);
+        activity.eligibility.refresh(state, home);
         for entry in entries.activities {
             let cancel_requested = state
                 .activities

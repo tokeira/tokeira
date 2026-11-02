@@ -1,0 +1,2 @@
+# Runtime reconstruction must follow completion of the previous node's tasks.
+cc 57e40a1bc6ab7dd45dea2d8cb126db4519d89903a306e367b07eefa29b05e981 # shrinks to lost = 1, held = 1, first_task_done = true

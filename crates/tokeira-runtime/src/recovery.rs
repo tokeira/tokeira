@@ -54,11 +54,11 @@ use crate::{
 #[cfg(test)]
 use crate::{
     lane::LaneHandle,
-    runtime::{ActivityRetryDeps, activity::reconcile_activity_dispatch_candidates},
+    runtime::ActivityRetryDeps,
     scanner::{command_for_due_timer, pick_lane_for_run_key, settle_failed_due_timer},
 };
 #[cfg(test)]
-use tokeira_storage::{DueActivityDispatch, DueTimer};
+use tokeira_storage::DueTimer;
 
 /// Observability summary produced by a shard sweep.
 ///
@@ -86,10 +86,6 @@ pub(crate) const RECOVERY_PAGE: usize = 100;
 /// bytes.
 #[cfg(test)]
 const DUE_TIMER_PAGE: usize = 500;
-
-/// Rows the sweep reads per page of due activity dispatches.
-#[cfg(test)]
-const DUE_ACTIVITY_DISPATCH_PAGE: usize = 100;
 
 /// Test lifecycle driver: reconstruct while non-serving, activate, then give
 /// the ordinary activity and timer processing paths their first opportunity.
@@ -138,14 +134,6 @@ where
     .await?;
     assert!(owner.write().unwrap().activate_acquisition(&acquisition));
     let now = OffsetDateTime::now_utc();
-    result.activity_tasks_republished = republish_due_activity_dispatches(
-        shard_id,
-        repo,
-        retry_deps,
-        now,
-        DUE_ACTIVITY_DISPATCH_PAGE,
-    )
-    .await?;
     let timers = fire_due_timers(shard_id, repo, lanes, lane_count, now, DUE_TIMER_PAGE).await?;
     result.due_timers_injected = timers.submitted;
     result.stale_timer_rows_deleted = timers.deleted;
@@ -166,6 +154,60 @@ pub(crate) struct RepairAcquisition {
 impl RepairAcquisition {
     pub(crate) fn validate(&self) -> Result<()> {
         crate::serving_gate::validate(&self.owner, &self.acquisition)
+    }
+
+    async fn repair_activity<R: RunRepository + ?Sized>(
+        &self,
+        repo: &R,
+        run_key: tokeira_types::RunKey,
+    ) -> Result<()> {
+        let mut after = None::<tokeira_storage::ActivityRepairCursor>;
+        let mut restarts = 0u32;
+        loop {
+            self.validate()?;
+            let result = repo
+                .reconcile_activity_dispatch_page(
+                    self.acquisition.shard_id,
+                    run_key,
+                    after,
+                    self.fence.clone(),
+                )
+                .await;
+            // A completed old-generation page may have repaired durable rows,
+            // but cannot grant serving rights or install replacement tracking.
+            self.validate()?;
+            match result {
+                Err(error)
+                    if error.is::<tokeira_storage::ActivityDispatchRepairConflict>()
+                        && restarts < self.max_retries =>
+                {
+                    restarts += 1;
+                    after = None;
+                }
+                result => {
+                    let page = result
+                        .with_context(|| format!("repair activity dispatch for {run_key:?}"))?;
+                    let Some(next) = page.continuation else {
+                        return Ok(());
+                    };
+                    if let Some(previous) = after {
+                        if previous.observed_seq != next.observed_seq {
+                            restarts += 1;
+                            anyhow::ensure!(
+                                restarts <= self.max_retries,
+                                "activity repair state kept changing for {run_key:?}"
+                            );
+                        } else {
+                            anyhow::ensure!(
+                                previous != next,
+                                "activity repair made no progress for {run_key:?}"
+                            );
+                        }
+                    }
+                    after = Some(next);
+                }
+            }
+        }
     }
 
     async fn repair<R: RunRepository + ?Sized>(
@@ -198,7 +240,8 @@ impl RepairAcquisition {
             repo.reconcile_outbound_run(self.acquisition.shard_id, run_key, self.fence.clone())
                 .await
                 .with_context(|| format!("repair outbound operations for {run_key:?}"))?;
-            return self.validate();
+            self.validate()?;
+            return self.repair_activity(repo, run_key).await;
         }
         unreachable!("last repair attempt returns")
     }
@@ -231,8 +274,10 @@ where
         let page = repo
             .list_recovery_candidates_for_shard(shard_id, cursor.as_ref(), RECOVERY_PAGE)
             .await?;
+        repair.validate()?;
         for state in &page.states {
             repair.repair(repo, state.run_key).await?;
+            activity_tracking.eligibility.refresh(state, shard_id);
             let entries = recovery_entries(state);
             if let Some(task) = entries.dispatchable_workflow_task {
                 // Recovery republishes the same derived envelope as the hot
@@ -289,6 +334,7 @@ where
             }
             #[cfg(test)]
             wft_timeout_tracking.pause_recovery().await?;
+            repair.validate()?;
             for entry in entries.activities {
                 // The last heartbeat time comes from the run's state, so the
                 // heartbeat deadline is the one the previous owner would have
@@ -348,6 +394,7 @@ where
             let keys = repo
                 .list_workflow_dispatch_for_home(shard_id, after, limit)
                 .await?;
+            repair.validate()?;
             let exhausted = keys.len() < limit.get() as usize;
             after = keys.last().copied();
             for key in keys {
@@ -359,45 +406,33 @@ where
         }
         repair.validate()?;
     }
-    Ok(result)
-}
-
-/// Republish a shard's due activity dispatches a page at a time through the
-/// shared preparation gate, returning how many were published.
-///
-/// The cursor advances past every row it reads, so the pass ends even though
-/// reconciliation prunes rows and leaves others for a later pass.
-#[cfg(test)]
-async fn republish_due_activity_dispatches<R, S>(
-    shard_id: ShardId,
-    repo: &R,
-    retry_deps: &ActivityRetryDeps<S>,
-    now: OffsetDateTime,
-    page_size: usize,
-) -> Result<usize>
-where
-    R: RunRepository + ?Sized,
-    S: RunRepository + 'static,
-{
-    let page_size = page_size.max(1);
-    let mut published = 0;
-    let mut after: Option<DueActivityDispatch> = None;
-    loop {
-        let page = repo
-            .list_due_dispatchable_activity_tasks_for_shard(
-                shard_id,
-                now,
-                after.as_ref(),
-                page_size,
-            )
-            .await?;
-        let more = page.len() == page_size;
-        after = page.last().cloned();
-        published += reconcile_activity_dispatch_candidates(retry_deps, page, now).await;
-        if !more {
-            return Ok(published);
+    {
+        // The queue index omits pre-upgrade NULL digests. The complete home
+        // walk also finds stale rows for closed/non-candidate runs and orphans.
+        // Positions advance independently of repairs that delete those rows.
+        let limit = std::num::NonZeroU32::new(64).expect("nonzero activity repair page");
+        let mut after = None;
+        let mut last_run = None;
+        loop {
+            repair.validate()?;
+            let page = repo
+                .list_activity_dispatch_home_page(shard_id, after, limit)
+                .await?;
+            repair.validate()?;
+            for position in page.candidates {
+                if last_run != Some(position.run_key) {
+                    repair.repair_activity(repo, position.run_key).await?;
+                    last_run = Some(position.run_key);
+                }
+            }
+            after = page.last_examined.or(after);
+            if page.exhausted {
+                break;
+            }
         }
+        repair.validate()?;
     }
+    Ok(result)
 }
 
 /// What firing a shard's due timers did.
@@ -676,6 +711,7 @@ mod tests {
 
     fn sample_state(run_key: RunKey) -> WorkflowState {
         WorkflowState {
+            activity_start_receipts: std::collections::BTreeMap::new(),
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,
@@ -1070,7 +1106,7 @@ mod tests {
                         retry_last_worker_identity: None,
                         activity_id: act_id.clone(),
                         activity_type: "activity-type".into(),
-                        schedule_event_id: idx as i64,
+                        schedule_event_id: idx as i64 + 1,
                         task_queue: TaskQueueName("q".into()),
                         deployment: None,
                         build_id: None,
@@ -1103,7 +1139,7 @@ mod tests {
                         DispatchOp::EnqueueActivityTask {
                             queue,
                             activity_id: act_id.clone(),
-                            schedule_event_id: idx as i64,
+                            schedule_event_id: idx as i64 + 1,
                             attempt: 1,
                             dispatch_revision: 0,
                             stamp: 0,
@@ -1163,24 +1199,11 @@ mod tests {
 
                 prop_assert_eq!(
                     result.activity_tasks_republished,
-                    expected_runs.len(),
+                    0,
                 );
 
-                let queue = QueueKey {
-                    namespace_id: ns,
-                    task_queue: TaskQueueName("q".into()),
-                    task_kind: TaskKind::Activity,
-                    deployment: None,
-                    build_id: None,
-                };
-                let mut polled = Vec::new();
-                while let Some((task, _)) = activity_broker
-                    .poll_activity_task(&queue, std::time::Duration::from_millis(1))
-                    .await
-                    .unwrap()
-                {
-                    polled.push(task.run_key)
-                }
+                let page = store.list_activity_dispatch_home_page(shard_id, None, std::num::NonZeroU32::new(64).unwrap()).await.unwrap();
+                let mut polled: Vec<_> = page.candidates.into_iter().map(|position| position.run_key).collect();
                 polled.sort_by_key(|rk| rk.0);
                 let mut expected_sorted =
                     expected_runs.clone();
@@ -1325,21 +1348,10 @@ mod tests {
                     }, None, std::num::NonZeroU32::new(64).unwrap()).await.unwrap();
                     let source = crate::discovery::WorkflowSource { repo: Arc::new(store.clone()), registry: Arc::new(RwLock::new(None)) };
                     let workflow = source.resolve(&page.candidates[0]).await.unwrap().unwrap();
-                    let activity = activity_broker
-                        .poll_activity_task(
-                            &QueueKey {
-                                namespace_id,
-                                task_queue: TaskQueueName("q".into()),
-                                task_kind: TaskKind::Activity,
-                                deployment: None,
-                                build_id: None,
-                            },
-                            std::time::Duration::ZERO,
-                        )
-                        .await
-                        .unwrap()
-                        .expect("recovered activity task")
-                        .0;
+                    let page = store.list_activity_dispatch_page(&tokeira_storage::ActivityDiscoveryRange {
+                        namespace_id, queue_name: TaskQueueName("q".into()),
+                    }, OffsetDateTime::now_utc(), None, std::num::NonZeroU32::new(64).unwrap()).await.unwrap();
+                    let activity = page.candidates.into_iter().next().unwrap().row.unwrap().task();
                     (workflow, activity)
                 };
 
@@ -1348,7 +1360,20 @@ mod tests {
                 prop_assert_eq!(first_workflow.logical_seq, LogicalTaskSeq(logical_seq));
                 prop_assert_eq!(&first_workflow.priority, &workflow_priority);
                 prop_assert_eq!(first_activity.stamp, activity_stamp);
-                prop_assert_eq!(&first_activity.priority, &activity_priority);
+                let expected_activity_priority = match (&workflow_priority, &activity_priority) {
+                    (None, None) => None,
+                    (parent, child) => {
+                        let empty = Priority { priority_key: 0, fairness_key: String::new(), fairness_weight: 0.0 };
+                        let parent = parent.clone().unwrap_or_else(|| empty.clone());
+                        let child = child.clone().unwrap_or(empty);
+                        Some(Priority {
+                            priority_key: if child.priority_key != 0 { child.priority_key } else { parent.priority_key },
+                            fairness_key: if !child.fairness_key.is_empty() { child.fairness_key } else { parent.fairness_key },
+                            fairness_weight: if child.fairness_weight != 0.0 { child.fairness_weight } else { parent.fairness_weight },
+                        })
+                    }
+                };
+                prop_assert_eq!(&first_activity.priority, &expected_activity_priority);
                 prop_assert_eq!(second_workflow.logical_seq, first_workflow.logical_seq);
                 prop_assert_eq!(second_workflow.priority, first_workflow.priority);
                 prop_assert_eq!(second_activity.activity_id, first_activity.activity_id);
@@ -1605,7 +1630,7 @@ mod tests {
                         fixed_now()
                             + Duration::seconds(2),
                     ),
-                    started_event_id: None,
+                    started_event_id: Some(8),
                     pause_info: None,
                     stamp: 0,
                     priority: None,
@@ -2424,46 +2449,43 @@ mod tests {
         );
     }
 
-    /// The sweep reads due activity dispatches a page at a time and
-    /// republishes every one.
+    /// Canonical queue traversal remains complete after recovery no longer publishes.
     #[tokio::test]
-    async fn sweep_pages_through_due_activity_dispatches() {
+    async fn activity_discovery_pages_after_recovery() {
         let store = InMemoryStore::with_shard_count(1);
         let ns = NamespaceId::new();
         let mut runs = Vec::new();
         for _ in 0..5 {
             runs.push(commit_run_with_due_activity(&store, ns).await);
         }
-        let activity_broker = InMemoryActivityBroker::default();
-
-        let published = republish_due_activity_dispatches(
-            ShardId(0),
-            &store,
-            &sweep_retry_deps(&store, &activity_broker, 1),
-            fixed_now(),
-            2,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(published, 5);
-        let queue = QueueKey {
+        let range = tokeira_storage::ActivityDiscoveryRange {
             namespace_id: ns,
-            task_queue: TaskQueueName("q".into()),
-            task_kind: TaskKind::Activity,
-            deployment: None,
-            build_id: None,
+            queue_name: TaskQueueName("q".into()),
         };
-        let mut polled = Vec::new();
-        while let Some((task, _)) = activity_broker
-            .poll_activity_task(&queue, std::time::Duration::from_millis(1))
-            .await
-            .unwrap()
-        {
-            polled.push(task.run_key);
+        let mut after = None;
+        let mut found = Vec::new();
+        loop {
+            let page = store
+                .list_activity_dispatch_page(
+                    &range,
+                    fixed_now(),
+                    after,
+                    std::num::NonZeroU32::new(2).unwrap(),
+                )
+                .await
+                .unwrap();
+            found.extend(
+                page.candidates
+                    .into_iter()
+                    .map(|candidate| candidate.row.unwrap().incarnation.run_key),
+            );
+            if page.exhausted {
+                break;
+            }
+            after = page.last_examined;
         }
-        polled.sort_by_key(|run_key| run_key.0);
-        runs.sort_by_key(|run_key| run_key.0);
-        assert_eq!(polled, runs);
+        found.sort();
+        runs.sort();
+        assert_eq!(found, runs);
     }
 }

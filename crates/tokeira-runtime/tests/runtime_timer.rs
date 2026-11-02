@@ -8,7 +8,7 @@ use tokeira_kernel::{
     HistoryEventKind, StartRequest, WorkflowCommand, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -28,7 +28,6 @@ async fn timer_scanner_fires_due_timer_end_to_end() -> Result<()> {
             max_timers_per_scan: 100,
         },
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
 
@@ -69,7 +68,6 @@ async fn canceled_timer_is_harmlessly_ignored_by_scanner() -> Result<()> {
             max_timers_per_scan: 100,
         },
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
 
@@ -120,7 +118,6 @@ async fn multiple_due_timers_all_fire() -> Result<()> {
             max_timers_per_scan: 100,
         },
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
 

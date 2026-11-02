@@ -14,10 +14,9 @@ use anyhow::Result;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{LoadedRun, ResetRequest, StartRequest, WorkflowCommand};
 use tokeira_runtime::{
-    ActivityTimeoutScannerConfig, BacklogConfig, LaneConfig, NexusCompletionDeps,
-    NexusEndpointRegistry, NexusTimeoutScannerConfig, NoopNexusHttpClient, ResetWorkflowResult,
-    StartedWorkflowTask, TimerScannerConfig, TokeiraRuntime, WorkflowActivation,
-    WorkflowTimeoutScannerConfig,
+    ActivityTimeoutScannerConfig, LaneConfig, NexusCompletionDeps, NexusEndpointRegistry,
+    NexusTimeoutScannerConfig, NoopNexusHttpClient, ResetWorkflowResult, StartedWorkflowTask,
+    TimerScannerConfig, TokeiraRuntime, WorkflowActivation, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{BulkWritePhase, CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -35,7 +34,6 @@ fn runtime(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     )
 }
 
@@ -48,7 +46,6 @@ async fn restarted(store: Arc<InMemoryStore>) -> Result<TokeiraRuntime<InMemoryS
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         ActivityTimeoutScannerConfig::default(),
         NexusTimeoutScannerConfig::default(),
         NexusEndpointRegistry::default(),

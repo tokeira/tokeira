@@ -37,8 +37,12 @@ The model checks that this is safe and that it makes progress:
   announces, is eventually started or converted by its schedule-to-start
   timeout into one that discovery can find.
 
-Activity tasks have the same shape, with the attempt and stamp as their
-incarnation, so one model covers both.
+Activity tasks have the same shape, with schedule-event identity, attempt and
+stamp as their incarnation. The integer inc names successive distinct tuples;
+it is not the numeric attempt. See ../refinement/activity-dispatch.md for the
+authority mapping and the separate proof obligation for request-ID replay.
+A receipt replay stutters authoritative state; this model does not encode its
+UUID or the full committed-but-unacknowledged response state.
 
 This is a sibling of 00_execution_contract, not a refinement of it. It keeps
 only the part of a run's state that dispatch depends on (whether a task is

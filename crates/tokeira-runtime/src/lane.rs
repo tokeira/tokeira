@@ -150,6 +150,18 @@ pub(crate) struct OutboundSubmission {
     pub(crate) authority: tokeira_storage::DeliveryGuard,
 }
 
+/// A decision made from one run image must be recomputed if that image changes.
+/// The original acquisition also fences time spent waiting in the lane queue.
+#[derive(Clone, Debug)]
+pub(crate) struct ObservedSubmission {
+    /// Lease and local acquisition captured before evaluating the decision.
+    pub(crate) attempt: crate::outbound::driver::Attempt,
+    /// Expected version of the run image used by the decision.
+    pub(crate) sequence: tokeira_types::TransitionSeq,
+    /// Prevent replacement of a deleted run key with another execution identity.
+    pub(crate) run_id: tokeira_types::RunId,
+}
+
 #[derive(Debug)]
 struct OutboundMetadataRequest {
     transition: Box<tokeira_kernel::Transition>,
@@ -174,6 +186,20 @@ impl LaneHandle {
         let (reply, received) = oneshot::channel();
         let mut message = LaneMessage::new(self.lane_id, run_key, command, reply);
         message.outbound = Some(submission);
+        self.tx.send(message).await?;
+        received.await?
+    }
+
+    /// Apply a state-dependent decision only to its original run image.
+    pub(crate) async fn submit_observed(
+        &self,
+        run_key: RunKey,
+        command: Command,
+        observed: ObservedSubmission,
+    ) -> Result<CommitResult> {
+        let (reply, received) = oneshot::channel();
+        let mut message = LaneMessage::new(self.lane_id, run_key, command, reply);
+        message.observed = Some(observed);
         self.tx.send(message).await?;
         received.await?
     }
@@ -287,6 +313,7 @@ struct LaneMessage {
     reserve_poller: bool,
     successor_plan: Option<SuccessorPlan>,
     outbound: Option<OutboundSubmission>,
+    observed: Option<ObservedSubmission>,
 }
 
 impl LaneMessage {
@@ -310,6 +337,7 @@ impl LaneMessage {
             reserve_poller: false,
             successor_plan: None,
             outbound: None,
+            observed: None,
         }
     }
 }
@@ -740,6 +768,7 @@ where
             message.command,
             message.successor_plan.as_ref(),
             message.outbound.as_ref(),
+            message.observed.as_ref(),
             &mut successor_effect,
             config.max_occ_retries,
             cache,
@@ -839,6 +868,7 @@ where
                 };
                 if let CommitResult::Applied { new_state } = &commit_result {
                     let shard_id = shard_id.expect("applied transition has an execution home");
+                    activity_tracking.eligibility.refresh(new_state, shard_id);
                     track_committed_run(
                         new_state,
                         &history_events,
@@ -1011,6 +1041,7 @@ where
                                     history,
                                 } = *committed;
                                 let home = shard_id.expect("paired close has an execution home");
+                                activity_tracking.eligibility.refresh(&state, home);
                                 track_committed_run(
                                     &state,
                                     &history,
@@ -1209,6 +1240,7 @@ where
         command,
         None,
         None,
+        None,
         &mut None,
         max_retries,
         cache,
@@ -1227,6 +1259,7 @@ async fn handle_message_with_successor<K, R>(
     command: Command,
     successor_plan: Option<&SuccessorPlan>,
     outbound: Option<&OutboundSubmission>,
+    observed: Option<&ObservedSubmission>,
     successor_effect: &mut Option<SuccessorEffect>,
     max_retries: u32,
     cache: &mut LaneCache,
@@ -1252,12 +1285,10 @@ where
     // delay evaluation clock carried in the plan (see successor::build_successor_start).
     let successor_now = OffsetDateTime::now_utc();
     let mut attempts = 0u32;
-    let mut original_acquisition = outbound.map(|submission| {
-        (
-            submission.attempt.acquisition.clone(),
-            submission.attempt.fence.clone(),
-        )
-    });
+    let mut original_acquisition = outbound
+        .map(|submission| &submission.attempt)
+        .or_else(|| observed.map(|submission| &submission.attempt))
+        .map(|attempt| (attempt.acquisition.clone(), attempt.fence.clone()));
     loop {
         let transition_span = tracing::info_span!(
             "kernel.transition",
@@ -1346,6 +1377,23 @@ where
             loaded = repo.load_run(run_key).await?;
             cache.insert(run_key, loaded.clone());
         }
+        if let Some(observed) = observed {
+            observed.attempt.validate(shard_owner)?;
+            if !matches!(&loaded, LoadedRun::Existing(state)
+                if state.transition_seq == observed.sequence && state.run_id == observed.run_id)
+            {
+                // A cache predating a direct activity start is also obsolete.
+                // Recompute the decision outside the lane from a fresh read.
+                cache.evict(run_key);
+                return Ok((
+                    CommitResult::Conflict {
+                        reason: "observed run image changed".into(),
+                    },
+                    SmallVec::new(),
+                    SmallVec::new(),
+                ));
+            }
+        }
         let processing_span = tracing::Span::current();
         processing_span.record("tokeira.shard_id", execution_home_bundle.0);
         processing_span.record("tokeira.bundle_id", execution_home_bundle.0);
@@ -1372,7 +1420,7 @@ where
             "transition_seq",
             transition.next_state.transition_seq.0 as i64,
         );
-        if transition.is_noop() && outbound.is_none() {
+        if transition.is_noop() && outbound.is_none() && observed.is_none() {
             // A state-equivalent options update is linearized by this lane
             // load/apply turn but has no durable write set. Temporal returns
             // `Noop=true` without persisting mutable state in the equivalent
@@ -2356,6 +2404,16 @@ mod tests {
 
     #[async_trait]
     impl RunRepository for MockRepo {
+        async fn validate_activity_start_observation(
+            &self,
+            _observed: &tokeira_kernel::WorkflowState,
+            _activity_id: &str,
+            _home: tokeira_types::ShardId,
+            _fence: tokeira_storage::WriteFence,
+        ) -> anyhow::Result<bool> {
+            anyhow::bail!("this fixture does not implement activity start replay")
+        }
+
         async fn commit_successor_fallback(
             &self,
             run: RunKey,
@@ -2546,6 +2604,28 @@ mod tests {
                 run.run_id = successor_run_id;
             }
             Ok(())
+        }
+
+        /// Read one fixed-cutoff queue-family page without claiming or mutating work.
+        /// Per-row payload errors retain their position; SQL/key errors fail the page.
+        async fn list_activity_dispatch_page(
+            &self,
+            _range: &tokeira_storage::ActivityDiscoveryRange,
+            _cutoff: time::OffsetDateTime,
+            _after: Option<tokeira_storage::ActivityDispatchPosition>,
+            _limit: std::num::NonZeroU32,
+        ) -> Result<tokeira_storage::ActivityDispatchPage> {
+            anyhow::bail!("activity discovery is outside this test repository")
+        }
+
+        /// Enumerate every physical activity slot for a home, including legacy/orphan rows.
+        async fn list_activity_dispatch_home_page(
+            &self,
+            _home: tokeira_types::ShardId,
+            _after: Option<tokeira_storage::ActivityHomePosition>,
+            _limit: std::num::NonZeroU32,
+        ) -> Result<tokeira_storage::ActivityHomePage> {
+            anyhow::bail!("activity discovery is outside this test repository")
         }
 
         async fn list_workflow_dispatch_page(
@@ -2966,6 +3046,7 @@ mod tests {
     fn sample_state(run_key: RunKey) -> WorkflowState {
         let namespace_id = NamespaceId::new();
         WorkflowState {
+            activity_start_receipts: std::collections::BTreeMap::new(),
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,

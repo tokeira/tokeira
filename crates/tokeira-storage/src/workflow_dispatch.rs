@@ -7,8 +7,9 @@
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use time::{Duration, OffsetDateTime};
+use time::OffsetDateTime;
+
+use crate::dispatch_key::{dispatch_timestamp, lookup_digest};
 use tokeira_kernel::{Priority, WorkflowState, WorkflowTaskType};
 use tokeira_types::{
     BuildId, DeploymentId, ExecutionStatus, LogicalTaskSeq, NamespaceId, QueueKey, RunKey, ShardId,
@@ -382,18 +383,6 @@ pub(crate) fn recoverable_sticky(state: &WorkflowState) -> Option<&StickyAffinit
         .filter(|affinity| !affinity.sticky_queue.0.is_empty())
 }
 
-fn dispatch_timestamp(value: OffsetDateTime) -> OffsetDateTime {
-    // SQLx encodes TIMESTAMPTZ as whole microseconds since 2000, truncating
-    // toward zero. Normalize both backends identically; authoritative state
-    // retains its original deadline and precision outside this derived view.
-    let epoch = OffsetDateTime::UNIX_EPOCH + Duration::seconds(946_684_800);
-    epoch
-        + Duration::microseconds(
-            i64::try_from((value - epoch).whole_microseconds())
-                .expect("time's supported date range fits SQL timestamp microseconds"),
-        )
-}
-
 fn lookup_keys(queue: &str, routing: &WorkflowDispatchRouting) -> [String; 3] {
     let (_, deployment, build_id) = routing.coordinates();
     [
@@ -403,23 +392,12 @@ fn lookup_keys(queue: &str, routing: &WorkflowDispatchRouting) -> [String; 3] {
     ]
 }
 
-fn lookup_digest(domain: &[u8], value: Option<&str>) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"tokeira-workflow-dispatch-v1\0");
-    digest.update((domain.len() as u64).to_be_bytes());
-    digest.update(domain);
-    digest.update([u8::from(value.is_some())]);
-    if let Some(value) = value {
-        digest.update((value.len() as u64).to_be_bytes());
-        digest.update(value.as_bytes());
-    }
-    format!("{:x}", digest.finalize())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use sha2::{Digest, Sha256};
+    use time::Duration;
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]

@@ -1763,6 +1763,9 @@ pub enum ActivityStartMode {
 /// (`BasicKernel::apply_activity_started`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActivityStartRequest {
+    /// Runtime-supplied request identity. None retains synthetic by-ID behavior;
+    /// the pure kernel never generates a random delivery identity.
+    pub request_id: Option<tokeira_types::Uuid>,
     /// Activity that started.
     pub activity_id: String,
     /// Identity of the polling worker, or of the by-id caller.

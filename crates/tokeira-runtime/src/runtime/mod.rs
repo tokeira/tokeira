@@ -43,7 +43,6 @@ use crate::{
     activity_timeout::{
         ActivityTimeoutScannerConfig, ActivityTrackingState, run_activity_timeout_scanner,
     },
-    backlog::{BacklogConfig, run_drain_loop, run_grace_scanner},
     broker::{InMemoryActivityBroker, InMemoryBroker, WorkflowPollResult},
     buffered_queries::{BufferedQuery, BufferedQueryRegistry},
     deployment_registry::DeploymentRegistry,
@@ -87,6 +86,8 @@ use crate::{
 };
 
 pub(crate) mod activity;
+#[cfg(test)]
+mod activity_retirement_tests;
 mod commit;
 #[cfg(test)]
 mod discovery_tests;
@@ -112,8 +113,8 @@ pub(crate) mod workflow_task;
 pub use workflow_task::continue_as_new_advice_policy;
 
 pub(crate) use activity::{
-    ActivityRetryDeps, ActivityRetryTarget, commit_activity_retry, exhausted_reason_to_retry_state,
-    reconcile_due_activity_dispatches_once,
+    ActivityRetryDeps, ActivityRetryTarget, activity_dispatch_task, commit_activity_retry,
+    evaluate_activity_eligibility, exhausted_reason_to_retry_state,
 };
 
 /// v1.31.0 default number of consecutive workflow-task problems required
@@ -240,8 +241,10 @@ pub struct TokeiraRuntime<R> {
     startup: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
     disposal_wake: Arc<tokio::sync::Notify>,
     task_starter: RwLock<Option<Arc<dyn crate::WorkflowTaskStarter>>>,
+    activity_task_starter: RwLock<Option<Arc<dyn crate::ActivityTaskStarter>>>,
     /// In-memory activity-task broker.
     activity_broker: InMemoryActivityBroker,
+    activity_discovery: crate::activity_discovery::ActivityDiscoveryRegistry,
     /// Lane executor handles (one per lane).
     lanes: Vec<LaneHandle>,
     /// Lane configuration shared across all lanes.
@@ -318,14 +321,6 @@ pub struct TokeiraRuntime<R> {
     activity_timeout_scanner_handle: Option<tokio::task::JoinHandle<()>>,
     /// Cancellation token for the activity-timeout scanner.
     activity_timeout_scanner_cancel: CancellationToken,
-    /// Background grace scanner task.
-    grace_scanner_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Cancellation token for the grace scanner.
-    grace_scanner_cancel: CancellationToken,
-    /// Background backlog drain task.
-    drain_loop_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Cancellation token for the drain loop.
-    drain_loop_cancel: CancellationToken,
     /// Background fairness control loop task.
     control_loop_handle: Option<tokio::task::JoinHandle<()>>,
     /// Cancellation token for the fairness control loop.
@@ -514,7 +509,6 @@ pub struct RuntimeConfig {
     pub lane: LaneConfig,
     pub timer_scanner: TimerScannerConfig,
     pub workflow_timeout_scanner: WorkflowTimeoutScannerConfig,
-    pub backlog: BacklogConfig,
     pub activity_timeout_scanner: ActivityTimeoutScannerConfig,
     pub nexus_timeout_scanner: NexusTimeoutScannerConfig,
 }
@@ -526,7 +520,6 @@ impl Default for RuntimeConfig {
             lane: LaneConfig::default(),
             timer_scanner: TimerScannerConfig::default(),
             workflow_timeout_scanner: WorkflowTimeoutScannerConfig::default(),
-            backlog: BacklogConfig::default(),
             activity_timeout_scanner: ActivityTimeoutScannerConfig::default(),
             nexus_timeout_scanner: NexusTimeoutScannerConfig::default(),
         }
@@ -604,7 +597,6 @@ where
         config: LaneConfig,
         timer_config: TimerScannerConfig,
         workflow_timeout_config: WorkflowTimeoutScannerConfig,
-        backlog_config: BacklogConfig,
     ) -> Self {
         Self::new_with_nexus(
             repo,
@@ -612,7 +604,6 @@ where
             config,
             timer_config,
             workflow_timeout_config,
-            backlog_config,
             ActivityTimeoutScannerConfig::default(),
             NexusTimeoutScannerConfig::default(),
             NexusEndpointRegistry::default(),
@@ -633,7 +624,6 @@ where
             runtime_config.lane,
             runtime_config.timer_scanner,
             runtime_config.workflow_timeout_scanner,
-            runtime_config.backlog,
         )
     }
 
@@ -648,7 +638,6 @@ where
         config: LaneConfig,
         timer_config: TimerScannerConfig,
         workflow_timeout_config: WorkflowTimeoutScannerConfig,
-        backlog_config: BacklogConfig,
         activity_timeout_config: ActivityTimeoutScannerConfig,
         nexus_timeout_config: NexusTimeoutScannerConfig,
         nexus_registry: NexusEndpointRegistry,
@@ -661,7 +650,6 @@ where
             config,
             timer_config,
             workflow_timeout_config,
-            backlog_config,
             activity_timeout_config,
             nexus_timeout_config,
             nexus_registry,
@@ -691,7 +679,6 @@ where
             runtime_config.lane,
             runtime_config.timer_scanner,
             runtime_config.workflow_timeout_scanner,
-            runtime_config.backlog,
             runtime_config.activity_timeout_scanner,
             runtime_config.nexus_timeout_scanner,
             nexus_registry,
@@ -711,7 +698,6 @@ where
         config: LaneConfig,
         timer_config: TimerScannerConfig,
         workflow_timeout_config: WorkflowTimeoutScannerConfig,
-        backlog_config: BacklogConfig,
         activity_timeout_config: ActivityTimeoutScannerConfig,
         nexus_timeout_config: NexusTimeoutScannerConfig,
         nexus_registry: NexusEndpointRegistry,
@@ -727,7 +713,6 @@ where
             config,
             timer_config,
             workflow_timeout_config,
-            backlog_config,
             activity_timeout_config,
             nexus_timeout_config,
             nexus_registry,
@@ -752,7 +737,6 @@ where
         config: LaneConfig,
         timer_config: TimerScannerConfig,
         workflow_timeout_config: WorkflowTimeoutScannerConfig,
-        backlog_config: BacklogConfig,
         activity_timeout_config: ActivityTimeoutScannerConfig,
         nexus_timeout_config: NexusTimeoutScannerConfig,
         nexus_registry: NexusEndpointRegistry,
@@ -777,11 +761,12 @@ where
             counts: RwLock::new((shard_count, shard_count)),
         });
         let broker = InMemoryBroker::with_discovery(homes.clone());
+        let activity_broker = InMemoryActivityBroker::with_discovery(homes.clone());
+        let activity_discovery = crate::activity_discovery::ActivityDiscoveryRegistry::default();
         let discovery = (crate::discovery::DiscoveryRegistry::default(), homes);
         let needs_recovery = seed_default_shard && !repo.recovery_is_empty();
         let (startup_tx, startup) =
             tokio::sync::watch::channel((!needs_recovery).then_some(Ok(())));
-        let activity_broker = InMemoryActivityBroker::default();
         let workflow_timeout_tracking = WorkflowTimeoutTrackingState::default();
         let wft_timeout_tracking = WftTimeoutTrackingState::default();
         let close_attempt_tracking =
@@ -942,26 +927,6 @@ where
             purger_queue,
             runtime_shutdown.cancellation_token(),
         ));
-        let grace_scanner_cancel = CancellationToken::new();
-        runtime_shutdown.register_cancellation(grace_scanner_cancel.clone());
-        let grace_scanner_handle = Some(runtime_shutdown.spawn(run_grace_scanner(
-            broker.clone(),
-            activity_broker.clone(),
-            repo.clone(),
-            backlog_config.clone(),
-            grace_scanner_cancel.clone(),
-        )));
-        let drain_loop_cancel = CancellationToken::new();
-        runtime_shutdown.register_cancellation(drain_loop_cancel.clone());
-        let drain_loop_handle = Some(runtime_shutdown.spawn(run_drain_loop(
-            broker.clone(),
-            activity_broker.clone(),
-            repo.clone(),
-            backlog_config,
-            fairness_state.clone(),
-            delivery_metrics.clone(),
-            drain_loop_cancel.clone(),
-        )));
         let control_loop_cancel = CancellationToken::new();
         runtime_shutdown.register_cancellation(control_loop_cancel.clone());
         let control_loop_handle = Some(runtime_shutdown.spawn(run_control_loop(
@@ -1042,6 +1007,15 @@ where
                 },
                 registry.clone(),
                 broker.clone(),
+                crate::activity_discovery::ActivityDiscovery {
+                    source: Arc::new(crate::activity_discovery::ActivitySource {
+                        repo: repo.clone(),
+                        registry: worker_deployment_registry.clone(),
+                        owner: shard_owner.clone(),
+                    }),
+                    registry: activity_discovery.clone(),
+                    broker: activity_broker.clone(),
+                },
                 cancel,
             ));
         }
@@ -1054,6 +1028,7 @@ where
         ));
         runtime_shutdown.close_registration();
         let runtime = Self {
+            activity_discovery,
             repo,
             outbound_publisher: completion_scanner_publisher,
             broker,
@@ -1061,6 +1036,7 @@ where
             startup,
             disposal_wake,
             task_starter: RwLock::new(None),
+            activity_task_starter: RwLock::new(None),
             activity_broker,
             lanes,
             config,
@@ -1091,10 +1067,6 @@ where
             completion_callback_scanner_cancel,
             activity_timeout_scanner_handle,
             activity_timeout_scanner_cancel,
-            grace_scanner_handle,
-            grace_scanner_cancel,
-            drain_loop_handle,
-            drain_loop_cancel,
             control_loop_handle,
             control_loop_cancel,
             heartbeat_maintenance_handle,
@@ -1121,6 +1093,14 @@ where
             .task_starter
             .write()
             .expect("workflow starter lock poisoned") = Some(starter);
+    }
+
+    /// Attach authenticated activity-owner transport before admitting network polls.
+    pub fn set_activity_task_starter(&self, starter: Arc<dyn crate::ActivityTaskStarter>) {
+        *self
+            .activity_task_starter
+            .write()
+            .expect("activity starter lock poisoned") = Some(starter);
     }
 
     /// Set the queue partition cardinalities published by placement before
@@ -1741,28 +1721,6 @@ where
         Ok(())
     }
 
-    pub async fn shutdown_grace_scanner(&mut self) -> Result<()> {
-        self.grace_scanner_cancel.cancel();
-        if let Some(handle) = self.grace_scanner_handle.take() {
-            tokio::time::timeout(tokio::time::Duration::from_secs(5), handle)
-                .await
-                .map_err(|_| anyhow!("grace scanner shutdown timed out"))?
-                .map_err(|error| anyhow!("grace scanner join failed: {error}"))?;
-        }
-        Ok(())
-    }
-
-    pub async fn shutdown_drain_loop(&mut self) -> Result<()> {
-        self.drain_loop_cancel.cancel();
-        if let Some(handle) = self.drain_loop_handle.take() {
-            tokio::time::timeout(tokio::time::Duration::from_secs(5), handle)
-                .await
-                .map_err(|_| anyhow!("drain loop shutdown timed out"))?
-                .map_err(|error| anyhow!("drain loop join failed: {error}"))?;
-        }
-        Ok(())
-    }
-
     pub async fn shutdown_control_loop(&mut self) -> Result<()> {
         self.control_loop_cancel.cancel();
         if let Some(handle) = self.control_loop_handle.take() {
@@ -1820,38 +1778,26 @@ where
         Ok(published)
     }
 
-    /// Like [`republish_queue`](Self::republish_queue) but
-    /// for activity tasks.
-    pub async fn republish_activity_queue(&self, queue: QueueKey, limit: usize) -> Result<usize> {
-        // Due-only: a retry inside its backoff window must not be offered
-        // early by an on-demand republish any more than by recovery.
-        let tasks = self
-            .repo
-            .list_due_dispatchable_activity_tasks(&queue, OffsetDateTime::now_utc(), limit)
-            .await?;
-        let count = tasks.len();
-        for task in tasks {
-            self.activity_broker
-                .publish_activity_task(task, Some(&self.delivery_metrics))
-                .await?;
-        }
-        Ok(count)
+    /// Wake registered activity demand without refilling a repeatedly scanned head.
+    ///
+    /// The legacy limit no longer controls storage reads. The shared scheduler
+    /// admits bounded slices through each family's existing cursor and budgets.
+    /// Returns zero because waking discovery publishes no offer synchronously.
+    pub async fn republish_activity_queue(&self, queue: QueueKey, _limit: usize) -> Result<usize> {
+        self.activity_discovery
+            .wake_family(&queue, tokio::time::Instant::now());
+        Ok(0)
     }
 
-    /// Return a previously polled offer to the broker without starting it.
+    /// Release an unsuccessful match and wake canonical rediscovery.
     ///
-    /// Used when a transient failure (e.g. a storage error while evaluating
-    /// workflow rules) prevents the edge from deciding a polled offer's fate:
-    /// the offer was already removed from the broker, so it must be put back or
-    /// the task is stranded until a shard takeover republishes the durable row.
+    /// Dropping the reservation returns capacity. A fresh offer comes from the
+    /// current row, so retries cannot reinsert a superseded incarnation.
     pub async fn republish_activity_offer(&self, offer: ActivityTaskOffer) {
-        if let Err(error) = self
-            .activity_broker
-            .publish_activity_task(offer.task, Some(&self.delivery_metrics))
-            .await
-        {
-            tracing::warn!(?error, "failed to republish activity offer");
-        }
+        let queue = offer.task.queue.clone();
+        drop(offer);
+        self.activity_discovery
+            .wake_family(&queue, tokio::time::Instant::now());
     }
 }
 
@@ -1969,15 +1915,25 @@ impl WorkflowActivation {
 /// into `StartedActivityTask`; dropping it leaves the activity unstarted.
 #[derive(Clone, Debug)]
 pub struct ActivityTaskOffer {
+    /// Stable identity for every owner attempt made for this poll's match.
+    pub request_id: Uuid,
     /// Broker offer whose durable premise must still be checked before start.
     pub task: tokeira_storage::DispatchableActivityTask,
     /// Matching admission instant used for schedule-to-start accounting.
     pub entered_at: tokio::time::Instant,
+    /// Keeps this exact offer counted while its start is unresolved. Dropping
+    /// the last clone releases only this acquisition and offer token.
+    pub(crate) _lease: Option<crate::activity_offers::ActivityOfferLease>,
 }
 
 /// An activity task that has been polled and started.
 #[derive(Clone, Debug)]
 pub struct StartedActivityTask {
+    /// Same-request recovery has the narrower public response of Temporal's
+    /// duplicate-start branch (`recordactivitytaskstarted/api.go @ v1.31.0`).
+    pub replayed: bool,
+    /// Workflow/activity priority merged at the authoritative start observation.
+    pub priority: Option<tokeira_kernel::Priority>,
     /// Unique key for the owning workflow run.
     pub run_key: RunKey,
     /// User-visible run id of the owning run (see `StartedWorkflowTask::run_id`).
@@ -2270,7 +2226,6 @@ pub(crate) mod tests {
                     LaneConfig::default(),
                     TimerScannerConfig::default(),
                     WorkflowTimeoutScannerConfig::default(),
-                    BacklogConfig::default(),
                 );
                 let run_key = RunKey(Uuid::from_u128(run));
                 (runtime.lane_index(run_key), runtime.lane_index(run_key))
@@ -2289,7 +2244,6 @@ pub(crate) mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         ));
         let request = sample_start_request(None, None);
         let queue = QueueKey {
@@ -2384,7 +2338,6 @@ pub(crate) mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         let queue = QueueKey {
             namespace_id: request.namespace_id,
@@ -2488,7 +2441,6 @@ pub(crate) mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         let mut request = sample_start_request(None, None);
         request.request.caller_identity = Some("eager-worker".to_string());
@@ -2529,7 +2481,6 @@ pub(crate) mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         let mut request = sample_start_request(None, None);
         let accepted_at = OffsetDateTime::UNIX_EPOCH + Duration::hours(1);
@@ -2610,7 +2561,6 @@ pub(crate) mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         let first = sample_start_request(None, None);
         let started = runtime
@@ -2710,7 +2660,6 @@ pub(crate) mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         let callback = CompletionCallback {
             spec: CallbackSpec::Nexus {
@@ -2785,7 +2734,6 @@ pub(crate) mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         let first = sample_start_request(None, None);
         let started = runtime
@@ -2835,7 +2783,6 @@ pub(crate) mod tests {
                 LaneConfig::default(),
                 TimerScannerConfig::default(),
                 WorkflowTimeoutScannerConfig::default(),
-                BacklogConfig::default(),
                 ActivityTimeoutScannerConfig::default(),
                 NexusTimeoutScannerConfig::default(),
                 NexusEndpointRegistry::default(),
@@ -2866,7 +2813,6 @@ pub(crate) mod tests {
                 LaneConfig::default(),
                 TimerScannerConfig::default(),
                 WorkflowTimeoutScannerConfig::default(),
-                BacklogConfig::default(),
                 ActivityTimeoutScannerConfig::default(),
                 NexusTimeoutScannerConfig::default(),
                 NexusEndpointRegistry::default(),
@@ -2904,7 +2850,6 @@ pub(crate) mod tests {
                 LaneConfig::default(),
                 TimerScannerConfig::default(),
                 WorkflowTimeoutScannerConfig::default(),
-                BacklogConfig::default(),
                 ActivityTimeoutScannerConfig::default(),
                 NexusTimeoutScannerConfig::default(),
                 NexusEndpointRegistry::default(),
@@ -3150,7 +3095,6 @@ pub(crate) mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         )
         .with_worker_deployment_repository(repo.clone());
         let registry = runtime
@@ -3676,7 +3620,6 @@ pub(crate) mod tests {
                     LaneConfig::default(),
                     TimerScannerConfig::default(),
                     WorkflowTimeoutScannerConfig::default(),
-                    BacklogConfig::default(),
                 );
                 let run_key = RunKey(Uuid::from_u128(run));
                 let lane_ptr = runtime.pick_lane(run_key) as *const LaneHandle as usize;
@@ -3935,7 +3878,6 @@ pub(crate) mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         assert!(runtime.timer_scanner_handle.is_some());
         runtime.shutdown_timer_scanner().await.unwrap();
@@ -3953,7 +3895,6 @@ pub(crate) mod tests {
                 max_timers_per_scan: 100,
             },
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         runtime.shutdown_timer_scanner().await.unwrap();
         assert!(runtime.timer_scanner_handle.is_none());
@@ -3968,7 +3909,6 @@ pub(crate) mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         assert!(runtime.workflow_timeout_scanner_handle.is_some());
         runtime.shutdown_workflow_timeout_scanner().await.unwrap();
@@ -3986,7 +3926,6 @@ pub(crate) mod tests {
                 scan_interval: tokio::time::Duration::from_secs(60),
                 max_timeouts_per_scan: 100,
             },
-            BacklogConfig::default(),
         );
         runtime.shutdown_workflow_timeout_scanner().await.unwrap();
         assert!(runtime.workflow_timeout_scanner_handle.is_none());
@@ -4001,7 +3940,6 @@ pub(crate) mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         let request = sample_start_request(Some(Duration::seconds(5)), Some(Duration::seconds(3)));
         let result = runtime.start_workflow(request.clone()).await.unwrap();
@@ -4041,7 +3979,6 @@ pub(crate) mod tests {
                     LaneConfig::default(),
                     TimerScannerConfig::default(),
                     WorkflowTimeoutScannerConfig::default(),
-                    BacklogConfig::default(),
                 );
                 let mut request = sample_start_request(
                     execution_timeout_secs.map(Duration::seconds),
@@ -4286,6 +4223,16 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl RunRepository for MockTimerRepo {
+        async fn validate_activity_start_observation(
+            &self,
+            _observed: &tokeira_kernel::WorkflowState,
+            _activity_id: &str,
+            _home: tokeira_types::ShardId,
+            _fence: tokeira_storage::WriteFence,
+        ) -> anyhow::Result<bool> {
+            anyhow::bail!("this fixture does not implement activity start replay")
+        }
+
         async fn resolve_execution(&self, _execution: &ExecutionRef) -> Result<Option<RunKey>> {
             panic!("unused in timer scanner tests")
         }
@@ -4395,6 +4342,28 @@ pub(crate) mod tests {
             _limit: usize,
         ) -> Result<Vec<tokeira_storage::RunBulkWrite>> {
             Ok(Vec::new())
+        }
+
+        /// Read one fixed-cutoff queue-family page without claiming or mutating work.
+        /// Per-row payload errors retain their position; SQL/key errors fail the page.
+        async fn list_activity_dispatch_page(
+            &self,
+            _range: &tokeira_storage::ActivityDiscoveryRange,
+            _cutoff: time::OffsetDateTime,
+            _after: Option<tokeira_storage::ActivityDispatchPosition>,
+            _limit: std::num::NonZeroU32,
+        ) -> Result<tokeira_storage::ActivityDispatchPage> {
+            anyhow::bail!("activity discovery is outside this test repository")
+        }
+
+        /// Enumerate every physical activity slot for a home, including legacy/orphan rows.
+        async fn list_activity_dispatch_home_page(
+            &self,
+            _home: tokeira_types::ShardId,
+            _after: Option<tokeira_storage::ActivityHomePosition>,
+            _limit: std::num::NonZeroU32,
+        ) -> Result<tokeira_storage::ActivityHomePage> {
+            anyhow::bail!("activity discovery is outside this test repository")
         }
 
         async fn list_workflow_dispatch_page(

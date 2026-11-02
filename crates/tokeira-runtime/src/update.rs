@@ -1663,9 +1663,7 @@ mod tests {
         TaskQueueName, WorkflowId, WorkflowType,
     };
 
-    use crate::{
-        BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
-    };
+    use crate::{LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig};
 
     fn make_runtime(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
         TokeiraRuntime::new(
@@ -1674,7 +1672,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         )
     }
 

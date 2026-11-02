@@ -1,7 +1,7 @@
-//! Bounded disposal of inert workflow backlog copies after reconstruction.
+//! Bounded disposal of inert workflow and activity copies after reconstruction.
 //!
 //! Coverage is checked with the current hot state and dispatch row in the same
-//! delete transaction. This module never makes or consumes workflow intent.
+//! delete transaction. This module never makes or consumes execution intent.
 
 use uuid::Uuid;
 
@@ -15,10 +15,9 @@ pub struct WorkflowBacklogDisposal {
     pub last_examined: Option<Uuid>,
     /// Entries inspected, whether covered or deferred.
     pub examined: usize,
-    /// Workflow entries whose coverage could not be established. Activity keys
-    /// advance the cursor but never count as deferred workflow work.
+    /// Entries whose coverage or supported payload could not be established.
     pub deferred: usize,
-    /// Covered workflow entries deleted atomically.
+    /// Covered workflow/activity entries deleted atomically.
     pub deleted: usize,
     /// Whether the traversal reached its end.
     pub exhausted: bool,

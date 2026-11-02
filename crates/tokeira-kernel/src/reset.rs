@@ -99,6 +99,9 @@ impl BasicKernel {
             .get_or_insert_with(Default::default)
             .reset_request_id = Some(fork.request.request.request_id.clone());
         state.reset_run_id = None;
+        // A fork is a different execution lineage; its workers cannot replay a
+        // start request accepted by the source run even when activity IDs survive.
+        state.activity_start_receipts.clear();
         state.sticky = None;
         let request = WorkflowTaskFailedRequest {
             logical_seq: pending.logical_seq,

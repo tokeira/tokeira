@@ -128,13 +128,6 @@ pub async fn invoke_nexus_callback(
 /// identifiers before the spawn and rebuilding a link inside the task keeps
 /// fanout topology observable without moving a subscriber-owned span handle or
 /// making telemetry part of delivery correctness.
-fn spawn_dispatch<F>(operation: &'static str, run_key: RunKey, future: F)
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    spawn_dispatch_owned(operation, run_key, future, None);
-}
-
 fn spawn_dispatch_owned<F>(
     operation: &'static str,
     run_key: RunKey,
@@ -1152,52 +1145,22 @@ where
                             priority: priority.clone(),
                             order: None,
                         };
-                        let now = OffsetDateTime::now_utc();
-                        let delay = *dispatch_at - now;
-                        // The offer becomes eligible at `dispatch_at`; anchor the
-                        // schedule-to-start clock there (immediate dispatch uses
-                        // `now`). record_scheduled preserves the schedule-to-close
-                        // anchor across re-dispatch.
-                        let effective = if delay.is_positive() {
-                            *dispatch_at
-                        } else {
-                            now
-                        };
+                        // Durable eligibility also anchors schedule-to-start after
+                        // a delayed publication. Rehydration must not grant another
+                        // timeout window merely because the owner recovered late.
                         self.activity_tracking.record_scheduled(
                             run_key,
                             execution_home,
                             activity_id.clone(),
-                            effective,
+                            *dispatch_at,
                         );
-                        if delay.is_positive() {
-                            // Jitter/eligibility delay (unpause/reset): hold the
-                            // broker offer until the runtime-chosen time, matching
-                            // v1.31.0's RegenerateActivityRetryTask timer. The
-                            // durable dispatch row was already committed, so a
-                            // crash during the delay is recovered by the sweeper.
-                            let broker = self.activity_broker.clone();
-                            let metrics = self.delivery_metrics.clone();
-                            let activity_id = activity_id.clone();
-                            spawn_dispatch("activity_delay", run_key, async move {
-                                tokio::time::sleep(std::time::Duration::from_millis(
-                                    delay.whole_milliseconds().max(0) as u64,
-                                ))
-                                .await;
-                                if let Err(error) =
-                                    broker.publish_activity_task(task, Some(&metrics)).await
-                                {
-                                    tracing::warn!(
-                                        ?error,
-                                        ?run_key,
-                                        activity_id,
-                                        "failed to publish delayed activity task"
-                                    );
-                                }
-                            });
-                        } else if let Err(error) = self
-                            .activity_broker
-                            .publish_activity_task(task, Some(&self.delivery_metrics))
-                            .await
+                        // The owner's eligibility index evaluates delayed rules;
+                        // queue-home discovery supplies offers once the row is due.
+                        if *dispatch_at <= OffsetDateTime::now_utc()
+                            && let Err(error) = self
+                                .activity_broker
+                                .publish_activity_task(task, Some(&self.delivery_metrics))
+                                .await
                         {
                             tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish activity task");
                         }

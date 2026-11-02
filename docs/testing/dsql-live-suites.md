@@ -14,6 +14,16 @@ test twenty minutes. On a new cluster the first test that migrates applies the w
 embedded corpus and waits for every asynchronous index build, which takes about ten
 minutes, longer than the default profile's three-minute ceiling.
 
+The [activity-dispatch verification matrix](activity-dispatch-verification.md)
+adds strict live selections: nine shared 100-case storage properties, three
+physical race/fence entries, one transaction-limit refusal and one production-shaped
+query-plan fixture. Its
+101-run acquisition and actual remote read-count fixture each require their own
+isolated database; do not mix their 4096-home and eight-home preparations with
+shared fixtures. The storage selection is `test(activity_dispatch_live_)`; use
+`--no-tests fail`, and `--run-ignored all` for runtime/edge selections. Missing
+configuration is a refusal, never a successful live check.
+
 ## Shared-cluster order and isolation
 
 The [storage contract suite](storage-contract-tests.md) adds paired generated
@@ -145,7 +155,7 @@ point them at a database holding application data.
 | Storage `placement_live_` | 4 | Stopped-cluster hot/timer relocation, concurrent starters and late-page exclusion, raw legacy-encoded lease refusal, corruption diagnostics, reset preservation, duplicates/orphans, exact joined continuation plans and screening latency; `dsql-integration`, URL gate only |
 | Storage `dsql_bulk_` (`bulk_write_tests`) | 10 | The paged bulk writes: spills of more than 3,000 rows or 10 MiB, the deletion of a run owning more than 3,000 rows, resets whose copied history is over 1 MiB or 10 MiB or whose successor holds 3,500 timers, a reset of a closed workflow, a start between a reset's commit and its materialization, a purge resumed by two purges at once, and an abandoned materialization refusing its open transaction; `dsql-integration`, URL gate only |
 | Storage `dsql_lease_fence_` (`lease_fence_tests`) | 11 | The bundle lease fence through Tokeira's repository: stale transition commits and a deletion held after their fence reads while another node takes the home over, each aborted and refused on its retry; a materialization stopped between its transactions and a recovery switch, both refused after a takeover; 100 generated lease histories in which only a change of ownership writes the epoch; a lost fence under each loss and write, changing nothing; the owner's renewals and refreshes beside its writes in flight; a write that commits first aborting a takeover; and 100 generated interleavings of fenced writes with renewals, refreshes, takeovers and releases; `dsql-integration`, URL gate only |
-| Storage `workflow_dispatch_live_generated_legacy_disposal` | 1 | Property 10: 100 interrupted disposal and concurrent-commit cases, preserving activity bytes and authoritative state; `dsql-integration`, URL gate only |
+| Storage `workflow_dispatch_live_generated_legacy_disposal` | 1 | Property 10: 100 interrupted disposal and concurrent-commit cases, preserving deferred unknown/corrupt copies and authoritative state; covered legacy activity copies are now also disposable; `dsql-integration`, URL gate only |
 | Storage `workflow_dispatch_live_disposal_rolls_back_cancelled_page_and_keeps_bounds` | 1 | Cancellation before page commit leaves legacy rows intact; resumed pages inspect at most 64 keys; `dsql-integration`, URL gate only |
 | Storage `dsql_transaction_limits` | 6 | DSQL's transaction limits, apart from the bulk writes' budgets: 3,000 rows, deleted rows included and rows read `FOR UPDATE` not; 9 MiB of values but not 10, deleted rows not counted; 1 MiB a value; `dsql-integration`, URL gate only |
 | Storage `history_event_tests` | 4 | The one-lookup read of a history event: each event of batches of one and of several events and of a reset successor's copied batches; the lookup's plan on a run of 5,000 batches, for an event near the end and one near the start: a backward scan of the primary key with both key columns in its index condition, no sort, and the limit pushed down to storage, which returns one row; and dispatch rows and backlog entries an earlier release wrote with an activity's input; set `TOKEIRA_HISTORY_EVENT_PLAN_OUTPUT` to save the plans; `dsql-integration`, URL gate only |

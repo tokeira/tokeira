@@ -16,7 +16,7 @@ use tokeira_kernel::{
     WorkflowCommand, WorkflowIdConflictPolicy, WorkflowState, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, StartWorkflowResult, TimerScannerConfig, TokeiraRuntime,
+    LaneConfig, StartWorkflowResult, TimerScannerConfig, TokeiraRuntime,
     WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{
@@ -248,7 +248,6 @@ fn runtime(repo: Arc<ExplorationRepo>) -> TokeiraRuntime<ExplorationRepo> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     )
 }
 
@@ -803,6 +802,32 @@ impl RunRepository for ExplorationRepo {
             .await
     }
 
+    /// Read one fixed-cutoff queue-family page without claiming or mutating work.
+    /// Per-row payload errors retain their position; SQL/key errors fail the page.
+    async fn list_activity_dispatch_page(
+        &self,
+        range: &tokeira_storage::ActivityDiscoveryRange,
+        cutoff: time::OffsetDateTime,
+        after: Option<tokeira_storage::ActivityDispatchPosition>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<tokeira_storage::ActivityDispatchPage> {
+        self.inner
+            .list_activity_dispatch_page(range, cutoff, after, limit)
+            .await
+    }
+
+    /// Enumerate every physical activity slot for a home, including legacy/orphan rows.
+    async fn list_activity_dispatch_home_page(
+        &self,
+        home: tokeira_types::ShardId,
+        after: Option<tokeira_storage::ActivityHomePosition>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<tokeira_storage::ActivityHomePage> {
+        self.inner
+            .list_activity_dispatch_home_page(home, after, limit)
+            .await
+    }
+
     async fn list_workflow_dispatch_page(
         &self,
         range: &WorkflowDiscoveryRange,
@@ -822,6 +847,30 @@ impl RunRepository for ExplorationRepo {
     ) -> Result<Vec<RunKey>> {
         self.inner
             .list_workflow_dispatch_for_home(home, after, limit)
+            .await
+    }
+
+    async fn validate_activity_start_observation(
+        &self,
+        observed: &tokeira_kernel::WorkflowState,
+        activity_id: &str,
+        home: tokeira_types::ShardId,
+        fence: tokeira_storage::WriteFence,
+    ) -> anyhow::Result<bool> {
+        self.inner
+            .validate_activity_start_observation(observed, activity_id, home, fence)
+            .await
+    }
+
+    async fn reconcile_activity_dispatch_page(
+        &self,
+        home: ShardId,
+        run_key: RunKey,
+        after: Option<tokeira_storage::ActivityRepairCursor>,
+        fence: WriteFence,
+    ) -> Result<tokeira_storage::ActivityRepairPage> {
+        self.inner
+            .reconcile_activity_dispatch_page(home, run_key, after, fence)
             .await
     }
 

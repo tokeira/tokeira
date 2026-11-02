@@ -118,6 +118,11 @@ The suite creates its own probe tables and needs no migrations; run it under the
 
 ### `tla/40_dispatch_handoff.tla`
 
+The [activity mapping](refinement/activity-dispatch.md) records concrete slot and
+incarnation identity and the boundary between modeled authority and receipt
+replay. Replay is observation; its request UUID and response are checked by
+executable properties, not by this model.
+
 This models how a scheduled task reaches a worker when dispatch is durable state rather than a message.
 The commit that schedules a task also writes a dispatch row.
 Queue homes find rows with discovery passes that start at the head of the queue every time.

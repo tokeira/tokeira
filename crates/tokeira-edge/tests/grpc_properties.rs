@@ -1512,6 +1512,8 @@ fn arb_poll_activity_response() -> impl Strategy<Value = PollActivityTaskQueueRe
             |(token, activity_id, input, attempt, workflow_id, run_key)| {
                 let token_bytes = serialize_activity_token(&token);
                 PollActivityTaskQueueResponse {
+                    replayed: false,
+                    priority: None,
                     task_token: token_bytes,
                     activity_id,
                     run_id: RunId(Uuid::from_u128(run_key)),

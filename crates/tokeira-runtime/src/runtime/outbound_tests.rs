@@ -14,7 +14,7 @@ proptest! {
         tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap().block_on(async {
             let repo = Arc::new(InMemoryStore::default());
             let runtime = TokeiraRuntime::new(repo.clone(), 1, LaneConfig::default(),
-                TimerScannerConfig::default(), WorkflowTimeoutScannerConfig::default(), BacklogConfig::default());
+                TimerScannerConfig::default(), WorkflowTimeoutScannerConfig::default());
             runtime.ready().await.unwrap();
             let mut start = tests::sample_start_request(None, None);
             start.run_key = RunKey::derive(start.namespace_id, &start.workflow_id, start.run_id);

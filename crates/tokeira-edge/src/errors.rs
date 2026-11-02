@@ -297,8 +297,20 @@ impl EdgeError {
 
 impl From<anyhow::Error> for EdgeError {
     fn from(value: anyhow::Error) -> Self {
+        if let Some(error) = value.downcast_ref::<tokeira_runtime::ActivityDemandCapacity>() {
+            return Self::ResourceExhausted(error.to_string());
+        }
         if let Some(status) = value.downcast_ref::<tonic::Status>() {
             return Self::ForwardedStatus(Box::new(status.clone()));
+        }
+        if value.is::<tokeira_runtime::ActivityStartTooLarge>() {
+            return Self::ResourceExhausted(value.to_string());
+        }
+        if value.is::<tokeira_runtime::InvalidActivityStart>() {
+            return Self::BadRequest(value.to_string());
+        }
+        if value.is::<tokeira_runtime::RetryableActivityTaskStart>() {
+            return Self::ServiceUnavailable(value.to_string());
         }
         if let Some(error) = value.downcast_ref::<tokeira_runtime::RetryableWorkflowTaskStart>() {
             return Self::ServiceUnavailable(error.to_string());

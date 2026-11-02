@@ -26,19 +26,21 @@ use std::{
 use anyhow::Result;
 use async_trait::async_trait;
 use time::OffsetDateTime;
-use tokeira_kernel::{
-    ActivityOp, BasicKernel, DispatchOp, LoadedRun, ReplayContext, TimerOp, Transition,
-    WorkflowState, merge_priority,
-};
+use tokeira_kernel::{BasicKernel, LoadedRun, ReplayContext, TimerOp, Transition, WorkflowState};
 use tokeira_types::{
-    ExecutionRef, ExecutionStatus, GenerationCounter, NamespaceId, QueueKey, RequestId, RunId,
-    RunKey, ShardEpoch, ShardId, TaskKind, TransitionSeq, WorkflowId, WorkflowRuleRecord,
+    ExecutionRef, GenerationCounter, NamespaceId, QueueKey, RequestId, RunId, RunKey, ShardEpoch,
+    ShardId, TaskKind, TransitionSeq, WorkflowId, WorkflowRuleRecord,
 };
 use tokio::sync::Mutex;
 
 #[cfg(test)]
 use crate::DeliveryOrder;
+#[cfg(test)]
+use tokeira_kernel::{ActivityOp, DispatchOp};
+#[cfg(test)]
+use tokeira_types::ExecutionStatus;
 
+mod activity_repair;
 mod outbound;
 #[cfg(test)]
 mod outbound_tests;
@@ -56,6 +58,9 @@ mod successor;
 pub(crate) mod successor_tests;
 mod transition;
 
+#[cfg(test)]
+#[path = "activity_dispatch_memory_tests.rs"]
+mod activity_dispatch_tests;
 #[cfg(test)]
 mod atomic_successors_tests;
 use crate::{
@@ -529,6 +534,9 @@ impl WorkerTaskProvenanceStore for InMemoryStore {
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct ActivityDispatchEntry {
+    key: uuid::Uuid,
+    execution_home: ShardId,
+    queue_key: Option<String>,
     task: DispatchableActivityTask,
     /// Durable eligibility time: the row exists from commit, but delivery
     /// queries surface it only once `dispatch_at <= now` — the persisted
@@ -538,6 +546,53 @@ struct ActivityDispatchEntry {
     schedule_to_start_timeout: Option<time::Duration>,
     start_to_close_timeout: Option<time::Duration>,
     heartbeat_timeout: Option<time::Duration>,
+}
+
+impl ActivityDispatchEntry {
+    fn from_row(
+        row: &crate::ActivityDispatchRow,
+        activity: &tokeira_kernel::ActivityState,
+    ) -> Self {
+        Self {
+            key: row.key,
+            execution_home: row.execution_home,
+            queue_key: Some(row.queue_key.clone()),
+            task: row.task(),
+            dispatch_at: row.dispatch_at,
+            schedule_to_close_timeout: activity.schedule_to_close_timeout,
+            schedule_to_start_timeout: activity.schedule_to_start_timeout,
+            start_to_close_timeout: activity.start_to_close_timeout,
+            heartbeat_timeout: activity.heartbeat_timeout,
+        }
+    }
+
+    fn row(&self) -> Result<crate::ActivityDispatchRow, crate::ActivityDispatchDataError> {
+        let row = crate::ActivityDispatchRow {
+            key: self.key,
+            incarnation: crate::ActivityIncarnation {
+                run_key: self.task.run_key,
+                activity_id: self.task.activity_id.clone(),
+                schedule_event_id: self.task.schedule_event_id,
+                attempt: self.task.attempt,
+                stamp: self.task.stamp,
+            },
+            execution_home: self.execution_home,
+            queue: self.task.queue.clone(),
+            queue_key: self
+                .queue_key
+                .clone()
+                .ok_or_else(|| crate::ActivityDispatchDataError {
+                    run_key: self.task.run_key,
+                    activity_id: self.task.activity_id.clone(),
+                    reason: "legacy row requires fenced acquisition repair".into(),
+                })?,
+            priority: self.task.priority.clone(),
+            dispatch_revision: self.task.dispatch_revision,
+            dispatch_at: self.dispatch_at,
+        };
+        row.validate()?;
+        Ok(row)
+    }
 }
 
 impl StoreState {
@@ -813,7 +868,9 @@ impl InMemoryStore {
 // v6: required outbound identities and child gates. A v5 reader would ignore the
 // unknown state-extension tag and could release children or lose selected identities.
 // v7: retained deleted sources and intent target lineage pins.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 7;
+// v8: complete activity row coordinates and required start-request receipts.
+// Old readers must not discard the receipt extension and start a request twice.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 8;
 
 /// Magic that opens the snapshot extension after a snapshot's document (`"TKSX"`).
 pub const SNAPSHOT_EXTENSION_MAGIC: u32 = 0x544B_5358;
@@ -922,6 +979,8 @@ fn snapshot_extension(state: &StoreState) -> Result<Vec<u8>, SnapshotError> {
     run_keys.sort_unstable();
     let mut runs = Vec::new();
     for run_key in run_keys {
+        crate::codec::validate_activity_receipts(&state.runs[run_key])
+            .map_err(SnapshotError::Extension)?;
         let extension =
             encode_state_extension(&state.runs[run_key]).map_err(SnapshotError::Encode)?;
         if !extension.is_empty() {
@@ -1453,6 +1512,37 @@ impl RunRepository for InMemoryStore {
             .map(|(loaded, _)| loaded)
     }
 
+    async fn validate_activity_start_observation(
+        &self,
+        observed: &WorkflowState,
+        activity_id: &str,
+        home: ShardId,
+        fence: WriteFence,
+    ) -> Result<bool> {
+        fence.ensure_home(home)?;
+        crate::read_probe::logical(observed.run_key);
+        let store = self.inner.lock().await;
+        store.check_fence(&fence)?;
+        let Some(current) = store.runs.get(&observed.run_key) else {
+            return Ok(false);
+        };
+        anyhow::ensure!(
+            tokeira_types::execution_home_bundle(
+                current.namespace_id.0.as_bytes(),
+                current.workflow_id.0.as_bytes(),
+                Self::effective_shard_count(&store),
+            ) == home,
+            "activity start observation home mismatch"
+        );
+        Ok(
+            crate::activity_dispatch::activity_start_observation_matches(
+                observed,
+                current,
+                activity_id,
+            ),
+        )
+    }
+
     async fn load_run_with_stats(&self, run_key: RunKey) -> Result<(LoadedRun, RunHistoryStats)> {
         crate::read_probe::logical(run_key);
         let started = Instant::now();
@@ -1957,12 +2047,19 @@ impl RunRepository for InMemoryStore {
                 principals_len(&copied_principals[batch.clone()])?,
             ));
         }
+        let activities = crate::derive_activity_dispatch(&successor_state, home)?
+            .into_values()
+            .collect::<Vec<_>>();
         let timers = successor_state.timers.values().cloned().collect::<Vec<_>>();
         for timer in &timers {
             costs.push((
                 WriteCost::write(crate::codec::encode_timer_state(timer)?.len()),
                 0,
             ));
+        }
+
+        for row in &activities {
+            costs.push((row.write_cost()?, 0));
         }
 
         {
@@ -1995,6 +2092,36 @@ impl RunRepository for InMemoryStore {
             );
         }
 
+        // The unpublished target is exclusively held by its bulk-write guard.
+        // Discard obsolete derived slots in bounded pages before staging the
+        // desired set, keeping the final visibility transaction constant-sized.
+        loop {
+            let mut store = self.inner.lock().await;
+            store.check_fence(&fence)?;
+            store.ensure_materializing(successor_run_key)?;
+            let mut keys: Vec<_> = store
+                .activity_dispatch
+                .keys()
+                .filter(|(run, _)| *run == successor_run_key)
+                .cloned()
+                .collect();
+            keys.sort();
+            keys.truncate(crate::ACTIVITY_DISPATCH_PAGE_LIMIT as usize);
+            if keys.is_empty() {
+                break;
+            }
+            let mut model = store.begin_bulk_transaction()?;
+            for _ in &keys {
+                model.write(&[]);
+            }
+            store.commit_bulk_transaction(&model);
+            for key in keys {
+                store.activity_dispatch.remove(&key);
+            }
+            drop(store);
+            tokio::task::yield_now().await;
+        }
+
         // The batches, then the timer rows, in pages within the budget. The
         // pages count each batch's principals with its events.
         let page_costs = costs
@@ -2010,6 +2137,16 @@ impl RunRepository for InMemoryStore {
             let mut store = self.inner.lock().await;
             store.check_fence(&fence)?;
             store.ensure_materializing(successor_run_key)?;
+            let wanted = page
+                .clone()
+                .filter_map(|index| {
+                    index
+                        .checked_sub(batches.len() + timers.len())
+                        .and_then(|index| activities.get(index))
+                })
+                .map(|row| (row.key, row.clone()))
+                .collect();
+            transition::validate_activity_slots(&store, successor_run_key, &wanted)?;
             let mut model = store.begin_bulk_transaction()?;
             for (cost, principals) in &costs[page.clone()] {
                 model.write(&[cost.bytes, *principals]);
@@ -2039,11 +2176,17 @@ impl RunRepository for InMemoryStore {
                             timer_ops: Vec::new(),
                             dispatch_ops: Vec::new(),
                         });
-                } else {
-                    let timer = &timers[index - batches.len()];
+                } else if let Some(timer) = timers.get(index - batches.len()) {
                     store.timer_bucket.insert(
                         timer_position(successor_run_key, home, timer),
                         timer.clone(),
+                    );
+                } else {
+                    let row = &activities[index - batches.len() - timers.len()];
+                    let activity = &successor_state.activities[&row.incarnation.activity_id];
+                    store.activity_dispatch.insert(
+                        (successor_run_key, activity.activity_id.clone()),
+                        ActivityDispatchEntry::from_row(row, activity),
                     );
                 }
             }
@@ -2147,6 +2290,16 @@ impl RunRepository for InMemoryStore {
             store.workflow_dispatch.remove(&run_key);
         }
         Ok(())
+    }
+
+    async fn reconcile_activity_dispatch_page(
+        &self,
+        home: ShardId,
+        run_key: RunKey,
+        after: Option<crate::ActivityRepairCursor>,
+        fence: WriteFence,
+    ) -> Result<crate::ActivityRepairPage> {
+        self.repair_activities(home, run_key, after, fence).await
     }
 
     async fn abandon_materialization(&self, run_key: RunKey, fence: WriteFence) -> Result<()> {
@@ -2333,6 +2486,73 @@ impl RunRepository for InMemoryStore {
             .collect())
     }
 
+    async fn list_activity_dispatch_page(
+        &self,
+        range: &crate::ActivityDiscoveryRange,
+        cutoff: OffsetDateTime,
+        after: Option<crate::ActivityDispatchPosition>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<crate::ActivityDispatchPage> {
+        let store = self.inner.lock().await;
+        let digest = range.lookup_key();
+        let limit = limit.get().min(crate::ACTIVITY_DISPATCH_PAGE_LIMIT) as usize;
+        let mut entries: Vec<_> = store
+            .activity_dispatch
+            .values()
+            .filter_map(|entry| {
+                let position = crate::ActivityDispatchPosition {
+                    dispatch_at: entry.dispatch_at,
+                    key: entry.key,
+                };
+                (entry.task.queue.namespace_id == range.namespace_id
+                    && entry.queue_key.as_ref() == Some(&digest)
+                    && entry.dispatch_at <= cutoff
+                    && after.is_none_or(|after| position > after))
+                .then_some((position, entry))
+            })
+            .collect();
+        entries.sort_unstable_by_key(|(position, _)| *position);
+        entries.truncate(limit);
+        Ok(crate::ActivityDispatchPage {
+            last_examined: entries.last().map(|(position, _)| *position),
+            exhausted: entries.len() < limit,
+            candidates: entries
+                .into_iter()
+                .map(|(position, entry)| crate::ActivityDispatchCandidate {
+                    position,
+                    row: entry.row().map_err(Into::into),
+                })
+                .collect(),
+        })
+    }
+
+    async fn list_activity_dispatch_home_page(
+        &self,
+        home: ShardId,
+        after: Option<crate::ActivityHomePosition>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<crate::ActivityHomePage> {
+        let store = self.inner.lock().await;
+        let limit = limit.get().min(crate::ACTIVITY_DISPATCH_PAGE_LIMIT) as usize;
+        let mut candidates: Vec<_> = store
+            .activity_dispatch
+            .values()
+            .filter(|entry| entry.execution_home == home)
+            .map(|entry| crate::ActivityHomePosition {
+                run_key: entry.task.run_key,
+                key: entry.key,
+            })
+            .filter(|position| after.is_none_or(|after| *position > after))
+            .collect();
+        candidates.sort_unstable();
+        candidates.truncate(limit);
+        Ok(crate::ActivityHomePage {
+            last_examined: candidates.last().copied(),
+            exhausted: candidates.len() < limit,
+            candidates,
+        })
+    }
+
     async fn list_workflow_dispatch_page(
         &self,
         range: &WorkflowDiscoveryRange,
@@ -2432,13 +2652,7 @@ impl RunRepository for InMemoryStore {
             .filter(|entry| &entry.task.queue == queue && entry.dispatch_at <= now)
             .cloned()
             .collect::<Vec<_>>();
-        due.sort_by(|a, b| {
-            (a.dispatch_at, a.task.run_key, &a.task.activity_id).cmp(&(
-                b.dispatch_at,
-                b.task.run_key,
-                &b.task.activity_id,
-            ))
-        });
+        due.sort_unstable_by_key(|entry| (entry.dispatch_at, entry.key));
         due.truncate(limit);
         Ok(due.into_iter().map(|entry| entry.task).collect())
     }
@@ -2455,13 +2669,7 @@ impl RunRepository for InMemoryStore {
             .filter(|entry| &entry.task.queue == queue)
             .cloned()
             .collect::<Vec<_>>();
-        rows.sort_by(|a, b| {
-            (a.dispatch_at, a.task.run_key, &a.task.activity_id).cmp(&(
-                b.dispatch_at,
-                b.task.run_key,
-                &b.task.activity_id,
-            ))
-        });
+        rows.sort_unstable_by_key(|entry| (entry.dispatch_at, entry.key));
         rows.truncate(limit);
         Ok(rows.into_iter().map(|entry| entry.task).collect())
     }
@@ -2575,32 +2783,69 @@ impl RunRepository for InMemoryStore {
                     &payload,
                     entry.run_key.0.as_bytes(),
                 ]);
-                Ok((key, entry.identity(), entry.run_key, entry.queue.task_kind))
+                Ok((key, entry.clone()))
             })
             .collect::<Result<Vec<_>>>()?;
-        entries.retain(|(key, _, _, _)| after.is_none_or(|after| *key > after));
-        entries.sort_by_key(|(key, _, _, _)| *key);
+        entries.retain(|(key, _)| after.is_none_or(|after| *key > after));
+        entries.sort_by_key(|(key, _)| *key);
         let exhausted = entries.len() <= crate::LEGACY_WORKFLOW_KEYS;
         entries.truncate(crate::LEGACY_WORKFLOW_KEYS);
         let mut removed = std::collections::HashSet::new();
-        let mut workflows = 0;
-        for (_, identity, run_key, kind) in &entries {
-            if *kind != TaskKind::Workflow {
-                continue;
-            }
-            workflows += 1;
-            let expected = store.runs.get(run_key).and_then(|state| {
-                crate::derive_workflow_dispatch(
-                    state,
-                    tokeira_types::execution_home_bundle(
-                        state.namespace_id.0.as_bytes(),
-                        state.workflow_id.0.as_bytes(),
-                        store.shard_count.max(1),
-                    ),
+        for (_, entry) in &entries {
+            let state = store.runs.get(&entry.run_key);
+            let home = state.map(|state| {
+                tokeira_types::execution_home_bundle(
+                    state.namespace_id.0.as_bytes(),
+                    state.workflow_id.0.as_bytes(),
+                    store.shard_count.max(1),
                 )
             });
-            if store.workflow_dispatch.get(run_key) == expected.as_ref() {
-                removed.insert(identity.clone());
+            let covered = match (&entry.queue.task_kind, &entry.payload) {
+                (TaskKind::Workflow, _) => {
+                    let expected = state.and_then(|state| {
+                        crate::derive_workflow_dispatch(
+                            state,
+                            home.expect("existing state has home"),
+                        )
+                    });
+                    store.workflow_dispatch.get(&entry.run_key) == expected.as_ref()
+                }
+                (
+                    TaskKind::Activity,
+                    crate::BacklogPayload::Activity {
+                        activity_id,
+                        schedule_event_id,
+                        attempt,
+                        ..
+                    },
+                ) if !activity_id.is_empty() && *schedule_event_id > 0 && *attempt > 0 => {
+                    match state {
+                        None => true,
+                        Some(state) => match crate::derive_activity_dispatch(
+                            state,
+                            home.expect("existing state has home"),
+                        ) {
+                            Ok(desired) => {
+                                let key = crate::activity_dispatch_key(entry.run_key, activity_id);
+                                match store
+                                    .activity_dispatch
+                                    .values()
+                                    .find(|entry| entry.key == key)
+                                    .map(ActivityDispatchEntry::row)
+                                    .transpose()
+                                {
+                                    Ok(current) => desired.get(&key) == current.as_ref(),
+                                    Err(_) => false,
+                                }
+                            }
+                            Err(_) => false,
+                        },
+                    }
+                }
+                _ => false,
+            };
+            if covered {
+                removed.insert(entry.identity());
             }
         }
         let mut model = store.begin_bulk_transaction()?;
@@ -2610,10 +2855,10 @@ impl RunRepository for InMemoryStore {
             .dispatch_backlog
             .retain(|entry| !removed.contains(&entry.identity()));
         Ok(crate::WorkflowBacklogDisposal {
-            last_examined: entries.last().map(|(key, _, _, _)| *key),
+            last_examined: entries.last().map(|(key, _)| *key),
             examined: entries.len(),
             deleted: removed.len(),
-            deferred: workflows - removed.len(),
+            deferred: entries.len() - removed.len(),
             exhausted,
         })
     }
@@ -2746,18 +2991,17 @@ impl RunRepository for InMemoryStore {
             .activity_dispatch
             .values()
             .filter(|entry| {
-                store.run_shard_map.get(&entry.task.run_key) == Some(&shard_id)
+                entry.execution_home == shard_id
                     && entry.dispatch_at <= now
                     && after.is_none_or(|after| {
-                        (
-                            entry.dispatch_at,
-                            entry.task.run_key,
-                            &entry.task.activity_id,
-                        ) > (
-                            after.dispatch_at,
-                            after.task.run_key,
-                            &after.task.activity_id,
-                        )
+                        (entry.dispatch_at, entry.key)
+                            > (
+                                after.dispatch_at,
+                                crate::activity_dispatch_key(
+                                    after.task.run_key,
+                                    &after.task.activity_id,
+                                ),
+                            )
                     })
             })
             .cloned()
@@ -2765,13 +3009,7 @@ impl RunRepository for InMemoryStore {
         // Sorted before truncation (determinism rule); `dispatch_at` first so
         // a bounded reconciliation pass sees the longest-overdue rows and a
         // pruned stale head admits later rows next pass.
-        due.sort_by(|a, b| {
-            (a.dispatch_at, a.task.run_key, &a.task.activity_id).cmp(&(
-                b.dispatch_at,
-                b.task.run_key,
-                &b.task.activity_id,
-            ))
-        });
+        due.sort_unstable_by_key(|entry| (entry.dispatch_at, entry.key));
         due.truncate(limit);
         Ok(due
             .into_iter()
@@ -3779,6 +4017,7 @@ mod tests {
 
     pub(super) fn sample_state(run_key: RunKey) -> WorkflowState {
         WorkflowState {
+            activity_start_receipts: std::collections::BTreeMap::new(),
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,
@@ -4702,7 +4941,7 @@ mod tests {
             start_to_close_timeout: Some(Duration::seconds(20)),
             heartbeat_timeout: Some(Duration::seconds(5)),
             scheduled_at: fixed_now(),
-            current_attempt_scheduled_at: None,
+            current_attempt_scheduled_at: Some(fixed_now()),
             started_at: None,
             started_event_id: None,
             pause_info: None,
@@ -4917,7 +5156,7 @@ mod tests {
         assert_eq!(due[0].run_key, run_key);
         assert_eq!(due[0].attempt, 2);
         assert_eq!(due[0].stamp, 5);
-        assert_eq!(due[0].dispatch_revision, 4);
+        assert_eq!(due[0].dispatch_revision, 0);
         let due_for_shard = store
             .list_due_dispatchable_activity_tasks_for_shard(ShardId(0), dispatch_at, None, 10)
             .await
@@ -5060,125 +5299,79 @@ mod tests {
     #[tokio::test]
     async fn started_activity_upsert_removes_dispatch_entry() {
         let store = InMemoryStore::default();
-        let run_key = RunKey::new();
-        let mut transition = start_transition(run_key);
-        let queue = QueueKey {
-            namespace_id: transition.next_state.namespace_id,
-            task_queue: TaskQueueName("queue".into()),
-            task_kind: TaskKind::Activity,
-            deployment: None,
-            build_id: None,
+        let (run_key, queue) = seed_dispatch_row(&store, fixed_now(), 1, 0).await;
+        assert_eq!(
+            store
+                .list_all_dispatchable_activity_tasks(&queue, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let LoadedRun::Existing(state) = store.load_run(run_key).await.unwrap() else {
+            panic!("seeded run")
         };
-        transition
-            .activity_ops
-            .push(ActivityOp::Upsert(activity_state("activity-1")));
-        transition
-            .dispatch_ops
-            .push(DispatchOp::EnqueueActivityTask {
-                queue: queue.clone(),
-                activity_id: "activity-1".to_owned(),
-                schedule_event_id: 7,
-                attempt: 1,
-                dispatch_revision: 0,
-                stamp: 0,
-                dispatch_at: OffsetDateTime::UNIX_EPOCH,
-                schedule_to_close_timeout: None,
-                schedule_to_start_timeout: None,
-                start_to_close_timeout: None,
-                heartbeat_timeout: None,
-                priority: None,
-            });
+        let mut transition = super::projection_accumulator_tests::following(&state);
+        let activity = transition
+            .next_state
+            .activities
+            .get_mut("activity-1")
+            .unwrap();
+        activity.started_at = Some(fixed_now());
+        activity.started_event_id = Some(9);
         store
             .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .unwrap();
-
-        let mut started = activity_state("activity-1");
-        started.started_at = Some(fixed_now());
-        started.started_event_id = Some(9);
-        let mut started_transition = start_transition(run_key);
-        started_transition.expected_seq = TransitionSeq(1);
-        started_transition.next_state.transition_seq = TransitionSeq(2);
-        started_transition.next_state.namespace_id = queue.namespace_id;
-        started_transition
-            .activity_ops
-            .push(ActivityOp::Upsert(started));
-        store
-            .commit_transition(run_key, started_transition, WriteFence::Unfenced)
-            .await
-            .unwrap();
-
-        let tasks = store
-            .list_all_dispatchable_activity_tasks(&queue, 10)
-            .await
-            .unwrap();
-        assert!(tasks.is_empty());
+        assert!(
+            store
+                .list_all_dispatchable_activity_tasks(&queue, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn still_dispatchable_activity_upsert_updates_existing_dispatch_entry() {
         let store = InMemoryStore::default();
-        let run_key = RunKey::new();
-        let mut transition = start_transition(run_key);
-        let old_queue = QueueKey {
-            namespace_id: transition.next_state.namespace_id,
-            task_queue: TaskQueueName("old-queue".into()),
-            task_kind: TaskKind::Activity,
-            deployment: None,
-            build_id: None,
+        let (run_key, queue) = seed_dispatch_row(&store, fixed_now(), 1, 0).await;
+        assert_eq!(
+            store
+                .list_all_dispatchable_activity_tasks(&queue, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let LoadedRun::Existing(state) = store.load_run(run_key).await.unwrap() else {
+            panic!("seeded run")
         };
-        transition
-            .activity_ops
-            .push(ActivityOp::Upsert(activity_state("activity-1")));
-        transition
-            .dispatch_ops
-            .push(DispatchOp::EnqueueActivityTask {
-                queue: old_queue.clone(),
-                activity_id: "activity-1".to_owned(),
-                schedule_event_id: 7,
-                attempt: 1,
-                dispatch_revision: 0,
-                stamp: 0,
-                dispatch_at: OffsetDateTime::UNIX_EPOCH,
-                schedule_to_close_timeout: None,
-                schedule_to_start_timeout: None,
-                start_to_close_timeout: None,
-                heartbeat_timeout: None,
-                priority: None,
-            });
+        let mut transition = super::projection_accumulator_tests::following(&state);
+        let activity = transition
+            .next_state
+            .activities
+            .get_mut("activity-1")
+            .unwrap();
+        activity.task_queue = TaskQueueName("new-queue".into());
+        activity.attempt = 2;
         store
             .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .unwrap();
-
-        let mut updated = activity_state("activity-1");
-        updated.task_queue = TaskQueueName("new-queue".into());
-        updated.attempt = 2;
-        let mut update_transition = start_transition(run_key);
-        update_transition.expected_seq = TransitionSeq(1);
-        update_transition.next_state.transition_seq = TransitionSeq(2);
-        update_transition.next_state.namespace_id = old_queue.namespace_id;
-        update_transition
-            .activity_ops
-            .push(ActivityOp::Upsert(updated));
-        store
-            .commit_transition(run_key, update_transition, WriteFence::Unfenced)
-            .await
-            .unwrap();
-
-        let new_queue = QueueKey {
-            task_queue: TaskQueueName("new-queue".into()),
-            ..old_queue.clone()
-        };
         assert!(
             store
-                .list_all_dispatchable_activity_tasks(&old_queue, 10)
+                .list_all_dispatchable_activity_tasks(&queue, 10)
                 .await
                 .unwrap()
                 .is_empty()
         );
+        let selected = QueueKey {
+            task_queue: TaskQueueName("new-queue".into()),
+            ..queue
+        };
         let tasks = store
-            .list_all_dispatchable_activity_tasks(&new_queue, 10)
+            .list_all_dispatchable_activity_tasks(&selected, 10)
             .await
             .unwrap();
         assert_eq!(tasks.len(), 1);
@@ -5188,179 +5381,137 @@ mod tests {
     #[tokio::test]
     async fn paused_activity_upsert_removes_dispatch_entry() {
         let store = InMemoryStore::default();
-        let run_key = RunKey::new();
-        let mut transition = start_transition(run_key);
-        let queue = QueueKey {
-            namespace_id: transition.next_state.namespace_id,
-            task_queue: TaskQueueName("queue".into()),
-            task_kind: TaskKind::Activity,
-            deployment: None,
-            build_id: None,
+        let (run_key, queue) = seed_dispatch_row(&store, fixed_now(), 1, 0).await;
+        assert_eq!(
+            store
+                .list_all_dispatchable_activity_tasks(&queue, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let LoadedRun::Existing(state) = store.load_run(run_key).await.unwrap() else {
+            panic!("seeded run")
         };
+        let mut transition = super::projection_accumulator_tests::following(&state);
         transition
-            .activity_ops
-            .push(ActivityOp::Upsert(activity_state("activity-1")));
-        transition
-            .dispatch_ops
-            .push(DispatchOp::EnqueueActivityTask {
-                queue: queue.clone(),
-                activity_id: "activity-1".to_owned(),
-                schedule_event_id: 7,
-                attempt: 1,
-                dispatch_revision: 0,
-                stamp: 0,
-                dispatch_at: OffsetDateTime::UNIX_EPOCH,
-                schedule_to_close_timeout: None,
-                schedule_to_start_timeout: None,
-                start_to_close_timeout: None,
-                heartbeat_timeout: None,
-                priority: None,
-            });
+            .next_state
+            .activities
+            .get_mut("activity-1")
+            .unwrap()
+            .pause_info = Some(ActivityPauseInfo {
+            pause_time: fixed_now(),
+            identity: "tester".into(),
+            reason: "maintenance".into(),
+            rule_id: None,
+        });
         store
             .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .unwrap();
-
-        let mut paused = activity_state("activity-1");
-        paused.pause_info = Some(ActivityPauseInfo {
-            pause_time: fixed_now(),
-            identity: "tester".to_owned(),
-            reason: "maintenance".to_owned(),
-            rule_id: None,
-        });
-        let mut pause_transition = start_transition(run_key);
-        pause_transition.expected_seq = TransitionSeq(1);
-        pause_transition.next_state.transition_seq = TransitionSeq(2);
-        pause_transition.next_state.namespace_id = queue.namespace_id;
-        pause_transition
-            .activity_ops
-            .push(ActivityOp::Upsert(paused));
-        store
-            .commit_transition(run_key, pause_transition, WriteFence::Unfenced)
-            .await
-            .unwrap();
-
-        let tasks = store
-            .list_all_dispatchable_activity_tasks(&queue, 10)
-            .await
-            .unwrap();
-        assert!(tasks.is_empty());
+        assert!(
+            store
+                .list_all_dispatchable_activity_tasks(&queue, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn workflow_pause_removes_activity_dispatch_entries_for_run() {
         let store = InMemoryStore::default();
-        let run_key = RunKey::new();
-        let mut transition = start_transition(run_key);
-        let queue = QueueKey {
-            namespace_id: transition.next_state.namespace_id,
-            task_queue: TaskQueueName("queue".into()),
-            task_kind: TaskKind::Activity,
-            deployment: None,
-            build_id: None,
+        let (run_key, queue) = seed_dispatch_row(&store, fixed_now(), 1, 0).await;
+        assert_eq!(
+            store
+                .list_all_dispatchable_activity_tasks(&queue, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let LoadedRun::Existing(state) = store.load_run(run_key).await.unwrap() else {
+            panic!("seeded run")
         };
-        for activity_id in ["activity-1", "activity-2"] {
-            transition
-                .activity_ops
-                .push(ActivityOp::Upsert(activity_state(activity_id)));
-            transition
-                .dispatch_ops
-                .push(DispatchOp::EnqueueActivityTask {
-                    queue: queue.clone(),
-                    activity_id: activity_id.to_owned(),
-                    schedule_event_id: 7,
-                    attempt: 1,
-                    dispatch_revision: 0,
-                    stamp: 0,
-                    dispatch_at: OffsetDateTime::UNIX_EPOCH,
-                    schedule_to_close_timeout: None,
-                    schedule_to_start_timeout: None,
-                    start_to_close_timeout: None,
-                    heartbeat_timeout: None,
-                    priority: None,
-                });
-        }
+        let mut transition = super::projection_accumulator_tests::following(&state);
+        let mut other = activity_state("activity-2");
+        other.task_queue = queue.task_queue.clone();
+        transition
+            .next_state
+            .activities
+            .insert(other.activity_id.clone(), other);
+        transition.next_state.status = ExecutionStatus::Paused;
+        transition.next_state.pause_info = Some(PauseInfo {
+            pause_time: fixed_now(),
+            identity: "tester".into(),
+            reason: "maintenance".into(),
+            request_id: "pause-1".into(),
+        });
         store
             .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .unwrap();
-
-        let mut pause_transition = start_transition(run_key);
-        pause_transition.expected_seq = TransitionSeq(1);
-        pause_transition.next_state.transition_seq = TransitionSeq(2);
-        pause_transition.next_state.namespace_id = queue.namespace_id;
-        pause_transition.next_state.status = ExecutionStatus::Paused;
-        pause_transition.next_state.pause_info = Some(PauseInfo {
-            pause_time: fixed_now(),
-            identity: "tester".to_owned(),
-            reason: "maintenance".to_owned(),
-            request_id: "pause-1".to_owned(),
-        });
-        store
-            .commit_transition(run_key, pause_transition, WriteFence::Unfenced)
-            .await
-            .unwrap();
-
-        let tasks = store
-            .list_all_dispatchable_activity_tasks(&queue, 10)
-            .await
-            .unwrap();
-        assert!(tasks.is_empty());
+        assert!(
+            store
+                .list_all_dispatchable_activity_tasks(&queue, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn unpaused_activity_reenqueue_restores_dispatch_entry() {
         let store = InMemoryStore::default();
-        let run_key = RunKey::new();
-        let mut transition = start_transition(run_key);
-        let queue = QueueKey {
-            namespace_id: transition.next_state.namespace_id,
-            task_queue: TaskQueueName("queue".into()),
-            task_kind: TaskKind::Activity,
-            deployment: None,
-            build_id: None,
+        let (run_key, queue) = seed_dispatch_row(&store, fixed_now(), 1, 0).await;
+        assert_eq!(
+            store
+                .list_all_dispatchable_activity_tasks(&queue, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let LoadedRun::Existing(state) = store.load_run(run_key).await.unwrap() else {
+            panic!("seeded run")
         };
-        let mut paused = activity_state("activity-1");
-        paused.pause_info = Some(ActivityPauseInfo {
+        let mut transition = super::projection_accumulator_tests::following(&state);
+        transition
+            .next_state
+            .activities
+            .get_mut("activity-1")
+            .unwrap()
+            .pause_info = Some(ActivityPauseInfo {
             pause_time: fixed_now(),
-            identity: "tester".to_owned(),
-            reason: "maintenance".to_owned(),
+            identity: "tester".into(),
+            reason: "maintenance".into(),
             rule_id: None,
         });
-        transition.activity_ops.push(ActivityOp::Upsert(paused));
         store
             .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .unwrap();
-
-        let mut unpause_transition = start_transition(run_key);
-        unpause_transition.expected_seq = TransitionSeq(1);
-        unpause_transition.next_state.transition_seq = TransitionSeq(2);
-        unpause_transition.next_state.namespace_id = queue.namespace_id;
-        unpause_transition
-            .activity_ops
-            .push(ActivityOp::Upsert(activity_state("activity-1")));
-        unpause_transition
-            .dispatch_ops
-            .push(DispatchOp::EnqueueActivityTask {
-                queue: queue.clone(),
-                activity_id: "activity-1".to_owned(),
-                schedule_event_id: 7,
-                attempt: 1,
-                dispatch_revision: 0,
-                stamp: 0,
-                dispatch_at: OffsetDateTime::UNIX_EPOCH,
-                schedule_to_close_timeout: None,
-                schedule_to_start_timeout: None,
-                start_to_close_timeout: None,
-                heartbeat_timeout: None,
-                priority: None,
-            });
+        assert!(
+            store
+                .list_all_dispatchable_activity_tasks(&queue, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let LoadedRun::Existing(state) = store.load_run(run_key).await.unwrap() else {
+            panic!("paused activity")
+        };
+        let mut transition = super::projection_accumulator_tests::following(&state);
+        transition
+            .next_state
+            .activities
+            .get_mut("activity-1")
+            .unwrap()
+            .pause_info = None;
         store
-            .commit_transition(run_key, unpause_transition, WriteFence::Unfenced)
+            .commit_transition(run_key, transition, WriteFence::Unfenced)
             .await
             .unwrap();
-
         let tasks = store
             .list_all_dispatchable_activity_tasks(&queue, 10)
             .await
@@ -5445,6 +5596,12 @@ mod tests {
                     priority: None,
                 });
 
+                let mut activity = activity_state(&activity_id);
+                activity.task_queue = queue.task_queue.clone();
+                activity.schedule_event_id = 42;
+                activity.attempt = 3;
+                activity.current_attempt_scheduled_at = Some(OffsetDateTime::UNIX_EPOCH);
+                transition.next_state.activities.insert(activity_id.clone(), activity);
                 let result = store.commit_transition(run_key, transition, WriteFence::Unfenced).await.unwrap();
                 assert!(matches!(result, CommitResult::Applied { .. }));
                 let tasks = store.list_all_dispatchable_activity_tasks(&queue, 10).await.unwrap();
@@ -5601,7 +5758,7 @@ mod tests {
                     transition.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
                         queue: if idx % 2 == 0 { activity_queue.clone() } else { other_queue.clone() },
                         activity_id: format!("a{idx}"),
-                        schedule_event_id: idx as i64,
+                        schedule_event_id: idx as i64 + 1,
                         attempt: 1,
                         dispatch_revision: 0,
                         stamp: 0,
@@ -7096,7 +7253,7 @@ mod tests {
                         retry_last_worker_identity: None,
                         activity_id: act_id.clone(),
                         activity_type: "activity-type".into(),
-                        schedule_event_id: idx as i64,
+                        schedule_event_id: idx as i64 + 1,
                         task_queue: TaskQueueName(
                             "q".into(),
                         ),
@@ -7115,7 +7272,7 @@ mod tests {
                         start_to_close_timeout: None,
                         heartbeat_timeout: None,
                         scheduled_at: fixed_now(),
-                        current_attempt_scheduled_at: None,
+                        current_attempt_scheduled_at: Some(fixed_now()),
                         started_at: None,
                         started_event_id: None,
                         pause_info: None,
@@ -7452,6 +7609,21 @@ mod tests {
                     )
                     .await
                     .unwrap();
+                {
+                    let mut inner = store.inner.lock().await;
+                    for index in 0..side_row_count {
+                        let id = format!("activity-{index}");
+                        inner.activity_dispatch.insert((run_key, id.clone()), ActivityDispatchEntry {
+                            key: crate::activity_dispatch_key(run_key, &id), execution_home: ShardId(0), queue_key: None,
+                            task: DispatchableActivityTask {
+                                run_key, queue: activity_queue.clone(), activity_id: id, schedule_event_id: index as i64 + 1,
+                                attempt: 1, dispatch_revision: 0, stamp: 0, priority: None, order: None,
+                            },
+                            dispatch_at: fixed_now(), schedule_to_close_timeout: None, schedule_to_start_timeout: None,
+                            start_to_close_timeout: None, heartbeat_timeout: None,
+                        });
+                    }
+                }
                 store.inject_conflict(run_key, 1).await;
 
                 {
@@ -8521,7 +8693,7 @@ mod tests {
     /// (`activity-inputs-from-history`).
     #[test]
     fn from_snapshot_refuses_v4_whose_entries_carry_inputs() {
-        assert_eq!(SNAPSHOT_FORMAT_VERSION, 7);
+        assert_eq!(SNAPSHOT_FORMAT_VERSION, 8);
         let bytes = postcard::to_allocvec(&4_u32).unwrap();
         match InMemoryStore::from_snapshot(&bytes) {
             Err(SnapshotError::VersionMismatch { found, supported }) => {
@@ -8676,6 +8848,7 @@ mod tests {
                     };
                     if *action == 1 {
                         activity.started_at = Some(fixed_now());
+                        activity.started_event_id = Some(9);
                         expected_dispatch.remove(&activity_id);
                     } else {
                         activity.task_queue = TaskQueueName("activity-q-moved".into());

@@ -880,3 +880,6 @@ async fn dsql_lease_fence_a_write_landing_first_aborts_a_takeover() -> anyhow::R
 
 #[path = "workflow_dispatch_fence_tests.rs"]
 mod workflow_dispatch_fence_tests;
+
+#[path = "activity_fence_tests.rs"]
+mod activity_fence_tests;

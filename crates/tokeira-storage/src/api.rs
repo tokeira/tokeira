@@ -1220,6 +1220,21 @@ pub trait RunRepository: Send + Sync {
     /// ids. Recovery changes only the returned state until its next commit.
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun>;
 
+    /// Validate a same-request activity start replay without another transition.
+    ///
+    /// The observed run lineage, sequence, activity and start receipt must still
+    /// match authority. The lease check and observation validation share one
+    /// serializable transaction (or memory-store lock). A missing or changed run
+    /// returns false, including an OCC conflict during validation; a fence already
+    /// lost when checked is an error. No history, row or sequence changes.
+    async fn validate_activity_start_observation(
+        &self,
+        observed: &WorkflowState,
+        activity_id: &str,
+        home: ShardId,
+        fence: WriteFence,
+    ) -> Result<bool>;
+
     /// Load the run and its persisted history statistics from one snapshot.
     ///
     /// The authoritative stores read the statistic with the state so the value
@@ -1606,6 +1621,24 @@ pub trait RunRepository: Send + Sync {
         limit: usize,
     ) -> Result<Vec<RunBulkWrite>>;
 
+    /// Read one fixed-cutoff queue-family page without claiming or mutating work.
+    /// Per-row payload errors retain their position; SQL/key errors fail the page.
+    async fn list_activity_dispatch_page(
+        &self,
+        range: &crate::ActivityDiscoveryRange,
+        cutoff: OffsetDateTime,
+        after: Option<crate::ActivityDispatchPosition>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<crate::ActivityDispatchPage>;
+
+    /// Enumerate every physical activity slot for a home, including legacy/orphan rows.
+    async fn list_activity_dispatch_home_page(
+        &self,
+        home: ShardId,
+        after: Option<crate::ActivityHomePosition>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<crate::ActivityHomePage>;
+
     /// Read a bounded normal-queue range across every execution home.
     ///
     /// This never claims or deletes rows. The continuation is the last examined
@@ -1659,6 +1692,21 @@ pub trait RunRepository: Send + Sync {
         anyhow::bail!("workflow dispatch repair is not implemented by this repository")
     }
 
+    /// Repair at most 64 activity slots and 4 MiB from fresh transaction-local
+    /// authority, under the captured execution-home fence. The caller must hold
+    /// the home non-serving and exclude authoritative writers for the entire
+    /// acquisition. A changed run sequence restarts the wanted phase; an absent
+    /// run permits only observed-home cleanup. No history or sequence is changed.
+    async fn reconcile_activity_dispatch_page(
+        &self,
+        _home: ShardId,
+        _run_key: RunKey,
+        _after: Option<crate::ActivityRepairCursor>,
+        _fence: WriteFence,
+    ) -> Result<crate::ActivityRepairPage> {
+        anyhow::bail!("activity dispatch repair is not implemented by this repository")
+    }
+
     /// Return workflow tasks that are scheduled but not
     /// yet started for the given queue, up to `limit`.
     async fn list_dispatchable_workflow_tasks(
@@ -1710,9 +1758,11 @@ pub trait RunRepository: Send + Sync {
     /// ascending [`DeliveryOrder`].
     async fn drain_backlog(&self, queue: &QueueKey, limit: usize) -> Result<Vec<BacklogEntry>>;
 
-    /// Dispose a page of legacy workflow copies only when dispatch equals the
-    /// current state's derivation in the same transaction. Advance past deferred
-    /// entries; restart at the head after errors. Activity entries are untouched.
+    /// Dispose at most 64 physical legacy workflow/activity copies after checking
+    /// canonical coverage in the same transaction. Activity coverage is per slot.
+    /// Missing runs owe no activity work; corrupt/unknown copies defer and advance
+    /// the cursor. Query failures abort the page. The historical method name is
+    /// retained for repository adapters; neither task kind is delivered here.
     async fn dispose_workflow_backlog_page(
         &self,
         _after: Option<Uuid>,
@@ -2092,9 +2142,8 @@ impl Default for DeliveryOrder {
 
 /// A single entry in the durable dispatch backlog.
 ///
-/// Tasks land here when no worker is immediately
-/// available. The runtime drains the backlog on the
-/// next sweep cycle.
+/// Retained for decoding and bounded disposal during the stopped-cluster cutover.
+/// Runtime delivery uses canonical dispatch discovery and never writes this table.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BacklogEntry {
     /// Durable storage key for the owning run.
@@ -3314,6 +3363,18 @@ where
         (**self).load_run(run_key).await
     }
 
+    async fn validate_activity_start_observation(
+        &self,
+        observed: &WorkflowState,
+        activity_id: &str,
+        home: ShardId,
+        fence: WriteFence,
+    ) -> Result<bool> {
+        (**self)
+            .validate_activity_start_observation(observed, activity_id, home, fence)
+            .await
+    }
+
     async fn load_run_with_stats(&self, run_key: RunKey) -> Result<(LoadedRun, RunHistoryStats)> {
         (**self).load_run_with_stats(run_key).await
     }
@@ -3489,6 +3550,44 @@ where
     ) -> Result<()> {
         self.as_ref()
             .reconcile_workflow_dispatch_run(home, run_key, fence)
+            .await
+    }
+
+    async fn reconcile_activity_dispatch_page(
+        &self,
+        home: ShardId,
+        run_key: RunKey,
+        after: Option<crate::ActivityRepairCursor>,
+        fence: WriteFence,
+    ) -> Result<crate::ActivityRepairPage> {
+        self.as_ref()
+            .reconcile_activity_dispatch_page(home, run_key, after, fence)
+            .await
+    }
+
+    /// Read one fixed-cutoff queue-family page without claiming or mutating work.
+    /// Per-row payload errors retain their position; SQL/key errors fail the page.
+    async fn list_activity_dispatch_page(
+        &self,
+        range: &crate::ActivityDiscoveryRange,
+        cutoff: time::OffsetDateTime,
+        after: Option<crate::ActivityDispatchPosition>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<crate::ActivityDispatchPage> {
+        (**self)
+            .list_activity_dispatch_page(range, cutoff, after, limit)
+            .await
+    }
+
+    /// Enumerate every physical activity slot for a home, including legacy/orphan rows.
+    async fn list_activity_dispatch_home_page(
+        &self,
+        home: tokeira_types::ShardId,
+        after: Option<crate::ActivityHomePosition>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<crate::ActivityHomePage> {
+        (**self)
+            .list_activity_dispatch_home_page(home, after, limit)
             .await
     }
 

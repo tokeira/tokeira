@@ -61,6 +61,7 @@ pub use runtime::continue_as_new_advice_policy;
 mod activity_discovery;
 mod activity_eligibility;
 mod activity_offers;
+pub mod deadline;
 pub mod scanner;
 pub mod schedule;
 mod serving_gate;

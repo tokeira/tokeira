@@ -404,3 +404,15 @@ proptest! {
 ```
 
 Each correctness property MUST be implemented by a SINGLE property-based test. Property tests should run a minimum of 100 iterations.
+
+### Property 7: Validated timer delays and checked fire times
+
+For any wire seconds/nanos pair or stored duration in this feature, conversion and deadline arithmetic SHALL be total. Accepted values SHALL preserve the specified cap, and rejected command values SHALL retain their cause and message. Every unrepresentable deadline SHALL saturate at the latest representable date, including underflow from malformed negative stored durations.
+
+**Validates: Requirements 7.**
+
+Validation and the failure cause follow `service/history/api/command_attr_validator.go:136-157 @ v1.31.0`; the shared duration rule is `common/primitives/timestamp/duration.go:67-88 @ v1.31.0`. Saturating stored deadlines is a Tokeira representational safeguard.
+
+Verification: `stored_start_delay_deadlines_are_total`, `command_durations_preserve_failure_cause_and_message`. Admission uses `validate_and_cap_proto_duration`; stored deadlines use saturating arithmetic because earlier rows did not pass that admission boundary. No schema or dependency changes are required.
+
+The appended `StartTimerWithTimeout` command carries the validated duration to the transition clock. This makes `TimerStarted` record the exact capped value; translating an absolute fire time earlier would subtract transport and queueing time from the recorded timeout. The legacy `StartTimer` variant retains its positional encoding. `capped_command_durations_are_recorded_in_history` checks the resulting wire history.

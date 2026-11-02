@@ -10493,3 +10493,57 @@ fn buffer_limit_writes_a_started_speculative_task_before_failing_it() {
         &(109, "WorkflowTaskScheduled".to_owned())
     );
 }
+
+proptest::proptest! {
+    // Feature: runtime-timer-scanner, Property 7: stored delay timers remain replayable
+    // at duration extremes.
+    #[test]
+    fn stored_start_delay_deadlines_are_total(
+        seconds in proptest::prelude::any::<i64>(),
+        nanos in -999_999_999i32..=999_999_999,
+    ) {
+        let delay = Duration::seconds(seconds)
+            .saturating_add(Duration::nanoseconds(i64::from(nanos)));
+        let mut request = make_start_request();
+        request.workflow_start_delay = Some(delay);
+        let context = replay_context_from_start(&request);
+        let transition = kernel()
+            .apply(LoadedRun::Absent, Command::Start(request.clone()))
+            .unwrap();
+        let replayed = kernel().replay_history_prefix(context, &transition.history_events).unwrap();
+        proptest::prop_assert_eq!(&transition.next_state.timers, &replayed.timers);
+        if delay.is_positive() {
+            let timer = transition.next_state.timers.get(WORKFLOW_START_DELAY_TIMER_ID).unwrap();
+            proptest::prop_assert_eq!(timer.fire_at, request.now.saturating_add(delay));
+        }
+        let _ = tokeira_kernel::kernel::continue_as_new_min_backoff(Some(delay), Duration::MAX);
+    }
+}
+
+proptest::proptest! {
+    // Stored date arithmetic returns the exact sum or the latest date, never a panic.
+    #[test]
+    fn stored_deadline_arithmetic_is_total(
+        seconds in proptest::prelude::any::<i64>(),
+        nanos in -999_999_999i32..=999_999_999,
+        anchor in -377705116800i64..=253402300799,
+    ) {
+        let anchor = OffsetDateTime::from_unix_timestamp(anchor).unwrap();
+        let duration = Duration::seconds(seconds)
+            .saturating_add(Duration::nanoseconds(i64::from(nanos)));
+        let latest = time::PrimitiveDateTime::MAX.assume_utc();
+        for (actual, nanos) in [
+            (
+                tokeira_kernel::deadline_after(anchor, duration),
+                anchor.unix_timestamp_nanos() + duration.whole_nanoseconds(),
+            ),
+            (
+                tokeira_kernel::deadline_before(anchor, duration),
+                anchor.unix_timestamp_nanos() - duration.whole_nanoseconds(),
+            ),
+        ] {
+            let expected = OffsetDateTime::from_unix_timestamp_nanos(nanos).unwrap_or(latest);
+            proptest::prop_assert_eq!(actual, expected);
+        }
+    }
+}

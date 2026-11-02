@@ -30,7 +30,7 @@ pub fn exponential_retry_interval(
     // is always called with a 1-based count, so the exponent is >= 0 in practice.
     // `powi` with a negative exponent would shrink the interval below `initial`,
     // which is harmless (clamped to >= 0), so no separate guard is needed.
-    let raw = initial_nanos as f64 * coefficient.powi(attempt - 1);
+    let raw = initial_nanos as f64 * coefficient.powi(attempt.saturating_sub(1));
     // Saturating conversion: NaN/inf and out-of-range floats clamp to the i64
     // bounds, reproducing the source's `max(0, min(int64(result), MaxInt64))`.
     let interval = if raw.is_nan() {

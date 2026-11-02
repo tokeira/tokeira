@@ -2,6 +2,8 @@
 //! Original metadata comes from start history; the closing transition supplies
 //! the actual outcome. Frozen evaluation and start clocks survive OCC and fallback.
 
+use tokeira_kernel::deadline_after;
+
 use anyhow::{Context as _, Result, anyhow, ensure};
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
@@ -96,8 +98,10 @@ pub(crate) struct SuccessorTiming {
 impl SuccessorTiming {
     /// Apply the shared minimum after selection, anchored on execution rather than wall-clock start.
     pub(crate) fn minimum_backoff(self, state: &WorkflowState) -> Option<Duration> {
-        let execution_time =
-            state.started_at + state.workflow_start_delay.unwrap_or(Duration::ZERO);
+        let execution_time = deadline_after(
+            state.started_at,
+            state.workflow_start_delay.unwrap_or(Duration::ZERO),
+        );
         continue_as_new_min_backoff(Some(self.backoff), self.now - execution_time)
     }
 }

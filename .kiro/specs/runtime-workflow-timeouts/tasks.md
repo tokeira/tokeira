@@ -227,3 +227,8 @@ Add a background workflow timeout scanner to `tokeira-runtime` that periodically
 - Tag format for property tests: `// Feature: runtime-workflow-timeouts, Property N: <title>`
 - The `scan_workflow_timeouts_once` helper is extracted (like `scan_due_timers_once` for the timer scanner) to enable unit-level property testing without spawning the full async loop
 - `WorkflowTimeoutTrackingState` is `Clone` (wraps `Arc<Mutex<...>>`) so it can be shared between the runtime, lifecycle hooks, and the scanner task
+
+## Duration validation and checked deadlines
+
+- [x] Verify Property 9 with the required property and regression tests: `stored_workflow_deadlines_are_total`, `stored_long_timeout_keeps_scan_bounded`.
+  _Requirements: 10._

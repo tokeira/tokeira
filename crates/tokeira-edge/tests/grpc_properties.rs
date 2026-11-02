@@ -352,6 +352,8 @@ proptest! {
             }
             WorkflowCommand::RecordMarker { .. }
             | WorkflowCommand::ContinueAsNew { .. }
+            | WorkflowCommand::ContinueAsNewWithBackoff { .. }
+            | WorkflowCommand::StartTimerWithTimeout { .. }
             | WorkflowCommand::RequestCancelActivity { .. }
             | WorkflowCommand::ScheduleNexusOperation { .. } => {
                 prop_assert!(workflow_command_to_proto(&cmd).is_ok());
@@ -366,7 +368,8 @@ proptest! {
             WorkflowCommand::UpdateCompleted { .. }
             | WorkflowCommand::UpdateRejected { .. }
             | WorkflowCommand::RequestNewWorkflowTask
-            | WorkflowCommand::InvalidSearchAttributes { .. } => {
+            | WorkflowCommand::InvalidSearchAttributes { .. }
+            | WorkflowCommand::InvalidDuration { .. } => {
                 prop_assert!(workflow_command_to_proto(&cmd).is_err());
             }
         }
@@ -385,7 +388,8 @@ proptest! {
             WorkflowCommand::UpdateCompleted { .. }
             | WorkflowCommand::UpdateRejected { .. }
             | WorkflowCommand::RequestNewWorkflowTask
-            | WorkflowCommand::InvalidSearchAttributes { .. } => {
+            | WorkflowCommand::InvalidSearchAttributes { .. }
+            | WorkflowCommand::InvalidDuration { .. } => {
                 prop_assert!(workflow_command_to_proto(&cmd).is_err());
             }
             _ => {}

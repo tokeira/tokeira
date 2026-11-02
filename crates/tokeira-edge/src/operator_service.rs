@@ -1,5 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
+use tokeira_kernel::deadline_after;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use http::HeaderMap;
@@ -371,7 +373,14 @@ impl OperatorService {
                 return;
             }
             if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
+                // A client-supplied delete delay can exceed Instant's range.
+                // Preserve the deadline through the same bounded waits used by
+                // recovered workflow timers.
+                tokeira_runtime::deadline::sleep_until(deadline_after(
+                    time::OffsetDateTime::now_utc(),
+                    time::Duration::try_from(delay).unwrap_or(time::Duration::MAX),
+                ))
+                .await;
             } else {
                 // Temporal waits for namespace-cache refresh before reclaim even when the
                 // configured delete delay is zero (`namespaceCacheRefreshDelay`,

@@ -16,6 +16,8 @@
 //!   whether the caller returns at admission or blocks for the final
 //!   resolution. The caller registration is always cleaned up on every error
 //!   and timeout path so a failed update cannot leak a parked waiter.
+use tokeira_kernel::deadline_after;
+
 use super::*;
 use crate::errors::UpdateLifecycleError;
 use tokeira_observability::{QueryDispatchOutcomeLabel, QueryDispatchPathLabel};
@@ -24,7 +26,7 @@ fn query_sticky_deadline(
     enqueued_at: OffsetDateTime,
     schedule_to_start_timeout: Duration,
 ) -> OffsetDateTime {
-    enqueued_at + schedule_to_start_timeout
+    deadline_after(enqueued_at, schedule_to_start_timeout)
 }
 
 impl<R> TokeiraRuntime<R>
@@ -146,7 +148,7 @@ where
                 .timers
                 .get(tokeira_kernel::WORKFLOW_START_DELAY_TIMER_ID)
                 .filter(|_| state.pending_workflow_task.is_none())
-                && OffsetDateTime::now_utc() + timeout_after < delay_timer.fire_at
+                && deadline_after(OffsetDateTime::now_utc(), timeout_after) < delay_timer.fire_at
             {
                 return Err(crate::errors::WorkflowNotReady {
                     message: "Workflow task is not scheduled yet.",

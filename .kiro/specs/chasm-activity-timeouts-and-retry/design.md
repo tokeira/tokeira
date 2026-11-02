@@ -111,3 +111,13 @@ loses no timeout.
   `activity_tasks.go:100-152 @ v1.31.0` during impl.
 - Backoff re-dispatch uses the existing `DispatchTask.fire_at` (option A) over a new `RetryTimer`
   (option B) — fewer moving parts.
+
+### Property 5: Standalone duration admission and stored deadlines
+
+For any wire seconds/nanos pair or stored duration in this feature, conversion and deadline arithmetic SHALL be total. Accepted values SHALL preserve the specified cap, and rejected command values SHALL retain their cause and message. Every unrepresentable deadline SHALL saturate at the latest representable date, including underflow from malformed negative stored durations.
+
+**Validates: Requirements 10.**
+
+Ground truth: `chasm/lib/activity/validator.go:128-160` and `common/retrypolicy/retry_policy.go:65-77 @ v1.31.0`. Nil/sign/cap semantics come from `common/primitives/timestamp/duration.go:67-88 @ v1.31.0`. i64 deadline saturation is the representation safeguard for previously persisted data.
+
+Verification: `stored_activity_deadlines_are_total`. Admission uses `validate_and_cap_proto_duration`; stored deadlines use saturating arithmetic because earlier rows did not pass that admission boundary. No schema or dependency changes are required.

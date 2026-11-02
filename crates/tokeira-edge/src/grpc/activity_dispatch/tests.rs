@@ -626,3 +626,53 @@ proptest! {
         })?;
     }
 }
+
+#[test]
+fn peer_duration_admission_preserves_errors_caps_and_disabled_retries() {
+    for (value, expected) in [
+        (
+            prost_types::Duration {
+                seconds: -1,
+                nanos: 0,
+            },
+            "negative duration",
+        ),
+        (
+            prost_types::Duration {
+                seconds: -1,
+                nanos: 1,
+            },
+            "duration has seconds and nanos with different signs",
+        ),
+    ] {
+        assert_eq!(duration(Some(value)).unwrap_err().to_string(), expected);
+        assert_eq!(
+            retry_duration(Some(value), 0).unwrap_err().to_string(),
+            expected
+        );
+        assert!(retry_duration(Some(value), 1).is_ok());
+    }
+    let value = prost_types::Duration {
+        seconds: i64::MAX,
+        nanos: i32::MAX,
+    };
+    assert_eq!(
+        duration(Some(value)).unwrap(),
+        Some(time::Duration::seconds(3_153_600_000))
+    );
+    assert_eq!(
+        retry_duration(Some(value), 1).unwrap(),
+        Some(time::Duration::nanoseconds(i64::MAX))
+    );
+}
+
+proptest! {
+    // Peer protobuf conversions are total, including policies that disable retries.
+    #[test]
+    fn peer_duration_conversions_are_total(seconds in any::<i64>(), nanos in any::<i32>()) {
+        let value = Some(prost_types::Duration { seconds, nanos });
+        let _ = duration(value);
+        let _ = retry_duration(value, 0);
+        let _ = retry_duration(value, 1);
+    }
+}

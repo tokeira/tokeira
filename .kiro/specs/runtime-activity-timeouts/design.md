@@ -501,3 +501,13 @@ proptest! {
 ```
 
 Each correctness property MUST be implemented by a SINGLE property-based test. Property tests should run a minimum of 100 iterations.
+
+### Property 16: Activity duration bounds and retry arithmetic
+
+For any wire seconds/nanos pair or stored duration in this feature, conversion and deadline arithmetic SHALL be total. Accepted values SHALL preserve the specified cap, and rejected command values SHALL retain their cause and message. Every unrepresentable deadline SHALL saturate at the latest representable date, including underflow from malformed negative stored durations.
+
+**Validates: Requirements 9.**
+
+Ground truth: `chasm/lib/activity/validator.go:149-160`, `common/retrypolicy/retry_policy.go:65-77`, and `service/history/workflow/retry.go:96-110 @ v1.31.0`. Existing timeout normalization and retry-boundary comparisons are unchanged; saturation protects legacy rows.
+
+Verification: `stored_retry_backoff_is_total`, `command_durations_preserve_failure_cause_and_message`. Admission uses `validate_and_cap_proto_duration`; stored deadlines use saturating arithmetic because earlier rows did not pass that admission boundary. No schema or dependency changes are required.

@@ -769,3 +769,91 @@ proptest! {
         prop_assert_eq!(delay, Some(Duration::milliseconds(1000 - age_ms)));
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn invalid_duration_commands_fail_and_reschedule_atomically() {
+    for cause in [
+        tokeira_kernel::WorkflowTaskFailedCause::BadStartTimerAttributes,
+        tokeira_kernel::WorkflowTaskFailedCause::BadScheduleActivityAttributes,
+        tokeira_kernel::WorkflowTaskFailedCause::BadStartChildExecutionAttributes,
+        tokeira_kernel::WorkflowTaskFailedCause::BadContinueAsNewAttributes,
+        tokeira_kernel::WorkflowTaskFailedCause::BadScheduleNexusOperationAttributes,
+    ] {
+        let runtime = runtime().await;
+        let start = request(vec![1]);
+        let mut completion = seed_history(&runtime, &start, 0).await;
+        completion.commands = vec![
+            WorkflowCommand::StartTimer {
+                timer_id: "discarded".into(),
+                fire_at: clock() + Duration::seconds(10),
+            },
+            WorkflowCommand::InvalidDuration {
+                cause: cause.clone(),
+                message: "negative duration".into(),
+                workflow_type: String::new(),
+                task_queue: String::new(),
+            },
+        ];
+        let error = runtime
+            .complete_workflow_task(completion)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("negative duration"));
+        let history = runtime
+            .repo
+            .read_history(start.run_key, 0, 64)
+            .await
+            .unwrap();
+        let failure = history
+            .iter()
+            .find_map(|event| match &event.kind {
+                HistoryEventKind::WorkflowTaskFailed {
+                    failure_cause,
+                    failure_details,
+                    ..
+                } => Some((failure_cause, failure_details)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(failure.0, &cause);
+        let payload = failure.1.as_ref().unwrap();
+        let failure = tokeira_proto::conversions::common::payload_to_failure(payload);
+        assert!(failure.message.contains("negative duration"));
+        let LoadedRun::Existing(state) = runtime.repo.load_run(start.run_key).await.unwrap() else {
+            panic!("missing run")
+        };
+        assert!(state.pending_workflow_task.is_some());
+        assert!(!state.timers.contains_key("discarded"));
+        assert!(!history.iter().any(|event| matches!(
+            event.kind,
+            HistoryEventKind::TimerStarted { .. } | HistoryEventKind::WorkflowTaskCompleted { .. }
+        )));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn continue_as_new_records_capped_backoff_in_successor_history() {
+    let runtime = runtime().await;
+    let start = request(vec![1]);
+    let mut completion = seed_history(&runtime, &start, 0).await;
+    let backoff = Duration::seconds(3_153_600_000);
+    completion.commands = vec![WorkflowCommand::ContinueAsNewWithBackoff {
+        command: Box::new(continue_command(&start)),
+        backoff,
+    }];
+    runtime.complete_workflow_task(completion).await.unwrap();
+    let (state, _) = successor(&runtime, &start).await.unwrap();
+    assert_eq!(state.workflow_start_delay, Some(backoff));
+    let history = runtime
+        .repo
+        .read_history(start.run_key, 0, 64)
+        .await
+        .unwrap();
+    assert!(history.iter().any(|event| matches!(
+        &event.kind,
+        HistoryEventKind::WorkflowExecutionContinuedAsNew {
+            backoff_start_interval: Some(recorded),
+            ..
+        } if *recorded == backoff
+    )));
+}

@@ -365,7 +365,7 @@ pub fn apply(
             // echo stay pinned to it (`activity.go:537,686 @ v1.31.0`;
             // `TransitionRescheduled` does not re-add the schedule-to-close timer).
             // The per-attempt anchor is the retry's start time.
-            let retry_scheduled = now + *interval_nanos;
+            let retry_scheduled = crate::timeouts::deadline_after_nanos(now, *interval_nanos);
             state.attempt_scheduled_time_nanos = retry_scheduled;
             state.last_attempt_complete_time_nanos = now;
             state.current_retry_interval_nanos = *interval_nanos;
@@ -402,7 +402,10 @@ pub fn apply(
                     START_TO_CLOSE_TASK_ID,
                     &StartToCloseTimer {
                         stamp: state.stamp,
-                        fire_at_nanos: started + state.start_to_close_nanos,
+                        fire_at_nanos: crate::timeouts::deadline_after_nanos(
+                            started,
+                            state.start_to_close_nanos,
+                        ),
                     },
                 )?;
             }
@@ -412,7 +415,10 @@ pub fn apply(
                     HEARTBEAT_TASK_ID,
                     &HeartbeatTimer {
                         stamp: state.stamp,
-                        fire_at_nanos: started + state.heartbeat_nanos,
+                        fire_at_nanos: crate::timeouts::deadline_after_nanos(
+                            started,
+                            state.heartbeat_nanos,
+                        ),
                     },
                 )?;
             }
@@ -476,7 +482,10 @@ pub fn apply(
                     HEARTBEAT_TASK_ID,
                     &HeartbeatTimer {
                         stamp: state.stamp,
-                        fire_at_nanos: now + state.heartbeat_nanos,
+                        fire_at_nanos: crate::timeouts::deadline_after_nanos(
+                            now,
+                            state.heartbeat_nanos,
+                        ),
                     },
                 )?;
             }
@@ -535,7 +544,10 @@ fn schedule_attempt_timers(
             SCHEDULE_TO_START_TASK_ID,
             &ScheduleToStartTimer {
                 stamp: state.stamp,
-                fire_at_nanos: anchor + state.schedule_to_start_nanos,
+                fire_at_nanos: crate::timeouts::deadline_after_nanos(
+                    anchor,
+                    state.schedule_to_start_nanos,
+                ),
             },
         )?;
     }
@@ -545,7 +557,10 @@ fn schedule_attempt_timers(
             SCHEDULE_TO_CLOSE_TASK_ID,
             &ScheduleToCloseTimer {
                 stamp: state.stamp,
-                fire_at_nanos: state.scheduled_time_nanos + state.schedule_to_close_nanos,
+                fire_at_nanos: crate::timeouts::deadline_after_nanos(
+                    state.scheduled_time_nanos,
+                    state.schedule_to_close_nanos,
+                ),
             },
         )?;
     }

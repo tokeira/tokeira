@@ -148,3 +148,8 @@ Add a background timer scanner to `tokeira-runtime` that periodically discovers 
 - Property tests should run a minimum of 100 iterations (proptest default is 256)
 - Tag format for property tests: `// Feature: runtime-timer-scanner, Property N: <title>`
 - `tokio-util` must be in `[dependencies]` (not just `[dev-dependencies]`) because `CancellationToken` is used in production code
+
+## Duration validation and checked deadlines
+
+- [x] Verify Property 7 with the required property and regression tests: `stored_start_delay_deadlines_are_total`, `command_durations_preserve_failure_cause_and_message`.
+  _Requirements: 7._

@@ -5,6 +5,8 @@
 //! child-workflow orchestration, external signal/cancel delivery, and Nexus
 //! operation scheduling.
 
+use tokeira_kernel::deadline_after;
+
 use std::{
     collections::HashMap,
     future::Future,
@@ -645,12 +647,14 @@ where
                     // retries (anti-synchronized-storm), derived from the run key + index.
                     let jitter_seed =
                         (run_key.0.as_u128() as u64) ^ (callback_index as u64).rotate_left(1);
-                    let next_attempt_at = now
-                        + nexus_completion_backoff(
+                    let next_attempt_at = deadline_after(
+                        now,
+                        nexus_completion_backoff(
                             &self.nexus_completion_config,
                             next_attempt,
                             jitter_seed,
-                        );
+                        ),
+                    );
                     CallbackAttemptOutcome::RetryableFailure {
                         failure: attempt_failure_payload(&detail),
                         next_attempt_at,

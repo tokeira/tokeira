@@ -101,3 +101,16 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 2. WHEN shard ownership changes, THE Timer_Scanner SHALL stop scanning timers for relinquished shards and begin scanning for newly acquired shards.
 3. WHILE shard ownership is not yet implemented (Feature 11), THE Timer_Scanner SHALL scan all timers regardless of shard assignment. This is safe because timer scanning is non-authoritative — duplicate `TimerDue` commands from multiple nodes are rejected harmlessly by the kernel.
 
+
+### Requirement 7: Validated timer delays and checked fire times
+
+**User Story:** As an operator, I want client and stored durations handled without overflow, so that validation and recovery remain reliable.
+
+Validation and the failure cause follow `service/history/api/command_attr_validator.go:136-157 @ v1.31.0`; the shared duration rule is `common/primitives/timestamp/duration.go:67-88 @ v1.31.0`. Saturating stored deadlines is a Tokeira representational safeguard.
+
+#### Acceptance Criteria
+
+1. WHEN StartTimer has an invalid duration, THE Edge SHALL carry BAD_START_TIMER_ATTRIBUTES and `An invalid StartToFireTimeout is set on StartTimerCommand: <error>. TimerId=<id>` through the invalid-command seam so the failed task and its rescheduling are committed together.
+2. WHEN a timer delay exceeds 100 × 365 days, THE Edge SHALL cap it before computing and recording its fire time.
+3. WHEN an ordinary or first-workflow-task timer is created or reconstructed from stored durations, THE Kernel SHALL saturate unrepresentable dates at the latest date without panicking.
+4. WHEN a durable deadline exceeds the monotonic clock range, THE Runtime SHALL wait in bounded segments without truncating the deadline or firing early.

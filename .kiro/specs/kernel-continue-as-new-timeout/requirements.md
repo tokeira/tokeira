@@ -439,3 +439,17 @@ Downstream breakage: `WorkflowCommand` gains a `ContinueAsNew` variant (breaks e
 #### Acceptance Criteria
 
 1. FOR ALL valid WorkflowExecutionTimedOut transitions, THE emitted WorkflowExecutionTimedOut event's timeout_type SHALL equal the request's timeout_type, and the event's retry_state SHALL equal the request's retry_state.
+
+### Requirement 9.1: Proto duration failures and continue-as-new backoff
+
+**User Story:** As an operator, I want client and stored durations handled without overflow, so that validation and recovery remain reliable.
+
+Ground truth: `service/history/api/command_attr_validator.go:386-443,453-517`, `components/nexusoperations/workflow/commands.go:120-143`, and `service/history/workflow/mutable_state_impl.go:2675-2694 @ v1.31.0`. ContinueAsNew uses BAD_CONTINUE_AS_NEW_ATTRIBUTES; StartChild uses BAD_START_CHILD_EXECUTION_ATTRIBUTES; Nexus uses BAD_SCHEDULE_NEXUS_OPERATION_ATTRIBUTES. Exact field/error prefixes are retained at the edge; inherited ContinueAsNew names are rendered by the kernel.
+
+#### Acceptance Criteria
+
+1. WHEN the edge detects a proto-only invalid duration on ContinueAsNew, StartChild or ScheduleNexusOperation, THE Kernel SHALL reject the completion through InvalidCommandAttributes with the command-specific cause and message, enabling the existing runtime failure/reschedule transition.
+2. WHEN a ContinueAsNew duration error needs inherited workflow type or task queue context, THE Kernel SHALL obtain those names from authoritative run state before rendering the message.
+3. WHEN an explicit ContinueAsNew backoff is supplied, THE Edge SHALL validate and cap it and THE Kernel SHALL preserve it in continued-as-new history and the successor's first-task delay, subject to the existing minimum-backoff rule.
+4. WHEN adding proto-only failure or backoff carriers, THE implementation SHALL append WorkflowCommand variants after InvalidSearchAttributes without modifying an existing positional encoding.
+5. WHEN calculating start-delay or minimum-backoff arithmetic from any stored duration, THE Kernel SHALL use saturating arithmetic.

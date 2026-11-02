@@ -445,13 +445,23 @@ fn timestamp(value: Option<prost_types::Timestamp>) -> Result<Option<OffsetDateT
 fn duration(value: Option<prost_types::Duration>) -> Result<Option<time::Duration>> {
     value
         .map(|value| {
-            ensure!(
-                value.seconds >= 0 && (0..1_000_000_000).contains(&value.nanos),
-                "invalid activity duration"
-            );
-            Ok(time::Duration::new(value.seconds, value.nanos))
+            crate::grpc::translate::validate_and_cap_proto_duration(Some(&value))
+                .map_err(|error| anyhow::anyhow!(error))
         })
         .transpose()
+}
+
+// Disabled retries bypass admission validation on the owner as well as at the
+// receiving node (common/retrypolicy/retry_policy.go:65-68 @ v1.31.0).
+fn retry_duration(
+    value: Option<prost_types::Duration>,
+    maximum_attempts: i32,
+) -> Result<Option<time::Duration>> {
+    if maximum_attempts == 1 {
+        Ok(crate::grpc::translate::proto_duration_value(value.as_ref()))
+    } else {
+        duration(value)
+    }
 }
 
 fn decode_response(
@@ -520,10 +530,10 @@ fn decode_response(
         .retry_policy
         .map(|policy| -> Result<_> {
             Ok(RetryPolicy {
-                initial_interval: duration(policy.initial_interval)?
+                initial_interval: retry_duration(policy.initial_interval, policy.maximum_attempts)?
                     .ok_or_else(|| anyhow!("retry interval missing"))?,
                 backoff_coefficient: policy.backoff_coefficient,
-                maximum_interval: duration(policy.maximum_interval)?,
+                maximum_interval: retry_duration(policy.maximum_interval, policy.maximum_attempts)?,
                 maximum_attempts: u32::try_from(policy.maximum_attempts)?,
                 non_retryable_error_types: policy.non_retryable_error_types,
             })

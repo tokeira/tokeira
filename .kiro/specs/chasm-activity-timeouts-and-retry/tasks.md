@@ -101,3 +101,8 @@ Waves (each wave's tasks may proceed once prior waves complete):
   history-authority hold (root AGENTS §2/§3).
 - Prefer `DispatchTask.fire_at` (option A) for backoff over a new `RetryTimer` (option B).
 - Confirm the v1.31.0 `scheduleToStart` Execute path (`activity_tasks.go:100-152`) during Stage 4.
+
+## Duration validation and checked deadlines
+
+- [x] Verify Property 5 with the required property and regression tests: `stored_activity_deadlines_are_total`.
+  _Requirements: 10._

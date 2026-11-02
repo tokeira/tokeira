@@ -119,3 +119,15 @@ For an unset `workflow_id_conflict_policy`, `StartWorkflowExecution` resolves to
 - Signal-with-start parity tests using shared helper functions.
 - Callback describe tests: a run with registered callbacks renders one `CallbackInfo` per registration; a run with none renders an empty list.
 - Restart/recovery tests for delayed starts, cron state, terminal callbacks, and versioning override routing.
+
+### Property 6: Duration admission
+
+For any wire seconds/nanos pair or stored duration in this feature, conversion and deadline arithmetic SHALL be total. Accepted values SHALL preserve the specified cap, and rejected command values SHALL retain their cause and message. Every unrepresentable deadline SHALL saturate at the latest representable date, including underflow from malformed negative stored durations.
+
+**Validates: Requirements 5.**
+
+Ground truth: `common/primitives/timestamp/duration.go:67-88`, `common/retrypolicy/retry_policy.go:65-77`, `service/frontend/workflow_handler.go:808-818,3837-3843,6623-6672`, and `service/frontend/errors.go:24-26 @ v1.31.0`. The constant is 100 × 365 days, despite the stale 250-year comment. Other timeout normalization, task-timeout maxima and run-to-execution capping are unchanged.
+
+Verification: `duration_conversions_are_total`, `start_and_signal_with_start_validate_and_record_each_duration`. Admission uses `validate_and_cap_proto_duration`; stored deadlines use saturating arithmetic because earlier rows did not pass that admission boundary. No schema or dependency changes are required.
+
+Additional boundaries: Create/UpdateSchedule validate embedded workflow timeouts with the frontend messages (`service/frontend/workflow_handler.go:3837-3843 @ v1.31.0`). Namespace registration validates/caps retention with the namespace-specific error (`service/frontend/namespace_handler.go:1065-1078 @ v1.31.0`). Activity option updates and inter-node activity replies share the duration converter. Batch reset/unpause jitter and schedule intervals/jitter retain their separate `DurationValue` conversion, which saturates at Go's signed nanosecond range; scheduler intervals explicitly do not use `ValidateAndCapProtoDuration` (`service/worker/scheduler/spec.go:236-244 @ v1.31.0`). Retry validation bypasses policies with `maximum_attempts = 1` (`common/retrypolicy/retry_policy.go:65-68 @ v1.31.0`). Typed child/retry/continue-as-new starts carry admitted durations; recovered history remains readable through checked deadline arithmetic.

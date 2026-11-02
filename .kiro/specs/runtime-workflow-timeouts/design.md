@@ -13,8 +13,8 @@ The feature has two halves:
 2. **Timeout scanner.** A background `tokio::spawn` task (`WorkflowTimeoutScanner`) that periodically iterates over the tracking state, computes whether each run has exceeded its execution or run timeout, and submits `Command::WorkflowExecutionTimedOut` through the lane when a violation is detected. The scanner is non-authoritative: the kernel is the final arbiter. If the run is already closed or absent, the kernel rejects the command harmlessly.
 
 There are two distinct timeout types with a precedence rule:
-- **Execution timeout** (`workflow_execution_timeout`): bounds the wall-clock time for the current run. Measured from `started_at`. Note: chain-aware measurement across continue-as-new/retry requires a `first_run_started_at` timestamp not yet in `StartRequest` or `WorkflowState`; deferred to Feature 8.
-- **Run timeout** (`workflow_run_timeout`): bounds the wall-clock time for a single run. Measured from `started_at` of the current run.
+- **Execution timeout** (`workflow_execution_timeout`): bounds the execution chain from `first_run_started_at`, falling back to `started_at` for legacy history. The anchor follows `service/history/workflow/task_generator.go:153-183 @ v1.31.0`.
+- **Run timeout** (`workflow_run_timeout`): bounds the wall-clock time for a single run. Measured from the checked sum of `started_at` and first-task backoff.
 - When both fire in the same scan cycle, only the execution timeout command is submitted.
 
 ## Architecture
@@ -29,7 +29,7 @@ flowchart TD
 
     subgraph "Workflow Timeout Scanner"
         SCANNER[WorkflowTimeoutScanner<br/>background task] -->|snapshot entries| WTS
-        SCANNER -->|now - started_at > timeout?| SCANNER
+        SCANNER -->|now exceeds checked deadline?| SCANNER
         SCANNER -->|Command::WorkflowExecutionTimedOut| LANE[Lane via submit]
         LANE -->|kernel processes or rejects| KERNEL[Kernel]
     end
@@ -152,11 +152,11 @@ Evaluation logic:
 evaluate_workflow_timeout(entry, now):
   // Execution timeout takes precedence
   if entry.workflow_execution_timeout is Some(d):
-    if now - entry.started_at > d:
+    if now > deadline_after(entry.first_run_started_at.unwrap_or(entry.started_at), d):
       return Some(ExecutionTimeout)
 
   if entry.workflow_run_timeout is Some(d):
-    if now - entry.started_at > d:
+    if now > deadline_after(deadline_after(entry.started_at, entry.workflow_start_delay.unwrap_or(ZERO)), d):
       return Some(RunTimeout)
 
   return None
@@ -353,8 +353,8 @@ WorkflowTimeoutScanner loop:
 ### Property 1: Workflow timeout evaluation correctness
 
 *For any* `WorkflowTimeoutEntry` and any `now` timestamp:
-- If `workflow_execution_timeout` is `Some(d)` and `now - started_at > d`, then `evaluate_workflow_timeout` shall return `Some(ExecutionTimeout)`, regardless of whether `workflow_run_timeout` also fires.
-- If `workflow_execution_timeout` is `None` or `now - started_at <= d`, and `workflow_run_timeout` is `Some(d2)` and `now - started_at > d2`, then `evaluate_workflow_timeout` shall return `Some(RunTimeout)`.
+- If `workflow_execution_timeout` is `Some(d)` and `now > deadline_after(chain_anchor, d)`, then `evaluate_workflow_timeout` shall return `Some(ExecutionTimeout)`, regardless of whether `workflow_run_timeout` also fires.
+- If `workflow_execution_timeout` is `None` or `now <= deadline_after(chain_anchor, d)`, and `workflow_run_timeout` is `Some(d2)` and `now > deadline_after(execution_time, d2)`, then `evaluate_workflow_timeout` shall return `Some(RunTimeout)`.
 - If neither timeout is configured (`None`), or neither has elapsed, then `evaluate_workflow_timeout` shall return `None`.
 - Execution timeout always takes precedence over run timeout.
 
@@ -500,3 +500,13 @@ proptest! {
 ```
 
 Each correctness property MUST be implemented by a SINGLE property-based test. Property tests should run a minimum of 100 iterations.
+
+### Property 9: Stored workflow deadlines
+
+For any wire seconds/nanos pair or stored duration in this feature, conversion and deadline arithmetic SHALL be total. Accepted values SHALL preserve the specified cap, and rejected command values SHALL retain their cause and message. Every unrepresentable deadline SHALL saturate at the latest representable date, including underflow from malformed negative stored durations.
+
+**Validates: Requirements 10.**
+
+Execution expiration is chain-wide and run expiration uses execution time (start plus first-task backoff). Admission follows `common/primitives/timestamp/duration.go:67-88 @ v1.31.0`; timeout task anchors follow `service/history/workflow/task_generator.go:153-183 @ v1.31.0`. Saturation for older stored values is Tokeira's representational safeguard, not a claim about Go's date range.
+
+Verification: `stored_workflow_deadlines_are_total`, `stored_long_timeout_keeps_scan_bounded`. Admission uses `validate_and_cap_proto_duration`; stored deadlines use saturating arithmetic because earlier rows did not pass that admission boundary. No schema or dependency changes are required.

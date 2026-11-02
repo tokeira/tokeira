@@ -116,3 +116,16 @@ HandleFailed`): retryable iff `ApplicationFailureInfo` present, `!NonRetryable`,
 1. The firing loop SHALL run in `tokeirad` alongside the existing CHASM background workers.
 2. The firing loop SHALL be non-authoritative: a missed tick SHALL self-heal on the next, and due
    timers SHALL be re-derivable from node state alone.
+
+### Requirement 10: Standalone duration admission and stored deadlines
+
+**User Story:** As an operator, I want client and stored durations handled without overflow, so that validation and recovery remain reliable.
+
+Ground truth: `chasm/lib/activity/validator.go:128-160` and `common/retrypolicy/retry_policy.go:65-77 @ v1.31.0`. Nil/sign/cap semantics come from `common/primitives/timestamp/duration.go:67-88 @ v1.31.0`. i64 deadline saturation is the representation safeguard for previously persisted data.
+
+#### Acceptance Criteria
+
+1. WHEN StartActivityExecution supplies an invalid timeout or validated retry interval, THE Edge SHALL return INVALID_ARGUMENT using `invalid <Timeout>: <error>` or `invalid <Interval> set on retry policy: <error>` respectively.
+2. WHEN accepted activity timeouts or validated retry intervals exceed 100 × 365 days, THE Edge SHALL persist the capped values in both execution fields and Describe echo data.
+3. WHEN computing a timer, retry budget, heartbeat reset or Describe expiration from stored nanosecond fields, THE activity implementation SHALL saturate unrepresentable sums at i64::MAX without panicking or wrapping.
+4. WHEN a retry exponent or floating-point product exceeds its representation, THE activity implementation SHALL compute a bounded backoff without panicking.

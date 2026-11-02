@@ -15,6 +15,8 @@
 // The bootstrap facade wires many subsystems and accepts them as parameters.
 #![allow(clippy::too_many_arguments)]
 
+use tokeira_kernel::deadline_after;
+
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -5041,8 +5043,10 @@ where
                     // (mutable_state_impl.go:2859) — NOT the chain's first-run start. tokeira
                     // carries that backoff (client start delay / workflow-retry backoff) as
                     // `workflow_start_delay`; TestWorkflowRetry asserts start + backoff per attempt.
-                    execution_time: state.started_at
-                        + state.workflow_start_delay.unwrap_or_default(),
+                    execution_time: deadline_after(
+                        state.started_at,
+                        state.workflow_start_delay.unwrap_or_default(),
+                    ),
                     execution_config: tokeira_edge::translate::ExecutionConfigDescription {
                         task_queue: state.task_queue.0.clone(),
                         workflow_execution_timeout: state.workflow_execution_timeout,
@@ -5171,11 +5175,14 @@ where
                         }
                     }),
                     execution_expiration_time: state.workflow_execution_timeout.map(|timeout| {
-                        state.first_run_started_at.unwrap_or(state.started_at) + timeout
+                        deadline_after(
+                            state.first_run_started_at.unwrap_or(state.started_at),
+                            timeout,
+                        )
                     }),
                     run_expiration_time: state
                         .workflow_run_timeout
-                        .map(|timeout| state.started_at + timeout),
+                        .map(|timeout| deadline_after(state.started_at, timeout)),
                     cancel_requested: state.cancel_requested,
                     original_start_time: state.first_run_started_at.unwrap_or(state.started_at),
                     versioning_info: versioning_info

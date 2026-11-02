@@ -178,3 +178,8 @@ All code lives in `tokeira-runtime`, in a new `activity_timeout.rs` module (foll
 - The scanner submits through the lane's `submit` path, preserving single-writer serialization
 - `tokio-util` is needed for `CancellationToken` (graceful scanner shutdown)
 - The kernel already handles `ActivityResolution::TimedOut { timeout_type }` — no kernel changes required
+
+## Duration validation and checked deadlines
+
+- [x] Verify Property 16 with the required property and regression tests: `stored_retry_backoff_is_total`, `command_durations_preserve_failure_cause_and_message`.
+  _Requirements: 9._

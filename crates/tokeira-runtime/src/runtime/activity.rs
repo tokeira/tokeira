@@ -16,6 +16,8 @@
 //! - Retry transitions retain canonical eligibility; discovery reconstructs lost
 //!   offers. Start OCC retries retain their request UUID and original acquisition,
 //!   so neither retry nor lost replies can authorize a second start.
+use tokeira_kernel::deadline_after;
+
 use super::*;
 use crate::{
     ActivityStartOutcome, ActivityTaskStartRequest,
@@ -593,7 +595,7 @@ where
         let expiration = activity
             .schedule_to_close_timeout
             .filter(|timeout| !timeout.is_zero())
-            .map(|timeout| activity.scheduled_at + timeout);
+            .map(|timeout| deadline_after(activity.scheduled_at, timeout));
         let should_retry = retry_policy.as_ref().map(|policy| {
             evaluate_activity_retry(
                 policy,
@@ -1975,7 +1977,7 @@ where
         // (`UpdateActivityInfoForRetries`, activity.go:74 +
         // GenerateActivityRetryTasks @ v1.31.0).
         let completed_at = OffsetDateTime::now_utc();
-        let dispatch_at = completed_at + backoff;
+        let dispatch_at = deadline_after(completed_at, backoff);
         next_activity.last_attempt_complete_time = Some(completed_at);
         next_activity.current_attempt_scheduled_at = Some(dispatch_at);
         // The failed attempt's failure is durable retry bookkeeping,
@@ -2300,13 +2302,13 @@ async fn prepare_activity_dispatch<R: RunRepository + 'static>(
         // would race the resolution that must terminally close the attempt.
         if let Some(timeout) = current.schedule_to_close_timeout
             && !timeout.is_zero()
-            && current.scheduled_at + timeout <= now
+            && deadline_after(current.scheduled_at, timeout) <= now
         {
             return Ok(Preparation::NotYetDispatchable);
         }
         if let Some(timeout) = current.schedule_to_start_timeout
             && !timeout.is_zero()
-            && dispatch_at + timeout <= now
+            && deadline_after(dispatch_at, timeout) <= now
         {
             return Ok(Preparation::NotYetDispatchable);
         }

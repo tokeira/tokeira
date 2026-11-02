@@ -489,7 +489,10 @@ impl TaskValidator<ActivityExecution, HeartbeatTimer> for HeartbeatValidator {
                 state
                     .last_heartbeat_time_nanos
                     .max(state.started_time_nanos)
-                    <= task.fire_at_nanos.saturating_sub(state.heartbeat_nanos)
+                    <= task
+                        .fire_at_nanos
+                        .checked_sub(state.heartbeat_nanos)
+                        .unwrap_or(i64::MAX)
             })
         {
             TaskValidity::Valid

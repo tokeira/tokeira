@@ -3,6 +3,8 @@
 //! Pure functions that decide whether a failed activity should be retried
 //! and how long to wait before the next attempt.
 
+use tokeira_kernel::deadline_after;
+
 use time::Duration;
 use tokeira_types::RetryPolicy;
 
@@ -75,7 +77,7 @@ pub fn evaluate_activity_retry(
 
     let backoff = compute_retry_backoff(policy, current_attempt);
     if let Some(expiration) = expiration
-        && now + backoff >= expiration
+        && deadline_after(now, backoff) >= expiration
     {
         return RetryDecision::Exhausted {
             reason: RetryExhaustedReason::Timeout,
@@ -96,7 +98,7 @@ pub fn compute_retry_backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
     }
 
     let coefficient = policy.backoff_coefficient.max(1.0);
-    let exponent = attempt.saturating_sub(1) as i32;
+    let exponent = i32::try_from(attempt.saturating_sub(1)).unwrap_or(i32::MAX);
     let millis = (policy.initial_interval.whole_milliseconds() as f64) * coefficient.powi(exponent);
     let mut computed = Duration::milliseconds(millis.round() as i64);
     if let Some(maximum) = policy.maximum_interval
@@ -105,4 +107,38 @@ pub fn compute_retry_backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
         computed = maximum;
     }
     computed
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // Feature: runtime-activity-timeouts, Property 16: stored retry inputs never overflow.
+        #[test]
+        fn stored_retry_backoff_is_total(
+            seconds in any::<i64>(),
+            coefficient in any::<f64>(),
+            attempt in any::<u32>(),
+        ) {
+            let policy = RetryPolicy {
+                initial_interval: Duration::seconds(seconds),
+                backoff_coefficient: coefficient,
+                maximum_interval: None,
+                maximum_attempts: 0,
+                non_retryable_error_types: Vec::new(),
+            };
+            let _ = compute_retry_backoff(&policy, attempt);
+            let _ = crate::runtime::workflow_task::retry_backoff(&policy, attempt);
+            let _ = evaluate_activity_retry(
+                &policy,
+                attempt,
+                None,
+                false,
+                time::OffsetDateTime::UNIX_EPOCH,
+                Some(time::OffsetDateTime::UNIX_EPOCH.saturating_add(Duration::MAX)),
+            );
+        }
+    }
 }

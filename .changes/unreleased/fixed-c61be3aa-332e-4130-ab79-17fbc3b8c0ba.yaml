@@ -1,0 +1,5 @@
+kind: fixed
+body: "Validate timeouts and delays as Temporal does: refuse negative values and cap long ones at 100 years."
+time: 2026-11-02T21:13:43.272250+00:00
+custom:
+    Slice: c61be3aa-332e-4130-ab79-17fbc3b8c0ba

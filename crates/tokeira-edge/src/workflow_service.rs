@@ -475,7 +475,8 @@ fn optional_duration_change(
     }
 }
 
-fn option_field_selected(update_mask: &[String], field: &str) -> bool {
+/// Match the same field-mask aliases during proto validation and patch construction.
+pub(crate) fn option_field_selected(update_mask: &[String], field: &str) -> bool {
     if update_mask.is_empty() {
         return false;
     }
@@ -514,7 +515,8 @@ fn option_field_selected(update_mask: &[String], field: &str) -> bool {
     })
 }
 
-fn option_field_exact_selected(update_mask: &[String], field: &str) -> bool {
+/// Distinguish whole-message replacement from a nested field patch.
+pub(crate) fn option_field_exact_selected(update_mask: &[String], field: &str) -> bool {
     if update_mask.is_empty() {
         return false;
     }

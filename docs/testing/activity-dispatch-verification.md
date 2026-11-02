@@ -224,3 +224,44 @@ All five task-owned ephemeral DSQL clusters and both disposable devboxes are
 deleted. Cluster deletion waiters and fresh devbox listings verify absence.
 Redacted reports, source archives and source/binary/result manifests were retained
 locally before deleting the boxes. No production deployment was performed.
+
+## Security advisory follow-up
+
+The approved CI follow-up updates `pulldown-cmark` from 0.13.5 to 0.13.6 for
+RUSTSEC-2026-0433 and `zip` from 8.2.0 to 9.0.4 for RUSTSEC-2026-0429. ZIP adds
+its required `nix` 0.31.3 transitive dependency. The three obsolete ZIP extraction
+exceptions are removed from `deny.toml`; no advisory exception is added.
+
+The Dagger SDK, engine and CLI remain on the existing release. The narrow vendor
+manifest patch and its retirement condition are recorded in
+[the vendoring notes](../../vendor/README.md). SDK Rust sources, application code,
+reviewed activity specifications and the live DSQL paths are unchanged.
+
+The tested source archive is
+`c31d4c040d0ed7b5c836581bdeafd0779e412b0d093cd00a2cc267d767c92547`.
+The full workspace bar passes again on Rust 1.97.1: formatting, lint, check,
+4,194 nextest tests, one doctest and warning-free documentation. The two existing
+SDK skips and 21 ignored doctest examples remain unchanged. Source-manifest
+verification passes before and after the bar. Current RustSec advisories,
+dependency bans, licenses, sources and offline Markdown links all pass.
+
+An isolated copy of the vendored SDK also passes 33 existing archive, preflight
+and launch tests on Rust 1.97.1. Its source is unchanged; the four unpackaged
+compile-time fixtures come from `iw/dagger` at
+`sdk/rust/v1.0.0-beta.11.rust.3`. The fixture uses a separate lockfile seeded from
+the tested workspace and the local macro companion. The exact selection is:
+
+```sh
+cargo +1.97.1 nextest run --locked --lib --no-fail-fast -E 'test(provisioning_tests::) | test(preflight_tests::) | test(launch_tests::)'
+```
+
+The selection reports 120 other tests skipped; it is not a claim about the full
+SDK suite. Its archive property checks bounded extraction, duplicate members,
+symlink refusal and path confinement with 128 generated cases. The original
+live DSQL and model receipts above remain the evidence for the unchanged activity
+implementation; those campaigns were not repeated for this dependency correction.
+
+Both disposable boxes used for this follow-up are deleted and fresh listings
+verify their absence. Logs, fixture lockfile and source manifests are retained.
+Only this receipt text was added after the archived run; executable inputs are
+unchanged.

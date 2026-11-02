@@ -177,7 +177,9 @@ features = [
 version = "2.5.8"
 
 [dependencies.zip]
-version = "=8.2.0"
+# Tokeira security patch: zip 9 fixes extraction advisories without replacing
+# the SDK release whose isolated-session and lock-mode APIs our tooling needs.
+version = "=9.0.4"
 features = ["deflate-flate2"]
 default-features = false
 
@@ -203,7 +205,7 @@ undocumented_unsafe_blocks = "deny"
 [lints.rust]
 unsafe_code = "deny"
 
-# Appended at vendoring (the only divergence from the release archive):
+# Appended at vendoring (besides the zip security pin above):
 # without an own workspace root, workspace discovery from this excluded
 # package escapes a nested checkout into the outer repository.
 [workspace]

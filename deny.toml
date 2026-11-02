@@ -22,16 +22,6 @@ ignore = [
     # to a revision without the default.
     "RUSTSEC-2023-0089", # `atomic-polyfill` unmaintained (transitive, via monty -> postcard)
     "RUSTSEC-2026-0097", # `rand` unsoundness in a custom-logger pattern Tokeira does not use
-    # `zip` 8.2.0 reaches the graph only through the vendored Dagger SDK, which
-    # requires zip 8, for `tkr` and the build and deployment tooling. All three
-    # advisories are in `ZipArchive::extract` and `ZipStreamReader::extract`, which
-    # nothing in the tree calls: the SDK copies one named regular member of the
-    # Dagger CLI archive into a file it already holds open, and refuses symlinks
-    # (`vendor/dagger-sdk/src/archive.rs`). Drop these entries when the vendored SDK
-    # moves to zip 9.
-    "RUSTSEC-2026-0367", # `zip` keeps SUID/SGID bits in `extract`
-    "RUSTSEC-2026-0368", # `zip` writes symlinks outside the destination in `extract`
-    "RUSTSEC-2026-0369", # `zip` applies permissions through symlinks in `extract`
     # `crypto-bigint` 0.5.5 reaches the graph only through the AWS SDK: `aws-sigv4`'s
     # SigV4a signer, and `p256` 0.13 under `aws-config`'s sign-in credentials
     # provider, which `aurora-dsql-sqlx-connector` turns on. The fix is crypto-bigint

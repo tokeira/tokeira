@@ -239,7 +239,7 @@ may retire a recovery mechanism before its replacement is verified.
     cleanup evidence. Record schema/format changes and legacy table retention.
     - _Requirements: 7.3, 7.5, 7.6, 8.8, 8.9_
 
-- [ ] 12. Checkpoint: the complete implementation is green and reviewable
+- [x] 12. Checkpoint: the complete implementation is green and reviewable
   - Run the full enforced bar: `cargo +nightly fmt --all`, `cargo lint --locked`,
     `cargo check --workspace --locked`, `cargo nextest run --workspace --locked`,
     `cargo test --workspace --doc --locked`, and
@@ -282,8 +282,9 @@ may retire a recovery mechanism before its replacement is verified.
   their intended outcomes. Retained manifests distinguish each tested revision,
   named skips and earlier failures. All five task-owned ephemeral databases and
   both disposable devboxes are verified deleted. The unreleased change record
-  and stopped-upgrade/rollback notes are complete. Checkpoint 12 awaits publication
-  of the single implementation PR for exact-head human review.
+  and stopped-upgrade/rollback notes are complete. The single implementation
+  [PR #343](https://github.com/tokeira/tokeira/pull/343) is open for exact-head
+  human review; publication completes checkpoint 12, while merge awaits approval.
 - Requirements, design and tasks are approved for implementation in one PR.
   Checked boxes must reflect completed evidence.
 - Property tasks require `proptest` with at least 100 cases and the exact tags above;

@@ -28,7 +28,7 @@ Cover the row count of the conditional inserts, and the nine operations' answers
   - _Requirements: 9.3_
 
 - [x] 4. Checkpoint: the full bar of root `AGENTS.md` §10.4, and every live test green on a DSQL cluster created for the run and deleted after it, recorded with the date, revision and outcome, without the cluster's identifier or endpoint
-  - DONE 2026-10-08 at `2a4f8768`. The bar passed. On a DSQL cluster created for the run and deleted after it, 24 live tests passed: the probe and Properties 1 to 9, with the other tests of `dsql_shard_leasing`, `dsql_embedded_ownership`, the CHASM store's live tests and `dsql_projection_persistence`. With a fault patched into each operation, each of Properties 1 to 9 failed on DSQL while the probe passed.
+  - DONE at `2a4f8768`. The bar passed. On a DSQL cluster created for the run and deleted after it, 24 live tests passed: the probe and Properties 1 to 9, with the other tests of `dsql_shard_leasing`, `dsql_embedded_ownership`, the CHASM store's live tests and `dsql_projection_persistence`. With a fault patched into each operation, each of Properties 1 to 9 failed on DSQL while the probe passed.
 
 ## Notes
 

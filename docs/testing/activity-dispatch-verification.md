@@ -101,7 +101,7 @@ not reverse migrations or reuse old volatile offers across the cutover.
 
 ## Verification receipt
 
-Verification completed on 2 November 2026 against the approved stopped-upgrade
+Verification completed against the approved stopped-upgrade
 contract. Source archives/manifests, immutable nextest archive identities, result logs,
 query plans, read reports and failed-attempt receipts are retained in the private
 delivery evidence. Resource identities and credentials are excluded from this

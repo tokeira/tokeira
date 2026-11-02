@@ -81,7 +81,7 @@ First show the defects, with tests that fail on the current code. Then:
 - [x] 9. Checkpoint: the exploration tests pass, each negative control fails its test, the live test passes on an
   ephemeral cluster, the corpus tiers for continue-as-new, retry and cron pass, and the full bar of root `AGENTS.md`
   §10.4 passes
-  - DONE (2026-10-31): The six-command bar passes, including 4,032 workspace tests (the two explicitly ignored Rust
+  - DONE: The six-command bar passes, including 4,032 workspace tests (the two explicitly ignored Rust
     SDK integration tests remain skipped). All 12 corpus cases pass without skips across continue-as-new, workflow
     retry, cron and cron client suites, using the pinned v1.31.0 conformance corpus. The history-wrapper regression
     fails before the forwarding fix and passes with it. The exploration and recorded negative-control evidence has

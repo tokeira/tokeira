@@ -51,7 +51,7 @@ commit/reload paths; a compile or a filtered-out test is not execution evidence.
 ## Delivery gates
 
 - Live DSQL: **all six selected tests passed** on a fresh ephemeral Aurora DSQL
-  cluster using the `default` profile in `eu-west-1`. A locked storage library archive
+  cluster. A locked storage library archive
   with `dsql-integration` ran serially under `dsql-live`: six executed, 569 filtered.
   Bootstrap plus tests took 848.517 seconds. The earlier cutover failure exposed a
   TKUP pointer incorrectly taking inline point-load/scan paths; both readers now
@@ -102,7 +102,7 @@ supplements the 100-case memory/model properties; it does not replace their case
 ## Pinned functional results
 
 These selected tests ran over the public gRPC wire against a local, conformance-feature
-`tokeirad` with its memory backend on 31 October 2026. The corpus was an isolated copy
+`tokeirad` with its memory backend. The corpus was an isolated copy
 of `tests/` at Temporal `v1.31.0` (`83881961df2bad7d78d93a2d50778dbc8bd1a2fc`),
 with the existing runner/skip registry from the reference fork's
 `tokeira/conformance-v1.31.0` commit `423ae614e3f471de696e2c890ff0cb05236b0a88`.

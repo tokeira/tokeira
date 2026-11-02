@@ -6,7 +6,7 @@ requires one semantic oracle for memory and DSQL. Shared cases live in
 `memory::contract_tests` and `dsql::run_repository::contract_tests`. Expectations
 come from authored inputs, not the production selector being tested.
 
-Verification completed on 1 November 2026; the receipt below records the executed
+Verification is complete; the receipt below records the executed
 selection and immutable archives. A listed test or a successful default run is
 not evidence of live DSQL execution.
 
@@ -263,7 +263,7 @@ Any future caller reusing their connection after an interrupted start must retir
 it or pass ownership through a cancellation guard. The startup lifecycle is the
 reason the existing engine paths are outside this storage-only repair.
 
-## Verification receipt — 1 November 2026
+## Verification receipt
 
 The final Rust source snapshot passes nightly formatting, zero-warning workspace
 lint/check, 4,132 nextest cases, doctests and warnings-denied documentation. The

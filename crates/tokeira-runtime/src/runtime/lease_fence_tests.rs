@@ -32,7 +32,6 @@ pub(super) fn fenced_runtime(store: Arc<InMemoryStore>) -> Arc<TokeiraRuntime<In
         },
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         ActivityTimeoutScannerConfig::default(),
         NexusTimeoutScannerConfig::default(),
         NexusEndpointRegistry::default(),
@@ -305,7 +304,7 @@ async fn a_lapsed_owner_admits_nothing_and_is_taken_over() {
 }
 
 /// The `src` files whose code is production code: not test modules.
-fn production_sources(dir: &Path, files: &mut Vec<PathBuf>) {
+pub(super) fn production_sources(dir: &Path, files: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -319,7 +318,7 @@ fn production_sources(dir: &Path, files: &mut Vec<PathBuf>) {
 }
 
 /// A file's text before its first inline test module.
-fn before_tests(text: &str) -> &str {
+pub(super) fn before_tests(text: &str) -> &str {
     let mut end = text.len();
     for marker in [
         "\n#[cfg(test)]\nmod ",

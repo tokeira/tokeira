@@ -23,9 +23,8 @@ use tokeira_kernel::{
     limits::{MAXIMUM_SIGNALS_PER_EXECUTION, UpdateLimit, UpdateLimitExceeded},
 };
 use tokeira_runtime::{
-    BacklogConfig, KernelRejected, LaneConfig, SignalWithStartResult, StartedWorkflowTask,
-    TimerScannerConfig, TokeiraRuntime, UpdateWaitPolicy, WorkflowClosing,
-    WorkflowTimeoutScannerConfig,
+    KernelRejected, LaneConfig, SignalWithStartResult, StartedWorkflowTask, TimerScannerConfig,
+    TokeiraRuntime, UpdateWaitPolicy, WorkflowClosing, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -42,7 +41,6 @@ fn runtime(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     )
 }
 

@@ -752,6 +752,10 @@ pub struct PollActivityTaskQueueRequest {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PollActivityTaskQueueResponse {
+    /// Preserve the narrower same-request branch when projecting optional fields.
+    pub replayed: bool,
+    /// Effective workflow/activity priority from the owner observation.
+    pub priority: Option<tokeira_kernel::Priority>,
     pub task_token: Vec<u8>,
     pub activity_id: String,
     /// User-visible run id of the owning run (distinct from `run_key`).

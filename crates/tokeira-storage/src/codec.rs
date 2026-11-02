@@ -41,15 +41,14 @@
 //!
 //! # The envelope versions
 //!
-//! This release writes [`WORKFLOW_STATE_ENVELOPE_VERSION`] and also reads
-//! [`PREVIOUS_WORKFLOW_STATE_ENVELOPE_VERSION`] and
-//! [`PRE_OUTBOUND_WORKFLOW_STATE_ENVELOPE_VERSION`] as legacy formats. Positional
-//! state layout stays frozen; activity inputs remain in history. The current
-//! envelope establishes the required outbound-state contract, so older writers
-//! reject it instead of dropping child seeds/gates. An absent outbound section
-//! means empty metadata only under the current envelope. In a legacy envelope it
-//! means unknown preparation state, and ordinary writes refuse it until the checked
-//! cutover supplies the missing metadata. A present section has its own exact version.
+//! This release writes TKW4, protecting required activity-start receipts from
+//! older writers that would silently drop them. It also reads TKW3, TKWS and TKW2;
+//! positional state and history layouts stay frozen. TKW3 and TKW4 both interpret
+//! an absent outbound section as empty prepared metadata. TKWS/TKW2 still mean
+//! unknown outbound preparation and require the checked cutover before writing.
+//! A legacy started activity without a receipt remains valid, but cannot replay an
+//! unknown start request. Section 7 has its own frozen representation, independent
+//! of the runtime's queue and receipt types.
 //!
 //! Section [`ACTIVITY_HEARTBEAT_SECTION`] holds each activity's last heartbeat time, and
 //! section [`SIGNAL_COUNT_SECTION`] the run's signal count (signal-update-limits,
@@ -84,12 +83,20 @@ use tokeira_types::{EventPrincipal, RunKey};
 
 use crate::{BacklogPayload, ProjectionContext};
 
+mod activity_receipts;
+#[cfg(test)]
+mod activity_start_tests;
 #[cfg(test)]
 mod outbound_tests;
 
+pub(crate) use activity_receipts::validate_activity_receipts;
+
 /// Magic prefix of an enveloped `workflow_hot.state_data` blob that this release
-/// writes (`"TKW3"`). Required outbound metadata cannot be ignored by an old writer.
-pub const WORKFLOW_STATE_ENVELOPE_VERSION: u32 = 0x544B_5733;
+/// writes (`"TKW4"`). Older writers must not drop required activity-start receipts.
+pub const WORKFLOW_STATE_ENVELOPE_VERSION: u32 = 0x544B_5734;
+
+/// Outbound-aware envelope (`"TKW3"`), with no activity-start receipts.
+pub const PRE_ACTIVITY_RECEIPT_WORKFLOW_STATE_ENVELOPE_VERSION: u32 = 0x544B_5733;
 
 /// Original envelope (`"TKWS"`), retained for explicit legacy reads.
 pub const PREVIOUS_WORKFLOW_STATE_ENVELOPE_VERSION: u32 = 0x544B_5753;
@@ -132,6 +139,9 @@ pub const COMPLETED_UPDATES_SECTION: u32 = 5;
 
 /// Required outbound-state layout, protected by the new state envelope.
 pub const OUTBOUND_STATE_SECTION: u32 = 6;
+
+/// Required activity-start receipts, protected by the TKW4 state envelope.
+pub const ACTIVITY_START_RECEIPTS_SECTION: u32 = 7;
 
 /// Whether `state` lacks the ids of updates it has completed: an open run with
 /// completions but an empty set. Each completion this release applies adds its id,
@@ -319,6 +329,11 @@ const WORKFLOW_STATE_KIND: &str = "workflow_hot.state_data";
 /// an older writer from accepting the new required contract.
 pub fn encode_workflow_state(state: &WorkflowState) -> Result<Vec<u8>> {
     validate_outbound_state(state)?;
+    validate_activity_receipts(state).map_err(|defect| StateExtensionError {
+        kind: WORKFLOW_STATE_KIND,
+        run_key: state.run_key,
+        defect,
+    })?;
     let mut bytes = encode_enveloped(WORKFLOW_STATE_ENVELOPE_VERSION, state)?;
     bytes.extend(encode_state_extension(state)?);
     Ok(bytes)
@@ -331,6 +346,7 @@ pub fn encode_workflow_state(state: &WorkflowState) -> Result<Vec<u8>> {
 pub(crate) fn encode_workflow_state_as_previous_release(state: &WorkflowState) -> Result<Vec<u8>> {
     let mut legacy = state.clone();
     legacy.outbound = None;
+    legacy.activity_start_receipts.clear();
     let mut bytes = encode_enveloped(PREVIOUS_WORKFLOW_STATE_ENVELOPE_VERSION, &legacy)?;
     bytes.extend(encode_state_extension(&legacy)?);
     Ok(bytes)
@@ -340,6 +356,11 @@ pub(crate) fn encode_workflow_state_as_previous_release(state: &WorkflowState) -
 /// encoding the state.
 pub fn workflow_state_encoded_len(state: &WorkflowState) -> Result<usize> {
     validate_outbound_state(state)?;
+    validate_activity_receipts(state).map_err(|defect| StateExtensionError {
+        kind: WORKFLOW_STATE_KIND,
+        run_key: state.run_key,
+        defect,
+    })?;
     let enveloped =
         postcard::experimental::serialized_size(&(WORKFLOW_STATE_ENVELOPE_VERSION, state))?;
     Ok(enveloped + encode_state_extension(state)?.len())
@@ -374,6 +395,7 @@ pub fn decode_workflow_state(run_key: RunKey, bytes: &[u8]) -> Result<WorkflowSt
         WORKFLOW_STATE_KIND,
         &[
             WORKFLOW_STATE_ENVELOPE_VERSION,
+            PRE_ACTIVITY_RECEIPT_WORKFLOW_STATE_ENVELOPE_VERSION,
             PREVIOUS_WORKFLOW_STATE_ENVELOPE_VERSION,
             PRE_OUTBOUND_WORKFLOW_STATE_ENVELOPE_VERSION,
         ],
@@ -389,11 +411,22 @@ pub fn decode_workflow_state(run_key: RunKey, bytes: &[u8]) -> Result<WorkflowSt
         })?;
     }
     let (version, _) = postcard::take_from_bytes::<u32>(bytes)?;
-    if version == WORKFLOW_STATE_ENVELOPE_VERSION {
+    if matches!(
+        version,
+        WORKFLOW_STATE_ENVELOPE_VERSION | PRE_ACTIVITY_RECEIPT_WORKFLOW_STATE_ENVELOPE_VERSION
+    ) {
         // The new envelope itself distinguishes an empty prepared state from
         // missing legacy metadata. Nonempty selections always require section 6.
         state.outbound.get_or_insert_with(Default::default);
         validate_outbound_state(&state)?;
+    }
+    if version != WORKFLOW_STATE_ENVELOPE_VERSION && !state.activity_start_receipts.is_empty() {
+        return Err(StateExtensionError {
+            kind: WORKFLOW_STATE_KIND,
+            run_key,
+            defect: "activity-start receipts require the TKW4 envelope",
+        }
+        .into());
     }
     Ok(state)
 }
@@ -475,6 +508,12 @@ pub(crate) fn encode_state_extension(state: &WorkflowState) -> postcard::Result<
             payload: postcard::to_allocvec(outbound)?,
         });
     }
+    if !state.activity_start_receipts.is_empty() {
+        sections.push(ExtensionSection {
+            tag: ACTIVITY_START_RECEIPTS_SECTION,
+            payload: activity_receipts::encode(state)?,
+        });
+    }
     encode_extension(WORKFLOW_STATE_EXTENSION_MAGIC, &sections)
 }
 
@@ -518,6 +557,9 @@ pub(crate) fn apply_state_extension(
                     return Err("unsupported required outbound state version");
                 }
                 state.outbound = Some(outbound);
+            }
+            ACTIVITY_START_RECEIPTS_SECTION => {
+                activity_receipts::apply(state, &section.payload)?;
             }
             // A later release's section: its data is safe to drop by rule.
             _ => {}
@@ -911,6 +953,7 @@ mod tests {
     /// started workflow task.
     pub(super) fn layout_state() -> WorkflowState {
         WorkflowState {
+            activity_start_receipts: std::collections::BTreeMap::new(),
             used_worker_deployment_versions: None,
             completed_update_count: 1,
             signal_count: 0,
@@ -1959,9 +2002,9 @@ mod tests {
         #[test]
         fn property_unknown_sections_and_activities_are_ignored(
             state in arb_state(),
-            // Tags 1 to 6 are known; anything above is a later optional section.
+            // Tags 1 to 7 are known; anything above is a later optional section.
             unknown in proptest::collection::btree_map(
-                7u32..64,
+                8u32..64,
                 proptest::collection::vec(any::<u8>(), 0..16),
                 0..3,
             ),

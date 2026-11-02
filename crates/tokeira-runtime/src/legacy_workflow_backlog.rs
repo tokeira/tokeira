@@ -1,4 +1,4 @@
-//! Volatile, restartable disposal passes over legacy workflow backlog copies.
+//! Volatile, restartable disposal passes over legacy workflow/activity backlog copies.
 //!
 //! Serving does not wait for disposal. Acquisition progress wakes deferred
 //! entries; a page error loses the cursor and the next pass starts at the head.
@@ -48,7 +48,7 @@ pub(crate) async fn run_disposal<R: RunRepository + 'static>(
                 Err(error) => {
                     tracing::warn!(
                         ?error,
-                        "legacy workflow disposal page failed; restarting from head"
+                        "legacy backlog disposal page failed; restarting from head"
                     );
                     break;
                 }

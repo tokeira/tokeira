@@ -170,6 +170,10 @@ pub struct BatchDispatchContext {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkflowMutationOutcome {
+    /// Newly scheduled activity IDs mapped to their committed event identities.
+    /// Only a successful completion fills this; duplicate replies cannot reuse
+    /// command payloads against an activity scheduled by another completion.
+    pub scheduled_activity_event_ids: BTreeMap<String, i64>,
     pub transition_seq: u64,
     pub last_event_id: i64,
     pub was_duplicate: bool,
@@ -812,11 +816,20 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         queue: tokeira_types::QueueKey,
         run_key: RunKey,
         activity_id: String,
+        schedule_event_id: i64,
         worker_identity: tokeira_types::WorkerIdentity,
         input: Payloads,
         header: Option<Headers>,
     ) -> Result<Option<StartedActivityTask>> {
-        let _ = (queue, run_key, activity_id, worker_identity, input, header);
+        let _ = (
+            queue,
+            run_key,
+            activity_id,
+            schedule_event_id,
+            worker_identity,
+            input,
+            header,
+        );
         Ok(None)
     }
 
@@ -4587,6 +4600,7 @@ impl WorkflowService {
                         let mut response = from_internal::start_response(
                             &internal,
                             WorkflowMutationOutcome {
+                                scheduled_activity_event_ids: BTreeMap::new(),
                                 transition_seq: mutation_metadata.transition_seq.0,
                                 last_event_id: mutation_metadata.last_event_id,
                                 was_duplicate: false,
@@ -5366,6 +5380,7 @@ impl WorkflowService {
                 self.notify_history_run_key(run_key, outcome.last_event_id)
                     .await;
 
+                let scheduled_activity_event_ids = outcome.scheduled_activity_event_ids.clone();
                 let mut resp = from_internal::completed_response(outcome);
                 // Speculative DROP (spec speculative-wft E2): the completion
                 // committed but persisted nothing for this task — its virtual
@@ -5381,6 +5396,9 @@ impl WorkflowService {
 
                 if let Some(workflow_namespace) = eager_activity_namespace.as_deref() {
                     for eager in eager_activity_specs {
+                        let Some(&schedule_event_id) = scheduled_activity_event_ids.get(&eager.activity_id) else {
+                            continue;
+                        };
                         let queue = tokeira_types::QueueKey {
                             namespace_id,
                             task_queue: eager.task_queue,
@@ -5400,17 +5418,17 @@ impl WorkflowService {
                         ) {
                             continue;
                         }
-                        if let Some(started) = self
-                            .runtime
-                            .try_claim_activity_task(
+                        if let Some(started) = tokeira_runtime::scope_activity_start_response(
+                            crate::grpc::activity_dispatch::ActivityResponsePreflight::new(context.clone(), workflow_namespace.to_owned(), namespace_id),
+                            self.runtime.try_claim_activity_task(
                                 queue,
                                 run_key,
                                 eager.activity_id,
+                                schedule_event_id,
                                 WorkerIdentity(completion_identity.clone()),
                                 eager.input,
                                 eager.header,
-                            )
-                            .await
+                            )).await
                             .map_err(EdgeError::from)?
                         {
                             let task = from_internal::poll_activity_response(
@@ -6983,6 +7001,7 @@ impl WorkflowService {
         req: PollActivityTaskQueueRequest,
         admitted: Option<EdgeContext>,
     ) -> EdgeResult<Option<PollActivityTaskQueueResponse>> {
+        let deadline = tokio::time::Instant::now() + req.timeout;
         let namespace_label = req.namespace.clone();
         self.observe_edge_call(
             headers,
@@ -7050,6 +7069,16 @@ impl WorkflowService {
                         })
                         .await?;
                 }
+                let forwarding = crate::grpc::activity_dispatch::ForwardedActivityPoll {
+                    headers: self.interceptors.forwarding_headers(headers),
+                    namespace: req.namespace.clone(),
+                    scoped_versioned: req.scoped_versioned,
+                };
+                let preflight = crate::grpc::activity_dispatch::ActivityResponsePreflight::new(
+                    ctx.clone(),
+                    workflow_namespace.clone(),
+                    namespace_id,
+                );
                 let internal = to_internal::poll_activity_request(req);
                 let scaling_queue = internal.queue.clone();
                 if internal.queue.deployment.is_some() {
@@ -7084,7 +7113,7 @@ impl WorkflowService {
                                 internal.queue.namespace_id,
                                 internal.queue.task_queue.clone(),
                                 worker_rate,
-                                internal.timeout,
+                                deadline.saturating_duration_since(tokio::time::Instant::now()),
                             )
                             .await
                         {
@@ -7099,9 +7128,18 @@ impl WorkflowService {
                 }
                 // The runtime evaluates durable rules when the broker offer is about to become a
                 // Started transition. Poll admission deliberately carries no CRUD-gate decision.
-                let started = self
-                    .runtime
-                    .poll_activity_task(internal.queue, internal.worker_identity, internal.timeout)
+                let started = crate::grpc::activity_dispatch::FORWARDED_ACTIVITY_POLL
+                    .scope(
+                        forwarding,
+                        tokeira_runtime::scope_activity_start_response(
+                            preflight,
+                            self.runtime.poll_activity_task(
+                                internal.queue,
+                                internal.worker_identity,
+                                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                            ),
+                        ),
+                    )
                     .await;
                 // A normal empty result is the long-poll timeout path and must
                 // refresh, while client cancellation drops the future before
@@ -8993,7 +9031,7 @@ fn is_scoped_worker(context: &EdgeContext) -> bool {
         .is_some_and(|claims| claims.worker_scope.is_some())
 }
 
-fn scoped_worker_allows_task_origin(
+pub(crate) fn scoped_worker_allows_task_origin(
     context: &EdgeContext,
     action: Action,
     origin: &tokeira_types::WorkerTaskOrigin,
@@ -10019,9 +10057,9 @@ mod tests {
         ActivityPriorityPatch, FieldChange, ParentClosePolicy, StartRequest, WorkflowCommand,
     };
     use tokeira_runtime::{
-        BacklogConfig, InMemoryBroker, LaneConfig, TaskQueueConfigEntry, TaskQueueConfigKind,
-        TimerScannerConfig, TokeiraRuntime, UpdateLifecycleStage, UpdateWaitPolicy,
-        WorkerRegistrationKey, WorkflowTimeoutScannerConfig,
+        InMemoryBroker, LaneConfig, TaskQueueConfigEntry, TaskQueueConfigKind, TimerScannerConfig,
+        TokeiraRuntime, UpdateLifecycleStage, UpdateWaitPolicy, WorkerRegistrationKey,
+        WorkflowTimeoutScannerConfig,
     };
     use tokeira_storage::{
         CommitResult, InMemoryStore, ProvenancePut, RunRepository, WorkerTaskProvenance,
@@ -10580,7 +10618,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         ));
         let cache = Arc::new(InMemoryNamespaceCache::new());
         cache.insert(ResolvedNamespace::active("default")).await?;

@@ -80,17 +80,27 @@ pub struct ActivityTrackingEntry {
 /// activities open at once.
 #[derive(Clone, Default, Debug)]
 pub struct ActivityTrackingState {
+    pub(crate) eligibility: crate::activity_eligibility::ActivityEligibility,
     pub(crate) inner:
         crate::acquisition_tracking::AcquisitionEntries<(RunKey, String), ActivityTrackingEntry>,
 }
 
 impl ActivityTrackingState {
     pub(crate) fn set_owner(&self, owner: Arc<RwLock<ShardOwner>>) {
+        self.eligibility.set_owner(owner.clone());
         self.inner.set_owner(owner);
     }
     pub(crate) fn for_acquisition(&self, acquisition: crate::shard::ShardAcquisition) -> Self {
         Self {
+            eligibility: self.eligibility.for_acquisition(acquisition.clone()),
             inner: self.inner.for_acquisition(acquisition),
+        }
+    }
+
+    pub(crate) fn for_activity(&self, run: RunKey, activity: &str) -> Self {
+        Self {
+            eligibility: self.eligibility.for_activity(run, activity),
+            inner: self.inner.for_key(&(run, activity.into())),
         }
     }
 
@@ -158,6 +168,7 @@ impl ActivityTrackingState {
     /// heartbeat clocks. Heartbeat is reset to `None` so the first interval is
     /// measured from start.
     pub fn record_started(&self, run_key: RunKey, activity_id: &str, now: OffsetDateTime) {
+        self.eligibility.remove(run_key, activity_id);
         self.inner
             .update(&(run_key, activity_id.to_string()), |entry| {
                 entry.started_at = Some(now);
@@ -200,17 +211,20 @@ impl ActivityTrackingState {
     /// Stop tracking an activity, called when it resolves so it is never scanned
     /// again.
     pub fn remove(&self, run_key: RunKey, activity_id: &str) {
+        self.eligibility.remove(run_key, activity_id);
         self.inner.remove(&(run_key, activity_id.to_string()));
     }
 
     /// Stop tracking every activity owned by a deleted workflow run.
     pub fn remove_all_for_run(&self, run_key: RunKey) {
+        self.eligibility.remove_run(run_key);
         self.inner.retain(|(key, _), _| *key != run_key);
     }
 
     /// Drop every entry for a shard on handoff; the new owner rebuilds them from
     /// durable state during its sweep.
     pub fn remove_all_for_shard(&self, shard_id: ShardId) {
+        self.eligibility.remove_home(shard_id);
         self.inner.retain(|_, entry| entry.shard_id != shard_id);
     }
 
@@ -251,11 +265,6 @@ pub struct ActivityTimeoutScannerConfig {
     /// Upper bound on timeouts submitted per scan, bounding the work one tick can
     /// do when many activities expire together.
     pub max_timeouts_per_scan: usize,
-    /// Upper bound on durable dispatch reconciliations per scan.
-    ///
-    /// A separate budget from `max_timeouts_per_scan`: a large population of
-    /// due dispatch rows must not starve timeout resolution, and vice versa.
-    pub max_dispatch_reconciliations_per_scan: usize,
 }
 
 impl Default for ActivityTimeoutScannerConfig {
@@ -263,7 +272,6 @@ impl Default for ActivityTimeoutScannerConfig {
         Self {
             scan_interval: tokio::time::Duration::from_secs(1),
             max_timeouts_per_scan: 100,
-            max_dispatch_reconciliations_per_scan: 100,
         }
     }
 }
@@ -464,8 +472,13 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
                     // acquisition and submitted revision, even if its repository
                     // reply arrives after another operation replaced the key.
                     let mut retry_deps = deps.clone();
+                    let scoped_tracking = tracked.acquisition().map_or_else(
+                        || tracking.clone(),
+                        |acquisition| tracking.for_acquisition(acquisition),
+                    );
                     retry_deps.tracking = ActivityTrackingState {
                         inner: tracking.inner.for_entry(&tracked),
+                        ..scoped_tracking
                     };
                     let result = commit_activity_retry(
                         &retry_deps,
@@ -726,19 +739,10 @@ pub(crate) async fn run_activity_timeout_scanner<R>(
         for shard_id in active_shards {
             runtime_metrics::record_scanner_tick("activity_timeout", shard_id.0);
             scan_activity_timeouts_once(&deps, Some(shard_id), &lanes, lane_count, &config).await;
-            // Durable-dispatch reconciliation runs AFTER timeout processing:
-            // a fired schedule deadline is resolved before its row could be
-            // republished. The durable `activity_dispatch` row is the
-            // discovery source — volatile tracking is only a deadline-clock
-            // optimization — so a lost broker publication or a take that
-            // never reached Started heals here, the local equivalent of
-            // v1.31.0's retried durable ActivityRetryTimerTask
-            // (timer_queue_active_task_executor.go:522-620 @ v1.31.0).
-            crate::runtime::reconcile_due_activity_dispatches_once(
+            crate::activity_eligibility::scan_activity_eligibility_once(
                 &deps,
                 shard_id,
                 OffsetDateTime::now_utc(),
-                config.max_dispatch_reconciliations_per_scan,
             )
             .await;
         }

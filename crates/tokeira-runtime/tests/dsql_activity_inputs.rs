@@ -16,8 +16,8 @@ use tokeira_kernel::{
     HistoryEventKind, ResetRequest, StartRequest, WorkflowCommand, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, NoopNexusHttpClient, StartedActivityTask, StartedWorkflowTask,
-    TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    LaneConfig, NoopNexusHttpClient, StartedActivityTask, StartedWorkflowTask, TimerScannerConfig,
+    TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{
     CommitResult, RunRepository, codec,
@@ -72,7 +72,6 @@ async fn dsql_runtime()
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         Default::default(),
         Default::default(),
         Default::default(),

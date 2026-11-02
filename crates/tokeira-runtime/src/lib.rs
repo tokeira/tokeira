@@ -22,7 +22,6 @@
 
 mod acquisition_tracking;
 pub mod activity_timeout;
-pub mod backlog;
 pub mod batch;
 pub mod broker;
 pub mod buffered_queries;
@@ -59,6 +58,9 @@ pub mod retry;
 mod run_growth;
 pub mod runtime;
 pub use runtime::continue_as_new_advice_policy;
+mod activity_discovery;
+mod activity_eligibility;
+mod activity_offers;
 pub mod scanner;
 pub mod schedule;
 mod serving_gate;
@@ -76,8 +78,8 @@ pub mod worker_registry;
 mod workflow_offers;
 mod workflow_rules;
 
+pub use activity_discovery::ActivityDemandCapacity;
 pub use activity_timeout::*;
-pub use backlog::*;
 pub use batch::*;
 pub use broker::*;
 pub use buffered_queries::*;
@@ -117,6 +119,13 @@ mod legacy_workflow_backlog;
 mod workflow_task_start;
 pub use workflow_task_start::{
     RetryableWorkflowTaskStart, WorkflowOfferRejected, WorkflowTaskStarter,
+};
+
+mod activity_task_start;
+pub use activity_task_start::{
+    ActivityStartOutcome, ActivityStartResponsePreflight, ActivityStartTooLarge,
+    ActivityTaskStartRequest, ActivityTaskStarter, InvalidActivityStart,
+    RetryableActivityTaskStart, scope_activity_start_response,
 };
 
 mod successor;

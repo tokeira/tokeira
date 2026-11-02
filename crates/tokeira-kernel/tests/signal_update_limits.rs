@@ -48,6 +48,7 @@ fn request(id: &str) -> RequestContext {
 fn open_state(signal_count: u64) -> WorkflowState {
     let now = now();
     WorkflowState {
+        activity_start_receipts: std::collections::BTreeMap::new(),
         used_worker_deployment_versions: Some(Vec::new()),
         completed_update_count: 0,
         signal_count,

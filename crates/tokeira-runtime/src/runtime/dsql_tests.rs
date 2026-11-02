@@ -131,6 +131,16 @@ async fn purge_contract_runs(
 #[tokio::test]
 #[ignore = "requires an ephemeral Aurora DSQL database"]
 async fn storage_contract_live_acquisition_spans_recovery_pages() -> Result<()> {
+    acquisition_spans_recovery_pages(false).await
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated ephemeral Aurora DSQL database with 4096 homes"]
+async fn activity_dispatch_live_acquisition_spans_recovery_pages() -> Result<()> {
+    acquisition_spans_recovery_pages(true).await
+}
+
+async fn acquisition_spans_recovery_pages(activities: bool) -> Result<()> {
     let url = std::env::var("TOKEIRA_DSQL_TEST_DATABASE_URL")
         .context("explicit live acquisition test requires TOKEIRA_DSQL_TEST_DATABASE_URL")?;
     let store = DsqlStore::from_database_url_for_tests(
@@ -182,14 +192,34 @@ async fn storage_contract_live_acquisition_spans_recovery_pages() -> Result<()> 
                 execution_home_bundle(queue.namespace_id.0.as_bytes(), id.0.as_bytes(), 4096)
                     == home
             })
-            .unwrap();
+            .expect("acquisition fixture invariant");
         item.next_state.started_at = clock;
         item.next_state.workflow_run_timeout = Some(time::Duration::hours(1));
         item.next_state.workflow_execution_timeout = None;
         item.next_state.workflow_task_timeout = time::Duration::hours(1);
-        let task = item.next_state.pending_workflow_task.as_mut().unwrap();
+        let task = item
+            .next_state
+            .pending_workflow_task
+            .as_mut()
+            .expect("acquisition fixture invariant");
         task.started_at = Some(clock);
         task.started_event_id = Some(2);
+        if activities {
+            // The first run crosses both the 64-slot repair bound and the
+            // inline state threshold; all 101 runs remain acquisition candidates.
+            for activity in 0..if index == 0 { 129 } else { 1 } {
+                let pending = acquisition_activity(activity, &queue, clock);
+                item.next_state
+                    .activities
+                    .insert(pending.activity_id.clone(), pending);
+            }
+            if index == 0 {
+                item.next_state.memo.0.insert(
+                    "split-state".into(),
+                    Payload::new(vec![0x53; 2 * 1024 * 1024]),
+                );
+            }
+        }
         transitions.push(item);
     }
     let keys: Vec<_> = transitions
@@ -205,7 +235,6 @@ async fn storage_contract_live_acquisition_spans_recovery_pages() -> Result<()> 
         },
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         ActivityTimeoutScannerConfig::default(),
         NexusTimeoutScannerConfig::default(),
         NexusEndpointRegistry::default(),
@@ -231,6 +260,27 @@ async fn storage_contract_live_acquisition_spans_recovery_pages() -> Result<()> 
             else {
                 anyhow::bail!("acquisition seed rejected");
             };
+            if activities {
+                for row in
+                    tokeira_storage::derive_activity_dispatch(&new_state, home)?.into_values()
+                {
+                    anyhow::ensure!(
+                        repo.delete_activity_dispatch_if_matches(
+                            &tokeira_storage::ActivityDispatchIdentity {
+                                run_key: row.incarnation.run_key,
+                                activity_id: row.incarnation.activity_id,
+                                schedule_event_id: row.incarnation.schedule_event_id,
+                                attempt: row.incarnation.attempt,
+                                stamp: row.incarnation.stamp,
+                                dispatch_revision: row.dispatch_revision,
+                                dispatch_at: row.dispatch_at,
+                            }
+                        )
+                        .await?,
+                        "fixture failed to remove a canonical activity row"
+                    );
+                }
+            }
             expected.push(new_state);
         }
         expected.sort_by_key(|state| state.run_key);
@@ -246,14 +296,14 @@ async fn storage_contract_live_acquisition_spans_recovery_pages() -> Result<()> 
             let current = runtime
                 .shard_owner
                 .read()
-                .unwrap()
+                .expect("acquisition fixture invariant")
                 .acquisition(home)
                 .context("missing acquiring generation")?;
             anyhow::ensure!(
                 !runtime
                     .shard_owner
                     .read()
-                    .unwrap()
+                    .expect("acquisition fixture invariant")
                     .acquisition_active(&current),
                 "home became active before recovery completed"
             );
@@ -278,17 +328,56 @@ async fn storage_contract_live_acquisition_spans_recovery_pages() -> Result<()> 
         let current = runtime
             .shard_owner
             .read()
-            .unwrap()
+            .expect("acquisition fixture invariant")
             .acquisition(home)
             .context("missing active generation")?;
         anyhow::ensure!(
             runtime
                 .shard_owner
                 .read()
-                .unwrap()
+                .expect("acquisition fixture invariant")
                 .acquisition_active(&current),
             "completed acquisition is not active"
         );
+        if activities {
+            let mut expected_rows = Vec::new();
+            for state in &expected {
+                anyhow::ensure!(
+                    repo.load_run(state.run_key).await? == LoadedRun::Existing(state.clone()),
+                    "acquisition changed authority or failed split-state hydration"
+                );
+                expected_rows.extend(
+                    tokeira_storage::derive_activity_dispatch(state, home)?
+                        .into_values()
+                        .map(|row| tokeira_storage::ActivityHomePosition {
+                            run_key: row.incarnation.run_key,
+                            key: row.key,
+                        }),
+                );
+            }
+            expected_rows.sort();
+            let mut actual = Vec::new();
+            let mut after = None;
+            loop {
+                let page = repo
+                    .list_activity_dispatch_home_page(
+                        home,
+                        after,
+                        std::num::NonZeroU32::new(64).expect("positive limit"),
+                    )
+                    .await?;
+                actual.extend(page.candidates);
+                after = page.last_examined;
+                if page.exhausted {
+                    break;
+                }
+            }
+            anyhow::ensure!(
+                actual == expected_rows && actual.len() == 229,
+                "activity acquisition lost slots across run/repair pages: {}",
+                actual.len()
+            );
+        }
         let mut workflows = runtime.workflow_timeout_tracking.snapshot_for_shard(home);
         workflows.sort_by_key(|entry| entry.run_key);
         let mut tasks = runtime.wft_timeout_tracking.snapshot_for_shard(home);
@@ -298,7 +387,10 @@ async fn storage_contract_live_acquisition_spans_recovery_pages() -> Result<()> 
             "acquisition lost recovered deadlines"
         );
         for ((workflow, task), state) in workflows.iter().zip(&tasks).zip(&expected) {
-            let pending = state.pending_workflow_task.as_ref().unwrap();
+            let pending = state
+                .pending_workflow_task
+                .as_ref()
+                .expect("acquisition fixture invariant");
             anyhow::ensure!(
                 runtime
                     .workflow_timeout_tracking
@@ -410,7 +502,6 @@ async fn workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs(
         },
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         ActivityTimeoutScannerConfig::default(),
         NexusTimeoutScannerConfig::default(),
         NexusEndpointRegistry::default(),
@@ -635,4 +726,43 @@ fn workflow_dispatch_live_fenced_repair_final_gate() {
     executor.block_on(director.shutdown()).unwrap();
     result.unwrap();
     assert_eq!(cases.load(std::sync::atomic::Ordering::SeqCst), 100);
+}
+
+fn acquisition_activity(
+    index: usize,
+    queue: &QueueKey,
+    scheduled_at: OffsetDateTime,
+) -> tokeira_kernel::ActivityState {
+    tokeira_kernel::ActivityState {
+        activity_id: format!("activity-{index}"),
+        activity_type: "work".into(),
+        schedule_event_id: index as i64 + 3,
+        task_queue: queue.task_queue.clone(),
+        deployment: None,
+        build_id: None,
+        retired_input: Default::default(),
+        retired_header: Default::default(),
+        attempt: 2,
+        retry_policy: None,
+        schedule_to_close_timeout: None,
+        schedule_to_start_timeout: None,
+        start_to_close_timeout: None,
+        heartbeat_timeout: None,
+        scheduled_at,
+        current_attempt_scheduled_at: Some(scheduled_at + time::Duration::hours(1)),
+        started_at: None,
+        started_event_id: None,
+        last_failure: None,
+        started_identity: None,
+        retry_last_worker_identity: None,
+        heartbeat_details: None,
+        cancel_requested: false,
+        pause_info: None,
+        stamp: 1,
+        activity_reset: false,
+        reset_heartbeats: false,
+        priority: None,
+        last_attempt_complete_time: Some(scheduled_at),
+        last_heartbeat_at: None,
+    }
 }

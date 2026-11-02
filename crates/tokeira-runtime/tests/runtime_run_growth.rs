@@ -16,7 +16,7 @@ use tokeira_kernel::{
     },
 };
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -280,7 +280,6 @@ fn runtime(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     )
 }
 

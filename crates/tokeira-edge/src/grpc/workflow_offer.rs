@@ -50,6 +50,7 @@ pub struct PeerOfferEndpoint {
     signer: PeerSigner,
     handlers: Arc<Semaphore>,
     outbound_handlers: Arc<Semaphore>,
+    activity_start_handlers: Arc<Semaphore>,
 }
 
 impl fmt::Debug for PeerOfferEndpoint {
@@ -66,6 +67,7 @@ impl PeerOfferEndpoint {
             signer,
             handlers: Arc::new(Semaphore::new(MAX_OFFER_HANDLERS)),
             outbound_handlers: Arc::new(Semaphore::new(32)),
+            activity_start_handlers: Arc::new(Semaphore::new(32)),
         }
     }
 
@@ -113,6 +115,44 @@ impl PeerOfferEndpoint {
             self.verifier.verify_at(value, now)
         }
         .map_err(peer_status)?;
+        Ok(permit)
+    }
+
+    fn enter_activity_start(
+        &self,
+        headers: &HeaderMap,
+        now: u64,
+    ) -> Result<OwnedSemaphorePermit, Status> {
+        let permit = self
+            .activity_start_handlers
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("activity start handler limit exceeded"))?;
+        let bytes = headers.iter().try_fold(0usize, |total, (name, value)| {
+            total
+                .checked_add(name.as_str().len())?
+                .checked_add(value.len())
+        });
+        if bytes.is_none_or(|bytes| bytes > 8 * 1024) {
+            return Err(Status::resource_exhausted(
+                "activity start metadata exceeds 8 KiB",
+            ));
+        }
+        let mut values = headers.get_all("x-tokeira-peer-authorization").iter();
+        let value = values
+            .next()
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| {
+                Status::unauthenticated("activity start peer authentication required")
+            })?;
+        if values.next().is_some() {
+            return Err(Status::unauthenticated(
+                "ambiguous activity start peer authentication",
+            ));
+        }
+        self.verifier
+            .verify_activity_start_at(value, now)
+            .map_err(peer_status)?;
         Ok(permit)
     }
 
@@ -169,11 +209,14 @@ where
 
     fn call(&mut self, request: Request<B>) -> Self::Future {
         let outbound = request.uri().path() == OUTBOUND_PATH;
-        if request.uri().path() != OFFER_PATH && !outbound {
+        let activity_start = request.uri().path() == super::activity_dispatch::START_PATH;
+        if request.uri().path() != OFFER_PATH && !outbound && !activity_start {
             return Box::pin(self.inner.call(request));
         }
         let deadline = tokio::time::Instant::now()
-            + if outbound {
+            + if activity_start {
+                Duration::from_secs(10)
+            } else if outbound {
                 OUTBOUND_TIMEOUT
             } else {
                 OFFER_TIMEOUT
@@ -184,7 +227,9 @@ where
         let entered = match (&self.peer, now) {
             (None, _) => Err(Status::unimplemented("unknown method")),
             (Some(peer), Ok(now)) => {
-                if outbound {
+                if activity_start {
+                    peer.enter_activity_start(request.headers(), now)
+                } else if outbound {
                     peer.enter_purpose(request.headers(), now, true)
                 } else {
                     peer.enter(request.headers(), now)
@@ -231,8 +276,8 @@ pub fn offer_client(
         .max_encoding_message_size(MAX_OFFER_REQUEST_BYTES)
 }
 
-/// Bound the unary offer body independently of the peer's response headers.
-/// Existing Start clients and their larger response budget are unchanged.
+/// Bound peer bodies independently of response headers, with each route's budget.
+/// Workflow starts pass through; activity starts retain their full native response budget.
 #[derive(Clone, Debug)]
 pub struct OfferResponseLimit<S>(S);
 
@@ -257,15 +302,19 @@ where
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
-        let offer = matches!(request.uri().path(), OFFER_PATH | OUTBOUND_PATH);
+        let budget = match request.uri().path() {
+            OFFER_PATH | OUTBOUND_PATH => Some(MAX_OFFER_RESPONSE_BYTES),
+            super::activity_dispatch::START_PATH => Some(super::activity_dispatch::MAX_RESPONSE),
+            _ => None,
+        };
         let response = self.0.call(request);
         Box::pin(async move {
             let response = response.await?;
-            if !offer {
+            let Some(budget) = budget else {
                 return Ok(response);
-            }
+            };
             // Tonic's trailers-only path uses Streaming::new_empty without the
-            // configured decode limit. A successful unary offer must carry a
+            // configured decode limit. A successful unary peer reply must carry a
             // message and trailers, so reject initial grpc-status=0 before that
             // path can allocate from an untrusted frame's declared length.
             if response
@@ -273,11 +322,11 @@ where
                 .get("grpc-status")
                 .is_some_and(|value| value == "0")
             {
-                return Ok(Status::internal("malformed workflow offer response").into_http());
+                return Ok(Status::internal("malformed peer response").into_http());
             }
             // Allow the five-byte gRPC header in addition to one uncompressed
             // message; compression is disabled. Extra frames share this budget.
-            Ok(response.map(|body| Body::new(Limited::new(body, MAX_OFFER_RESPONSE_BYTES + 5))))
+            Ok(response.map(|body| Body::new(Limited::new(body, budget + 5))))
         })
     }
 }
@@ -441,6 +490,56 @@ mod tests {
     }
 
     struct ReplyFixture(usize, bool);
+
+    struct PendingReply;
+
+    impl Service<Request<Body>> for PendingReply {
+        type Response = Response<Body>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Pending<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _: Request<Body>) -> Self::Future {
+            std::future::pending()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activity_handler_deadline_and_cancellation_release_capacity() {
+        let peer = Arc::new(endpoint());
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let authorization = peer.signer().activity_start_token_at(now).unwrap();
+        let request = || {
+            Request::builder()
+                .uri(super::super::activity_dispatch::START_PATH)
+                .header(
+                    "x-tokeira-peer-authorization",
+                    authorization.authorization(),
+                )
+                .body(Body::empty())
+                .unwrap()
+        };
+        let mut gate = OfferGate::new(PendingReply, Some(peer.clone()));
+        let mut active = (0..32).map(|_| gate.call(request())).collect::<Vec<_>>();
+        assert_eq!(
+            gate.call(request()).await.unwrap().headers()["grpc-status"],
+            "8"
+        );
+        let pending = active.pop().unwrap();
+        drop(active);
+        assert_eq!(peer.activity_start_handlers.available_permits(), 31);
+        let began = tokio::time::Instant::now();
+        let response = pending.await.unwrap();
+        assert_eq!(response.headers()["grpc-status"], "4");
+        assert_eq!(began.elapsed(), Duration::from_secs(10));
+        assert_eq!(peer.activity_start_handlers.available_permits(), 32);
+    }
 
     impl Service<Request<Body>> for ReplyFixture {
         type Response = Response<Body>;
@@ -607,6 +706,30 @@ mod tests {
     // Unknown enums and malformed combinations never reach volatile admission.
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: activity-dispatch, Property 9: purpose, total metadata and independent handler capacity precede body decode.
+        #[test]
+        fn activity_start_has_separate_bounded_admission(release in 1usize..=32) {
+            let endpoint = endpoint();
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", "Bearer synthetic-worker".parse().unwrap());
+            headers.insert("x-tokeira-peer-authorization", endpoint.signer().activity_start_token_at(10_000).unwrap().authorization().parse().unwrap());
+            let mut permits = (0..32).map(|_| endpoint.enter_activity_start(&headers, 10_000).unwrap()).collect::<Vec<_>>();
+            prop_assert_eq!(endpoint.enter_activity_start(&headers, 10_000).unwrap_err().code(), tonic::Code::ResourceExhausted);
+            let mut offer = HeaderMap::new();
+            offer.insert("authorization", endpoint.signer().token_at(10_000).unwrap().authorization().parse().unwrap());
+            prop_assert!(endpoint.enter(&offer, 10_000).is_ok());
+            offer.insert("authorization", endpoint.signer().outbound_token_at(10_000).unwrap().authorization().parse().unwrap());
+            prop_assert!(endpoint.enter_purpose(&offer, 10_000, true).is_ok());
+            permits.truncate(32 - release);
+            for _ in 0..release { permits.push(endpoint.enter_activity_start(&headers, 10_000).unwrap()); }
+            drop(permits);
+            let used: usize = headers.iter().map(|(name, value)| name.as_str().len() + value.len()).sum();
+            headers.insert("padding", "x".repeat(8 * 1024 - used - 7).parse().unwrap());
+            prop_assert!(endpoint.enter_activity_start(&headers, 10_000).is_ok());
+            headers.insert("padding", "x".repeat(8 * 1024 - used - 6).parse().unwrap());
+            prop_assert_eq!(endpoint.enter_activity_start(&headers, 10_000).unwrap_err().code(), tonic::Code::ResourceExhausted);
+        }
 
         // Feature: outbound-dispatch-recovery, Property 18: Remote delivery grants no extra authority.
         #[test]

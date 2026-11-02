@@ -22,6 +22,14 @@ pub(crate) struct Tracked<V> {
     acquisition: Option<ShardAcquisition>,
 }
 
+impl<V> Tracked<V> {
+    /// Capture the original generation for a related volatile index; never
+    /// adopt the owner observed after an awaited scanner operation.
+    pub(crate) fn acquisition(&self) -> Option<ShardAcquisition> {
+        self.acquisition.clone()
+    }
+}
+
 #[derive(Debug)]
 struct Entries<K, V> {
     values: HashMap<K, Tracked<V>>,
@@ -57,10 +65,13 @@ impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
 
     pub(crate) fn for_acquisition(&self, acquisition: ShardAcquisition) -> Self {
         Self {
-            acquisition: Some(acquisition),
-            submitted_revision: None,
+            acquisition: self.acquisition.clone().or(Some(acquisition)),
             ..self.clone()
         }
+    }
+
+    pub(crate) fn captured_acquisition(&self) -> Option<ShardAcquisition> {
+        self.acquisition.clone()
     }
 
     /// Restrict post-await mutations to the exact snapshot a scanner submitted.
@@ -69,6 +80,17 @@ impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
         Self {
             acquisition: entry.acquisition.clone(),
             submitted_revision: Some(entry.revision),
+            ..self.clone()
+        }
+    }
+
+    /// Bind a callback to the value present before its await, including absence.
+    /// Revision zero is never allocated, so an absent entry cannot later mutate
+    /// a replacement installed under the same logical key.
+    pub(crate) fn for_key(&self, key: &K) -> Self {
+        let entries = self.entries.lock().expect("tracking lock poisoned");
+        Self {
+            submitted_revision: Some(entries.values.get(key).map_or(0, |entry| entry.revision)),
             ..self.clone()
         }
     }
@@ -100,6 +122,17 @@ impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
     }
 
     pub(crate) fn upsert(&self, key: K, home: ShardId, make: impl FnOnce(Option<V>) -> V) {
+        self.upsert_if(key, home, |previous| Some(make(previous)));
+    }
+
+    /// Preserve a completed obligation's revision when its authoritative
+    /// incarnation is unchanged; unrelated transitions must not rearm it.
+    pub(crate) fn upsert_if(
+        &self,
+        key: K,
+        home: ShardId,
+        make: impl FnOnce(Option<V>) -> Option<V>,
+    ) {
         let owner = self
             .owner
             .get()
@@ -126,7 +159,9 @@ impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
                 _ => false,
             })
             .map(|entry| entry.value.clone());
-        let value = make(previous);
+        let Some(value) = make(previous) else {
+            return;
+        };
         inner.revision = inner
             .revision
             .checked_add(1)
@@ -222,7 +257,19 @@ impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
             .lock()
             .expect("tracking lock poisoned")
             .values
-            .retain(|key, entry| retain(key, &entry.value));
+            .retain(|key, entry| {
+                // A late acquisition-scoped cleanup has no authority over a
+                // replacement's entries, even if its logical keys are reused.
+                self.acquisition.as_ref().is_some_and(|scope| {
+                    entry
+                        .acquisition
+                        .as_ref()
+                        .is_none_or(|a| a.generation != scope.generation)
+                }) || self
+                    .submitted_revision
+                    .is_some_and(|revision| revision != entry.revision)
+                    || retain(key, &entry.value)
+            });
     }
 
     pub(crate) fn snapshot(&self, home: Option<ShardId>) -> Vec<Tracked<V>> {
@@ -284,6 +331,18 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
+        // Feature: activity-dispatch, Property 6: a late start callback cannot update a replacement or fill a formerly absent slot.
+        #[test]
+        fn captured_activity_key_preserves_replacement(original in proptest::option::of(any::<u64>()), replacement in any::<u64>()) {
+            let entries = AcquisitionEntries::default();
+            if let Some(value) = original { entries.insert(1, ShardId(0), value); }
+            let callback = entries.for_key(&1);
+            entries.insert(1, ShardId(0), replacement);
+            prop_assert_eq!(callback.update(&1, |value| *value = 0), None);
+            callback.remove(&1);
+            prop_assert_eq!(entries.get(&1), Some(replacement));
+        }
+
         // Feature: workflow-dispatch, Property 8: cancelled acquisition cannot install or retire a replacement.
         #[test]
         fn replacement_survives_old_install_and_scan(value in any::<u64>(), replacement in any::<u64>()) {

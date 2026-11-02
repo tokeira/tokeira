@@ -13,11 +13,12 @@
 //!   task token is honoured only after its `(schedule_event_id, attempt,
 //!   shard_epoch)` identity is revalidated against durable state, so a stale
 //!   or replayed token cannot mutate a run.
-//! - Activity transitions reject-and-reschedule rather than block: a retryable
-//!   failure re-enqueues the next attempt, and an OCC conflict at start
-//!   republishes the offer instead of making the worker wait on a lock.
+//! - Retry transitions retain canonical eligibility; discovery reconstructs lost
+//!   offers. Start OCC retries retain their request UUID and original acquisition,
+//!   so neither retry nor lost replies can authorize a second start.
 use super::*;
 use crate::{
+    ActivityStartOutcome, ActivityTaskStartRequest,
     lane::{KernelRejected, LaneHandle},
     runtime::workflow_task::{
         ResolvedWorkflowTaskTarget, poller_deployment_version,
@@ -33,7 +34,91 @@ use tracing::Instrument as _;
 /// event (`activity-inputs-from-history`).
 type ScheduledInput = (Payloads, Option<Headers>);
 
-const ACTIVITY_BACKLOG_REPROCESS_BATCH: usize = 100;
+#[derive(Clone, Debug)]
+struct ActivitySchedule {
+    input: Payloads,
+    header: Option<Headers>,
+    scheduled_time: OffsetDateTime,
+    schedule_to_close_timeout: Option<Duration>,
+    start_to_close_timeout: Option<Duration>,
+    heartbeat_timeout: Option<Duration>,
+}
+
+fn activity_start_response(
+    state: &WorkflowState,
+    activity: &tokeira_kernel::ActivityState,
+    task: &DispatchableActivityTask,
+    scheduled: &ActivitySchedule,
+    epoch: ShardEpoch,
+    replayed: bool,
+) -> StartedActivityTask {
+    // Matching builds a duplicate-start response from the scheduled event;
+    // history's early same-request branch omits these fresh-only fields.
+    // service/matching/matching_engine.go createPollActivityTaskQueueResponse
+    // and service/history/api/recordactivitytaskstarted/api.go @ v1.31.0.
+    StartedActivityTask {
+        replayed,
+        priority: merge_priority(state.priority.as_ref(), activity.priority.as_ref()),
+        run_key: task.run_key,
+        run_id: state.run_id,
+        activity_id: activity.activity_id.clone(),
+        activity_type: activity.activity_type.clone(),
+        task_queue: task.queue.task_queue.clone(),
+        token: ActivityTaskToken {
+            run_key: task.run_key,
+            activity_id: activity.activity_id.clone(),
+            schedule_event_id: activity.schedule_event_id,
+            attempt: activity.attempt,
+            shard_epoch: epoch,
+        },
+        input: scheduled.input.clone(),
+        attempt: activity.attempt,
+        workflow_id: state.workflow_id.0.clone(),
+        workflow_type: if replayed {
+            String::new()
+        } else {
+            state.workflow_type.0.clone()
+        },
+        header: scheduled.header.clone(),
+        retry_policy: (!replayed).then(|| activity.retry_policy.clone()).flatten(),
+        heartbeat_details: (!replayed)
+            .then(|| activity.heartbeat_details.clone())
+            .flatten(),
+        scheduled_time: if replayed {
+            scheduled.scheduled_time
+        } else {
+            activity.scheduled_at
+        },
+        current_attempt_scheduled_time: activity.current_attempt_scheduled_at,
+        started_time: activity
+            .started_at
+            .expect("a start response requires a started attempt"),
+        schedule_to_close_timeout: if replayed {
+            Some(
+                scheduled
+                    .schedule_to_close_timeout
+                    .unwrap_or(Duration::ZERO),
+            )
+        } else {
+            activity.schedule_to_close_timeout
+        },
+        start_to_close_timeout: if replayed {
+            scheduled.start_to_close_timeout
+        } else {
+            activity.start_to_close_timeout
+        },
+        heartbeat_timeout: if replayed {
+            scheduled.heartbeat_timeout
+        } else {
+            activity.heartbeat_timeout
+        },
+        origin: WorkerTaskOrigin::from_queue_key(
+            &task.queue,
+            task.queue.task_queue.clone(),
+            WorkerTaskClass::Activity,
+        ),
+    }
+}
 
 /// Decide whether an activity-start poller should move the workflow deployment.
 ///
@@ -116,9 +201,11 @@ where
     /// (`TestPinnedWorkflowWithLateActivityPoller`; task-queue user-data change
     /// handling in `service/matching/task_queue_partition_manager.go @
     /// v1.31.0`). Tokeira applies the observable behavior to its disposable
-    /// live and durable backlog coordinates, re-deriving every candidate from
+    /// bounded live offers, re-deriving every candidate from
     /// authoritative run and deployment state.
     pub async fn reprocess_unversioned_activity_backlog(&self, target: &QueueKey) -> Result<()> {
+        self.activity_discovery
+            .wake_family(target, tokio::time::Instant::now());
         let Some(registry) = self.deployment_registry() else {
             return Ok(());
         };
@@ -153,72 +240,6 @@ where
             .reroute_unversioned_ready_tasks(target, &routes)
             .await;
 
-        loop {
-            let entries = self
-                .repo
-                .drain_backlog(&source, ACTIVITY_BACKLOG_REPROCESS_BATCH)
-                .await?;
-            let exhausted = entries.len() < ACTIVITY_BACKLOG_REPROCESS_BATCH;
-            for entry in entries {
-                let tokeira_storage::BacklogPayload::Activity {
-                    activity_id,
-                    retired_input: _,
-                    schedule_event_id,
-                    attempt,
-                    dispatch_revision,
-                    stamp,
-                } = entry.payload.clone()
-                else {
-                    // A workflow payload under an activity QueueKey is corrupt
-                    // derived state. Put it back rather than discarding work.
-                    self.repo.persist_to_backlog(vec![entry]).await?;
-                    return Err(anyhow!(
-                        "workflow payload found in unversioned activity backlog"
-                    ));
-                };
-                let LoadedRun::Existing(state) = self.repo.load_run(entry.run_key).await? else {
-                    // The authoritative run no longer exists, so the derived
-                    // backlog entry is stale and can be discarded.
-                    continue;
-                };
-                let (queue, dispatch_revision) = match route_activity_task_queue(
-                    Some(&registry),
-                    &state,
-                    source.clone(),
-                    dispatch_revision,
-                )
-                .await
-                {
-                    Ok(route) => route,
-                    Err(error) => {
-                        self.repo.persist_to_backlog(vec![entry]).await?;
-                        return Err(error);
-                    }
-                };
-                let task = DispatchableActivityTask {
-                    run_key: entry.run_key,
-                    queue,
-                    activity_id,
-                    schedule_event_id,
-                    attempt,
-                    dispatch_revision,
-                    stamp,
-                    priority: entry.priority.clone(),
-                    order: None,
-                };
-                if let Err(error) = self
-                    .activity_broker
-                    .publish_activity_task(task, Some(&self.delivery_metrics))
-                    .await
-                {
-                    self.repo.persist_to_backlog(vec![entry]).await?;
-                    return Err(error);
-                }
-            }
-            if exhausted {
-                break;
-            }
-        }
         Ok(())
     }
 
@@ -229,13 +250,93 @@ where
         worker_identity: WorkerIdentity,
         timeout_after: tokio::time::Duration,
     ) -> Result<Option<StartedActivityTask>> {
-        let Some(offer) = self
-            .poll_activity_task_offer(queue, worker_identity.clone(), timeout_after)
-            .await?
+        let deadline = tokio::time::Instant::now() + timeout_after;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            let Some(offer) = self
+                .poll_activity_task_offer(queue.clone(), worker_identity.clone(), deadline - now)
+                .await?
+            else {
+                return Ok(None);
+            };
+            let request = ActivityTaskStartRequest {
+                offered: offer.task.clone(),
+                request_id: offer.request_id,
+                worker: worker_identity.clone(),
+            };
+            let mut outcome = None;
+            for attempt in 0..3 {
+                let until = deadline
+                    .min(tokio::time::Instant::now() + tokio::time::Duration::from_secs(10));
+                let result = tokio::time::timeout_at(
+                    until,
+                    self.route_activity_start(request.clone(), deadline),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(crate::RetryableActivityTaskStart("owner attempt timed out".into()).into())
+                });
+                match result {
+                    Ok(result) => {
+                        outcome = Some(result);
+                        break;
+                    }
+                    Err(error)
+                        if (error.is::<crate::RetryableActivityTaskStart>()
+                            || error.is::<crate::NotShardOwner>())
+                            && attempt < 2
+                            && tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            // Keep the offer lease through every ambiguous attempt. A replacement
+            // poll must use a different request identity, never recover this one.
+            drop(offer);
+            if let Some(task) = outcome.and_then(ActivityStartOutcome::into_task) {
+                return Ok(Some(task));
+            }
+        }
+    }
+
+    async fn route_activity_start(
+        &self,
+        request: ActivityTaskStartRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<ActivityStartOutcome> {
+        let LoadedRun::Existing(state) = tokeira_storage::read_probe::scope(
+            "queue-home/activity-owner",
+            self.repo.load_run(request.offered.run_key),
+        )
+        .await?
         else {
-            return Ok(None);
+            return Ok(ActivityStartOutcome::Stale);
         };
-        self.start_activity_task_offer(offer, worker_identity).await
+        if state.namespace_id != request.offered.queue.namespace_id {
+            return Ok(ActivityStartOutcome::Stale);
+        }
+        let home = self.execution_home(&state);
+        let local = self
+            .shard_owner
+            .read()
+            .expect("shard owner lock poisoned")
+            .is_active(home);
+        if !local {
+            let starter = self
+                .activity_task_starter
+                .read()
+                .expect("activity starter lock poisoned")
+                .clone();
+            if let Some(starter) = starter {
+                return starter.start(home, request, deadline).await;
+            }
+        }
+        self.start_forwarded_activity_task(request).await
     }
 
     /// Poll matching without committing the Started transition.
@@ -251,14 +352,22 @@ where
         timeout_after: tokio::time::Duration,
     ) -> Result<Option<ActivityTaskOffer>> {
         self.ready().await?;
+        let home =
+            crate::discovery::QueueHomeProvider::local_home(self.discovery.1.as_ref(), &queue)
+                .ok_or_else(|| anyhow::anyhow!("activity queue home is not active"))?;
+        let _demand = self.activity_discovery.register_poll(
+            queue.clone(),
+            home,
+            tokio::time::Instant::now(),
+        )?;
         match self
             .activity_broker
-            .poll_activity_task_for_worker(&queue, &worker_identity, timeout_after)
+            .poll_activity_offer_for_worker(&queue, &worker_identity, timeout_after)
             .await?
         {
-            Some((task, entered_at)) => {
+            Some(offer) => {
                 self.delivery_metrics.record_poll_success(&queue);
-                Ok(Some(ActivityTaskOffer { task, entered_at }))
+                Ok(Some(offer))
             }
             None => {
                 self.delivery_metrics.record_poll_timeout(&queue);
@@ -273,81 +382,127 @@ where
         offer: ActivityTaskOffer,
         worker_identity: WorkerIdentity,
     ) -> Result<Option<StartedActivityTask>> {
-        self.start_activity_task(&offer.task, offer.entered_at, &worker_identity, None)
-            .await
+        self.start_activity_task(
+            &offer.task,
+            offer.request_id,
+            offer.entered_at,
+            &worker_identity,
+            None,
+        )
+        .await
     }
 
-    async fn pause_activity_for_matching_workflow_rule(
+    /// Start or recover one admitted activity match at its execution owner.
+    /// The receiver performs worker admission and installs its response preflight
+    /// before this call; this method never forwards to another owner.
+    pub async fn start_forwarded_activity_task(
+        &self,
+        request: ActivityTaskStartRequest,
+    ) -> Result<ActivityStartOutcome> {
+        self.start_activity_task_traced(
+            &request.offered,
+            request.request_id,
+            tokio::time::Instant::now(),
+            &request.worker,
+            None,
+        )
+        .await
+    }
+
+    async fn commit_activity_start_gate(
+        &self,
+        state: &WorkflowState,
+        attempt: &crate::outbound::driver::Attempt,
+        command: Command,
+    ) -> Result<bool> {
+        // Rules and routing were evaluated before awaiting the lane. Bind both
+        // the state image and acquisition so that an ID replacement or takeover
+        // cannot inherit the decision, while retaining normal lane side effects.
+        let lane =
+            crate::scanner::pick_lane_for_run_key(&self.lanes, self.lanes.len(), state.run_key);
+        let result = lane
+            .submit_observed(
+                state.run_key,
+                command,
+                crate::lane::ObservedSubmission {
+                    attempt: attempt.clone(),
+                    sequence: state.transition_seq,
+                    run_id: state.run_id,
+                },
+            )
+            .await?;
+        Ok(matches!(result, CommitResult::Applied { .. }))
+    }
+
+    async fn activity_start_rule_command(
         &self,
         state: &WorkflowState,
         activity: &tokeira_kernel::ActivityState,
         backoff_interval_seconds: Option<i64>,
-    ) -> Result<bool> {
+    ) -> Result<Option<Command>> {
         let rules = self.repo.list_workflow_rules(state.namespace_id).await?;
         let now = OffsetDateTime::now_utc();
         let Some(rule) =
             matching_pause_rule(state, activity, &rules, now, backoff_interval_seconds)
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let rule_id = rule.id.clone();
-        self.pause_activities(
-            state.run_key,
-            PauseActivityRequest {
-                target: ActivityControlTarget::Id(activity.activity_id.clone()),
-                identity: rule.created_by_identity.clone(),
-                reason: rule.description.clone(),
-                request: RequestContext {
-                    request_id: RequestId(format!(
-                        "workflow-rule-{rule_id}-{}-{}",
-                        activity.activity_id, activity.attempt
-                    )),
-                    caller_identity: (!rule.created_by_identity.is_empty())
-                        .then(|| rule.created_by_identity.clone()),
-                    principal: None,
-                    received_at: now,
-                },
-                now,
-                rule_id: Some(rule_id),
+        Ok(Some(Command::PauseActivity(PauseActivityRequest {
+            target: ActivityControlTarget::Id(activity.activity_id.clone()),
+            identity: rule.created_by_identity.clone(),
+            reason: rule.description.clone(),
+            request: RequestContext {
+                request_id: RequestId(format!(
+                    "workflow-rule-{rule_id}-{}-{}",
+                    activity.activity_id, activity.attempt
+                )),
+                caller_identity: (!rule.created_by_identity.is_empty())
+                    .then(|| rule.created_by_identity.clone()),
+                principal: None,
+                received_at: now,
             },
-        )
-        .await?;
-        Ok(true)
+            now,
+            rule_id: Some(rule_id),
+        })))
     }
 
-    /// Eagerly claim a specific activity task by `(run_key, activity_id)`
-    /// without waiting in the long-poll queue, then start it.
+    /// Start a just-committed schedule directly on its execution owner.
     ///
-    /// Returns `Ok(None)` when the broker has no matching offer (already
-    /// claimed by another poller, or not yet dispatched); the caller treats
-    /// that as "no work available" rather than an error. Used by the eager
-    /// dispatch path where a worker that just completed a task is handed the
-    /// next one directly, skipping a broker round-trip.
-    ///
-    /// `input` and `header` are those of the ScheduleActivity command the
-    /// completion just recorded as the activity's ActivityTaskScheduled event,
-    /// so the start answers with them and reads nothing, as v1.31.0's eager
-    /// start does (`workflow_task_completed_handler.go:594-598 @ v1.31.0`).
+    /// `schedule_event_id`, `input` and `header` must come from the same successful
+    /// workflow-task completion. The event identity prevents an old completion
+    /// callback from supplying payloads to a replacement using the same activity ID.
+    /// An ordinary poll may win first; the common fenced start then returns no task.
+    #[allow(clippy::too_many_arguments)] // The completion carries one exact schedule and its payload.
     pub async fn try_claim_activity_task(
         &self,
         queue: QueueKey,
         run_key: RunKey,
         activity_id: String,
+        schedule_event_id: i64,
         worker_identity: WorkerIdentity,
         input: Payloads,
         header: Option<Headers>,
     ) -> Result<Option<StartedActivityTask>> {
-        let Some(offered) = self
-            .activity_broker
-            .try_claim_activity_task(&queue, run_key, &activity_id)
-            .await
-        else {
+        self.ready().await?;
+        let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
             return Ok(None);
         };
-        self.delivery_metrics.record_poll_success(&queue);
+        let Some(activity) = state.activities.get(&activity_id) else {
+            return Ok(None);
+        };
+        if activity.schedule_event_id != schedule_event_id
+            || activity.attempt != 1
+            || activity.stamp != 0
+        {
+            return Ok(None);
+        }
+        let mut task = activity_dispatch_task(run_key, &state, activity);
+        task.queue = queue;
         self.start_activity_task(
-            &offered.0,
-            offered.1,
+            &task,
+            Uuid::new_v4(),
+            tokio::time::Instant::now(),
             &worker_identity,
             Some((input, header)),
         )
@@ -825,6 +980,7 @@ where
                 .apply_activity_started(
                     LoadedRun::Existing(state.clone()),
                     ActivityStartRequest {
+                        request_id: None,
                         activity_id: activity_id.to_string(),
                         identity: identity.clone(),
                         principal: request.principal.clone(),
@@ -1056,8 +1212,8 @@ where
     /// stale (run closed, activity already started/retried) and yields
     /// `Ok(None)` so the poller simply sees no work. On commit conflict the
     /// start is retried up to `max_occ_retries`; if that is exhausted the offer
-    /// is republished to the broker (reject-and-reschedule) rather than dropped,
-    /// so the task is not lost when contention is high.
+    /// returns a retryable owner error. The same request can retry, and canonical
+    /// discovery recovers the work if that poll ends.
     ///
     /// The task's input and header are `scheduled` when the caller has them, as
     /// an eager start does; otherwise the start reads them from the activity's
@@ -1065,10 +1221,26 @@ where
     async fn start_activity_task(
         &self,
         task: &DispatchableActivityTask,
+        request_id: Uuid,
         entered_at: tokio::time::Instant,
         worker_identity: &WorkerIdentity,
         scheduled: Option<ScheduledInput>,
     ) -> Result<Option<StartedActivityTask>> {
+        self.start_activity_task_traced(task, request_id, entered_at, worker_identity, scheduled)
+            .await
+            .map(ActivityStartOutcome::into_task)
+    }
+
+    // Local eager claims and forwarded owner starts share the same span boundary:
+    // changing placement must not remove host-owned activity processing telemetry.
+    async fn start_activity_task_traced(
+        &self,
+        task: &DispatchableActivityTask,
+        request_id: Uuid,
+        entered_at: tokio::time::Instant,
+        worker_identity: &WorkerIdentity,
+        scheduled: Option<ScheduledInput>,
+    ) -> Result<ActivityStartOutcome> {
         let span = tracing::info_span!(
             "activity_task.process",
             tokeira.run_key = %task.run_key.0,
@@ -1079,11 +1251,22 @@ where
             tokeira.task_queue = %task.queue.task_queue.0,
             tokeira.attempt = i64::from(task.attempt),
         );
-        let result = self
-            .start_activity_task_inner(task, entered_at, worker_identity, scheduled)
-            .instrument(span.clone())
-            .await;
-        if let Ok(Some(started)) = &result {
+        // Owner processing retains whole run images across awaits. Keeping its
+        // future on the heap prevents eager/poll/forwarding wrappers from
+        // multiplying that state on the caller's stack in unoptimized builds.
+        let result = Box::pin(self.start_activity_task_inner(
+            task,
+            request_id,
+            entered_at,
+            worker_identity,
+            scheduled,
+        ))
+        .instrument(span.clone())
+        .await;
+        if let Ok(
+            ActivityStartOutcome::Started(started) | ActivityStartOutcome::Replayed(started),
+        ) = &result
+        {
             span.record("tokeira.workflow_id", started.workflow_id.as_str());
             span.record("tokeira.run_id", started.run_id.0.to_string());
             span.record("tokeira.activity_type", started.activity_type.as_str());
@@ -1094,34 +1277,139 @@ where
     async fn start_activity_task_inner(
         &self,
         task: &DispatchableActivityTask,
+        request_id: Uuid,
         entered_at: tokio::time::Instant,
         worker_identity: &WorkerIdentity,
-        mut scheduled: Option<ScheduledInput>,
-    ) -> Result<Option<StartedActivityTask>> {
+        eager: Option<ScheduledInput>,
+    ) -> Result<ActivityStartOutcome> {
+        ActivityTaskStartRequest {
+            offered: task.clone(),
+            request_id,
+            worker: worker_identity.clone(),
+        }
+        .validate()?;
         self.ready().await?;
+        let mut scheduled: Option<ActivitySchedule> = None;
         let mut attempts = 0u32;
+        let mut captured_owner = None;
         loop {
-            let LoadedRun::Existing(state) = self.repo.load_run(task.run_key).await? else {
-                return Ok(None);
+            let LoadedRun::Existing(state) = tokeira_storage::read_probe::scope(
+                "execution-owner/activity-start",
+                self.repo.load_run(task.run_key),
+            )
+            .await?
+            else {
+                return Ok(ActivityStartOutcome::Stale);
             };
             if !state.is_open() {
-                return Ok(None);
+                return Ok(ActivityStartOutcome::Stale);
             }
             let Some(current) = state.activities.get(&task.activity_id).cloned() else {
-                return Ok(None);
+                return Ok(ActivityStartOutcome::Stale);
             };
+            if state.namespace_id != task.queue.namespace_id {
+                return Ok(ActivityStartOutcome::Stale);
+            }
+            let bundle = self.execution_home(&state);
+            let owner_attempt = match &captured_owner {
+                Some(attempt) => attempt,
+                None => captured_owner.insert(
+                    crate::outbound::driver::Attempt::capture(&self.shard_owner, bundle)
+                        .ok_or_else(|| {
+                            crate::errors::NotShardOwner::local(bundle, ShardEpoch::ZERO)
+                        })?,
+                ),
+            };
+            // OCC retries belong to the acquisition that admitted this call.
+            // Only a new owner RPC may capture a replacement's fence; an old
+            // in-flight attempt cannot silently become that replacement.
+            owner_attempt.validate(&self.shard_owner)?;
+            let start_tracking = self
+                .activity_tracking
+                .for_acquisition(owner_attempt.acquisition.clone())
+                .for_activity(task.run_key, &task.activity_id);
+            if current.started_event_id.is_some() {
+                // Temporal checks same-request identity before pause/stamp gates.
+                // Control edits can advance the current stamp after this start;
+                // only the receipt's consumed stamp binds the original request.
+                // service/history/api/recordactivitytaskstarted/api.go @ v1.31.0.
+                let matching = state
+                    .activity_start_receipts
+                    .get(&task.activity_id)
+                    .is_some_and(|receipt| {
+                        receipt.request_id == request_id
+                            && receipt.schedule_event_id == task.schedule_event_id
+                            && receipt.attempt == task.attempt
+                            && receipt.offered_stamp == task.stamp
+                            && receipt.worker_identity == *worker_identity
+                            && receipt.selected_queue == task.queue
+                            && receipt.dispatch_revision == task.dispatch_revision
+                            && current.schedule_event_id == task.schedule_event_id
+                            && current.attempt == task.attempt
+                            && current.started_at.is_some()
+                    });
+                if !matching {
+                    return Ok(ActivityStartOutcome::Stale);
+                }
+                if scheduled.is_none() {
+                    scheduled = Some(self.read_scheduled_input(task).await?);
+                }
+                let started = activity_start_response(
+                    &state,
+                    &current,
+                    task,
+                    scheduled.as_ref().expect("loaded schedule"),
+                    owner_attempt.acquisition.epoch,
+                    true,
+                );
+                crate::activity_task_start::preflight_activity_start(&started)?;
+                let _admission = crate::serving_gate::admit(&self.shard_owner, bundle).await?;
+                owner_attempt.validate(&self.shard_owner)?;
+                let current_observation = tokeira_storage::read_probe::scope(
+                    "execution-owner/activity-replay",
+                    self.repo.validate_activity_start_observation(
+                        &state,
+                        &task.activity_id,
+                        bundle,
+                        owner_attempt.fence.clone(),
+                    ),
+                )
+                .await
+                .map_err(|error| crate::errors::lease_loss(error, &self.shard_owner))?;
+                owner_attempt.validate(&self.shard_owner)?;
+                if current_observation {
+                    return Ok(ActivityStartOutcome::Replayed(started));
+                }
+                if attempts >= self.config.max_occ_retries {
+                    return Err(crate::RetryableActivityTaskStart(
+                        "replay observation changed repeatedly".into(),
+                    )
+                    .into());
+                }
+                attempts += 1;
+                continue;
+            }
+            if current.task_queue != task.queue.task_queue {
+                return Ok(ActivityStartOutcome::Stale);
+            }
+            if current
+                .current_attempt_scheduled_at
+                .is_none_or(|at| at > OffsetDateTime::now_utc())
+            {
+                return Ok(ActivityStartOutcome::Suppressed);
+            }
             // Durable dispatch rows are deleted by the pause transition, but
             // an ephemeral broker offer may already be in flight. Recheck the
             // authoritative pause bits before starting so that stale offer is
             // consumed without defeating either workflow- or activity-level
             // pause (`PauseActivity`, activity.go:263-284 @ v1.31.0).
             if state.status == ExecutionStatus::Paused || current.pause_info.is_some() {
-                return Ok(None);
+                return Ok(ActivityStartOutcome::Suppressed);
             }
             if current.attempt != task.attempt
                 || current.schedule_event_id != task.schedule_event_id
             {
-                return Ok(None);
+                return Ok(ActivityStartOutcome::Stale);
             }
             // Fence a superseded offer via the activity stamp. Every mutation
             // that invalidates an outstanding dispatch — pause, unpause, reset,
@@ -1131,10 +1419,10 @@ where
             // is v1.31.0's `ObsoleteMatchingTask` stamp check
             // (recordactivitytaskstarted/api.go @ v1.31.0).
             if current.stamp != task.stamp {
-                return Ok(None);
+                return Ok(ActivityStartOutcome::Stale);
             }
             if current.started_event_id.is_some() {
-                return Ok(None);
+                return Ok(ActivityStartOutcome::Stale);
             }
 
             // All delivery shapes converge here: ordinary long-poll and eager claim both call
@@ -1144,20 +1432,32 @@ where
             // backoff interval is derived from durable state so a
             // `BackoffInterval` rule created after publication but before
             // start is still enforced.
-            if self
-                .pause_activity_for_matching_workflow_rule(
+            if let Some(command) = self
+                .activity_start_rule_command(
                     &state,
                     &current,
                     activity_backoff_interval_seconds(&current)?,
                 )
                 .await?
             {
-                return Ok(None);
+                if self
+                    .commit_activity_start_gate(&state, owner_attempt, command)
+                    .await?
+                {
+                    return Ok(ActivityStartOutcome::Suppressed);
+                }
+                if attempts >= self.config.max_occ_retries {
+                    return Err(crate::RetryableActivityTaskStart(
+                        "rule observation changed repeatedly".into(),
+                    )
+                    .into());
+                }
+                attempts += 1;
+                continue;
             }
 
             if activity_start_rejected_by_in_flight_transition(&state) {
-                self.republish_rejected_activity_task(task).await;
-                return Ok(None);
+                return Ok(ActivityStartOutcome::Suppressed);
             }
 
             // The activity poller is on an activity task queue, but the
@@ -1200,35 +1500,27 @@ where
                 // The matching mutable-state path starts the transition and
                 // requests `CreateWorkflowTask`; this kernel command applies
                 // the same transition and schedules a WFT when needed.
-                let result = self
-                    .submit_for_owned_home(
-                        task.run_key,
-                        self.execution_home(&state),
-                        Command::StartDeploymentTransition(
-                            tokeira_kernel::StartDeploymentTransitionRequest {
-                                target,
-                                revision_number: task.dispatch_revision,
-                                now: OffsetDateTime::now_utc(),
-                            },
-                        ),
-                    )
-                    .await;
-                match result {
-                    Ok(_) => self.republish_rejected_activity_task(task).await,
-                    Err(error)
-                        if error.to_string().contains(
-                            "pinned workflow cannot start a deployment-version transition",
-                        ) =>
-                    {
-                        // A concurrent update can pin the run after the runtime
-                        // made its routing decision. The kernel is the final
-                        // authority; once it rejects, this poll is stale and
-                        // must not start the activity against the old premise.
-                        return Ok(None);
-                    }
-                    Err(error) => return Err(error),
+                let command = Command::StartDeploymentTransition(
+                    tokeira_kernel::StartDeploymentTransitionRequest {
+                        target,
+                        revision_number: task.dispatch_revision,
+                        now: OffsetDateTime::now_utc(),
+                    },
+                );
+                if self
+                    .commit_activity_start_gate(&state, owner_attempt, command)
+                    .await?
+                {
+                    return Ok(ActivityStartOutcome::Suppressed);
                 }
-                return Ok(None);
+                if attempts >= self.config.max_occ_retries {
+                    return Err(crate::RetryableActivityTaskStart(
+                        "routing observation changed repeatedly".into(),
+                    )
+                    .into());
+                }
+                attempts += 1;
+                continue;
             }
 
             // The kernel computes the start, so its event follows the same
@@ -1243,6 +1535,7 @@ where
                 .apply_activity_started(
                     LoadedRun::Existing(state.clone()),
                     ActivityStartRequest {
+                        request_id: Some(request_id),
                         activity_id: task.activity_id.clone(),
                         identity: worker_identity.clone(),
                         principal: None,
@@ -1251,6 +1544,18 @@ where
                     },
                 )
                 .map_err(|reject| anyhow::Error::new(KernelRejected(reject)))?;
+            transition.next_state.activity_start_receipts.insert(
+                task.activity_id.clone(),
+                tokeira_kernel::ActivityStartReceipt {
+                    request_id,
+                    schedule_event_id: task.schedule_event_id,
+                    attempt: task.attempt,
+                    offered_stamp: task.stamp,
+                    worker_identity: worker_identity.clone(),
+                    selected_queue: task.queue.clone(),
+                    dispatch_revision: task.dispatch_revision,
+                },
+            );
             transition.growth_limits = Some(crate::run_growth::run_growth_limits());
             let next_activity = transition
                 .next_state
@@ -1266,31 +1571,44 @@ where
             // event never changes, so a retry after a conflict keeps what the
             // first pass read.
             if scheduled.is_none() {
-                scheduled = Some(self.read_scheduled_input(task).await?);
+                scheduled = Some(if let Some((input, header)) = eager.as_ref() {
+                    if current.attempt != 1 {
+                        return Ok(ActivityStartOutcome::Stale);
+                    }
+                    ActivitySchedule {
+                        input: input.clone(),
+                        header: header.clone(),
+                        scheduled_time: current.scheduled_at,
+                        schedule_to_close_timeout: current.schedule_to_close_timeout,
+                        start_to_close_timeout: current.start_to_close_timeout,
+                        heartbeat_timeout: current.heartbeat_timeout,
+                    }
+                } else {
+                    self.read_scheduled_input(task).await?
+                });
             }
 
-            // Mirror the lane's fence (see lane.rs): under controller-managed
-            // placement, the home's lease at the epoch this node holds it, so
-            // storage refuses a superseded owner's write — the authoritative
-            // ownership check. With no placement controller there is no lease
-            // to fence against (`bundle-lease-fence`).
-            let (bundle, fence) = {
-                let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
-                let bundle_id = execution_home_bundle(
-                    state.namespace_id.0.as_bytes(),
-                    state.workflow_id.0.as_bytes(),
-                    owner.shard_count(),
-                );
-                let fence = owner.write_fence(bundle_id).ok_or_else(|| {
-                    crate::errors::NotShardOwner::local(bundle_id, ShardEpoch::ZERO)
-                })?;
-                (bundle_id, fence)
-            };
-
+            let started = activity_start_response(
+                &state,
+                &next_activity,
+                task,
+                scheduled
+                    .as_ref()
+                    .expect("the start reads its input before commit"),
+                owner_attempt.acquisition.epoch,
+                false,
+            );
+            crate::activity_task_start::preflight_activity_start(&started)?;
             let mut write_admission = crate::serving_gate::admit(&self.shard_owner, bundle).await?;
+            owner_attempt.validate(&self.shard_owner)?;
             let committed = self
                 .repo
-                .commit_transition_for_bundle(task.run_key, bundle, transition, fence)
+                .commit_transition_for_bundle(
+                    task.run_key,
+                    bundle,
+                    transition,
+                    owner_attempt.fence.clone(),
+                )
                 .await
                 .map_err(|error| crate::errors::lease_loss(error, &self.shard_owner));
             let committed = terminate_on_growth_breach(
@@ -1308,72 +1626,31 @@ where
                 .is_err_and(|error| error.downcast_ref::<RunLimitExceeded>().is_some())
             {
                 runtime_metrics::record_activity_task_started(OutcomeLabel::Failure);
-                return Ok(None);
+                return Ok(ActivityStartOutcome::Stale);
             }
             match committed? {
                 CommitResult::Applied { .. } => {
-                    let (input, header) = scheduled
-                        .take()
-                        .expect("the start reads its input before it commits");
                     runtime_metrics::record_activity_task_started(OutcomeLabel::Success);
                     self.delivery_metrics
                         .record_latency(&task.queue, entered_at.elapsed());
-                    self.activity_tracking.record_started(
-                        task.run_key,
-                        &next_activity.activity_id,
-                        OffsetDateTime::now_utc(),
-                    );
-                    let origin = WorkerTaskOrigin::from_queue_key(
-                        &task.queue,
-                        next_activity.task_queue.clone(),
-                        WorkerTaskClass::Activity,
-                    );
-                    return Ok(Some(StartedActivityTask {
-                        run_key: task.run_key,
-                        run_id: state.run_id,
-                        activity_id: next_activity.activity_id.clone(),
-                        activity_type: next_activity.activity_type.clone(),
-                        task_queue: next_activity.task_queue.clone(),
-                        token: ActivityTaskToken {
-                            run_key: task.run_key,
-                            activity_id: next_activity.activity_id.clone(),
-                            schedule_event_id: next_activity.schedule_event_id,
-                            attempt: next_activity.attempt,
-                            shard_epoch: self.current_shard_epoch(&state).await?,
-                        },
-                        input,
-                        attempt: next_activity.attempt,
-                        workflow_id: state.workflow_id.0.clone(),
-                        workflow_type: state.workflow_type.0.clone(),
-                        header,
-                        retry_policy: next_activity.retry_policy.clone(),
-                        heartbeat_details: next_activity.heartbeat_details.clone(),
-                        scheduled_time: next_activity.scheduled_at,
-                        current_attempt_scheduled_time: next_activity.current_attempt_scheduled_at,
-                        started_time: now,
-                        schedule_to_close_timeout: next_activity.schedule_to_close_timeout,
-                        start_to_close_timeout: next_activity.start_to_close_timeout,
-                        heartbeat_timeout: next_activity.heartbeat_timeout,
-                        origin,
-                    }));
+                    // Callback authority stays with the acquisition that committed;
+                    // a replacement owner must reconstruct its own timeout tracking.
+                    start_tracking.record_started(task.run_key, &next_activity.activity_id, now);
+                    return Ok(ActivityStartOutcome::Started(started));
                 }
                 CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
                     if attempts >= self.config.max_occ_retries {
                         runtime_metrics::record_activity_task_started(OutcomeLabel::Failure);
-                        if let Err(error) = self
-                            .activity_broker
-                            .publish_activity_task(task.clone(), Some(&self.delivery_metrics))
-                            .await
-                        {
-                            tracing::warn!(?error, run_key = ?task.run_key, activity_id = task.activity_id, "failed to republish activity task after start conflict exhaustion");
-                        }
-                        return Ok(None);
+                        return Err(crate::RetryableActivityTaskStart(
+                            "activity start OCC budget exhausted".into(),
+                        )
+                        .into());
                     }
                     attempts += 1;
                 }
                 CommitResult::Duplicate => {
                     runtime_metrics::record_activity_task_started(OutcomeLabel::Failure);
-                    return Ok(None);
+                    return Ok(ActivityStartOutcome::Stale);
                 }
             }
         }
@@ -1392,8 +1669,8 @@ where
     async fn read_scheduled_input(
         &self,
         task: &DispatchableActivityTask,
-    ) -> Result<ScheduledInput> {
-        let read = match self
+    ) -> Result<ActivitySchedule> {
+        match self
             .repo
             .read_history_event(task.run_key, task.schedule_event_id)
             .await
@@ -1406,10 +1683,21 @@ where
                         activity_id,
                         input,
                         header,
+                        schedule_to_close_timeout,
+                        start_to_close_timeout,
+                        heartbeat_timeout,
                         ..
                     },
+                happened_at,
                 ..
-            })) if activity_id == task.activity_id => Ok((input, header)),
+            })) if activity_id == task.activity_id => Ok(ActivitySchedule {
+                input,
+                header,
+                scheduled_time: happened_at,
+                schedule_to_close_timeout,
+                start_to_close_timeout,
+                heartbeat_timeout,
+            }),
             Ok(_) => Err(anyhow!(
                 "unable to get activity scheduled event {} of activity {} in run {}",
                 task.schedule_event_id,
@@ -1417,35 +1705,6 @@ where
                 task.run_key.0
             )),
             Err(error) => Err(error),
-        };
-        if read.is_err()
-            && let Err(error) = self
-                .activity_broker
-                .publish_activity_task(task.clone(), Some(&self.delivery_metrics))
-                .await
-        {
-            tracing::warn!(
-                ?error,
-                run_key = ?task.run_key,
-                activity_id = task.activity_id,
-                "failed to republish activity task after its scheduled-event read failed"
-            );
-        }
-        read
-    }
-
-    async fn republish_rejected_activity_task(&self, task: &DispatchableActivityTask) {
-        if let Err(error) = self
-            .activity_broker
-            .publish_activity_task(task.clone(), Some(&self.delivery_metrics))
-            .await
-        {
-            tracing::warn!(
-                ?error,
-                run_key = ?task.run_key,
-                activity_id = task.activity_id,
-                "failed to republish activity task rejected during worker-deployment transition"
-            );
         }
     }
 
@@ -1645,12 +1904,11 @@ pub(crate) struct ActivityRetryTarget<'a> {
     pub expected_schedule_event_id: i64,
 }
 
-/// Commit an activity's next attempt and (re)publish its dispatch task after
-/// the retry backoff.
+/// Commit an activity's next attempt and durable eligibility time.
 ///
-/// Bumps the attempt, clears the started markers, and commits a transition
-/// whose dispatch op re-enqueues the activity task — the reject-and-retry
-/// half of activity failure handling, also run by the timeout scanner when a
+/// Canonical storage maintenance retains the future attempt's row; owner
+/// eligibility tracking evaluates rules at the deadline and queue-home discovery
+/// reconstructs offers. The timeout scanner uses the same transition when a
 /// fired attempt timeout is retryable (`RetryActivity` →
 /// `UpdateActivityInfoForRetries`, mutable_state_impl.go + activity.go:63-97
 /// @ v1.31.0). The reload-and-recheck OCC loop guards against a concurrent
@@ -1699,6 +1957,9 @@ where
         next_state.transition_seq = state.transition_seq.next();
         let mut next_activity = current.clone();
         next_activity.attempt = next_attempt;
+        // A retry is a new incarnation: the preceding start can no longer be
+        // replayed even if its queue owner retries an ambiguous response.
+        next_state.activity_start_receipts.remove(activity_id);
         next_activity.stamp += 1;
         next_activity.started_at = None;
         next_activity.started_event_id = None;
@@ -1820,7 +2081,7 @@ where
         };
 
         // Same fence as start_activity_task (`bundle-lease-fence`).
-        let (bundle, fence) = {
+        let (bundle, fence, acquisition) = {
             let owner = deps.shard_owner.read().expect("shard_owner lock poisoned");
             let bundle_id = execution_home_bundle(
                 state.namespace_id.0.as_bytes(),
@@ -1830,10 +2091,28 @@ where
             let fence = owner
                 .write_fence(bundle_id)
                 .ok_or_else(|| crate::errors::NotShardOwner::local(bundle_id, ShardEpoch::ZERO))?;
-            (bundle_id, fence)
+            (
+                bundle_id,
+                fence,
+                owner
+                    .acquisition(bundle_id)
+                    .expect("fenced activity retry has an acquisition"),
+            )
         };
 
         let mut write_admission = crate::serving_gate::admit(&deps.shard_owner, bundle).await?;
+        if let Some(captured) = deps.tracking.inner.captured_acquisition()
+            && captured.generation != acquisition.generation
+        {
+            return Err(
+                crate::errors::NotShardOwner::local(captured.shard_id, captured.epoch).into(),
+            );
+        }
+        crate::outbound::driver::Attempt {
+            acquisition: acquisition.clone(),
+            fence: fence.clone(),
+        }
+        .validate(&deps.shard_owner)?;
         let committed = deps
             .repo
             .commit_transition_for_bundle(run_key, bundle, transition, fence)
@@ -1842,76 +2121,16 @@ where
         match terminate_on_growth_breach(&deps.lanes, run_key, committed, &mut write_admission)
             .await?
         {
-            CommitResult::Applied { .. } => {
+            CommitResult::Applied { new_state } => {
+                let tracking = deps.tracking.for_acquisition(acquisition);
+                tracking.eligibility.refresh(&new_state, bundle);
                 if paused {
-                    deps.tracking.remove(run_key, activity_id);
+                    tracking.remove(run_key, activity_id);
                     return Ok(());
                 }
-                deps.tracking
-                    .record_retry(run_key, activity_id, dispatch_at);
-                let Some(dispatch_task) = dispatch_task else {
-                    return Err(anyhow!("dispatchable activity retry missing after commit"));
-                };
-                if backoff.is_positive() {
-                    // Backoff-delayed dispatch: the commit above recorded the
-                    // durable eligibility time; this in-memory timer is only
-                    // the LOW-LATENCY publication path. The durable dispatch
-                    // row is the correctness obligation — if this timer is
-                    // lost for any reason, the activity scanner's durable
-                    // reconciliation republishes the row once due, mirroring
-                    // v1.31.0's retried durable retry timer
-                    // (`executeActivityRetryTimerTask`,
-                    // timer_queue_active_task_executor.go:522-620 @ v1.31.0).
-                    let timer_deps = deps.clone();
-                    let activity_id = activity_id.to_string();
-                    let delay = std::time::Duration::from_millis(
-                        backoff.whole_milliseconds().max(0) as u64,
-                    );
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        match prepare_activity_dispatch_publish(
-                            &timer_deps,
-                            &dispatch_task,
-                            OffsetDateTime::now_utc(),
-                        )
-                        .await
-                        {
-                            Ok(ActivityDispatchPreparation::Publish(dispatch_task)) => {
-                                if let Err(error) = timer_deps
-                                    .broker
-                                    .publish_activity_task(
-                                        dispatch_task,
-                                        Some(&timer_deps.delivery_metrics),
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish backoff-delayed activity retry");
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(error) => {
-                                // Rule evaluation is a correctness gate. The durable
-                                // row stays; the scanner's reconciliation retries the
-                                // publish later. Publishing without the check could
-                                // defeat a namespace pause policy.
-                                tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to evaluate workflow rules for backoff-delayed activity retry");
-                            }
-                        }
-                    });
-                } else if let ActivityDispatchPreparation::Publish(dispatch_task) =
-                    prepare_activity_dispatch_publish(
-                        deps,
-                        &dispatch_task,
-                        OffsetDateTime::now_utc(),
-                    )
-                    .await?
-                    && let Err(error) = deps
-                        .broker
-                        .publish_activity_task(dispatch_task, Some(&deps.delivery_metrics))
-                        .await
-                {
-                    tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish retried activity task");
-                }
+                tracking.record_retry(run_key, activity_id, dispatch_at);
+                // The committed canonical row is discoverable independently of
+                // this callback; eligibility tracking applies later owner rules.
                 return Ok(());
             }
             CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
@@ -1962,12 +2181,11 @@ pub(crate) fn activity_dispatch_task(
     }
 }
 
-/// The classified outcome of preparing one durable activity dispatch for
-/// broker publication.
+/// Execution-owner eligibility outcome; none of these outcomes publishes work.
 #[derive(Debug)]
 pub(crate) enum ActivityDispatchPreparation {
-    /// Authoritative state accepts the dispatch: publish this routed task.
-    Publish(DispatchableActivityTask),
+    /// The due attempt passed owner rule evaluation.
+    Eligible,
     /// A workflow rule paused the activity. The pause transition committed
     /// (its activity upsert deletes the durable dispatch row) and nothing
     /// publishes.
@@ -2011,143 +2229,48 @@ pub(crate) fn activity_backoff_interval_seconds(
     Ok(Some((scheduled_at - completed_at).whole_seconds()))
 }
 
-/// One bounded reconciliation pass over a shard's due durable dispatch rows.
-///
-/// For each row due at `now`: revalidate through the shared preparation gate
-/// and publish accepted tasks (broker dedupe on `(run, activity, attempt,
-/// stamp)` makes a still-parked offer a no-op, and a taken-but-unstarted
-/// offer republishable); conditionally prune rows the gate proves permanently
-/// stale, using the exact observed row version so a concurrently replaced
-/// live row is untouched — pruning is also what keeps a bounded pass making
-/// forward progress instead of re-reading zombie rows forever. Transient
-/// errors and not-yet-dispatchable rows are left intact for a later pass;
-/// publication failure never removes the durable row.
-pub(crate) async fn reconcile_due_activity_dispatches_once<R>(
-    deps: &ActivityRetryDeps<R>,
-    shard_id: ShardId,
-    now: OffsetDateTime,
-    limit: usize,
-) -> usize
-where
-    R: RunRepository + 'static,
-{
-    let due = match deps
-        .repo
-        .list_due_dispatchable_activity_tasks_for_shard(shard_id, now, None, limit)
-        .await
-    {
-        Ok(due) => due,
-        Err(error) => {
-            tracing::warn!(
-                ?error,
-                shard_id = shard_id.0,
-                "failed to list due activity dispatches"
-            );
-            return 0;
-        }
-    };
-    reconcile_activity_dispatch_candidates(deps, due, now).await
-}
-
-/// Run listed due rows through the shared gate; returns how many published.
-///
-/// Split from [`reconcile_due_activity_dispatches_once`] so shard recovery
-/// can list with its own error propagation (a failing sweep query aborts the
-/// takeover) while sharing the exact per-candidate semantics.
-pub(crate) async fn reconcile_activity_dispatch_candidates<R>(
-    deps: &ActivityRetryDeps<R>,
-    candidates: Vec<tokeira_storage::DueActivityDispatch>,
-    now: OffsetDateTime,
-) -> usize
-where
-    R: RunRepository + 'static,
-{
-    let mut published = 0usize;
-    for candidate in candidates {
-        // Broker-resident work needs no healing. Skipping it prevents every
-        // scanner tick from reloading authoritative state and workflow rules for
-        // the entire healthy backlog. The observation carries no correctness
-        // weight: once a poll takes the offer its dedupe key disappears, so a
-        // lost take is fully revalidated and republished on the following tick.
-        if deps.broker.contains_activity_task(&candidate.task).await {
-            continue;
-        }
-        match prepare_activity_dispatch_publish(deps, &candidate.task, now).await {
-            Ok(ActivityDispatchPreparation::Publish(task)) => {
-                if let Err(error) = deps
-                    .broker
-                    .publish_activity_task(task, Some(&deps.delivery_metrics))
-                    .await
-                {
-                    tracing::warn!(
-                        ?error,
-                        run_key = ?candidate.task.run_key,
-                        activity_id = candidate.task.activity_id,
-                        "failed to publish reconciled activity dispatch"
-                    );
-                } else {
-                    published += 1;
-                }
-            }
-            Ok(
-                ActivityDispatchPreparation::SuppressedByRule
-                | ActivityDispatchPreparation::NotYetDispatchable,
-            ) => {}
-            Ok(ActivityDispatchPreparation::PermanentlyStale) => {
-                if let Err(error) = deps
-                    .repo
-                    .delete_activity_dispatch_if_matches(&candidate.identity())
-                    .await
-                {
-                    tracing::warn!(
-                        ?error,
-                        run_key = ?candidate.task.run_key,
-                        activity_id = candidate.task.activity_id,
-                        "failed to prune permanently stale activity dispatch row"
-                    );
-                }
-            }
-            Err(error) => {
-                // Transient: authoritative reads and rule evaluation are
-                // correctness gates; the durable row stays for the next pass.
-                tracing::warn!(
-                    ?error,
-                    run_key = ?candidate.task.run_key,
-                    activity_id = candidate.task.activity_id,
-                    "failed to prepare reconciled activity dispatch"
-                );
-            }
-        }
-    }
-    published
-}
-
-/// Revalidate a durable activity dispatch against authoritative state and
-/// apply any workflow rule created since it was recorded.
-///
-/// The shared publication gate for the backoff timer, the scanner's durable
-/// reconciliation, and shard recovery — the local equivalent of v1.31.0's
-/// retry-timer executor, which reloads mutable state, validates stamp, pause,
-/// attempt, `StartedEventId`, and workflow-running state, evaluates current
-/// Workflow Rules, and only then adds the task to matching
-/// (`executeActivityRetryTimerTask`,
-/// timer_queue_active_task_executor.go:522-620,945-977 @ v1.31.0). Errors are
-/// transient: the durable row stays for a later pass, and publication never
-/// proceeds past a failed correctness gate.
-async fn prepare_activity_dispatch_publish<R>(
+/// Evaluate the captured execution-owner timer without resolving a queue or
+/// publishing an offer. A non-match is read-only; a pause uses the captured fence.
+pub(crate) async fn evaluate_activity_eligibility<R: RunRepository + 'static>(
     deps: &ActivityRetryDeps<R>,
     task: &DispatchableActivityTask,
     now: OffsetDateTime,
-) -> Result<ActivityDispatchPreparation>
-where
-    R: RunRepository + 'static,
-{
+    attempt: &crate::outbound::driver::Attempt,
+) -> Result<bool> {
+    Ok(!matches!(
+        prepare_activity_dispatch(deps, task, now, attempt).await?,
+        ActivityDispatchPreparation::NotYetDispatchable
+    ))
+}
+
+async fn prepare_activity_dispatch<R: RunRepository + 'static>(
+    deps: &ActivityRetryDeps<R>,
+    task: &DispatchableActivityTask,
+    now: OffsetDateTime,
+    captured: &crate::outbound::driver::Attempt,
+) -> Result<ActivityDispatchPreparation> {
     use ActivityDispatchPreparation as Preparation;
     let mut attempts = 0u32;
     loop {
+        captured.validate(&deps.shard_owner)?;
         let LoadedRun::Existing(state) = deps.repo.load_run(task.run_key).await? else {
             return Ok(Preparation::PermanentlyStale);
         };
+        {
+            captured.validate(&deps.shard_owner)?;
+            let home = execution_home_bundle(
+                state.namespace_id.0.as_bytes(),
+                state.workflow_id.0.as_bytes(),
+                deps.shard_owner
+                    .read()
+                    .expect("shard owner lock poisoned")
+                    .shard_count(),
+            );
+            anyhow::ensure!(
+                home == captured.acquisition.shard_id,
+                "activity eligibility run belongs to another execution home"
+            );
+        }
         // Exactly `Running`: `is_open()` also admits `Paused`, and workflow
         // pause deletes the run's dispatch rows (resume recreates them), so a
         // row observed against a paused workflow is lifecycle-stale.
@@ -2189,26 +2312,12 @@ where
         }
 
         let rules = deps.repo.list_workflow_rules(state.namespace_id).await?;
+        captured.validate(&deps.shard_owner)?;
         let backoff_interval_seconds = activity_backoff_interval_seconds(&current)?;
         let Some(rule) =
             matching_pause_rule(&state, &current, &rules, now, backoff_interval_seconds)
         else {
-            let registry = deps
-                .worker_deployment_registry
-                .read()
-                .expect("worker deployment registry lock poisoned")
-                .clone();
-            let (queue, dispatch_revision) = route_activity_task_queue(
-                registry.as_ref(),
-                &state,
-                task.queue.clone(),
-                task.dispatch_revision,
-            )
-            .await?;
-            let mut routed = task.clone();
-            routed.queue = queue;
-            routed.dispatch_revision = dispatch_revision;
-            return Ok(Preparation::Publish(routed));
+            return Ok(Preparation::Eligible);
         };
 
         let mut next_state = state.clone();
@@ -2232,20 +2341,12 @@ where
             events_numbered_at_close: 0,
             growth_limits: Some(crate::run_growth::run_growth_limits()),
         };
-        let (bundle, fence) = {
-            let owner = deps.shard_owner.read().expect("shard_owner lock poisoned");
-            let bundle_id = execution_home_bundle(
-                state.namespace_id.0.as_bytes(),
-                state.workflow_id.0.as_bytes(),
-                owner.shard_count(),
-            );
-            let fence = owner
-                .write_fence(bundle_id)
-                .ok_or_else(|| crate::errors::NotShardOwner::local(bundle_id, ShardEpoch::ZERO))?;
-            (bundle_id, fence)
-        };
+        captured.validate(&deps.shard_owner)?;
+        let bundle = captured.acquisition.shard_id;
+        let fence = captured.fence.clone();
 
         let mut write_admission = crate::serving_gate::admit(&deps.shard_owner, bundle).await?;
+        captured.validate(&deps.shard_owner)?;
         let committed = deps
             .repo
             .commit_transition_for_bundle(task.run_key, bundle, transition, fence)
@@ -2255,7 +2356,9 @@ where
             .await?
         {
             CommitResult::Applied { .. } => {
-                deps.tracking.remove(task.run_key, &task.activity_id);
+                // Eligibility completion retires its submitted revision in the
+                // scanner. An older pause reply must not remove tracking that
+                // a concurrent unpause installed while this commit was pending.
                 return Ok(Preparation::SuppressedByRule);
             }
             CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
@@ -2356,6 +2459,7 @@ mod tests {
 
     fn open_state(info: Option<WorkflowVersioningInfo>) -> WorkflowState {
         WorkflowState {
+            activity_start_receipts: std::collections::BTreeMap::new(),
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,
@@ -2800,7 +2904,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         )
         .with_worker_deployment_repository(repo.clone());
         let pinned = pinned_state().versioning_info;
@@ -2858,7 +2961,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         )
         .with_worker_deployment_repository(repo);
         let registry = runtime
@@ -2918,7 +3020,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         )
         .with_worker_deployment_repository(repo.clone());
         let (state, source, mut task) = seed_scheduled_activity(&runtime, &repo).await;
@@ -2940,6 +3041,7 @@ mod tests {
         let started = runtime
             .start_activity_task(
                 &task,
+                Uuid::new_v4(),
                 tokio::time::Instant::now(),
                 &WorkerIdentity("activity-worker".to_string()),
                 None,
@@ -2982,7 +3084,6 @@ mod tests {
                     ..Default::default()
                 },
                 WorkflowTimeoutScannerConfig::default(),
-                BacklogConfig::default(),
             ));
             let (state, _, task) = seed_scheduled_activity(&runtime, &repo).await;
             runtime.activity_broker.remove_run(state.run_key).await;
@@ -3036,16 +3137,12 @@ mod tests {
             });
             entered.await.unwrap();
             assert!(runtime.active_shards().is_empty());
-            assert_eq!(
-                reconcile_due_activity_dispatches_once(
-                    &runtime.activity_retry_deps(),
-                    ShardId(0),
-                    OffsetDateTime::now_utc(),
-                    64
-                )
-                .await,
-                0
-            );
+            crate::activity_eligibility::scan_activity_eligibility_once(
+                &runtime.activity_retry_deps(),
+                ShardId(0),
+                OffsetDateTime::now_utc(),
+            )
+            .await;
             assert_eq!(repo.snapshot().await.unwrap(), before);
             if interrupted {
                 drop(resume);
@@ -3078,11 +3175,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            reconcile_due_activity_dispatches_once(
+            crate::activity_eligibility::scan_activity_eligibility_once(
                 &runtime.activity_retry_deps(),
                 ShardId(0),
                 OffsetDateTime::now_utc(),
-                64,
             )
             .await;
             let LoadedRun::Existing(after) = repo.load_run(state.run_key).await.unwrap() else {
@@ -3109,7 +3205,6 @@ mod tests {
                 LaneConfig::default(),
                 TimerScannerConfig::default(),
                 WorkflowTimeoutScannerConfig::default(),
-                BacklogConfig::default(),
             );
             let (state, queue, task) = seed_scheduled_activity(&runtime, &repo).await;
             assert_eq!(
@@ -3129,6 +3224,7 @@ mod tests {
                         queue,
                         task.run_key,
                         task.activity_id.clone(),
+                        task.schedule_event_id,
                         WorkerIdentity("worker".to_string()),
                         Payloads::default(),
                         None,
@@ -3172,12 +3268,11 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         ));
         let (state, queue, task) = seed_scheduled_activity(&runtime, &repo).await;
-        runtime
+        let seed_offer = runtime
             .activity_broker
-            .try_claim_activity_task(&queue, task.run_key, &task.activity_id)
+            .try_claim_activity_offer(&queue, task.run_key, &task.activity_id)
             .await
             .expect("remove the seed offer before admitting the test poll");
 
@@ -3214,6 +3309,9 @@ mod tests {
         )
         .await
         .expect("store rule after poll admission");
+        // Keep the taken incarnation in flight until admission is observed;
+        // otherwise durable discovery can refill it before the poll parks.
+        drop(seed_offer);
         runtime
             .activity_broker
             .publish_activity_task(task.clone(), Some(&runtime.delivery_metrics))
@@ -3250,7 +3348,6 @@ mod tests {
                 LaneConfig::default(),
                 TimerScannerConfig::default(),
                 WorkflowTimeoutScannerConfig::default(),
-                BacklogConfig::default(),
             );
             let (state, token, _queue) = seed_started_activity(&runtime, &repo, None).await;
             repo.create_workflow_rule(
@@ -3293,6 +3390,136 @@ mod tests {
         }
     }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(100))]
+
+        // Feature: activity-dispatch, Property 10: delayed control operations restore owner eligibility without poll demand.
+        #[test]
+        fn delayed_activity_controls_evaluate_rules_at_eligibility(reset in proptest::bool::ANY, restart in proptest::bool::ANY, seconds in 2i64..30) {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let repo = Arc::new(InMemoryStore::default());
+                let runtime = quiet_runtime(repo.clone());
+                let (mut state, queue, task) = seed_scheduled_activity(&runtime, &repo).await;
+                state.workflow_run_timeout = None;
+                state.workflow_execution_timeout = None;
+                replace_activity_fixture(&repo, state).await;
+                let now = OffsetDateTime::now_utc();
+                let request = |id: &str| RequestContext { request_id: RequestId(id.into()), ..RequestContext::unattributed(now) };
+                runtime.submit(task.run_key, Command::PauseActivity(tokeira_kernel::PauseActivityRequest {
+                    target: tokeira_kernel::ActivityControlTarget::Id(task.activity_id.clone()),
+                    identity: "operator".into(), reason: "control fixture".into(), rule_id: None,
+                    request: request("pause"), now,
+                })).await.unwrap();
+                let due = now + Duration::seconds(seconds);
+                let control = if reset { Command::ResetActivity(tokeira_kernel::ResetActivityRequest {
+                    target: tokeira_kernel::ActivityControlTarget::Id(task.activity_id.clone()), reset_heartbeat: true,
+                    keep_paused: false, dispatch_at: due, original_options: BTreeMap::new(), restore_original_options: false,
+                    request: request("reset"), now,
+                }) } else { Command::UnpauseActivity(tokeira_kernel::UnpauseActivityRequest {
+                    target: tokeira_kernel::ActivityControlTarget::Id(task.activity_id.clone()), reset_attempts: false,
+                    reset_heartbeat: false, dispatch_at: due, request: request("unpause"), now,
+                }) };
+                runtime.submit(task.run_key, control).await.unwrap();
+                repo.create_workflow_rule(queue.namespace_id, pause_rule("delayed-control", "Attempts >= 1"), 10).await.unwrap();
+                if restart { runtime.recover_self_assigned_shard(ShardId(0), ShardEpoch::ZERO).await.unwrap(); }
+                let before = repo.load_run(task.run_key).await.unwrap();
+                let deps = runtime.activity_retry_deps();
+                crate::activity_eligibility::scan_activity_eligibility_once(&deps, ShardId(0), due - Duration::microseconds(1)).await;
+                prop_assert_eq!(&repo.load_run(task.run_key).await.unwrap(), &before);
+                crate::activity_eligibility::scan_activity_eligibility_once(&deps, ShardId(0), due).await;
+                let LoadedRun::Existing(after) = repo.load_run(task.run_key).await.unwrap() else { panic!("run"); };
+                let activity = &after.activities[&task.activity_id];
+                prop_assert_eq!(activity.pause_info.as_ref().and_then(|pause| pause.rule_id.as_deref()), Some("delayed-control"));
+                prop_assert!(activity.started_event_id.is_none() && activity.current_attempt_scheduled_at.is_none());
+                prop_assert!(repo.list_all_dispatchable_activity_tasks(&queue, 10).await.unwrap().is_empty());
+                runtime.runtime_shutdown.begin_shutdown();
+                runtime.runtime_shutdown.wait(std::time::Instant::now() + std::time::Duration::from_secs(10)).await.unwrap();
+                Ok(())
+            })?;
+        }
+
+        // Feature: activity-dispatch, Property 10
+        // Due rule checks survive acquisition without pollers, and successful non-matches stay retired until a new acquisition.
+        #[test]
+        fn activity_eligibility_rules_survive_restart(backoff_seconds in 2i64..120, restart in proptest::bool::ANY, matches_rule in proptest::bool::ANY) {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                let repo = Arc::new(InMemoryStore::default());
+                let runtime = TokeiraRuntime::new(repo.clone(), 1, LaneConfig::default(), TimerScannerConfig::default(), WorkflowTimeoutScannerConfig::default());
+                let (state, token, queue) = seed_started_activity(&runtime, &repo, None).await;
+                let deps = runtime.activity_retry_deps();
+                commit_activity_retry(&deps, ActivityRetryTarget { run_key: token.run_key, activity_id: &token.activity_id,
+                    expected_attempt: token.attempt, expected_schedule_event_id: token.schedule_event_id },
+                    2, Duration::seconds(backoff_seconds), None, None).await.unwrap();
+                let LoadedRun::Existing(retried) = repo.load_run(token.run_key).await.unwrap() else { panic!("retry exists"); };
+                let due = retried.activities[&token.activity_id].current_attempt_scheduled_at.unwrap();
+                repo.create_workflow_rule(state.namespace_id, pause_rule("after-retry", if matches_rule { "Attempts >= 2" } else { "Attempts > 10" }), 10).await.unwrap();
+                if restart { runtime.recover_self_assigned_shard(ShardId(0), ShardEpoch::ZERO).await.unwrap(); }
+                crate::activity_eligibility::scan_activity_eligibility_once(&deps, ShardId(0), due - Duration::microseconds(1)).await;
+                assert_eq!(repo.load_run(token.run_key).await.unwrap(), LoadedRun::Existing(retried.clone()));
+                crate::activity_eligibility::scan_activity_eligibility_once(&deps, ShardId(0), due).await;
+                let LoadedRun::Existing(after) = repo.load_run(token.run_key).await.unwrap() else { panic!("run exists"); };
+                assert_eq!(after.activities[&token.activity_id].pause_info.is_some(), matches_rule);
+                if !matches_rule {
+                    assert_eq!(after, retried);
+                    repo.create_workflow_rule(state.namespace_id, pause_rule("after-evaluation", "Attempts >= 2"), 10).await.unwrap();
+                    deps.tracking.eligibility.refresh(&after, ShardId(0));
+                    crate::activity_eligibility::scan_activity_eligibility_once(&deps, ShardId(0), due).await;
+                    assert_eq!(repo.load_run(token.run_key).await.unwrap(), LoadedRun::Existing(after));
+                    runtime.recover_self_assigned_shard(ShardId(0), ShardEpoch::ZERO).await.unwrap();
+                    crate::activity_eligibility::scan_activity_eligibility_once(&deps, ShardId(0), due).await;
+                    let LoadedRun::Existing(after) = repo.load_run(token.run_key).await.unwrap() else { panic!("run exists"); };
+                    assert!(after.activities[&token.activity_id].pause_info.is_some());
+                }
+                assert_eq!(runtime.activity_broker.backlog_stats(&queue).await.count, 0);
+                runtime.runtime_shutdown.begin_shutdown();
+                runtime.runtime_shutdown.wait(std::time::Instant::now() + std::time::Duration::from_secs(10)).await.unwrap();
+            });
+        }
+
+        // Feature: activity-dispatch, Property 10
+        // A failing due prefix larger than one quantum cannot hide later eligibility obligations.
+        #[test]
+        fn activity_eligibility_failing_prefix_is_bounded(prefix in 65usize..90, tail in 1usize..15) {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                let repo = Arc::new(InMemoryStore::default());
+                let runtime = TokeiraRuntime::new(repo.clone(), 1, LaneConfig::default(), TimerScannerConfig::default(), WorkflowTimeoutScannerConfig::default());
+                let (mut state, queue, template) = seed_scheduled_activity(&runtime, &repo).await;
+                runtime.activity_broker.remove_run(state.run_key).await;
+                let activity_template = state.activities[&template.activity_id].clone();
+                let expected_seq = state.transition_seq;
+                state.transition_seq = expected_seq.next();
+                state.activities.clear();
+                let due = OffsetDateTime::now_utc() + Duration::minutes(2);
+                for i in 0..prefix + tail {
+                    let mut activity = activity_template.clone();
+                    activity.activity_id = format!("eligibility-{i:03}");
+                    activity.schedule_event_id = i as i64 + 10;
+                    activity.attempt = 2;
+                    activity.current_attempt_scheduled_at = Some(due);
+                    activity.last_attempt_complete_time = (i >= prefix).then_some(due - Duration::seconds(2));
+                    activity.schedule_to_start_timeout = None;
+                    activity.schedule_to_close_timeout = None;
+                    state.activities.insert(activity.activity_id.clone(), activity);
+                }
+                repo.commit_transition(state.run_key, Transition { expected_seq, next_state: state.clone(), history_events: SmallVec::new(),
+                    event_principals: SmallVec::new(), request_dedupe_ops: SmallVec::new(), activity_ops: SmallVec::new(), timer_ops: SmallVec::new(),
+                    dispatch_ops: SmallVec::new(), events_numbered_at_close: 0, growth_limits: None }, WriteFence::Unfenced).await.unwrap();
+                runtime.activity_tracking.eligibility.refresh(&state, ShardId(0));
+                repo.create_workflow_rule(state.namespace_id, pause_rule("bounded", "Attempts >= 2"), 10).await.unwrap();
+                let deps = runtime.activity_retry_deps();
+                crate::activity_eligibility::scan_activity_eligibility_once(&deps, ShardId(0), due).await;
+                assert_eq!(repo.load_run(state.run_key).await.unwrap(), LoadedRun::Existing(state.clone()));
+                crate::activity_eligibility::scan_activity_eligibility_once(&deps, ShardId(0), due).await;
+                let LoadedRun::Existing(after) = repo.load_run(state.run_key).await.unwrap() else { panic!("run exists"); };
+                for (i, activity) in after.activities.values().enumerate() { assert_eq!(activity.pause_info.is_some(), i >= prefix); }
+                assert_eq!(after.transition_seq.0 - state.transition_seq.0, tail as u64);
+                assert_eq!(repo.list_all_dispatchable_activity_tasks(&queue, 200).await.unwrap().len(), prefix);
+                runtime.runtime_shutdown.begin_shutdown();
+                runtime.runtime_shutdown.wait(std::time::Instant::now() + std::time::Duration::from_secs(10)).await.unwrap();
+            });
+        }
+    }
+
     #[tokio::test]
     async fn retry_timer_applies_rule_created_during_backoff_before_publish() {
         let repo = Arc::new(InMemoryStore::default());
@@ -3302,7 +3529,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         let (state, token, queue) = seed_started_activity(&runtime, &repo, None).await;
         let backoff = Duration::minutes(1);
@@ -3326,18 +3552,6 @@ mod tests {
         let LoadedRun::Existing(retried) = repo.load_run(token.run_key).await.unwrap() else {
             panic!("seeded run should exist after retry");
         };
-        let activity = retried.activities[&token.activity_id].clone();
-        let task = DispatchableActivityTask {
-            run_key: token.run_key,
-            queue: queue.clone(),
-            activity_id: activity.activity_id.clone(),
-            schedule_event_id: activity.schedule_event_id,
-            attempt: activity.attempt,
-            dispatch_revision: 0,
-            stamp: activity.stamp,
-            priority: None,
-            order: None,
-        };
         // The durable row exists during the backoff window (inspection view)
         // even though the delivery view withholds it until due.
         assert_eq!(
@@ -3355,12 +3569,14 @@ mod tests {
         )
         .await
         .expect("store rule during retry backoff");
-        assert!(matches!(
-            prepare_activity_dispatch_publish(&deps, &task, OffsetDateTime::now_utc() + backoff)
-                .await
-                .expect("evaluate delayed retry"),
-            ActivityDispatchPreparation::SuppressedByRule
-        ));
+        crate::activity_eligibility::scan_activity_eligibility_once(
+            &deps,
+            ShardId(0),
+            retried.activities[&token.activity_id]
+                .current_attempt_scheduled_at
+                .unwrap(),
+        )
+        .await;
 
         let LoadedRun::Existing(after) = repo.load_run(token.run_key).await.unwrap() else {
             panic!("seeded run should exist after timer evaluation");
@@ -3429,7 +3645,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         let (_state, token, queue) = seed_started_activity(&runtime, &repo, None).await;
         let closed = close_seeded_run(&repo, token.run_key).await;
@@ -3486,7 +3701,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         let (state, token, _queue) = seed_started_activity(&runtime, &repo, None).await;
         let activity = &state.activities[&token.activity_id];
@@ -3529,7 +3743,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         let (_state, token, queue) = seed_started_activity(&runtime, &repo, None).await;
         let details = payloads(b"checkpoint-1");
@@ -3621,7 +3834,6 @@ mod tests {
                 LaneConfig::default(),
                 TimerScannerConfig::default(),
                 WorkflowTimeoutScannerConfig::default(),
-                BacklogConfig::default(),
             );
             let (key, token, task) = if path < 2 {
                 let (state, token, _) =
@@ -3645,7 +3857,6 @@ mod tests {
                 LaneConfig::default(),
                 TimerScannerConfig::default(),
                 WorkflowTimeoutScannerConfig::default(),
-                BacklogConfig::default(),
             );
             let LoadedRun::Existing(before) = repo.load_run(key).await.unwrap() else {
                 panic!("missing legacy run")
@@ -3703,6 +3914,7 @@ mod tests {
                         runtime
                             .start_activity_task(
                                 &task.unwrap(),
+                                Uuid::new_v4(),
                                 tokio::time::Instant::now(),
                                 &WorkerIdentity("poller".into()),
                                 None,
@@ -3721,10 +3933,15 @@ mod tests {
                     .await
                     .unwrap();
                     assert!(matches!(
-                        prepare_activity_dispatch_publish(
+                        prepare_activity_dispatch(
                             &runtime.activity_retry_deps(),
                             &task.unwrap(),
-                            OffsetDateTime::now_utc()
+                            OffsetDateTime::now_utc(),
+                            &crate::outbound::driver::Attempt::capture(
+                                &runtime.shard_owner,
+                                ShardId(0)
+                            )
+                            .unwrap(),
                         )
                         .await
                         .unwrap(),
@@ -3757,7 +3974,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         let (_state, token, _queue) = seed_started_activity(&runtime, &repo, None).await;
         let now = OffsetDateTime::now_utc();
@@ -3820,7 +4036,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         let original = payloads(b"before-reset");
         let (_state, token, _queue) =
@@ -3958,7 +4173,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         let (state, token, _queue) = seed_started_activity(&runtime, &repo, None).await;
         let activity = &state.activities[&token.activity_id];
@@ -3995,7 +4209,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         let (_state, token, _queue) =
             seed_started_activity(&runtime, &repo, Some(payloads(b"heartbeat"))).await;
@@ -4035,7 +4248,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         let (_state, token, _queue) =
             seed_started_activity(&runtime, &repo, Some(payloads(b"before-reset"))).await;
@@ -4135,7 +4347,6 @@ mod tests {
                     LaneConfig::default(),
                     TimerScannerConfig::default(),
                     WorkflowTimeoutScannerConfig::default(),
-                    BacklogConfig::default(),
                 );
                 let (_state, mut token, _queue) =
                     seed_started_activity(&runtime, &repo, None).await;
@@ -4199,6 +4410,7 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(128))]
 
         // Feature: worker-deployments, Property 13: deployment-version transition lifecycle
+        // Feature: activity-dispatch, Property 11: equal revisions do not turn independent activities into workflow transitions.
         // **Validates: Requirements 9.2, 9.5, 9.6**
         #[test]
         fn property_activity_start_transition_lifecycle(
@@ -4359,7 +4571,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconciliation_skips_activity_already_resident_in_broker() {
+    async fn retained_activity_head_page_cannot_starve_later_due_work() {
         let repo = Arc::new(InMemoryStore::default());
         let runtime = TokeiraRuntime::new(
             repo.clone(),
@@ -4367,18 +4579,166 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
+        );
+        let (mut state, queue, template) = seed_scheduled_activity(&runtime, &repo).await;
+        runtime.activity_broker.remove_run(state.run_key).await;
+        let activity_template = state.activities[&template.activity_id].clone();
+        let expected_seq = state.transition_seq;
+        state.transition_seq = TransitionSeq(expected_seq.0 + 1);
+        state.activities.clear();
+        let cutoff = OffsetDateTime::now_utc();
+        let mut dispatch_ops = SmallVec::new();
+        let mut activity_ops = smallvec![ActivityOp::Delete {
+            activity_id: template.activity_id.clone()
+        }];
+        let mut offers = Vec::new();
+        for index in 0..65 {
+            let mut activity = activity_template.clone();
+            activity.activity_id = format!("retained-{index:03}");
+            activity.schedule_event_id = 10 + index;
+            activity.scheduled_at = cutoff - Duration::seconds(1) + Duration::microseconds(index);
+            activity.current_attempt_scheduled_at = Some(activity.scheduled_at);
+            let task = DispatchableActivityTask {
+                activity_id: activity.activity_id.clone(),
+                schedule_event_id: activity.schedule_event_id,
+                ..template.clone()
+            };
+            dispatch_ops.push(DispatchOp::EnqueueActivityTask {
+                queue: queue.clone(),
+                activity_id: activity.activity_id.clone(),
+                schedule_event_id: activity.schedule_event_id,
+                attempt: 1,
+                dispatch_revision: 0,
+                stamp: 0,
+                dispatch_at: activity.scheduled_at,
+                schedule_to_close_timeout: activity.schedule_to_close_timeout,
+                schedule_to_start_timeout: activity.schedule_to_start_timeout,
+                start_to_close_timeout: activity.start_to_close_timeout,
+                heartbeat_timeout: activity.heartbeat_timeout,
+                priority: None,
+            });
+            activity_ops.push(ActivityOp::Upsert(activity.clone()));
+            state
+                .activities
+                .insert(activity.activity_id.clone(), activity);
+            offers.push(task);
+        }
+        repo.commit_transition(
+            state.run_key,
+            Transition {
+                expected_seq,
+                next_state: state.clone(),
+                history_events: SmallVec::new(),
+                event_principals: SmallVec::new(),
+                request_dedupe_ops: SmallVec::new(),
+                activity_ops,
+                timer_ops: SmallVec::new(),
+                dispatch_ops,
+                events_numbered_at_close: 0,
+                growth_limits: None,
+            },
+            WriteFence::Unfenced,
+        )
+        .await
+        .expect("seed more than one due page");
+        for task in &offers[..64] {
+            runtime
+                .activity_broker
+                .publish_activity_task(task.clone(), None)
+                .await
+                .unwrap();
+        }
+        let tail = &offers[64];
+        let discovery = crate::activity_discovery::ActivityDiscoveryRegistry::default();
+        let home =
+            crate::discovery::QueueHomeProvider::local_home(runtime.discovery.1.as_ref(), &queue)
+                .unwrap();
+        let instant = tokio::time::Instant::now();
+        let _demand = discovery
+            .register_poll(queue.clone(), home, instant)
+            .unwrap();
+        let source = crate::activity_discovery::ActivitySource {
+            repo: repo.clone(),
+            registry: runtime.worker_deployment_registry.clone(),
+            owner: runtime.shard_owner.clone(),
+        };
+        // Resident offers retain their durable rows; a complete pass must still
+        // reach the lost offer after them without deleting the healthy prefix.
+        for _ in 0..4 {
+            let Some((key, home, mut pass)) = discovery.select(instant, cutoff) else {
+                break;
+            };
+            let outcome = crate::activity_discovery::run_slice(
+                &source,
+                &discovery,
+                &runtime.activity_broker,
+                &key,
+                &home,
+                &mut pass,
+            )
+            .await
+            .unwrap();
+            discovery.complete(&key, outcome, pass, instant);
+        }
+        assert!(
+            runtime.activity_broker.contains_activity_task(tail).await,
+            "65th due activity is starved behind 64 retained healthy rows"
+        );
+        assert_eq!(
+            repo.list_all_dispatchable_activity_tasks(&queue, 100)
+                .await
+                .unwrap()
+                .len(),
+            65
+        );
+        runtime.runtime_shutdown.begin_shutdown();
+    }
+
+    async fn discover_activity_page(
+        runtime: &TokeiraRuntime<InMemoryStore>,
+        queue: &QueueKey,
+    ) -> usize {
+        let before = runtime.activity_broker.backlog_stats(queue).await.count;
+        let registry = crate::activity_discovery::ActivityDiscoveryRegistry::default();
+        let home =
+            crate::discovery::QueueHomeProvider::local_home(runtime.discovery.1.as_ref(), queue)
+                .unwrap();
+        let now = tokio::time::Instant::now();
+        let _demand = registry.register_poll(queue.clone(), home, now).unwrap();
+        let source = crate::activity_discovery::ActivitySource {
+            repo: runtime.repo.clone(),
+            registry: runtime.worker_deployment_registry.clone(),
+            owner: runtime.shard_owner.clone(),
+        };
+        let (key, home, mut pass) = registry.select(now, OffsetDateTime::now_utc()).unwrap();
+        let outcome = crate::activity_discovery::run_slice(
+            &source,
+            &registry,
+            &runtime.activity_broker,
+            &key,
+            &home,
+            &mut pass,
+        )
+        .await
+        .unwrap();
+        registry.complete(&key, outcome, pass, now);
+        (runtime.activity_broker.backlog_stats(queue).await.count - before) as usize
+    }
+
+    #[tokio::test]
+    async fn discovery_skips_activity_already_resident_in_broker() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
         );
         let (state, queue, _task) = seed_scheduled_activity(&runtime, &repo).await;
         let deps = runtime.activity_retry_deps();
 
-        let published = reconcile_due_activity_dispatches_once(
-            &deps,
-            tokeira_types::ShardId(0),
-            OffsetDateTime::now_utc(),
-            1,
-        )
-        .await;
+        let published = discover_activity_page(&runtime, &queue).await;
 
         assert_eq!(published, 0, "resident work needs no reconciliation");
         let offered = deps
@@ -4391,7 +4751,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconciliation_prunes_stale_head_and_admits_live_row_under_limit_one() {
+    async fn obsolete_dispatch_effect_cannot_hide_live_row_under_limit_one() {
         let repo = Arc::new(InMemoryStore::default());
         let runtime = TokeiraRuntime::new(
             repo.clone(),
@@ -4399,7 +4759,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         // A live scheduled activity whose broker entry is consumed without a
         // Started commit (the lost-take shape).
@@ -4415,9 +4774,8 @@ mod tests {
             .expect("live offer");
         drop(offer);
 
-        // A zombie row ordered before the live one: a dispatch op whose
-        // activity does not exist in any run state, eligibility at epoch so it
-        // heads the (dispatch_at, ...) ordering.
+        // An obsolete effect cannot create a zombie ahead of live work: the
+        // committed state, rather than the dispatch operation, defines the rows.
         let zombie_run = RunKey::new();
         let mut zombie_state = state.clone();
         zombie_state.run_key = zombie_run;
@@ -4457,20 +4815,17 @@ mod tests {
         let deps = runtime.activity_retry_deps();
         let shard_id = tokeira_types::ShardId(0);
         let now = OffsetDateTime::now_utc();
-        // Pass 1 (budget one): only the stale head is scanned; it is
-        // conditionally pruned rather than retried forever.
-        let published = reconcile_due_activity_dispatches_once(&deps, shard_id, now, 1).await;
-        assert_eq!(published, 0, "the stale head publishes nothing");
+        // Even a one-row scan reaches the live incarnation immediately.
+        let published = discover_activity_page(&runtime, &queue).await;
+        assert_eq!(published, 1, "obsolete effects must not occupy the head");
         assert!(
             repo.list_all_dispatchable_activity_tasks(&queue, 10)
                 .await
                 .expect("inspect rows")
                 .iter()
                 .all(|task| task.run_key != zombie_run),
-            "the stale head must be pruned"
+            "the obsolete effect must not create a row"
         );
-        // Pass 2 (same budget): forward progress — the live row is admitted
-        // and republished into the broker.
         let due_after_prune = repo
             .list_due_dispatchable_activity_tasks_for_shard(shard_id, now, None, 10)
             .await
@@ -4481,10 +4836,10 @@ mod tests {
                 .map(|due| due.task.run_key)
                 .collect::<Vec<_>>(),
             vec![state.run_key],
-            "after pruning, exactly the live row is due"
+            "exactly the authoritative live row is due"
         );
-        let published = reconcile_due_activity_dispatches_once(&deps, shard_id, now, 1).await;
-        assert_eq!(published, 1, "the live row must be admitted after pruning");
+        let published = discover_activity_page(&runtime, &queue).await;
+        assert_eq!(published, 0, "the resident live offer must not duplicate");
         let redelivered = deps
             .broker
             .poll_activity_task(&queue, std::time::Duration::ZERO)
@@ -4637,7 +4992,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
             crate::ActivityTimeoutScannerConfig {
                 scan_interval: tokio::time::Duration::from_secs(3600),
                 ..crate::ActivityTimeoutScannerConfig::default()
@@ -4656,7 +5010,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         )
     }
 
@@ -4751,6 +5104,7 @@ mod tests {
             let started = runtime
                 .start_activity_task(
                     &offered,
+                    Uuid::new_v4(),
                     tokio::time::Instant::now(),
                     &WorkerIdentity("poller".into()),
                     None,
@@ -4781,6 +5135,7 @@ mod tests {
                 queue,
                 task.run_key,
                 task.activity_id.clone(),
+                task.schedule_event_id,
                 WorkerIdentity("worker".into()),
                 input.clone(),
                 header.clone(),
@@ -4814,14 +5169,14 @@ mod tests {
                 }
                 let before = repo.load_run(state.run_key).await.unwrap();
                 let rows = repo.list_all_dispatchable_activity_tasks(&queue, 10).await.unwrap();
-                // A poll finds the task each time, so each failed start put it back:
-                // nothing else re-offers it while the test runs.
+                // Rediscovery has a one-second cadence: the assertion is eventual
+                // delivery with unchanged authority, not an immediate queue write.
                 for _ in 0..failures {
                     let error = runtime
                         .poll_activity_task(
                             queue.clone(),
                             WorkerIdentity("poller".into()),
-                            tokio::time::Duration::from_secs(1),
+                            tokio::time::Duration::from_secs(10),
                         )
                         .await
                         .expect_err("the start answers the failed read");
@@ -4846,7 +5201,7 @@ mod tests {
                         .poll_activity_task(
                             queue.clone(),
                             WorkerIdentity("poller".into()),
-                            tokio::time::Duration::from_secs(1),
+                            tokio::time::Duration::from_secs(10),
                         )
                         .await
                         .unwrap()
@@ -4867,7 +5222,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         );
         let (state, queue, _) = seed_scheduled_activity(&runtime, &repo).await;
         runtime.activity_broker.remove_run(state.run_key).await;
@@ -4889,5 +5243,172 @@ mod tests {
             .wait(std::time::Instant::now() + std::time::Duration::from_secs(10))
             .await
             .unwrap();
+    }
+    #[derive(Debug)]
+    struct RefuseActivityResponse;
+
+    impl crate::ActivityStartResponsePreflight for RefuseActivityResponse {
+        fn validate(&self, _task: &StartedActivityTask) -> Result<()> {
+            Err(crate::ActivityStartTooLarge.into())
+        }
+    }
+
+    async fn replace_activity_fixture(repo: &InMemoryStore, mut state: WorkflowState) {
+        let expected_seq = state.transition_seq;
+        state.transition_seq = expected_seq.next();
+        let result = repo
+            .commit_transition(
+                state.run_key,
+                Transition {
+                    expected_seq,
+                    next_state: state,
+                    history_events: SmallVec::new(),
+                    event_principals: SmallVec::new(),
+                    request_dedupe_ops: SmallVec::new(),
+                    activity_ops: SmallVec::new(),
+                    timer_ops: SmallVec::new(),
+                    dispatch_ops: SmallVec::new(),
+                    events_numbered_at_close: 0,
+                    growth_limits: None,
+                },
+                WriteFence::Unfenced,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, CommitResult::Applied { .. }));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: activity-dispatch, Property 11: owner starts preserve pinned, independent and revision-ordered routing decisions.
+        #[test]
+        fn activity_owner_preserves_registry_routing(case in 0u8..6, revision_delta in 0i64..1000, worker in "[a-z]{0,12}") {
+            tokio::runtime::Runtime::new().unwrap().block_on(async move {
+                let repo = Arc::new(InMemoryStore::default());
+                let runtime = inputs_runtime(repo.clone()).with_worker_deployment_repository(repo.clone());
+                let versioning = match case { 4 => pinned_state(), 5 => transitioning_state(), _ => auto_upgrade_state("previous") }.versioning_info;
+                let (mut state, queue, mut task) = seed_scheduled_activity_with_versioning(&runtime, &repo, versioning).await;
+                state.previous_started_event_id = 2;
+                state.last_event_id = task.schedule_event_id;
+                replace_activity_fixture(&repo, state).await;
+                let LoadedRun::Existing(state) = repo.load_run(task.run_key).await.unwrap() else { panic!("run"); };
+                let registry = runtime.deployment_registry().unwrap();
+                register_activity_version(&registry, state.namespace_id, "deployment", "current", &queue.task_queue.0).await;
+                registry.register_polled_deployment(RegisterPolledDeployment {
+                    namespace_id: state.namespace_id, deployment_name: DeploymentName("deployment".into()),
+                    build_id: StoredBuildId("current".into()), task_queue: state.task_queue.0.clone(),
+                    task_queue_type: DeploymentTaskQueueType::Workflow, identity: "workflow-worker".into(),
+                }).await.unwrap();
+                set_current_activity_version(&registry, state.namespace_id, "deployment", "current").await;
+                task.queue.deployment = Some(DeploymentId(if case == 3 { "independent" } else { "deployment" }.into()));
+                task.queue.build_id = Some(RuntimeBuildId(if case == 0 { "current" } else { "other" }.into()));
+                task.dispatch_revision = if case == 1 || case == 3 { i64::MAX - revision_delta } else { 0 };
+                let selected = task.queue.clone();
+                let outcome = runtime.start_forwarded_activity_task(ActivityTaskStartRequest { offered: task.clone(), request_id: Uuid::new_v4(), worker: WorkerIdentity(worker) }).await.unwrap();
+                let started = matches!(case, 2..=4);
+                prop_assert_eq!(matches!(&outcome, ActivityStartOutcome::Started(_)), started);
+                if let ActivityStartOutcome::Started(result) = outcome { prop_assert_eq!(result.origin, WorkerTaskOrigin::from_queue_key(&selected, selected.task_queue.clone(), WorkerTaskClass::Activity)); }
+                let LoadedRun::Existing(after) = repo.load_run(state.run_key).await.unwrap() else { panic!("run"); };
+                prop_assert_eq!(after.transition_seq, if case == 5 { state.transition_seq } else { state.transition_seq.next() });
+                prop_assert_eq!(after.activity_start_receipts.len(), usize::from(started));
+                if case < 2 {
+                    prop_assert_eq!(after.versioning_info.as_ref().unwrap().version_transition.as_ref(), Some(&version_ref("deployment", if case == 0 { "current" } else { "other" })));
+                    prop_assert!(after.pending_workflow_task.is_some());
+                } else {
+                    prop_assert_eq!(after.versioning_info.as_ref().unwrap().version_transition.as_ref(), state.versioning_info.as_ref().unwrap().version_transition.as_ref());
+                }
+                runtime.runtime_shutdown.begin_shutdown();
+                runtime.runtime_shutdown.wait(std::time::Instant::now() + std::time::Duration::from_secs(10)).await.unwrap();
+                Ok(())
+            })?;
+        }
+
+        // Feature: activity-dispatch, Property 7: competing matches commit exactly one start.
+        #[test]
+        fn activity_owner_competing_starts(worker in "[a-z]{0,12}", stale in 0u8..4) {
+            tokio::runtime::Runtime::new().unwrap().block_on(async move {
+                let repo = Arc::new(InMemoryStore::default());
+                let runtime = inputs_runtime(repo.clone());
+                let (state, _, task) = seed_scheduled_activity(&runtime, &repo).await;
+                let request = ActivityTaskStartRequest { offered: task.clone(), request_id: Uuid::new_v4(), worker: WorkerIdentity(worker) };
+                let mut obsolete = request.clone();
+                match stale {
+                    0 => obsolete.offered.attempt += 1,
+                    1 => obsolete.offered.schedule_event_id += 1,
+                    2 => obsolete.offered.stamp += 1,
+                    _ => obsolete.offered.queue.namespace_id = NamespaceId::new(),
+                }
+                prop_assert!(matches!(runtime.start_forwarded_activity_task(obsolete).await.unwrap(), ActivityStartOutcome::Stale));
+                let mut competing = request.clone();
+                competing.request_id = Uuid::new_v4();
+                let (left, right) = tokio::join!(runtime.start_forwarded_activity_task(request), runtime.start_forwarded_activity_task(competing));
+                let results = [left.unwrap(), right.unwrap()];
+                prop_assert_eq!(results.iter().filter(|result| matches!(result, ActivityStartOutcome::Started(_))).count(), 1);
+                prop_assert_eq!(results.iter().filter(|result| matches!(result, ActivityStartOutcome::Stale)).count(), 1);
+                let LoadedRun::Existing(after) = repo.load_run(state.run_key).await.unwrap() else { panic!("run"); };
+                prop_assert_eq!(after.transition_seq, state.transition_seq.next());
+                prop_assert_eq!(after.activity_start_receipts.len(), 1);
+                runtime.runtime_shutdown.begin_shutdown();
+                runtime.runtime_shutdown.wait(std::time::Instant::now() + std::time::Duration::from_secs(10)).await.unwrap();
+                Ok(())
+            })?;
+        }
+
+        // Feature: activity-dispatch, Property 8: replay observes one start and never resurrects resolved work.
+        #[test]
+        fn activity_owner_replay_is_observation(worker in "[a-z]{0,12}", stamp_delta in 1u64..100, resolution in 0u8..3) {
+            tokio::runtime::Runtime::new().unwrap().block_on(async move {
+                let repo = Arc::new(InMemoryStore::default());
+                let runtime = inputs_runtime(repo.clone());
+                let (state, _, task) = seed_scheduled_activity(&runtime, &repo).await;
+                let request = ActivityTaskStartRequest { offered: task.clone(), request_id: Uuid::new_v4(), worker: WorkerIdentity(worker) };
+                let ActivityStartOutcome::Started(started) = runtime.start_forwarded_activity_task(request.clone()).await.unwrap() else { panic!("first start"); };
+                let LoadedRun::Existing(mut after) = repo.load_run(state.run_key).await.unwrap() else { panic!("run"); };
+                after.activities.get_mut(&task.activity_id).unwrap().stamp += stamp_delta;
+                replace_activity_fixture(&repo, after).await;
+                let before_replay = repo.load_run(state.run_key).await.unwrap();
+                let ActivityStartOutcome::Replayed(replayed) = runtime.start_forwarded_activity_task(request.clone()).await.unwrap() else { panic!("same request"); };
+                prop_assert_eq!(&replayed.token, &started.token);
+                prop_assert_eq!(replayed.started_time, started.started_time);
+                prop_assert_eq!(replayed.input, started.input);
+                prop_assert!(replayed.replayed && replayed.workflow_type.is_empty() && replayed.retry_policy.is_none() && replayed.heartbeat_details.is_none());
+                prop_assert_eq!(&repo.load_run(state.run_key).await.unwrap(), &before_replay);
+                let mut changed = request.clone();
+                changed.worker.0.push('x');
+                prop_assert!(matches!(runtime.start_forwarded_activity_task(changed).await.unwrap(), ActivityStartOutcome::Stale));
+                let LoadedRun::Existing(mut resolved) = before_replay else { panic!("run"); };
+                match resolution {
+                    0 => { resolved.activities.remove(&task.activity_id); resolved.activity_start_receipts.remove(&task.activity_id); }
+                    1 => { resolved.status = ExecutionStatus::Completed; resolved.closed_at = Some(OffsetDateTime::now_utc()); }
+                    _ => { let activity = resolved.activities.get_mut(&task.activity_id).unwrap(); activity.attempt += 1; activity.started_at = None; activity.started_event_id = None; resolved.activity_start_receipts.remove(&task.activity_id); }
+                }
+                replace_activity_fixture(&repo, resolved).await;
+                let resolved = repo.load_run(state.run_key).await.unwrap();
+                prop_assert!(matches!(runtime.start_forwarded_activity_task(request).await.unwrap(), ActivityStartOutcome::Stale));
+                prop_assert_eq!(repo.load_run(state.run_key).await.unwrap(), resolved);
+                runtime.runtime_shutdown.begin_shutdown();
+                runtime.runtime_shutdown.wait(std::time::Instant::now() + std::time::Duration::from_secs(10)).await.unwrap();
+                Ok(())
+            })?;
+        }
+
+        // Feature: activity-dispatch, Property 9: response refusal precedes the authoritative start.
+        #[test]
+        fn activity_owner_response_refusal_is_read_only(worker in "[a-z]{0,12}") {
+            tokio::runtime::Runtime::new().unwrap().block_on(async move {
+                let repo = Arc::new(InMemoryStore::default());
+                let runtime = inputs_runtime(repo.clone());
+                let (state, _, task) = seed_scheduled_activity(&runtime, &repo).await;
+                let request = ActivityTaskStartRequest { offered: task, request_id: Uuid::new_v4(), worker: WorkerIdentity(worker) };
+                let before = repo.load_run(state.run_key).await.unwrap();
+                let result = crate::scope_activity_start_response(Arc::new(RefuseActivityResponse), runtime.start_forwarded_activity_task(request)).await;
+                prop_assert!(result.unwrap_err().is::<crate::ActivityStartTooLarge>());
+                prop_assert_eq!(repo.load_run(state.run_key).await.unwrap(), before);
+                runtime.runtime_shutdown.begin_shutdown();
+                runtime.runtime_shutdown.wait(std::time::Instant::now() + std::time::Duration::from_secs(10)).await.unwrap();
+                Ok(())
+            })?;
+        }
     }
 }

@@ -1,0 +1,42 @@
+syntax = "proto3";
+package tokeira.internal.runtime.v1;
+
+import "temporal/api/workflowservice/v1/request_response.proto";
+
+// A queue-home match asks the execution owner to start one exact incarnation.
+// Worker and peer admission are independent; the receiver never forwards.
+service ActivityTaskDispatch {
+  rpc StartActivityTask(StartActivityTaskRequest) returns (StartActivityTaskResponse);
+}
+
+// No user payloads or authority supplied by the caller are accepted here.
+message StartActivityTaskRequest {
+  bytes run_key = 1;
+  string activity_id = 2;
+  int64 schedule_event_id = 3;
+  uint32 attempt = 4;
+  uint64 stamp = 5;
+  bytes request_id = 6;
+  string namespace = 7;
+  string task_queue = 8;
+  optional string deployment = 9;
+  optional string build_id = 10;
+  int64 dispatch_revision = 11;
+  string worker_identity = 12;
+  bool scoped_versioned = 13;
+}
+
+// Internal authorization coordinates; namespace names are not stable identity.
+message ActivityStartOrigin {
+  bytes namespace_id = 1;
+  string normal_task_queue = 2;
+  optional string deployment = 3;
+  optional string build_id = 4;
+}
+
+message StartActivityTaskResponse {
+  // Both success fields are absent for a suppressed/stale offer.
+  temporal.api.workflowservice.v1.PollActivityTaskQueueResponse task = 1;
+  ActivityStartOrigin origin = 2;
+  bool replayed = 3;
+}

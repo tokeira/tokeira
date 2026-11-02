@@ -1020,7 +1020,7 @@ async fn workflow_dispatch_live_disposal_bounds_activity_prefix_and_passes_corru
         .dispose_workflow_backlog_page(Some(Uuid::from_u128(base - 1)))
         .await?;
     assert_eq!(page.examined, 64);
-    assert_eq!((page.deleted, page.deferred), (0, 0));
+    assert_eq!((page.deleted, page.deferred), (0, 64));
     assert_eq!(page.last_examined, Some(Uuid::from_u128(base + 63)));
     let next = fixture
         .repo()

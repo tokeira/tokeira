@@ -18,10 +18,10 @@ use tokeira_kernel::{
     WorkflowCommand, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    ActivityTimeoutScannerConfig, BacklogConfig, LaneConfig, NexusCompletionDeps,
-    NexusEndpointRegistry, NexusTimeoutScannerConfig, NoopNexusHttpClient, ResetActivitiesRequest,
-    StartedActivityTask, StartedWorkflowTask, TimerScannerConfig, TokeiraRuntime,
-    UnpauseActivitiesRequest, UpdateActivitiesOptionsRequest, WorkflowTimeoutScannerConfig,
+    ActivityTimeoutScannerConfig, LaneConfig, NexusCompletionDeps, NexusEndpointRegistry,
+    NexusTimeoutScannerConfig, NoopNexusHttpClient, ResetActivitiesRequest, StartedActivityTask,
+    StartedWorkflowTask, TimerScannerConfig, TokeiraRuntime, UnpauseActivitiesRequest,
+    UpdateActivitiesOptionsRequest, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository, codec};
 use tokeira_types::{
@@ -36,14 +36,13 @@ const ACTIVITY_QUEUE: &str = "activity-q";
 /// backlog entry holds, so any copy of it shows in their sizes.
 const INPUT_BYTES: usize = 100_000;
 
-fn runtime(store: Arc<InMemoryStore>, backlog: BacklogConfig) -> TokeiraRuntime<InMemoryStore> {
+fn runtime(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
     TokeiraRuntime::new(
         store,
         2,
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        backlog,
     )
 }
 
@@ -221,7 +220,7 @@ async fn poll_activity(
 #[tokio::test]
 async fn a_runs_state_holds_none_of_its_pending_inputs() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let runtime = runtime(store.clone(), BacklogConfig::default());
+    let runtime = runtime(store.clone());
     let namespace_id = NamespaceId::new();
     let commands = (0..3).map(|index| schedule(index, INPUT_BYTES)).collect();
     let run_key = start_and_schedule(&runtime, namespace_id, "state", commands).await?;
@@ -243,7 +242,7 @@ async fn a_runs_state_holds_none_of_its_pending_inputs() -> Result<()> {
 #[tokio::test]
 async fn a_dispatch_row_holds_no_input() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let runtime = runtime(store.clone(), BacklogConfig::default());
+    let runtime = runtime(store.clone());
     let namespace_id = NamespaceId::new();
     start_and_schedule(
         &runtime,
@@ -268,19 +267,11 @@ async fn a_dispatch_row_holds_no_input() -> Result<()> {
     Ok(())
 }
 
-/// A task spilled to the durable backlog carries no copy of its input (bugfix
-/// 1.4, 2.1).
+/// Legacy payload compatibility keeps retired input empty after delivery retirement.
 #[tokio::test]
-async fn a_spilled_backlog_entry_holds_no_input() -> Result<()> {
+async fn a_legacy_backlog_payload_holds_no_input() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let runtime = runtime(
-        store.clone(),
-        BacklogConfig {
-            activity_grace_window: tokio::time::Duration::ZERO,
-            grace_scan_interval: tokio::time::Duration::from_millis(10),
-            ..BacklogConfig::default()
-        },
-    );
+    let runtime = runtime(store.clone());
     let namespace_id = NamespaceId::new();
     start_and_schedule(
         &runtime,
@@ -290,21 +281,26 @@ async fn a_spilled_backlog_entry_holds_no_input() -> Result<()> {
     )
     .await?;
 
-    // No worker polls, so the grace scanner spills the task and nothing drains
-    // it; the ceiling only bounds the suite.
     let activity_queue = queue(namespace_id, ACTIVITY_QUEUE, TaskKind::Activity);
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
-    let entry = loop {
-        if let Some(entry) = store.drain_backlog(&activity_queue, 10).await?.pop() {
-            break entry;
-        }
-        anyhow::ensure!(
-            tokio::time::Instant::now() < deadline,
-            "the task was never spilled"
-        );
-        tokio::task::yield_now().await;
+    let rows = store
+        .list_all_dispatchable_activity_tasks(&activity_queue, 10)
+        .await?;
+    let task = &rows[0];
+    let payload = tokeira_storage::BacklogPayload::Activity {
+        activity_id: task.activity_id.clone(),
+        retired_input: tokeira_kernel::RetiredField::default(),
+        schedule_event_id: task.schedule_event_id,
+        attempt: task.attempt,
+        dispatch_revision: task.dispatch_revision,
+        stamp: task.stamp,
     };
-    let size = codec::encode_backlog_payload(&entry.payload, entry.priority.as_ref())?.len();
+    let size = codec::encode_backlog_payload(&payload, task.priority.as_ref())?.len();
+    assert!(
+        store
+            .backlog_stats_by_priority(&activity_queue)
+            .await?
+            .is_empty()
+    );
     assert!(
         size < INPUT_BYTES,
         "the backlog entry encodes to {size} bytes for an input of {INPUT_BYTES}"
@@ -317,7 +313,7 @@ async fn a_spilled_backlog_entry_holds_no_input() -> Result<()> {
 #[tokio::test]
 async fn a_polled_task_carries_its_scheduled_input_and_header() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let runtime = runtime(store.clone(), BacklogConfig::default());
+    let runtime = runtime(store.clone());
     let namespace_id = NamespaceId::new();
     let commands = (0..3).map(|index| schedule(index, 1_000 + index)).collect();
     start_and_schedule(&runtime, namespace_id, "delivery", commands).await?;
@@ -347,7 +343,6 @@ async fn restarted(store: Arc<InMemoryStore>) -> Result<TokeiraRuntime<InMemoryS
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         ActivityTimeoutScannerConfig::default(),
         NexusTimeoutScannerConfig::default(),
         NexusEndpointRegistry::default(),
@@ -537,7 +532,7 @@ enum Path {
     PauseUnpause,
     ResetActivity,
     Recovery,
-    BacklogDrain,
+    LostOffer,
     ResetSuccessor,
 }
 
@@ -550,7 +545,7 @@ fn arb_path() -> impl Strategy<Value = Path> {
         Just(Path::PauseUnpause),
         Just(Path::ResetActivity),
         Just(Path::Recovery),
-        Just(Path::BacklogDrain),
+        Just(Path::LostOffer),
         Just(Path::ResetSuccessor),
     ]
 }
@@ -562,15 +557,7 @@ async fn deliver(
     activities: &[Scheduled],
 ) -> Result<BTreeMap<String, (StartedActivityTask, Scheduled)>> {
     let store = Arc::new(InMemoryStore::default());
-    let backlog = match path {
-        Path::BacklogDrain => BacklogConfig {
-            activity_grace_window: tokio::time::Duration::ZERO,
-            grace_scan_interval: tokio::time::Duration::from_millis(10),
-            ..BacklogConfig::default()
-        },
-        _ => BacklogConfig::default(),
-    };
-    let mut runtime = runtime(store.clone(), backlog);
+    let mut runtime = runtime(store.clone());
     let namespace_id = NamespaceId::new();
     let CommitResult::Applied { new_state } = runtime
         .start_workflow(start_request(namespace_id, "delivery-paths"))
@@ -598,6 +585,10 @@ async fn deliver(
     match path {
         Path::Poll => {}
         Path::Eager => {
+            let LoadedRun::Existing(committed) = store.load_run(run_key).await? else {
+                anyhow::bail!("committed run");
+            };
+            let schedule_event_id = committed.activities["activity-0"].schedule_event_id;
             // The completion's own answer claims the task with the command's
             // input and header, as the edge's eager path does.
             started.push(
@@ -606,6 +597,7 @@ async fn deliver(
                         activity_queue.clone(),
                         run_key,
                         "activity-0".to_string(),
+                        schedule_event_id,
                         WorkerIdentity("worker".to_string()),
                         activities[0].input.clone(),
                         activities[0].header.clone(),
@@ -695,22 +687,23 @@ async fn deliver(
                 .await?;
         }
         Path::Recovery => {
+            let shutdown = runtime.shutdown_handle();
             drop(runtime);
+            shutdown
+                .wait(std::time::Instant::now() + std::time::Duration::from_secs(10))
+                .await?;
             runtime = restarted(store.clone()).await?;
         }
-        Path::BacklogDrain => {
-            // Every task spills, unclaimed, and a poll drains it back.
-            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
-            let mut spilled = Vec::new();
-            while spilled.len() < activities.len() {
-                anyhow::ensure!(
-                    tokio::time::Instant::now() < deadline,
-                    "the tasks were never spilled"
-                );
-                spilled.extend(store.drain_backlog(&activity_queue, 10).await?);
-                tokio::task::yield_now().await;
-            }
-            store.persist_to_backlog(spilled).await?;
+        Path::LostOffer => {
+            // Throw away every available delivery copy without starting it;
+            // canonical discovery must preserve all scheduled bytes.
+            runtime.activity_broker().remove_run(run_key).await;
+            anyhow::ensure!(
+                store
+                    .backlog_stats_by_priority(&activity_queue)
+                    .await?
+                    .is_empty()
+            );
         }
         Path::ResetSuccessor => {
             let task = poll_workflow_task(&runtime, namespace_id).await?;
@@ -760,10 +753,11 @@ async fn deliver(
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(48))]
+    #![proptest_config(ProptestConfig::with_cases(100))]
 
     // Feature: activity-inputs-from-history, Property 2: A delivered task carries
     // its scheduled event's input and header
+    // Feature: activity-dispatch, Property 12: local/eager/retry/reset delivery preserves generated binary payloads.
     #[test]
     fn property_a_delivered_task_carries_its_scheduled_events_input_and_header(
         path in arb_path(),
@@ -851,14 +845,7 @@ async fn assert_no_copies(
 
 async fn take_steps(activities: &[Scheduled], steps: &[Step]) -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let runtime = runtime(
-        store.clone(),
-        BacklogConfig {
-            activity_grace_window: tokio::time::Duration::ZERO,
-            grace_scan_interval: tokio::time::Duration::from_millis(10),
-            ..BacklogConfig::default()
-        },
-    );
+    let runtime = runtime(store.clone());
     let namespace_id = NamespaceId::new();
     let commands = activities
         .iter()

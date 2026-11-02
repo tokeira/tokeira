@@ -183,6 +183,12 @@ impl InMemoryStore {
             prepared.push((run, transition::prepare(&store, run, mutation)?));
         }
         let new_prepared = transition::prepare(&store, token.target_run, *publication.new_run)?;
+        transition::validate_activity_batch(
+            prepared
+                .iter()
+                .map(|(_, value)| value)
+                .chain(std::iter::once(&new_prepared)),
+        )?;
         // All encoding, projection and growth checks precede the first mutation.
         // No observer can see the base link without the current termination and
         // complete new run, even if one participant's preparation fails.

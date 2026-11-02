@@ -23,7 +23,7 @@ use tokeira_types::{
 };
 
 use crate::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
     successor::{SuccessorStartedEvent, SuccessorTiming},
 };
 
@@ -145,7 +145,6 @@ async fn projection_accumulator_runtime_reset_commits_from_materialized_state() 
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let CommitResult::Applied {
         new_state: mut state,
@@ -220,7 +219,6 @@ async fn projection_accumulator_runtime_reset_commits_from_materialized_state() 
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let new_run_id = RunId::new();
     runtime

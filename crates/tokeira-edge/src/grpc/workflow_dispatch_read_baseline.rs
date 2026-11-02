@@ -9,8 +9,8 @@ use crate::{EdgeContext, InMemoryNamespaceCache, NamespaceCache, ResolvedNamespa
 use std::{collections::BTreeMap, sync::atomic::AtomicUsize};
 use tokeira_kernel::{BasicKernel, Command, Kernel, LoadedRun, SignalRequest, TerminateRequest};
 use tokeira_runtime::{
-    ActivityTimeoutScannerConfig, BacklogConfig, LaneConfig, NexusCompletionDeps,
-    NexusEndpointRegistry, NexusTimeoutScannerConfig, NoopNexusHttpClient, TimerScannerConfig,
+    ActivityTimeoutScannerConfig, LaneConfig, NexusCompletionDeps, NexusEndpointRegistry,
+    NexusTimeoutScannerConfig, NoopNexusHttpClient, TimerScannerConfig,
     WorkflowTimeoutScannerConfig,
 };
 #[cfg(feature = "dsql-integration")]
@@ -36,7 +36,6 @@ fn runtime<R: RunRepository + 'static>(repo: Arc<R>, identity: &str) -> Arc<Toke
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         ActivityTimeoutScannerConfig::default(),
         NexusTimeoutScannerConfig::default(),
         NexusEndpointRegistry::default(),

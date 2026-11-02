@@ -19,7 +19,7 @@
 //! ## Deduplication
 //!
 //! Each workflow task is keyed by `(RunKey, LogicalTaskSeq)` and each activity
-//! task by `(RunKey, activity_id, attempt)`. Duplicate publications are
+//! task by `(RunKey, activity_id, schedule_event_id, attempt, stamp)`. Duplicate publications are
 //! silently suppressed so that scanner sweeps and retry paths can safely
 //! re-publish without creating phantom work items.
 //!
@@ -46,7 +46,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
-    sync::{Arc, RwLock as StdRwLock},
+    sync::{
+        Arc, RwLock as StdRwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use anyhow::Result;
@@ -67,6 +70,7 @@ use crate::{
     DispatchEligibility, DispatchRateLimits, InMemoryTaskQueueConfigStore, QueryResult, QueryTask,
     StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigKey, TaskQueueConfigKind,
     TaskQueueConfigStore, WorkerComputeQueueMetrics,
+    activity_offers::{ActivityOfferReservation, ActivityOfferToken, ActivityOffers, incarnation},
     discovery::{QueueHome, QueueHomeProvider},
     effective_priority, metrics as runtime_metrics,
     workflow_offers::{OfferAdmission, OfferKey, OfferReservation, WorkflowOffers},
@@ -101,11 +105,13 @@ impl std::fmt::Debug for InMemoryBroker {
 /// In-memory activity-task broker.
 ///
 /// Mirrors [`InMemoryBroker`] but for activity tasks.
-/// Deduplication is keyed on `(run_key, activity_id, attempt)`.
+/// Deduplication includes the complete activity incarnation; takes retain capacity until release or expiry.
 #[derive(Clone)]
 pub struct InMemoryActivityBroker {
     inner: Arc<Mutex<ActivityBrokerState>>,
     policy: Arc<BrokerPolicy>,
+    queue_homes: Option<Arc<dyn QueueHomeProvider>>,
+    capacity_changed: Arc<Notify>,
 }
 
 // Manual impl: summarizes without taking the interior lock — a `Debug` that
@@ -168,8 +174,9 @@ pub(crate) fn merge_priority_stats(
 }
 
 struct ActivityBrokerState {
+    offers: ActivityOffers,
     ready: HashMap<QueueKey, OrderedReady<TimestampedActivityTask>>,
-    enqueued: HashSet<(RunKey, String, u32, u64)>,
+    enqueued: HashSet<tokeira_storage::ActivityIncarnation>,
     /// Last successful claim per physical queue.
     ///
     /// The grace scanner must distinguish an idle queue from a deep queue that
@@ -182,7 +189,7 @@ struct ActivityBrokerState {
     /// Tokeira's live-broker/durable-backlog split.
     last_take_at: HashMap<QueueKey, Instant>,
     ordering: DeliveryOrdering,
-    waiter_counts: HashMap<QueueKey, usize>,
+    waiter_counts: HashMap<QueueKey, Arc<AtomicUsize>>,
     /// Per-queue wake handles (see the module's "Per-queue wake pattern").
     wakes: HashMap<QueueKey, Arc<Notify>>,
     denied_workers: HashSet<(NamespaceId, TaskQueueName, WorkerIdentity)>,
@@ -190,9 +197,20 @@ struct ActivityBrokerState {
     rate_limits: DispatchRateLimits,
 }
 
+/// Poll cancellation cannot await the broker lock. A counted guard releases
+/// demand synchronously; zero entries are pruned on the next registration.
+struct ActivityWaiter(Arc<AtomicUsize>);
+
+impl Drop for ActivityWaiter {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl Default for ActivityBrokerState {
     fn default() -> Self {
         Self {
+            offers: ActivityOffers::default(),
             ready: HashMap::new(),
             enqueued: HashSet::new(),
             last_take_at: HashMap::new(),
@@ -391,6 +409,8 @@ impl Default for InMemoryActivityBroker {
         Self {
             inner: Arc::new(Mutex::new(ActivityBrokerState::default())),
             policy: Arc::new(BrokerPolicy::default()),
+            queue_homes: None,
+            capacity_changed: Arc::new(Notify::new()),
         }
     }
 }
@@ -620,11 +640,11 @@ pub(crate) struct TimestampedWorkflowTask {
 pub(crate) struct TimestampedActivityTask {
     pub(crate) task: DispatchableActivityTask,
     pub(crate) entered_at: Instant,
-    pub(crate) scheduled_at: OffsetDateTime,
+    token: Option<ActivityOfferToken>,
 }
 
 enum ActivityTakeOutcome {
-    Ready((DispatchableActivityTask, Instant)),
+    Ready(crate::runtime::ActivityTaskOffer),
     WaitUntil(Instant),
     Blocked,
     Empty,
@@ -2102,6 +2122,65 @@ impl InMemoryBroker {
 }
 
 impl InMemoryActivityBroker {
+    pub(crate) fn with_discovery(queue_homes: Arc<dyn QueueHomeProvider>) -> Self {
+        Self {
+            queue_homes: Some(queue_homes),
+            ..Self::default()
+        }
+    }
+
+    fn forget_offers(
+        inner: &mut ActivityBrokerState,
+        removed: &[tokeira_storage::ActivityIncarnation],
+    ) {
+        if removed.is_empty() {
+            return;
+        }
+        let removed: HashSet<_> = removed.iter().collect();
+        inner.enqueued.retain(|key| !removed.contains(key));
+        for ready in inner.ready.values_mut() {
+            ready.retain(|entry| !removed.contains(&incarnation(&entry.task)));
+        }
+    }
+
+    fn expire_locked(inner: &mut ActivityBrokerState, now: Instant) {
+        let removed = inner.offers.expire(now);
+        Self::forget_offers(inner, &removed);
+    }
+
+    pub(crate) async fn expire_offers(&self, now: Instant) {
+        Self::expire_locked(&mut *self.inner.lock().await, now);
+    }
+
+    pub(crate) async fn reserve_offers(
+        &self,
+        home: &QueueHome,
+        count: usize,
+    ) -> ActivityOfferReservation {
+        let mut inner = self.inner.lock().await;
+        Self::expire_locked(&mut inner, Instant::now());
+        inner.offers.reserve(home, count)
+    }
+
+    pub(crate) async fn offer_capacity_changed(&self) {
+        self.capacity_changed.notified().await;
+    }
+
+    pub(crate) async fn retire_offers(&self, home: &QueueHome, queue: &QueueKey) {
+        let mut inner = self.inner.lock().await;
+        let removed = inner.offers.retire(home, queue);
+        Self::forget_offers(&mut inner, &removed);
+        self.capacity_changed.notify_one();
+    }
+
+    pub(crate) async fn publish_discovered(
+        &self,
+        task: DispatchableActivityTask,
+        reservation: &mut ActivityOfferReservation,
+    ) -> OfferAdmission {
+        self.publish_offer(task, None, Some(reservation)).await
+    }
+
     /// Share the process-local worker-compute observation sink with broker clones.
     ///
     /// Publications use only the sink's non-blocking method. Replacing or stopping
@@ -2153,12 +2232,10 @@ impl InMemoryActivityBroker {
     /// must republish it. A take racing a true result is therefore harmless — the
     /// following scan observes the missing key and performs the full durable check.
     pub async fn contains_activity_task(&self, task: &DispatchableActivityTask) -> bool {
-        self.inner.lock().await.enqueued.contains(&(
-            task.run_key,
-            task.activity_id.clone(),
-            task.attempt,
-            task.stamp,
-        ))
+        let mut inner = self.inner.lock().await;
+        Self::expire_locked(&mut inner, Instant::now());
+        let key = incarnation(task);
+        inner.enqueued.contains(&key) || inner.offers.contains(&key)
     }
 
     /// Snapshot activity backlog for `DescribeTaskQueue`.
@@ -2339,7 +2416,19 @@ impl InMemoryActivityBroker {
         run_key: RunKey,
         activity_id: &str,
     ) -> Option<(DispatchableActivityTask, Instant)> {
+        self.try_claim_activity_offer(queue, run_key, activity_id)
+            .await
+            .map(|offer| (offer.task, offer.entered_at))
+    }
+
+    pub(crate) async fn try_claim_activity_offer(
+        &self,
+        queue: &QueueKey,
+        run_key: RunKey,
+        activity_id: &str,
+    ) -> Option<crate::runtime::ActivityTaskOffer> {
         let mut inner = self.inner.lock().await;
+        Self::expire_locked(&mut inner, Instant::now());
         let ready = inner.ready.get_mut(queue)?;
         let removed = ready.remove_where(|task| {
             task.task.run_key == run_key && task.task.activity_id == activity_id
@@ -2351,43 +2440,74 @@ impl InMemoryActivityBroker {
             inner.ordering.served(&removed.task.queue, order);
         }
         inner.last_take_at.insert(queue.clone(), Instant::now());
-        inner.enqueued.remove(&(
-            removed.task.run_key,
-            removed.task.activity_id.clone(),
-            removed.task.attempt,
-            removed.task.stamp,
-        ));
+        inner.enqueued.remove(&incarnation(&removed.task));
+        let lease = match removed.token {
+            Some(token) => Some(inner.offers.take(
+                &incarnation(&removed.task),
+                token,
+                Instant::now(),
+                self.capacity_changed.clone(),
+            )?),
+            None => None,
+        };
         Self::emit_queue_depth(&inner, queue);
         drop(inner);
         if let Some(metric_key) = metric_key {
             self.policy.queue_metrics().record_dispatch(metric_key);
         }
-        Some((removed.task, removed.entered_at))
+        Some(crate::runtime::ActivityTaskOffer {
+            request_id: uuid::Uuid::new_v4(),
+            task: removed.task,
+            entered_at: removed.entered_at,
+            _lease: lease,
+        })
     }
 
     /// Enqueue an activity task for delivery.
     ///
-    /// Duplicate publications (same `run_key` +
-    /// `activity_id` + `attempt`) are silently suppressed.
+    /// Duplicate complete incarnations are suppressed, including while a start is in flight.
     pub async fn publish_activity_task(
+        &self,
+        task: DispatchableActivityTask,
+        metrics: Option<&DeliveryMetrics>,
+    ) -> Result<()> {
+        self.publish_offer(task, metrics, None).await;
+        Ok(())
+    }
+
+    async fn publish_offer(
         &self,
         mut task: DispatchableActivityTask,
         metrics: Option<&DeliveryMetrics>,
-    ) -> Result<()> {
+        reservation: Option<&mut ActivityOfferReservation>,
+    ) -> OfferAdmission {
         runtime_metrics::record_broker_publish(&task.queue);
         let queue = task.queue.clone();
         let (mode, scope_generation, config) = self.policy.delivery_inputs(&task.queue).await;
         let mut inner = self.inner.lock().await;
+        let now = Instant::now();
+        Self::expire_locked(&mut inner, now);
         inner.ordering.enter_scope(scope_generation);
-        let dedupe_key = (
-            task.run_key,
-            task.activity_id.clone(),
-            task.attempt,
-            task.stamp,
-        );
-        if !inner.enqueued.insert(dedupe_key) {
-            return Ok(());
+        let dedupe_key = incarnation(&task);
+        if inner.enqueued.contains(&dedupe_key) || inner.offers.contains(&dedupe_key) {
+            return OfferAdmission::Known;
         }
+        let token = if let Some(homes) = &self.queue_homes {
+            let Some(home) = homes.local_home(&queue) else {
+                return OfferAdmission::Full;
+            };
+            let (outcome, token) =
+                inner
+                    .offers
+                    .admit(dedupe_key.clone(), queue.clone(), &home, now, reservation);
+            if outcome != OfferAdmission::Admitted {
+                return outcome;
+            }
+            token
+        } else {
+            None
+        };
+        inner.enqueued.insert(dedupe_key);
         let order = match task.order {
             Some(order) => inner.ordering.preserve(order),
             None => inner.ordering.assign(
@@ -2399,7 +2519,10 @@ impl InMemoryActivityBroker {
             ),
         };
         task.order = Some(order);
-        let has_waiter = inner.waiter_counts.get(&task.queue).copied().unwrap_or(0) > 0;
+        let has_waiter = inner
+            .waiter_counts
+            .get(&task.queue)
+            .is_some_and(|count| count.load(Ordering::Relaxed) > 0);
         let observation =
             demand_observation(&task.queue, WorkerComputeTaskType::Activity, has_waiter);
         if let Some(metrics) = metrics {
@@ -2414,8 +2537,8 @@ impl InMemoryActivityBroker {
             order,
             TimestampedActivityTask {
                 task,
-                entered_at: Instant::now(),
-                scheduled_at: OffsetDateTime::now_utc(),
+                entered_at: now,
+                token,
             },
         );
         Self::emit_queue_depth(&inner, &queue);
@@ -2428,7 +2551,7 @@ impl InMemoryActivityBroker {
             let _ = self.policy.observation_sink().try_observe(observation);
         }
         wake.notify_waiters();
-        Ok(())
+        OfferAdmission::Admitted
     }
 
     /// Long-poll for an activity task on `queue`.
@@ -2453,6 +2576,18 @@ impl InMemoryActivityBroker {
         worker: &WorkerIdentity,
         wait_for: Duration,
     ) -> Result<Option<(DispatchableActivityTask, Instant)>> {
+        Ok(self
+            .poll_activity_offer_for_worker(queue, worker, wait_for)
+            .await?
+            .map(|offer| (offer.task, offer.entered_at)))
+    }
+
+    pub(crate) async fn poll_activity_offer_for_worker(
+        &self,
+        queue: &QueueKey,
+        worker: &WorkerIdentity,
+        wait_for: Duration,
+    ) -> Result<Option<crate::runtime::ActivityTaskOffer>> {
         if self.is_denied(queue, worker).await {
             return Ok(None);
         }
@@ -2463,13 +2598,13 @@ impl InMemoryActivityBroker {
             | ActivityTakeOutcome::Empty => {}
         }
 
-        self.increment_waiter(queue).await;
+        let _waiter = self.increment_waiter(queue).await;
         let wake = self.queue_wake(queue).await;
         let config_store = self.policy.config_store();
         let config_changed = config_store.changed(&activity_config_key(queue));
         let deadline = Instant::now() + wait_for;
 
-        let result = loop {
+        loop {
             // Enable before the re-check so a publish racing it still wakes us.
             let notified = wake.notified();
             tokio::pin!(notified);
@@ -2497,10 +2632,7 @@ impl InMemoryActivityBroker {
                 _ = changed.as_mut() => {}
                 _ = tokio::time::sleep(rate_wait.min(remaining)) => {}
             }
-        };
-
-        self.decrement_waiter(queue).await;
-        result
+        }
     }
 
     /// Cancel current and reject future activity polls for a shutting-down
@@ -2548,10 +2680,13 @@ impl InMemoryActivityBroker {
             .await
             .waiter_counts
             .iter()
-            .filter_map(|(queue, count)| (*count > 0).then_some(queue.clone()))
+            .filter_map(|(queue, count)| {
+                (count.load(Ordering::Relaxed) > 0).then_some(queue.clone())
+            })
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) async fn take_expired(
         &self,
         grace_window: Duration,
@@ -2563,12 +2698,9 @@ impl InMemoryActivityBroker {
             .filter_map(|(queue, taken_at)| {
                 (taken_at.elapsed() < grace_window).then_some(queue.clone())
             })
-            .chain(
-                inner
-                    .waiter_counts
-                    .iter()
-                    .filter_map(|(queue, count)| (*count > 0).then_some(queue.clone())),
-            )
+            .chain(inner.waiter_counts.iter().filter_map(|(queue, count)| {
+                (count.load(Ordering::Relaxed) > 0).then_some(queue.clone())
+            }))
             .collect();
         let mut expired = Vec::new();
         let mut dedupe_keys = Vec::new();
@@ -2579,17 +2711,13 @@ impl InMemoryActivityBroker {
             while let Some(entry) =
                 ready.remove_where(|entry| entry.entered_at.elapsed() >= grace_window)
             {
-                dedupe_keys.push((
-                    entry.task.run_key,
-                    entry.task.activity_id.clone(),
-                    entry.task.attempt,
-                    entry.task.stamp,
-                ));
+                dedupe_keys.push((incarnation(&entry.task), entry.token));
                 expired.push(entry);
             }
         }
-        for key in dedupe_keys {
+        for (key, token) in dedupe_keys {
             inner.enqueued.remove(&key);
+            inner.offers.remove_ready(&key, token);
         }
         expired
     }
@@ -2603,6 +2731,7 @@ impl InMemoryActivityBroker {
             .await
             .expect("hydrated task-queue cache reads are infallible");
         let mut inner = self.inner.lock().await;
+        Self::expire_locked(&mut inner, Instant::now());
         let Some(candidate) = inner.ready.get(queue).and_then(OrderedReady::front) else {
             Self::emit_queue_depth(&inner, queue);
             return Ok(ActivityTakeOutcome::Empty);
@@ -2631,17 +2760,29 @@ impl InMemoryActivityBroker {
             inner
                 .rate_limits
                 .consume(&config_key, &effective, config.as_ref(), now);
-            inner.enqueued.remove(&(
-                task.task.run_key,
-                task.task.activity_id.clone(),
-                task.task.attempt,
-                task.task.stamp,
-            ));
+            inner.enqueued.remove(&incarnation(&task.task));
             inner.last_take_at.insert(queue.clone(), Instant::now());
         }
         Self::emit_queue_depth(&inner, queue);
         let outcome = task.map_or(ActivityTakeOutcome::Empty, |task| {
-            ActivityTakeOutcome::Ready((task.task, task.entered_at))
+            let lease = match task.token {
+                Some(token) => match inner.offers.take(
+                    &incarnation(&task.task),
+                    token,
+                    Instant::now(),
+                    self.capacity_changed.clone(),
+                ) {
+                    Some(lease) => Some(lease),
+                    None => return ActivityTakeOutcome::Empty,
+                },
+                None => None,
+            };
+            ActivityTakeOutcome::Ready(crate::runtime::ActivityTaskOffer {
+                request_id: uuid::Uuid::new_v4(),
+                task: task.task,
+                entered_at: task.entered_at,
+                _lease: lease,
+            })
         });
         drop(inner);
         if let Some(metric_key) = metric_key {
@@ -2650,30 +2791,30 @@ impl InMemoryActivityBroker {
         Ok(outcome)
     }
 
-    async fn increment_waiter(&self, queue: &QueueKey) {
+    async fn increment_waiter(&self, queue: &QueueKey) -> ActivityWaiter {
         let mut inner = self.inner.lock().await;
-        *inner.waiter_counts.entry(queue.clone()).or_default() += 1;
-    }
-
-    async fn decrement_waiter(&self, queue: &QueueKey) {
-        let mut inner = self.inner.lock().await;
-        if let Some(count) = inner.waiter_counts.get_mut(queue) {
-            *count -= 1;
-            if *count == 0 {
-                inner.waiter_counts.remove(queue);
-            }
-        }
+        inner
+            .waiter_counts
+            .retain(|_, count| count.load(Ordering::Relaxed) != 0);
+        let counter = inner
+            .waiter_counts
+            .entry(queue.clone())
+            .or_default()
+            .clone();
+        counter.fetch_add(1, Ordering::Relaxed);
+        ActivityWaiter(counter)
     }
 
     /// Remove all not-yet-delivered activity tasks for a deleted run.
     pub async fn remove_run(&self, run_key: RunKey) {
         let mut inner = self.inner.lock().await;
+        inner.offers.remove_run(run_key);
         for ready in inner.ready.values_mut() {
             ready.retain(|entry| entry.task.run_key != run_key);
         }
         inner
             .enqueued
-            .retain(|(candidate, _, _, _)| *candidate != run_key);
+            .retain(|candidate| candidate.run_key != run_key);
         let queues = inner.ready.keys().cloned().collect::<Vec<_>>();
         inner.ready.retain(|_, ready| !ready.is_empty());
         for queue in queues {
@@ -2795,6 +2936,66 @@ mod tests {
             activity_id: activity_id.into(),
             priority: Some(priority),
             ..activity_task(queue.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct PolicyHome(crate::discovery::QueueHome);
+
+    impl crate::discovery::QueueHomeProvider for PolicyHome {
+        fn local_home(&self, _queue: &QueueKey) -> Option<crate::discovery::QueueHome> {
+            (!self.0.cancel.is_cancelled()).then(|| self.0.clone())
+        }
+    }
+
+    // Feature: activity-dispatch, Property 11
+    // Bounded canonical admission preserves existing priority/fairness/rate choices and retires on shutdown.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+        #[test]
+        fn activity_discovery_preserves_broker_delivery_policy(
+            priorities in prop::collection::vec(1i32..6, 2..60),
+            fairness in any::<bool>(), priority_enabled in any::<bool>(),
+            stop_after in 0usize..60,
+        ) {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                let queue = activity_queue("policy-preservation");
+                let home = PolicyHome(crate::discovery::QueueHome { id: tokeira_types::ShardId(0), generation: 7, cancel: tokio_util::sync::CancellationToken::new() });
+                let stop = home.0.cancel.clone();
+                let bounded = InMemoryActivityBroker::with_discovery(Arc::new(home));
+                let existing = InMemoryActivityBroker::default();
+                let mode = DeliveryMode { priority_enabled, fairness_enabled: fairness, auto_enable: false };
+                let store = Arc::new(crate::RepositoryBackedTaskQueueConfigStore::new(Arc::new(tokeira_storage::InMemoryStore::default())));
+                store.hydrate().await.unwrap();
+                let key = activity_config_key(&queue);
+                let metadata = TaskQueueConfigMetadata { reason: "property".into(), update_identity: "property".into(), update_time: OffsetDateTime::UNIX_EPOCH };
+                store.apply(key.clone(), crate::TaskQueueConfigPatch { queue_rate_limit: crate::TaskQueueConfigFieldPatch::Set((Some(0.0), metadata.clone())), ..Default::default() }, 1000).await.unwrap();
+                for broker in [&bounded, &existing] {
+                    set_activity_mode(broker, mode);
+                    broker.set_task_queue_config_store(store.clone());
+                    for (index, band) in priorities.iter().enumerate() {
+                        let task = named_activity_task(&queue, index.to_string(), priority(*band, if index % 2 == 0 { "heavy" } else { "light" }, if index % 2 == 0 { 2.0 } else { 1.0 }));
+                        broker.publish_activity_task(task.clone(), None).await.unwrap();
+                        broker.publish_activity_task(task, None).await.unwrap();
+                    }
+                    assert!(broker.poll_activity_task(&queue, Duration::ZERO).await.unwrap().is_none());
+                    assert_eq!(broker.backlog_stats(&queue).await.count, priorities.len());
+                }
+                store.apply(key, crate::TaskQueueConfigPatch { queue_rate_limit: crate::TaskQueueConfigFieldPatch::Set((None, metadata)), ..Default::default() }, 1000).await.unwrap();
+                let mut seen = HashSet::new();
+                let mut previous = 0;
+                for _ in 0..stop_after.min(priorities.len()) {
+                    let old = existing.poll_activity_task(&queue, Duration::ZERO).await.unwrap().unwrap().0;
+                    let new = bounded.poll_activity_task(&queue, Duration::ZERO).await.unwrap().unwrap().0;
+                    assert_eq!(new.activity_id, old.activity_id);
+                    let index = new.activity_id.parse::<usize>().unwrap();
+                    assert!(seen.insert(index));
+                    if priority_enabled { assert!(priorities[index] >= previous); previous = priorities[index]; }
+                }
+                stop.cancel();
+                assert!(bounded.poll_activity_task(&queue, Duration::ZERO).await.unwrap().is_none());
+                assert_eq!(bounded.backlog_stats(&queue).await.count, 0);
+            });
         }
     }
 
@@ -3470,8 +3671,7 @@ mod tests {
                 .await
                 .waiter_counts
                 .get(queue)
-                .copied()
-                .unwrap_or(0)
+                .map_or(0, |count| count.load(Ordering::Relaxed))
                 > 0
             {
                 return;

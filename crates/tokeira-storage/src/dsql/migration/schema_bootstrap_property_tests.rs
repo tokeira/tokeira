@@ -285,6 +285,9 @@ fn startup_schema_contract_migrates_and_accepts_required_tables() {
         (110, "outbound_recovery_upgrade"),
         (120, "outbound_retained_run"),
         (127, "outbound_upgrade_state_part"),
+        (128, "activity_dispatch_queue_key"),
+        (129, "activity_dispatch_queue_due"),
+        (130, "activity_dispatch_home_key"),
     ] {
         assert!(
             recognized
@@ -294,7 +297,8 @@ fn startup_schema_contract_migrates_and_accepts_required_tables() {
     }
     for current in [
         0, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
-        90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 110, 119, 120, 126, 127,
+        90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 110, 119, 120, 126, 127, 128, 129, 130,
+        131, 132,
     ] {
         let observed = observation(&recognized, current, (current > 0).then_some(current));
         for policy in [
@@ -302,24 +306,24 @@ fn startup_schema_contract_migrates_and_accepts_required_tables() {
             SchemaMigrationPolicy::ValidateOnly,
         ] {
             let expected = match (current, policy) {
-                (127, _) => SchemaDecision::Compatible {
-                    current: 127,
+                (132, _) => SchemaDecision::Compatible {
+                    current: 132,
                     legacy_backfill: false,
                 },
-                (0, SchemaMigrationPolicy::Automatic) => SchemaDecision::Initialize { target: 127 },
+                (0, SchemaMigrationPolicy::Automatic) => SchemaDecision::Initialize { target: 132 },
                 (_, SchemaMigrationPolicy::Automatic) => SchemaDecision::Migrate {
                     from: current,
-                    to: 127,
+                    to: 132,
                 },
                 (_, SchemaMigrationPolicy::ValidateOnly) => SchemaDecision::MigrationRequired {
                     current,
-                    target: 127,
+                    target: 132,
                 },
             };
             assert_eq!(
                 assess_schema_compatibility(&contract, &recognized, &observed, policy),
                 expected,
-                "Unconditional startup requires V127: current={current}, policy={policy:?}",
+                "Unconditional startup requires V132: current={current}, policy={policy:?}",
             );
         }
     }

@@ -165,11 +165,9 @@ fn generate(workspace_root: &Path, outputs: &Outputs) -> Result<()> {
         .context("generate upstream Temporal bindings")?;
 
     // ── Tokeira surface: internal packages — tonic/prost ────────────────────
-    // The internal packages import nothing from `temporal.api`, so this pass
-    // emits only `tokeira.*` files; the assertion below fails the regen if a
-    // future import breaks that assumption (prost would then emit a transitive
-    // subset of the Temporal packages here, shadowing the complete upstream
-    // output at include time).
+    // Native activity-start replies import the public poll response. Map all
+    // Temporal references to the already generated complete upstream surface;
+    // never emit a partial transitive package that could shadow it.
     let mut internal_protos = discover_protos(&internal_dir)?;
     internal_protos.retain(|path| !path.starts_with(&compute_dir));
     if !internal_protos.is_empty() {
@@ -188,6 +186,7 @@ fn generate(workspace_root: &Path, outputs: &Outputs) -> Result<()> {
             .btree_map(".")
             .emit_rerun_if_changed(false)
             .out_dir(&tokeira_out)
+            .extern_path(".temporal.api", "crate::public::temporal::api")
             .compile_fds(internal.set)
             .context("generate Tokeira internal bindings")?;
     }

@@ -1274,7 +1274,7 @@ pub(crate) fn run_disposal_cases(
                         ])
                         .await
                         .unwrap();
-                    let activity_bytes = backend.backlog_bytes(&activity_queue).await.unwrap();
+
                     let mut after = None;
                     if interrupt {
                         let page = backend
@@ -1312,9 +1312,12 @@ pub(crate) fn run_disposal_cases(
                         after = page.last_examined;
                     }
                     prop_assert_eq!(backend.backlog_bytes(&queue).await.unwrap().len(), 1);
-                    prop_assert_eq!(
-                        &backend.backlog_bytes(&activity_queue).await.unwrap(),
-                        &activity_bytes
+                    prop_assert!(
+                        backend
+                            .backlog_bytes(&activity_queue)
+                            .await
+                            .unwrap()
+                            .is_empty()
                     );
                     prop_assert_eq!(backend.disposal_authority(&keys).await.unwrap(), authority);
                     backend
@@ -1339,16 +1342,19 @@ pub(crate) fn run_disposal_cases(
                         after = page.last_examined;
                     }
                     prop_assert!(backend.backlog_bytes(&queue).await.unwrap().is_empty());
-                    prop_assert_eq!(
-                        backend.backlog_bytes(&activity_queue).await.unwrap(),
-                        activity_bytes
+                    prop_assert!(
+                        backend
+                            .backlog_bytes(&activity_queue)
+                            .await
+                            .unwrap()
+                            .is_empty()
                     );
                     let delivered = backend
                         .repo()
                         .drain_backlog(&activity_queue, 64)
                         .await
                         .unwrap();
-                    prop_assert_eq!(delivered, vec![activity]);
+                    prop_assert!(delivered.is_empty());
                     backend.finish_repair_case(&keys).await.unwrap();
                     Ok(())
                 })

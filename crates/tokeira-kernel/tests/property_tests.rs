@@ -11,6 +11,9 @@ mod successor_semantics;
 #[path = "support/outbound.rs"]
 mod outbound;
 
+#[path = "support/activity_receipts.rs"]
+mod activity_receipts;
+
 use proptest::prelude::*;
 use prost::Message;
 use time::{Duration, OffsetDateTime};
@@ -138,6 +141,7 @@ fn stamp_callback_field_change(
 
 fn make_open_state(now: OffsetDateTime) -> WorkflowState {
     WorkflowState {
+        activity_start_receipts: std::collections::BTreeMap::new(),
         used_worker_deployment_versions: Some(Vec::new()),
         completed_update_count: 0,
         signal_count: 0,
@@ -9075,6 +9079,7 @@ fn step_input(
         RunStep::ActivityStarted => {
             return Some(StepInput::ActivityStart(
                 tokeira_kernel::ActivityStartRequest {
+                    request_id: None,
                     activity_id: activity(false)?.activity_id,
                     identity: WorkerIdentity("activity-worker".into()),
                     principal: None,

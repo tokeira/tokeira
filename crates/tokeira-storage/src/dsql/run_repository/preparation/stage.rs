@@ -7,6 +7,10 @@ use super::{
 };
 
 enum StageRow<'a> {
+    Activity {
+        row: crate::ActivityDispatchRow,
+        cost: WriteCost,
+    },
     Part {
         kind: RunValueKind,
         key: i64,
@@ -27,8 +31,12 @@ enum StageRow<'a> {
 
 impl StageRow<'_> {
     fn cost(&self) -> WriteCost {
+        if let Self::Activity { cost, .. } = self {
+            return *cost;
+        }
         WriteCost::write(
             128 + match self {
+                Self::Activity { .. } => unreachable!("activity cost returned above"),
                 Self::Part { bytes, .. } => bytes.len(),
                 Self::History {
                     events, principals, ..
@@ -45,6 +53,9 @@ impl StageRow<'_> {
         seq: TransitionSeq,
     ) -> Result<()> {
         match self {
+            Self::Activity { row, .. } => {
+                super::super::activity_dispatch::upsert(tx, row).await?;
+            }
             Self::Part {
                 kind,
                 key,
@@ -167,6 +178,12 @@ impl DsqlRunRepository {
                 timer,
                 bytes: codec::encode_timer_state(timer)?,
             });
+        }
+        for row in
+            crate::derive_activity_dispatch(&transition.next_state, token.home)?.into_values()
+        {
+            let cost = row.write_cost()?;
+            rows.push(StageRow::Activity { row, cost });
         }
         let costs: Vec<_> = rows.iter().map(StageRow::cost).collect();
         // Each part is independently budgeted. Never use pages' oversized-single-

@@ -194,6 +194,7 @@ impl PeerMaterial {
             key: EncodingKey::from_ec_der(&private),
             cached: Mutex::new(None),
             cached_outbound: Mutex::new(None),
+            cached_activity_start: Mutex::new(None),
         })
     }
 }
@@ -226,6 +227,7 @@ pub struct PeerSigner {
     key: EncodingKey,
     cached: Mutex<Option<PeerToken>>,
     cached_outbound: Mutex<Option<PeerToken>>,
+    cached_activity_start: Mutex<Option<PeerToken>>,
 }
 
 impl fmt::Debug for PeerSigner {
@@ -270,6 +272,15 @@ impl PeerSigner {
             now,
             &outbound_audience(self.profile.cluster_id),
             &self.cached_outbound,
+        )
+    }
+
+    /// Sign for activity starts only; the worker's credentials travel separately.
+    pub fn activity_start_token_at(&self, now: u64) -> Result<PeerToken, PeerError> {
+        self.sign_at(
+            now,
+            &activity_start_audience(self.profile.cluster_id),
+            &self.cached_activity_start,
         )
     }
 
@@ -383,6 +394,16 @@ impl PeerVerifier {
         )
     }
 
+    /// Require this cluster's activity-start purpose, independently of worker grants.
+    pub fn verify_activity_start_at(&self, authorization: &str, now: u64) -> Result<(), PeerError> {
+        self.verify_for(
+            authorization,
+            now,
+            &activity_start_audience(self.profile.cluster_id),
+            false,
+        )
+    }
+
     fn verify_for(
         &self,
         authorization: &str,
@@ -434,6 +455,10 @@ impl PeerVerifier {
     }
 }
 
+fn activity_start_audience(cluster: Uuid) -> String {
+    format!("urn:tokeira:activity-start:{cluster}")
+}
+
 fn outbound_audience(cluster: Uuid) -> String {
     format!("urn:tokeira:outbound-delivery:{cluster}")
 }
@@ -481,6 +506,27 @@ mod tests {
             prop_assert!(verifier.verify_outbound_at(later.authorization(), now + renew + 3600).is_err());
             let diagnostic = format!("{signer:?} {outbound:?}");
             prop_assert!(!diagnostic.contains(outbound.authorization()));
+        }
+
+        // Feature: activity-dispatch, Property 9: a peer purpose never grants another route.
+        #[test]
+        fn activity_start_credentials_are_purpose_and_cluster_scoped(now in 10_000u64..1_000_000_000, renew in 0u64..900) {
+            let material = fixture_material();
+            let signer = material.signer(material.profile()).unwrap();
+            let verifier = PeerVerifier::new(material.profile().clone()).unwrap();
+            let activity = signer.activity_start_token_at(now).unwrap();
+            prop_assert!(verifier.verify_activity_start_at(activity.authorization(), now).is_ok());
+            prop_assert!(verifier.verify_at(activity.authorization(), now).is_err());
+            prop_assert!(verifier.verify_outbound_at(activity.authorization(), now).is_err());
+            prop_assert!(verifier.verify_activity_start_at(signer.token_at(now).unwrap().authorization(), now).is_err());
+            prop_assert!(verifier.verify_activity_start_at(signer.outbound_token_at(now).unwrap().authorization(), now).is_err());
+            let other = fixture_material();
+            prop_assert!(PeerVerifier::new(other.profile().clone()).unwrap().verify_activity_start_at(activity.authorization(), now).is_err());
+            let renewed = signer.activity_start_token_at(now + renew).unwrap();
+            prop_assert!(verifier.verify_activity_start_at(renewed.authorization(), now + renew).is_ok());
+            prop_assert!(verifier.verify_activity_start_at(renewed.authorization(), now + renew + 3600).is_err());
+            let diagnostic = format!("{signer:?} {activity:?}");
+            prop_assert!(!diagnostic.contains(activity.authorization()));
         }
 
         #[test]

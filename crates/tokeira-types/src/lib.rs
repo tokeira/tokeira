@@ -77,3 +77,6 @@ pub use worker_authorization::*;
 pub use worker_compute::*;
 pub use worker_heartbeat::*;
 pub use workflow_rules::*;
+
+/// UUID representation shared by durable identity types and start-request receipts.
+pub use uuid::Uuid;

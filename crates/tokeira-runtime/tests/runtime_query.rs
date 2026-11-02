@@ -8,8 +8,7 @@ use tokeira_kernel::{
     WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, QueryResult, TimerScannerConfig, TokeiraRuntime,
-    WorkflowTimeoutScannerConfig,
+    LaneConfig, QueryResult, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -343,7 +342,6 @@ fn make_runtime(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     )
 }
 

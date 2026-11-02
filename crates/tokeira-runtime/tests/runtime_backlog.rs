@@ -4,7 +4,7 @@ use time::{Duration, OffsetDateTime};
 
 use tokeira_kernel::StartRequest;
 use tokeira_runtime::{
-    BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    LaneConfig, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -80,19 +80,12 @@ fn sample_start_request(
 #[tokio::test]
 async fn workflow_delivery_survives_broker_loss_without_legacy_backlog() {
     let store = Arc::new(InMemoryStore::default());
-    let backlog_config = BacklogConfig {
-        activity_grace_window: std::time::Duration::from_millis(10),
-        grace_scan_interval: std::time::Duration::from_millis(5),
-        drain_interval: std::time::Duration::from_millis(5),
-        drain_batch_limit: 100,
-    };
     let runtime = TokeiraRuntime::new(
         store.clone(),
         1,
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        backlog_config,
     );
 
     let ns = NamespaceId::new();
@@ -114,7 +107,6 @@ async fn workflow_delivery_survives_broker_loss_without_legacy_backlog() {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     runtime.ready().await.unwrap();
     let queue = QueueKey {
@@ -138,17 +130,13 @@ async fn workflow_delivery_survives_broker_loss_without_legacy_backlog() {
         .unwrap();
 
     assert!(task.is_some(), "expected task after backlog lifecycle");
-
-    runtime.shutdown_grace_scanner().await.unwrap();
-    runtime.shutdown_drain_loop().await.unwrap();
     runtime.shutdown_timer_scanner().await.unwrap();
     runtime.shutdown_workflow_timeout_scanner().await.unwrap();
 }
 
-/// Graceful shutdown: cancel the grace scanner and drain
-/// loop, verify they exit cleanly.
+/// Runtime shutdown still joins scanners after retiring backlog workers.
 #[tokio::test]
-async fn backlog_graceful_shutdown() {
+async fn runtime_shutdown_after_backlog_retirement() {
     let store = Arc::new(InMemoryStore::default());
     let mut runtime = TokeiraRuntime::new(
         store.clone(),
@@ -156,13 +144,10 @@ async fn backlog_graceful_shutdown() {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
 
     // Shutdown immediately — should complete without
     // hanging.
-    runtime.shutdown_grace_scanner().await.unwrap();
-    runtime.shutdown_drain_loop().await.unwrap();
     runtime.shutdown_timer_scanner().await.unwrap();
     runtime.shutdown_workflow_timeout_scanner().await.unwrap();
 }

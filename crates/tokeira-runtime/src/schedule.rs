@@ -1557,7 +1557,6 @@ mod tests {
             crate::LaneConfig::default(),
             crate::TimerScannerConfig::default(),
             crate::WorkflowTimeoutScannerConfig::default(),
-            crate::BacklogConfig::default(),
         )
     }
 
@@ -1567,8 +1566,6 @@ mod tests {
         let _ = runtime.shutdown_wft_timeout_scanner().await;
         let _ = runtime.shutdown_activity_timeout_scanner().await;
         let _ = runtime.shutdown_nexus_timeout_scanner().await;
-        let _ = runtime.shutdown_grace_scanner().await;
-        let _ = runtime.shutdown_drain_loop().await;
         let _ = runtime.shutdown_control_loop().await;
     }
 

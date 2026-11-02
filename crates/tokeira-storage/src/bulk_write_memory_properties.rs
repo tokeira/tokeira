@@ -130,6 +130,12 @@ async fn closed_run(
         inner.activity_dispatch.insert(
             (run_key, activity_id.clone()),
             ActivityDispatchEntry {
+                key: crate::activity_dispatch_key(run_key, &activity_id),
+                execution_home: ShardId(0),
+                queue_key: Some(crate::dispatch_key::lookup_digest(
+                    b"queue",
+                    Some(&queue.task_queue.0),
+                )),
                 task: DispatchableActivityTask {
                     run_key,
                     queue: queue.clone(),

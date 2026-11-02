@@ -16,9 +16,9 @@ use tokeira_kernel::{
     HistoryEvent, HistoryEventKind, StartRequest, WorkflowCommand, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    ActivityTimeoutScannerConfig, BacklogConfig, LaneConfig, NexusCompletionDeps,
-    NexusEndpointRegistry, NexusNamespaceResolver, NexusTimeoutScannerConfig, NoopNexusHttpClient,
-    TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    ActivityTimeoutScannerConfig, LaneConfig, NexusCompletionDeps, NexusEndpointRegistry,
+    NexusNamespaceResolver, NexusTimeoutScannerConfig, NoopNexusHttpClient, TimerScannerConfig,
+    TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -58,7 +58,6 @@ fn runtime(
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         ActivityTimeoutScannerConfig::default(),
         NexusTimeoutScannerConfig::default(),
         NexusEndpointRegistry::default(),

@@ -432,6 +432,7 @@ impl BasicKernel {
             .unwrap_or_else(|| ctx.workflow_id.clone());
         let canonical_root_run_id = root_run_id.unwrap_or(ctx.run_id);
         let mut state = WorkflowState {
+            activity_start_receipts: std::collections::BTreeMap::new(),
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,
@@ -573,6 +574,7 @@ impl BasicKernel {
         let mut completion_callbacks = req.completion_callbacks.clone();
         stamp_callback_registration_times(&mut completion_callbacks, req.now);
         let initial = WorkflowState {
+            activity_start_receipts: std::collections::BTreeMap::new(),
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,
@@ -764,6 +766,7 @@ impl BasicKernel {
         let initial_worker_deployment_name =
             initial_worker_deployment_name(req.versioning_override.as_ref());
         let initial = WorkflowState {
+            activity_start_receipts: std::collections::BTreeMap::new(),
             used_worker_deployment_versions: Some(Vec::new()),
             completed_update_count: 0,
             signal_count: 0,
@@ -2471,7 +2474,10 @@ impl BasicKernel {
                     scheduled_event_id: activity.schedule_event_id,
                     attempt: activity.attempt,
                     identity: req.identity.clone(),
-                    request_id: format!("activity-start-{}-{}", req.activity_id, activity.attempt),
+                    request_id: req.request_id.map_or_else(
+                        || format!("activity-start-{}-{}", req.activity_id, activity.attempt),
+                        |id| id.to_string(),
+                    ),
                     last_failure: activity.last_failure.clone(),
                 })
             };
@@ -2523,20 +2529,38 @@ impl BasicKernel {
         // still applies and `flush_buffered` wires the eventual real event ID.
         let started_event_id =
             if activity.started_event_id == Some(TRANSIENT_ACTIVITY_STARTED_EVENT_ID) {
-                builder.append_external(HistoryEventKind::ActivityTaskStarted {
-                    activity_id: activity.activity_id.clone(),
-                    scheduled_event_id: activity.schedule_event_id,
-                    attempt: activity.attempt,
-                    identity: activity
-                        .started_identity
-                        .clone()
-                        .unwrap_or_else(|| WorkerIdentity(String::new())),
-                    request_id: format!(
-                        "activity-start-{}-{}",
-                        activity.activity_id, activity.attempt
-                    ),
-                    last_failure: activity.last_failure.clone(),
-                })
+                // Late materialization keeps the original event time, including
+                // through a running WFT's buffer (mutable_state_impl.go,
+                // addStartedEventForTransientActivity @ v1.31.0).
+                builder.append_external_at(
+                    activity.started_at.unwrap_or(req.now),
+                    HistoryEventKind::ActivityTaskStarted {
+                        activity_id: activity.activity_id.clone(),
+                        scheduled_event_id: activity.schedule_event_id,
+                        attempt: activity.attempt,
+                        identity: activity
+                            .started_identity
+                            .clone()
+                            .unwrap_or_else(|| WorkerIdentity(String::new())),
+                        // Transient materialization preserves the accepted request,
+                        // as addStartedEventForTransientActivity does with ai.RequestId
+                        // (service/history/workflow/mutable_state_impl.go @ v1.31.0).
+                        request_id: builder
+                            .state
+                            .activity_start_receipts
+                            .get(&activity.activity_id)
+                            .map_or_else(
+                                || {
+                                    format!(
+                                        "activity-start-{}-{}",
+                                        activity.activity_id, activity.attempt
+                                    )
+                                },
+                                |receipt| receipt.request_id.to_string(),
+                            ),
+                        last_failure: activity.last_failure.clone(),
+                    },
+                )
             } else {
                 activity.started_event_id.unwrap_or(0)
             };
@@ -5797,8 +5821,10 @@ fn apply_workflow_command(
                 // A freshly scheduled activity is at stamp 0; a later pause or
                 // options update bumps it and fences this initial dispatch.
                 stamp: 0,
-                // Initial dispatch is immediate.
-                dispatch_at: OffsetDateTime::UNIX_EPOCH,
+                // The hint carries the same schedule clock as authority.
+                // An epoch sentinel would make timeout reconstruction treat a
+                // freshly scheduled activity as already overdue.
+                dispatch_at: builder.now,
                 schedule_to_close_timeout,
                 schedule_to_start_timeout,
                 start_to_close_timeout,
@@ -7559,11 +7585,11 @@ impl TransitionBuilder {
     /// consumed and `last_event_id` is untouched until the WFT closes and
     /// [`Self::flush_buffered`] emits it (spec: kernel-event-buffering
     /// Req 2.1, 6.1.1).
-    fn buffer(&mut self, kind: HistoryEventKind) {
+    fn buffer(&mut self, happened_at: OffsetDateTime, kind: HistoryEventKind) {
         self.state
             .buffered_events
             .push(crate::state::BufferedEvent {
-                admitted_at: self.now,
+                admitted_at: happened_at,
                 kind,
                 principal: self.principal.clone(),
             });
@@ -7584,16 +7610,22 @@ impl TransitionBuilder {
     /// each event as it is appended, so the conversion has to come first here.
     /// Returns the event's real id when it is appended.
     fn append_external(&mut self, kind: HistoryEventKind) -> i64 {
+        self.append_external_at(self.now, kind)
+    }
+
+    /// Materialized transient starts retain their original time without changing
+    /// the transition clock used for the following terminal event.
+    fn append_external_at(&mut self, happened_at: OffsetDateTime, kind: HistoryEventKind) -> i64 {
         debug_assert!(
             is_externally_originated(&kind),
             "append_external is for externally-originated events: {kind:?}"
         );
         if should_buffer(&self.state, &kind) {
-            self.buffer(kind);
+            self.buffer(happened_at, kind);
             return BUFFERED_EVENT_ID;
         }
         self.finishing(Self::materialize_scheduled_speculative);
-        self.emit(kind)
+        self.emit_at(happened_at, kind)
     }
 
     /// Drain `buffered_events` into history in admission order, assigning
@@ -8492,6 +8524,7 @@ impl TransitionBuilder {
         // Accepting, rejecting or closing removes an id from the admitted set
         // at many sites; this one step keeps the history-admitted set with it.
         keep_history_admitted_within_admitted(&mut self.state);
+        self.state.retain_activity_start_receipts();
         self.state.transition_seq = self.state.transition_seq.next();
         debug_assert_eq!(self.history_events.len(), self.event_principals.len());
         let events_numbered_at_close = self

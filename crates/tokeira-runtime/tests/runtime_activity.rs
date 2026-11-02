@@ -8,7 +8,7 @@ use tokeira_kernel::{
     UpdateActivityOptionsRequest, WorkflowCommand, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    ActivityTokenResolutionError, BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
+    ActivityTokenResolutionError, LaneConfig, TimerScannerConfig, TokeiraRuntime,
     UpdateActivitiesOptionsRequest, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
@@ -27,7 +27,6 @@ async fn schedule_poll_complete_activity_produces_completed_history() -> Result<
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let workflow_id = WorkflowId("activity-complete".to_string());
@@ -76,7 +75,6 @@ async fn retryable_activity_failure_redispatches_next_attempt() -> Result<()> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
 
@@ -126,6 +124,32 @@ async fn retryable_activity_failure_redispatches_next_attempt() -> Result<()> {
         )
         .await?;
 
+    let LoadedRun::Existing(retrying) = store.load_run(first.run_key).await? else {
+        panic!("retrying run must remain present");
+    };
+    let rows = store
+        .list_all_dispatchable_activity_tasks(&activity_queue(namespace_id), 100)
+        .await?;
+    assert_eq!(
+        rows.len(),
+        1,
+        "retry intent must be committed: {:?}",
+        retrying.activities
+    );
+    assert_eq!(rows[0].attempt, 2);
+    let page = store
+        .list_activity_dispatch_page(
+            &tokeira_storage::ActivityDiscoveryRange {
+                namespace_id,
+                queue_name: activity_queue(namespace_id).task_queue,
+            },
+            OffsetDateTime::now_utc() + Duration::days(1),
+            None,
+            std::num::NonZeroU32::new(64).unwrap(),
+        )
+        .await?;
+    assert_eq!(page.candidates.len(), 1, "retry must be discoverable");
+
     // The retried attempt is published only after the 1s retry backoff
     // (v1.31.0 dispatches retries on a retry timer, activity.go:74 @ v1.31.0),
     // so the poll window must cover it.
@@ -163,7 +187,6 @@ async fn retryable_activity_failure_preserves_versioned_queue() -> Result<()> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let deployment = DeploymentId("deploy-a".to_string());
@@ -271,7 +294,6 @@ async fn non_retryable_activity_failure_submits_failed_resolution() -> Result<()
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let run_key = start_and_schedule_activity(
@@ -358,7 +380,6 @@ async fn republish_activity_queue_after_restart_restores_pollability() -> Result
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let _ = start_and_schedule_activity(
         &runtime,
@@ -369,18 +390,28 @@ async fn republish_activity_queue_after_restart_restores_pollability() -> Result
     )
     .await?;
 
+    let shutdown = runtime.shutdown_handle();
+    shutdown.begin_shutdown();
+    shutdown
+        .wait(std::time::Instant::now() + std::time::Duration::from_secs(10))
+        .await?;
+    drop(runtime);
+
     let restarted = TokeiraRuntime::new(
         store.clone(),
         2,
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
+    restarted.ready().await?;
     let count = restarted
         .republish_activity_queue(activity_queue(namespace_id), 10)
         .await?;
-    assert!(count >= 1);
+    assert_eq!(
+        count, 0,
+        "waking discovery performs no synchronous publication"
+    );
 
     let started = restarted
         .poll_activity_task(
@@ -402,7 +433,6 @@ async fn resolve_activity_token_matches_started_activity() -> Result<()> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let run_key = start_and_schedule_activity(
@@ -441,7 +471,6 @@ async fn resolve_activity_token_distinguishes_missing_and_not_started() -> Resul
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let run_key = start_and_schedule_activity(
@@ -494,7 +523,6 @@ async fn resolve_activity_token_refuses_a_closed_run() -> Result<()> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let start = runtime
@@ -587,7 +615,6 @@ async fn cancel_activity_task_emits_canceled_history_with_worker_identity() -> R
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let run_key = start_and_schedule_activity(
@@ -643,7 +670,6 @@ async fn update_activity_options_applies_field_changes_to_scheduled_activity() -
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let namespace_id = NamespaceId::new();
     let run_key = start_and_schedule_activity(
@@ -712,7 +738,6 @@ async fn restoring_activity_options_reads_the_scheduled_event_by_id() -> Result<
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     );
     let run_key = start_and_schedule_activity(
         &runtime,
@@ -980,24 +1005,17 @@ fn payloads(value: &str) -> Payloads {
     }])
 }
 
-/// Runtime with an aggressive activity scanner so durable-dispatch
-/// reconciliation is observable within test time, and a reconciliation
-/// budget the starvation test can pin to one row per pass.
-fn reconciling_runtime(
-    store: Arc<InMemoryStore>,
-    max_dispatch_reconciliations_per_scan: usize,
-) -> TokeiraRuntime<InMemoryStore> {
+/// Short owner-timer ticks expose eligibility and timeout progress in this fixture.
+fn reconciling_runtime(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
     TokeiraRuntime::new_with_nexus(
         store,
         2,
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         tokeira_runtime::ActivityTimeoutScannerConfig {
             scan_interval: tokio::time::Duration::from_millis(50),
             max_timeouts_per_scan: 100,
-            max_dispatch_reconciliations_per_scan,
         },
         tokeira_runtime::NexusTimeoutScannerConfig::default(),
         tokeira_runtime::NexusEndpointRegistry::default(),
@@ -1052,7 +1070,7 @@ fn activity_pause_rule(id: &str, predicate: &str) -> tokeira_types::WorkflowRule
 #[tokio::test(flavor = "multi_thread")]
 async fn dropped_offer_is_rediscovered_by_durable_dispatch_reconciliation() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let runtime = reconciling_runtime(store.clone(), 100);
+    let runtime = reconciling_runtime(store.clone());
     let namespace_id = NamespaceId::new();
     let run_key = start_and_schedule_activity(
         &runtime,
@@ -1135,7 +1153,7 @@ async fn dropped_offer_is_rediscovered_by_durable_dispatch_reconciliation() -> R
 #[tokio::test(flavor = "multi_thread")]
 async fn retry_backoff_is_respected_by_reconciliation_and_recovery() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let runtime = reconciling_runtime(store.clone(), 100);
+    let runtime = reconciling_runtime(store.clone());
     let namespace_id = NamespaceId::new();
     let policy = RetryPolicy {
         initial_interval: Duration::seconds(2),
@@ -1194,6 +1212,13 @@ async fn retry_backoff_is_respected_by_reconciliation_and_recovery() -> Result<(
         "a retry must not be delivered inside its backoff"
     );
 
+    let shutdown = runtime.shutdown_handle();
+    shutdown.begin_shutdown();
+    shutdown
+        .wait(std::time::Instant::now() + std::time::Duration::from_secs(10))
+        .await?;
+    drop(runtime);
+
     // A shard-recovery sweep during the window must not publish it either.
     let recovered = TokeiraRuntime::new_with_nexus_and_shards(
         store.clone(),
@@ -1201,11 +1226,9 @@ async fn retry_backoff_is_respected_by_reconciliation_and_recovery() -> Result<(
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         tokeira_runtime::ActivityTimeoutScannerConfig {
             scan_interval: tokio::time::Duration::from_millis(50),
             max_timeouts_per_scan: 100,
-            max_dispatch_reconciliations_per_scan: 100,
         },
         tokeira_runtime::NexusTimeoutScannerConfig::default(),
         tokeira_runtime::NexusEndpointRegistry::default(),
@@ -1248,7 +1271,7 @@ async fn retry_backoff_is_respected_by_reconciliation_and_recovery() -> Result<(
 #[tokio::test(flavor = "multi_thread")]
 async fn parked_offer_is_not_duplicated_by_reconciliation() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let runtime = reconciling_runtime(store.clone(), 100);
+    let runtime = reconciling_runtime(store.clone());
     let namespace_id = NamespaceId::new();
     let run_key = start_and_schedule_activity(
         &runtime,
@@ -1301,7 +1324,7 @@ async fn parked_offer_is_not_duplicated_by_reconciliation() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn backoff_interval_rule_between_publication_and_start_pauses_durably() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let runtime = reconciling_runtime(store.clone(), 100);
+    let runtime = reconciling_runtime(store.clone());
     let namespace_id = NamespaceId::new();
     let policy = RetryPolicy {
         initial_interval: Duration::seconds(1),
@@ -1412,7 +1435,7 @@ async fn backoff_interval_rule_between_publication_and_start_pauses_durably() ->
 #[tokio::test(flavor = "multi_thread")]
 async fn backoff_interval_rule_is_clean_non_match_for_first_attempt() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
-    let runtime = reconciling_runtime(store.clone(), 100);
+    let runtime = reconciling_runtime(store.clone());
     let namespace_id = NamespaceId::new();
     store
         .create_workflow_rule(

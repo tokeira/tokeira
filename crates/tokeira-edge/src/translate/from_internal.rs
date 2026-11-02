@@ -210,6 +210,8 @@ pub fn poll_activity_response(
     workflow_namespace: &str,
 ) -> Result<crate::translate::PollActivityTaskQueueResponse> {
     Ok(crate::translate::PollActivityTaskQueueResponse {
+        replayed: started.replayed,
+        priority: started.priority,
         task_token: crate::task_token::encode(started.token.clone(), namespace_id)?,
         activity_id: started.activity_id,
         run_id: started.run_id,
@@ -218,7 +220,11 @@ pub fn poll_activity_response(
         attempt: started.attempt,
         workflow_id: started.workflow_id,
         workflow_type: started.workflow_type,
-        workflow_namespace: workflow_namespace.to_owned(),
+        workflow_namespace: if started.replayed {
+            String::new()
+        } else {
+            workflow_namespace.to_owned()
+        },
         run_key: started.run_key,
         header: started.header,
         retry_policy: started.retry_policy,
@@ -391,6 +397,8 @@ mod tests {
     fn started_activity_task() -> StartedActivityTask {
         let run_key = RunKey::new();
         StartedActivityTask {
+            replayed: false,
+            priority: None,
             run_key,
             run_id: RunId(uuid::Uuid::nil()),
             activity_id: "activity".to_owned(),

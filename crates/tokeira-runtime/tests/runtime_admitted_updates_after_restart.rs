@@ -27,7 +27,7 @@ use tokeira_kernel::{
     limits::{UpdateLimit, UpdateLimitExceeded},
 };
 use tokeira_runtime::{
-    ActivityTimeoutScannerConfig, BacklogConfig, KernelRejected, LaneConfig, NexusCompletionDeps,
+    ActivityTimeoutScannerConfig, KernelRejected, LaneConfig, NexusCompletionDeps,
     NexusEndpointRegistry, NexusTimeoutScannerConfig, NoopNexusHttpClient, StartedWorkflowTask,
     TimerScannerConfig, TokeiraRuntime, UpdateLifecycleStage, UpdateOutcome, UpdateWaitPolicy,
     WorkflowActivation, WorkflowTimeoutScannerConfig,
@@ -49,8 +49,19 @@ fn runtime(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     )
+}
+
+async fn stop(runtime: TokeiraRuntime<InMemoryStore>) {
+    let shutdown = runtime.shutdown_handle();
+    // Drop requests cancellation; joining makes this a stopped-node restart.
+    // Otherwise an old discovery read can still hold the shared store lock
+    // while the replacement's synchronous readiness check inspects it.
+    drop(runtime);
+    shutdown
+        .wait(Instant::now() + std::time::Duration::from_secs(10))
+        .await
+        .expect("prior runtime tasks finish before replacement construction");
 }
 
 /// The node after a restart: a new runtime over the same store that takes its
@@ -62,7 +73,6 @@ async fn restarted(store: Arc<InMemoryStore>) -> Result<TokeiraRuntime<InMemoryS
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         ActivityTimeoutScannerConfig::default(),
         NexusTimeoutScannerConfig::default(),
         NexusEndpointRegistry::default(),
@@ -382,7 +392,7 @@ async fn a_lost_updates_retry_gets_its_outcome() -> Result<()> {
     let before = runtime(store.clone());
     start(&before, namespace_id).await?;
     admit(&before, namespace_id, "lost").await?;
-    drop(before);
+    stop(before).await;
 
     let after = restarted(store.clone()).await?;
     let answer = retry_while_working(&after, namespace_id, "lost").await?;
@@ -407,7 +417,7 @@ async fn no_empty_speculative_task_follows_a_lost_update() -> Result<()> {
         .complete_workflow_task(completion(first, Vec::new()))
         .await?;
     admit(&before, namespace_id, "lost").await?;
-    drop(before);
+    stop(before).await;
 
     let after = restarted(store.clone()).await?;
     if let Some(stray) = poll(&after, namespace_id, 300).await? {
@@ -447,7 +457,7 @@ async fn the_advice_leaves_out_lost_updates() -> Result<()> {
     for index in 0..10 {
         admit(&before, namespace_id, &format!("lost-{index}")).await?;
     }
-    drop(before);
+    stop(before).await;
 
     let after = restarted(store.clone()).await?;
     let task = poll(&after, namespace_id, 300)
@@ -538,7 +548,7 @@ async fn a_lost_updates_retry_meets_the_update_limits() -> Result<()> {
     let before = runtime(store.clone());
     start(&before, namespace_id).await?;
     admit(&before, namespace_id, "lost").await?;
-    drop(before);
+    stop(before).await;
 
     let after = restarted(store.clone()).await?;
     // The first admission forgets the lost update, so ten new ones fit.
@@ -605,7 +615,7 @@ async fn a_resets_reapplied_updates_survive_a_restart() -> Result<()> {
             },
         )
         .await?;
-    drop(before);
+    stop(before).await;
 
     let after = restarted(store.clone()).await?;
     let joined = after
@@ -659,7 +669,7 @@ proptest! {
             for index in 0..lost {
                 admit(&before, namespace_id, &format!("lost-{index}")).await.unwrap();
             }
-            drop(before);
+            stop(before).await;
 
             let after = restarted(store.clone()).await.unwrap();
             for index in 0..held {

@@ -603,20 +603,35 @@ pub(crate) async fn run_discovery<R: RunRepository + 'static>(
     source: WorkflowSource<R>,
     registry: DiscoveryRegistry,
     broker: InMemoryBroker,
+    activity: crate::activity_discovery::ActivityDiscovery<R>,
     cancel: CancellationToken,
 ) {
     let source = Arc::new(source);
     let mut slices = tokio::task::JoinSet::new();
+    let mut prefer_activity = true;
     loop {
         let now = Instant::now();
         broker.expire_offers(now).await;
+        activity.broker.expire_offers(now).await;
         for (home, queue) in registry.retire(now) {
             broker.retire_offers(&home, &queue).await;
         }
+        for (home, queue) in activity.registry.retire(now) {
+            activity.broker.retire_offers(&home, &queue).await;
+        }
         while slices.len() < CONCURRENT_QUERIES {
+            if prefer_activity && activity.try_spawn(&mut slices, &cancel, now) {
+                prefer_activity = false;
+                continue;
+            }
             let Some((key, home, mut pass)) = registry.select(now) else {
+                if activity.try_spawn(&mut slices, &cancel, now) {
+                    prefer_activity = false;
+                    continue;
+                }
                 break;
             };
+            prefer_activity = true;
             let source = source.clone();
             let registry = registry.clone();
             let broker = broker.clone();
@@ -638,7 +653,9 @@ pub(crate) async fn run_discovery<R: RunRepository + 'static>(
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = registry.wake.notified() => {},
+            _ = activity.registry.wake.notified() => {},
             _ = broker.offer_capacity_changed() => { registry.capacity_returned(Instant::now()); },
+            _ = activity.broker.offer_capacity_changed() => { activity.registry.capacity_returned(Instant::now()); },
             _ = slices.join_next(), if !slices.is_empty() => {},
             _ = tokio::time::sleep(DISCOVERY_PERIOD) => {},
         }

@@ -18,14 +18,13 @@ use tokeira_kernel::{
     HistoryEventKind, SignalRequest, StartRequest, WorkflowCommand, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    ActivityTimeoutScannerConfig, BacklogConfig, COMPLETION_TOKEN_VERSION,
-    CompletionCallbackScannerConfig, CompletionDeliveryOutcome, EndpointTarget,
-    InMemoryNexusEndpointStore, LaneConfig, NexusCancelResult, NexusCompletion,
-    NexusCompletionClient, NexusCompletionDeps, NexusCompletionRuntimeConfig, NexusCompletionToken,
-    NexusEndpointRegistry, NexusEndpointSpec, NexusEndpointSpecTarget, NexusEndpointStore,
-    NexusHttpClient, NexusStartResult, NexusTaskCorrelation, NexusTaskRequest,
-    NexusTimeoutScannerConfig, SYSTEM_CALLBACK_URL, TimerScannerConfig, TokeiraRuntime,
-    WorkflowTimeoutScannerConfig,
+    ActivityTimeoutScannerConfig, COMPLETION_TOKEN_VERSION, CompletionCallbackScannerConfig,
+    CompletionDeliveryOutcome, EndpointTarget, InMemoryNexusEndpointStore, LaneConfig,
+    NexusCancelResult, NexusCompletion, NexusCompletionClient, NexusCompletionDeps,
+    NexusCompletionRuntimeConfig, NexusCompletionToken, NexusEndpointRegistry, NexusEndpointSpec,
+    NexusEndpointSpecTarget, NexusEndpointStore, NexusHttpClient, NexusStartResult,
+    NexusTaskCorrelation, NexusTaskRequest, NexusTimeoutScannerConfig, SYSTEM_CALLBACK_URL,
+    TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -638,7 +637,6 @@ fn runtime_with_registry(
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         ActivityTimeoutScannerConfig::default(),
         NexusTimeoutScannerConfig {
             scan_interval: tokio::time::Duration::from_millis(10),
@@ -2073,7 +2071,6 @@ fn runtime_with_completion_client(
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         ActivityTimeoutScannerConfig::default(),
         NexusTimeoutScannerConfig::default(),
         registry,
@@ -2661,7 +2658,6 @@ async fn completion_callback_exhausts_max_attempts_to_failed() -> Result<()> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         ActivityTimeoutScannerConfig::default(),
         NexusTimeoutScannerConfig::default(),
         seed_registry(vec![]),

@@ -93,7 +93,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     use crate::{
-        BacklogConfig, InMemoryBroker, LaneConfig, TimerScannerConfig, TokeiraRuntime,
+        InMemoryBroker, LaneConfig, TimerScannerConfig, TokeiraRuntime,
         WorkflowTimeoutScannerConfig,
     };
 
@@ -104,7 +104,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
         )
     }
 

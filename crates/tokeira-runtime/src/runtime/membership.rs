@@ -541,7 +541,6 @@ mod tests {
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
-            BacklogConfig::default(),
             ActivityTimeoutScannerConfig::default(),
             NexusTimeoutScannerConfig::default(),
             NexusEndpointRegistry::default(),

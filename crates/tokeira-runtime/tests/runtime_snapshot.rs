@@ -14,9 +14,9 @@ use proptest::prelude::*;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{StartRequest, WorkflowCommand, WorkflowTaskCompletedRequest};
 use tokeira_runtime::{
-    ActivityTimeoutScannerConfig, BacklogConfig, LaneConfig, NexusCompletionDeps,
-    NexusEndpointRegistry, NexusTimeoutScannerConfig, NoopNexusHttpClient, TimerScannerConfig,
-    TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    ActivityTimeoutScannerConfig, LaneConfig, NexusCompletionDeps, NexusEndpointRegistry,
+    NexusTimeoutScannerConfig, NoopNexusHttpClient, TimerScannerConfig, TokeiraRuntime,
+    WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -43,7 +43,6 @@ fn seeding_runtime(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
             max_timers_per_scan: 100,
         },
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     )
 }
 
@@ -57,7 +56,6 @@ fn recovering_runtime(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
         ActivityTimeoutScannerConfig::default(),
         NexusTimeoutScannerConfig::default(),
         NexusEndpointRegistry::default(),

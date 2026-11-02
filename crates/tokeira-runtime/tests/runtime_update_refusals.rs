@@ -21,9 +21,9 @@ use tokeira_kernel::{
     WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
 };
 use tokeira_runtime::{
-    BacklogConfig, InvalidWorkflowCommand, KernelRejected, LaneConfig, MultiOperationError,
-    StartedWorkflowTask, TimerScannerConfig, TokeiraRuntime, UpdateLifecycleSnapshot, UpdatePaused,
-    UpdateWaitPolicy, WorkflowClosing, WorkflowNotReady, WorkflowTimeoutScannerConfig,
+    InvalidWorkflowCommand, KernelRejected, LaneConfig, MultiOperationError, StartedWorkflowTask,
+    TimerScannerConfig, TokeiraRuntime, UpdateLifecycleSnapshot, UpdatePaused, UpdateWaitPolicy,
+    WorkflowClosing, WorkflowNotReady, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -52,7 +52,6 @@ fn runtime(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
         LaneConfig::default(),
         TimerScannerConfig::default(),
         WorkflowTimeoutScannerConfig::default(),
-        BacklogConfig::default(),
     )
 }
 

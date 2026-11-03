@@ -321,7 +321,7 @@ No separate specification PR is planned.
   - Cover Properties 6, 19 and 20 with at least 100 cases per property test, including
     cancellation, close policies, deletion, retained proof and restart. Run the kernel and
     runtime negative controls with only the production kernel/storage fix reversed.
-  - Compile the storage and runtime live DSQL regressions for operator execution, and
+  - Run the storage and runtime live DSQL regressions on an ephemeral cluster, and
     update the delivery ledger, live-suite ordering and internal change record.
   - _Requirements: 3.6, 3.7, 6.1, 6.8, 6.9, 10.4, 10.5, 10.6, 10.7._
 

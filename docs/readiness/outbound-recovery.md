@@ -96,6 +96,7 @@ supplements the 100-case memory/model properties; it does not replace their case
 | `dsql::run_repository::outbound_live_tests::outbound_live_future_child_result_retains_deleted_parent` | Pass |
 | `dsql::run_repository::outbound_live_tests::outbound_live_interrupted_large_legacy_cutover` | Pass |
 | `dsql::run_repository::outbound_live_tests::outbound_live_original_fences_and_retained_destination_proof` | Pass |
+| `dsql::run_repository::outbound_live_tests::outbound_live_owed_release_survives_parent_deletion` | Pass |
 | `dsql::run_repository::outbound_live_tests::outbound_live_reset_conflict_preserves_all_participants` | Pass |
 | `dsql::run_repository::outbound_live_tests::outbound_live_successor_reservation_and_interrupted_publication` | Pass |
 

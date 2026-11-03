@@ -1170,7 +1170,10 @@ async fn child_release_live_case(case: ChildReleaseCase) -> Result<()> {
                     external_initiator: None,
                     external_initiated_event_id: 0,
                     links: Vec::new(),
-                    request: RequestContext::unattributed(OffsetDateTime::now_utc()),
+                    request: RequestContext {
+                        request_id: RequestId(format!("child-release-cancel:{}", child.run_key.0)),
+                        ..RequestContext::unattributed(OffsetDateTime::now_utc())
+                    },
                     now: OffsetDateTime::now_utc(),
                 }),
             )
@@ -1344,7 +1347,10 @@ async fn child_release_live_case(case: ChildReleaseCase) -> Result<()> {
                         identity: "fixture".into(),
                         links: Vec::new(),
                         now: OffsetDateTime::now_utc(),
-                        request: RequestContext::unattributed(OffsetDateTime::now_utc()),
+                        request: RequestContext {
+                            request_id: RequestId(format!("child-release-cleanup:{}", key.0)),
+                            ..RequestContext::unattributed(OffsetDateTime::now_utc())
+                        },
                     }),
                 )
                 .await?;

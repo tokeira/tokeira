@@ -59,7 +59,7 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
         attempt: Attempt,
         owner: &Arc<RwLock<ShardOwner>>,
     ) -> Result<()> {
-        let source = self.operation_source(&row).await?;
+        let source = self.operation_source(&row, &attempt, owner).await?;
         let initiation = row.incarnation.key.initiating_event;
         let signal = row.incarnation.key.kind == OperationKind::ExternalSignal;
         let history = self

@@ -14,6 +14,12 @@ use crate::{
     IntentRow, OperationRow, OutboundPage, RecoveryError, ScanBound, dsql::value_parts,
 };
 
+pub(super) use crate::outbound::close_batch::same_index_entry;
+use crate::{
+    outbound::close_batch,
+    write_budget::{WriteBudget, WriteCost},
+};
+
 const OPERATION_SELECT: &str = "SELECT source_run_key, kind, initiating_event_id, source_home,
     requested_event_id, attempt, due_at, target_namespace, target_workflow_id FROM run_operation";
 const INTENT_SELECT: &str = "SELECT source_run_key, intent_id, source_home, close_seq, kind,
@@ -62,6 +68,7 @@ fn decode_descriptor(row: &PgRow) -> Result<IntentDescriptor> {
         2 => IntentKind::ChildResult,
         3 => IntentKind::Successor,
         4 => IntentKind::ChildRelease,
+        5 => IntentKind::CloseBatch,
         kind => bail!("unknown outbound intent kind {kind}"),
     };
     let ordinal = storage_id
@@ -225,34 +232,28 @@ pub(super) async fn maintain_operations(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     state: &WorkflowState,
     home: ShardId,
+    used: WriteCost,
 ) -> Result<()> {
     maintain_parent_reference(tx, state, state.is_open()).await?;
     let rows = sqlx::query("SELECT source_run_key, kind, initiating_event_id, source_home, requested_event_id, attempt, due_at, target_namespace, target_workflow_id FROM run_operation WHERE source_run_key=$1")
         .bind(state.run_key.0).fetch_all(&mut **tx).await?;
-    let mut prior: BTreeMap<_, _> = rows
+    let prior: BTreeMap<_, _> = rows
         .into_iter()
         .map(decode_operation)
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .map(|row| (row.incarnation.key, row))
         .collect();
-    for row in crate::derive_operations(state, home)? {
-        let key = row.incarnation.key;
-        // Keep unchanged entries untouched: a hot run with many pending external
-        // operations must not consume a row mutation per slot on every WFT.
-        if prior
-            .remove(&key)
-            .as_ref()
-            .is_some_and(|prior| same_index_entry(prior, &row))
-        {
-            continue;
-        }
+    let (upserts, deletes) = close_batch::operation_changes(
+        prior,
+        crate::derive_operations(state, home)?,
+        used,
+        WriteBudget::TRANSACTION,
+    );
+    for row in upserts {
         write_operation_row(tx, &row).await?;
     }
-    for key in prior.into_keys() {
-        sqlx::query("DELETE FROM run_operation WHERE source_run_key=$1 AND kind=$2 AND initiating_event_id=$3")
-            .bind(key.source_run.0).bind(key.kind as i16).bind(key.initiating_event).execute(&mut **tx).await?;
-    }
+    delete_operations(tx, deletes).await?;
     Ok(())
 }
 
@@ -270,18 +271,6 @@ pub(super) async fn write_operation_row(
             .bind(row.due_at).bind(row.target.as_ref().map(|(ns, _)| ns.0)).bind(row.target.as_ref().map(|(_, wf)| wf.0.as_str()))
             .execute(&mut **tx).await?;
     Ok(())
-}
-
-pub(super) fn same_index_entry(left: &OperationRow, right: &OperationRow) -> bool {
-    // PostgreSQL encodes timestamps as whole microseconds since 2000. State
-    // retains nanoseconds; direct equality would rewrite every unchanged due
-    // entry on each WFT and could exhaust DSQL's row budget. Delivery still
-    // evaluates the full-precision deadline in authoritative run state.
-    let micros = |at: OffsetDateTime| (at.unix_timestamp_nanos() - 946_684_800_000_000_000) / 1_000;
-    left.incarnation == right.incarnation
-        && left.source_home == right.source_home
-        && left.target == right.target
-        && micros(left.due_at) == micros(right.due_at)
 }
 
 pub(super) async fn insert_intent(
@@ -310,15 +299,24 @@ pub(super) async fn maintain(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     transition: &Transition,
     home: ShardId,
+    extra_intents: &[IntentRow],
 ) -> Result<()> {
     let state = &transition.next_state;
+    let mut intents = extra_intents.to_vec();
     if !state.is_open() && !transition.history_events.is_empty() {
         let prior = read_source(tx, state.run_key).await?;
-        for row in crate::derive_close_intents(prior.as_ref(), transition, home)? {
-            insert_intent(tx, &row).await?;
-        }
+        intents.extend(crate::derive_close_intents(
+            prior.as_ref(),
+            transition,
+            home,
+        )?);
     }
-    maintain_operations(tx, state, home).await
+    let intents = close_batch::batch_close(intents, WriteBudget::TRANSACTION)?;
+    let used = close_batch::intents_cost(&intents)?;
+    for row in intents {
+        insert_intent(tx, &row).await?;
+    }
+    maintain_operations(tx, state, home, used).await
 }
 
 impl DsqlRunRepository {
@@ -460,16 +458,59 @@ impl DsqlRunRepository {
                 ) == home,
                 "outbound repair home mismatch"
             );
-            maintain_operations(&mut tx, &state, home).await?;
+            maintain_operations(&mut tx, &state, home, WriteCost::default()).await?;
         } else {
-            sqlx::query("DELETE FROM run_operation WHERE source_run_key=$1 AND source_home=$2")
-                .bind(run.0)
-                .bind(Self::shard_id_to_uuid(home))
-                .execute(&mut *tx)
-                .await?;
+            let rows = sqlx::query_as::<_, (i16, i64)>(
+                "SELECT kind,initiating_event_id FROM run_operation
+                 WHERE source_run_key=$1 AND source_home=$2
+                 ORDER BY kind,initiating_event_id LIMIT $3",
+            )
+            .bind(run.0)
+            .bind(Self::shard_id_to_uuid(home))
+            .bind(i64::try_from(WriteBudget::TRANSACTION.rows)?)
+            .fetch_all(&mut *tx)
+            .await?;
+            let keys = rows
+                .into_iter()
+                .map(|(kind, initiating_event)| {
+                    Ok(OperationKey {
+                        source_run: run,
+                        kind: operation_kind(kind)?,
+                        initiating_event,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            delete_operations(&mut tx, keys).await?;
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Replace only the captured batch key under its original source fence.
+    pub(super) async fn do_expand_close_batch(
+        &self,
+        key: IntentKey,
+        fence: WriteFence,
+    ) -> Result<bool> {
+        let mut permit = self.director.acquire(DbClass::Maintenance).await?;
+        let mut tx = permit.begin().await?;
+        if let Some(lost) = Self::check_fence(&mut tx, &fence, key.source_run).await? {
+            return Err(lost.into());
+        }
+        let Some(batch) = load_intent(&mut tx, key).await? else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        fence.ensure_home(batch.source_home)?;
+        let rows = close_batch::expansion(&batch, WriteBudget::TRANSACTION)?;
+        for row in rows {
+            insert_intent(&mut tx, &row).await?;
+        }
+        // Concurrent expanders both delete this exact key, so OCC permits only
+        // one page to commit. A retry of a committed key observes absence.
+        delete_intent(&mut tx, key).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub(super) async fn do_retire_intent(
@@ -500,19 +541,7 @@ impl DsqlRunRepository {
         }
         // Source sequence is intentionally NOT changed. Intent retirement is an
         // exact fenced maintenance write; later run repair cannot recreate it.
-        sqlx::query("DELETE FROM run_intent_part WHERE source_run_key=$1 AND intent_id=$2")
-            .bind(proof.key.source_run.0)
-            .bind(proof.key.storage_id())
-            .execute(&mut *tx)
-            .await?;
-        let deleted =
-            sqlx::query("DELETE FROM run_intent WHERE source_run_key=$1 AND intent_id=$2")
-                .bind(proof.key.source_run.0)
-                .bind(proof.key.storage_id())
-                .execute(&mut *tx)
-                .await?
-                .rows_affected()
-                != 0;
+        let deleted = delete_intent(&mut tx, proof.key).await?;
         tx.commit().await?;
         Ok(deleted)
     }
@@ -548,6 +577,7 @@ pub(super) async fn load_intent(
         IntentPayload::ChildResult { .. } => IntentKind::ChildResult,
         IntentPayload::Successor { .. } => IntentKind::Successor,
         IntentPayload::ChildRelease { .. } => IntentKind::ChildRelease,
+        IntentPayload::CloseBatch { .. } => IntentKind::CloseBatch,
     };
     anyhow::ensure!(
         key == descriptor.key && key.kind == expected_kind,
@@ -567,4 +597,42 @@ pub(super) async fn load_intent(
         },
         payload,
     }))
+}
+
+async fn delete_operations(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    keys: Vec<OperationKey>,
+) -> Result<()> {
+    for key in keys {
+        sqlx::query(
+            "DELETE FROM run_operation
+            WHERE source_run_key=$1 AND kind=$2 AND initiating_event_id=$3",
+        )
+        .bind(key.source_run.0)
+        .bind(key.kind as i16)
+        .bind(key.initiating_event)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn delete_intent(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    key: IntentKey,
+) -> Result<bool> {
+    sqlx::query("DELETE FROM run_intent_part WHERE source_run_key=$1 AND intent_id=$2")
+        .bind(key.source_run.0)
+        .bind(key.storage_id())
+        .execute(&mut **tx)
+        .await?;
+    Ok(
+        sqlx::query("DELETE FROM run_intent WHERE source_run_key=$1 AND intent_id=$2")
+            .bind(key.source_run.0)
+            .bind(key.storage_id())
+            .execute(&mut **tx)
+            .await?
+            .rows_affected()
+            != 0,
+    )
 }

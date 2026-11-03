@@ -94,18 +94,29 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
         }
     }
 
-    async fn operation_source(&self, row: &OperationRow) -> Result<WorkflowState> {
-        let LoadedRun::Existing(state) = self.repo.load_run(row.incarnation.key.source_run).await?
-        else {
-            return Err(RecoveryError::Obsolete.into());
-        };
-        ensure!(
-            tokeira_storage::derive_operations(&state, row.source_home)?
+    async fn operation_source(
+        &self,
+        row: &OperationRow,
+        attempt: &Attempt,
+        owner: &Arc<RwLock<ShardOwner>>,
+    ) -> Result<WorkflowState> {
+        let source_run = row.incarnation.key.source_run;
+        if let LoadedRun::Existing(state) = self.repo.load_run(source_run).await?
+            && tokeira_storage::derive_operations(&state, row.source_home)?
                 .iter()
-                .any(|pending| pending.incarnation == row.incarnation),
-            RecoveryError::Obsolete
-        );
-        Ok(state)
+                .any(|pending| pending.incarnation == row.incarnation)
+        {
+            return Ok(state);
+        }
+        // Reclaim only a missing or underived cause. A later source-sequence
+        // guard failure says nothing about index staleness and needs no scan.
+        // Closed sources may be absent from acquisition's recovery scan, so
+        // discovery must finish their bounded deletions under the original fence.
+        attempt.validate(owner)?;
+        self.repo
+            .reconcile_outbound_run(row.source_home, source_run, attempt.fence.clone())
+            .await?;
+        Err(RecoveryError::Obsolete.into())
     }
 
     async fn source_outcome(
@@ -116,7 +127,7 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
         owner: &Arc<RwLock<ShardOwner>>,
     ) -> Result<CommitResult> {
         attempt.validate(owner)?;
-        let state = self.operation_source(row).await?;
+        let state = self.operation_source(row, attempt, owner).await?;
         self.pick_lane(state.run_key)
             .submit_outbound(
                 state.run_key,

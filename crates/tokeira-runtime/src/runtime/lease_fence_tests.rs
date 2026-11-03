@@ -347,10 +347,11 @@ pub(super) fn before_tests(text: &str) -> &str {
 /// commit and reset materialization, the activity paths that commit directly,
 /// a deletion's first transaction, and a takeover's recovery switch. A new
 /// writer fails the audit until its fence is checked and it is listed here.
-const FENCED_WRITERS: [(&str, usize); 8] = [
+const FENCED_WRITERS: [(&str, usize); 9] = [
     ("lane.rs", 5),
     ("outbound/successor.rs", 4),
-    ("publisher/outbound/close.rs", 1),
+    ("publisher/outbound/close.rs", 2),
+    ("publisher/outbound.rs", 1),
     ("runtime/activity.rs", 5),
     ("runtime/lifecycle.rs", 1),
     ("runtime/reset.rs", 5),
@@ -392,6 +393,7 @@ fn every_runtime_write_takes_its_fence_from_the_ownership_state() {
             ".abandon_prepared_run(",
             ".complete_run_preparation(",
             ".retire_intent(",
+            ".expand_close_batch(",
             ".reconcile_outbound_run(",
         ]
         .iter()

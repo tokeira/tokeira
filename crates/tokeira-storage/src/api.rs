@@ -1062,6 +1062,11 @@ pub trait RunRepository: Send + Sync {
         Err(anyhow!("outbound reconciliation is not implemented"))
     }
 
+    /// Expand one close batch page atomically under the original source fence.
+    /// Returns false without writes if the exact batch key is already gone.
+    /// Rejects nested batches with `RecoveryError::InvalidIdentity`.
+    async fn expand_close_batch(&self, key: crate::IntentKey, fence: WriteFence) -> Result<bool>;
+
     /// Retire only the exact verified obligation under its original source fence.
     /// Returns false for an already-retired key; that is idempotent success.
     async fn retire_intent(
@@ -3265,6 +3270,13 @@ where
         fence: crate::WriteFence,
     ) -> anyhow::Result<()> {
         (**self).reconcile_outbound_run(home, run, fence).await
+    }
+    async fn expand_close_batch(
+        &self,
+        key: crate::IntentKey,
+        fence: crate::WriteFence,
+    ) -> anyhow::Result<bool> {
+        (**self).expand_close_batch(key, fence).await
     }
     async fn retire_intent(
         &self,

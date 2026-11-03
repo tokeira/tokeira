@@ -56,9 +56,8 @@ impl InMemoryStore {
                 reason: "injected fallback conflict".into(),
             });
         }
-        let prepared = transition::prepare(&store, run, closing)?;
+        let prepared = transition::prepare_with_intents(&store, run, closing, vec![intent])?;
         let state = transition::write(&mut store, run, prepared);
-        store.outbound_intents.insert(intent.key, intent);
         store.successor_reservations.insert(workflow, reservation);
         Ok(CommitResult::Applied { new_state: state })
     }

@@ -4,7 +4,10 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use std::{
     ops::Deref,
-    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+    },
 };
 use time::OffsetDateTime;
 use tokeira_kernel::{HistoryEvent, LoadedRun, Transition};
@@ -29,7 +32,10 @@ pub(super) struct Repository {
     pub(super) fail_outbound_before: AtomicU8,
     pub(super) lose_child_seed_reply: AtomicBool,
     pub(super) lose_retirement: AtomicU8,
+    pub(super) lose_expansion: AtomicU8,
     pub(super) hold_child_releases: AtomicBool,
+    pub(super) reconcile_calls: AtomicUsize,
+    pub(super) source_transition_before_outcome: Mutex<Option<Transition>>,
 }
 
 impl Deref for Repository {
@@ -152,7 +158,22 @@ impl RunRepository for Repository {
         run: tokeira_types::RunKey,
         fence: tokeira_storage::WriteFence,
     ) -> anyhow::Result<()> {
+        self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.reconcile_outbound_run(home, run, fence).await
+    }
+    async fn expand_close_batch(
+        &self,
+        key: tokeira_storage::IntentKey,
+        fence: tokeira_storage::WriteFence,
+    ) -> anyhow::Result<bool> {
+        if self.lose_expansion.fetch_and(!1, Ordering::SeqCst) & 1 != 0 {
+            bail!("injected interruption before batch expansion");
+        }
+        let result = self.inner.expand_close_batch(key, fence).await?;
+        if self.lose_expansion.fetch_and(!2, Ordering::SeqCst) & 2 != 0 {
+            bail!("injected lost batch expansion reply");
+        }
+        Ok(result)
     }
     async fn retire_intent(
         &self,
@@ -213,6 +234,17 @@ impl RunRepository for Repository {
         };
         if bit != 0 && self.fail_outbound_before.fetch_and(!bit, Ordering::SeqCst) & bit != 0 {
             bail!("injected interruption before outbound commit");
+        }
+        if guard.operation().is_some_and(|op| op.key.source_run == run) {
+            let concurrent = self.source_transition_before_outcome.lock().unwrap().take();
+            if let Some(concurrent) = concurrent {
+                assert!(matches!(
+                    self.inner
+                        .commit_transition(run, concurrent, source_fence.clone())
+                        .await?,
+                    CommitResult::Applied { .. }
+                ));
+            }
         }
         let result = self
             .inner

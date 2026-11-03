@@ -15,9 +15,9 @@ use proptest::prelude::*;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     BasicKernel, ChildStartConfirmedRequest, ChildStartResult, Command, DispatchOp,
-    HistoryEventKind, LoadedRun, NexusOperationResolvedRequest, NexusResolution, ParentClosePolicy,
-    StartRequest, StartWorkflowTaskRequest, WorkflowCommand, WorkflowIdReusePolicy, WorkflowState,
-    WorkflowTaskCompletedRequest,
+    HistoryEventKind, Kernel, LoadedRun, NexusOperationResolvedRequest, NexusResolution,
+    ParentClosePolicy, StartRequest, StartWorkflowTaskRequest, WorkflowCommand,
+    WorkflowIdReusePolicy, WorkflowState, WorkflowTaskCompletedRequest,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -81,6 +81,7 @@ impl DispatchPublisher for LostPublication {
 struct Fixture {
     repo: Arc<Repository>,
     lane: LaneHandle,
+    owner: Arc<RwLock<ShardOwner>>,
     source: StartRequest,
     target: StartRequest,
 }
@@ -166,11 +167,12 @@ impl Fixture {
         let mut owner = ShardOwner::new(1);
         owner.record_acquired(ShardId(0), ShardEpoch::ZERO);
         owner.mark_active(ShardId(0));
+        let owner = Arc::new(RwLock::new(owner));
         let lane = spawn_lane(
             BasicKernel,
             repo.clone(),
             LostPublication,
-            Arc::new(RwLock::new(owner)),
+            owner.clone(),
             ActivityTrackingState::default(),
             WorkflowTimeoutTrackingState::default(),
             WftTimeoutTrackingState::default(),
@@ -190,9 +192,29 @@ impl Fixture {
         Self {
             repo,
             lane,
+            owner,
             source,
             target,
         }
+    }
+
+    fn publisher(&self) -> crate::publisher::RuntimeDispatchPublisher<Repository> {
+        crate::publisher::RuntimeDispatchPublisher::new(
+            crate::InMemoryBroker::default(),
+            crate::InMemoryActivityBroker::default(),
+            self.repo.clone(),
+            Arc::new(Mutex::new(vec![self.lane.clone()])),
+            1,
+            Arc::new(NexusClient::default()),
+            Arc::new(crate::nexus::NoopNexusCompletionClient),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            crate::fairness::DeliveryMetrics::new(),
+        )
     }
 
     async fn complete(
@@ -393,6 +415,142 @@ impl Fixture {
             now: self.source.now,
         }
     }
+}
+
+// Feature: outbound-dispatch-recovery, Property 21: A close's outbound writes stay within budget
+#[test]
+fn obsolete_leftover_operation_reconciles_source() {
+    executor().block_on(async {
+        let fixture = Fixture::new(0).await;
+        let commands = (0..4)
+            .map(
+                |i| WorkflowCommand::RequestCancelExternalWorkflowExecution {
+                    target_namespace_id: fixture.target.namespace_id,
+                    target_namespace: None,
+                    target_workflow_id: WorkflowId(format!("absent-{i}")),
+                    target_run_id: None,
+                    control: String::new(),
+                },
+            )
+            .collect();
+        fixture.complete(&fixture.source, commands).await;
+        fixture
+            .repo
+            .set_outbound_write_budget(tokeira_storage::write_budget::WriteBudget {
+                rows: 1,
+                bytes: 4_096,
+            })
+            .await;
+        applied(
+            fixture
+                .lane
+                .submit(
+                    fixture.source.run_key,
+                    Command::Terminate(tokeira_kernel::TerminateRequest {
+                        reason: "close with deferred deletions".into(),
+                        details: None,
+                        identity: String::new(),
+                        links: Vec::new(),
+                        request: RequestContext::unattributed(fixture.source.now),
+                        now: fixture.source.now,
+                    }),
+                )
+                .await
+                .unwrap(),
+        );
+        let page = fixture
+            .repo
+            .read_operation_page(
+                ShardId(0),
+                tokeira_kernel::OperationKind::ExternalCancel,
+                tokeira_storage::ScanBound::Capture,
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.rows.len(), 3);
+        let attempt = super::driver::Attempt::capture(&fixture.owner, ShardId(0)).unwrap();
+        let error = fixture
+            .publisher()
+            .drive_outbound_operation(page.rows[0].clone(), attempt, &fixture.owner)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<tokeira_storage::RecoveryError>(),
+            Some(tokeira_storage::RecoveryError::Obsolete)
+        ));
+        assert_eq!(fixture.repo.reconcile_calls.load(Ordering::SeqCst), 1);
+        let remaining = fixture
+            .repo
+            .read_operation_page(
+                ShardId(0),
+                tokeira_kernel::OperationKind::ExternalCancel,
+                tokeira_storage::ScanBound::Capture,
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(remaining.rows.len(), 2);
+    });
+}
+
+// Feature: outbound-dispatch-recovery, Property 21: A close's outbound writes stay within budget
+#[test]
+fn obsolete_outcome_after_source_advance_does_not_reconcile() {
+    executor().block_on(async {
+        let fixture = Fixture::new(0).await;
+        let before = fixture
+            .complete(
+                &fixture.source,
+                vec![WorkflowCommand::RequestCancelExternalWorkflowExecution {
+                    target_namespace_id: fixture.target.namespace_id,
+                    target_namespace: None,
+                    target_workflow_id: fixture.target.workflow_id.clone(),
+                    target_run_id: None,
+                    control: String::new(),
+                }],
+            )
+            .await;
+        let operations = tokeira_storage::derive_operations(&before, ShardId(0)).unwrap();
+        assert_eq!(operations.len(), 1);
+        let concurrent = BasicKernel
+            .apply(
+                LoadedRun::Existing(before.clone()),
+                Command::Signal(tokeira_kernel::SignalRequest {
+                    signal_name: "concurrent transition".into(),
+                    input: Payloads::default(),
+                    header: None,
+                    links: Vec::new(),
+                    request: RequestContext::unattributed(fixture.source.now),
+                    now: fixture.source.now,
+                }),
+            )
+            .unwrap();
+        *fixture
+            .repo
+            .source_transition_before_outcome
+            .lock()
+            .unwrap() = Some(concurrent);
+        let attempt = super::driver::Attempt::capture(&fixture.owner, ShardId(0)).unwrap();
+        let error = fixture
+            .publisher()
+            .drive_outbound_operation(operations[0].clone(), attempt, &fixture.owner)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<tokeira_storage::RecoveryError>(),
+            Some(tokeira_storage::RecoveryError::Obsolete)
+        ));
+        let after = state(&fixture.repo, fixture.source.run_key).await;
+        assert!(after.transition_seq > before.transition_seq);
+        assert_eq!(
+            tokeira_storage::derive_operations(&after, ShardId(0)).unwrap(),
+            operations,
+        );
+        assert_eq!(fixture.repo.reconcile_calls.load(Ordering::SeqCst), 0);
+    });
 }
 
 fn check_external_delivery_survives_lost_publication(
@@ -744,6 +902,207 @@ fn check_refused_reset_leaves_all_participants_unchanged(
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
+
+    // Feature: outbound-dispatch-recovery, Property 20: End-to-end crash refinement
+    #[test]
+    fn close_batch_survives_restarts_and_lost_replies(
+        seed in any::<u64>(), count in 8usize..15, cuts in 0u8..4,
+    ) {
+        executor().block_on(async {
+            let mut fixture = Fixture::new(seed).await;
+            fixture
+                .repo
+                .set_outbound_write_budget(tokeira_storage::write_budget::WriteBudget {
+                    rows: 6,
+                    bytes: 100_000,
+                })
+                .await;
+            let mut children = Vec::new();
+            for i in 0..count {
+                fixture.target = request(&format!("batch-child-{i}"), seed);
+                let policy = if i % 2 == 0 {
+                    ParentClosePolicy::Terminate
+                } else {
+                    ParentClosePolicy::RequestCancel
+                };
+                fixture.create_confirmed_child_with_policy(policy).await;
+                children.push((fixture.target.clone(), policy));
+            }
+            let closed = fixture
+                .complete(
+                    &fixture.source,
+                    vec![WorkflowCommand::CompleteWorkflow {
+                        result: Payloads::default(),
+                    }],
+                )
+                .await;
+            let page = fixture
+                .repo
+                .read_intent_page(ShardId(0), tokeira_storage::ScanBound::Capture, None, 100)
+                .await
+                .unwrap();
+            prop_assert_eq!(page.rows.len(), 1);
+            let key = page.rows[0].key;
+            prop_assert_eq!(key.kind, tokeira_storage::IntentKind::CloseBatch);
+            prop_assert!(
+                !fixture
+                    .repo
+                    .read_operation_page(
+                        ShardId(0),
+                        tokeira_kernel::OperationKind::ChildRelease,
+                        tokeira_storage::ScanBound::Capture,
+                        None,
+                        100,
+                    )
+                    .await
+                    .unwrap()
+                    .rows
+                    .is_empty()
+            );
+            fixture.repo.lose_expansion.store(cuts, Ordering::SeqCst);
+            // Cut the first expansion before discovery; a lost committed reply
+            // must leave the next key discoverable by a fresh runtime.
+            let _ = fixture
+                .repo
+                .expand_close_batch(key, tokeira_storage::WriteFence::Unfenced)
+                .await;
+            fixture.repo.lose_outbound_reply.store(3, Ordering::SeqCst);
+            fixture.repo.lose_retirement.store(3, Ordering::SeqCst);
+            for _ in 0..2 {
+                let runtime = fixture.restart().await;
+                let shutdown = runtime.shutdown_handle();
+                shutdown.begin_shutdown();
+                drop(runtime);
+                shutdown
+                    .wait(std::time::Instant::now() + std::time::Duration::from_secs(5))
+                    .await
+                    .unwrap();
+            }
+            prop_assert!(
+                fixture
+                    .repo
+                    .read_operation_page(
+                        ShardId(0),
+                        tokeira_kernel::OperationKind::ChildRelease,
+                        tokeira_storage::ScanBound::Capture,
+                        None,
+                        100,
+                    )
+                    .await
+                    .unwrap()
+                    .rows
+                    .is_empty()
+            );
+            for (child, policy) in &children {
+                let actual = state(&fixture.repo, child.run_key).await;
+                if *policy == ParentClosePolicy::Terminate {
+                    prop_assert_eq!(actual.status, tokeira_types::ExecutionStatus::Terminated);
+                } else {
+                    prop_assert!(actual.cancel_requested);
+                }
+                let history = fixture
+                    .repo
+                    .read_history(child.run_key, 0, 100)
+                    .await
+                    .unwrap();
+                prop_assert_eq!(
+                    history
+                        .iter()
+                        .filter(|event| matches!(
+                            (&event.kind, policy),
+                            (
+                                HistoryEventKind::WorkflowExecutionTerminated { .. },
+                                ParentClosePolicy::Terminate
+                            ) | (
+                                HistoryEventKind::WorkflowExecutionCancelRequested { .. },
+                                ParentClosePolicy::RequestCancel
+                            )
+                        ))
+                        .count(),
+                    1
+                );
+            }
+            prop_assert!(
+                fixture
+                    .repo
+                    .read_intent_page(ShardId(0), tokeira_storage::ScanBound::Capture, None, 100)
+                    .await
+                    .unwrap()
+                    .rows
+                    .is_empty()
+            );
+            fixture
+                .repo
+                .delete_run_for_bundle(
+                    closed.run_key,
+                    ShardId(0),
+                    tokeira_storage::DeleteRunRequest {
+                        expected_seq: closed.transition_seq,
+                        deleted_at: closed.started_at,
+                    },
+                    tokeira_storage::WriteFence::Unfenced,
+                )
+                .await
+                .unwrap();
+            fixture.repo.purge_run(closed.run_key).await.unwrap();
+            prop_assert!(matches!(
+                fixture
+                    .repo
+                    .load_outbound_source(closed.run_key)
+                    .await
+                    .unwrap(),
+                LoadedRun::Existing(_)
+            ));
+            for (child, policy) in &children {
+                if *policy == ParentClosePolicy::RequestCancel {
+                    applied(
+                        fixture
+                            .lane
+                            .submit(
+                                child.run_key,
+                                Command::Terminate(tokeira_kernel::TerminateRequest {
+                                    reason: "settle canceled child".into(),
+                                    details: None,
+                                    identity: "test".into(),
+                                    links: Vec::new(),
+                                    request: RequestContext::unattributed(child.now),
+                                    now: child.now,
+                                }),
+                            )
+                            .await
+                            .unwrap(),
+                    );
+                }
+            }
+            let runtime = fixture.restart().await;
+            prop_assert!(
+                fixture
+                    .repo
+                    .read_intent_page(ShardId(0), tokeira_storage::ScanBound::Capture, None, 100)
+                    .await
+                    .unwrap()
+                    .rows
+                    .is_empty()
+            );
+            fixture.repo.purge_run(closed.run_key).await.unwrap();
+            prop_assert_eq!(
+                fixture
+                    .repo
+                    .load_outbound_source(closed.run_key)
+                    .await
+                    .unwrap(),
+                LoadedRun::Absent
+            );
+            let shutdown = runtime.shutdown_handle();
+            shutdown.begin_shutdown();
+            drop(runtime);
+            shutdown
+                .wait(std::time::Instant::now() + std::time::Duration::from_secs(5))
+                .await
+                .unwrap();
+            Ok(())
+        })?;
+    }
 
     // Feature: outbound-dispatch-recovery, Property 20: End-to-end crash refinement.
     #[test]

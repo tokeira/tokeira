@@ -2406,6 +2406,14 @@ mod tests {
 
     #[async_trait]
     impl RunRepository for MockRepo {
+        async fn expand_close_batch(
+            &self,
+            _key: tokeira_storage::IntentKey,
+            _fence: tokeira_storage::WriteFence,
+        ) -> anyhow::Result<bool> {
+            anyhow::bail!("test repository has no outbound store")
+        }
+
         async fn validate_activity_start_observation(
             &self,
             _observed: &tokeira_kernel::WorkflowState,

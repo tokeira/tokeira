@@ -89,8 +89,10 @@ impl DsqlRunRepository {
             if current != Some(run.0) || convert::u64_from_i64(seq, "transition_seq")? != closing.expected_seq.0 {
                 return Ok(CommitResult::Conflict { reason: "successor predecessor or current pointer changed".into() });
             }
-            super::commit::write_transition(&mut tx, run, home, self.projection_partition_count, &closing, &mut state, size.unwrap_or(0), parts).await?;
-            super::outbound::insert_intent(&mut tx, &intent).await?;
+            super::commit::write_transition_with_intents(
+                &mut tx, run, home, self.projection_partition_count, &closing, &mut state,
+                size.unwrap_or(0), parts, std::slice::from_ref(&intent),
+            ).await?;
             super::outbound::maintain_parent_reference(&mut tx, &state, true).await?;
             sqlx::query("INSERT INTO successor_reservation (key,namespace_id,workflow_id,source_home,predecessor_run_key,predecessor_close_seq,successor_run_key,intent_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)")
                 .bind(key).bind(state.namespace_id.0).bind(&state.workflow_id.0).bind(Self::shard_id_to_uuid(home))

@@ -23,7 +23,7 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
         attempt: Attempt,
         owner: &Arc<RwLock<ShardOwner>>,
     ) -> Result<()> {
-        let mut source = self.operation_source(&row).await?;
+        let mut source = self.operation_source(&row, &attempt, owner).await?;
         let initiating_event = row.incarnation.key.initiating_event;
         let history = self
             .repo
@@ -589,7 +589,7 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
         attempt: Attempt,
         owner: &Arc<RwLock<ShardOwner>>,
     ) -> Result<()> {
-        let source = self.operation_source(&row).await?;
+        let source = self.operation_source(&row, &attempt, owner).await?;
         let initiation = row.incarnation.key.initiating_event;
         let release = source
             .outbound
@@ -661,7 +661,7 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
                         && gate.first_child_run_id == release.child_run_id),
             "child release remains unverified"
         );
-        let mut source = self.operation_source(&row).await?;
+        let mut source = self.operation_source(&row, &attempt, owner).await?;
         source
             .outbound
             .as_mut()

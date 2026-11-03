@@ -312,6 +312,34 @@ pub(super) async fn write_transition(
         prior_history_size_bytes,
         prior_state_parts,
         false,
+        &[],
+    )
+    .await
+}
+
+/// Reserve space for frozen successor intents in the same close transaction.
+pub(super) async fn write_transition_with_intents(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_key: RunKey,
+    shard_id: ShardId,
+    projection_partition_count: u32,
+    transition: &Transition,
+    state: &mut WorkflowState,
+    prior_history_size_bytes: i64,
+    prior_state_parts: Option<i32>,
+    extra_intents: &[crate::IntentRow],
+) -> Result<()> {
+    write_transition_mode(
+        tx,
+        run_key,
+        shard_id,
+        projection_partition_count,
+        transition,
+        state,
+        prior_history_size_bytes,
+        prior_state_parts,
+        false,
+        extra_intents,
     )
     .await
 }
@@ -336,6 +364,7 @@ pub(super) async fn write_prepared_transition(
         0,
         None,
         true,
+        &[],
     )
     .await
 }
@@ -350,6 +379,7 @@ async fn write_transition_mode(
     prior_history_size_bytes: i64,
     prior_state_parts: Option<i32>,
     staged: bool,
+    extra_intents: &[crate::IntentRow],
 ) -> Result<()> {
     if transition.history_events.len() != transition.event_principals.len() {
         bail!(
@@ -360,7 +390,7 @@ async fn write_transition_mode(
     }
     // Read the prior source before replacing hot state. This is also called by
     // paired commits, so every publication authors its obligations atomically.
-    super::outbound::maintain(tx, transition, shard_id).await?;
+    super::outbound::maintain(tx, transition, shard_id, extra_intents).await?;
     // The batch is encoded once: the same bytes are inserted and counted, so the
     // History Size is the persisted size by construction (Requirement 1.1).
     let events_data = (!transition.history_events.is_empty())

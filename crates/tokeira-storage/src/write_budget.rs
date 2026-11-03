@@ -14,8 +14,9 @@
 //! The live suite `dsql_transaction_limits` asserts these facts, so a change in
 //! DSQL fails a test rather than a purge.
 //!
-//! The backlog spill, a run's purge and a reset's materialization cut their work
-//! with [`pages`], so each of their transactions stays within
+//! The backlog spill, a run's purge, a reset's materialization, a close's outbound
+//! writes and close-batch expansion cut their work with [`pages`], so each of
+//! their transactions stays within
 //! [`WriteBudget::TRANSACTION`] (`bounded-bulk-writes`). The budget sits far
 //! enough under DSQL's limits that the keys, fixed-width columns and per-row
 //! overhead it doesn't count never matter.

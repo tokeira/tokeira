@@ -94,13 +94,51 @@ impl InMemoryStore {
         } else {
             Vec::new()
         };
+        let (upserts, deletes) = crate::outbound::close_batch::operation_changes(
+            crate::outbound::close_batch::prior_operations(&store.outbound_operations, run),
+            rows,
+            WriteCost::default(),
+            store.outbound_budget(),
+        );
+        let model = model_writes(&[], &upserts, deletes.len())?;
+        for key in deletes {
+            store.outbound_operations.remove(&key);
+        }
         store
             .outbound_operations
-            .retain(|key, _| key.source_run != run);
-        store
-            .outbound_operations
-            .extend(rows.into_iter().map(|row| (row.incarnation.key, row)));
+            .extend(upserts.into_iter().map(|row| (row.incarnation.key, row)));
+        store.record_outbound_transaction(&model);
         Ok(())
+    }
+
+    /// Replace only the captured batch key under its original source fence.
+    pub(super) async fn expand_outbound_batch(
+        &self,
+        key: IntentKey,
+        fence: WriteFence,
+    ) -> Result<bool> {
+        let mut store = self.inner.lock().await;
+        store.check_fence(&fence)?;
+        let Some(batch) = store.outbound_intents.get(&key) else {
+            return Ok(false);
+        };
+        fence.ensure_home(batch.source_home)?;
+        let rows = crate::outbound::close_batch::expansion(batch, store.outbound_budget())?;
+        let deletes = crate::outbound::close_batch::intent_cost(batch)?.rows;
+        let model = model_writes(&rows, &[], deletes)?;
+        anyhow::ensure!(
+            rows.iter()
+                .all(|row| !store.outbound_intents.contains_key(&row.key)),
+            "expanded intent already exists"
+        );
+        // Publication under this lock is the memory equivalent of the source-
+        // fenced DSQL transaction: no observer sees either half of the replacement.
+        store.outbound_intents.remove(&key);
+        store
+            .outbound_intents
+            .extend(rows.into_iter().map(|row| (row.key, row)));
+        store.record_outbound_transaction(&model);
+        Ok(true)
     }
 
     pub(super) async fn retire_outbound_intent(
@@ -382,4 +420,29 @@ fn validate_guard(
         }
     }
     Ok(())
+}
+
+/// Tally physical rows independently of page selection, including overflow parts.
+pub(super) fn model_writes(
+    intents: &[crate::IntentRow],
+    operations: &[OperationRow],
+    deletes: usize,
+) -> Result<TransactionModel> {
+    let mut model = TransactionModel::default();
+    model.delete(deletes);
+    for row in intents {
+        let bytes = postcard::to_allocvec(&(1_u32, &row.payload))?;
+        let parts = crate::value_parts::split(&bytes);
+        model.write(&[
+            parts.first.len(),
+            row.target.as_ref().map_or(0, |(_, wf)| wf.0.len()),
+        ]);
+        for part in parts.rest {
+            model.write(&[part.len()]);
+        }
+    }
+    for row in operations {
+        model.write(&[row.target.as_ref().map_or(0, |(_, wf)| wf.0.len())]);
+    }
+    Ok(model)
 }

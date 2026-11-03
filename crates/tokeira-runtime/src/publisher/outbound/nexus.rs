@@ -38,7 +38,7 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
         owner: &Arc<RwLock<ShardOwner>>,
     ) -> Result<()> {
         acquisition.validate(owner)?;
-        let source = self.operation_source(&row).await?;
+        let source = self.operation_source(&row, &acquisition, owner).await?;
         let pending = source
             .pending_nexus_operations
             .values()

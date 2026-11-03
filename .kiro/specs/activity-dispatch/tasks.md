@@ -265,8 +265,8 @@ may retire a recovery mechanism before its replacement is verified.
   - Inject failed post-commit workflow and activity publications with a parked poll;
     synchronize an empty pass and require the next offer within one discovery period
     plus one period of slack. Use paused Tokio time in memory and real time on DSQL.
-  - Add and compile the three opt-in live fixtures with owned-data/lease cleanup.
-    Live execution is reserved for the operator's ephemeral cluster.
+  - Add the three opt-in live fixtures with owned-data/lease cleanup. On an ephemeral
+    DSQL cluster, after the storage schema bootstrap, all three passed.
   - _Requirements: 7.2, 7.7, 8.4, 8.5, 8.7_
 
 ## Task Dependency Graph

@@ -325,6 +325,21 @@ No separate specification PR is planned.
     update the delivery ledger, live-suite ordering and internal change record.
   - _Requirements: 3.6, 3.7, 6.1, 6.8, 6.9, 10.4, 10.5, 10.6, 10.7._
 
+- [x] 21. Bound close outbound writes with batches and expansion
+  - Share direct-versus-batch selection and page cutting across memory and DSQL with
+    `WriteBudget::TRANSACTION`, `WriteCost` and `pages`; preserve every obligation and
+    avoid redundant target copies in batch payloads.
+  - Expand under the original source fence, atomically replacing each batch key with
+    its remainder and per-child intents; forward the required method through every
+    repository implementation. Bound obsolete-operation deletions in commit and repair.
+  - Implement **Property 21**, at least 100 generated cases, with memory transaction
+    tallies, direct-row equality, lost replies, restart, bounded reconciliation and the
+    maximum child count and workflow-ID length. Exercise the batch-disabled negative control.
+    - Tag: `// Feature: outbound-dispatch-recovery, Property 21: A close's outbound writes stay within budget`
+  - Extend Properties 19 and 20 for parent retention and real runtime delivery across
+    batch expansion cuts, and add compilable live DSQL close/expansion regressions.
+  - _Requirements: 6.1, 6.9, 9.1, 9.2, 10.5, 10.6._
+
 ## Verification evidence
 
 The [delivery ledger](../../../docs/readiness/outbound-recovery.md) records the
@@ -356,7 +371,8 @@ one upstream skip and four existing registry exclusions are reported separately.
   "17": ["16"],
   "18": ["17"],
   "19": ["18"],
-  "20": ["18"]
+  "20": ["18"],
+  "21": ["20"]
 }
 ```
 

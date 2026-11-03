@@ -202,6 +202,13 @@ where
     ) -> anyhow::Result<()> {
         self.inner.reconcile_outbound_run(home, run, fence).await
     }
+    async fn expand_close_batch(
+        &self,
+        key: tokeira_storage::IntentKey,
+        fence: tokeira_storage::WriteFence,
+    ) -> anyhow::Result<bool> {
+        self.inner.expand_close_batch(key, fence).await
+    }
     async fn retire_intent(
         &self,
         proof: tokeira_storage::IntentRetirement,

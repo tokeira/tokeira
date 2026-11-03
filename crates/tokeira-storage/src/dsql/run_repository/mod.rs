@@ -659,6 +659,13 @@ impl RunRepository for DsqlRunRepository {
     ) -> Result<()> {
         self.do_reconcile_outbound_run(home, run, fence).await
     }
+    async fn expand_close_batch(
+        &self,
+        key: crate::IntentKey,
+        fence: crate::WriteFence,
+    ) -> anyhow::Result<bool> {
+        self.do_expand_close_batch(key, fence).await
+    }
     async fn retire_intent(
         &self,
         proof: crate::IntentRetirement,

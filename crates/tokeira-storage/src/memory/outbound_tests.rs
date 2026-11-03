@@ -93,7 +93,7 @@ fn home(state: &WorkflowState) -> ShardId {
     )
 }
 
-fn close(state: &WorkflowState) -> Transition {
+pub(super) fn close(state: &WorkflowState) -> Transition {
     BasicKernel
         .apply(
             LoadedRun::Existing(state.clone()),

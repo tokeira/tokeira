@@ -41,6 +41,8 @@ use tokeira_kernel::{ActivityOp, DispatchOp};
 use tokeira_types::ExecutionStatus;
 
 mod activity_repair;
+#[cfg(test)]
+mod close_batch_tests;
 mod outbound;
 #[cfg(test)]
 mod outbound_tests;
@@ -262,6 +264,10 @@ struct StoreState {
     /// Every covered write transaction's total, for the budget properties.
     #[cfg(test)]
     modeled_transactions: Vec<WriteCost>,
+    /// Test override; production always uses the shared transaction budget.
+    outbound_budget: Option<WriteBudget>,
+    #[cfg(test)]
+    modeled_outbound_transactions: Vec<WriteCost>,
 }
 
 fn timer_position(
@@ -278,6 +284,17 @@ fn timer_position(
 }
 
 impl StoreState {
+    fn outbound_budget(&self) -> WriteBudget {
+        self.outbound_budget.unwrap_or(WriteBudget::TRANSACTION)
+    }
+
+    fn record_outbound_transaction(&mut self, model: &TransactionModel) {
+        #[cfg(test)]
+        self.modeled_outbound_transactions.push(model.total());
+        #[cfg(not(test))]
+        let _ = model;
+    }
+
     /// Open one transaction of a covered write (`bounded-bulk-writes`). A
     /// failure injected for tests stops the write here, before the transaction
     /// changes anything, as a refused DSQL transaction does.
@@ -609,6 +626,13 @@ impl StoreState {
 }
 
 impl InMemoryStore {
+    /// Lower the outbound budget for generated crash tests without changing production limits.
+    pub async fn set_outbound_write_budget(&self, budget: WriteBudget) {
+        assert!(budget.rows <= WriteBudget::TRANSACTION.rows);
+        assert!(budget.bytes <= WriteBudget::TRANSACTION.bytes);
+        self.inner.lock().await.outbound_budget = Some(budget);
+    }
+
     /// Create a store with a configured shard count for
     /// shard-filtered queries.
     pub fn with_shard_count(shard_count: u32) -> Self {
@@ -814,6 +838,8 @@ impl InMemoryStore {
                 run.workflow_id.0.as_bytes(),
                 Self::effective_shard_count(&state),
             );
+            // Restore completes deferred deletions by rebuilding only current causes;
+            // obsolete index rows carry no authoritative state.
             for row in crate::derive_operations(run, home)
                 .map_err(|_| SnapshotError::Extension("invalid outbound operation metadata"))?
             {
@@ -1073,6 +1099,7 @@ impl SnapshotDoc {
             outbound_upgrade,
             workflow_dispatch: _,
             outbound_operations: _,
+            outbound_budget: _,
             outbound_intents,
             preparations,
             successor_reservations,
@@ -1112,6 +1139,8 @@ impl SnapshotDoc {
                 pair_failure: _,
             #[cfg(test)]
                 modeled_transactions: _,
+            #[cfg(test)]
+                modeled_outbound_transactions: _,
         } = state;
         Self {
             legacy_runs: {
@@ -1254,6 +1283,9 @@ impl SnapshotDoc {
             pair_failure: None,
             #[cfg(test)]
             modeled_transactions: Vec::new(),
+            #[cfg(test)]
+            modeled_outbound_transactions: Vec::new(),
+            outbound_budget: None,
         };
         // These maps only accelerate reads over the durable-equivalent log;
         // rebuilding them at boot preserves snapshot bytes and makes them
@@ -1372,6 +1404,13 @@ impl RunRepository for InMemoryStore {
         fence: WriteFence,
     ) -> Result<()> {
         self.repair_outbound(home, run, fence).await
+    }
+    async fn expand_close_batch(
+        &self,
+        key: crate::IntentKey,
+        fence: crate::WriteFence,
+    ) -> anyhow::Result<bool> {
+        self.expand_outbound_batch(key, fence).await
     }
     async fn retire_intent(
         &self,

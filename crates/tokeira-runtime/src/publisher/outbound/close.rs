@@ -33,6 +33,13 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
             intent.source_home == attempt.acquisition.shard_id,
             "intent source home changed"
         );
+        if matches!(intent.payload, IntentPayload::CloseBatch { .. }) {
+            attempt.validate(owner)?;
+            self.repo
+                .expand_close_batch(intent.key, attempt.fence)
+                .await?;
+            return Ok(());
+        }
         let outcome = match &intent.payload {
             IntentPayload::ParentClose { .. } => {
                 self.deliver_parent_close(&intent, &attempt, owner).await?
@@ -43,6 +50,7 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
             IntentPayload::ChildResult { .. } => {
                 self.deliver_child_result(&intent, &attempt, owner).await?
             }
+            IntentPayload::CloseBatch { .. } => unreachable!("batch expanded above"),
             IntentPayload::Successor { .. } => {
                 anyhow::bail!("successor requires atomic publication")
             }

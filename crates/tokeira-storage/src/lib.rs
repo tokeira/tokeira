@@ -60,6 +60,7 @@ pub mod recovery_index;
 pub mod schema_contract;
 #[cfg(test)]
 mod update_refusals_tests;
+pub mod value_parts;
 pub mod worker_compute;
 pub mod workflow_dispatch;
 #[cfg(test)]

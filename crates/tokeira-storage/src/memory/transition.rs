@@ -14,6 +14,8 @@ pub(super) struct PreparedTransition {
     activity_dispatch: BTreeMap<String, ActivityDispatchEntry>,
     operations: Vec<crate::OperationRow>,
     intents: Vec<crate::IntentRow>,
+    operation_deletes: Vec<tokeira_kernel::OperationKey>,
+    outbound_model: TransactionModel,
     pub(super) outbound_origin: Option<tokeira_kernel::OutboundOrigin>,
 }
 
@@ -71,6 +73,16 @@ pub(super) fn prepare(
     run_key: RunKey,
     transition: Transition,
 ) -> Result<PreparedTransition> {
+    prepare_with_intents(store, run_key, transition, Vec::new())
+}
+
+/// Admit exceptional direct intents with the close before budgeting obsolete operations.
+pub(super) fn prepare_with_intents(
+    store: &StoreState,
+    run_key: RunKey,
+    transition: Transition,
+    extra_intents: Vec<crate::IntentRow>,
+) -> Result<PreparedTransition> {
     if transition.history_events.len() != transition.event_principals.len() {
         anyhow::bail!("history/principal sidecar length mismatch");
     }
@@ -111,8 +123,17 @@ pub(super) fn prepare(
         })
         .collect();
     let operations = crate::derive_operations(&state, execution_home)?;
-    let intents =
+    let mut intents =
         crate::derive_close_intents(store.runs.get(&run_key), &transition, execution_home)?;
+    intents.extend(extra_intents);
+    let intents = crate::outbound::close_batch::batch_close(intents, store.outbound_budget())?;
+    let (operations, operation_deletes) = crate::outbound::close_batch::operation_changes(
+        crate::outbound::close_batch::prior_operations(&store.outbound_operations, run_key),
+        operations,
+        crate::outbound::close_batch::intents_cost(&intents)?,
+        store.outbound_budget(),
+    );
+    let outbound_model = outbound::model_writes(&intents, &operations, operation_deletes.len())?;
     if let Some(row) = &workflow_dispatch {
         row.validate()?;
     }
@@ -143,6 +164,8 @@ pub(super) fn prepare(
         activity_dispatch,
         operations,
         intents,
+        operation_deletes,
+        outbound_model,
         outbound_origin: None,
     })
 }
@@ -161,11 +184,14 @@ pub(super) fn write(
         activity_dispatch,
         operations,
         intents,
+        operation_deletes,
+        outbound_model,
         outbound_origin,
     } = prepared;
-    store
-        .outbound_operations
-        .retain(|key, _| key.source_run != run_key);
+    store.record_outbound_transaction(&outbound_model);
+    for key in operation_deletes {
+        store.outbound_operations.remove(&key);
+    }
     for row in operations {
         store.outbound_operations.insert(row.incarnation.key, row);
     }

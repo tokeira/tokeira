@@ -15,6 +15,7 @@ use tokeira_kernel::{
 };
 use tokeira_types::{NamespaceId, RunId, RunKey, ShardId, TransitionSeq, WorkflowId};
 
+pub(crate) mod close_batch;
 pub(crate) mod preparation;
 pub(crate) mod successor;
 pub use preparation::{PreparationToken, PublicationResult, RunPreparation};
@@ -91,6 +92,8 @@ pub enum IntentKind {
     Successor = 3,
     /// Confirmed ABANDON child's first-task release still owed at parent close.
     ChildRelease = 4,
+    /// Per-child close obligations awaiting bounded expansion.
+    CloseBatch = 5,
 }
 
 /// Collision-free identity of one obligation authored by one close transition.
@@ -151,6 +154,13 @@ pub enum IntentPayload {
     ChildRelease {
         /// Confirmation proof retained by the close, independent of source deletion.
         release: ChildReleaseState,
+    },
+    /// Remaining per-child obligations, with original ordinals and payloads.
+    /// Source identity and clock come from the batch row; targets derive from
+    /// payloads, avoiding a second copy of every workflow ID.
+    CloseBatch {
+        /// Only ParentClose and ChildRelease are valid; nested batches are refused.
+        obligations: Vec<(u32, IntentPayload)>,
     },
 }
 
@@ -532,6 +542,7 @@ pub fn derive_close_intents(
                 workflow_id,
                 ..
             } => Some((*namespace_id, workflow_id.clone())),
+            IntentPayload::CloseBatch { .. } => None,
             IntentPayload::ChildResult { .. } => {
                 state.parent_workflow_id.as_ref().map(|workflow| {
                     (

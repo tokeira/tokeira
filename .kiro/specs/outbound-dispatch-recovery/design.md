@@ -84,6 +84,7 @@ for the relevant incarnation/attempt.
 | Nexus start | Source run + scheduled event + durable attempt generation | Source home / Nexus adapter | Outcome/retry/timeout transition | Existing persisted Nexus attempt/deadline state |
 | Nexus cancel | Scheduled event + cancellation-request event + attempt generation | Source home / Nexus adapter | Cancellation-attempt outcome or operation termination | Existing persisted cancellation state |
 | Completion callback | Run + callback index + attempt | Existing callback scanner | Existing callback outcome transition | Existing persisted callback state |
+| Close batch | Source close sequence + batch ordinal | Closed parent's home / intent executor | Atomic expansion replaces the exact batch with a page and its remainder, or deletes the final batch | Executor |
 | Parent-close action | Source close sequence + child initiation/first run + action kind | Closed parent's home / intent executor | Executor after proven application or terminal relationship outcome | Executor |
 | Child result | Closed final child run + parent initiation + first child run | Closed child's home / intent executor | Executor after parent outcome or proven terminal absence/staleness | Executor |
 | Oversized successor | Predecessor close + selected successor/request ID | Predecessor home / successor coordinator | Atomic successor publication plus reservation/intent retirement | Executor |
@@ -130,6 +131,7 @@ silently interpreted as ALLOW_DUPLICATE during recovery.
 | `IntentPayload::ChildRelease` | `ChildReleaseState` for an owed ABANDON release at close; targets the child's namespace/workflow for retention |
 | `IntentPayload::ParentClose` | Target namespace/workflow, parent identity, initiation, first child run, policy and reason; excludes ABANDON |
 | `IntentPayload::ChildResult` | Parent/child lineage and immutable terminal-event reference; preserves result, failure, retry-state and cancellation details |
+| `IntentPayload::CloseBatch` | Remaining per-child payloads and original ordinals; source identity and clock come from the batch row, targets derive from payloads, and the batch itself has no target |
 | `IntentPayload::Successor` | Versioned frozen `StartRequest`, predecessor identity and expected pointer; preserves PR 340's separate frozen clocks |
 | `PreparedReset` | Reset request identity, base/current sequence expectations, fork prefix and principals, full replay/reapply result, ordered options, final dispatch and current-pointer expectation |
 | `PreparationManifest` | Preparation ID/generation, source request identity, participant sequence expectations, content digest, staged-row counts, final state references and phase |
@@ -375,6 +377,25 @@ Build parent-close intents from the pre-close child state before it is cleared. 
 child-result intents from the actual terminal event and full lineage; suppress retry,
 cron, continue-as-new and reset intermediate closes. Sort before assigning ordinals.
 Creation, payload parts and the close commit together.
+
+The per-child close rows, batch and obsolete-operation deletions use
+`WriteBudget::TRANSACTION` (1,000 rows and 4 MiB), priced with `WriteCost` and cut with
+`pages`. If all close intents fit, the close keeps its direct per-child intents;
+otherwise one `CloseBatch` holds all `ParentClose` and owed `ChildRelease` obligations,
+with their original ordinals and payloads. `ChildResult` and `Successor` always remain
+direct, excluded from this bound and subject to their own payload limits. They still
+count toward the rows used when capping deletions. Only a batch that cannot fit on its
+own is refused. The close establishes every obligation atomically. Each source-fenced
+expansion inserts one page and replaces batch ordinal n with n + 1 holding the
+remainder, or deletes the final batch; inserts, replacement parts and deleted parts
+all count. A missing exact key returns false without writes, and nested batches are
+invalid identities. Operation upserts remain mandatory; obsolete-operation deletions
+consume only the remaining row budget, including during reconciliation of open,
+closed or absent sources. Later discovery converges, and source validation prevents
+obsolete delivery. The batch pins the parent; child target pins begin on expansion.
+A child purged before expansion is absent and its intent retires, matching the
+`NotFound` handling in `service/history/transfer_queue_active_task_executor.go @ v1.31.0`.
+That source also hands large child lists to a system workflow in one request.
 
 Parent-close execution follows the matching child first-run chain and checks the parent
 relationship. A reused workflow ID outside that chain is untouched. Child-result delivery
@@ -698,6 +719,22 @@ recoverable until a definitive outcome. The exploration version SHALL expose `C(
 on the baseline; the corrected version SHALL exclude it under the stated assumptions.
 
 **Validates: Requirements 10.4, 10.5, 10.6, 10.7.**
+
+### Property 21: A close's outbound writes stay within budget
+
+For any close and sequence of expansion, restart, lost-reply and reconciliation cuts, the
+close's per-child rows, batch, obsolete-operation deletions and each expansion page SHALL
+stay within `WriteBudget::TRANSACTION`, counting inserted, updated and deleted rows and
+payload parts. Fitting closes SHALL preserve direct rows; oversized closes SHALL establish
+exactly the same obligations through a batch, keeping child results and successors direct.
+Expansion SHALL insert each per-child identity once and converge to the direct rows.
+Obsolete operation deletions SHALL consume only the remaining row budget and converge
+through repeated reconciliation without delivery. The bound excludes open-run operation
+upserts, the close's other writes, and direct child-result and successor intents, which
+retain their own payload limits. Direct intents SHALL still count toward the rows used
+when capping deletions.
+
+**Validates: Requirements 6.1, 6.9, 9.1, 9.2, 10.5, 10.6.**
 
 ## Testing and completion evidence
 

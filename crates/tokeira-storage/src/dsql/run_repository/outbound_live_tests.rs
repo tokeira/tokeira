@@ -838,3 +838,159 @@ async fn outbound_live_interrupted_large_legacy_cutover() -> Result<()> {
     fixture.store.shutdown().await?;
     Ok(())
 }
+
+async fn pending_child_limit_parent(repo: &dyn RunRepository) -> Result<WorkflowState> {
+    let mut initial = fresh_transition(RunKey::new());
+    for i in 0..2_000 {
+        let workflow_id = WorkflowId(format!("pending-{}-{i}", initial.next_state.run_key.0));
+        initial.next_state.children.insert(
+            workflow_id.clone(),
+            tokeira_kernel::ChildWorkflowState {
+                child_workflow_id: workflow_id,
+                namespace_id: initial.next_state.namespace_id,
+                namespace: None,
+                workflow_type: tokeira_types::WorkflowType("child".into()),
+                header: None,
+                child_run_id: None,
+                initiated_event_id: i + 10,
+                started_event_id: None,
+                parent_close_policy: tokeira_kernel::ParentClosePolicy::Terminate,
+            },
+        );
+    }
+    let parent = applied(
+        repo.commit_transition(initial.next_state.run_key, initial, WriteFence::Unfenced)
+            .await?,
+    );
+    assert_eq!(crate::derive_operations(&parent, ShardId(0))?.len(), 2_000);
+    Ok(parent)
+}
+
+async fn retire_pending_child_limit_intents(
+    repo: &dyn RunRepository,
+    parent: &WorkflowState,
+) -> Result<()> {
+    let mut bound = ScanBound::Capture;
+    let mut after = None;
+    loop {
+        let page = repo.read_intent_page(ShardId(0), bound, after, 100).await?;
+        let Some(through) = page.through else {
+            break;
+        };
+        bound = ScanBound::Through(through);
+        if page.rows.is_empty() {
+            break;
+        }
+        for descriptor in page.rows {
+            after = Some(descriptor.key);
+            if descriptor.key.source_run != parent.run_key {
+                continue;
+            }
+            // This fixture never creates a child, so all its obligations have a
+            // definitive absent destination, including an unexpanded batch.
+            repo.retire_intent(
+                IntentRetirement {
+                    key: descriptor.key,
+                    outcome: DefinitiveOutcome::Absent,
+                },
+                WriteFence::Unfenced,
+            )
+            .await?;
+        }
+    }
+    delete_and_purge(repo, parent).await
+}
+
+// Feature: outbound-dispatch-recovery, Property 21: A close's outbound writes stay within budget
+#[tokio::test]
+async fn outbound_live_close_at_pending_child_limit_commits() -> Result<()> {
+    let Some(fixture) = Fixture::connect().await? else {
+        return Ok(());
+    };
+    let repo = fixture.store.run_repository();
+    let parent = pending_child_limit_parent(repo).await?;
+    // Keep this regression on the baseline's APIs so it can demonstrate SQLSTATE
+    // 54000 before the fix, with the same 2,000 ChildStart rows and close.
+    let closed = applied(
+        repo.commit_transition(parent.run_key, close(&parent), WriteFence::Unfenced)
+            .await?,
+    );
+    assert!(!closed.is_open());
+    retire_pending_child_limit_intents(repo, &closed).await?;
+    fixture.store.shutdown().await?;
+    Ok(())
+}
+
+// Feature: outbound-dispatch-recovery, Property 21: A close's outbound writes stay within budget
+#[tokio::test]
+async fn outbound_live_close_batch_expands_within_budget() -> Result<()> {
+    let Some(fixture) = Fixture::connect().await? else {
+        return Ok(());
+    };
+    let repo = fixture.store.run_repository();
+    let parent = pending_child_limit_parent(repo).await?;
+    let closing = close(&parent);
+    let mut expected = crate::derive_close_intents(Some(&parent), &closing, ShardId(0))?;
+    expected.sort_by_key(|row| row.key);
+    let closed = applied(
+        repo.commit_transition(parent.run_key, closing, WriteFence::Unfenced)
+            .await?,
+    );
+    let count_operations = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM run_operation WHERE source_run_key=$1")
+            .bind(parent.run_key.0)
+            .fetch_one(&fixture.pool)
+            .await
+    };
+    let mut prior = count_operations().await?;
+    assert!(prior > 0);
+    while prior > 0 {
+        repo.reconcile_outbound_run(ShardId(0), parent.run_key, WriteFence::Unfenced)
+            .await?;
+        let left = count_operations().await?;
+        assert!(left < prior);
+        assert!(prior - left <= i64::try_from(crate::write_budget::WriteBudget::TRANSACTION.rows)?);
+        prior = left;
+    }
+    let mut batch = crate::IntentKey {
+        source_run: parent.run_key,
+        close_seq: closed.transition_seq,
+        kind: IntentKind::CloseBatch,
+        ordinal: 0,
+    };
+    assert!(repo.load_intent(batch).await?.is_some());
+    while repo.load_intent(batch).await?.is_some() {
+        assert!(repo.expand_close_batch(batch, WriteFence::Unfenced).await?);
+        assert!(!repo.expand_close_batch(batch, WriteFence::Unfenced).await?);
+        batch.ordinal += 1;
+    }
+    let mut actual = Vec::new();
+    let mut bound = ScanBound::Capture;
+    let mut after = None;
+    loop {
+        let page = repo.read_intent_page(ShardId(0), bound, after, 100).await?;
+        let Some(through) = page.through else {
+            break;
+        };
+        bound = ScanBound::Through(through);
+        if page.rows.is_empty() {
+            break;
+        }
+        for descriptor in page.rows {
+            after = Some(descriptor.key);
+            if descriptor.key.source_run == parent.run_key {
+                actual.push(
+                    repo.load_intent(descriptor.key)
+                        .await?
+                        .expect("discovered intent"),
+                );
+            }
+        }
+    }
+    assert_eq!(actual.len(), 2_000);
+    assert!(actual.iter().all(|row| row.target.is_some()));
+    assert_eq!(actual, expected);
+    retire_pending_child_limit_intents(repo, &closed).await?;
+    fixture.store.shutdown().await?;
+    Ok(())
+}

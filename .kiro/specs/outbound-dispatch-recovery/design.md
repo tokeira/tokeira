@@ -391,8 +391,9 @@ remainder, or deletes the final batch; inserts, replacement parts and deleted pa
 all count. A missing exact key returns false without writes, and nested batches are
 invalid identities. Operation upserts remain mandatory; obsolete-operation deletions
 consume only the remaining row budget, including during reconciliation of open,
-closed or absent sources. Later discovery converges, and source validation prevents
-obsolete delivery. The batch pins the parent; child target pins begin on expansion.
+closed or absent sources. A delivery that finds its row missing or no longer derived
+reconciles one more bounded page, so later discovery converges, and source validation
+prevents obsolete delivery. The batch pins the parent; child target pins begin on expansion.
 A child purged before expansion is absent and its intent retires, matching the
 `NotFound` handling in `service/history/transfer_queue_active_task_executor.go @ v1.31.0`.
 That source also hands large child lists to a system workflow in one request.

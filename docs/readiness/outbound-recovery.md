@@ -47,7 +47,7 @@ commit/reload paths; a compile or a filtered-out test is not execution evidence.
 | 18: peer authority | [auth properties](../../crates/tokeira-auth/src/peer.rs), [frame properties](../../crates/tokeira-edge/src/grpc/outbound_delivery_tests.rs), [runtime parity](../../crates/tokeira-runtime/src/runtime/outbound_delivery_tests.rs) | Purpose/capacity/reference/parity runs passed; expanded real gRPC frame property passed 100 cases |
 | 19: retained proof | Storage properties and reset reconnection property | Close-source and destination-dedupe runs passed; future-result/reset properties passed 100 cases each |
 | 20: end-to-end crash refinement | Crash exploration, real lane/repository fault seams | All 18 selected expanded properties passed: publication loss, child handshake cuts, external target/source reply loss, Nexus outcome commit loss, close delivery/retirement loss, reset and successor cuts; 100 cases per property |
-| 21: bounded close writes | [Storage transaction tallies and generated direct/batch/expansion/reconcile checks](../../crates/tokeira-storage/src/memory/close_batch_tests.rs); [runtime crash exploration](../../crates/tokeira-runtime/src/outbound/bug_condition_exploration_tests.rs) | At least 100 cases per generated property; maximum 2,000 children with 1,000-byte workflow IDs; live close and expansion regressions added |
+| 21: bounded close writes | [Storage transaction tallies and generated direct/batch/expansion/reconcile checks](../../crates/tokeira-storage/src/memory/close_batch_tests.rs); [runtime crash exploration](../../crates/tokeira-runtime/src/outbound/bug_condition_exploration_tests.rs) | At least 100 cases per generated property; maximum 2,000 children with 1,000-byte workflow IDs; the live close and expansion cases pass at 2,000 pending children |
 
 ## Delivery gates
 
@@ -94,6 +94,8 @@ supplements the 100-case memory/model properties; it does not replace their case
 | Test | Result |
 |---|---|
 | `dsql::run_repository::atomic_successors_live_tests::atomic_successors_live` | Pass |
+| `dsql::run_repository::outbound_live_tests::outbound_live_close_at_pending_child_limit_commits` | Pass; on the code before the bounded close, DSQL refuses the close with "transaction row limit exceeded" |
+| `dsql::run_repository::outbound_live_tests::outbound_live_close_batch_expands_within_budget` | Pass |
 | `dsql::run_repository::outbound_live_tests::outbound_live_future_child_result_retains_deleted_parent` | Pass |
 | `dsql::run_repository::outbound_live_tests::outbound_live_interrupted_large_legacy_cutover` | Pass |
 | `dsql::run_repository::outbound_live_tests::outbound_live_original_fences_and_retained_destination_proof` | Pass |

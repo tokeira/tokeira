@@ -1164,40 +1164,87 @@ async fn child_fan_out_live_starts_every_child() -> Result<()> {
             }
         }
         keys.push((parent.run_key, home));
-        for &(key, _) in &keys {
-            if let LoadedRun::Existing(state) = repo.load_run(key).await?
-                && state.is_open()
-            {
-                child_release_fixture_apply(
-                    repo.as_ref(),
-                    key,
-                    Command::Terminate(TerminateRequest {
-                        reason: "fan-out fixture cleanup".into(),
-                        details: None,
-                        identity: "fixture".into(),
-                        links: Vec::new(),
-                        now: OffsetDateTime::now_utc(),
-                        request: RequestContext {
-                            request_id: RequestId(format!("fan-out-cleanup:{}", key.0)),
-                            ..RequestContext::unattributed(OffsetDateTime::now_utc())
+        purge_fan_out_runs(repo.as_ref(), &log, &keys, &homes).await?;
+        Ok(())
+    }
+    .await;
+    let closed = director.shutdown().await;
+    let result = finish_cleanup(result, stopped.map_err(Into::into), "runtime shutdown");
+    let result = finish_cleanup(result, cleanup, "fixture cleanup");
+    finish_cleanup(result, closed, "connection shutdown")
+}
+
+// This fixture deliberately stops before every release retires. Delete all hot
+// sources before purging any target, so leftover operation rows cannot pin a
+// child through the still-visible parent. Closing also authors intents in both
+// directions; sweep after all closes/deletes, and start a fresh bounded scan on
+// each pass rather than assuming one retirement pass exhausted the fixture.
+async fn purge_fan_out_runs(
+    repo: &dyn RunRepository,
+    log: &dyn ProjectionLog,
+    keys: &[(RunKey, ShardId)],
+    homes: &[ShardId],
+) -> Result<()> {
+    const PASSES: usize = 3;
+    let mut remaining = Vec::new();
+    for _ in 0..PASSES {
+        for &(key, home) in keys {
+            if let LoadedRun::Existing(mut state) = repo.load_run(key).await? {
+                if state.is_open() {
+                    state = child_release_fixture_apply(
+                        repo,
+                        key,
+                        Command::Terminate(TerminateRequest {
+                            reason: "fan-out fixture cleanup".into(),
+                            details: None,
+                            identity: "fixture".into(),
+                            links: Vec::new(),
+                            now: OffsetDateTime::now_utc(),
+                            request: RequestContext {
+                                request_id: RequestId(format!("fan-out-cleanup:{}", key.0)),
+                                ..RequestContext::unattributed(OffsetDateTime::now_utc())
+                            },
+                        }),
+                    )
+                    .await
+                    .with_context(|| format!("fan-out cleanup run {key:?}: workflow_hot close"))?;
+                }
+                let deleted = repo
+                    .delete_run_for_bundle(
+                        key,
+                        home,
+                        DeleteRunRequest {
+                            expected_seq: state.transition_seq,
+                            deleted_at: OffsetDateTime::now_utc(),
                         },
-                    }),
-                )
-                .await?;
+                        WriteFence::Unfenced,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("fan-out cleanup run {key:?}: workflow_hot deletion")
+                    })?;
+                anyhow::ensure!(
+                    matches!(
+                        deleted,
+                        tokeira_storage::DeleteRunResult::Deleted { .. }
+                            | tokeira_storage::DeleteRunResult::NotFound
+                    ),
+                    "fan-out cleanup run {key:?}: workflow_hot hold: {deleted:?}"
+                );
             }
         }
-        // Closing children creates result intents that pin the parent. Retire only
-        // this fixture's intents, across every home, after all runs have closed.
-        for id in homes {
+        for &home in homes {
+            let mut bound = tokeira_storage::ScanBound::Capture;
             let mut after = None;
             loop {
-                let page = repo
-                    .read_intent_page(id, tokeira_storage::ScanBound::Capture, after, 100)
-                    .await?;
+                let page = repo.read_intent_page(home, bound, after, 100).await?;
                 if page.rows.is_empty() {
                     break;
                 }
                 after = page.rows.last().map(|row| row.key);
+                if let Some(through) = page.through {
+                    bound = tokeira_storage::ScanBound::Through(through);
+                }
                 for row in page
                     .rows
                     .into_iter()
@@ -1210,20 +1257,117 @@ async fn child_fan_out_live_starts_every_child() -> Result<()> {
                         },
                         WriteFence::Unfenced,
                     )
-                    .await?;
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "fan-out cleanup run {:?}: run_intent hold {:?}",
+                            row.key.source_run, row.key
+                        )
+                    })?;
                 }
             }
         }
-        for (key, home) in keys {
-            purge_contract_runs(repo.as_ref(), &log, &[key], home).await?;
+        remaining.clear();
+        // Callers supply children before parent: purging a child can remove its
+        // remaining outbound_parent_reference before the parent's purge check.
+        for &(key, home) in keys {
+            repo.purge_run(key)
+                .await
+                .with_context(|| format!("fan-out cleanup run {key:?}: purge"))?;
+            if repo.load_outbound_source(key).await? != LoadedRun::Absent
+                || !repo.read_history(key, 0, 1).await?.is_empty()
+            {
+                remaining.push((key, home));
+            }
         }
-        Ok(())
+        if remaining.is_empty() {
+            break;
+        }
     }
-    .await;
-    let closed = director.shutdown().await;
-    let result = finish_cleanup(result, stopped.map_err(Into::into), "runtime shutdown");
-    let result = finish_cleanup(result, cleanup, "fixture cleanup");
-    finish_cleanup(result, closed, "connection shutdown")
+    if !remaining.is_empty() {
+        let mut holds = Vec::new();
+        let mut pending = Vec::new();
+        for &home in homes {
+            let mut bound = tokeira_storage::ScanBound::Capture;
+            let mut after = None;
+            loop {
+                let page = repo.read_intent_page(home, bound, after, 100).await?;
+                if page.rows.is_empty() {
+                    break;
+                }
+                after = page.rows.last().map(|row| row.key);
+                if let Some(through) = page.through {
+                    bound = tokeira_storage::ScanBound::Through(through);
+                }
+                for row in page.rows {
+                    if let Some(intent) = repo.load_intent(row.key).await? {
+                        pending.push(intent);
+                    }
+                }
+            }
+        }
+        for (key, home) in remaining {
+            let hot = repo.load_run(key).await?;
+            let retained = repo.load_outbound_source(key).await?;
+            let intents: Vec<_> = pending
+                .iter()
+                .filter(|intent| intent.key.source_run == key)
+                .map(|intent| intent.key)
+                .collect();
+            let target_pins: Vec<_> = pending.iter().filter(|intent| {
+                matches!(&retained, LoadedRun::Existing(state) if intent.target.as_ref().is_some_and(|(namespace, workflow)| *namespace == state.namespace_id && *workflow == state.workflow_id))
+            }).map(|intent| intent.key).collect();
+            let mut after = None;
+            let mut phase = None;
+            loop {
+                let page = repo.list_run_bulk_writes(home, after, 100).await?;
+                if page.is_empty() {
+                    break;
+                }
+                after = page.last().map(|record| record.run_key);
+                if let Some(record) = page.into_iter().find(|record| record.run_key == key) {
+                    phase = Some(record.phase);
+                    break;
+                }
+            }
+            holds.push(format!(
+                "run {key:?}: run_bulk_write.phase={phase:?}, workflow_hot={}, outbound_retained_run={}, run_intent={intents:?}, target_run_intents={target_pins:?}",
+                hot != LoadedRun::Absent,
+                hot == LoadedRun::Absent && retained != LoadedRun::Absent,
+            ));
+        }
+        anyhow::bail!(
+            "fan-out cleanup holds after {PASSES} passes: {}",
+            holds.join("; ")
+        );
+    }
+    // Projection images are independent of purge eligibility, including the
+    // deletion tombstones written above. Do not call the general helper here:
+    // it can close a run and author an intent after our retirement pass.
+    for &(key, _) in keys {
+        let partition = (key.0.as_u128() as u32) % 16;
+        let mut cursor = Some(ProjectionImageKey {
+            run_key: key,
+            transition_seq: tokeira_types::TransitionSeq::ZERO,
+        });
+        loop {
+            let page = log.read_page(partition, 1, cursor, 100).await?;
+            let owned: Vec<_> = page
+                .images
+                .iter()
+                .take_while(|image| image.run_key == key)
+                .map(|image| image.key())
+                .collect();
+            if owned.is_empty() {
+                break;
+            }
+            cursor = owned.last().copied();
+            log.delete_images(partition, 1, &owned)
+                .await
+                .with_context(|| format!("fan-out cleanup run {key:?}: projection images"))?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]

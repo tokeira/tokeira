@@ -2,8 +2,9 @@
 
 use proptest::prelude::*;
 use tokeira_kernel::{
-    ChildStartGate, ChildWorkflowState, Command, Kernel, OperationKind, ParentClosePolicy,
-    PendingExternalCancel, PendingExternalSignal, TerminateRequest,
+    ChildReleaseState, ChildStartGate, ChildWorkflowState, Command, HistoryEventKind, Kernel,
+    OperationKind, ParentClosePolicy, PendingExternalCancel, PendingExternalSignal,
+    TerminateRequest,
 };
 use tokeira_types::{RequestContext, WorkflowType};
 use uuid::Uuid;
@@ -108,8 +109,139 @@ fn close(state: &WorkflowState) -> Transition {
         .unwrap()
 }
 
+fn owed_releases(seed: u32, count: u8, policy: ParentClosePolicy) -> Transition {
+    let mut start = source(seed, count, 2);
+    for child in start.next_state.children.values_mut() {
+        child.parent_close_policy = policy;
+        let first = RunId::new();
+        child.child_run_id = Some(first);
+        child.started_event_id = Some(child.initiated_event_id + 100);
+        start
+            .next_state
+            .outbound
+            .as_mut()
+            .unwrap()
+            .child_releases
+            .insert(
+                child.initiated_event_id,
+                ChildReleaseState {
+                    namespace_id: child.namespace_id,
+                    workflow_id: child.child_workflow_id.clone(),
+                    initiating_event: child.initiated_event_id,
+                    child_run_id: first,
+                    parent_started_event_id: child.started_event_id,
+                    parent_close_policy: policy,
+                },
+            );
+    }
+    start
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
+
+    // Feature: outbound-dispatch-recovery, Property 6: Child start precedes execution exactly once.
+    #[test]
+    fn close_authors_only_owed_abandon_release_intents(
+        seed in any::<u32>(), count in 1u8..12, reset in any::<bool>(),
+    ) {
+        for policy in [ParentClosePolicy::Abandon, ParentClosePolicy::Terminate,
+            ParentClosePolicy::RequestCancel] {
+            let start = owed_releases(seed, count, policy);
+            let before = &start.next_state;
+            let mut closed = close(before);
+            closed.next_state.outbound.as_mut().unwrap().child_releases =
+                before.outbound.as_ref().unwrap().child_releases.clone();
+            if reset {
+                closed.next_state.reset_run_id = Some(RunId::new());
+                for event in &mut closed.history_events {
+                    if let HistoryEventKind::WorkflowExecutionTerminated { identity, .. }
+                        = &mut event.kind {
+                        *identity = "history-resetter".into();
+                    }
+                }
+            }
+            let rows = crate::derive_close_intents(Some(before), &closed, home(before)).unwrap();
+            let releases: Vec<_> = rows.iter()
+                .filter(|row| row.key.kind == IntentKind::ChildRelease).collect();
+            let expected = if policy == ParentClosePolicy::Abandon && !reset {
+                usize::from(count)
+            } else { 0 };
+            prop_assert_eq!(releases.len(), expected);
+            for (ordinal, row) in releases.iter().enumerate() {
+                let IntentPayload::ChildRelease { release } = &row.payload else {
+                    panic!("release kind requires release payload");
+                };
+                prop_assert_eq!(row.key.ordinal, ordinal as u32);
+                prop_assert_eq!(release.initiating_event, ordinal as i64 + 1);
+                prop_assert_eq!(release,
+                    &before.outbound.as_ref().unwrap().child_releases[&release.initiating_event]);
+                prop_assert_eq!(&row.target,
+                    &Some((release.namespace_id, release.workflow_id.clone())));
+            }
+            prop_assert!(crate::derive_operations(&closed.next_state, home(before)).unwrap()
+                .iter().all(|row| row.incarnation.key.kind != OperationKind::ChildRelease));
+            if policy == ParentClosePolicy::Abandon && !reset {
+                closed.next_state.outbound.as_mut().unwrap().child_releases
+                    .get_mut(&1).unwrap().parent_started_event_id = None;
+                prop_assert!(matches!(crate::derive_close_intents(
+                    Some(before), &closed, home(before)),
+                    Err(crate::RecoveryError::InvalidIdentity { .. })), "missing close proof");
+            }
+        }
+    }
+
+    // Feature: outbound-dispatch-recovery, Property 19: Retention cannot erase outstanding proof.
+    #[test]
+    fn owed_release_intents_survive_parent_deletion(seed in any::<u32>(), count in 1u8..12) {
+        block_on(async {
+            let store = InMemoryStore::default();
+            let start = owed_releases(seed, count, ParentClosePolicy::Abandon);
+            let parent = applied(store.commit_transition(start.next_state.run_key, start,
+                WriteFence::Unfenced).await.unwrap());
+            let closed = applied(store.commit_transition(parent.run_key, close(&parent),
+                WriteFence::Unfenced).await.unwrap());
+            prop_assert!(store.read_operation_page(home(&parent), OperationKind::ChildRelease,
+                ScanBound::Capture, None, 100).await.unwrap().rows.is_empty());
+            store.delete_run_for_bundle(parent.run_key, home(&parent), crate::DeleteRunRequest {
+                expected_seq: closed.transition_seq, deleted_at: closed.started_at,
+            }, WriteFence::Unfenced).await.unwrap();
+            store.purge_run(parent.run_key).await.unwrap();
+            let store = InMemoryStore::from_snapshot(&store.snapshot().await.unwrap()).unwrap();
+            prop_assert_eq!(store.load_outbound_source(parent.run_key).await.unwrap(),
+                LoadedRun::Existing(closed));
+            let intents = store.read_intent_page(home(&parent), ScanBound::Capture, None, 100)
+                .await.unwrap().rows;
+            prop_assert_eq!(intents.len(), usize::from(count));
+            for row in intents {
+                prop_assert_eq!(row.key.kind, IntentKind::ChildRelease);
+                let payload = store.load_intent(row.key).await.unwrap().unwrap().payload;
+                prop_assert!(matches!(payload, IntentPayload::ChildRelease { .. }),
+                    "release payload");
+                store.retire_intent(IntentRetirement {
+                    key: row.key, outcome: DefinitiveOutcome::Absent,
+                }, WriteFence::Unfenced).await.unwrap();
+            }
+            store.purge_run(parent.run_key).await.unwrap();
+            prop_assert_eq!(store.load_outbound_source(parent.run_key).await.unwrap(),
+                LoadedRun::Absent);
+            Ok(())
+        })?;
+    }
+
+    // Feature: outbound-dispatch-recovery, Property 6: Child start precedes execution exactly once.
+    #[test]
+    fn release_recovery_index_only_counts_open_runs(seed in any::<u32>(), count in 1u8..12) {
+        let mut open = owed_releases(seed, count, ParentClosePolicy::Abandon).next_state;
+        open.pending_workflow_task = None;
+        open.children.clear();
+        open.workflow_run_timeout = None;
+        open.workflow_execution_timeout = None;
+        prop_assert!(crate::recovery_needed(&open));
+        let closed = close(&open).next_state;
+        prop_assert!(!closed.outbound.as_ref().unwrap().child_releases.is_empty());
+        prop_assert!(!crate::recovery_needed(&closed));
+    }
 
     // Feature: outbound-dispatch-recovery, Property 19: Retention cannot erase outstanding proof.
     #[test]

@@ -521,6 +521,68 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
         Ok(())
     }
 
+    /// Check retained confirmation and child identity before releasing or retiring
+    /// a close intent. A reset may owe release to the original parent's gate.
+    pub(super) async fn child_release_matches(
+        &self,
+        source: &WorkflowState,
+        child: &WorkflowState,
+        release: &tokeira_kernel::ChildReleaseState,
+    ) -> Result<bool> {
+        let started = release.parent_started_event_id.filter(|id| *id > 0).ok_or(
+            RecoveryError::InvalidIdentity {
+                run: source.run_key,
+                detail: "child release has no committed Started event",
+            },
+        )?;
+        let history = self
+            .repo
+            .read_history(source.run_key, started - 1, 1)
+            .await?;
+        ensure!(
+            history.first().is_some_and(|event| {
+                event.event_id == started
+                    && matches!(&event.kind,
+                        HistoryEventKind::ChildWorkflowExecutionStarted {
+                            child_workflow_id, child_run_id, initiated_event_id, ..
+                        } if child_workflow_id == &release.workflow_id
+                            && *child_run_id == release.child_run_id
+                            && *initiated_event_id == release.initiating_event)
+            }),
+            RecoveryError::InvalidIdentity {
+                run: source.run_key,
+                detail: "child release confirmation history mismatch",
+            }
+        );
+        if child.run_key
+            != RunKey::derive(
+                release.namespace_id,
+                &release.workflow_id,
+                release.child_run_id,
+            )
+            || child.namespace_id != release.namespace_id
+            || child.workflow_id != release.workflow_id
+            || child.run_id != release.child_run_id
+            || child.first_execution_run_id.unwrap_or(child.run_id) != release.child_run_id
+            || child.parent_initiated_event_id != release.initiating_event
+            || !(child.parent_run_key == Some(source.run_key)
+                || self
+                    .reset_child_relationship(source, child, release.initiating_event)
+                    .await?)
+        {
+            return Ok(false);
+        }
+        Ok(child
+            .outbound
+            .as_ref()
+            .and_then(|outbound| outbound.child_gate.as_ref())
+            .is_some_and(|gate| {
+                Some(gate.parent_run_key) == child.parent_run_key
+                    && gate.initiating_event == release.initiating_event
+                    && gate.first_child_run_id == release.child_run_id
+            }))
+    }
+
     pub(super) async fn drive_child_release(
         &self,
         row: OperationRow,

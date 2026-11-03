@@ -46,10 +46,12 @@ pub fn recovery_needed(state: &WorkflowState) -> bool {
                 || !state.children.is_empty()
                 || !state.pending_external_signals.is_empty()
                 || !state.pending_external_cancels.is_empty()))
-        || state
-            .outbound
-            .as_ref()
-            .is_some_and(|outbound| !outbound.child_releases.is_empty())
+        // Closed release maps are snapshots; immutable intents own that work.
+        || (open
+            && state
+                .outbound
+                .as_ref()
+                .is_some_and(|outbound| !outbound.child_releases.is_empty()))
         || state
             .completion_callbacks
             .iter()

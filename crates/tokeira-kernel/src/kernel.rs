@@ -1145,7 +1145,23 @@ impl BasicKernel {
         // scheduled speculative task converts, like a signal.
         builder.append_external(kind);
 
-        if builder.state.pending_workflow_task.is_none() {
+        if builder.state.pending_workflow_task.is_none()
+            && builder.state.status != ExecutionStatus::Paused
+        {
+            // Cancellation can create the first task before parent confirmation:
+            // service/history/api/requestcancelworkflow/api.go:82-86 and
+            // service/history/api/update_workflow_util.go:80-90 @ v1.31.0.
+            // A later first-task release is then a no-op, as in
+            // service/history/api/scheduleworkflowtask/api.go:40-44 @ v1.31.0.
+            // Keep the original delay timer, just as for a non-child cancellation.
+            if let Some(gate) = builder
+                .state
+                .outbound
+                .as_mut()
+                .and_then(|outbound| outbound.child_gate.as_mut())
+            {
+                gate.released = true;
+            }
             builder.schedule_workflow_task();
         }
 

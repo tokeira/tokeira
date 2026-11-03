@@ -107,7 +107,8 @@ pub struct ChildStartGate {
     pub initiating_event: i64,
     /// Child chain's first run; successors cannot impersonate another initiation.
     pub first_child_run_id: RunId,
-    /// Set only after runtime verifies the committed parent Started event.
+    /// Set after runtime verifies the committed parent Started event, or by a
+    /// cancel request scheduling the first task as Temporal v1.31.0 does.
     pub released: bool,
 }
 
@@ -140,7 +141,9 @@ pub struct OutboundState {
     pub version: u32,
     /// Winning child identity/inheritance, keyed by parent initiation.
     pub child_seeds: BTreeMap<i64, ChildStartSeed>,
-    /// Confirmed children whose first task still needs verified release.
+    /// Confirmed children whose first task still needs verified release while open.
+    /// After close this is the snapshot used to author immutable release intents;
+    /// those intents, rather than this retained map, own the remaining obligations.
     pub child_releases: BTreeMap<i64, ChildReleaseState>,
     /// This run's own first-task gate, when it was created as a child.
     pub child_gate: Option<ChildStartGate>,

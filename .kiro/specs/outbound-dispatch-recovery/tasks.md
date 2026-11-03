@@ -311,6 +311,20 @@ No separate specification PR is planned.
     after human approval of that exact head and green checks.
   - _Requirements: 10.8, 10.9._
 
+- [x] 20. Release gated children on cancellation and preserve releases through parent deletion
+  - Open a child's gate when cancellation schedules its first task; preserve held signals,
+    stale-release rejection and the original start-delay timer.
+  - Author owed ABANDON releases as close intents, suppress reset-termination copies,
+    remove closed release operations and exclude closed snapshots from the recovery index.
+  - Deliver under the intent guard with history, first-run, parent and gate verification;
+    retire the exact intent without a transition on the closed parent.
+  - Cover Properties 6, 19 and 20 with at least 100 cases per property test, including
+    cancellation, close policies, deletion, retained proof and restart. Run the kernel and
+    runtime negative controls with only the production kernel/storage fix reversed.
+  - Compile the storage and runtime live DSQL regressions for operator execution, and
+    update the delivery ledger, live-suite ordering and internal change record.
+  - _Requirements: 3.6, 3.7, 6.1, 6.8, 6.9, 10.4, 10.5, 10.6, 10.7._
+
 ## Verification evidence
 
 The [delivery ledger](../../../docs/readiness/outbound-recovery.md) records the
@@ -341,7 +355,8 @@ one upstream skip and four existing registry exclusions are reported separately.
   "16": ["14", "15"],
   "17": ["16"],
   "18": ["17"],
-  "19": ["18"]
+  "19": ["18"],
+  "20": ["18"]
 }
 ```
 

@@ -276,6 +276,30 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
                 reference.source_fence.ensure_home(intent.source_home)?;
                 let source = self.delivery_state(key.source_run).await?;
                 match (&intent.payload, reference.phase) {
+                    (IntentPayload::ChildRelease { release }, DeliveryPhase::ChildRelease) => {
+                        let child = self.delivery_state(target).await?;
+                        ensure!(
+                            !source.is_open()
+                                && self.child_release_matches(&source, &child, release).await?,
+                            RecoveryError::Obsolete
+                        );
+                        guard = DeliveryGuard::Intent(key);
+                        (
+                            Command::ParentChildStartRecorded(ParentChildStartRecordedRequest {
+                                parent_run_key: child
+                                    .parent_run_key
+                                    .ok_or(RecoveryError::Obsolete)?,
+                                initiating_event: release.initiating_event,
+                                first_child_run_id: release.child_run_id,
+                                parent_started_event_id: release
+                                    .parent_started_event_id
+                                    .ok_or(RecoveryError::Obsolete)?,
+                                now,
+                            }),
+                            release.namespace_id,
+                            release.workflow_id.clone(),
+                        )
+                    }
                     (
                         IntentPayload::ParentClose {
                             namespace_id,

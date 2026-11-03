@@ -234,7 +234,7 @@ crashes, so that a retry cannot create a second execution or lose its confirmati
 3. IF a previous attempt may have committed, THEN THE executor SHALL verify the matching child incarnation before reporting success or an already-existing-workflow failure.
 4. WHEN a verified start outcome is available, THE runtime SHALL retry recording that outcome on the parent until committed or definitively obsolete.
 5. WHEN a confirmation is duplicated, THE parent transition SHALL append at most one started or failed event for that initiation.
-6. THE runtime SHALL make the child's first workflow task runnable only after the parent has durably recorded its start, subject to the v1.31.0 already-started ABANDON case.
+6. THE runtime SHALL make the child's first workflow task runnable only after the parent has durably recorded its start, subject to the v1.31.0 already-started ABANDON case, or when a cancel request schedules it as `service/history/api/requestcancelworkflow/api.go:82-86 @ v1.31.0` does.
 7. WHEN parent confirmation commits but first-task release is lost, THE runtime SHALL recover that release from durable state.
 8. IF the parent is closed before an unconfirmed child can be started, THEN THE executor SHALL abandon further start attempts as specified by `processStartChildExecution @ v1.31.0`.
 9. IF child delivery fails without a definitive outcome, THEN THE runtime SHALL retain the initiation without recording a start-failed event.
@@ -271,7 +271,7 @@ a timeout, so that losing its first task cannot leave it permanently pending.
 **User story:** As a workflow author, I want parent-close actions and child results to
 survive crashes, so that related executions converge to the recorded outcome.
 
-1. WHEN a close requires child termination, cancellation or parent notification, THE storage layer SHALL establish each required obligation in the close's transaction.
+1. WHEN a close requires child termination, cancellation, parent notification or an owed ABANDON child's first-task release, THE storage layer SHALL establish each required obligation in the close's transaction.
 2. WHEN a parent-close action is retried, THE executor SHALL target only the child chain identified by its parent relationship and first run.
 3. IF a workflow ID has been reused for an unrelated execution, THEN THE executor SHALL leave that execution unchanged.
 4. WHEN a child chain ends, THE runtime SHALL deliver its final result to the matching parent initiation, including valid reset redirects.

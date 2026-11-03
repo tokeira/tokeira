@@ -13,6 +13,7 @@ use tokeira_storage::{
     DeleteRunRequest, LeaseOutcome, ProjectionImageKey, ProjectionLog, WriteFence,
     dsql::{DsqlPoolConfig, DsqlStore, MigrationConfig, ReservoirConfig},
 };
+use tokeira_types::WorkflowId;
 
 fn finish_cleanup(result: Result<()>, cleanup: Result<()>, step: &str) -> Result<()> {
     match (result, cleanup) {
@@ -913,6 +914,469 @@ async fn live_dispatch_observation(lost: Option<TaskKind>) -> Result<()> {
     } else {
         cleanup = Err(anyhow!("cleanup deferred until runtime renewal tasks stop"));
     }
+    let closed = director.shutdown().await;
+    let result = finish_cleanup(result, stopped.map_err(Into::into), "runtime shutdown");
+    let result = finish_cleanup(result, cleanup, "fixture cleanup");
+    finish_cleanup(result, closed, "connection shutdown")
+}
+
+async fn child_release_fixture_apply(
+    repo: &dyn RunRepository,
+    key: RunKey,
+    command: Command,
+) -> Result<WorkflowState> {
+    let next = BasicKernel.apply(repo.load_run(key).await?, command)?;
+    match repo
+        .commit_transition(key, next, WriteFence::Unfenced)
+        .await?
+    {
+        CommitResult::Applied { new_state } => Ok(new_state),
+        other => anyhow::bail!("child release fixture rejected: {other:?}"),
+    }
+}
+
+async fn child_release_fixture_complete(
+    repo: &dyn RunRepository,
+    start: &StartRequest,
+    commands: Vec<WorkflowCommand>,
+) -> Result<WorkflowState> {
+    let LoadedRun::Existing(state) = repo.load_run(start.run_key).await? else {
+        anyhow::bail!("parent fixture disappeared before task completion");
+    };
+    let task = state.pending_workflow_task.context("parent pending task")?;
+    let state = child_release_fixture_apply(
+        repo,
+        start.run_key,
+        Command::WorkflowTaskStarted(tokeira_kernel::StartWorkflowTaskRequest {
+            logical_seq: task.logical_seq,
+            worker_identity: WorkerIdentity("release-fixture".into()),
+            request_id: format!("parent-task:{}", task.logical_seq.0),
+            history_size_bytes: 0,
+            advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
+            deployment_transition: None,
+            deployment_transition_revision_number: None,
+            polled_task_queue: start.task_queue.clone(),
+            now: OffsetDateTime::now_utc(),
+            target_version_changed_enabled: false,
+            target_deployment_version: None,
+        }),
+    )
+    .await?;
+    let task = state.pending_workflow_task.context("started parent task")?;
+    let state = child_release_fixture_apply(
+        repo,
+        start.run_key,
+        Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
+            token: WorkflowTaskToken {
+                run_key: start.run_key,
+                logical_seq: task.logical_seq,
+                started_event_id: task.started_event_id.context("started event")?,
+                attempt: task.attempt,
+                shard_epoch: ShardEpoch::ZERO,
+            },
+            identity: WorkerIdentity("release-fixture".into()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: Default::default(),
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky: None,
+            commands,
+            force_new_workflow_task: false,
+            limits: Default::default(),
+            delivered_update_ids: Vec::new(),
+            command_sizes: Vec::new(),
+            request: RequestContext::unattributed(OffsetDateTime::now_utc()),
+            now: OffsetDateTime::now_utc(),
+        }),
+    )
+    .await?;
+    Ok(state)
+}
+
+async fn child_release_parent_intents(
+    repo: &dyn RunRepository,
+    home: ShardId,
+    parent: RunKey,
+) -> Result<Vec<tokeira_storage::IntentKey>> {
+    let mut bound = tokeira_storage::ScanBound::Capture;
+    let mut after = None;
+    let mut keys = Vec::new();
+    loop {
+        let page = repo.read_intent_page(home, bound, after, 100).await?;
+        if page.rows.is_empty() {
+            return Ok(keys);
+        }
+        after = page.rows.last().map(|row| row.key);
+        if let Some(through) = page.through {
+            bound = tokeira_storage::ScanBound::Through(through);
+        }
+        keys.extend(
+            page.rows
+                .into_iter()
+                .filter(|row| row.key.source_run == parent)
+                .map(|row| row.key),
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ChildReleaseCase {
+    ParentDeletion,
+    AfterCancel,
+}
+
+// Feature: outbound-dispatch-recovery, Property 20: End-to-end crash refinement.
+#[tokio::test]
+#[ignore = "requires an ephemeral Aurora DSQL database"]
+async fn child_release_live_survives_parent_deletion() -> Result<()> {
+    child_release_live_case(ChildReleaseCase::ParentDeletion).await
+}
+
+// Feature: outbound-dispatch-recovery, Property 20: End-to-end crash refinement.
+#[tokio::test]
+#[ignore = "requires an ephemeral Aurora DSQL database"]
+async fn child_release_live_intent_after_cancel_retires() -> Result<()> {
+    child_release_live_case(ChildReleaseCase::AfterCancel).await
+}
+
+async fn child_release_live_case(case: ChildReleaseCase) -> Result<()> {
+    let url = std::env::var("TOKEIRA_DSQL_TEST_DATABASE_URL")
+        .context("explicit child release test requires TOKEIRA_DSQL_TEST_DATABASE_URL")?;
+    let store = DsqlStore::from_database_url_for_tests(
+        url,
+        DsqlPoolConfig {
+            migration: MigrationConfig {
+                migrations_dir: Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../tokeira-storage/migrations"),
+            },
+            reservoir: ReservoirConfig {
+                target_ready: 4,
+                inflight_limit: 2,
+                ..Default::default()
+            },
+            shard_count: 8,
+            projection_partition_count: 16,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let log = store.projection_log().clone();
+    let (director, repo, _, _, _) = store.into_parts();
+    let repo = Arc::new(repo);
+    tokeira_storage::prepare_execution_placement(repo.as_ref()).await?;
+    let mut parent = tests::sample_start_request(None, None);
+    parent.run_key = RunKey::derive(parent.namespace_id, &parent.workflow_id, parent.run_id);
+    parent.workflow_task_timeout = Duration::minutes(5);
+    let home = execution_home_bundle(
+        parent.namespace_id.0.as_bytes(),
+        parent.workflow_id.0.as_bytes(),
+        8,
+    );
+    let mut child = tests::sample_start_request(None, None);
+    child.namespace_id = parent.namespace_id;
+    child.workflow_id = (0..)
+        .map(|index| WorkflowId(format!("release-child-{index}")))
+        .find(|id| {
+            execution_home_bundle(child.namespace_id.0.as_bytes(), id.0.as_bytes(), 8) == home
+        })
+        .expect("fixture child home");
+    child.run_key = RunKey::derive(child.namespace_id, &child.workflow_id, child.run_id);
+    child.task_queue = TaskQueueName(format!("child-release-{}", child.run_id.0));
+    child.workflow_task_timeout = Duration::minutes(5);
+    child.parent_run_key = Some(parent.run_key);
+    child.parent_run_id = Some(parent.run_id);
+    child.parent_namespace_id = Some(parent.namespace_id);
+    child.parent_workflow_id = Some(parent.workflow_id.clone());
+    let queue = QueueKey {
+        namespace_id: child.namespace_id,
+        task_queue: child.task_queue.clone(),
+        task_kind: TaskKind::Workflow,
+        deployment: None,
+        build_id: None,
+    };
+    let queue_home = tokeira_types::bundle_for_partition(
+        tokeira_types::workflow_queue_partition(queue.namespace_id, &queue.task_queue.0, 8),
+        8,
+    );
+    let mut homes = vec![home, queue_home];
+    homes.sort();
+    homes.dedup();
+    let keys = [child.run_key, parent.run_key];
+    let setup: Result<()> = async {
+        child_release_fixture_apply(
+            repo.as_ref(),
+            parent.run_key,
+            Command::Start(parent.clone()),
+        )
+        .await?;
+        let state = child_release_fixture_complete(
+            repo.as_ref(),
+            &parent,
+            vec![WorkflowCommand::StartChildWorkflow {
+                child_workflow_id: child.workflow_id.clone(),
+                namespace_id: child.namespace_id,
+                namespace: None,
+                workflow_type: child.workflow_type.clone(),
+                task_queue: child.task_queue.clone(),
+                input: Payloads::default(),
+                header: None,
+                memo: Default::default(),
+                search_attributes: Default::default(),
+                workflow_execution_timeout: None,
+                workflow_run_timeout: None,
+                workflow_task_timeout: child.workflow_task_timeout,
+                retry_policy: None,
+                cron_schedule: None,
+                parent_close_policy: tokeira_kernel::ParentClosePolicy::Abandon,
+                reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::RejectDuplicate,
+                priority: None,
+            }],
+        )
+        .await?;
+        child.parent_initiated_event_id = state.children[&child.workflow_id].initiated_event_id;
+        let state = child_release_fixture_apply(
+            repo.as_ref(),
+            child.run_key,
+            Command::Start(child.clone()),
+        )
+        .await?;
+        anyhow::ensure!(
+            state.pending_workflow_task.is_none(),
+            "child bypassed its gate"
+        );
+        child_release_fixture_apply(
+            repo.as_ref(),
+            parent.run_key,
+            Command::ChildStartConfirmed(tokeira_kernel::ChildStartConfirmedRequest {
+                child_workflow_id: child.workflow_id.clone(),
+                initiated_event_id: child.parent_initiated_event_id,
+                result: tokeira_kernel::ChildStartResult::Started {
+                    child_run_id: child.run_id,
+                    workflow_type: child.workflow_type.clone(),
+                },
+                now: OffsetDateTime::now_utc(),
+            }),
+        )
+        .await?;
+        if matches!(case, ChildReleaseCase::AfterCancel) {
+            let canceled = child_release_fixture_apply(
+                repo.as_ref(),
+                child.run_key,
+                Command::Cancel(tokeira_kernel::CancelRequest {
+                    reason: "client cancels before parent close".into(),
+                    external_initiator: None,
+                    external_initiated_event_id: 0,
+                    links: Vec::new(),
+                    request: RequestContext::unattributed(OffsetDateTime::now_utc()),
+                    now: OffsetDateTime::now_utc(),
+                }),
+            )
+            .await?;
+            anyhow::ensure!(
+                canceled.cancel_requested
+                    && canceled.pending_workflow_task.is_some()
+                    && canceled
+                        .outbound
+                        .as_ref()
+                        .and_then(|outbound| outbound.child_gate.as_ref())
+                        .is_some_and(|gate| gate.released),
+                "cancel did not open the child gate"
+            );
+        }
+        let closed = if matches!(case, ChildReleaseCase::AfterCancel) {
+            child_release_fixture_complete(
+                repo.as_ref(),
+                &parent,
+                vec![WorkflowCommand::CompleteWorkflow {
+                    result: Payloads::default(),
+                }],
+            )
+            .await?
+        } else {
+            child_release_fixture_apply(
+                repo.as_ref(),
+                parent.run_key,
+                Command::Terminate(TerminateRequest {
+                    reason: "close before release".into(),
+                    details: None,
+                    identity: "fixture".into(),
+                    links: Vec::new(),
+                    now: OffsetDateTime::now_utc(),
+                    request: RequestContext::unattributed(OffsetDateTime::now_utc()),
+                }),
+            )
+            .await?
+        };
+        let intents = child_release_parent_intents(repo.as_ref(), home, parent.run_key).await?;
+        anyhow::ensure!(
+            intents.len() == 1 && intents[0].kind == tokeira_storage::IntentKind::ChildRelease,
+            "parent close did not author exactly one release intent"
+        );
+        if matches!(case, ChildReleaseCase::ParentDeletion) {
+            repo.delete_run_for_bundle(
+                parent.run_key,
+                home,
+                DeleteRunRequest {
+                    expected_seq: closed.transition_seq,
+                    deleted_at: OffsetDateTime::now_utc(),
+                },
+                WriteFence::Unfenced,
+            )
+            .await?;
+            repo.purge_run(parent.run_key).await?;
+            anyhow::ensure!(
+                repo.load_outbound_source(parent.run_key).await? == LoadedRun::Existing(closed),
+                "release source was purged"
+            );
+        }
+        Ok(())
+    }
+    .await;
+    let runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
+        repo.clone(),
+        1,
+        LaneConfig {
+            controller_managed_placement: true,
+            ..Default::default()
+        },
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        ActivityTimeoutScannerConfig::default(),
+        NexusTimeoutScannerConfig::default(),
+        NexusEndpointRegistry::default(),
+        Arc::new(NoopNexusHttpClient),
+        NexusCompletionDeps::default(),
+        8,
+        format!("live-child-release-{}", Uuid::new_v4()),
+        "127.0.0.1:0".into(),
+        false,
+        None,
+    ));
+    let result: Result<()> = async {
+        setup?;
+        for id in &homes {
+            runtime.acquire_shard(*id).await?;
+        }
+        runtime.ready().await?;
+        if matches!(case, ChildReleaseCase::ParentDeletion) {
+            let activation = runtime
+                .poll_workflow_activation(
+                    queue,
+                    None,
+                    WorkerIdentity("child-release-worker".into()),
+                    std::time::Duration::from_secs(30),
+                )
+                .await?;
+            let Some(WorkflowActivation::WorkflowTask(task)) = activation else {
+                anyhow::bail!("released child's first task did not reach a poll");
+            };
+            anyhow::ensure!(
+                task.token.run_key == child.run_key,
+                "wrong child reached poll"
+            );
+        } else {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while !child_release_parent_intents(repo.as_ref(), home, parent.run_key)
+                    .await?
+                    .is_empty()
+                {
+                    tokio::task::yield_now().await;
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .context("release intent did not retire before the deadline")??;
+            let history = repo.read_history(child.run_key, 0, 100).await?;
+            anyhow::ensure!(
+                history
+                    .iter()
+                    .filter(|event| matches!(
+                        event.kind,
+                        tokeira_kernel::HistoryEventKind::WorkflowTaskScheduled { .. }
+                    ))
+                    .count()
+                    == 1,
+                "no-op release scheduled a second workflow task"
+            );
+        }
+        let LoadedRun::Existing(state) = repo.load_run(child.run_key).await? else {
+            anyhow::bail!("released child disappeared");
+        };
+        anyhow::ensure!(
+            state
+                .outbound
+                .as_ref()
+                .and_then(|outbound| outbound.child_gate.as_ref())
+                .is_some_and(|gate| gate.released),
+            "gate still closed"
+        );
+        Ok(())
+    }
+    .await;
+    runtime.runtime_shutdown.begin_shutdown();
+    for id in &homes {
+        runtime.relinquish_shard(*id).await;
+    }
+    let stopped = runtime
+        .runtime_shutdown
+        .wait(std::time::Instant::now() + std::time::Duration::from_secs(10))
+        .await;
+    let cleanup: Result<()> = async {
+        anyhow::ensure!(stopped.is_ok(), "cleanup requires stopped renewal tasks");
+        for id in homes {
+            release_contract_lease(repo.as_ref(), id, &runtime.owner_identity).await?;
+        }
+        // Close every fixture run before retiring intents, including partial
+        // setup failures. The child's future result otherwise pins the parent.
+        for key in keys {
+            if let LoadedRun::Existing(state) = repo.load_run(key).await?
+                && state.is_open()
+            {
+                child_release_fixture_apply(
+                    repo.as_ref(),
+                    key,
+                    Command::Terminate(TerminateRequest {
+                        reason: "fixture cleanup".into(),
+                        details: None,
+                        identity: "fixture".into(),
+                        links: Vec::new(),
+                        now: OffsetDateTime::now_utc(),
+                        request: RequestContext::unattributed(OffsetDateTime::now_utc()),
+                    }),
+                )
+                .await?;
+            }
+        }
+        let mut after = None;
+        loop {
+            let page = repo
+                .read_intent_page(home, tokeira_storage::ScanBound::Capture, after, 100)
+                .await?;
+            if page.rows.is_empty() {
+                break;
+            }
+            after = page.rows.last().map(|row| row.key);
+            for row in page
+                .rows
+                .into_iter()
+                .filter(|row| keys.contains(&row.key.source_run))
+            {
+                repo.retire_intent(
+                    tokeira_storage::IntentRetirement {
+                        key: row.key,
+                        outcome: tokeira_storage::DefinitiveOutcome::Absent,
+                    },
+                    WriteFence::Unfenced,
+                )
+                .await?;
+            }
+        }
+        purge_contract_runs(repo.as_ref(), &log, &keys, home).await
+    }
+    .await;
     let closed = director.shutdown().await;
     let result = finish_cleanup(result, stopped.map_err(Into::into), "runtime shutdown");
     let result = finish_cleanup(result, cleanup, "fixture cleanup");

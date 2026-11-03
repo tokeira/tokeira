@@ -29,6 +29,7 @@ pub(super) struct Repository {
     pub(super) fail_outbound_before: AtomicU8,
     pub(super) lose_child_seed_reply: AtomicBool,
     pub(super) lose_retirement: AtomicU8,
+    pub(super) hold_child_releases: AtomicBool,
 }
 
 impl Deref for Repository {
@@ -182,6 +183,13 @@ impl RunRepository for Repository {
         source_fence: tokeira_storage::WriteFence,
         fence: tokeira_storage::WriteFence,
     ) -> anyhow::Result<tokeira_storage::CommitResult> {
+        let release = guard.operation().is_some_and(|operation| {
+            operation.key.kind == tokeira_kernel::OperationKind::ChildRelease
+        }) || matches!(guard, tokeira_storage::DeliveryGuard::Intent(key)
+            if key.kind == tokeira_storage::IntentKind::ChildRelease);
+        if release && self.hold_child_releases.load(Ordering::SeqCst) {
+            bail!("injected held child release before parent deletion");
+        }
         let bit = match guard.operation() {
             Some(incarnation) => match (incarnation.key.kind, run == incarnation.key.source_run) {
                 (tokeira_kernel::OperationKind::ChildStart, false) => 1,

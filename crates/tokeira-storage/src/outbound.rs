@@ -9,9 +9,9 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    ChildOutcomeIdentity, ChildWorkflowState, HistoryEventKind, NexusOperationCancellationState,
-    OperationIncarnation, OperationKey, OperationKind, ParentClosePolicy, StartRequest, Transition,
-    WorkflowState,
+    ChildOutcomeIdentity, ChildReleaseState, ChildWorkflowState, HistoryEventKind,
+    NexusOperationCancellationState, OperationIncarnation, OperationKey, OperationKind,
+    ParentClosePolicy, StartRequest, Transition, WorkflowState,
 };
 use tokeira_types::{NamespaceId, RunId, RunKey, ShardId, TransitionSeq, WorkflowId};
 
@@ -89,6 +89,8 @@ pub enum IntentKind {
     ChildResult = 2,
     /// A frozen successor that did not fit the ordinary atomic pair.
     Successor = 3,
+    /// Confirmed ABANDON child's first-task release still owed at parent close.
+    ChildRelease = 4,
 }
 
 /// Collision-free identity of one obligation authored by one close transition.
@@ -128,7 +130,7 @@ pub enum IntentPayload {
         initiating_event: i64,
         /// Confirmed or prepared first child run, when known.
         first_child_run: Option<RunId>,
-        /// ABANDON is never an intent.
+        /// ABANDON never authors a ParentClose intent.
         policy: ParentClosePolicy,
     },
     /// Hydrate the exact terminal event; no payload or retry-state truncation.
@@ -144,6 +146,11 @@ pub enum IntentPayload {
     Successor {
         /// Selected successor and all accepted/inherited start values.
         start: Box<StartRequest>,
+    },
+    /// Release the exact confirmed ABANDON child after its parent closes.
+    ChildRelease {
+        /// Confirmation proof retained by the close, independent of source deletion.
+        release: ChildReleaseState,
     },
 }
 
@@ -382,8 +389,8 @@ pub fn derive_operations(
             }
         }
     }
-    for release in outbound.child_releases.values() {
-        if state.is_open() || release.parent_close_policy == ParentClosePolicy::Abandon {
+    if state.is_open() {
+        for release in outbound.child_releases.values() {
             push(
                 OperationKind::ChildRelease,
                 release.initiating_event,
@@ -536,6 +543,9 @@ pub fn derive_close_intents(
             IntentPayload::Successor { start } => {
                 Some((start.namespace_id, start.workflow_id.clone()))
             }
+            IntentPayload::ChildRelease { release } => {
+                Some((release.namespace_id, release.workflow_id.clone()))
+            }
         };
         rows.push(IntentRow {
             key: IntentKey {
@@ -557,6 +567,36 @@ pub fn derive_close_intents(
     let reset_termination = matches!(&terminal.kind,
         HistoryEventKind::WorkflowExecutionTerminated { identity, .. } if identity == "history-resetter");
     if !(reset_termination && state.reset_run_id.is_some()) {
+        // Only ABANDON still owes release after close, independently of kernel
+        // pruning. Intents retain proof through deletion; the closed map must
+        // never recreate retired work.
+        let mut releases: Vec<_> = state
+            .outbound
+            .as_ref()
+            .into_iter()
+            .flat_map(|outbound| outbound.child_releases.values())
+            .filter(|release| release.parent_close_policy == ParentClosePolicy::Abandon)
+            .collect();
+        releases.sort_by_key(|release| release.initiating_event);
+        for (ordinal, release) in releases.into_iter().enumerate() {
+            if release.parent_started_event_id.is_none_or(|id| id <= 0) {
+                return Err(RecoveryError::InvalidIdentity {
+                    run: state.run_key,
+                    detail: "child release close proof has no committed Started event",
+                });
+            }
+            let ordinal = u32::try_from(ordinal).map_err(|_| RecoveryError::InvalidIdentity {
+                run: state.run_key,
+                detail: "too many child release obligations",
+            })?;
+            push(
+                IntentKind::ChildRelease,
+                ordinal,
+                IntentPayload::ChildRelease {
+                    release: release.clone(),
+                },
+            );
+        }
         let mut children: Vec<_> = children.into_values().collect();
         children.sort_by_key(|child| child.initiated_event_id);
         for (ordinal, child) in children.into_iter().enumerate() {

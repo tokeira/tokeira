@@ -282,8 +282,11 @@ The ignored projection test `dsql_cancelled_visibility_start_preserves_next_writ
 uses one reservoir slot and a manual first poll. A consumed ready slot proves
 checkout completed; a mismatched cursor would fail synchronously immediately
 after BEGIN, so `Pending` proves startup is still in progress. After dropping
-the read, the next store apply must commit and read back. Live execution remains
-operator-run against an ephemeral DSQL database.
+the read, the next store apply must commit and read back. It runs only against
+an ephemeral DSQL database. Run from an archive, it passes with the other 31
+projection live tests. On the unfixed code it fails with
+`cannot execute INSERT in a read-only transaction`: the write inherits the
+abandoned read-only transaction.
 
 ## Verification receipt
 

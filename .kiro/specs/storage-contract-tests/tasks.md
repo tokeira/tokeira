@@ -211,7 +211,7 @@ task must represent implemented and verified work, not a planned test selector.
     CI or unrelated specification changes before the PR boundary.
   - _Requirements: 1.1, 1.2, 1.3, 1.5, 2.1, 3.1, 4.1, 4.5, 5.2, 6.1, 6.3, 6.4, 6.5, 7.1, 7.2, 7.3, 7.4, 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 8.8, 8.9, 8.10_
 
-- [ ] 15. Guard visibility-store transaction starts
+- [x] 15. Guard visibility-store transaction starts
   - Route all eleven starts through the permit, moving list snapshot ownership
     to `list_executions` and passing the permit to `get_execution_row`; preserve
     autocommit probes, snapshot rereads, statements, isolation and retries.
@@ -219,8 +219,9 @@ task must represent implemented and verified work, not a planned test selector.
     a negative control, and document narrow exceptions and the updated audit.
   - Add an ignored single-slot DSQL test that proves cancellation during BEGIN
     and verifies the next store write commits and reads back. Run local lint,
-    nextest and doctests; live verification remains operator-run on an ephemeral
-    cluster. Add a changie fix fragment.
+    nextest and doctests, then the projection live suites from an archive on an
+    ephemeral cluster; on the unfixed code the new test must fail. Add a changie
+    fix fragment.
   - _Requirements: 9.1, 9.2, 9.4, 9.5, 9.6, 9.7_
 
 ## Task Dependency Graph

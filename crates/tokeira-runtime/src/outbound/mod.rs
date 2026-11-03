@@ -10,4 +10,6 @@ pub(crate) mod successor;
 #[cfg(test)]
 mod bug_condition_exploration_tests;
 #[cfg(test)]
+pub(crate) mod fan_out_measurement;
+#[cfg(test)]
 mod test_repository;

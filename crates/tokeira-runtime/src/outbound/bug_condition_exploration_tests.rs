@@ -40,7 +40,7 @@ use crate::{
     wft_timeout::WftTimeoutTrackingState,
 };
 
-use super::test_repository::Repository;
+use super::{fan_out_measurement::FanOutMeasurement, test_repository::Repository};
 
 #[derive(Debug, Default)]
 struct HeldCallbackClient {
@@ -415,6 +415,55 @@ impl Fixture {
             now: self.source.now,
         }
     }
+}
+
+// Feature: outbound-dispatch-recovery, Property 20: End-to-end crash refinement.
+#[tokio::test]
+#[ignore = "measurement: run explicitly"]
+async fn child_fan_out_starts_every_child() -> Result<()> {
+    let fixture = Fixture::new(0).await;
+    let children: Vec<_> = (0..100)
+        .map(|index| WorkflowId(format!("fan-out-child-{index}")))
+        .collect();
+    let commands = children
+        .iter()
+        .map(|id| {
+            let mut command = fixture.child_command(Vec::new());
+            if let WorkflowCommand::StartChildWorkflow {
+                child_workflow_id,
+                parent_close_policy,
+                ..
+            } = &mut command
+            {
+                *child_workflow_id = id.clone();
+                *parent_close_policy = ParentClosePolicy::Abandon;
+            }
+            command
+        })
+        .collect();
+    let parent = fixture.complete(&fixture.source, commands).await;
+    assert_eq!(parent.children.len(), children.len());
+    let measurement = FanOutMeasurement::new(Some(fixture.repo.outbound_committed.clone()));
+    let runtime = TokeiraRuntime::new_with_config(fixture.repo.clone(), RuntimeConfig::default());
+    let result = measurement
+        .run(
+            "memory",
+            fixture.repo.as_ref(),
+            &fixture.source,
+            ShardId(0),
+            &children,
+            std::time::Duration::from_secs(10 * 60),
+            runtime.ready(),
+        )
+        .await;
+    let shutdown = runtime.shutdown_handle();
+    shutdown.begin_shutdown();
+    let stopped = shutdown
+        .wait(std::time::Instant::now() + std::time::Duration::from_secs(10))
+        .await;
+    result?;
+    stopped?;
+    Ok(())
 }
 
 // Feature: outbound-dispatch-recovery, Property 21: A close's outbound writes stay within budget

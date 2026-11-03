@@ -5,6 +5,7 @@ use crate::{
     activity_timeout::ActivityTrackingEntry,
     discovery::tests::transition,
     nexus::{CompletionCallbackTrackingEntry, NexusTimeoutEntry},
+    outbound::fan_out_measurement::FanOutMeasurement,
 };
 use anyhow::Context;
 use std::path::Path;
@@ -1020,6 +1021,209 @@ async fn child_release_parent_intents(
                 .map(|row| row.key),
         );
     }
+}
+
+// Feature: outbound-dispatch-recovery, Property 20: End-to-end crash refinement.
+#[tokio::test]
+#[ignore = "requires an ephemeral Aurora DSQL database"]
+async fn child_fan_out_live_starts_every_child() -> Result<()> {
+    let url = std::env::var("TOKEIRA_DSQL_TEST_DATABASE_URL")
+        .context("explicit fan-out test requires TOKEIRA_DSQL_TEST_DATABASE_URL")?;
+    let store = DsqlStore::from_database_url_for_tests(
+        url,
+        DsqlPoolConfig {
+            migration: MigrationConfig {
+                migrations_dir: Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../tokeira-storage/migrations"),
+            },
+            reservoir: ReservoirConfig::default(),
+            shard_count: 8,
+            projection_partition_count: 16,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let log = store.projection_log().clone();
+    let (director, repo, _, _, _) = store.into_parts();
+    let repo = Arc::new(repo);
+    tokeira_storage::prepare_execution_placement(repo.as_ref()).await?;
+    let mut parent = tests::sample_start_request(None, None);
+    parent.run_key = RunKey::derive(parent.namespace_id, &parent.workflow_id, parent.run_id);
+    parent.workflow_task_timeout = Duration::minutes(5);
+    let home_for = |id: &WorkflowId| {
+        execution_home_bundle(parent.namespace_id.0.as_bytes(), id.0.as_bytes(), 8)
+    };
+    let home = home_for(&parent.workflow_id);
+    let children: Vec<_> = (0..100)
+        .map(|index| WorkflowId(format!("fan-out-{}-{index}", parent.run_id.0)))
+        .collect();
+    let child_queue = TaskQueueName(format!("fan-out-{}", parent.run_id.0));
+    let mut homes: Vec<_> = children.iter().map(home_for).collect();
+    homes.push(home);
+    for queue in [&parent.task_queue, &child_queue] {
+        homes.push(tokeira_types::bundle_for_partition(
+            tokeira_types::workflow_queue_partition(parent.namespace_id, &queue.0, 8),
+            8,
+        ));
+    }
+    homes.sort();
+    homes.dedup();
+    let setup: Result<()> = async {
+        child_release_fixture_apply(
+            repo.as_ref(),
+            parent.run_key,
+            Command::Start(parent.clone()),
+        )
+        .await?;
+        let commands = children
+            .iter()
+            .map(|id| WorkflowCommand::StartChildWorkflow {
+                child_workflow_id: id.clone(),
+                namespace_id: parent.namespace_id,
+                namespace: None,
+                workflow_type: parent.workflow_type.clone(),
+                task_queue: child_queue.clone(),
+                input: Payloads::default(),
+                header: None,
+                memo: Default::default(),
+                search_attributes: Default::default(),
+                workflow_execution_timeout: None,
+                workflow_run_timeout: None,
+                workflow_task_timeout: Duration::seconds(10),
+                retry_policy: None,
+                cron_schedule: None,
+                parent_close_policy: tokeira_kernel::ParentClosePolicy::Abandon,
+                reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::RejectDuplicate,
+                priority: None,
+            })
+            .collect();
+        let state = child_release_fixture_complete(repo.as_ref(), &parent, commands).await?;
+        anyhow::ensure!(
+            state.children.len() == children.len(),
+            "fan-out was not initiated"
+        );
+        Ok(())
+    }
+    .await;
+    let measurement = FanOutMeasurement::new(None);
+    let runtime = TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
+        repo.clone(),
+        1,
+        LaneConfig {
+            controller_managed_placement: true,
+            ..Default::default()
+        },
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        ActivityTimeoutScannerConfig::default(),
+        NexusTimeoutScannerConfig::default(),
+        NexusEndpointRegistry::default(),
+        Arc::new(NoopNexusHttpClient),
+        NexusCompletionDeps::default(),
+        8,
+        format!("live-fan-out-{}", Uuid::new_v4()),
+        "127.0.0.1:0".into(),
+        false,
+        None,
+    );
+    let result = measurement
+        .run(
+            "dsql",
+            repo.as_ref(),
+            &parent,
+            home,
+            &children,
+            std::time::Duration::from_secs(15 * 60),
+            async {
+                setup?;
+                for id in &homes {
+                    runtime.acquire_shard(*id).await?;
+                }
+                runtime.ready().await
+            },
+        )
+        .await;
+    runtime.runtime_shutdown.begin_shutdown();
+    for id in &homes {
+        runtime.relinquish_shard(*id).await;
+    }
+    let stopped = runtime
+        .runtime_shutdown
+        .wait(std::time::Instant::now() + std::time::Duration::from_secs(10))
+        .await;
+    let cleanup: Result<()> = async {
+        anyhow::ensure!(stopped.is_ok(), "cleanup requires stopped renewal tasks");
+        for id in &homes {
+            release_contract_lease(repo.as_ref(), *id, &runtime.owner_identity).await?;
+        }
+        // Include creations whose parent confirmation was still pending at the deadline.
+        let mut keys = Vec::new();
+        for child in &children {
+            if let Some(key) = repo.find_latest_run(parent.namespace_id, child).await? {
+                keys.push((key, home_for(child)));
+            }
+        }
+        keys.push((parent.run_key, home));
+        for &(key, _) in &keys {
+            if let LoadedRun::Existing(state) = repo.load_run(key).await?
+                && state.is_open()
+            {
+                child_release_fixture_apply(
+                    repo.as_ref(),
+                    key,
+                    Command::Terminate(TerminateRequest {
+                        reason: "fan-out fixture cleanup".into(),
+                        details: None,
+                        identity: "fixture".into(),
+                        links: Vec::new(),
+                        now: OffsetDateTime::now_utc(),
+                        request: RequestContext {
+                            request_id: RequestId(format!("fan-out-cleanup:{}", key.0)),
+                            ..RequestContext::unattributed(OffsetDateTime::now_utc())
+                        },
+                    }),
+                )
+                .await?;
+            }
+        }
+        // Closing children creates result intents that pin the parent. Retire only
+        // this fixture's intents, across every home, after all runs have closed.
+        for id in homes {
+            let mut after = None;
+            loop {
+                let page = repo
+                    .read_intent_page(id, tokeira_storage::ScanBound::Capture, after, 100)
+                    .await?;
+                if page.rows.is_empty() {
+                    break;
+                }
+                after = page.rows.last().map(|row| row.key);
+                for row in page
+                    .rows
+                    .into_iter()
+                    .filter(|row| keys.iter().any(|(key, _)| *key == row.key.source_run))
+                {
+                    repo.retire_intent(
+                        tokeira_storage::IntentRetirement {
+                            key: row.key,
+                            outcome: tokeira_storage::DefinitiveOutcome::Absent,
+                        },
+                        WriteFence::Unfenced,
+                    )
+                    .await?;
+                }
+            }
+        }
+        for (key, home) in keys {
+            purge_contract_runs(repo.as_ref(), &log, &[key], home).await?;
+        }
+        Ok(())
+    }
+    .await;
+    let closed = director.shutdown().await;
+    let result = finish_cleanup(result, stopped.map_err(Into::into), "runtime shutdown");
+    let result = finish_cleanup(result, cleanup, "fixture cleanup");
+    finish_cleanup(result, closed, "connection shutdown")
 }
 
 #[derive(Clone, Copy, Debug)]

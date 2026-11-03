@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use std::{
     ops::Deref,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
 };
@@ -36,6 +36,7 @@ pub(super) struct Repository {
     pub(super) hold_child_releases: AtomicBool,
     pub(super) reconcile_calls: AtomicUsize,
     pub(super) source_transition_before_outcome: Mutex<Option<Transition>>,
+    pub(super) outbound_committed: Arc<tokio::sync::Notify>,
 }
 
 impl Deref for Repository {
@@ -250,6 +251,7 @@ impl RunRepository for Repository {
             .inner
             .commit_outbound_transition(run, transition, guard, source_fence, fence)
             .await?;
+        self.outbound_committed.notify_one();
         if bit != 0 && self.lose_outbound_reply.fetch_and(!bit, Ordering::SeqCst) & bit != 0 {
             bail!("injected lost outbound commit reply");
         }

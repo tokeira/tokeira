@@ -11,7 +11,10 @@ use crate::{
 use proptest::prelude::*;
 use tokeira_storage::{InMemoryStore, WorkflowDiscoveryRange, WorkflowDispatchRouting, WriteFence};
 
-fn runtime(store: Arc<InMemoryStore>, _home: QueueHome) -> TokeiraRuntime<InMemoryStore> {
+pub(super) fn runtime(
+    store: Arc<InMemoryStore>,
+    _home: QueueHome,
+) -> TokeiraRuntime<InMemoryStore> {
     let runtime = TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
         store,
         1,
@@ -122,7 +125,7 @@ async fn sticky_poll_without_normal_name_never_registers_periodic_discovery() {
     stop(&runtime).await;
 }
 
-async fn stop(runtime: &TokeiraRuntime<InMemoryStore>) {
+pub(super) async fn stop(runtime: &TokeiraRuntime<InMemoryStore>) {
     runtime.runtime_shutdown.begin_shutdown();
     runtime
         .runtime_shutdown

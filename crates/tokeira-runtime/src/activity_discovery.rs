@@ -200,6 +200,8 @@ struct RegistryState {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ActivityDiscoveryRegistry {
+    #[cfg(test)]
+    pub(crate) test_gate: Arc<crate::discovery::test_gate::TestPassGate>,
     state: Arc<Mutex<RegistryState>>,
     pub(crate) wake: Arc<Notify>,
 }
@@ -384,6 +386,10 @@ impl ActivityDiscoveryRegistry {
         now: Instant,
         cutoff: OffsetDateTime,
     ) -> Option<(RangeKey, QueueHome, ActivityPass)> {
+        #[cfg(test)]
+        if self.test_gate.is_held() {
+            return None;
+        }
         let mut state = self.state.lock().expect("activity discovery lock poisoned");
         let key = state
             .ranges
@@ -439,6 +445,10 @@ impl ActivityDiscoveryRegistry {
             } else {
                 now + DISCOVERY_PERIOD
             };
+        }
+        #[cfg(test)]
+        if outcome == SliceOutcome::Complete {
+            self.test_gate.completed();
         }
     }
 

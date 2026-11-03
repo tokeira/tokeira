@@ -99,10 +99,10 @@ struct QueueSamplerState {
 
 /// Periodic producer of durable advisory queue snapshots.
 ///
-/// Workflow and activity backlog combines disposable ready state with the disjoint
-/// durable backlog. Nexus uses live ready state and the maximum of that count and
-/// reconstructible authoritative pending deliveries, avoiding obvious double counting
-/// while remaining conservative after broker loss.
+/// Workflow and activity backlog combines volatile ready state with durable dispatch
+/// intent. Retained offers count only through that intent. Nexus uses live ready state
+/// and the maximum of that count and reconstructible authoritative pending deliveries,
+/// avoiding obvious double counting while remaining conservative after broker loss.
 pub struct WorkerComputeQueueSampler<R> {
     run_repository: Arc<R>,
     sample_repository: Arc<dyn WorkerComputeRepository>,
@@ -176,31 +176,6 @@ where
                 .or_insert(count);
         }
 
-        for queue in self
-            .run_repository
-            .list_versioned_backlog_queue_keys()
-            .await?
-        {
-            if queue.task_kind == TaskKind::Workflow {
-                continue;
-            }
-            let Some(key) = sample_key_from_queue(&queue) else {
-                continue;
-            };
-            let durable_count = self
-                .run_repository
-                .backlog_stats_by_priority(&queue)
-                .await?
-                .values()
-                .fold(0_u64, |total, band| {
-                    total.saturating_add(u64::try_from(band.count).unwrap_or(u64::MAX))
-                });
-            backlog
-                .entry(key)
-                .and_modify(|current| *current = current.saturating_add(durable_count))
-                .or_insert(durable_count);
-        }
-
         let mut nexus_live = self.nexus_broker.versioned_backlog_counts().await;
         let mut nexus_reconstructed = BTreeMap::<WorkerComputeQueueKey, u64>::new();
         // Only recovery candidates can hold reconstructible deliveries (open
@@ -220,7 +195,31 @@ where
                     repo: self.run_repository.clone(),
                     registry: self.deployment_registry.clone(),
                 };
+                let registry = self
+                    .deployment_registry
+                    .read()
+                    .expect("deployment registry lock poisoned")
+                    .clone();
                 for state in &page.states {
+                    // Every pending activity is a recovery candidate. Derive here
+                    // so each due row counts once at its execution owner, even
+                    // without poll demand or after its offer has been handed out.
+                    for row in tokeira_storage::derive_activity_dispatch(state, *shard_id)?
+                        .into_values()
+                        .filter(|row| row.dispatch_at <= now)
+                    {
+                        let (queue, _) = crate::runtime::workflow_task::route_activity_task_queue(
+                            registry.as_ref(),
+                            state,
+                            row.queue,
+                            row.dispatch_revision,
+                        )
+                        .await?;
+                        if let Some(key) = sample_key_from_queue(&queue) {
+                            *backlog.entry(key).or_default() += 1;
+                        }
+                    }
+
                     if let Some(row) = tokeira_storage::derive_workflow_dispatch(state, *shard_id)
                         && !row.sticky
                         && let Some(task) = source.resolve(&row).await?

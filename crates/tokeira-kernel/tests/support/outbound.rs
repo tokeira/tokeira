@@ -157,6 +157,79 @@ proptest! {
 
     // Feature: outbound-dispatch-recovery, Property 6: Child start precedes execution exactly once.
     #[test]
+    fn cancel_opens_child_gate_with_held_signals(
+        delay_seconds in 0i64..60, signal_count in 1usize..4, stale_field in 0u8..4,
+    ) {
+        let now = fixed_now();
+        let parent = RunKey::new();
+        let mut start = advice_start_request(now, None);
+        start.parent_run_key = Some(parent);
+        start.parent_run_id = Some(RunId::new());
+        start.parent_workflow_id = Some(WorkflowId("parent".into()));
+        start.parent_namespace_id = Some(start.namespace_id);
+        start.parent_initiated_event_id = 17;
+        start.workflow_start_delay = (delay_seconds > 0).then(|| Duration::seconds(delay_seconds));
+        let child_id = start.run_id;
+        let mut state = BasicKernel.apply(LoadedRun::Absent, Command::Start(start))
+            .unwrap().next_state;
+        for index in 0..signal_count {
+            let signaled = BasicKernel.apply(LoadedRun::Existing(state),
+                Command::Signal(SignalRequest {
+                    signal_name: "held".into(), input: Payloads::default(), header: None,
+                    links: Vec::new(), request: RequestContext {
+                        request_id: RequestId(format!("signal-{index}")),
+                        ..RequestContext::unattributed(now)
+                    }, now,
+                })).unwrap();
+            prop_assert!(signaled.next_state.pending_workflow_task.is_none());
+            prop_assert!(signaled.dispatch_ops.is_empty());
+            state = signaled.next_state;
+        }
+        let timers = state.timers.clone();
+        let cancel = CancelRequest {
+            reason: "cancel gated child".into(), external_initiator: None,
+            external_initiated_event_id: 0, links: Vec::new(),
+            request: RequestContext::unattributed(now), now,
+        };
+        let mut paused = state.clone();
+        paused.status = ExecutionStatus::Paused;
+        let paused = BasicKernel.apply(LoadedRun::Existing(paused),
+            Command::Cancel(cancel.clone())).unwrap();
+        prop_assert!(paused.next_state.pending_workflow_task.is_none());
+        prop_assert!(!paused.next_state.outbound.unwrap().child_gate.unwrap().released);
+        let canceled = BasicKernel.apply(LoadedRun::Existing(state), Command::Cancel(cancel))
+            .unwrap();
+        prop_assert!(canceled.next_state.cancel_requested);
+        prop_assert!(canceled.next_state.pending_workflow_task.is_some(),
+            "cancel must schedule the gated child's first task");
+        prop_assert!(canceled.next_state.outbound.as_ref().unwrap()
+            .child_gate.as_ref().unwrap().released);
+        prop_assert_eq!(&canceled.next_state.timers, &timers);
+        prop_assert_eq!(canceled.history_events.iter().filter(|event| matches!(event.kind,
+            HistoryEventKind::WorkflowExecutionCancelRequested { .. })).count(), 1);
+        prop_assert_eq!(canceled.history_events.iter().filter(|event| matches!(event.kind,
+            HistoryEventKind::WorkflowTaskScheduled { .. })).count(), 1);
+        let release = tokeira_kernel::ParentChildStartRecordedRequest {
+            parent_run_key: parent, initiating_event: 17, first_child_run_id: child_id,
+            parent_started_event_id: 22, now,
+        };
+        let again = BasicKernel.apply(LoadedRun::Existing(canceled.next_state.clone()),
+            Command::ParentChildStartRecorded(release.clone())).unwrap();
+        prop_assert!(again.is_noop());
+        prop_assert_eq!(&again.next_state, &canceled.next_state);
+        let mut stale = release;
+        match stale_field {
+            0 => stale.parent_run_key = RunKey::new(),
+            1 => stale.initiating_event += 1,
+            2 => stale.first_child_run_id = RunId::new(),
+            _ => stale.parent_started_event_id = 0,
+        }
+        prop_assert_eq!(BasicKernel.apply(LoadedRun::Existing(canceled.next_state),
+            Command::ParentChildStartRecorded(stale)), Err(Reject::StaleChildRelease));
+    }
+
+    // Feature: outbound-dispatch-recovery, Property 6: Child start precedes execution exactly once.
+    #[test]
     fn parent_confirmation_gates_signals_and_original_delay(
         delay_seconds in 0i64..60, elapsed_seconds in 0i64..120, signal_count in 0usize..4,
     ) {

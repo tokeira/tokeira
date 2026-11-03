@@ -10,7 +10,7 @@ approval remain. See the executed gate results and named corpus outcomes below.
 
 | Path | Implementation | Recovery/preservation evidence |
 |---|---|---|
-| Child start and release | [child executor](../../crates/tokeira-runtime/src/publisher/outbound/child.rs), [kernel metadata](../../crates/tokeira-kernel/src/outbound.rs) | Persisted seed and accepted policy, original acquisition, gated first task; generated lost creation/confirmation/release reply and duplicate-confirmation checks |
+| Child start and release | [child executor](../../crates/tokeira-runtime/src/publisher/outbound/child.rs), [kernel metadata](../../crates/tokeira-kernel/src/outbound.rs) | Persisted seed and accepted policy, original acquisition, gated first task; generated lost creation/confirmation/release reply and duplicate-confirmation checks; a release owed at close is a close intent that survives the parent's deletion, and a cancel request opens a gated child, with generated close, deletion and restart checks |
 | External signal/cancel | [external executor](../../crates/tokeira-runtime/src/publisher/outbound/external.rs) | Original initiation payload/request ID, target provenance and typed terminal outcomes; generated publication-loss and duplicate-delivery checks |
 | Nexus start/cancel | [Nexus executor](../../crates/tokeira-runtime/src/publisher/outbound/nexus.rs), [tracking](../../crates/tokeira-runtime/src/nexus.rs) | Untimed first attempts, persisted backoff and cancellation phase, stale worker outcomes; generated missing-publication and phase fencing checks |
 | Completion callbacks | [publisher and scanner](../../crates/tokeira-runtime/src/publisher.rs) | One shared admission authority, original acquisition, shutdown ownership and metadata CAS retry; 10 focused callback tests pass, including 100 generated payload/deadline cases |
@@ -96,6 +96,7 @@ supplements the 100-case memory/model properties; it does not replace their case
 | `dsql::run_repository::outbound_live_tests::outbound_live_future_child_result_retains_deleted_parent` | Pass |
 | `dsql::run_repository::outbound_live_tests::outbound_live_interrupted_large_legacy_cutover` | Pass |
 | `dsql::run_repository::outbound_live_tests::outbound_live_original_fences_and_retained_destination_proof` | Pass |
+| `dsql::run_repository::outbound_live_tests::outbound_live_owed_release_survives_parent_deletion` | Pass |
 | `dsql::run_repository::outbound_live_tests::outbound_live_reset_conflict_preserves_all_participants` | Pass |
 | `dsql::run_repository::outbound_live_tests::outbound_live_successor_reservation_and_interrupted_publication` | Pass |
 

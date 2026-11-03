@@ -61,6 +61,7 @@ fn decode_descriptor(row: &PgRow) -> Result<IntentDescriptor> {
         1 => IntentKind::ParentClose,
         2 => IntentKind::ChildResult,
         3 => IntentKind::Successor,
+        4 => IntentKind::ChildRelease,
         kind => bail!("unknown outbound intent kind {kind}"),
     };
     let ordinal = storage_id
@@ -546,6 +547,7 @@ pub(super) async fn load_intent(
         IntentPayload::ParentClose { .. } => IntentKind::ParentClose,
         IntentPayload::ChildResult { .. } => IntentKind::ChildResult,
         IntentPayload::Successor { .. } => IntentKind::Successor,
+        IntentPayload::ChildRelease { .. } => IntentKind::ChildRelease,
     };
     anyhow::ensure!(
         key == descriptor.key && key.kind == expected_kind,

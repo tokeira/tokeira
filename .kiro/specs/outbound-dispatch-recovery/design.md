@@ -78,7 +78,8 @@ for the relevant incarnation/attempt.
 | Kind | Incarnation and dedupe identity | Discoverer / executor | Remover | Retry authority |
 |---|---|---|---|---|
 | Child start | Parent run + initiated event; stable prepared child run/request ID | Parent home / outbound executor | Parent failure or transition advancing to release phase | Executor's bounded attempt backoff; pending state remains durable |
-| Child first-task release | Same initiation + confirmed child run | Parent home, including a closed ABANDON parent / outbound executor | Runtime source transition recording verified child release or obsolescence | Executor |
+| Child first-task release | Same initiation + confirmed child run | Open parent's home / outbound executor | Runtime source transition recording verified child release or obsolescence | Executor |
+| Child first-task release owed at close | Source close sequence + child initiation/first run | Closed parent's home, including after its deletion / intent executor | Executor after the child's verified release, closure or absence | Executor |
 | External signal/cancel | Source run + kind + initiated event; existing stable request ID | Source home / outbound executor | Source resolution or authoritative cancellation of the obligation | Executor |
 | Nexus start | Source run + scheduled event + durable attempt generation | Source home / Nexus adapter | Outcome/retry/timeout transition | Existing persisted Nexus attempt/deadline state |
 | Nexus cancel | Scheduled event + cancellation-request event + attempt generation | Source home / Nexus adapter | Cancellation-attempt outcome or operation termination | Existing persisted cancellation state |
@@ -121,11 +122,12 @@ silently interpreted as ALLOW_DUPLICATE during recovery.
 | `OperationKey { source_run, kind, initiating_event }` | Committed initiation/schedule; `kind` distinguishes signal, cancel, start and release slots |
 | `OperationIncarnation { key, requested_event, attempt }` | Cancellation-request identity and recorded Nexus generation; zero/absent only where that kind has no such dimension |
 | `ChildStartSeed { child_run_id, request_id, prepared_at, parent_namespace_name, root_identity, effective_priority, versioning_info }` | Runtime-selected values committed before any target start; static start fields remain in initiation history |
-| `ChildReleaseState { initiating_event, child_run_id, parent_started_event_id, parent_close_policy }` | Parent start confirmation; survives parent close only when release remains owed |
-| `ChildStartGate { parent_identity, initiating_event, first_child_run_id, released }` | Child creation and verified parent confirmation; prevents premature first-task eligibility |
+| `ChildReleaseState { initiating_event, child_run_id, parent_started_event_id, parent_close_policy }` | Parent start confirmation; survives parent close only when release remains owed, as the snapshot its close intent is authored from |
+| `ChildStartGate { parent_identity, initiating_event, first_child_run_id, released }` | Child creation, then verified parent confirmation or a cancel request; prevents premature first-task eligibility |
 | `ChildOutcomeIdentity { parent_initiated_event, child_first_run, child_final_run }` | Fences `ChildResolved` and prevents workflow-ID reuse from resolving a different child |
 | `OutboundOrigin { source_run, operation_key, incarnation }` | Internal destination submission provenance; stored with request dedupe evidence and used to retain it while a source still needs confirmation |
 | `IntentKey { source_run, close_seq, kind, ordinal }` | Stable deterministic ordering of obligations authored by one close; `ordinal` follows sorted child/operation identity |
+| `IntentPayload::ChildRelease` | `ChildReleaseState` for an owed ABANDON release at close; targets the child's namespace/workflow for retention |
 | `IntentPayload::ParentClose` | Target namespace/workflow, parent identity, initiation, first child run, policy and reason; excludes ABANDON |
 | `IntentPayload::ChildResult` | Parent/child lineage and immutable terminal-event reference; preserves result, failure, retry-state and cancellation details |
 | `IntentPayload::Successor` | Versioned frozen `StartRequest`, predecessor identity and expected pointer; preserves PR 340's separate frozen clocks |
@@ -312,15 +314,26 @@ file; it neither generates credentials nor reads them into logs.
    different child ID or initiation is stale. Advance the derived operation to
    first-task release, retaining the seed/confirmation proof.
 5. The child receives a fact-bearing `ParentChildStartRecorded` transition after runtime
-   verification of the parent started event. It removes its gate and schedules the
+   verification of the parent started event. It opens its gate and schedules the
    first task, or leaves the original cron/start-delay deadline in control. An already
    elapsed delay schedules immediately; recovery does not restart delay or timeout
    clocks. This command records an observed relationship, not a request to do I/O.
 6. A source runtime transition records verified release and removes the pending release
    metadata/row. Losing this final reply merely repeats an idempotent child transition.
 
-A closed unconfirmed parent stops further starts. A confirmed ABANDON child retains
-release work after parent close; other policies hand control to the close intent.
+A closed unconfirmed parent stops further starts. An owed confirmed ABANDON release
+becomes a close intent, so it survives parent deletion; other policies hand control to
+the parent-close intent. Reset termination suppresses these release intents under the
+same condition as parent-close intents; the reset run restores its verified releases.
+The closed parent's release map stays only as the snapshot its intents were authored from,
+and no longer marks the run for recovery.
+A cancel request opens a gated child when it schedules a task (none pending, not paused),
+as `service/history/api/requestcancelworkflow/api.go:82-86`,
+`service/history/api/update_workflow_util.go:80-90`, and
+`service/history/api/scheduleworkflowtask/api.go:40-44 @ v1.31.0` specify. Signals and
+queries remain held. Cancellation leaves the original delay timer unchanged.
+An open child still retains its parent's history for a future result; retiring the release
+intent alone does not permit physical purge until that separate obligation settles.
 The parent transition preserves the necessary confirmation data before clearing its
 ordinary children map. A materialized but unconfirmed child never becomes runnable
 just because the source lookup failed. If the parent is definitively obsolete, the
@@ -565,10 +578,13 @@ fields, and an unrelated duplicate SHALL never prove success.
 ### Property 6: Child start precedes execution exactly once
 
 For any crash cut in child creation/confirmation/release and parent close-policy race,
-the child SHALL become runnable only under the targeted parent-confirmation rule; the
-parent SHALL record at most one start outcome; every still-owed release SHALL recover.
+the child SHALL become runnable only under the targeted parent-confirmation rule or when
+a cancel request schedules its first task; the parent SHALL record at most one start
+outcome; every still-owed release SHALL recover, including an ABANDON release after its
+parent's close and deletion. A matching release after a cancel request SHALL be a no-op,
+and a stale release SHALL reject.
 
-**Validates: Requirements 3.4, 3.5, 3.6, 3.7, 3.8, 3.9.**
+**Validates: Requirements 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 6.1.**
 
 ### Property 7: External delivery records only definitive outcomes
 

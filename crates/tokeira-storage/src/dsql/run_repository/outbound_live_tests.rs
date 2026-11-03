@@ -281,6 +281,95 @@ async fn outbound_live_future_child_result_retains_deleted_parent() -> Result<()
     Ok(())
 }
 
+// Feature: outbound-dispatch-recovery, Property 19: Retention cannot erase outstanding proof.
+#[tokio::test]
+async fn outbound_live_owed_release_survives_parent_deletion() -> Result<()> {
+    let Some(fixture) = Fixture::connect().await? else {
+        return Ok(());
+    };
+    let repo = fixture.store.run_repository();
+    let mut initial = fresh_transition(RunKey::new());
+    let release = tokeira_kernel::ChildReleaseState {
+        namespace_id: initial.next_state.namespace_id,
+        workflow_id: WorkflowId(format!("owed-child-{}", initial.next_state.run_key.0)),
+        initiating_event: 4,
+        child_run_id: RunId::new(),
+        parent_started_event_id: Some(5),
+        parent_close_policy: tokeira_kernel::ParentClosePolicy::Abandon,
+    };
+    initial
+        .next_state
+        .outbound
+        .as_mut()
+        .unwrap()
+        .child_releases
+        .insert(release.initiating_event, release.clone());
+    let parent = applied(
+        repo.commit_transition(initial.next_state.run_key, initial, WriteFence::Unfenced)
+            .await?,
+    );
+    let parent = applied(
+        repo.commit_transition(parent.run_key, close(&parent), WriteFence::Unfenced)
+            .await?,
+    );
+    let intents: Vec<_> = repo
+        .read_intent_page(ShardId(0), ScanBound::Capture, None, 100)
+        .await?
+        .rows
+        .into_iter()
+        .filter(|row| row.key.source_run == parent.run_key)
+        .collect();
+    assert_eq!(intents.len(), 1);
+    let key = intents[0].key;
+    assert_eq!(key.kind, IntentKind::ChildRelease);
+    assert_eq!(
+        repo.load_intent(key).await?.unwrap().payload,
+        crate::IntentPayload::ChildRelease { release }
+    );
+    assert!(
+        repo.read_operation_page(
+            ShardId(0),
+            OperationKind::ChildRelease,
+            ScanBound::Capture,
+            None,
+            100
+        )
+        .await?
+        .rows
+        .iter()
+        .all(|row| row.incarnation.key.source_run != parent.run_key)
+    );
+    delete_and_purge(repo, &parent).await?;
+    assert_eq!(
+        repo.load_outbound_source(parent.run_key).await?,
+        LoadedRun::Existing(parent.clone())
+    );
+    assert!(
+        repo.read_intent_page(ShardId(0), ScanBound::Capture, None, 100)
+            .await?
+            .rows
+            .iter()
+            .any(|row| row.key == key)
+    );
+    assert!(
+        repo.retire_intent(
+            IntentRetirement {
+                key,
+                outcome: DefinitiveOutcome::Absent,
+            },
+            WriteFence::Unfenced
+        )
+        .await?
+    );
+    repo.purge_run(parent.run_key).await?;
+    assert_eq!(
+        repo.load_outbound_source(parent.run_key).await?,
+        LoadedRun::Absent
+    );
+    fixture.store.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn outbound_live_successor_reservation_and_interrupted_publication() -> Result<()> {
     let Some(fixture) = Fixture::connect().await? else {

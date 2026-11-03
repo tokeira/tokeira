@@ -330,6 +330,22 @@ impl Fixture {
     }
 
     async fn create_confirmed_child_with_policy(&mut self, policy: ParentClosePolicy) {
+        let proof = self.create_confirmed_child_with_owed_release(policy).await;
+        applied(
+            self.lane
+                .submit(
+                    self.target.run_key,
+                    Command::ParentChildStartRecorded(proof),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+
+    async fn create_confirmed_child_with_owed_release(
+        &mut self,
+        policy: ParentClosePolicy,
+    ) -> tokeira_kernel::ParentChildStartRecordedRequest {
         let mut command = self.child_command(Vec::new());
         if let WorkflowCommand::StartChildWorkflow {
             parent_close_policy,
@@ -369,23 +385,13 @@ impl Fixture {
                 .unwrap(),
         );
         let proof = &confirmed.outbound.as_ref().unwrap().child_releases[&child.initiated_event_id];
-        applied(
-            self.lane
-                .submit(
-                    self.target.run_key,
-                    Command::ParentChildStartRecorded(
-                        tokeira_kernel::ParentChildStartRecordedRequest {
-                            parent_run_key: self.source.run_key,
-                            initiating_event: child.initiated_event_id,
-                            first_child_run_id: self.target.run_id,
-                            parent_started_event_id: proof.parent_started_event_id.unwrap(),
-                            now: self.source.now,
-                        },
-                    ),
-                )
-                .await
-                .unwrap(),
-        );
+        tokeira_kernel::ParentChildStartRecordedRequest {
+            parent_run_key: self.source.run_key,
+            initiating_event: child.initiated_event_id,
+            first_child_run_id: self.target.run_id,
+            parent_started_event_id: proof.parent_started_event_id.unwrap(),
+            now: self.source.now,
+        }
     }
 }
 
@@ -738,6 +744,145 @@ fn check_refused_reset_leaves_all_participants_unchanged(
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
+
+    // Feature: outbound-dispatch-recovery, Property 20: End-to-end crash refinement.
+    #[test]
+    fn request_cancel_releases_child_after_parent_close(seed in any::<u64>()) {
+        executor().block_on(async {
+            let mut fixture = Fixture::new(seed).await;
+            fixture.create_confirmed_child_with_owed_release(ParentClosePolicy::RequestCancel)
+                .await;
+            fixture.complete(&fixture.source, vec![WorkflowCommand::CompleteWorkflow {
+                result: Payloads::default(),
+            }]).await;
+            let runtime = fixture.restart().await;
+            let child = state(&fixture.repo, fixture.target.run_key).await;
+            prop_assert!(child.cancel_requested);
+            prop_assert!(child.pending_workflow_task.is_some(),
+                "parent close cancellation must schedule the child's first task");
+            prop_assert!(child.outbound.unwrap().child_gate.unwrap().released);
+            prop_assert!(fixture.repo.read_history(child.run_key, 0, 100).await.unwrap()
+                .iter().any(|event| matches!(event.kind,
+                    HistoryEventKind::WorkflowExecutionCancelRequested { .. })), "cancel history");
+            prop_assert!(fixture.repo.read_intent_page(ShardId(0),
+                tokeira_storage::ScanBound::Capture, None, 100).await.unwrap().rows.is_empty());
+            let shutdown = runtime.shutdown_handle();
+            shutdown.begin_shutdown();
+            drop(runtime);
+            shutdown.wait(std::time::Instant::now() + std::time::Duration::from_secs(5))
+                .await.unwrap();
+            Ok(())
+        })?;
+    }
+
+    // Feature: outbound-dispatch-recovery, Property 20: End-to-end crash refinement.
+    #[test]
+    fn release_intent_after_cancel_retires(seed in any::<u64>()) {
+        executor().block_on(async {
+            let mut fixture = Fixture::new(seed).await;
+            fixture.repo.hold_child_releases.store(true, Ordering::SeqCst);
+            fixture.create_confirmed_child_with_owed_release(ParentClosePolicy::Abandon).await;
+            let canceled = applied(fixture.lane.submit(fixture.target.run_key,
+                Command::Cancel(tokeira_kernel::CancelRequest {
+                    reason: "client cancels before parent close".into(), external_initiator: None,
+                    external_initiated_event_id: 0, links: Vec::new(),
+                    request: RequestContext::unattributed(fixture.target.now),
+                    now: fixture.target.now,
+                })).await.unwrap());
+            prop_assert!(canceled.cancel_requested);
+            prop_assert!(canceled.pending_workflow_task.is_some());
+            prop_assert!(canceled.outbound.unwrap().child_gate.unwrap().released);
+            fixture.complete(&fixture.source, vec![WorkflowCommand::CompleteWorkflow {
+                result: Payloads::default(),
+            }]).await;
+            let intents = fixture.repo.read_intent_page(ShardId(0),
+                tokeira_storage::ScanBound::Capture, None, 100).await.unwrap().rows;
+            prop_assert_eq!(intents.len(), 1);
+            let key = intents[0].key;
+            prop_assert_eq!(key.source_run, fixture.source.run_key);
+            prop_assert_eq!(key.kind, tokeira_storage::IntentKind::ChildRelease);
+            fixture.repo.hold_child_releases.store(false, Ordering::SeqCst);
+            let runtime = fixture.restart().await;
+            prop_assert!(fixture.repo.load_intent(key).await.unwrap().is_none(),
+                "a no-op child release must still retire its intent");
+            prop_assert!(fixture.repo.read_intent_page(ShardId(0),
+                tokeira_storage::ScanBound::Capture, None, 100).await.unwrap().rows.is_empty());
+            let history = fixture.repo.read_history(fixture.target.run_key, 0, 100).await.unwrap();
+            prop_assert_eq!(history.iter().filter(|event| matches!(event.kind,
+                HistoryEventKind::WorkflowTaskScheduled { .. })).count(), 1);
+            let shutdown = runtime.shutdown_handle();
+            shutdown.begin_shutdown();
+            drop(runtime);
+            shutdown.wait(std::time::Instant::now() + std::time::Duration::from_secs(5))
+                .await.unwrap();
+            Ok(())
+        })?;
+    }
+
+    // Feature: outbound-dispatch-recovery, Property 20: End-to-end crash refinement.
+    #[test]
+    fn abandon_release_survives_parent_deletion(seed in any::<u64>(), open in any::<bool>()) {
+        executor().block_on(async {
+            let mut fixture = Fixture::new(seed).await;
+            fixture.create_confirmed_child_with_owed_release(ParentClosePolicy::Abandon).await;
+            if !open {
+                fixture.complete(&fixture.source, vec![WorkflowCommand::CompleteWorkflow {
+                    result: Payloads::default(),
+                }]).await;
+            }
+            fixture.repo.hold_child_releases.store(true, Ordering::SeqCst);
+            let deleting = fixture.restart().await;
+            deleting.delete_workflow(fixture.source.run_key, crate::DeleteWorkflowRequest {
+                request: RequestContext::unattributed(fixture.source.now),
+                now: fixture.source.now, purge_inline: true,
+            }).await.unwrap();
+            let shutdown = deleting.shutdown_handle();
+            shutdown.begin_shutdown();
+            drop(deleting);
+            shutdown.wait(std::time::Instant::now() + std::time::Duration::from_secs(5))
+                .await.unwrap();
+            prop_assert!(!state(&fixture.repo, fixture.target.run_key).await
+                .outbound.unwrap().child_gate.unwrap().released);
+            let retained = fixture.repo.load_outbound_source(fixture.source.run_key)
+                .await.unwrap();
+            fixture.repo.hold_child_releases.store(false, Ordering::SeqCst);
+            let runtime = fixture.restart().await;
+            let child = state(&fixture.repo, fixture.target.run_key).await;
+            prop_assert!(child.pending_workflow_task.is_some(),
+                "deletion must preserve the child's owed first-task release");
+            prop_assert!(child.outbound.unwrap().child_gate.unwrap().released);
+            prop_assert!(fixture.repo.read_intent_page(ShardId(0),
+                tokeira_storage::ScanBound::Capture, None, 100).await.unwrap().rows.is_empty());
+            fixture.repo.purge_run(fixture.source.run_key).await.unwrap();
+            prop_assert_eq!(fixture.repo.load_outbound_source(fixture.source.run_key)
+                .await.unwrap(), retained);
+            let shutdown = runtime.shutdown_handle();
+            shutdown.begin_shutdown();
+            drop(runtime);
+            shutdown.wait(std::time::Instant::now() + std::time::Duration::from_secs(5))
+                .await.unwrap();
+            let closed = tokeira_kernel::Kernel::apply(&BasicKernel,
+                fixture.repo.load_run(fixture.target.run_key).await.unwrap(),
+                Command::Terminate(tokeira_kernel::TerminateRequest {
+                    reason: "settle future child result".into(), details: None,
+                    identity: "fixture".into(), links: Vec::new(),
+                    request: RequestContext::unattributed(fixture.target.now),
+                    now: fixture.target.now,
+                })).unwrap();
+            applied(fixture.repo.commit_transition(fixture.target.run_key, closed,
+                tokeira_storage::WriteFence::Unfenced).await.unwrap());
+            let runtime = fixture.restart().await;
+            fixture.repo.purge_run(fixture.source.run_key).await.unwrap();
+            prop_assert_eq!(fixture.repo.load_outbound_source(fixture.source.run_key)
+                .await.unwrap(), LoadedRun::Absent);
+            let shutdown = runtime.shutdown_handle();
+            shutdown.begin_shutdown();
+            drop(runtime);
+            shutdown.wait(std::time::Instant::now() + std::time::Duration::from_secs(5))
+                .await.unwrap();
+            Ok(())
+        })?;
+    }
 
     // Feature: outbound-dispatch-recovery, Property 9: Callback recovery preservation.
     #[test]

@@ -37,6 +37,9 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
             IntentPayload::ParentClose { .. } => {
                 self.deliver_parent_close(&intent, &attempt, owner).await?
             }
+            IntentPayload::ChildRelease { .. } => {
+                self.deliver_child_release(&intent, &attempt, owner).await?
+            }
             IntentPayload::ChildResult { .. } => {
                 self.deliver_child_result(&intent, &attempt, owner).await?
             }
@@ -55,6 +58,76 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
             )
             .await?;
         Ok(())
+    }
+
+    async fn deliver_child_release(
+        &self,
+        intent: &IntentRow,
+        attempt: &Attempt,
+        owner: &Arc<RwLock<ShardOwner>>,
+    ) -> Result<DefinitiveOutcome> {
+        let IntentPayload::ChildRelease { release } = &intent.payload else {
+            unreachable!("kind checked");
+        };
+        let LoadedRun::Existing(source) = self
+            .repo
+            .load_outbound_source(intent.key.source_run)
+            .await?
+        else {
+            return Err(RecoveryError::InvalidIdentity {
+                run: intent.key.source_run,
+                detail: "child release source unavailable while intent remains",
+            }
+            .into());
+        };
+        ensure!(
+            !source.is_open(),
+            "child release intent source is still open"
+        );
+        let target = RunKey::derive(
+            release.namespace_id,
+            &release.workflow_id,
+            release.child_run_id,
+        );
+        let LoadedRun::Existing(child) = self.repo.load_outbound_source(target).await? else {
+            return Ok(DefinitiveOutcome::Absent);
+        };
+        if !child.is_open() {
+            return Ok(DefinitiveOutcome::Absent);
+        }
+        if !self.child_release_matches(&source, &child, release).await? {
+            return Ok(DefinitiveOutcome::Obsolete);
+        }
+        attempt.validate(owner)?;
+        let result = self
+            .destination(
+                target,
+                (release.namespace_id, &release.workflow_id),
+                crate::DeliveryPhase::ChildRelease,
+                DeliveryGuard::Intent(intent.key),
+                attempt,
+                owner,
+            )
+            .await?;
+        if let CommitResult::Applied { new_state } = result {
+            if !new_state.is_open() {
+                return Ok(DefinitiveOutcome::Absent);
+            }
+            if self
+                .child_release_matches(&source, &new_state, release)
+                .await?
+                && new_state
+                    .outbound
+                    .as_ref()
+                    .and_then(|outbound| outbound.child_gate.as_ref())
+                    .is_some_and(|gate| gate.released)
+            {
+                // This includes an idempotent release after cancellation. Only
+                // retire the intent; the closed source snapshot is immutable.
+                return Ok(applied(&new_state));
+            }
+        }
+        anyhow::bail!("child release target outcome requires rediscovery")
     }
 
     async fn deliver_parent_close(

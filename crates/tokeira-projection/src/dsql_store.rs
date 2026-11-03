@@ -10,13 +10,13 @@ use std::{collections::BTreeSet, sync::Arc, time::Instant};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use sqlx::{
-    AssertSqlSafe, Connection, PgConnection, Postgres, Row,
+    AssertSqlSafe, PgConnection, Postgres, Row,
     postgres::{PgArguments, PgRow},
     query::Query,
 };
 use tokeira_storage::{
     ConnectionDirector, DbClass, ProjectionRecord,
-    dsql::{DsqlConnectionDirector, codec, value_parts},
+    dsql::{DsqlConnectionDirector, DsqlPermit, codec, value_parts},
     metrics as storage_metrics,
 };
 use tokeira_types::{
@@ -88,6 +88,10 @@ mod memo_read_pause;
 #[cfg(all(test, feature = "dsql-integration"))]
 #[path = "dsql_large_value_tests.rs"]
 mod large_value_tests;
+
+#[cfg(all(test, feature = "dsql-integration"))]
+#[path = "dsql_transaction_start_tests.rs"]
+mod transaction_start_tests;
 
 #[path = "dsql_memo_parts.rs"]
 mod memo_parts;
@@ -342,7 +346,7 @@ impl DsqlVisibilityStore {
         version: Version,
     ) -> Result<Option<SingleAttempt>> {
         let mut permit = self.director.acquire(DbClass::Projection).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let (previous, previous_parts) = Self::read_stored_row(&mut tx, row).await?;
         if !visibility_version_is_newer(
             previous.as_ref(),
@@ -417,7 +421,7 @@ impl DsqlVisibilityStore {
         #[cfg(all(test, feature = "dsql-integration"))]
         apply_faults::fire(apply_faults::Fault::CellBatch(row.run_key))?;
         let mut permit = self.director.acquire(DbClass::Projection).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let started = Instant::now();
         insert_cells(&mut tx, row.namespace_id, row.run_key, version, cells).await?;
         storage_metrics::record_dsql_statement_duration(
@@ -440,7 +444,7 @@ impl DsqlVisibilityStore {
         version: Version,
     ) -> Result<ApplyOutcome> {
         let mut permit = self.director.acquire(DbClass::Projection).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let (previous, previous_parts) = Self::read_stored_row(&mut tx, row).await?;
         if !visibility_version_is_newer(
             previous.as_ref(),
@@ -517,7 +521,7 @@ impl VisibilityStore for DsqlVisibilityStore {
         {
             return Ok(());
         }
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let (previous, count) = Self::read_stored_row(&mut tx, row).await?;
         if visibility_version_is_newer(
             previous.as_ref(),
@@ -558,7 +562,7 @@ impl VisibilityStore for DsqlVisibilityStore {
             false,
         )?;
         let mut permit = self.director.acquire(DbClass::Projection).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let version = current_version_of(&mut tx, namespace_id, run_key).await?;
         delete_attribute_at(&mut tx, namespace_id, run_key, version, attr_id, attr_type).await?;
         insert_cells(&mut tx, namespace_id, run_key, version, &image.cells).await?;
@@ -576,7 +580,7 @@ impl VisibilityStore for DsqlVisibilityStore {
         attr_type: SearchAttrType,
     ) -> Result<()> {
         let mut permit = self.director.acquire(DbClass::Projection).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let version = current_version_of(&mut tx, namespace_id, run_key).await?;
         delete_attribute_at(&mut tx, namespace_id, run_key, version, attr_id, attr_type).await?;
         tx.commit().await?;
@@ -599,15 +603,43 @@ impl VisibilityStore for DsqlVisibilityStore {
         page: &PageBounds,
     ) -> Result<ListResult> {
         let mut permit = self.director.acquire(DbClass::Projection).await?;
-        list_rows(
-            permit.connection()?,
-            namespace_id,
-            filter,
-            sort,
-            page,
-            false,
-        )
-        .await
+        let (query, rows) =
+            list_rows(permit.connection()?, namespace_id, filter, sort, page).await?;
+        if memo_page_needs_snapshot(
+            rows.iter()
+                .map(|row| row.try_get("memo_parts"))
+                .collect::<Result<Vec<Option<i32>>, _>>()?
+                .iter()
+                .copied(),
+        ) {
+            // The autocommit page is only a probe. Reread its rows and parts in
+            // one guarded snapshot; a flip may replace parts between reads.
+            let mut tx = permit.begin_read_only().await?;
+            let rows = fetch_list_rows(
+                &mut tx,
+                &query.sql,
+                namespace_id,
+                &query.values,
+                query.limit,
+            )
+            .await?;
+            #[cfg(all(test, feature = "dsql-integration"))]
+            memo_read_pause::reached(namespace_id).await;
+            let result =
+                decode_list_page(&mut tx, rows, namespace_id, sort, query.limit, false).await?;
+            tx.commit().await?;
+            Ok(result)
+        } else {
+            decode_list_page(
+                permit.connection()?,
+                rows,
+                namespace_id,
+                sort,
+                query.limit,
+                false,
+            )
+            .await
+        }
     }
 
     async fn list_component_executions(
@@ -622,11 +654,9 @@ impl VisibilityStore for DsqlVisibilityStore {
         // only the values at each listed row's version, and a flip and its cleanup
         // between two separate reads would delete them, so the row would list
         // without its attributes.
-        let mut tx = permit
-            .connection()?
-            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .await?;
-        let result = list_rows(&mut tx, namespace_id, filter, sort, page, true).await?;
+        let mut tx = permit.begin_read_only().await?;
+        let (query, rows) = list_rows(&mut tx, namespace_id, filter, sort, page).await?;
+        let result = decode_list_page(&mut tx, rows, namespace_id, sort, query.limit, true).await?;
         tx.commit().await?;
         Ok(result)
     }
@@ -779,7 +809,7 @@ impl VisibilityStore for DsqlVisibilityStore {
     // This is a trait-level limitation — the warn! log is the best we can do.
     async fn get_row(&self, run_key: RunKey) -> Option<ExecutionRow> {
         match self.director.acquire(DbClass::Projection).await {
-            Ok(mut permit) => match get_execution_row(permit.connection().ok()?, run_key).await {
+            Ok(mut permit) => match get_execution_row(&mut permit, run_key).await {
                 Ok(row) => row,
                 Err(error) => {
                     warn!(%error, run_key = %run_key.0, "failed to read DSQL visibility row");
@@ -848,14 +878,20 @@ impl ProjectionSink for DsqlVisibilityStore {
     }
 }
 
+/// Retain the probe's exact statement and binds for a snapshot reread.
+struct ListQuery {
+    sql: String,
+    values: Vec<SqlValue>,
+    limit: usize,
+}
+
 async fn list_rows(
     connection: &mut PgConnection,
     namespace_id: NamespaceId,
     filter: &CompiledFilter,
     sort: SortOrder,
     page: &PageBounds,
-    hydrate_attributes: bool,
-) -> Result<ListResult> {
+) -> Result<(ListQuery, Vec<PgRow>)> {
     let (filter_sql, mut values, next_param) = compile_filter(filter, 2)?;
     let (cursor_sql, cursor_values, next_param) =
         cursor_predicate(sort, page.after.as_ref(), next_param)?;
@@ -910,37 +946,7 @@ async fn list_rows(
     for table in referenced_tables {
         projection_metrics::record_sa_index_scan_duration(table, duration);
     }
-    if memo_page_needs_snapshot(
-        rows.iter()
-            .map(|row| row.try_get("memo_parts"))
-            .collect::<Result<Vec<Option<i32>>, _>>()?
-            .iter()
-            .copied(),
-    ) && !hydrate_attributes
-    {
-        // The initial page is only a probe. Reread its rows and parts in one
-        // snapshot; a flip may replace or remove parts between autocommit reads.
-        let mut tx = connection
-            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .await?;
-        let rows = fetch_list_rows(&mut tx, &sql, namespace_id, &values, limit).await?;
-        #[cfg(all(test, feature = "dsql-integration"))]
-        memo_read_pause::reached(namespace_id).await;
-        let result = decode_list_page(&mut tx, rows, namespace_id, sort, limit, false).await?;
-        tx.commit().await?;
-        Ok(result)
-    } else {
-        // Component lists already own a snapshot for their attribute hydration.
-        decode_list_page(
-            connection,
-            rows,
-            namespace_id,
-            sort,
-            limit,
-            hydrate_attributes,
-        )
-        .await
-    }
+    Ok((ListQuery { sql, values, limit }, rows))
 }
 
 fn memo_page_needs_snapshot(counts: impl Iterator<Item = Option<i32>>) -> bool {
@@ -2126,13 +2132,13 @@ const READ_EXECUTION_ROW_SQL: &str =
     execution_row_select!("namespace_id = $1 AND archetype_id = $2 AND run_key = $3");
 
 async fn get_execution_row(
-    connection: &mut PgConnection,
+    permit: &mut DsqlPermit,
     run_key: RunKey,
 ) -> Result<Option<ExecutionRow>> {
     let sql = execution_row_select!("run_key = $1");
     let row = sqlx::query(sql)
         .bind(run_key.0)
-        .fetch_optional(&mut *connection)
+        .fetch_optional(permit.connection()?)
         .await?;
     if row
         .as_ref()
@@ -2141,9 +2147,8 @@ async fn get_execution_row(
         .flatten()
         .is_some()
     {
-        let mut tx = connection
-            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .await?;
+        // The probe cannot bind a split memo to its parts across autocommit reads.
+        let mut tx = permit.begin_read_only().await?;
         let row = sqlx::query(sql)
             .bind(run_key.0)
             .fetch_optional(&mut *tx)
@@ -2156,7 +2161,7 @@ async fn get_execution_row(
         Ok(result)
     } else {
         match row {
-            Some(row) => Ok(Some(row_to_execution(connection, row).await?)),
+            Some(row) => Ok(Some(row_to_execution(permit.connection()?, row).await?)),
             None => Ok(None),
         }
     }
@@ -2912,7 +2917,11 @@ mod tests {
                     );
                     let applied =
                         upsert_execution_row(&mut connection, &next, None, None, false).await?;
-                    let kept = get_execution_row(&mut connection, run_key)
+                    let mut permit = store
+                        .connection_director()
+                        .acquire(DbClass::Projection)
+                        .await?;
+                    let kept = get_execution_row(&mut permit, run_key)
                         .await?
                         .ok_or_else(|| anyhow!("the row is stored"))?;
                     sqlx::query("DELETE FROM execution_visibility_current WHERE run_key = $1")

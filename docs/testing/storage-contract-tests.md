@@ -240,10 +240,23 @@ previous flag only after successful startup. The existing return processors
 retire uncertain connections without adding a ping or rollback to healthy return.
 
 Repository writes, history/state/CHASM snapshots, projection images, outbound
-reads, and worker-compute/deployment writes use those permit methods. Helpers
-inside an established transaction still accept `PgConnection` because SQLx then
-owns rollback-on-drop. The remaining raw starts are deliberately separate:
+reads, worker-compute/deployment writes, and the visibility store's writes,
+attribute cleanup/copy and read snapshots use those permit methods. Visibility
+list/get reads retain their autocommit probe and start a guarded snapshot only
+when memo parts require a reread; component lists share one guarded snapshot
+with attribute hydration. Helpers inside an established transaction still accept
+`PgConnection` because SQLx then owns rollback-on-drop.
 
+Workspace `clippy.toml` enforces the rule through `disallowed-methods` for SQLx
+`Connection::{begin, begin_with, transaction}`, `Acquire::begin`,
+`Transaction::begin` and `TransactionManager::begin`. Dedicated `Pool::begin`
+and `Pool::begin_with` remain allowed. Before the visibility repair, workspace
+clippy reported its eleven raw starts and four production exceptions; enabling
+`dsql-integration` also reported four dedicated-connection fixture starts.
+Neither check found a raw start outside storage or projection. Narrow, explained
+allows cover only these deliberate raw-connection entry points:
+
+- `DsqlPermit::{begin, begin_read_only}` implement the cancellation guard itself.
 - `control_lease.rs` has a dedicated `PgPool` implementation and a caller-owned
   connection API. Engine schema/ownership acquisition uses the latter before
   runtime admission; failure or deadline cancellation shuts down its director
@@ -255,13 +268,25 @@ owns rollback-on-drop. The remaining raw starts are deliberately separate:
   migration fixtures use dedicated SQLx pools. Embedded schema startup runs
   before runtime admission and shuts its director down on failure/cancellation.
   No migration API or schema changes are included here.
-- Raw starts in live fixture modules and integration binaries use dedicated
-  SQLx test pools rather than reservoir permits.
+- `tests/dsql_activity_state_drop.rs` starts transactions in
+  `fill_activity_state` and `rebuild_activity_state` on its dedicated connection.
+- `tests/dsql_lease_fence.rs::run_case` starts its two competing transactions on
+  dedicated connections. Other pool-backed fixtures use the allowed pool methods.
 
-These raw-connection APIs do not acquire the new permit guarantee themselves.
+The caller-owned raw-connection APIs do not acquire the permit guarantee themselves.
 Any future caller reusing their connection after an interrupted start must retire
 it or pass ownership through a cancellation guard. The startup lifecycle is the
-reason the existing engine paths are outside this storage-only repair.
+reason the existing engine paths are outside this transaction-start repair.
+
+The ignored projection test `dsql_cancelled_visibility_start_preserves_next_write`
+uses one reservoir slot and a manual first poll. A consumed ready slot proves
+checkout completed; a mismatched cursor would fail synchronously immediately
+after BEGIN, so `Pending` proves startup is still in progress. After dropping
+the read, the next store apply must commit and read back. It runs only against
+an ephemeral DSQL database. Run from an archive, it passes with the other 31
+projection live tests. On the unfixed code it fails with
+`cannot execute INSERT in a read-only transaction`: the write inherits the
+abandoned read-only transaction.
 
 ## Verification receipt
 

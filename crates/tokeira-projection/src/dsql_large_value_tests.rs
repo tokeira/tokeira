@@ -7,7 +7,7 @@ use proptest::{
     test_runner::{TestCaseError, TestRunner},
 };
 use tokeira_storage::{
-    ProjectionRecord, codec,
+    ConnectionDirector, DbClass, ProjectionRecord, codec,
     dsql::value_parts::{self, PART_BYTES},
 };
 use tokeira_types::{Memo, Payload, RunKey, VisibilityLifecycleState};
@@ -54,8 +54,12 @@ async fn exact(live: &Live, image: &ProjectionRecord) -> Result<()> {
         value_parts::join(|| "the test memo".to_owned(), first, count, rest)? == expected,
         "only this memo's parts remain"
     );
-    let mut connection = live.pool.acquire().await?;
-    let read = super::get_execution_row(&mut connection, image.run_key)
+    let mut permit = live
+        .visibility
+        .director
+        .acquire(DbClass::Projection)
+        .await?;
+    let read = super::get_execution_row(&mut permit, image.run_key)
         .await?
         .expect("the row exists");
     ensure!(

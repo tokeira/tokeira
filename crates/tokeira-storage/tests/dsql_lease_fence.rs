@@ -236,6 +236,7 @@ async fn dsql_lease_fence_conflict_rules() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::disallowed_methods)] // Fixture owns competing connections outside the reservoir.
 async fn run_case(
     setup: &mut PgConnection,
     first: &mut PgConnection,

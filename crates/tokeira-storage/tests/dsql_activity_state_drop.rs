@@ -182,6 +182,7 @@ async fn table_and_indexes(connection: &mut PgConnection) -> Result<(bool, usize
 }
 
 /// Write `ROWS` rows, in transactions of `ROWS_PER_BATCH`.
+#[allow(clippy::disallowed_methods)] // Fixture owns a dedicated connection outside the reservoir.
 async fn fill_activity_state(connection: &mut PgConnection) -> Result<()> {
     for batch in 0..ROWS / ROWS_PER_BATCH {
         let mut transaction = connection.begin().await?;
@@ -221,6 +222,7 @@ async fn forget_from(connection: &mut PgConnection, version: u32) -> Result<()> 
 
 /// Recreate `activity_state` and its three indexes from the migrations that
 /// built them, and wait for the index builds.
+#[allow(clippy::disallowed_methods)] // Fixture owns a dedicated connection outside the reservoir.
 async fn rebuild_activity_state(connection: &mut PgConnection) -> Result<()> {
     for file in [
         "V007__activity_state.sql",

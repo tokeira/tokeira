@@ -1103,6 +1103,8 @@ trait MigrationSession: Send {
 impl MigrationSession for PgConnection {
     type Error = sqlx::Error;
 
+    // Caller-owned migration connection; cancelled startup stops its director.
+    #[allow(clippy::disallowed_methods)]
     async fn attempt(
         &mut self,
         migration: &MigrationFile,

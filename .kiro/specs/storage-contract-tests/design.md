@@ -567,3 +567,15 @@ live test cancels a read-only BEGIN before it returns its Transaction, drops the
 permit and verifies a later borrower can execute a write transaction. Preserve
 normal completed read-only/read-write transactions and rollback-on-drop behavior.
 **Validates: Requirements 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7.**
+
+The visibility-store follow-up extends this repair to its eleven transaction
+starts, as already required by 9.4. `list_executions` owns the conditional guarded
+snapshot and reuses the probe's SQL and binds; `list_rows` remains a raw-connection
+reader, including inside component-list snapshots. `get_execution_row` receives
+the permit and retains its autocommit probe followed by a snapshot reread only
+for memo parts. Workspace Clippy disallows SQLx connection transaction-start
+methods, including their convenience and lower-level entry points, with narrow
+documented exceptions for the guard and caller-owned startup/fixture connections;
+dedicated pool methods remain allowed. The lint's negative control reports all
+eleven visibility sites. An ignored single-slot live test cancels the component
+list during BEGIN and requires the next store write to commit and read back.

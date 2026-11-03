@@ -20,7 +20,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use sqlx::{Connection, PgConnection, Postgres, QueryBuilder};
+use sqlx::{PgConnection, Postgres, QueryBuilder};
 use time::OffsetDateTime;
 use tokeira_storage::{ConnectionDirector, DbClass, dsql::codec};
 use tokeira_types::{NamespaceId, RunKey, SearchAttrValue};
@@ -470,7 +470,7 @@ impl DsqlVisibilityStore {
             loop {
                 let (chunk, more) = retry_conflicts(Some(CLEANUP_CONFLICT_ATTEMPTS), || async {
                     let mut permit = self.director.acquire(DbClass::Projection).await?;
-                    let mut tx = permit.connection()?.begin().await?;
+                    let mut tx = permit.begin().await?;
                     let result = delete_below_chunk(
                         &mut tx,
                         table,
@@ -1051,7 +1051,7 @@ impl DsqlVisibilityStore {
     /// One copy transaction.
     async fn copy_step(&self, scope: &CopyScope, limits: CopyLimits) -> Result<CopyStep> {
         let mut permit = self.director.acquire(DbClass::Projection).await?;
-        let mut tx = permit.connection()?.begin().await?;
+        let mut tx = permit.begin().await?;
         let (position_data, completed_at): (Option<Vec<u8>>, Option<OffsetDateTime>) =
             sqlx::query_as(
                 "SELECT position_data, completed_at FROM execution_visibility_attr_copy \

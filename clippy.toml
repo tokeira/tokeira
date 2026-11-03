@@ -5,3 +5,29 @@ msrv = "1.97"
 allow-dbg-in-tests = true
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
+
+# Reservoir connections need the permit's cancellation guard before polling BEGIN.
+# Pool::begin and Pool::begin_with remain available for dedicated SQLx pools.
+[[disallowed-methods]]
+path = "sqlx_core::connection::Connection::begin"
+reason = "Use DsqlPermit::begin or DsqlPermit::begin_read_only for reservoir connections"
+
+[[disallowed-methods]]
+path = "sqlx_core::connection::Connection::begin_with"
+reason = "Use DsqlPermit::begin or DsqlPermit::begin_read_only for reservoir connections"
+
+[[disallowed-methods]]
+path = "sqlx_core::connection::Connection::transaction"
+reason = "Use DsqlPermit::begin or DsqlPermit::begin_read_only for reservoir connections"
+
+[[disallowed-methods]]
+path = "sqlx_core::acquire::Acquire::begin"
+reason = "Use DsqlPermit::begin or DsqlPermit::begin_read_only for reservoir connections"
+
+[[disallowed-methods]]
+path = "sqlx_core::transaction::Transaction::begin"
+reason = "Use DsqlPermit::begin or DsqlPermit::begin_read_only for reservoir connections"
+
+[[disallowed-methods]]
+path = "sqlx_core::transaction::TransactionManager::begin"
+reason = "Use DsqlPermit::begin or DsqlPermit::begin_read_only for reservoir connections"

@@ -339,6 +339,7 @@ impl Default for ConnectionControlLeaseRepository {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // Caller owns startup connection; cancellation stops director.
 async fn acquire_once_connection(
     clock: &dyn MonotonicClock,
     connection: &mut PgConnection,

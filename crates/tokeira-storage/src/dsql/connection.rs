@@ -901,6 +901,7 @@ impl DsqlPermit {
 
     /// Start a write transaction, retiring this connection if startup fails or
     /// is cancelled. A returned transaction retains SQLx's rollback-on-drop.
+    #[allow(clippy::disallowed_methods)] // The permit guards this raw start against cancellation.
     pub async fn begin(&mut self) -> Result<Transaction<'_, Postgres>> {
         let connection = self
             .connection
@@ -911,6 +912,7 @@ impl DsqlPermit {
 
     /// Start a repeatable-read, read-only snapshot with the same cancellation
     /// retirement guarantee as [`Self::begin`].
+    #[allow(clippy::disallowed_methods)] // The permit guards this raw start against cancellation.
     pub async fn begin_read_only(&mut self) -> Result<Transaction<'_, Postgres>> {
         let connection = self
             .connection

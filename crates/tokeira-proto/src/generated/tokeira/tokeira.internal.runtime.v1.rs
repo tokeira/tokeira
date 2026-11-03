@@ -376,8 +376,6 @@ pub struct OutboundOperationReference {
     pub requested_event_id: i64,
     #[prost(uint32, tag = "4")]
     pub attempt: u32,
-    #[prost(uint64, tag = "5")]
-    pub source_transition_seq: u64,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OutboundIntentReference {

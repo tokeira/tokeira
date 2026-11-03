@@ -62,7 +62,6 @@ fn reference(seed: u128, phase: u8) -> OutboundDeliveryReference {
     let authority = match phase {
         0 => DeliveryGuard::ChildStart {
             incarnation,
-            source_seq,
             expected_current: Some(destination),
         },
         5 => DeliveryGuard::CurrentIntent {
@@ -80,10 +79,7 @@ fn reference(seed: u128, phase: u8) -> OutboundDeliveryReference {
             kind: IntentKind::ChildResult,
             ordinal: 0,
         }),
-        _ => DeliveryGuard::Operation {
-            incarnation,
-            source_seq,
-        },
+        _ => DeliveryGuard::Operation { incarnation },
     };
     OutboundDeliveryReference {
         authority,

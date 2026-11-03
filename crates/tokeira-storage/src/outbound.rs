@@ -224,7 +224,8 @@ pub struct OutboundPage<K, V> {
 /// A hydrate-then-submit check alone has a TOCTOU window: parent close could retire
 /// policy against an absent child while an old start subsequently creates it. The
 /// source read in the destination transaction conflicts with that close on DSQL;
-/// memory uses the same store lock for both. A source lease is not a target fence.
+/// memory uses the same store lock for both. Unrelated source commits do not revoke
+/// an incarnation that is still derived. A source lease is not a target fence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeliveryGuard {
     /// Child creation also fences the current execution used to evaluate its
@@ -232,17 +233,13 @@ pub enum DeliveryGuard {
     ChildStart {
         /// Exact pending child initiation.
         incarnation: OperationIncarnation,
-        /// Source sequence used for the recipe.
-        source_seq: TransitionSeq,
         /// Current pointer observed before applying the accepted reuse policy.
         expected_current: Option<RunKey>,
     },
-    /// Pending operation and captured source sequence.
+    /// Operation incarnation still derived from the current source state.
     Operation {
         /// Expected initiation/attempt.
         incarnation: OperationIncarnation,
-        /// State whose validated recipe was hydrated.
-        source_seq: TransitionSeq,
     },
     /// Exact immutable intent, still present at the target commit.
     Intent(IntentKey),

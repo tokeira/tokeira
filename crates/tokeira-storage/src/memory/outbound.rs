@@ -385,15 +385,8 @@ fn validate_guard(
         return Err(RecoveryError::Obsolete.into());
     }
     match guard {
-        DeliveryGuard::Operation {
-            incarnation,
-            source_seq,
-        }
-        | DeliveryGuard::ChildStart {
-            incarnation,
-            source_seq,
-            ..
-        } => {
+        DeliveryGuard::Operation { incarnation }
+        | DeliveryGuard::ChildStart { incarnation, .. } => {
             let Some(source) = store.runs.get(&incarnation.key.source_run) else {
                 return Err(RecoveryError::Obsolete.into());
             };
@@ -403,10 +396,9 @@ fn validate_guard(
                 InMemoryStore::effective_shard_count(store),
             );
             source_fence.ensure_home(home)?;
-            if source.transition_seq != source_seq
-                || !crate::derive_operations(source, home)?
-                    .iter()
-                    .any(|row| row.incarnation == incarnation)
+            if !crate::derive_operations(source, home)?
+                .iter()
+                .any(|row| row.incarnation == incarnation)
             {
                 return Err(RecoveryError::Obsolete.into());
             }

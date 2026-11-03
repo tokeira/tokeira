@@ -536,7 +536,7 @@ proptest! {
                 ending.history_events.clear();
                 ending.event_principals.clear();
             }
-            let ended = applied(
+            applied(
                 store
                     .commit_transition(open.run_key, ending, WriteFence::Unfenced)
                     .await
@@ -568,7 +568,6 @@ proptest! {
                         close(&target),
                         DeliveryGuard::Operation {
                             incarnation: old[0].incarnation,
-                            source_seq: ended.transition_seq,
                         },
                         WriteFence::Unfenced,
                         WriteFence::Unfenced,

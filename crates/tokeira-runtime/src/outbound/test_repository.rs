@@ -3,6 +3,7 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use std::{
+    collections::VecDeque,
     ops::Deref,
     sync::{
         Arc, Mutex,
@@ -37,6 +38,9 @@ pub(super) struct Repository {
     pub(super) reconcile_calls: AtomicUsize,
     pub(super) source_transition_before_outcome: Mutex<Option<Transition>>,
     pub(super) outbound_committed: Arc<tokio::sync::Notify>,
+    pub(super) metadata_before_commit: Mutex<VecDeque<Transition>>,
+    pub(super) metadata_commit_calls: AtomicUsize,
+    pub(super) transition_before_destination: Mutex<Option<Transition>>,
 }
 
 impl Deref for Repository {
@@ -247,6 +251,17 @@ impl RunRepository for Repository {
                 ));
             }
         }
+        if guard.operation().is_some_and(|op| op.key.source_run != run) {
+            let concurrent = self.transition_before_destination.lock().unwrap().take();
+            if let Some(concurrent) = concurrent {
+                assert!(matches!(
+                    self.inner
+                        .commit_transition(concurrent.next_state.run_key, concurrent, fence.clone())
+                        .await?,
+                    CommitResult::Applied { .. }
+                ));
+            }
+        }
         let result = self
             .inner
             .commit_outbound_transition(run, transition, guard, source_fence, fence)
@@ -395,6 +410,18 @@ impl RunRepository for Repository {
                 .outbound
                 .as_ref()
                 .is_some_and(|outbound| !outbound.child_seeds.is_empty());
+        if transition.history_events.is_empty() {
+            self.metadata_commit_calls.fetch_add(1, Ordering::SeqCst);
+            let concurrent = self.metadata_before_commit.lock().unwrap().pop_front();
+            if let Some(concurrent) = concurrent {
+                assert!(matches!(
+                    self.inner
+                        .commit_transition(run_key, concurrent, fence.clone())
+                        .await?,
+                    CommitResult::Applied { .. }
+                ));
+            }
+        }
         let result = self
             .inner
             .commit_transition(run_key, transition, fence)

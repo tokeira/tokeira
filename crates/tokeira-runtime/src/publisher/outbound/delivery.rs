@@ -107,21 +107,13 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
         let target = reference.destination;
         let mut guard = reference.authority;
         let (command, namespace, workflow) = match guard {
-            DeliveryGuard::Operation {
-                incarnation,
-                source_seq,
-            }
-            | DeliveryGuard::ChildStart {
-                incarnation,
-                source_seq,
-                ..
-            } => {
+            DeliveryGuard::Operation { incarnation }
+            | DeliveryGuard::ChildStart { incarnation, .. } => {
                 let LoadedRun::Existing(source) =
                     self.repo.load_run(incarnation.key.source_run).await?
                 else {
                     return Err(RecoveryError::Obsolete.into());
                 };
-                ensure!(source.transition_seq == source_seq, RecoveryError::Obsolete);
                 let home = match &reference.source_fence {
                     tokeira_storage::WriteFence::Lease(fence) => fence.home,
                     tokeira_storage::WriteFence::Unfenced => tokeira_types::ShardId(0),
@@ -192,7 +184,6 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
                         // survive until the same transaction creates/replaces it.
                         guard = DeliveryGuard::ChildStart {
                             incarnation,
-                            source_seq,
                             expected_current: current,
                         };
                         (command, start.namespace_id, start.workflow_id)

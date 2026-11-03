@@ -185,64 +185,73 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
             run: source.run_key,
             detail: "child initiation reuse policy requires verified repair",
         })?;
-        let seed = match source
-            .outbound
-            .as_ref()
-            .and_then(|outbound| outbound.child_seeds.get(&initiating_event))
-            .cloned()
-        {
-            Some(seed) => seed,
-            None => {
-                // Registry observations are selected against this exact source
-                // sequence. An OCC loser never sends its uncommitted candidate.
-                let candidate = ChildStartSeed {
-                    child_run_id: RunId::new(),
-                    request_id: RequestId(format!(
-                        "child-start:{}:{initiating_event}",
-                        source.run_key.0
-                    )),
-                    prepared_at: OffsetDateTime::now_utc(),
-                    parent_namespace_name: match &self.namespace_resolver {
-                        Some(resolver) => {
-                            Some(resolver.name_for_id(source.namespace_id).await?.ok_or(
-                                RecoveryError::InvalidIdentity {
-                                    run: source.run_key,
-                                    detail: "child parent namespace no longer resolves",
-                                },
-                            )?)
-                        }
-                        None => None,
-                    },
-                    root_workflow_id: Some(
-                        source
-                            .root_workflow_id
-                            .clone()
-                            .unwrap_or_else(|| source.workflow_id.clone()),
-                    ),
-                    root_run_id: Some(source.root_run_id.unwrap_or(source.run_id)),
-                    effective_priority: tokeira_kernel::merge_priority(
-                        source.priority.as_ref(),
-                        priority.as_ref(),
-                    ),
-                    versioning_info: self
-                        .child_versioning_from_state(&source, namespace_id, task_queue)
-                        .await?,
-                };
-                source
-                    .outbound
-                    .as_mut()
-                    .ok_or(RecoveryError::LegacyState(source.run_key))?
-                    .child_seeds
-                    .insert(initiating_event, candidate.clone());
-                source = require_applied(
-                    self.pick_lane(source.run_key)
-                        .commit_outbound_metadata(
-                            Box::new(metadata_transition(source)),
-                            attempt.clone(),
-                        )
-                        .await?,
-                )?;
-                candidate
+        let lane = self.pick_lane(source.run_key);
+        let mut retries = 0;
+        let seed = loop {
+            attempt.validate(owner)?;
+            if let Some(seed) = source
+                .outbound
+                .as_ref()
+                .and_then(|outbound| outbound.child_seeds.get(&initiating_event))
+                .cloned()
+            {
+                break seed;
+            }
+            // Registry observations are selected against this exact source
+            // sequence. An OCC loser never sends its uncommitted candidate.
+            let candidate = ChildStartSeed {
+                child_run_id: RunId::new(),
+                request_id: RequestId(format!(
+                    "child-start:{}:{initiating_event}",
+                    source.run_key.0
+                )),
+                prepared_at: OffsetDateTime::now_utc(),
+                parent_namespace_name: match &self.namespace_resolver {
+                    Some(resolver) => {
+                        Some(resolver.name_for_id(source.namespace_id).await?.ok_or(
+                            RecoveryError::InvalidIdentity {
+                                run: source.run_key,
+                                detail: "child parent namespace no longer resolves",
+                            },
+                        )?)
+                    }
+                    None => None,
+                },
+                root_workflow_id: Some(
+                    source
+                        .root_workflow_id
+                        .clone()
+                        .unwrap_or_else(|| source.workflow_id.clone()),
+                ),
+                root_run_id: Some(source.root_run_id.unwrap_or(source.run_id)),
+                effective_priority: tokeira_kernel::merge_priority(
+                    source.priority.as_ref(),
+                    priority.as_ref(),
+                ),
+                versioning_info: self
+                    .child_versioning_from_state(&source, namespace_id, task_queue)
+                    .await?,
+            };
+            source
+                .outbound
+                .as_mut()
+                .ok_or(RecoveryError::LegacyState(source.run_key))?
+                .child_seeds
+                .insert(initiating_event, candidate.clone());
+            match lane
+                .commit_outbound_metadata(Box::new(metadata_transition(source)), attempt.clone())
+                .await?
+            {
+                CommitResult::Conflict { .. } if retries < lane.max_occ_retries => {
+                    retries += 1;
+                    // Re-select registry-dependent inheritance against the new
+                    // sequence, or adopt the seed another attempt committed.
+                    source = self.operation_source(&row, &attempt, owner).await?;
+                }
+                result => {
+                    source = require_applied(result)?;
+                    break candidate;
+                }
             }
         };
         attempt.validate(owner)?;
@@ -295,7 +304,7 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
                     current,
                     (namespace_id, child_workflow_id),
                     crate::DeliveryPhase::ChildReplace,
-                    authority(&row, &source),
+                    authority(&row),
                     &attempt,
                     owner,
                 )
@@ -337,7 +346,6 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
                 crate::DeliveryPhase::ChildStart,
                 tokeira_storage::DeliveryGuard::ChildStart {
                     incarnation: row.incarnation,
-                    source_seq: source.transition_seq,
                     expected_current,
                 },
                 &attempt,
@@ -640,7 +648,7 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
                 target,
                 (release.namespace_id, &release.workflow_id),
                 crate::DeliveryPhase::ChildRelease,
-                authority(&row, &source),
+                authority(&row),
                 &attempt,
                 owner,
             )
@@ -661,18 +669,36 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
                         && gate.first_child_run_id == release.child_run_id),
             "child release remains unverified"
         );
-        let mut source = self.operation_source(&row, &attempt, owner).await?;
-        source
-            .outbound
-            .as_mut()
-            .ok_or(RecoveryError::LegacyState(source.run_key))?
-            .child_releases
-            .remove(&initiation);
-        require_applied(
-            self.pick_lane(source.run_key)
-                .commit_outbound_metadata(Box::new(metadata_transition(source)), attempt)
-                .await?,
-        )?;
+        let lane = self.pick_lane(row.incarnation.key.source_run);
+        let mut retries = 0;
+        loop {
+            attempt.validate(owner)?;
+            // Re-derive on every OCC retry: a close or resolved operation must
+            // reconcile as obsolete instead of overwriting its replacement.
+            let mut source = self.operation_source(&row, &attempt, owner).await?;
+            if source
+                .outbound
+                .as_mut()
+                .ok_or(RecoveryError::LegacyState(source.run_key))?
+                .child_releases
+                .remove(&initiation)
+                .is_none()
+            {
+                break;
+            }
+            match lane
+                .commit_outbound_metadata(Box::new(metadata_transition(source)), attempt.clone())
+                .await?
+            {
+                CommitResult::Conflict { .. } if retries < lane.max_occ_retries => {
+                    retries += 1;
+                }
+                result => {
+                    require_applied(result)?;
+                    break;
+                }
+            }
+        }
         Ok(())
     }
 }

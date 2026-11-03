@@ -267,7 +267,10 @@ fences and idempotency absorb that race.
 
 Use `proto/tokeira/internal/runtime/v1/command.proto` for a narrow `OutboundDelivery`
 service, not a generic serialized `Command` endpoint. The request references committed
-work; the receiver loads the recipe itself and revalidates the source incarnation.
+work; the receiver loads the recipe itself, and the destination transaction revalidates
+that the source still derives the referenced incarnation. Unrelated source commits do
+not refuse the delivery. The source row remains read `FOR UPDATE` on DSQL so a
+concurrent close conflicts with the destination transaction.
 All source resolution commits remain local to the source executor. Only effects on a
 different execution home need the RPC.
 
@@ -301,7 +304,10 @@ file; it neither generates credentials nor reads them into logs.
 1. The initiation records accepted configuration, including reuse policy. A source
    preparation transition chooses and persists its child seed before any target I/O.
    Parent/registry reads used to derive versioning are checked against the source
-   sequence when the seed commits. Subsequent attempts use that seed.
+   sequence when the seed commits. A seed commit that loses an OCC race reloads the
+   source through operation re-derivation and selects again against the new sequence,
+   within the lane's `LaneConfig::max_occ_retries` bound. If another attempt already
+   committed the seed, use that winning seed. Subsequent attempts use that seed.
 2. Load the pending initiation and seed, then submit the same child start to its owner.
    The start persists `ChildStartGate`; it records Started history but creates no
    runnable first workflow task. Run/execution timeout anchors still begin at creation.
@@ -321,7 +327,11 @@ file; it neither generates credentials nor reads them into logs.
    elapsed delay schedules immediately; recovery does not restart delay or timeout
    clocks. This command records an observed relationship, not a request to do I/O.
 6. A source runtime transition records verified release and removes the pending release
-   metadata/row. Losing this final reply merely repeats an idempotent child transition.
+   metadata/row. An OCC loser reloads and re-derives the operation, then removes the
+   release from the fresh state within the same lane OCC retry bound; no absent entry
+   needs a commit. A no-longer-derived operation is obsolete and reconciled. Exhausting
+   the bound remains retryable by the driver. Losing the final reply merely repeats an
+   idempotent child transition.
 
 A closed unconfirmed parent stops further starts. An owed confirmed ABANDON release
 becomes a close intent, so it survives parent deletion; other policies hand control to
@@ -541,7 +551,7 @@ writes requires compatible data restoration, not an in-place rolling downgrade.
 | Transport/storage/registry read failure or lost reply | Retryable | No manufactured terminal workflow-history event |
 | Child duplicate without matching run proof | `UnverifiedDuplicate` | Retain operation; diagnose/retry |
 | Proven child/external terminal refusal | Kind-specific terminal enum from requirements | Exactly the corresponding v1.31.0 source history cause |
-| Stale initiation/chain/attempt or source no longer wants work | Obsolete | No mutation of replacement incarnation; source transition/reconciliation retires derived eligibility |
+| Stale initiation/chain/attempt or source no longer derives the incarnation | Obsolete | The destination transaction revalidates source derivation; unrelated source commits do not refuse delivery. No mutation of replacement incarnation; source transition/reconciliation retires derived eligibility |
 | Proven target success or matching duplicate | `DefinitiveOutcome` | Source resolution or fenced intent retirement |
 | Missing namespace/child/parent | Typed lookup outcome, not arbitrary string matching | Terminal only for the applicable kind's verified Temporal case |
 | Redirect limit/cycle | `UnresolvedRedirect` | Retain intent, bounded retry and diagnostic |
@@ -736,6 +746,23 @@ retain their own payload limits. Direct intents SHALL still count toward the row
 when capping deletions.
 
 **Validates: Requirements 6.1, 6.9, 9.1, 9.2, 10.5, 10.6.**
+
+### Property 22: A source's unrelated commits don't void its deliveries
+
+For any interleaving of source commits that leave an operation's incarnation derived,
+its destination effect, seed, source outcome and release retirement SHALL each commit
+without an obsolete refusal caused by those unrelated commits. A closed source, or one
+that no longer derives the incarnation, SHALL still refuse the delivery. Source and
+destination ownership fences, current-execution checks and each commit's `expected_seq`
+remain in force. Metadata OCC losses SHALL reload and rebuild within the lane's retry
+bound; exhaustion remains retryable, and a committed seed wins over a losing candidate.
+
+This follows the pending-child and running-parent checks in
+`service/history/transfer_queue_active_task_executor.go::processStartChildExecution`
+and `recordChildExecutionStarted` at Temporal v1.31.0; neither checks a mutable-state
+sequence for child delivery.
+
+**Validates: Requirements 2.6, 2.7, 3.4, 3.8, 10.4, 10.5, 10.6, 10.7.**
 
 ## Testing and completion evidence
 

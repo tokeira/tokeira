@@ -183,10 +183,7 @@ fn decode_reference(
         .map(RunKey);
     let authority = match value.reference.ok_or_else(invalid)? {
         Reference::Operation(operation) => {
-            if operation.initiating_event_id <= 0
-                || operation.requested_event_id < 0
-                || operation.source_transition_seq == 0
-            {
+            if operation.initiating_event_id <= 0 || operation.requested_event_id < 0 {
                 return Err(invalid());
             }
             let kind = match (operation.kind, phase) {
@@ -207,21 +204,16 @@ fn decode_reference(
                 requested_event: operation.requested_event_id,
                 attempt: operation.attempt,
             };
-            let source_seq = TransitionSeq(operation.source_transition_seq);
             if phase == DeliveryPhase::ChildStart {
                 DeliveryGuard::ChildStart {
                     incarnation,
-                    source_seq,
                     expected_current: current,
                 }
             } else {
                 if current.is_some() {
                     return Err(invalid());
                 }
-                DeliveryGuard::Operation {
-                    incarnation,
-                    source_seq,
-                }
+                DeliveryGuard::Operation { incarnation }
             }
         }
         Reference::Intent(intent) => {
@@ -275,15 +267,8 @@ fn encode_reference(
         anyhow::bail!("unfenced execution cannot use peer delivery");
     };
     let (source, wire_reference, current) = match reference.authority {
-        DeliveryGuard::Operation {
-            incarnation,
-            source_seq,
-        }
-        | DeliveryGuard::ChildStart {
-            incarnation,
-            source_seq,
-            ..
-        } => {
+        DeliveryGuard::Operation { incarnation }
+        | DeliveryGuard::ChildStart { incarnation, .. } => {
             let current = match reference.authority {
                 DeliveryGuard::ChildStart {
                     expected_current, ..
@@ -297,7 +282,6 @@ fn encode_reference(
                     initiating_event_id: incarnation.key.initiating_event,
                     requested_event_id: incarnation.requested_event,
                     attempt: incarnation.attempt,
-                    source_transition_seq: source_seq.0,
                 }),
                 current,
             )

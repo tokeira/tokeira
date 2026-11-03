@@ -12,7 +12,8 @@ message OutboundOperationReference {
   int64 initiating_event_id = 2;
   int64 requested_event_id = 3;
   uint32 attempt = 4;
-  uint64 source_transition_seq = 5;
+  reserved 5;
+  reserved "source_transition_seq";
 }
 
 message OutboundIntentReference {

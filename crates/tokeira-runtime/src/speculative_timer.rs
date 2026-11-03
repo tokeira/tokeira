@@ -84,13 +84,9 @@ impl SpeculativeTimerSet {
         let lanes = self.lanes.clone();
         let lane_count = self.lane_count;
         tokio::spawn(async move {
-            let remaining = deadline - OffsetDateTime::now_utc();
-            let sleep = std::time::Duration::from_nanos(
-                remaining.whole_nanoseconds().clamp(0, i64::MAX as i128) as u64,
-            );
             tokio::select! {
                 _ = task_cancel.cancelled() => return,
-                _ = tokio::time::sleep(sleep) => {}
+                _ = crate::deadline::sleep_until(deadline) => {}
             }
             let timeout_type = match kind {
                 WftTimeoutKind::StartToClose => WorkflowTaskTimeoutType::StartToClose,

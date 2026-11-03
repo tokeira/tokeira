@@ -32,7 +32,9 @@ fields remain `INVALID_ARGUMENT` for normal clients.
 | `workflow_id_reuse_policy` | Not supported | Map to kernel current-run conflict handling | `INVALID_ARGUMENT` for unknown enum | Current-run conflict handling |
 | `workflow_id_conflict_policy` | Not supported | Map to kernel current-run conflict handling | `INVALID_ARGUMENT` for unknown enum | Current-run conflict handling |
 | `request_eager_execution` | Supported | Preserve existing eager path | n/a | Runtime eager dispatch |
-| `workflow_start_delay` | Not supported | Commit delayed-start state and durable first-WFT timer | `INVALID_ARGUMENT` for invalid duration | Delayed start state/timer |
+| `workflow_execution_timeout`, `workflow_run_timeout`, `workflow_task_timeout` | Supported | Validate signs and cap at 100 × 365 days (Requirement 5) | Field-specific INVALID_ARGUMENT | Capped start state/history and Describe |
+| `retry_policy.initial_interval`, `retry_policy.maximum_interval` | Supported | Validate and cap when retries are enabled (Requirement 5) | Retry-policy-specific INVALID_ARGUMENT | Capped policy in state/history |
+| `workflow_start_delay` | Not supported | Validate and cap; commit delayed-start state and durable first-WFT timer | `INVALID_ARGUMENT` for invalid duration | Delayed start state/timer |
 | `completion_callbacks` | Not supported | Persist callback registrations with representable fields (callback spec/URL, trigger, registration time, state, attempt/failure data) and fire on terminal transition | validation errors for malformed callback targets | Callback state/effects; rendered by `DescribeWorkflowExecution.callbacks` |
 | `user_metadata` | Not supported | Thread into start history and describe response | validation errors only | Start history/projection |
 | `links` | Not supported | Thread into start history | validation errors only | Start history |
@@ -103,3 +105,18 @@ fields remain `INVALID_ARGUMENT` for normal clients.
 3. WHEN a run has no registered completion callbacks, `DescribeWorkflowExecution` SHALL emit an empty `callbacks` list and SHALL NOT fabricate placeholder entries.
 4. THE callback describe rendering SHALL be derived from the same run snapshot used by the rest of the `DescribeWorkflowExecution` response, consistent with the `api-conformance-workflow-describe` single-snapshot contract.
 5. Registered callback state SHALL survive process restart so describe reads remain consistent after reload.
+
+### Requirement 5: Duration admission
+
+**User Story:** As an operator, I want client and stored durations handled without overflow, so that validation and recovery remain reliable.
+
+Ground truth: `common/primitives/timestamp/duration.go:67-88`, `common/retrypolicy/retry_policy.go:65-77`, `service/frontend/workflow_handler.go:808-818,3837-3843,6623-6672`, and `service/frontend/errors.go:24-26 @ v1.31.0`. The constant is 100 × 365 days, despite the stale 250-year comment. Other timeout normalization, task-timeout maxima and run-to-execution capping are unchanged.
+
+#### Acceptance Criteria
+
+1. WHEN a supplied duration has opposing nonzero seconds and nanos signs, THE Edge SHALL reject it with `duration has seconds and nanos with different signs` before testing negativity.
+2. WHEN a supplied duration is negative, THE Edge SHALL reject it with `negative duration`.
+3. WHEN an accepted duration exceeds 3,153,600,000 seconds, THE Edge SHALL record 3,153,600,000 seconds and zero nanos; WHEN a duration is absent, THE Edge SHALL treat it as zero for validation while retaining existing unset/default semantics.
+4. WHEN StartWorkflowExecution or SignalWithStart supplies an invalid execution, run, task timeout or start delay, THE Edge SHALL return INVALID_ARGUMENT with `An invalid <Field>Seconds is set on request. cause: <error>`, where Field is WorkflowExecutionTimeout, WorkflowRunTimeout, WorkflowTaskTimeout or WorkflowStartDelay.
+5. WHEN an ExecuteMultiOperation start is invalid, THE Edge SHALL preserve the same text in the existing per-operation failure and abort the sibling operation; WHEN a schedule action contains a start, THE Edge SHALL validate and cap its workflow timeouts before persisting the action.
+6. WHEN a retry policy is validated and maximum_attempts is not one, THE Edge SHALL reject invalid InitialInterval or MaximumInterval using `invalid <Field> set on retry policy: <error>` and record accepted capped intervals.

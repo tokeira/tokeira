@@ -6,6 +6,8 @@
 //! sweep from reinstalling authority, and revision-checked retirement prevents an
 //! awaited timeout result from removing a worker start's replacement entry.
 
+use tokeira_kernel::deadline_after;
+
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, RwLock},
@@ -330,8 +332,8 @@ impl Default for WftTimeoutScannerConfig {
 /// deadline.
 pub fn evaluate_wft_timeout(entry: &WftTimeoutEntry, now: OffsetDateTime) -> bool {
     (entry.kind == WftTimeoutKind::ScheduleToStart
-        && now >= entry.started_at + entry.workflow_task_timeout)
-        || now - entry.started_at > entry.workflow_task_timeout
+        && now >= deadline_after(entry.started_at, entry.workflow_task_timeout))
+        || now > deadline_after(entry.started_at, entry.workflow_task_timeout)
         || entry.workflow_task_timeout.is_zero() && now >= entry.started_at
 }
 

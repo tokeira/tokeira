@@ -16,6 +16,8 @@
 //! `first_run_started_at`) so the server can enforce execution-level timeouts
 //! across the entire chain, not just the current run.
 
+use tokeira_kernel::deadline_after;
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex, RwLock},
@@ -2015,7 +2017,7 @@ pub(crate) fn track_committed_run(
                     shard_id,
                     pending.logical_seq,
                     pending.started_event_id.unwrap_or(0),
-                    started_at + new_state.workflow_task_timeout,
+                    deadline_after(started_at, new_state.workflow_task_timeout),
                     crate::wft_timeout::WftTimeoutKind::StartToClose,
                 );
             } else if let Some(deadline) = pending.schedule_to_start_deadline {

@@ -31,7 +31,7 @@ use time::OffsetDateTime;
 use tokeira_kernel::{
     CommandPayloadSizes, FieldChange, MemoPatch, PayloadSize, ProtocolMessageSize,
     SearchAttributeSizes, SearchAttributesPatch, UpsertedFieldSizes, WorkerVersionStamp,
-    WorkflowCommand, WorkflowTaskWorkerVersion,
+    WorkflowCommand, WorkflowTaskFailedCause, WorkflowTaskWorkerVersion,
     state::{
         CallbackSpec as KernelCallbackSpec, CallbackState as KernelCallbackState,
         CallbackTrigger as KernelCallbackTrigger, CompletionCallback as KernelCompletionCallback,
@@ -120,6 +120,7 @@ use crate::translate::{
     to_internal::{namespace_id_for, versioning_override_to_kernel},
 };
 use tokeira_kernel::state::ParentClosePolicy;
+use tokeira_proto::public::temporal::api::command::v1::command::Attributes;
 
 const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_STICKY_TTL: Duration = Duration::from_secs(30);
@@ -150,13 +151,141 @@ const CHASM_INTERNAL_CALLBACK_URL: &str = "temporal://internal";
 const MAX_LINKS_PER_REQUEST: usize = 10;
 const LINK_MAX_SIZE: usize = 4000;
 
+/// Validate before narrowing: even non-canonical nanos and i64 extremes are total.
+/// The cap, sign precedence and nil semantics follow
+/// common/primitives/timestamp/duration.go:67-88 @ v1.31.0.
+pub(crate) fn validate_and_cap_proto_duration(
+    value: Option<&prost_types::Duration>,
+) -> Result<time::Duration, &'static str> {
+    let Some(value) = value else {
+        return Ok(time::Duration::ZERO);
+    };
+    if (value.seconds > 0 && value.nanos < 0) || (value.seconds < 0 && value.nanos > 0) {
+        return Err("duration has seconds and nanos with different signs");
+    }
+    if value.seconds < 0 || value.nanos < 0 {
+        return Err("negative duration");
+    }
+    let nanos = i128::from(value.seconds) * 1_000_000_000 + i128::from(value.nanos);
+    let capped = nanos.min(3_153_600_000_000_000_000);
+    Ok(time::Duration::nanoseconds(capped as i64))
+}
+
 pub(crate) fn proto_duration_to_time(
     value: Option<&prost_types::Duration>,
 ) -> Option<time::Duration> {
-    value.map(|duration| {
-        time::Duration::seconds(duration.seconds)
-            + time::Duration::nanoseconds(i64::from(duration.nanos))
+    value.and_then(|duration| validate_and_cap_proto_duration(Some(duration)).ok())
+}
+
+/// Total DurationValue conversion for fields that Temporal does not validate:
+/// scheduler intervals/jitter, activity jitter and disabled retry policies.
+/// AsDuration saturates at Go's signed nanosecond range; it does not apply the
+/// 100-year validation cap (common/primitives/timestamp/duration.go:21-26;
+/// service/worker/scheduler/spec.go:236-244 @ v1.31.0).
+pub(crate) fn proto_duration_value(
+    value: Option<&prost_types::Duration>,
+) -> Option<time::Duration> {
+    value.map(|value| {
+        let nanos = i128::from(value.seconds) * 1_000_000_000 + i128::from(value.nanos);
+        time::Duration::nanoseconds(nanos.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64)
     })
+}
+
+fn retry_duration_to_time(
+    value: Option<&prost_types::Duration>,
+    maximum_attempts: i32,
+) -> Option<time::Duration> {
+    if maximum_attempts == 1 {
+        proto_duration_value(value)
+    } else {
+        proto_duration_to_time(value)
+    }
+}
+
+/// Frontend start validation is also used by schedule actions and multi-operation
+/// starts (service/frontend/workflow_handler.go:3837,6623-6672 @ v1.31.0).
+pub(crate) fn validate_start_durations(
+    execution: Option<&prost_types::Duration>,
+    run: Option<&prost_types::Duration>,
+    task: Option<&prost_types::Duration>,
+    delay: Option<&prost_types::Duration>,
+) -> Result<(), ProtoConversionError> {
+    for (name, value) in [
+        ("WorkflowExecutionTimeout", execution),
+        ("WorkflowRunTimeout", run),
+        ("WorkflowTaskTimeout", task),
+        ("WorkflowStartDelay", delay),
+    ] {
+        validate_and_cap_proto_duration(value).map_err(|error| {
+            ProtoConversionError::InvalidArgument(format!(
+                "An invalid {name}Seconds is set on request. cause: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// The one-attempt exception precedes duration validation in
+/// common/retrypolicy/retry_policy.go:65-77 @ v1.31.0.
+pub(crate) fn validate_retry_durations(
+    policy: Option<&proto_common::RetryPolicy>,
+) -> Result<(), ProtoConversionError> {
+    let Some(policy) = policy.filter(|policy| policy.maximum_attempts != 1) else {
+        return Ok(());
+    };
+    for (name, value) in [
+        ("InitialInterval", policy.initial_interval.as_ref()),
+        ("MaximumInterval", policy.maximum_interval.as_ref()),
+    ] {
+        validate_and_cap_proto_duration(value).map_err(|error| {
+            ProtoConversionError::InvalidArgument(format!(
+                "invalid {name} set on retry policy: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Shared by standalone starts, activity option updates and workflow commands
+/// (chasm/lib/activity/validator.go:149-160 @ v1.31.0).
+pub(crate) fn validate_activity_durations(
+    close: Option<&prost_types::Duration>,
+    start: Option<&prost_types::Duration>,
+    execution: Option<&prost_types::Duration>,
+    heartbeat: Option<&prost_types::Duration>,
+) -> Result<(), ProtoConversionError> {
+    for (name, value) in [
+        ("ScheduleToCloseTimeout", close),
+        ("ScheduleToStartTimeout", start),
+        ("StartToCloseTimeout", execution),
+        ("HeartbeatTimeout", heartbeat),
+    ] {
+        validate_and_cap_proto_duration(value).map_err(|error| {
+            ProtoConversionError::InvalidArgument(format!("invalid {name}: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
+/// Validate standalone activity timeouts before folding away the wire signs.
+/// Returns schedule-to-close, schedule-to-start, start-to-close and heartbeat
+/// nanoseconds for the durable CHASM fields and their Describe representation.
+pub(crate) fn standalone_activity_durations(
+    request: &workflowservice::StartActivityExecutionRequest,
+) -> Result<[i64; 4], ProtoConversionError> {
+    validate_retry_durations(request.retry_policy.as_ref())?;
+    let values = [
+        request.schedule_to_close_timeout.as_ref(),
+        request.schedule_to_start_timeout.as_ref(),
+        request.start_to_close_timeout.as_ref(),
+        request.heartbeat_timeout.as_ref(),
+    ];
+    validate_activity_durations(values[0], values[1], values[2], values[3])?;
+    Ok(values.map(|value| {
+        validate_and_cap_proto_duration(value)
+            .expect("duration validated before folding")
+            .whole_nanoseconds() as i64
+    }))
 }
 
 #[cfg(not(feature = "conformance"))]
@@ -213,16 +342,12 @@ fn valid_non_negative_duration(
     value: Option<&prost_types::Duration>,
     field: &'static str,
 ) -> Result<Option<time::Duration>, ProtoConversionError> {
-    match value {
-        Some(duration) if duration.seconds < 0 || duration.nanos < 0 => {
-            Err(ProtoConversionError::MissingField(field))
-        }
-        Some(duration) => Ok(Some(
-            time::Duration::seconds(duration.seconds)
-                + time::Duration::nanoseconds(i64::from(duration.nanos)),
-        )),
-        None => Ok(None),
-    }
+    value
+        .map(|duration| {
+            validate_and_cap_proto_duration(Some(duration))
+                .map_err(|error| ProtoConversionError::InvalidArgument(format!("{field}: {error}")))
+        })
+        .transpose()
 }
 
 fn time_skipping_requests_behavior(config: &workflow::TimeSkippingConfig) -> bool {
@@ -738,14 +863,20 @@ fn activity_retry_classification(failure: &failure_proto::Failure) -> (Option<St
 
 fn retry_policy_to_domain(value: &tokeira_proto::common::RetryPolicy) -> RetryPolicy {
     RetryPolicy {
-        initial_interval: proto_duration_to_time(value.initial_interval.as_ref())
-            .unwrap_or(time::Duration::ZERO),
+        initial_interval: retry_duration_to_time(
+            value.initial_interval.as_ref(),
+            value.maximum_attempts,
+        )
+        .unwrap_or(time::Duration::ZERO),
         backoff_coefficient: if value.backoff_coefficient > 0.0 {
             value.backoff_coefficient
         } else {
             1.0
         },
-        maximum_interval: proto_duration_to_time(value.maximum_interval.as_ref()),
+        maximum_interval: retry_duration_to_time(
+            value.maximum_interval.as_ref(),
+            value.maximum_attempts,
+        ),
         maximum_attempts: value.maximum_attempts.max(0) as u32,
         non_retryable_error_types: value.non_retryable_error_types.clone(),
     }
@@ -771,7 +902,7 @@ fn activity_retry_policy_with_defaults(
     proto: Option<&tokeira_proto::common::RetryPolicy>,
 ) -> RetryPolicy {
     let initial_interval = proto
-        .and_then(|p| proto_duration_to_time(p.initial_interval.as_ref()))
+        .and_then(|p| retry_duration_to_time(p.initial_interval.as_ref(), p.maximum_attempts))
         .filter(|interval| !interval.is_zero())
         .unwrap_or(time::Duration::seconds(1));
     let backoff_coefficient = proto
@@ -779,9 +910,13 @@ fn activity_retry_policy_with_defaults(
         .filter(|coefficient| *coefficient > 0.0)
         .unwrap_or(2.0);
     let maximum_interval = proto
-        .and_then(|p| proto_duration_to_time(p.maximum_interval.as_ref()))
+        .and_then(|p| retry_duration_to_time(p.maximum_interval.as_ref(), p.maximum_attempts))
         .filter(|interval| !interval.is_zero())
-        .unwrap_or(initial_interval * 100);
+        .unwrap_or(
+            initial_interval
+                .saturating_mul(100)
+                .min(time::Duration::seconds(3_153_600_000)),
+        );
     RetryPolicy {
         initial_interval,
         backoff_coefficient,
@@ -805,17 +940,23 @@ fn activity_retry_policy_with_defaults(
 /// generic `retry_policy_to_domain`, which uses BackoffCoefficient 1.0 — is what
 /// makes the workflow retry chain match the release.
 fn workflow_retry_policy_with_defaults(proto: &tokeira_proto::common::RetryPolicy) -> RetryPolicy {
-    let initial_interval = proto_duration_to_time(proto.initial_interval.as_ref())
-        .filter(|interval| !interval.is_zero())
-        .unwrap_or(time::Duration::seconds(1));
+    let initial_interval =
+        retry_duration_to_time(proto.initial_interval.as_ref(), proto.maximum_attempts)
+            .filter(|interval| !interval.is_zero())
+            .unwrap_or(time::Duration::seconds(1));
     let backoff_coefficient = if proto.backoff_coefficient > 0.0 {
         proto.backoff_coefficient
     } else {
         2.0
     };
-    let maximum_interval = proto_duration_to_time(proto.maximum_interval.as_ref())
-        .filter(|interval| !interval.is_zero())
-        .unwrap_or(initial_interval * 100);
+    let maximum_interval =
+        retry_duration_to_time(proto.maximum_interval.as_ref(), proto.maximum_attempts)
+            .filter(|interval| !interval.is_zero())
+            .unwrap_or(
+                initial_interval
+                    .saturating_mul(100)
+                    .min(time::Duration::seconds(3_153_600_000)),
+            );
     RetryPolicy {
         initial_interval,
         backoff_coefficient,
@@ -1204,6 +1345,13 @@ fn reject_internal_per_ns_task_queue(task_queue: &str) -> Result<(), ProtoConver
 pub fn start_request_to_edge(
     req: workflowservice::StartWorkflowExecutionRequest,
 ) -> Result<StartWorkflowExecutionRequest, ProtoConversionError> {
+    validate_start_durations(
+        req.workflow_execution_timeout.as_ref(),
+        req.workflow_run_timeout.as_ref(),
+        req.workflow_task_timeout.as_ref(),
+        req.workflow_start_delay.as_ref(),
+    )?;
+    validate_retry_durations(req.retry_policy.as_ref())?;
     reject_behavioral_time_skipping(
         req.time_skipping_config.as_ref(),
         "StartWorkflowExecutionRequest.time_skipping_config",
@@ -2656,7 +2804,7 @@ pub fn respond_completed_request_to_edge(
         .iter()
         .position(|(command, _)| {
             matches!(
-                command,
+                command.semantic_command(),
                 WorkflowCommand::CompleteWorkflow { .. }
                     | WorkflowCommand::FailWorkflow { .. }
                     | WorkflowCommand::CancelWorkflow { .. }
@@ -3200,15 +3348,20 @@ pub fn count_activity_request_to_edge(
 pub fn register_namespace_request_to_edge(
     req: workflowservice::RegisterNamespaceRequest,
 ) -> Result<EdgeRegisterNamespaceRequest, ProtoConversionError> {
-    // Carry the client's requested retention through to the namespace model; a
-    // missing or non-positive value falls back to the scoped-model default so the
-    // field is always present (Temporal clients/UI require it).
+    // Sign errors use the namespace-specific message; minimum/default retention
+    // policy is unchanged (service/frontend/namespace_handler.go:1065-1078 @ v1.31.0).
     let retention = req
         .workflow_execution_retention_period
-        .map(|d| {
-            time::Duration::seconds(d.seconds) + time::Duration::nanoseconds(i64::from(d.nanos))
+        .as_ref()
+        .map(|value| {
+            validate_and_cap_proto_duration(Some(value)).map_err(|_| {
+                ProtoConversionError::InvalidArgument(
+                    "A valid retention period is not set on request.".to_owned(),
+                )
+            })
         })
-        .filter(|d| d.is_positive())
+        .transpose()?
+        .filter(|duration| duration.is_positive())
         .unwrap_or_else(|| {
             time::Duration::seconds(crate::namespace_cache::DEFAULT_NAMESPACE_RETENTION_SECONDS)
         });
@@ -4688,6 +4841,13 @@ pub fn reset_response_to_proto(
 pub fn signal_with_start_request_to_edge(
     req: workflowservice::SignalWithStartWorkflowExecutionRequest,
 ) -> Result<EdgeSignalWithStartWorkflowExecutionRequest, ProtoConversionError> {
+    validate_start_durations(
+        req.workflow_execution_timeout.as_ref(),
+        req.workflow_run_timeout.as_ref(),
+        req.workflow_task_timeout.as_ref(),
+        req.workflow_start_delay.as_ref(),
+    )?;
+    validate_retry_durations(req.retry_policy.as_ref())?;
     reject_behavioral_time_skipping(
         req.time_skipping_config.as_ref(),
         "SignalWithStartWorkflowExecutionRequest.time_skipping_config",
@@ -5005,11 +5165,184 @@ fn protocol_message_sizes(body: Option<&prost_types::Any>) -> CommandPayloadSize
     }
 }
 
+/// Preserve validation at the proto boundary: mixed signs disappear on conversion.
+/// Causes/messages: service/history/api/command_attr_validator.go:136-157,386-517;
+/// chasm/lib/activity/validator.go:149-160;
+/// components/nexusoperations/workflow/commands.go:120-143 @ v1.31.0.
+fn invalid_command_duration(
+    attributes: Option<&command::command::Attributes>,
+) -> Option<WorkflowCommand> {
+    let mut workflow_type = String::new();
+    let mut task_queue = String::new();
+    let (cause, message) = match attributes? {
+        Attributes::StartTimerCommandAttributes(attrs) => (
+            WorkflowTaskFailedCause::BadStartTimerAttributes,
+            invalid_timer_duration(attrs),
+        ),
+        Attributes::ScheduleActivityTaskCommandAttributes(attrs) => (
+            WorkflowTaskFailedCause::BadScheduleActivityAttributes,
+            invalid_activity_duration(attrs),
+        ),
+        Attributes::StartChildWorkflowExecutionCommandAttributes(attrs) => (
+            WorkflowTaskFailedCause::BadStartChildExecutionAttributes,
+            invalid_child_workflow_duration(attrs),
+        ),
+        Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(attrs) => {
+            workflow_type = attrs
+                .workflow_type
+                .as_ref()
+                .map(|kind| kind.name.clone())
+                .unwrap_or_default();
+            task_queue = attrs
+                .task_queue
+                .as_ref()
+                .map(|queue| queue.name.clone())
+                .unwrap_or_default();
+            (
+                WorkflowTaskFailedCause::BadContinueAsNewAttributes,
+                invalid_continue_as_new_duration(attrs),
+            )
+        }
+        Attributes::ScheduleNexusOperationCommandAttributes(attrs) => (
+            WorkflowTaskFailedCause::BadScheduleNexusOperationAttributes,
+            invalid_nexus_duration(attrs),
+        ),
+        _ => return None,
+    };
+    message.map(|message| WorkflowCommand::InvalidDuration {
+        cause,
+        message,
+        workflow_type,
+        task_queue,
+    })
+}
+
+fn invalid_timer_duration(attrs: &command::StartTimerCommandAttributes) -> Option<String> {
+    validate_and_cap_proto_duration(attrs.start_to_fire_timeout.as_ref())
+        .err()
+        .map(|error| {
+            format!(
+                "An invalid StartToFireTimeout is set on StartTimerCommand: {error}. \
+                 TimerId={}",
+                attrs.timer_id,
+            )
+        })
+}
+
+fn invalid_activity_duration(
+    attrs: &command::ScheduleActivityTaskCommandAttributes,
+) -> Option<String> {
+    validate_retry_durations(attrs.retry_policy.as_ref())
+        .and_then(|()| {
+            validate_activity_durations(
+                attrs.schedule_to_close_timeout.as_ref(),
+                attrs.schedule_to_start_timeout.as_ref(),
+                attrs.start_to_close_timeout.as_ref(),
+                attrs.heartbeat_timeout.as_ref(),
+            )
+        })
+        .err()
+        .map(|error| error.to_string())
+}
+
+fn invalid_child_workflow_duration(
+    attrs: &command::StartChildWorkflowExecutionCommandAttributes,
+) -> Option<String> {
+    let context = format!(
+        "WorkflowId={} WorkflowType={} Namespace={}",
+        attrs.workflow_id,
+        attrs
+            .workflow_type
+            .as_ref()
+            .map_or("", |kind| kind.name.as_str()),
+        attrs.namespace,
+    );
+    [
+        (
+            "WorkflowExecutionTimeout",
+            attrs.workflow_execution_timeout.as_ref(),
+        ),
+        ("WorkflowRunTimeout", attrs.workflow_run_timeout.as_ref()),
+        ("WorkflowTaskTimeout", attrs.workflow_task_timeout.as_ref()),
+    ]
+    .into_iter()
+    .find_map(|(name, value)| {
+        validate_and_cap_proto_duration(value).err().map(|error| {
+            format!("Invalid {name} on StartChildWorkflowExecutionCommand: {error}. {context}")
+        })
+    })
+    .or_else(|| {
+        validate_retry_durations(attrs.retry_policy.as_ref())
+            .err()
+            .map(|error| {
+                format!(
+                    "invalid WorkflowRetryPolicy on StartChildWorkflowExecutionCommand: \
+                     {error}. {context}"
+                )
+            })
+    })
+}
+
+fn invalid_continue_as_new_duration(
+    attrs: &command::ContinueAsNewWorkflowExecutionCommandAttributes,
+) -> Option<String> {
+    [
+        ("WorkflowRunTimeout", attrs.workflow_run_timeout.as_ref()),
+        ("WorkflowTaskTimeout", attrs.workflow_task_timeout.as_ref()),
+        (
+            "BackoffStartInterval",
+            attrs.backoff_start_interval.as_ref(),
+        ),
+    ]
+    .into_iter()
+    .find_map(|(name, value)| {
+        validate_and_cap_proto_duration(value).err().map(|error| {
+            format!("Invalid {name} on ContinueAsNewWorkflowExecutionCommand: {error}")
+        })
+    })
+    .or_else(|| {
+        validate_retry_durations(attrs.retry_policy.as_ref())
+            .err()
+            .map(|error| {
+                format!(
+                    "invalid WorkflowRetryPolicy on ContinueAsNewWorkflowExecutionCommand: \
+                     {error}"
+                )
+            })
+    })
+}
+
+fn invalid_nexus_duration(
+    attrs: &command::ScheduleNexusOperationCommandAttributes,
+) -> Option<String> {
+    [
+        (
+            "ScheduleToCloseTimeout",
+            attrs.schedule_to_close_timeout.as_ref(),
+        ),
+        (
+            "ScheduleToStartTimeout",
+            attrs.schedule_to_start_timeout.as_ref(),
+        ),
+        ("StartToCloseTimeout", attrs.start_to_close_timeout.as_ref()),
+    ]
+    .into_iter()
+    .find_map(|(name, value)| {
+        validate_and_cap_proto_duration(value).err().map(|error| {
+            format!("ScheduleNexusOperationCommandAttributes.{name} is invalid: {error}")
+        })
+    })
+}
+
 pub fn proto_command_to_workflow_command(
     cmd: command::Command,
     default_namespace: &str,
 ) -> Result<WorkflowCommand, ProtoConversionError> {
     use command::command::Attributes;
+
+    if let Some(invalid) = invalid_command_duration(cmd.attributes.as_ref()) {
+        return Ok(invalid);
+    }
 
     match cmd.attributes {
         Some(Attributes::ScheduleActivityTaskCommandAttributes(attrs)) => {
@@ -5057,13 +5390,11 @@ pub fn proto_command_to_workflow_command(
             })
         }
         Some(Attributes::StartTimerCommandAttributes(attrs)) => {
-            let delay = attrs
-                .start_to_fire_timeout
-                .map(|d| time::Duration::new(d.seconds, d.nanos))
+            let delay = proto_duration_to_time(attrs.start_to_fire_timeout.as_ref())
                 .unwrap_or(time::Duration::ZERO);
-            Ok(WorkflowCommand::StartTimer {
+            Ok(WorkflowCommand::StartTimerWithTimeout {
                 timer_id: attrs.timer_id,
-                fire_at: OffsetDateTime::now_utc() + delay,
+                timeout: delay,
             })
         }
         Some(Attributes::UpsertWorkflowSearchAttributesCommandAttributes(attrs)) => {
@@ -5156,7 +5487,8 @@ pub fn proto_command_to_workflow_command(
                 .as_ref()
                 .map(task_queue_to_domain)
                 .unwrap_or_default();
-            Ok(WorkflowCommand::ContinueAsNew {
+            let backoff = proto_duration_to_time(attrs.backoff_start_interval.as_ref());
+            let command = WorkflowCommand::ContinueAsNew {
                 new_run_id: RunId::new(),
                 workflow_type: WorkflowType(
                     attrs
@@ -5192,6 +5524,13 @@ pub fn proto_command_to_workflow_command(
                 // Runtime fills this only after resolving predecessor state and
                 // cross-task-queue membership.
                 successor_versioning_info: None,
+            };
+            Ok(match backoff {
+                Some(backoff) => WorkflowCommand::ContinueAsNewWithBackoff {
+                    command: Box::new(command),
+                    backoff,
+                },
+                None => command,
             })
         }
         Some(Attributes::StartChildWorkflowExecutionCommandAttributes(attrs)) => {
@@ -5379,6 +5718,15 @@ pub fn workflow_command_to_proto(
     cmd: &WorkflowCommand,
 ) -> Result<command::Command, ProtoConversionError> {
     use command::command::Attributes;
+    if let WorkflowCommand::ContinueAsNewWithBackoff { command, backoff } = cmd {
+        let mut wire = workflow_command_to_proto(command)?;
+        if let Some(Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(attrs)) =
+            &mut wire.attributes
+        {
+            attrs.backoff_start_interval = Some(to_proto_duration(*backoff));
+        }
+        return Ok(wire);
+    }
     let attributes = match cmd {
         WorkflowCommand::ScheduleActivity {
             activity_id,
@@ -5415,6 +5763,12 @@ pub fn workflow_command_to_proto(
                 ..Default::default()
             },
         )),
+        WorkflowCommand::StartTimerWithTimeout { timer_id, timeout } => Some(
+            Attributes::StartTimerCommandAttributes(command::StartTimerCommandAttributes {
+                timer_id: timer_id.clone(),
+                start_to_fire_timeout: Some(to_proto_duration(*timeout)),
+            }),
+        ),
         WorkflowCommand::StartTimer { timer_id, fire_at } => {
             let now = OffsetDateTime::now_utc();
             let delay = *fire_at - now;
@@ -5671,7 +6025,9 @@ pub fn workflow_command_to_proto(
         WorkflowCommand::UpdateCompleted { .. }
         | WorkflowCommand::UpdateRejected { .. }
         | WorkflowCommand::RequestNewWorkflowTask
-        | WorkflowCommand::InvalidSearchAttributes { .. } => {
+        | WorkflowCommand::InvalidSearchAttributes { .. }
+        | WorkflowCommand::InvalidDuration { .. }
+        | WorkflowCommand::ContinueAsNewWithBackoff { .. } => {
             return Err(ProtoConversionError::MissingField(
                 "WorkflowCommand has no proto Command equivalent",
             ));
@@ -6309,6 +6665,13 @@ pub fn record_activity_heartbeat_by_id_to_proto(
 pub(crate) fn activity_options_to_edge(
     value: &activity_proto::ActivityOptions,
 ) -> Result<crate::translate::ActivityOptions, ProtoConversionError> {
+    validate_activity_durations(
+        value.schedule_to_close_timeout.as_ref(),
+        value.schedule_to_start_timeout.as_ref(),
+        value.start_to_close_timeout.as_ref(),
+        value.heartbeat_timeout.as_ref(),
+    )?;
+    validate_retry_durations(value.retry_policy.as_ref())?;
     Ok(crate::translate::ActivityOptions {
         task_queue: value.task_queue.as_ref().map(|queue| queue.name.clone()),
         schedule_to_close_timeout: proto_duration_to_time(value.schedule_to_close_timeout.as_ref()),
@@ -6318,6 +6681,49 @@ pub(crate) fn activity_options_to_edge(
         retry_policy: value.retry_policy.as_ref().map(retry_policy_to_domain),
         priority: priority_to_edge(value.priority.as_ref())?,
     })
+}
+
+/// Validate only durations selected by the patch; unselected fields and the
+/// restore-only body are ignored before validation (service/history/api/
+/// updateactivityoptions/api.go:37-43,196-207 @ v1.31.0).
+pub(crate) fn activity_options_patch_to_edge(
+    value: &activity_proto::ActivityOptions,
+    update_mask: &[String],
+    restore_original: bool,
+) -> Result<crate::translate::ActivityOptions, ProtoConversionError> {
+    let selected = |field| {
+        !restore_original && crate::workflow_service::option_field_selected(update_mask, field)
+    };
+    let mut value = value.clone();
+    for (field, duration) in [
+        (
+            "schedule_to_close_timeout",
+            &mut value.schedule_to_close_timeout,
+        ),
+        (
+            "schedule_to_start_timeout",
+            &mut value.schedule_to_start_timeout,
+        ),
+        ("start_to_close_timeout", &mut value.start_to_close_timeout),
+        ("heartbeat_timeout", &mut value.heartbeat_timeout),
+    ] {
+        if !selected(field) {
+            *duration = None;
+        }
+    }
+    if !selected("retry_policy") {
+        value.retry_policy = None;
+    } else if !crate::workflow_service::option_field_exact_selected(update_mask, "retry_policy")
+        && let Some(policy) = value.retry_policy.as_mut()
+    {
+        if !selected("retry_policy.initial_interval") {
+            policy.initial_interval = None;
+        }
+        if !selected("retry_policy.maximum_interval") {
+            policy.maximum_interval = None;
+        }
+    }
+    activity_options_to_edge(&value)
 }
 
 fn activity_options_to_proto(
@@ -6359,10 +6765,11 @@ pub fn update_activity_options_to_edge(
         Activity::Type(activity_type) => crate::translate::ActivityTarget::Type(activity_type),
         Activity::MatchAll(_) => crate::translate::ActivityTarget::MatchAll,
     };
+    let update_mask = req.update_mask.map(|mask| mask.paths).unwrap_or_default();
     let activity_options = req
         .activity_options
         .as_ref()
-        .map(activity_options_to_edge)
+        .map(|options| activity_options_patch_to_edge(options, &update_mask, req.restore_original))
         .transpose()?;
     Ok(crate::translate::UpdateActivityOptionsRequest {
         namespace: req.namespace,
@@ -6370,7 +6777,7 @@ pub fn update_activity_options_to_edge(
         run_id: non_empty(execution.run_id),
         identity: req.identity,
         activity_options,
-        update_mask: req.update_mask.map(|mask| mask.paths).unwrap_or_default(),
+        update_mask,
         target,
         restore_original: req.restore_original,
         activity_type: None,
@@ -6437,7 +6844,7 @@ pub fn unpause_activity_to_edge(
         target,
         reset_attempts: req.reset_attempts,
         reset_heartbeat: req.reset_heartbeat,
-        jitter: proto_duration_to_time(req.jitter.as_ref()),
+        jitter: proto_duration_value(req.jitter.as_ref()),
     })
 }
 
@@ -6467,7 +6874,7 @@ pub fn reset_activity_to_edge(
         target,
         reset_heartbeat: req.reset_heartbeat,
         keep_paused: req.keep_paused,
-        jitter: proto_duration_to_time(req.jitter.as_ref()),
+        jitter: proto_duration_value(req.jitter.as_ref()),
         restore_original_options: req.restore_original_options,
     })
 }
@@ -7164,6 +7571,18 @@ mod tests {
     use tokeira_kernel::state::WorkflowVersioningInfo;
     use tokeira_proto::public::temporal::api::{filter::v1 as filter, taskqueue::v1 as taskqueue};
     use tokeira_types::RunKey;
+
+    #[test]
+    fn proto_duration_conversion_caps_large_values() {
+        let duration = prost_types::Duration {
+            seconds: i64::MAX,
+            nanos: i32::MAX,
+        };
+        assert_eq!(
+            proto_duration_to_time(Some(&duration)),
+            Some(time::Duration::seconds(3_153_600_000)),
+        );
+    }
 
     #[cfg(feature = "conformance")]
     static VISIBILITY_PAGE_SIZE_OVERRIDE_TEST_LOCK: std::sync::Mutex<()> =
@@ -10605,3 +11024,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "duration_tests.rs"]
+mod duration_tests;

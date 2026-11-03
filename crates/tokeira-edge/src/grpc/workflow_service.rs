@@ -6,6 +6,8 @@
 //! layer owns field mapping and the edge `WorkflowService` owns
 //! orchestration.
 
+use tokeira_kernel::deadline_after;
+
 use std::{collections::BTreeMap, sync::Arc};
 
 use prost::Message as _;
@@ -56,9 +58,8 @@ fn standalone_provenance_expiry(
     served_at: OffsetDateTime,
     start_to_close_nanos: i64,
 ) -> Option<OffsetDateTime> {
-    served_at
-        .checked_add(time::Duration::nanoseconds(start_to_close_nanos))
-        .filter(|expires_at| *expires_at > served_at)
+    let expires_at = deadline_after(served_at, time::Duration::nanoseconds(start_to_close_nanos));
+    (expires_at > served_at).then_some(expires_at)
 }
 
 fn shutdown_worker_task_classes(task_queue_types: &[i32]) -> Vec<WorkerTaskClass> {
@@ -478,21 +479,7 @@ fn namespace_resolution_status(error: crate::errors::EdgeError) -> Status {
 fn proto_timestamp_to_time(value: &prost_types::Timestamp) -> Option<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp(value.seconds)
         .ok()
-        .map(|time| time + time::Duration::nanoseconds(i64::from(value.nanos)))
-}
-
-/// Convert an optional proto `Duration` to whole nanoseconds, treating an absent
-/// value as `0` (the bridge's "unset" sentinel; normalization applies the real
-/// defaults). Saturating arithmetic keeps a hostile or overflowing duration from
-/// panicking the handler.
-fn proto_duration_to_nanos(value: Option<&prost_types::Duration>) -> i64 {
-    match value {
-        Some(duration) => duration
-            .seconds
-            .saturating_mul(1_000_000_000)
-            .saturating_add(i64::from(duration.nanos)),
-        None => 0,
-    }
+        .map(|time| deadline_after(time, time::Duration::nanoseconds(i64::from(value.nanos))))
 }
 
 /// Build a `PollActivityTaskQueueResponse` for a standalone-activity task served
@@ -731,7 +718,10 @@ fn chasm_activity_info(
         expiration_time: (description.schedule_to_close_nanos > 0)
             .then(|| {
                 nanos_to_proto_timestamp(
-                    description.scheduled_time_nanos + description.schedule_to_close_nanos,
+                    description
+                        .scheduled_time_nanos
+                        .checked_add(description.schedule_to_close_nanos)
+                        .unwrap_or(i64::MAX),
                 )
             })
             .flatten(),
@@ -3667,6 +3657,12 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         // result into scalar fields on the activity state (the pure crate is
         // proto-free). Computed before `req.retry_policy` is moved into the opaque
         // describe-echo bytes below.
+        let [
+            schedule_to_close_nanos,
+            schedule_to_start_nanos,
+            start_to_close_nanos,
+            heartbeat_nanos,
+        ] = translate::standalone_activity_durations(&req).map_err(proto_conversion_status)?;
         let retry_policy = defaulted_retry_policy(req.retry_policy.as_ref());
         let (retry_initial, retry_coefficient, retry_maximum, retry_max_attempts) =
             retry_policy_fields(&retry_policy);
@@ -3688,14 +3684,10 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             // The activity input is opaque to the edge; carry the encoded
             // `Payloads` envelope through to the component verbatim.
             input: req.input.map(|p| p.encode_to_vec()).unwrap_or_default(),
-            schedule_to_start_nanos: proto_duration_to_nanos(
-                req.schedule_to_start_timeout.as_ref(),
-            ),
-            schedule_to_close_nanos: proto_duration_to_nanos(
-                req.schedule_to_close_timeout.as_ref(),
-            ),
-            start_to_close_nanos: proto_duration_to_nanos(req.start_to_close_timeout.as_ref()),
-            heartbeat_nanos: proto_duration_to_nanos(req.heartbeat_timeout.as_ref()),
+            schedule_to_start_nanos,
+            schedule_to_close_nanos,
+            start_to_close_nanos,
+            heartbeat_nanos,
             // Standalone activities have no enclosing run; schedule-to-close is the
             // outer cap, applied during normalization.
             run_timeout_nanos: 0,

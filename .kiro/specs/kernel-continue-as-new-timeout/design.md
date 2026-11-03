@@ -392,3 +392,15 @@ All tests extend existing files:
 - Golden tests → `tokeira/crates/tokeira-kernel/tests/golden_tests.rs`
 
 No new test files are created.
+
+### Property 10: Proto duration failures and continue-as-new backoff
+
+For any wire seconds/nanos pair or stored duration in this feature, conversion and deadline arithmetic SHALL be total. Accepted values SHALL preserve the specified cap, and rejected command values SHALL retain their cause and message. Every unrepresentable deadline SHALL saturate at the latest representable date, including underflow from malformed negative stored durations.
+
+**Validates: Requirements 9.1.**
+
+Ground truth: `service/history/api/command_attr_validator.go:386-443,453-517`, `components/nexusoperations/workflow/commands.go:120-143`, and `service/history/workflow/mutable_state_impl.go:2675-2694 @ v1.31.0`. ContinueAsNew uses BAD_CONTINUE_AS_NEW_ATTRIBUTES; StartChild uses BAD_START_CHILD_EXECUTION_ATTRIBUTES; Nexus uses BAD_SCHEDULE_NEXUS_OPERATION_ATTRIBUTES. Exact field/error prefixes are retained at the edge; inherited ContinueAsNew names are rendered by the kernel.
+
+Verification: `duration_conversions_are_total`, `stored_start_delay_deadlines_are_total`, `invalid_duration_commands_fail_and_reschedule_atomically`, `continue_as_new_records_capped_backoff_in_successor_history`. Admission uses `validate_and_cap_proto_duration`; stored deadlines use saturating arithmetic because earlier rows did not pass that admission boundary. No schema or dependency changes are required.
+
+`InvalidDuration` and `ContinueAsNewWithBackoff` are appended after the existing command variants. The former preserves proto-only errors until kernel rejection and runtime failure/rescheduling; the latter carries the capped backoff without changing the legacy `ContinueAsNew` encoding. All existing variant positions and history encodings remain unchanged.

@@ -6,6 +6,8 @@
 //! module deliberately stores codec-neutral domain values so the edge crate can
 //! translate protobufs without owning schedule behavior.
 
+use tokeira_kernel::deadline_after;
+
 use std::{
     collections::{HashMap, VecDeque},
     hash::{Hash, Hasher},
@@ -564,13 +566,13 @@ pub fn compute_next_times(
 ) -> Vec<OffsetDateTime> {
     let mut out = Vec::new();
     let mut cursor = now;
-    while out.len() < count && cursor < now + Duration::days(366) {
-        let end = cursor + Duration::hours(24);
+    while out.len() < count && cursor < deadline_after(now, Duration::days(366)) {
+        let end = deadline_after(cursor, Duration::hours(24));
         out.extend(compute_matching_times(spec, cursor, end, schedule_id));
         out.sort();
         out.dedup();
         out.retain(|time| *time >= now);
-        cursor = end + Duration::seconds(1);
+        cursor = deadline_after(end, Duration::seconds(1));
     }
     out.truncate(count);
     out
@@ -623,18 +625,21 @@ pub fn cron_backoff_for_next_schedule(
 fn cron_next(cron: &str, t: OffsetDateTime) -> Result<OffsetDateTime, ScheduleError> {
     if let Some(interval) = parse_every_descriptor(cron)? {
         let floored = t - Duration::nanoseconds(i64::from(t.nanosecond()));
-        return Ok(floored + interval);
+        return Ok(deadline_after(floored, interval));
     }
     let spec = compile_standard_cron(cron)?;
     let next_minute = t.unix_timestamp() - i64::from(t.second()) + 60;
     let mut candidate = OffsetDateTime::from_unix_timestamp(next_minute)
         .map_err(|_| ScheduleError::InvalidArgument("invalid CronSchedule.".to_string()))?;
-    let end = t + Duration::days(366);
+    let end = deadline_after(t, Duration::days(366));
     while candidate <= end {
         if calendar_matches(&spec, candidate) {
             return Ok(candidate);
         }
-        candidate += Duration::minutes(1);
+        let Some(next) = candidate.checked_add(Duration::minutes(1)) else {
+            break;
+        };
+        candidate = next;
     }
     Err(ScheduleError::InvalidArgument(
         "invalid CronSchedule, no time can be found to satisfy the schedule".to_string(),
@@ -856,7 +861,10 @@ pub fn compute_matching_times(
             {
                 times.push(cursor);
             }
-            cursor += Duration::seconds(1);
+            let Some(next) = cursor.checked_add(Duration::seconds(1)) else {
+                break;
+            };
+            cursor = next;
         }
     }
 
@@ -969,9 +977,11 @@ fn apply_jitter(
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     schedule_id.hash(&mut hasher);
     time.unix_timestamp_nanos().hash(&mut hasher);
-    let span = jitter.whole_nanoseconds().max(0) as u64;
+    // Keep the positive nanosecond range before narrowing; truncation could
+    // wrap span + 1 to zero or turn the chosen offset negative on legacy rows.
+    let span = jitter.whole_nanoseconds().clamp(0, i128::from(i64::MAX)) as u64;
     let offset = (hasher.finish() % (span + 1)) as i64;
-    time + Duration::nanoseconds(offset)
+    deadline_after(time, Duration::nanoseconds(offset))
 }
 
 fn truncate_to_second(time: OffsetDateTime) -> OffsetDateTime {

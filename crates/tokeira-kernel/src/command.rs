@@ -2368,4 +2368,40 @@ pub enum WorkflowCommand {
     /// the compatibility edge; this sentinel lets the pure kernel author the
     /// durable v1.31.0 failure event atomically with WFT rescheduling.
     InvalidSearchAttributes { message: String },
+    /// Preserve proto-only duration errors until the kernel can atomically fail
+    /// and reschedule the workflow task. Continue-as-new context is resolved
+    /// against the authoritative run, because omitted names inherit its values.
+    InvalidDuration {
+        cause: WorkflowTaskFailedCause,
+        message: String,
+        workflow_type: String,
+        task_queue: String,
+    },
+    /// Carry a validated continue-as-new backoff without changing the positional
+    /// encoding of the existing command. Only wraps `ContinueAsNew`.
+    ContinueAsNewWithBackoff {
+        command: Box<WorkflowCommand>,
+        backoff: Duration,
+    },
+    /// Anchor a validated timeout at the transition clock so history records
+    /// the exact capped duration. Appended to preserve legacy command encoding.
+    StartTimerWithTimeout { timer_id: String, timeout: Duration },
+}
+
+impl WorkflowCommand {
+    /// The semantic command, including through a continue-as-new timing envelope.
+    pub fn semantic_command(&self) -> &Self {
+        match self {
+            Self::ContinueAsNewWithBackoff { command, .. } => command.semantic_command(),
+            other => other,
+        }
+    }
+
+    /// Mutable semantic command for runtime preparation of successor placement.
+    pub fn semantic_command_mut(&mut self) -> &mut Self {
+        match self {
+            Self::ContinueAsNewWithBackoff { command, .. } => command.semantic_command_mut(),
+            other => other,
+        }
+    }
 }

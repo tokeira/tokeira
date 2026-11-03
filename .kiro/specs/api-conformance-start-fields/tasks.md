@@ -109,3 +109,8 @@ Implement full external start field handling across `StartWorkflowExecution` and
 - The `CompletionCallback` field additions use `#[serde(default)]` so existing persisted runs deserialize without migration.
 - Property tests are required, not optional; they are externally-visible correctness contracts for the start surface.
 - Server-internal `continued_failure` / `last_completion_result` remain `INVALID_ARGUMENT` for external clients.
+
+## Duration validation and checked deadlines
+
+- [x] Verify Property 6 with the required property and regression tests: `duration_conversions_are_total`, `start_and_signal_with_start_validate_and_record_each_duration`.
+  _Requirements: 5._

@@ -12,6 +12,8 @@
 //! decides whether to start fresh, reuse an existing run, terminate-then-start,
 //! or reject — matching Temporal's `WorkflowIdConflictPolicy` (against an
 //! *open* run) and `WorkflowIdReusePolicy` (against the *latest closed* run).
+use tokeira_kernel::{deadline_after, deadline_before};
+
 use super::*;
 
 /// Temporal v1.31.0's eager-workflow-start compatibility value is enabled by
@@ -325,7 +327,7 @@ where
         };
         if pending.started_event_id != Some(3)
             || pending.attempt != 1
-            || request.now >= started_at + state.workflow_task_timeout
+            || request.now >= deadline_after(started_at, state.workflow_task_timeout)
         {
             return Ok(None);
         }
@@ -1215,7 +1217,7 @@ where
             let old_backoff = backoff_for(activity.retry_policy.as_ref());
             let anchor = activity
                 .current_attempt_scheduled_at
-                .map(|scheduled_at| scheduled_at - old_backoff)
+                .map(|scheduled_at| deadline_before(scheduled_at, old_backoff))
                 .unwrap_or(request.now);
             let new_policy = if request.restore_original_options {
                 original_options
@@ -1225,7 +1227,10 @@ where
                 patched_retry_policy(activity.retry_policy.clone(), &request.retry_policy)?
             };
             let new_backoff = backoff_for(new_policy.as_ref());
-            reschedule_at.insert(activity.activity_id.clone(), anchor + new_backoff);
+            reschedule_at.insert(
+                activity.activity_id.clone(),
+                deadline_after(anchor, new_backoff),
+            );
         }
 
         let result = self
@@ -1296,10 +1301,7 @@ where
                     let broker = self.activity_broker.clone();
                     let metrics = self.delivery_metrics.clone();
                     tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            delay.whole_milliseconds().max(0) as u64,
-                        ))
-                        .await;
+                        crate::deadline::sleep_until(dispatch_at).await;
                         if let Err(error) = broker.publish_activity_task(task, Some(&metrics)).await
                         {
                             tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish rescheduled activity after option update");
@@ -1712,11 +1714,11 @@ fn jittered_dispatch_at(now: OffsetDateTime, jitter: Option<Duration>) -> Offset
     let Some(jitter) = jitter.filter(|jitter| jitter.is_positive()) else {
         return now;
     };
-    let jitter_nanos = jitter.whole_nanoseconds().max(1) as u128;
+    let jitter_nanos = jitter.whole_nanoseconds().clamp(1, i128::from(i64::MAX)) as u128;
     let bytes = uuid::Uuid::new_v4().into_bytes();
     let entropy = u64::from_le_bytes(bytes[0..8].try_into().expect("16-byte uuid")) as u128;
     let offset_nanos = (entropy % jitter_nanos) as i64;
-    now + Duration::nanoseconds(offset_nanos)
+    deadline_after(now, Duration::nanoseconds(offset_nanos))
 }
 
 /// Precompute the retry policy an `UpdateActivityOptions` field-mask patch would

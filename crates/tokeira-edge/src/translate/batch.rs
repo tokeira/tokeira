@@ -247,7 +247,7 @@ pub fn start_batch_request_to_edge(
                     target,
                     reset_attempts: op.reset_attempts,
                     reset_heartbeat: op.reset_heartbeat,
-                    jitter: crate::grpc::translate::proto_duration_to_time(op.jitter.as_ref()),
+                    jitter: crate::grpc::translate::proto_duration_value(op.jitter.as_ref()),
                 },
             )
         }
@@ -276,13 +276,19 @@ pub fn start_batch_request_to_edge(
                     ));
                 }
             };
+            let update_mask = op.update_mask.map(|mask| mask.paths).unwrap_or_default();
             let options = op
                 .activity_options
                 .as_ref()
-                .map(crate::grpc::translate::activity_options_to_edge)
+                .map(|options| {
+                    crate::grpc::translate::activity_options_patch_to_edge(
+                        options,
+                        &update_mask,
+                        op.restore_original,
+                    )
+                })
                 .transpose()
                 .map_err(|error| BatchTranslateError::InvalidArgument(error.to_string()))?;
-            let update_mask = op.update_mask.map(|mask| mask.paths).unwrap_or_default();
             let patch = crate::workflow_service::build_activity_options_patch(
                 target,
                 options.as_ref(),

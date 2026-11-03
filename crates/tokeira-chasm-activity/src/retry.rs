@@ -74,8 +74,11 @@ pub fn retry_decision(state: &ActivityState, now: i64, override_nanos: i64) -> R
     if state.schedule_to_close_nanos == 0 {
         return RetryOutcome::Reschedule(interval);
     }
-    let deadline = state.scheduled_time_nanos + state.schedule_to_close_nanos;
-    if now + interval < deadline {
+    let deadline = crate::timeouts::deadline_after_nanos(
+        state.scheduled_time_nanos,
+        state.schedule_to_close_nanos,
+    );
+    if crate::timeouts::deadline_after_nanos(now, interval) < deadline {
         RetryOutcome::Reschedule(interval)
     } else {
         RetryOutcome::Terminal

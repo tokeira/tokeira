@@ -173,3 +173,8 @@ All changes are additive to the existing kernel and types crates. Types first (t
 - Each property test is tagged with its design property reference
 - `WorkflowExecutionFailed` gaining `retry_state` and `attempt` is a breaking change — task 4.3 covers all construction sites
 - Entity cleanup in `apply_workflow_execution_timed_out` uses `std::mem::take` pattern (same as Terminate in Feature 3)
+
+## Duration validation and checked deadlines
+
+- [x] Verify Property 10 with the required property and regression tests: `duration_conversions_are_total`, `stored_start_delay_deadlines_are_total`, `invalid_duration_commands_fail_and_reschedule_atomically`, `continue_as_new_records_capped_backoff_in_successor_history`.
+  _Requirements: 9.1._

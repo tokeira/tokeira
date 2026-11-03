@@ -6,6 +6,8 @@
 //! explicit and keep unsupported schedule-action fields from leaking into the
 //! runtime with surprising defaults.
 
+use tokeira_kernel::deadline_after;
+
 use prost_types::{Duration as ProtoDuration, Timestamp};
 use time::{Duration, OffsetDateTime};
 use tokeira_proto::{
@@ -367,6 +369,13 @@ pub fn schedule_action_to_domain(
             "schedule action must start workflow",
         ));
     };
+    crate::grpc::translate::validate_start_durations(
+        start.workflow_execution_timeout.as_ref(),
+        start.workflow_run_timeout.as_ref(),
+        start.workflow_task_timeout.as_ref(),
+        None,
+    )
+    .map_err(|error| Status::invalid_argument(error.to_string()))?;
     if start.versioning_override.is_some() {
         return Err(Status::invalid_argument(
             "schedule action versioning_override is not supported",
@@ -395,11 +404,15 @@ pub fn schedule_action_to_domain(
                 .map(payloads_to_domain)
                 .unwrap_or_default(),
             header: start.header.as_ref().map(headers_to_domain),
-            workflow_execution_timeout: proto_duration_to_time(
+            workflow_execution_timeout: crate::grpc::translate::proto_duration_to_time(
                 start.workflow_execution_timeout.as_ref(),
             ),
-            workflow_run_timeout: proto_duration_to_time(start.workflow_run_timeout.as_ref()),
-            workflow_task_timeout: proto_duration_to_time(start.workflow_task_timeout.as_ref()),
+            workflow_run_timeout: crate::grpc::translate::proto_duration_to_time(
+                start.workflow_run_timeout.as_ref(),
+            ),
+            workflow_task_timeout: crate::grpc::translate::proto_duration_to_time(
+                start.workflow_task_timeout.as_ref(),
+            ),
             retry_policy: start.retry_policy.as_ref().map(retry_policy_to_domain),
             memo: start.memo.as_ref().map(memo_to_domain).unwrap_or_default(),
             search_attributes: match start.search_attributes.as_ref() {
@@ -804,29 +817,31 @@ fn parse_named_int(value: &str) -> Result<i32, Status> {
 }
 
 fn proto_duration_to_time(value: Option<&ProtoDuration>) -> Option<Duration> {
-    value.map(|duration| {
-        Duration::seconds(duration.seconds) + Duration::nanoseconds(i64::from(duration.nanos))
-    })
+    crate::grpc::translate::proto_duration_value(value)
 }
 
 fn proto_timestamp_to_time(value: Option<&Timestamp>) -> Option<OffsetDateTime> {
     value.and_then(|timestamp| {
         OffsetDateTime::from_unix_timestamp(timestamp.seconds)
             .ok()
-            .map(|time| time + Duration::nanoseconds(i64::from(timestamp.nanos)))
+            .map(|time| deadline_after(time, Duration::nanoseconds(i64::from(timestamp.nanos))))
     })
 }
 
 fn retry_policy_to_domain(value: &common::RetryPolicy) -> RetryPolicy {
     RetryPolicy {
-        initial_interval: proto_duration_to_time(value.initial_interval.as_ref())
-            .unwrap_or(Duration::ZERO),
+        initial_interval: crate::grpc::translate::proto_duration_value(
+            value.initial_interval.as_ref(),
+        )
+        .unwrap_or(Duration::ZERO),
         backoff_coefficient: if value.backoff_coefficient > 0.0 {
             value.backoff_coefficient
         } else {
             1.0
         },
-        maximum_interval: proto_duration_to_time(value.maximum_interval.as_ref()),
+        maximum_interval: crate::grpc::translate::proto_duration_value(
+            value.maximum_interval.as_ref(),
+        ),
         maximum_attempts: value.maximum_attempts.max(0) as u32,
         non_retryable_error_types: value.non_retryable_error_types.clone(),
     }

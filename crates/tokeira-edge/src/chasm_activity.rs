@@ -1660,6 +1660,19 @@ pub(crate) fn defaulted_retry_policy(
             nanos: (maximum % 1_000_000_000) as i32,
         });
     }
+    if normalized.maximum_attempts != 1 {
+        for duration in [
+            &mut normalized.initial_interval,
+            &mut normalized.maximum_interval,
+        ] {
+            if let Some(value) = duration.as_mut()
+                && let Ok(capped) =
+                    crate::grpc::translate::validate_and_cap_proto_duration(Some(value))
+            {
+                *value = tokeira_proto::conversions::common::to_proto_duration(capped);
+            }
+        }
+    }
     normalized
 }
 

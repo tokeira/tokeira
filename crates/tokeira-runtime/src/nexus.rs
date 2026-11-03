@@ -4,6 +4,8 @@
 //! and registry, timeout tracking state, and the background scanner that
 //! detects timed-out Nexus operations.
 
+use tokeira_kernel::deadline_after;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex, OnceLock, RwLock},
@@ -101,15 +103,16 @@ pub fn nexus_operation_next_attempt_at(
     schedule_to_close_timeout: Option<Duration>,
     now: OffsetDateTime,
 ) -> Option<OffsetDateTime> {
-    let factor = NEXUS_RETRY_BACKOFF_COEFFICIENT.powi(failed_attempts as i32);
+    let factor =
+        NEXUS_RETRY_BACKOFF_COEFFICIENT.powi(i32::try_from(failed_attempts).unwrap_or(i32::MAX));
     let delay_secs = (NEXUS_RETRY_INITIAL_INTERVAL.as_seconds_f64() * factor)
         .min(NEXUS_RETRY_MAXIMUM_INTERVAL.as_seconds_f64());
-    let next = now + Duration::seconds_f64(delay_secs);
+    let next = deadline_after(now, Duration::saturating_seconds_f64(delay_secs));
     // Only cap when schedule-to-close is set and positive (zero/absent = unbounded,
     // matching the request-timeout treatment); a retry at/after the deadline is terminal.
     if let Some(stc) = schedule_to_close_timeout
         && stc.is_positive()
-        && next >= scheduled_at + stc
+        && next >= deadline_after(scheduled_at, stc)
     {
         return None;
     }
@@ -2452,7 +2455,7 @@ pub fn nexus_completion_backoff(
 
     // Hard positive floor: a degenerate (non-positive) config must not yield a zero
     // deadline that hot-loops the scanner.
-    Duration::seconds_f64(jittered.max(0.001))
+    Duration::saturating_seconds_f64(jittered.max(0.001))
 }
 
 /// Decide which Nexus timeout, if any, the live operation has breached at `now`.
@@ -2486,19 +2489,28 @@ pub fn evaluate_nexus_timeout(
     if let Some(timeout) = op.schedule_to_close_timeout
         && !timeout.is_zero()
     {
-        consider(op.scheduled_at + timeout, NexusTimeoutType::ScheduleToClose);
+        consider(
+            deadline_after(op.scheduled_at, timeout),
+            NexusTimeoutType::ScheduleToClose,
+        );
     }
     if !op.started
         && let Some(timeout) = op.schedule_to_start_timeout
         && !timeout.is_zero()
     {
-        consider(op.scheduled_at + timeout, NexusTimeoutType::ScheduleToStart);
+        consider(
+            deadline_after(op.scheduled_at, timeout),
+            NexusTimeoutType::ScheduleToStart,
+        );
     }
     if let Some(started_at) = op.started_at
         && let Some(timeout) = op.start_to_close_timeout
         && !timeout.is_zero()
     {
-        consider(started_at + timeout, NexusTimeoutType::StartToClose);
+        consider(
+            deadline_after(started_at, timeout),
+            NexusTimeoutType::StartToClose,
+        );
     }
 
     fired.map(|(_, kind)| kind)

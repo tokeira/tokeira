@@ -14,6 +14,12 @@
 //! are tagged with their `ShardId` so a handoff can drop exactly the runs this
 //! node no longer owns via [`WorkflowTimeoutTrackingState::remove_all_for_shard`]
 //! without disturbing co-resident shards.
+//!
+//! Unrepresentable deadlines saturate at the latest date. Admission caps new
+//! client durations, but recovered history can still contain earlier uncapped
+//! values; those must never panic or wrap into a different deadline.
+
+use tokeira_kernel::deadline_after;
 
 use std::sync::{Arc, RwLock};
 
@@ -147,15 +153,19 @@ pub fn evaluate_workflow_timeout(
 ) -> Option<WorkflowTimeoutViolation> {
     let execution_started_at = entry.first_run_started_at.unwrap_or(entry.started_at);
     if let Some(timeout) = entry.workflow_execution_timeout
-        && (now - execution_started_at > timeout
+        && (now > deadline_after(execution_started_at, timeout)
             || timeout.is_zero() && now >= execution_started_at)
     {
         return Some(WorkflowTimeoutViolation::ExecutionTimeout);
     }
 
-    let run_started_at = entry.started_at + entry.workflow_start_delay.unwrap_or(Duration::ZERO);
+    let run_started_at = deadline_after(
+        entry.started_at,
+        entry.workflow_start_delay.unwrap_or(Duration::ZERO),
+    );
     if let Some(timeout) = entry.workflow_run_timeout
-        && (now - run_started_at > timeout || timeout.is_zero() && now >= run_started_at)
+        && (now > deadline_after(run_started_at, timeout)
+            || timeout.is_zero() && now >= run_started_at)
     {
         return Some(WorkflowTimeoutViolation::RunTimeout);
     }
@@ -249,19 +259,26 @@ fn workflow_timeout_scan_delay(
             let entry = &tracked.value;
             [
                 entry.workflow_execution_timeout.map(|timeout| {
-                    entry.first_run_started_at.unwrap_or(entry.started_at) + timeout
+                    deadline_after(
+                        entry.first_run_started_at.unwrap_or(entry.started_at),
+                        timeout,
+                    )
                 }),
                 entry.workflow_run_timeout.map(|timeout| {
-                    entry.started_at
-                        + entry.workflow_start_delay.unwrap_or(Duration::ZERO)
-                        + timeout
+                    deadline_after(
+                        deadline_after(
+                            entry.started_at,
+                            entry.workflow_start_delay.unwrap_or(Duration::ZERO),
+                        ),
+                        timeout,
+                    )
                 }),
             ]
             .into_iter()
             .flatten()
         })
         // The existing evaluator uses a strict comparison for nonzero timeouts.
-        .map(|deadline| deadline + Duration::NANOSECOND - now)
+        .map(|deadline| deadline_after(deadline, Duration::NANOSECOND) - now)
         // An already overdue entry may have failed its storage read. Preserve
         // the normal retry interval instead of spinning on that failed entry.
         .filter(|remaining| *remaining > Duration::ZERO)
@@ -351,7 +368,11 @@ pub(crate) async fn submit_workflow_timeout<R: tokeira_storage::RunRepository + 
                 policy.maximum_attempts == 0 || state.attempt < policy.maximum_attempts;
             let backoff = crate::runtime::workflow_task::retry_backoff(policy, state.attempt);
             let within_deadline = state.workflow_execution_timeout.is_none_or(|timeout| {
-                now + backoff < state.first_run_started_at.unwrap_or(state.started_at) + timeout
+                deadline_after(now, backoff)
+                    < deadline_after(
+                        state.first_run_started_at.unwrap_or(state.started_at),
+                        timeout,
+                    )
             });
             (attempts_ok && within_deadline).then_some(backoff)
         });
@@ -367,8 +388,10 @@ pub(crate) async fn submit_workflow_timeout<R: tokeira_storage::RunRepository + 
             // The schedule anchor preserves phase; processing time controls the
             // new start and minimum interval (timer_queue_active_task_executor.go:
             // 743-754; mutable_state_impl.go:2675-2695 @ v1.31.0).
-            let scheduled_time =
-                state.started_at + state.workflow_start_delay.unwrap_or(Duration::ZERO);
+            let scheduled_time = deadline_after(
+                state.started_at,
+                state.workflow_start_delay.unwrap_or(Duration::ZERO),
+            );
             let backoff =
                 crate::schedule::cron_backoff_for_next_schedule(schedule, scheduled_time, now)?;
             new_execution_run_id = Some(tokeira_types::RunId::new());
@@ -420,6 +443,46 @@ mod successor_scan_tests {
             first_run_started_at: None,
             has_retry_policy: false,
         }
+    }
+
+    proptest::proptest! {
+        // Stored durations, including pre-admission values, never overflow either scanner path.
+        #[test]
+        fn stored_workflow_deadlines_are_total(
+            seconds in proptest::prelude::any::<i64>(),
+            nanos in -999_999_999i32..=999_999_999,
+            anchor in -377705116800i64..=253402300799,
+        ) {
+            let now = OffsetDateTime::from_unix_timestamp(anchor).unwrap();
+            let duration = Duration::seconds(seconds)
+                .saturating_add(Duration::nanoseconds(i64::from(nanos)));
+            let mut entry = entry(now);
+            entry.workflow_execution_timeout = Some(duration);
+            entry.workflow_run_timeout = Some(duration);
+            entry.workflow_start_delay = Some(duration);
+            let _ = evaluate_workflow_timeout(&entry, now);
+            let tracking = WorkflowTimeoutTrackingState::default();
+            tracking.insert(entry);
+            let maximum = tokio::time::Duration::from_secs(1);
+            proptest::prop_assert!(workflow_timeout_scan_delay(&tracking, now, maximum) <= maximum);
+        }
+    }
+
+    #[test]
+    fn stored_long_timeout_keeps_scan_bounded() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let mut entry = entry(now);
+        entry.workflow_execution_timeout = Some(Duration::days(365 * 10_000));
+        entry.workflow_run_timeout = Some(Duration::MAX);
+        entry.workflow_start_delay = Some(Duration::MAX);
+        assert_eq!(evaluate_workflow_timeout(&entry, now), None);
+        let tracking = WorkflowTimeoutTrackingState::default();
+        tracking.insert(entry);
+        let maximum = tokio::time::Duration::from_secs(1);
+        assert_eq!(
+            workflow_timeout_scan_delay(&tracking, now, maximum),
+            maximum
+        );
     }
 
     #[test]

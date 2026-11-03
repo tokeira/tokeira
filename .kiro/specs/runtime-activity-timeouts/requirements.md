@@ -131,3 +131,16 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 1. WHEN the Runtime is created, THE Runtime SHALL start the Activity_Timeout_Scanner background task.
 2. WHEN the Runtime is shut down, THE Runtime SHALL stop the Activity_Timeout_Scanner background task gracefully.
 3. IF the Activity_Timeout_Scanner encounters a transient error while loading activity state from storage, THEN THE Activity_Timeout_Scanner SHALL log the error and continue to the next scan cycle rather than crashing.
+
+### Requirement 9: Activity duration bounds and retry arithmetic
+
+**User Story:** As an operator, I want client and stored durations handled without overflow, so that validation and recovery remain reliable.
+
+Ground truth: `chasm/lib/activity/validator.go:149-160`, `common/retrypolicy/retry_policy.go:65-77`, and `service/history/workflow/retry.go:96-110 @ v1.31.0`. Existing timeout normalization and retry-boundary comparisons are unchanged; saturation protects legacy rows.
+
+#### Acceptance Criteria
+
+1. WHEN a ScheduleActivityTask command supplies invalid ScheduleToCloseTimeout, ScheduleToStartTimeout, StartToCloseTimeout or HeartbeatTimeout, THE Edge SHALL preserve `invalid <Field>: <error>` and BAD_SCHEDULE_ACTIVITY_ATTRIBUTES through the kernel invalid-command seam.
+2. WHEN activity timeouts or validated retry intervals exceed 100 × 365 days, THE Edge SHALL cap them before the authoritative history and state are built.
+3. WHEN evaluating activity windows, retry expiration, option-update redispatch or retry backoff from any stored duration, THE Runtime SHALL use total arithmetic and saturate future deadline overflow to the latest representable date.
+4. WHEN a retry coefficient produces an infinite or unrepresentable backoff, THE Runtime SHALL apply the configured maximum when present and otherwise saturate the conversion without panicking.

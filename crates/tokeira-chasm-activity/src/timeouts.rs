@@ -21,6 +21,10 @@
 //! - **heartbeat**: `max(last_heartbeat, started) + heartbeat`, valid only while
 //!   `STARTED`/`CANCEL_REQUESTED`; a heartbeat pushes the anchor out
 //!   (`activity_tasks.go` heartbeat `Validate`).
+//!
+//! Unrepresentable deadlines saturate at the latest date. Admission caps new
+//! client durations, but recovered history can still contain earlier uncapped
+//! values; those must never panic or wrap into a different deadline.
 
 use prost::Message as _;
 use tokeira_proto::{
@@ -33,6 +37,11 @@ use crate::{
     state::{ActivityState, ActivityStatus},
     statemachine::{ActivityEvent, TimeoutType},
 };
+
+/// Match the latest-date overflow policy used for workflow deadlines.
+pub(crate) fn deadline_after_nanos(anchor: i64, duration: i64) -> i64 {
+    anchor.checked_add(duration).unwrap_or(i64::MAX)
+}
 
 /// Earliest callback backoff deadline. The activity evaluator combines this with
 /// its activity timeout hint; terminal activity status does not suppress delivery work.
@@ -123,7 +132,10 @@ fn candidates(state: &ActivityState) -> Vec<Candidate> {
     if state.schedule_to_close_nanos > 0 {
         out.push(Candidate {
             timeout_type: TimeoutType::ScheduleToClose,
-            deadline: state.scheduled_time_nanos + state.schedule_to_close_nanos,
+            deadline: crate::timeouts::deadline_after_nanos(
+                state.scheduled_time_nanos,
+                state.schedule_to_close_nanos,
+            ),
         });
     }
 
@@ -131,7 +143,10 @@ fn candidates(state: &ActivityState) -> Vec<Candidate> {
         if state.schedule_to_start_nanos > 0 {
             out.push(Candidate {
                 timeout_type: TimeoutType::ScheduleToStart,
-                deadline: state.attempt_scheduled_time_nanos + state.schedule_to_start_nanos,
+                deadline: crate::timeouts::deadline_after_nanos(
+                    state.attempt_scheduled_time_nanos,
+                    state.schedule_to_start_nanos,
+                ),
             });
         }
     } else if matches!(
@@ -141,7 +156,10 @@ fn candidates(state: &ActivityState) -> Vec<Candidate> {
         if state.start_to_close_nanos > 0 {
             out.push(Candidate {
                 timeout_type: TimeoutType::StartToClose,
-                deadline: state.started_time_nanos + state.start_to_close_nanos,
+                deadline: crate::timeouts::deadline_after_nanos(
+                    state.started_time_nanos,
+                    state.start_to_close_nanos,
+                ),
             });
         }
         if state.heartbeat_nanos > 0 {
@@ -150,7 +168,7 @@ fn candidates(state: &ActivityState) -> Vec<Candidate> {
                 .max(state.started_time_nanos);
             out.push(Candidate {
                 timeout_type: TimeoutType::Heartbeat,
-                deadline: anchor + state.heartbeat_nanos,
+                deadline: crate::timeouts::deadline_after_nanos(anchor, state.heartbeat_nanos),
             });
         }
     }
@@ -204,6 +222,42 @@ mod tests {
         };
         s.set_status(ActivityStatus::Scheduled);
         s
+    }
+
+    proptest::proptest! {
+        // Every stored nanosecond deadline saturates instead of wrapping or panicking.
+        #[test]
+        fn stored_activity_deadlines_are_total(
+            anchor in proptest::prelude::any::<i64>(),
+            duration in proptest::prelude::any::<i64>(),
+        ) {
+            for status in [ActivityStatus::Scheduled, ActivityStatus::Started] {
+                let mut state = ActivityState {
+                    scheduled_time_nanos: anchor,
+                    attempt_scheduled_time_nanos: anchor,
+                    started_time_nanos: anchor,
+                    last_heartbeat_time_nanos: anchor,
+                    schedule_to_close_nanos: duration,
+                    schedule_to_start_nanos: duration,
+                    start_to_close_nanos: duration,
+                    heartbeat_nanos: duration,
+                    ..Default::default()
+                };
+                state.set_status(status);
+                let _ = due_timeout(&state, anchor);
+                let _ = next_timeout_deadline(&state);
+                let _ = retry_decision(&state, anchor, duration);
+                if duration > 0 {
+                    proptest::prop_assert_eq!(
+                        next_timeout_deadline(&state),
+                        Some(
+                            i64::try_from(i128::from(anchor) + i128::from(duration))
+                                .unwrap_or(i64::MAX)
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     #[test]

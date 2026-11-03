@@ -13,6 +13,8 @@
 //! `service/history/workflow/util.go`); the inline comments cite the specific
 //! source for each non-obvious decision.
 
+use tokeira_kernel::deadline_after;
+
 use super::*;
 use crate::successor::{
     SuccessorCause, SuccessorPlan, SuccessorStartedEvent, SuccessorTiming,
@@ -1089,7 +1091,7 @@ where
                     task_queue,
                     initial_versioning_behavior,
                     ..
-                } = command
+                } = command.semantic_command()
                 else {
                     return None;
                 };
@@ -1170,7 +1172,7 @@ where
         if let WorkflowCommand::ContinueAsNew {
             successor_versioning_info: slot,
             ..
-        } = &mut commands[command_index]
+        } = commands[command_index].semantic_command_mut()
         {
             *slot = successor_versioning_info;
         }
@@ -1542,15 +1544,19 @@ where
         Option<CronContinuation>,
         Option<SuccessorPlan>,
     )> {
-        let close = req.commands.iter().find(|command| {
-            matches!(
-                command,
-                WorkflowCommand::CompleteWorkflow { .. }
-                    | WorkflowCommand::FailWorkflow { .. }
-                    | WorkflowCommand::ContinueAsNew { .. }
-                    | WorkflowCommand::CancelWorkflow { .. }
-            )
-        });
+        let close = req
+            .commands
+            .iter()
+            .map(WorkflowCommand::semantic_command)
+            .find(|command| {
+                matches!(
+                    command,
+                    WorkflowCommand::CompleteWorkflow { .. }
+                        | WorkflowCommand::FailWorkflow { .. }
+                        | WorkflowCommand::ContinueAsNew { .. }
+                        | WorkflowCommand::CancelWorkflow { .. }
+                )
+            });
         if !matches!(
             close,
             Some(
@@ -1602,8 +1608,10 @@ where
             ));
         }
         if let Some(schedule) = started.cron_schedule.as_deref().filter(|s| !s.is_empty()) {
-            let scheduled_time =
-                state.started_at + state.workflow_start_delay.unwrap_or(Duration::ZERO);
+            let scheduled_time = deadline_after(
+                state.started_at,
+                state.workflow_start_delay.unwrap_or(Duration::ZERO),
+            );
             let backoff =
                 crate::schedule::cron_backoff_for_next_schedule(schedule, scheduled_time, req.now)?;
             let failure_retry_state = match retry {
@@ -1674,7 +1682,7 @@ where
         let backoff = retry_backoff(policy, state.attempt);
         if let Some(execution_timeout) = state.workflow_execution_timeout {
             let anchor = state.first_run_started_at.unwrap_or(state.started_at);
-            if req.now + backoff >= anchor + execution_timeout {
+            if deadline_after(req.now, backoff) >= deadline_after(anchor, execution_timeout) {
                 return Some(RetryContinuation::Terminal {
                     retry_state: RetryState::Timeout,
                 });
@@ -2039,7 +2047,7 @@ pub(crate) fn retry_backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
         Some(max) if max.as_seconds_f64() > 0.0 => seconds.min(max.as_seconds_f64()),
         _ => seconds,
     };
-    Duration::seconds_f64(capped.max(0.0))
+    Duration::saturating_seconds_f64(capped.max(0.0))
 }
 
 /// The server failure persisted on an invalid-command `WorkflowTaskFailed`

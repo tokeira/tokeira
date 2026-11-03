@@ -6,6 +6,10 @@
 //! pair. That contract is what makes the kernel safe to test with
 //! golden-file snapshots and property-based fuzzing, and what lets
 //! the runtime layer treat it as an opaque, infallible oracle.
+//!
+//! Unrepresentable deadlines saturate at the latest date. Admission caps new
+//! client durations, but recovered history can still contain earlier uncapped
+//! values; those must never panic or wrap into a different deadline.
 
 use std::collections::BTreeMap;
 
@@ -57,6 +61,24 @@ use crate::{
         ActivityOp, CallbackCompletionOutcome, DispatchOp, RequestDedupeOp, TimerOp, Transition,
     },
 };
+
+/// Compute a stored deadline without panicking. Any unrepresentable result is
+/// the latest UTC date, including underflow from malformed legacy durations.
+/// New client durations are validated at admission; replay cannot assume that
+/// older history passed those checks.
+pub fn deadline_after(anchor: OffsetDateTime, duration: Duration) -> OffsetDateTime {
+    anchor
+        .checked_add(duration)
+        .unwrap_or(time::PrimitiveDateTime::MAX.assume_utc())
+}
+
+/// Recover a deadline anchor by subtraction, with the same latest-date fallback
+/// as [`deadline_after`]. In particular, negating `Duration::MIN` is unnecessary.
+pub fn deadline_before(anchor: OffsetDateTime, duration: Duration) -> OffsetDateTime {
+    anchor
+        .checked_sub(duration)
+        .unwrap_or(time::PrimitiveDateTime::MAX.assume_utc())
+}
 
 #[path = "reset.rs"]
 mod reset;
@@ -199,8 +221,8 @@ pub fn continue_as_new_min_backoff(
 ) -> Option<time::Duration> {
     let lifetime = lifetime.max(time::Duration::ZERO);
     let backoff = command_backoff.unwrap_or(time::Duration::ZERO);
-    if lifetime + backoff < CONTINUE_AS_NEW_MIN_INTERVAL {
-        Some(CONTINUE_AS_NEW_MIN_INTERVAL - lifetime)
+    if lifetime.saturating_add(backoff) < CONTINUE_AS_NEW_MIN_INTERVAL {
+        Some(CONTINUE_AS_NEW_MIN_INTERVAL.saturating_sub(lifetime))
     } else {
         command_backoff
     }
@@ -520,7 +542,7 @@ impl BasicKernel {
             let timer = TimerState {
                 timer_id: WORKFLOW_START_DELAY_TIMER_ID.to_string(),
                 started_event_id: 0,
-                fire_at: first.happened_at + delay,
+                fire_at: deadline_after(first.happened_at, delay),
             };
             state.timers.insert(timer.timer_id.clone(), timer);
         }
@@ -726,7 +748,7 @@ impl BasicKernel {
             let timer = TimerState {
                 timer_id: WORKFLOW_START_DELAY_TIMER_ID.to_string(),
                 started_event_id: 0,
-                fire_at: req.now + delay,
+                fire_at: deadline_after(req.now, delay),
             };
             builder
                 .state
@@ -900,7 +922,7 @@ impl BasicKernel {
             let timer = TimerState {
                 timer_id: WORKFLOW_START_DELAY_TIMER_ID.to_string(),
                 started_event_id: 0,
-                fire_at: req.now + delay,
+                fire_at: deadline_after(req.now, delay),
             };
             builder
                 .state
@@ -5682,6 +5704,34 @@ fn normalize_activity_command(
     })
 }
 
+// Anchor timer timeouts in the same transition that records TimerStarted, so
+// translation latency cannot shorten the recorded timeout
+// (service/history/api/command_attr_validator.go:149-154
+// and service/history/workflow/mutable_state_impl.go:5037-5056 @ v1.31.0).
+fn apply_start_timer(
+    builder: &mut TransitionBuilder,
+    timer_id: String,
+    fire_at: OffsetDateTime,
+    workflow_task_completed_event_id: i64,
+) -> Result<bool, Reject> {
+    if builder.state.timers.contains_key(&timer_id) {
+        return Err(Reject::DuplicateTimerId(timer_id));
+    }
+    let started_event_id = builder.emit(HistoryEventKind::TimerStarted {
+        workflow_task_completed_event_id,
+        timer_id: timer_id.clone(),
+        fire_at,
+    });
+    let timer = TimerState {
+        timer_id: timer_id.clone(),
+        started_event_id,
+        fire_at,
+    };
+    builder.state.timers.insert(timer_id, timer.clone());
+    builder.timer_ops.push(TimerOp::Upsert(timer));
+    Ok(false)
+}
+
 fn apply_workflow_command(
     builder: &mut TransitionBuilder,
     command: WorkflowCommand,
@@ -5691,6 +5741,10 @@ fn apply_workflow_command(
     retry_continuation: Option<&RetryContinuation>,
     limits: &WorkflowTaskCompletionLimits,
 ) -> Result<bool, Reject> {
+    let (command, requested_backoff) = match command {
+        WorkflowCommand::ContinueAsNewWithBackoff { command, backoff } => (*command, Some(backoff)),
+        command => (command, None),
+    };
     match command {
         WorkflowCommand::ScheduleActivity {
             activity_id,
@@ -5834,23 +5888,14 @@ fn apply_workflow_command(
             Ok(false)
         }
         WorkflowCommand::StartTimer { timer_id, fire_at } => {
-            if builder.state.timers.contains_key(&timer_id) {
-                return Err(Reject::DuplicateTimerId(timer_id));
-            }
-            let started_event_id = builder.emit(HistoryEventKind::TimerStarted {
-                workflow_task_completed_event_id,
-                timer_id: timer_id.clone(),
-                fire_at,
-            });
-            let timer = TimerState {
-                timer_id: timer_id.clone(),
-                started_event_id,
-                fire_at,
-            };
-            builder.state.timers.insert(timer_id, timer.clone());
-            builder.timer_ops.push(TimerOp::Upsert(timer));
-            Ok(false)
+            apply_start_timer(builder, timer_id, fire_at, workflow_task_completed_event_id)
         }
+        WorkflowCommand::StartTimerWithTimeout { timer_id, timeout } => apply_start_timer(
+            builder,
+            timer_id,
+            deadline_after(builder.now, timeout),
+            workflow_task_completed_event_id,
+        ),
         WorkflowCommand::UpsertMemo(memo) => {
             builder.state.memo = memo;
             Ok(false)
@@ -5917,6 +5962,39 @@ fn apply_workflow_command(
             apply_search_attributes_patch(&mut builder.state.search_attributes, &patch);
             Ok(false)
         }
+        WorkflowCommand::InvalidDuration {
+            cause,
+            mut message,
+            workflow_type,
+            task_queue,
+        } => {
+            if cause == WorkflowTaskFailedCause::BadContinueAsNewAttributes {
+                let workflow_type = if workflow_type.is_empty() {
+                    &builder.state.workflow_type.0
+                } else {
+                    &workflow_type
+                };
+                let task_queue = if task_queue.is_empty() {
+                    &builder.state.task_queue.0
+                } else {
+                    &task_queue
+                };
+                // Validation runs after name inheritance and task-queue normalization
+                // (service/history/api/command_attr_validator.go:397-427 @ v1.31.0).
+                message.push_str(&format!(
+                    ". WorkflowType={workflow_type} TaskQueue=name:\"{task_queue}\" \
+                     kind:TASK_QUEUE_KIND_NORMAL"
+                ));
+            }
+            Err(Reject::InvalidCommandAttributes {
+                cause,
+                message: Some(message),
+            })
+        }
+        WorkflowCommand::ContinueAsNewWithBackoff { .. } => Err(Reject::InvalidCommandAttributes {
+            cause: WorkflowTaskFailedCause::BadContinueAsNewAttributes,
+            message: Some("nested continue-as-new timing envelope".to_owned()),
+        }),
         WorkflowCommand::InvalidSearchAttributes { message } => {
             Err(Reject::InvalidCommandAttributes {
                 cause: WorkflowTaskFailedCause::BadSearchAttributes,
@@ -6169,13 +6247,15 @@ fn apply_workflow_command(
             // only became available after its own delay still yields a fresh
             // backoff for the next generation (v1.31.0 uses ExecutionTime,
             // mutable_state_impl.go:2678-2679).
-            let execution_time = builder.state.started_at
-                + builder
+            let execution_time = deadline_after(
+                builder.state.started_at,
+                builder
                     .state
                     .workflow_start_delay
-                    .unwrap_or(time::Duration::ZERO);
+                    .unwrap_or(time::Duration::ZERO),
+            );
             let backoff_start_interval =
-                continue_as_new_min_backoff(None, builder.now - execution_time);
+                continue_as_new_min_backoff(requested_backoff, builder.now - execution_time);
             builder.emit(HistoryEventKind::WorkflowExecutionContinuedAsNew {
                 workflow_task_completed_event_id,
                 new_run_id,
@@ -8259,7 +8339,7 @@ impl TransitionBuilder {
             .map(|sticky| sticky.sticky_queue.clone())
             .unwrap_or_else(|| self.state.task_queue.clone());
         let schedule_to_start_deadline = match sticky_dispatch.as_ref() {
-            Some(sticky) => Some(self.now + sticky.schedule_to_start_timeout),
+            Some(sticky) => Some(deadline_after(self.now, sticky.schedule_to_start_timeout)),
             // A speculative task dispatched on the NORMAL queue carries the
             // pinned 5s schedule-to-start timeout so a task no worker picks up
             // reschedules a normal attempt-1 task; the timed-out Scheduled event

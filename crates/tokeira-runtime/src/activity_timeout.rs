@@ -21,6 +21,8 @@
 //! the tracking entry only supplies the timing anchors the durable state does not
 //! retain.
 
+use tokeira_kernel::deadline_after;
+
 use std::sync::{Arc, RwLock};
 
 use crate::shard::ShardOwner;
@@ -296,7 +298,7 @@ pub fn evaluate_activity_timeout(
 ) -> Option<TimeoutViolation> {
     if let Some(timeout) = activity.schedule_to_close_timeout
         && !timeout.is_zero()
-        && now - entry.original_scheduled_at > timeout
+        && now > deadline_after(entry.original_scheduled_at, timeout)
     {
         return Some(TimeoutViolation::ScheduleToClose);
     }
@@ -312,20 +314,20 @@ pub fn evaluate_activity_timeout(
             let heartbeat_at = entry
                 .last_heartbeat_at
                 .map_or(started_at, |at| at.max(started_at));
-            if now - heartbeat_at > timeout {
+            if now > deadline_after(heartbeat_at, timeout) {
                 return Some(TimeoutViolation::Heartbeat);
             }
         }
 
         if let Some(timeout) = activity.start_to_close_timeout
             && !timeout.is_zero()
-            && now - started_at > timeout
+            && now > deadline_after(started_at, timeout)
         {
             return Some(TimeoutViolation::StartToClose);
         }
     } else if let Some(timeout) = activity.schedule_to_start_timeout
         && !timeout.is_zero()
-        && now - entry.last_dispatched_at > timeout
+        && now > deadline_after(entry.last_dispatched_at, timeout)
     {
         return Some(TimeoutViolation::ScheduleToStart);
     }
@@ -451,7 +453,7 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
             let expiration = activity
                 .schedule_to_close_timeout
                 .filter(|timeout| !timeout.is_zero())
-                .map(|timeout| activity.scheduled_at + timeout);
+                .map(|timeout| deadline_after(activity.scheduled_at, timeout));
             // Timeout failures classify against the non-retryable list as
             // "TemporalTimeout:<type>" (`isRetryable`, retry.go:124-133 +
             // retrypolicy.TimeoutFailureTypePrefix @ v1.31.0).

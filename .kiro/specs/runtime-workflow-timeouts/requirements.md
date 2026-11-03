@@ -9,8 +9,8 @@ Workflow timeout detection is non-authoritative. The scanner is a delivery mecha
 Unlike the timer scanner (Feature 4), which reads from a dedicated storage timer bucket, the workflow timeout scanner needs to check open runs' `WorkflowState` for timeout configuration (`workflow_execution_timeout`, `workflow_run_timeout`) and the `started_at` timestamp. The chosen approach is runtime-local tracking state — consistent with the activity timeout scanner (Feature 3). The runtime tracks open runs that have timeout configuration and checks them periodically. This avoids expensive full-table scans of all open runs in storage.
 
 There are two distinct timeout types:
-- **Execution timeout** (`workflow_execution_timeout`): bounds the wall-clock time for the current run. Measured from `started_at` of the current run. Note: Temporal's execution timeout semantically spans the entire execution chain (including continue-as-new and retry runs). Chain-aware measurement requires a `first_run_started_at` timestamp that is not yet carried in `StartRequest` or `WorkflowState`. This is deferred to Feature 8 (Continue-As-New), which handles chain identity propagation. For now, execution timeout is measured from the current run's `started_at`, which is correct for single-run workflows and a conservative approximation for chains.
-- **Run timeout** (`workflow_run_timeout`): bounds the wall-clock time for a single run. Measured from `started_at` of the current run.
+- **Execution timeout** (`workflow_execution_timeout`): bounds the execution chain from `first_run_started_at`, falling back to `started_at` for legacy history without the chain anchor (`service/history/workflow/task_generator.go:153-183 @ v1.31.0`).
+- **Run timeout** (`workflow_run_timeout`): bounds the wall-clock time for a single run. Measured from the checked sum of `started_at` and the current run’s first-task backoff.
 
 This feature depends on Feature 1 (Lane OCC Retry and Mailbox Coalescing), which is already implemented.
 
@@ -21,8 +21,8 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 - **Runtime**: The execution shell (`tokeira-runtime`) that orchestrates command routing, kernel invocation, storage commits, and derived-effect publication.
 - **Lane**: A single-thread serial command processor hosting many run actors. Commands for a run are routed to one lane via `hash(run_key) mod lane_count`.
 - **Workflow_Timeout_Scanner**: A background task in the Runtime that periodically checks tracked open runs for workflow execution timeout and workflow run timeout violations, and submits `Command::WorkflowExecutionTimedOut` commands through the lane when violations are detected.
-- **Workflow_Execution_Timeout**: The maximum wall-clock time for the current run. Configured per workflow via `WorkflowState.workflow_execution_timeout`. Measured from the `started_at` of the current run. Note: chain-aware measurement across continue-as-new/retry is deferred to Feature 8.
-- **Workflow_Run_Timeout**: The maximum wall-clock time for a single run. Configured per workflow via `WorkflowState.workflow_run_timeout`. Measured from the `started_at` of the current run.
+- **Workflow_Execution_Timeout**: The maximum wall-clock time for the execution chain, configured by `WorkflowState.workflow_execution_timeout` and anchored at `first_run_started_at` (legacy fallback: `started_at`).
+- **Workflow_Run_Timeout**: The maximum wall-clock time for a single run. Configured per workflow via `WorkflowState.workflow_run_timeout`. Measured from the checked sum of `started_at` and first-task backoff.
 - **WorkflowTimeoutType**: Kernel enum distinguishing `ExecutionTimeout` from `RunTimeout`, carried in the `WorkflowExecutionTimedOutRequest`.
 - **RetryState**: Kernel enum describing the retry decision outcome, carried in the `WorkflowExecutionTimedOutRequest`.
 - **Workflow_Timeout_Tracking_State**: Runtime-local state that tracks open runs with timeout configuration. Keyed by `RunKey`, stores the timeout durations and the relevant `started_at` timestamp needed for timeout detection. This state is not part of the kernel's `WorkflowState` — it is a runtime-side tracking structure populated by lifecycle hooks.
@@ -38,7 +38,7 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 
 #### Acceptance Criteria
 
-1. WHEN a workflow has a configured `workflow_execution_timeout` and the elapsed time since the workflow's `started_at` exceeds the timeout, THE Workflow_Timeout_Scanner SHALL submit a `Command::WorkflowExecutionTimedOut` with `timeout_type` set to `WorkflowTimeoutType::ExecutionTimeout` to the owning run via the lane.
+1. WHEN a workflow has a configured `workflow_execution_timeout` and the current time exceeds the checked sum of its chain anchor and timeout, THE Workflow_Timeout_Scanner SHALL submit a `Command::WorkflowExecutionTimedOut` with `timeout_type` set to `WorkflowTimeoutType::ExecutionTimeout` to the owning run via the lane.
 2. THE Workflow_Timeout_Scanner SHALL set the `retry_state` field in the `WorkflowExecutionTimedOutRequest` to `RetryState::Timeout` when the workflow has a retry policy configured, or `RetryState::RetryPolicyNotSet` when no retry policy is configured. This feature does not evaluate retry eligibility (max attempts, non-retryable errors); full retry evaluation is a runtime concern handled by the retry/continue-as-new path.
 3. THE Workflow_Timeout_Scanner SHALL set the `now` field in the `WorkflowExecutionTimedOutRequest` to the wall-clock time at which the timeout violation was detected.
 4. THE Workflow_Timeout_Scanner SHALL only check execution timeout for runs that have a non-None `workflow_execution_timeout` in the Workflow_Timeout_Tracking_State.
@@ -51,7 +51,7 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 
 #### Acceptance Criteria
 
-1. WHEN a workflow has a configured `workflow_run_timeout` and the elapsed time since the current run's `started_at` exceeds the timeout, THE Workflow_Timeout_Scanner SHALL submit a `Command::WorkflowExecutionTimedOut` with `timeout_type` set to `WorkflowTimeoutType::RunTimeout` to the owning run via the lane.
+1. WHEN a workflow has a configured `workflow_run_timeout` and the current time exceeds the checked sum of the run’s execution time and timeout, THE Workflow_Timeout_Scanner SHALL submit a `Command::WorkflowExecutionTimedOut` with `timeout_type` set to `WorkflowTimeoutType::RunTimeout` to the owning run via the lane.
 2. THE Workflow_Timeout_Scanner SHALL check workflow run timeouts as part of the same scan cycle used for execution timeouts.
 3. WHEN both execution timeout and run timeout fire for the same run in the same scan cycle, THE Workflow_Timeout_Scanner SHALL submit only one `WorkflowExecutionTimedOut` command. The execution timeout SHALL take precedence over the run timeout.
 4. THE Workflow_Timeout_Scanner SHALL only check run timeout for runs that have a non-None `workflow_run_timeout` in the Workflow_Timeout_Tracking_State.
@@ -143,3 +143,16 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 1. THE Workflow_Timeout_Scanner SHALL be designed to support shard-scoped scanning, where only runs for shards owned by the current runtime node are checked.
 2. WHEN shard ownership changes, THE Workflow_Timeout_Scanner SHALL stop checking runs for relinquished shards and begin checking runs for newly acquired shards.
 3. WHILE shard ownership is not yet implemented (Feature 11), THE Workflow_Timeout_Scanner SHALL check all tracked runs regardless of shard assignment. This is safe because workflow timeout scanning is non-authoritative — duplicate `WorkflowExecutionTimedOut` commands from multiple nodes are rejected harmlessly by the kernel.
+
+### Requirement 10: Stored workflow deadlines
+
+**User Story:** As an operator, I want client and stored durations handled without overflow, so that validation and recovery remain reliable.
+
+Execution expiration is chain-wide and run expiration uses execution time (start plus first-task backoff). Admission follows `common/primitives/timestamp/duration.go:67-88 @ v1.31.0`; timeout task anchors follow `service/history/workflow/task_generator.go:153-183 @ v1.31.0`. Saturation for older stored values is Tokeira's representational safeguard, not a claim about Go's date range.
+
+#### Acceptance Criteria
+
+1. WHEN a stored execution or run timeout or first-task delay exceeds the date range, THE Runtime SHALL compute deadlines with saturating arithmetic, using the latest representable date for every unrepresentable result.
+2. WHEN scanning, evaluating retries, or describing a run, THE Runtime SHALL preserve this overflow rule for both the first-run execution anchor and the current-run start plus delay.
+3. WHEN a scanner chooses its next wake, THE Runtime SHALL bound the converted wait by the configured scan interval without overflowing the strict-comparison nanosecond adjustment.
+4. WHEN a run is recovered after acquisition, THE Runtime SHALL apply the same checked deadline calculation to the recovered durations without rewriting history.

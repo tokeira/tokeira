@@ -766,3 +766,155 @@ fn acquisition_activity(
         last_heartbeat_at: None,
     }
 }
+
+#[tokio::test]
+#[ignore = "requires an ephemeral Aurora DSQL database with 4096 homes"]
+async fn workflow_dispatch_live_lost_publication_offered_by_next_pass() -> Result<()> {
+    live_dispatch_observation(Some(TaskKind::Workflow)).await
+}
+
+#[tokio::test]
+#[ignore = "requires an ephemeral Aurora DSQL database with 4096 homes"]
+async fn activity_dispatch_live_lost_publication_offered_by_next_pass() -> Result<()> {
+    live_dispatch_observation(Some(TaskKind::Activity)).await
+}
+
+#[tokio::test]
+#[ignore = "requires an ephemeral Aurora DSQL database with 4096 homes"]
+async fn activity_dispatch_live_backlog_counts_rows_without_pollers() -> Result<()> {
+    live_dispatch_observation(None).await
+}
+
+async fn live_dispatch_observation(lost: Option<TaskKind>) -> Result<()> {
+    let url = std::env::var("TOKEIRA_DSQL_TEST_DATABASE_URL")
+        .context("explicit live dispatch test requires TOKEIRA_DSQL_TEST_DATABASE_URL")?;
+    let store = DsqlStore::from_database_url_for_tests(
+        url,
+        DsqlPoolConfig {
+            migration: MigrationConfig {
+                migrations_dir: Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../tokeira-storage/migrations"),
+            },
+            reservoir: ReservoirConfig {
+                target_ready: 4,
+                inflight_limit: 2,
+                ..Default::default()
+            },
+            shard_count: 4096,
+            projection_partition_count: 16,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let log = store.projection_log().clone();
+    let (director, repo, _, _, _) = store.into_parts();
+    let repo = Arc::new(repo);
+    tokeira_storage::prepare_execution_placement(repo.as_ref()).await?;
+    let request = super::lost_publication_tests::request();
+    let queue = QueueKey {
+        namespace_id: request.namespace_id,
+        task_queue: request.task_queue.clone(),
+        task_kind: TaskKind::Activity,
+        deployment: None,
+        build_id: None,
+    };
+    let item = super::activity_backlog_tests::fixture(&queue, &[1, 1, 0, 5], true);
+    let (run_key, workflow_id) = if lost.is_some() {
+        (request.run_key, &request.workflow_id)
+    } else {
+        (item.next_state.run_key, &item.next_state.workflow_id)
+    };
+    let home = execution_home_bundle(
+        queue.namespace_id.0.as_bytes(),
+        workflow_id.0.as_bytes(),
+        4096,
+    );
+    let queue_home = tokeira_types::bundle_for_partition(
+        tokeira_types::workflow_queue_partition(queue.namespace_id, &queue.task_queue.0, 4096),
+        4096,
+    );
+    let mut homes = vec![home, queue_home];
+    homes.sort();
+    homes.dedup();
+    let runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
+        repo.clone(),
+        1,
+        LaneConfig {
+            controller_managed_placement: true,
+            ..Default::default()
+        },
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        ActivityTimeoutScannerConfig::default(),
+        NexusTimeoutScannerConfig::default(),
+        NexusEndpointRegistry::default(),
+        Arc::new(NoopNexusHttpClient),
+        NexusCompletionDeps::default(),
+        4096,
+        format!("live-dispatch-{}", Uuid::new_v4()),
+        "127.0.0.1:0".into(),
+        false,
+        None,
+    ));
+    let checking = runtime.clone();
+    let checking_homes = homes.clone();
+    // Turn assertion panics into errors so every live failure still cleans up.
+    let result = tokio::spawn(async move {
+        for id in checking_homes {
+            checking.acquire_shard(id).await?;
+        }
+        checking.ready().await?;
+        if let Some(kind) = lost {
+            super::lost_publication_tests::lost_publication(&checking, request, kind).await?;
+        } else {
+            let fence = checking
+                .shard_owner
+                .read()
+                .expect("fixture shard owner lock poisoned")
+                .write_fence(home)
+                .context("fixture execution home is not serving")?;
+            let committed = checking
+                .repo
+                .commit_transition_for_bundle(run_key, home, item, fence)
+                .await?;
+            anyhow::ensure!(
+                matches!(committed, CommitResult::Applied { .. }),
+                "seed rejected"
+            );
+            super::activity_backlog_tests::check_no_poller_count(&checking, &queue).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
+    runtime.runtime_shutdown.begin_shutdown();
+    for id in &homes {
+        runtime.relinquish_shard(*id).await;
+    }
+    let stopped = runtime
+        .runtime_shutdown
+        .wait(std::time::Instant::now() + std::time::Duration::from_secs(10))
+        .await;
+    let mut cleanup = Ok(());
+    if stopped.is_ok() {
+        for id in homes {
+            cleanup = finish_cleanup(
+                cleanup,
+                release_contract_lease(repo.as_ref(), id, &runtime.owner_identity).await,
+                "owned lease release",
+            );
+        }
+        cleanup = finish_cleanup(
+            cleanup,
+            purge_contract_runs(repo.as_ref(), &log, &[run_key], home).await,
+            "owned data cleanup",
+        );
+    } else {
+        cleanup = Err(anyhow!("cleanup deferred until runtime renewal tasks stop"));
+    }
+    let closed = director.shutdown().await;
+    let result = finish_cleanup(result, stopped.map_err(Into::into), "runtime shutdown");
+    let result = finish_cleanup(result, cleanup, "fixture cleanup");
+    finish_cleanup(result, closed, "connection shutdown")
+}

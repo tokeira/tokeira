@@ -577,6 +577,17 @@ the run sequence, and preserves logical-deletion/staged-publication semantics.
 | Reset/purge/placement/successor and repository test doubles | Populate/read the canonical metadata and preserve publication/ownership barriers; include in the inventory test. |
 | `BacklogConfig` and `max_dispatch_reconciliations_per_scan` | Remove obsolete runtime settings/call sites and document removal; do not silently repurpose their units. |
 
+The broker-statistics / worker-compute inspection entry uses due `activity_dispatch`
+rows, resolved as discovery resolves them. DescribeTaskQueue reads at most four
+discovery pages, counting only decoded, matching rows whose current resolved queue
+is the requested queue. Worker compute derives due rows from its existing recovery
+candidates and counts each row once on its execution owner. Both broker reads exclude
+retained offers, so each row counts once, through its row, until its start commits.
+This keeps persisted work visible without poll demand, as in
+`service/matching/backlog_manager.go:200-207 @ v1.31.0`, while preserving the bounded observation.
+Future retries enter matching from `executeActivityRetryTimerTask` in
+`service/history/timer_queue_active_task_executor.go:522 @ v1.31.0`.
+
 Legacy disposal examines at most 64 physical keys, including deferred/other-kind
 entries. In one read/write transaction, decode the current run and the referenced
 activity slot; remove a copy only when that slot's canonical row equals its desired
@@ -785,12 +796,20 @@ unrelated task families retain their contracts.
 
 **Validates: Requirements 3.4, 6.8, 7.1, 7.2, 7.7, 8.4, 8.5**
 
+### Property 19: Activity backlog counts durable intent once
+
+*For any* due activity row, DescribeTaskQueue and worker compute count it once while
+it is due, whether it is discovered, published again or handed out, and not after
+its start commits.
+
+**Validates: Requirements 7.2, 7.7**
+
 ## Testing Strategy and Delivery Evidence
 
 | Suite location | Required coverage |
 |---|---|
 | Storage `activity_dispatch_tests.rs`, memory adapter, DSQL adapter | Properties 1–3, 13–14, 17 against the same oracle; real transaction conflicts and conditional replacement. |
-| Runtime discovery/offer tests | Properties 4–6; tiny budgets plus >64-row retained/incompatible prefixes and fair interleaving with workflow demand. |
+| Runtime discovery/offer tests | Properties 4–6, 19; tiny budgets plus >64-row retained/incompatible prefixes and fair interleaving with workflow demand. |
 | Runtime activity/start/eligibility tests | Properties 7–8, 10–12, 15, 18; controlled clocks, channels and acquisition pause points. |
 | Storage codec and kernel lifecycle/reset tests | Property 16, frozen legacy bytes, TKW3 outbound preparation, TKW4 rejection by old decoder, transient history request IDs. |
 | Edge activity-dispatch and auth peer tests | Properties 9 and 12 over real bounded protobuf transport and distinct owner runtimes, including malformed/oversize framing and purpose isolation. |

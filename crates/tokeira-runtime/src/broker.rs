@@ -2245,6 +2245,22 @@ impl InMemoryActivityBroker {
 
     /// Snapshot activity backlog by effective priority band.
     pub async fn backlog_stats_by_priority(&self, queue: &QueueKey) -> PriorityBacklogStats {
+        self.priority_backlog_stats(queue, true).await
+    }
+
+    /// Snapshot volatile activity work, excluding offers counted from durable rows.
+    pub(crate) async fn volatile_backlog_stats_by_priority(
+        &self,
+        queue: &QueueKey,
+    ) -> PriorityBacklogStats {
+        self.priority_backlog_stats(queue, false).await
+    }
+
+    async fn priority_backlog_stats(
+        &self,
+        queue: &QueueKey,
+        include_retained_offers: bool,
+    ) -> PriorityBacklogStats {
         let inner = self.inner.lock().await;
         let Some(ready) = inner.ready.get(queue) else {
             return PriorityBacklogStats::new();
@@ -2253,27 +2269,35 @@ impl InMemoryActivityBroker {
             .seen_priority_keys()
             .map(|priority_key| (priority_key, BrokerBacklogStats::default()))
             .collect();
-        for task in ready.iter() {
+        for entry in ready.iter().filter(|entry| {
+            include_retained_offers || !inner.offers.contains(&incarnation(&entry.task))
+        }) {
             add_priority_stat(
                 &mut stats,
-                task.task
+                entry
+                    .task
                     .order
                     .map_or(3, |order| i32::from(order.priority_key)),
-                task.entered_at.elapsed(),
+                entry.entered_at.elapsed(),
             );
         }
         stats
     }
 
-    /// Snapshot ready backlog for every exact-version activity queue.
+    /// Snapshot volatile backlog for exact-version activity queues, excluding retained offers.
     pub async fn versioned_backlog_counts(&self) -> BTreeMap<WorkerComputeQueueKey, u64> {
         let inner = self.inner.lock().await;
         inner
             .ready
             .iter()
             .filter_map(|(queue, ready)| {
-                queue_metrics_key(queue, WorkerComputeTaskType::Activity)
-                    .map(|key| (key, u64::try_from(ready.len()).unwrap_or(u64::MAX)))
+                queue_metrics_key(queue, WorkerComputeTaskType::Activity).map(|key| {
+                    let count = ready
+                        .iter()
+                        .filter(|entry| !inner.offers.contains(&incarnation(&entry.task)))
+                        .count();
+                    (key, u64::try_from(count).unwrap_or(u64::MAX))
+                })
             })
             .collect()
     }

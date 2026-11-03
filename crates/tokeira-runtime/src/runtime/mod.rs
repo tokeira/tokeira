@@ -40,6 +40,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
+    activity_discovery::ActivityDiscoverySource as _,
     activity_timeout::{
         ActivityTimeoutScannerConfig, ActivityTrackingState, run_activity_timeout_scanner,
     },
@@ -87,6 +88,8 @@ use crate::{
 
 pub(crate) mod activity;
 #[cfg(test)]
+mod activity_backlog_tests;
+#[cfg(test)]
 mod activity_retirement_tests;
 mod commit;
 #[cfg(test)]
@@ -96,6 +99,8 @@ mod dsql_tests;
 #[cfg(test)]
 mod lease_fence_tests;
 mod lifecycle;
+#[cfg(test)]
+mod lost_publication_tests;
 mod membership;
 mod outbound_delivery;
 #[cfg(test)]
@@ -818,6 +823,8 @@ where
             shared_lanes.clone(),
             lane_count,
         ));
+        #[cfg(test)]
+        let publication_failure = Arc::new(Mutex::new(None));
         let outbound_wake = Arc::new(tokio::sync::Notify::new());
         let lanes: Vec<_> = (0..lane_count)
             .map(|lane_id| {
@@ -840,6 +847,12 @@ where
                 .with_outbound_wake(outbound_wake.clone())
                 .with_namespace_resolver(namespace_resolver.clone())
                 .with_worker_deployment_registry(worker_deployment_registry.clone());
+                #[cfg(test)]
+                let publisher = {
+                    let mut publisher = publisher;
+                    publisher.publication_failure = publication_failure.clone();
+                    publisher
+                };
                 spawn_lane_with_id(
                     lane_id,
                     BasicKernel,
@@ -976,6 +989,12 @@ where
         .with_outbound_wake(outbound_wake.clone())
         .with_namespace_resolver(namespace_resolver.clone())
         .with_worker_deployment_registry(worker_deployment_registry.clone());
+        #[cfg(test)]
+        let completion_scanner_publisher = {
+            let mut publisher = completion_scanner_publisher;
+            publisher.publication_failure = publication_failure;
+            publisher
+        };
         let _successor_recovery = runtime_shutdown.spawn(crate::outbound::successor::run(
             repo.clone(),
             completion_scanner_publisher.clone(),
@@ -1260,13 +1279,17 @@ where
     ) -> crate::PriorityBacklogStats {
         let mut stats = match queue.task_kind {
             TaskKind::Workflow => self.broker.backlog_stats_by_priority(queue).await,
-            TaskKind::Activity => self.activity_broker.backlog_stats_by_priority(queue).await,
+            TaskKind::Activity => {
+                self.activity_broker
+                    .volatile_backlog_stats_by_priority(queue)
+                    .await
+            }
         };
         if queue.task_kind == TaskKind::Workflow {
             self.merge_workflow_dispatch_stats(queue, false, &mut stats)
                 .await;
         } else {
-            self.merge_durable_backlog_stats(queue, &mut stats).await;
+            self.merge_activity_dispatch_stats(queue, &mut stats).await;
         }
         stats
     }
@@ -1390,34 +1413,70 @@ where
         }
     }
 
-    async fn merge_durable_backlog_stats(
+    async fn merge_activity_dispatch_stats(
         &self,
         queue: &QueueKey,
         stats: &mut crate::PriorityBacklogStats,
     ) {
-        match self.repo.backlog_stats_by_priority(queue).await {
-            Ok(durable) => {
-                let now = OffsetDateTime::now_utc();
-                let mut durable_stats = crate::PriorityBacklogStats::new();
-                for (priority_key, band) in durable {
-                    let age = (now - band.oldest_scheduled_at)
-                        .try_into()
-                        .unwrap_or(std::time::Duration::ZERO);
-                    durable_stats.insert(
-                        i32::from(priority_key),
-                        crate::BrokerBacklogStats {
-                            count: band.count,
-                            oldest_age: age,
-                        },
-                    );
+        let source = crate::activity_discovery::ActivitySource {
+            repo: self.repo.clone(),
+            registry: self.worker_deployment_registry.clone(),
+            owner: self.shard_owner.clone(),
+        };
+        let range = tokeira_storage::ActivityDiscoveryRange {
+            namespace_id: queue.namespace_id,
+            queue_name: queue.task_queue.clone(),
+        };
+        let now = OffsetDateTime::now_utc();
+        // Matching counts persisted work, including offers handed out but not
+        // started (service/matching/backlog_manager.go:200-207 @ v1.31.0). Future rows
+        // still represent history timers there. Keep this observation bounded
+        // to the same four physical pages as workflow statistics.
+        let mut durable = crate::PriorityBacklogStats::new();
+        let result: Result<()> = async {
+            let mut after = None;
+            let limit =
+                std::num::NonZeroU32::new(crate::discovery::PAGE_SIZE).expect("nonzero page");
+            for _ in 0..4 {
+                let page = self
+                    .repo
+                    .list_activity_dispatch_page(&range, now, after, limit)
+                    .await?;
+                for candidate in page.candidates {
+                    let row = match candidate.row {
+                        Ok(row) => row,
+                        Err(error) => {
+                            tracing::warn!(?error, "activity statistics row decode failed");
+                            continue;
+                        }
+                    };
+                    if range.matches(&row)
+                        && let Some(task) = source.resolve(&row).await?
+                        && task.queue == *queue
+                    {
+                        let priority =
+                            crate::task_ordering::effective_priority(row.priority.as_ref(), None);
+                        let band = durable.entry(i32::from(priority.priority_key)).or_default();
+                        band.count += 1;
+                        let age = (now - row.dispatch_at).try_into().unwrap_or_default();
+                        band.oldest_age = band.oldest_age.max(age);
+                    }
                 }
-                crate::broker::merge_priority_stats(stats, durable_stats);
+                if page.exhausted {
+                    break;
+                }
+                after = page.last_examined;
             }
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => crate::broker::merge_priority_stats(stats, durable),
             Err(error) => {
                 tracing::warn!(
                     ?error,
                     ?queue,
-                    "failed to read durable priority backlog stats"
+                    "failed to read activity dispatch statistics"
                 );
             }
         }

@@ -30,6 +30,9 @@ use crate::{
     runtime::workflow_task::resolve_workflow_task_target_version, workflow_offers::OfferAdmission,
 };
 
+#[cfg(test)]
+pub(crate) mod test_gate;
+
 pub(crate) const DISCOVERY_PERIOD: Duration = Duration::from_secs(1);
 pub(crate) const PAGE_SIZE: u32 = 64;
 pub(crate) const SLICE_PAGES: usize = 1;
@@ -270,6 +273,8 @@ struct RegistryState {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DiscoveryRegistry {
+    #[cfg(test)]
+    pub(crate) test_gate: Arc<crate::discovery::test_gate::TestPassGate>,
     state: Arc<Mutex<RegistryState>>,
     pub(crate) wake: Arc<Notify>,
 }
@@ -380,6 +385,10 @@ impl DiscoveryRegistry {
     }
 
     fn select(&self, now: Instant) -> Option<(RangeKey, QueueHome, WorkflowPass)> {
+        #[cfg(test)]
+        if self.test_gate.is_held() {
+            return None;
+        }
         let mut state = self.state.lock().expect("discovery registry lock poisoned");
         let key = state
             .ranges
@@ -441,6 +450,10 @@ impl DiscoveryRegistry {
             entry.pass =
                 (outcome == SliceOutcome::Yield || outcome == SliceOutcome::Idle).then_some(pass);
             entry.next_pass = now + DISCOVERY_PERIOD;
+        }
+        #[cfg(test)]
+        if outcome == SliceOutcome::Complete {
+            self.test_gate.completed();
         }
     }
 

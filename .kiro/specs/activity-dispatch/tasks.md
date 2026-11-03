@@ -252,6 +252,23 @@ may retire a recovery mechanism before its replacement is verified.
     head for human merge review; no deployment is authorized by this checklist.
   - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 8.8, 8.9_
 
+- [x] 13. Restore activity backlog observations from canonical dispatch rows
+  - Read due rows through the discovery resolver for DescribeTaskQueue, bounded
+    to four discovery pages, using effective priority and dispatch age.
+  - Count due activity rows on their execution owner in the existing worker-compute
+    recovery scan. Exclude retained broker offers in both readers; retain legacy
+    storage methods and their forwarding wrappers for separate cleanup.
+  - Add no-poller priority/future-row, four-page bound and worker-compute regressions,
+    plus Property 19 (`activity_dispatch_statistics_do_not_double_count_offers`), with
+    100 cases through discovery, duplicate publication, handout and committed start.
+    Run the no-poller tests against the unfixed readers.
+  - Inject failed post-commit workflow and activity publications with a parked poll;
+    synchronize an empty pass and require the next offer within one discovery period
+    plus one period of slack. Use paused Tokio time in memory and real time on DSQL.
+  - Add the three opt-in live fixtures with owned-data/lease cleanup. On an ephemeral
+    DSQL cluster, after the storage schema bootstrap, all three passed.
+  - _Requirements: 7.2, 7.7, 8.4, 8.5, 8.7_
+
 ## Task Dependency Graph
 
 ```json
@@ -267,7 +284,8 @@ may retire a recovery mechanism before its replacement is verified.
   "9": ["8"],
   "10": ["5", "6", "7", "8", "9"],
   "11": ["2", "3", "5", "6", "7", "8", "9", "10"],
-  "12": ["10", "11"]
+  "12": ["10", "11"],
+  "13": ["12"]
 }
 ```
 

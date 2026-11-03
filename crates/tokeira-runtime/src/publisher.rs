@@ -164,6 +164,8 @@ fn spawn_dispatch_owned<F>(
 /// [`DispatchPublisher`] that forwards dispatch ops to
 /// the runtime's in-memory brokers.
 pub struct RuntimeDispatchPublisher<R> {
+    #[cfg(test)]
+    pub(crate) publication_failure: Arc<Mutex<Option<tokeira_types::TaskKind>>>,
     broker: InMemoryBroker,
     activity_broker: InMemoryActivityBroker,
     repo: Arc<R>,
@@ -200,6 +202,8 @@ impl<R> std::fmt::Debug for RuntimeDispatchPublisher<R> {
 impl<R> Clone for RuntimeDispatchPublisher<R> {
     fn clone(&self) -> Self {
         Self {
+            #[cfg(test)]
+            publication_failure: self.publication_failure.clone(),
             broker: self.broker.clone(),
             activity_broker: self.activity_broker.clone(),
             repo: self.repo.clone(),
@@ -244,6 +248,8 @@ where
         delivery_metrics: DeliveryMetrics,
     ) -> Self {
         Self {
+            #[cfg(test)]
+            publication_failure: Arc::new(Mutex::new(None)),
             broker,
             activity_broker,
             repo,
@@ -263,6 +269,16 @@ where
             worker_deployment_registry: None,
             namespace_resolver: None,
         }
+    }
+
+    #[cfg(test)]
+    fn fail_publication(&self, kind: tokeira_types::TaskKind) -> Result<()> {
+        let mut failure = self.publication_failure.lock().unwrap();
+        if *failure == Some(kind) {
+            *failure = None;
+            anyhow::bail!("injected broker publication failure");
+        }
+        Ok(())
     }
 
     /// Attach the shared deployment registry used for derived dispatch routing.
@@ -1085,6 +1101,9 @@ where
                         priority: priority.clone(),
                         order: None,
                     };
+                    // Exercise the lane's real post-commit publish-error path.
+                    #[cfg(test)]
+                    self.fail_publication(tokeira_types::TaskKind::Workflow)?;
                     if *speculative {
                         self.broker
                             .publish_speculative_workflow_task(task, Some(&self.delivery_metrics))
@@ -1161,10 +1180,14 @@ where
                         // The owner's eligibility index evaluates delayed rules;
                         // queue-home discovery supplies offers once the row is due.
                         if *dispatch_at <= OffsetDateTime::now_utc()
-                            && let Err(error) = self
-                                .activity_broker
-                                .publish_activity_task(task, Some(&self.delivery_metrics))
-                                .await
+                            && let Err(error) = async {
+                                #[cfg(test)]
+                                self.fail_publication(tokeira_types::TaskKind::Activity)?;
+                                self.activity_broker
+                                    .publish_activity_task(task, Some(&self.delivery_metrics))
+                                    .await
+                            }
+                            .await
                         {
                             tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish activity task");
                         }

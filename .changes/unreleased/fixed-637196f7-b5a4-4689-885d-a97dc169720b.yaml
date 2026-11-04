@@ -1,5 +1,0 @@
-kind: fixed
-body: A visibility read or write cancelled while starting its transaction no longer leaves that transaction open on a pooled connection.
-time: 2026-11-03T10:36:12.355166+00:00
-custom:
-    Slice: 637196f7-b5a4-4689-885d-a97dc169720b

@@ -1,5 +1,0 @@
-kind: changed
-body: Remove BacklogConfig, RuntimeConfig.backlog and max_dispatch_reconciliations_per_scan settings.
-time: 2026-11-02T13:00:02Z
-custom:
-    Slice: 74a10920-a58d-4824-b0f4-ee402d390c42

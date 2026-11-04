@@ -2,9 +2,10 @@
 
 use super::*;
 use crate::bulk_write_tests::{
-    Backend, OwnedRows, StoredBatch, deletion_of_a_large_run, plain_reset_of_a_closed_workflow,
-    reset_over_one_mib, reset_over_ten_mib, reset_with_a_start_between, reset_with_many_timers,
-    spill_of_large_entries, spill_of_many_small_entries,
+    Backend, OwnedRows, StoredBatch, deletion_across_decimal_boundaries, deletion_of_a_large_run,
+    plain_reset_of_a_closed_workflow, reset_over_one_mib, reset_over_ten_mib,
+    reset_with_a_start_between, reset_with_many_timers, spill_of_large_entries,
+    spill_of_many_small_entries,
 };
 
 #[async_trait]
@@ -44,6 +45,8 @@ impl Backend for InMemoryStore {
                 .filter(|entry| entry.run_key == run_key)
                 .count(),
             parts: 0,
+            run_operation: 0,
+            outbound_upgrade_state_part: 0,
         })
     }
 
@@ -115,4 +118,9 @@ async fn bulk_plain_reset_of_a_closed_workflow() {
 #[tokio::test]
 async fn bulk_reset_with_a_start_between() {
     reset_with_a_start_between(&InMemoryStore::default()).await;
+}
+
+#[tokio::test]
+async fn bulk_deletion_across_decimal_boundaries() {
+    deletion_across_decimal_boundaries(&InMemoryStore::default()).await;
 }

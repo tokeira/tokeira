@@ -25,6 +25,7 @@
 //!
 //! [`purge_run`]: crate::RunRepository::purge_run
 
+use anyhow::ensure;
 use sqlx::Row;
 
 use super::{
@@ -43,9 +44,31 @@ use crate::{
 /// the write.
 const TRANSACTION_ATTEMPTS: usize = 5;
 
+/// One initial sweep and one retry before reporting a table that will not drain.
+/// Recorded runs admit no new rows, so more retries would hide a purge defect.
+pub(super) const PURGE_PASSES: usize = 2;
+
+/// A refusal must stop the whole attempt, even if its hold subsequently clears.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum PurgePage {
+    /// The record or a retention hold did not permit this page.
+    Refused,
+    /// Number of selected rows deleted, including zero for an empty table.
+    Deleted(usize),
+}
+
+/// The final page either stops the attempt or requires more bounded work.
+enum PurgeLastPage {
+    Stopped,
+    More,
+    Remaining(&'static str),
+}
+
 /// One run-owned table a purge pages through, with the statements that select a
 /// page's keys in order and delete the page by its last key. A key's columns are
 /// selected as text, and the delete binds them in order and casts them back.
+/// ORDER BY qualifies the source columns: a bare output name would bind to the
+/// text cast and order integers lexically, unlike the typed delete predicate.
 pub(super) struct PurgeTable {
     pub(super) table: &'static str,
     pub(super) select_page: &'static str,
@@ -65,44 +88,44 @@ pub(super) struct PurgeTable {
 pub(super) const PURGE_TABLES: [PurgeTable; 8] = [
     PurgeTable {
         table: "outbound_upgrade_state_part",
-        select_page: "SELECT generation::text,part_no::text FROM outbound_upgrade_state_part WHERE run_key = $1 ORDER BY generation,part_no LIMIT $2",
+        select_page: "SELECT generation::text,part_no::text FROM outbound_upgrade_state_part WHERE run_key = $1 ORDER BY outbound_upgrade_state_part.generation,outbound_upgrade_state_part.part_no LIMIT $2",
         delete_page: "DELETE FROM outbound_upgrade_state_part WHERE run_key = $1 AND (generation,part_no) <= ($2::uuid,$3::integer)",
     },
     PurgeTable {
         table: "run_operation",
-        select_page: "SELECT kind::text,initiating_event_id::text FROM run_operation WHERE source_run_key = $1 ORDER BY kind,initiating_event_id LIMIT $2",
+        select_page: "SELECT kind::text,initiating_event_id::text FROM run_operation WHERE source_run_key = $1 ORDER BY run_operation.kind,run_operation.initiating_event_id LIMIT $2",
         delete_page: "DELETE FROM run_operation WHERE source_run_key = $1 AND (kind,initiating_event_id) <= ($2::smallint,$3::bigint)",
     },
     PurgeTable {
         table: "request_dedupe",
-        select_page: "SELECT key::text FROM request_dedupe WHERE run_key = $1 ORDER BY key LIMIT $2",
+        select_page: "SELECT key::text FROM request_dedupe WHERE run_key = $1 ORDER BY request_dedupe.key LIMIT $2",
         delete_page: "DELETE FROM request_dedupe WHERE run_key = $1 AND key <= $2::uuid",
     },
     PurgeTable {
         table: "timer_bucket",
-        select_page: "SELECT timer_id FROM timer_bucket WHERE run_key = $1 ORDER BY timer_id LIMIT $2",
+        select_page: "SELECT timer_id FROM timer_bucket WHERE run_key = $1 ORDER BY timer_bucket.timer_id LIMIT $2",
         delete_page: "DELETE FROM timer_bucket WHERE run_key = $1 AND timer_id <= $2",
     },
     PurgeTable {
         table: "activity_dispatch",
-        select_page: "SELECT key::text FROM activity_dispatch WHERE run_key = $1 ORDER BY key LIMIT $2",
+        select_page: "SELECT key::text FROM activity_dispatch WHERE run_key = $1 ORDER BY activity_dispatch.key LIMIT $2",
         delete_page: "DELETE FROM activity_dispatch WHERE run_key = $1 AND key <= $2::uuid",
     },
     PurgeTable {
         table: "dispatch_backlog",
-        select_page: "SELECT key::text FROM dispatch_backlog WHERE run_key = $1 ORDER BY key LIMIT $2",
+        select_page: "SELECT key::text FROM dispatch_backlog WHERE run_key = $1 ORDER BY dispatch_backlog.key LIMIT $2",
         delete_page: "DELETE FROM dispatch_backlog WHERE run_key = $1 AND key <= $2::uuid",
     },
     PurgeTable {
         table: "history_batch",
         select_page: "SELECT first_event_id::text FROM history_batch WHERE run_key = $1 \
-                      ORDER BY first_event_id LIMIT $2",
+                      ORDER BY history_batch.first_event_id LIMIT $2",
         delete_page: "DELETE FROM history_batch WHERE run_key = $1 AND first_event_id <= $2::bigint",
     },
     PurgeTable {
         table: "run_value_part",
         select_page: "SELECT value_kind::text, value_key::text, part_no::text FROM run_value_part \
-                      WHERE run_key = $1 ORDER BY value_kind, value_key, part_no LIMIT $2",
+                      WHERE run_key = $1 ORDER BY run_value_part.value_kind,run_value_part.value_key,run_value_part.part_no LIMIT $2",
         delete_page: "DELETE FROM run_value_part WHERE run_key = $1 \
                       AND (value_kind, value_key, part_no) <= ($2::smallint, $3::bigint, $4::integer)",
     },
@@ -122,6 +145,28 @@ pub(super) async fn delete_through(
     }
     delete.execute(&mut **tx).await?;
     Ok(())
+}
+
+/// Name a purge table that still holds a row of the run, read in the
+/// transaction that would delete the record. That transaction reads the record
+/// `FOR UPDATE`, so a concurrent purge either commits first or loses a
+/// serialization conflict.
+pub(super) async fn remaining_purge_table(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_key: RunKey,
+) -> Result<Option<&'static str>> {
+    for table in &PURGE_TABLES {
+        if sqlx::query(table.select_page)
+            .bind(run_key.0)
+            .bind(1i64)
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some()
+        {
+            return Ok(Some(table.table));
+        }
+    }
+    Ok(None)
 }
 
 pub(super) const SELECT_RECORD_FOR_UPDATE: &str =
@@ -243,34 +288,54 @@ impl DsqlRunRepository {
             let (parts, tables) = PURGE_TABLES
                 .split_last()
                 .expect("the purge has a last table");
-            for table in tables {
-                while retry_on_conflict(|| {
-                    self.purge_page(run_key, table, MAX_ROWS_PER_TRANSACTION - 2)
-                })
-                .await?
-                    == MAX_ROWS_PER_TRANSACTION - 2
-                {}
+            let mut pass = 1;
+            loop {
+                for table in tables {
+                    loop {
+                        match retry_on_conflict(|| {
+                            self.purge_page(run_key, table, MAX_ROWS_PER_TRANSACTION - 2)
+                        })
+                        .await?
+                        {
+                            PurgePage::Refused => return Ok(()),
+                            PurgePage::Deleted(rows) if rows == MAX_ROWS_PER_TRANSACTION - 2 => {}
+                            PurgePage::Deleted(_) => break,
+                        }
+                    }
+                }
+                loop {
+                    match retry_on_conflict(|| self.purge_last_page(run_key, parts)).await? {
+                        PurgeLastPage::Stopped => return Ok(()),
+                        PurgeLastPage::More => {}
+                        PurgeLastPage::Remaining(table) => {
+                            ensure!(
+                                pass < PURGE_PASSES,
+                                "purge of run {run_key:?} left rows in {table} after {pass} passes"
+                            );
+                            pass += 1;
+                            break;
+                        }
+                    }
+                }
             }
-            // The parts last, and the record with their last page: the record
-            // goes only when every table is empty, so a purge that stops early
-            // leaves it for the next attempt.
-            while !retry_on_conflict(|| self.purge_last_page(run_key, parts)).await? {}
-            Ok(())
         })
     }
 
-    /// Delete one page of `table`'s rows of the run, and return how many it
-    /// held.
+    /// Delete one page of `table`'s rows, distinguishing an empty page from a
+    /// refusal that must end the entire purge attempt.
     pub(super) async fn purge_page(
         &self,
         run_key: RunKey,
         table: &PurgeTable,
         limit: usize,
-    ) -> Result<usize> {
+    ) -> Result<PurgePage> {
         let mut permit = self.director.acquire(DbClass::Commit).await?;
         let mut tx = permit.begin().await?;
         if !ordinary_purge_valid(&mut tx, run_key).await? {
-            return Ok(0);
+            tx.rollback().await?;
+            #[cfg(all(test, feature = "dsql-integration"))]
+            super::pause_point::reached(super::pause_point::PauseKey::PurgeRefused(run_key)).await;
+            return Ok(PurgePage::Refused);
         }
         let keys = sqlx::query(table.select_page)
             .bind(run_key.0)
@@ -279,7 +344,7 @@ impl DsqlRunRepository {
             .await?;
         let Some(last) = keys.last() else {
             tx.rollback().await?;
-            return Ok(0);
+            return Ok(PurgePage::Deleted(0));
         };
         delete_through(&mut tx, run_key, table, last).await?;
         tx.commit().await?;
@@ -291,18 +356,18 @@ impl DsqlRunRepository {
         metrics::record_dsql_rows_written("purge_run", keys.len() as u64);
         #[cfg(all(test, feature = "dsql-integration"))]
         super::pause_point::reached(super::pause_point::PauseKey::Purge(run_key)).await;
-        Ok(keys.len())
+        Ok(PurgePage::Deleted(keys.len()))
     }
 
     /// Delete one page of the purge's last table, with the record when it is the
-    /// last page. Returns whether it was.
-    async fn purge_last_page(&self, run_key: RunKey, table: &PurgeTable) -> Result<bool> {
+    /// last page and every purge table is empty in this transaction's snapshot.
+    async fn purge_last_page(&self, run_key: RunKey, table: &PurgeTable) -> Result<PurgeLastPage> {
         // A page leaves one row of the budget for the record.
         let page = MAX_ROWS_PER_TRANSACTION - 5;
         let mut permit = self.director.acquire(DbClass::Commit).await?;
         let mut tx = permit.begin().await?;
         if !ordinary_purge_valid(&mut tx, run_key).await? {
-            return Ok(true);
+            return Ok(PurgeLastPage::Stopped);
         }
         let keys = sqlx::query(table.select_page)
             .bind(run_key.0)
@@ -315,6 +380,12 @@ impl DsqlRunRepository {
             delete_through(&mut tx, run_key, table, &keys[deleted - 1]).await?;
         }
         if last {
+            if let Some(remaining) = remaining_purge_table(&mut tx, run_key).await? {
+                // Keep the last parts with the record until the earlier tables
+                // are empty; this also preserves history/parts read ordering.
+                tx.rollback().await?;
+                return Ok(PurgeLastPage::Remaining(remaining));
+            }
             sqlx::query("DELETE FROM run_preparation WHERE target_run_key=$1 AND phase=5")
                 .bind(run_key.0)
                 .execute(&mut *tx)
@@ -332,7 +403,11 @@ impl DsqlRunRepository {
         metrics::record_dsql_rows_written("purge_run", (deleted + 3 * usize::from(last)) as u64);
         #[cfg(all(test, feature = "dsql-integration"))]
         super::pause_point::reached(super::pause_point::PauseKey::Purge(run_key)).await;
-        Ok(last)
+        Ok(if last {
+            PurgeLastPage::Stopped
+        } else {
+            PurgeLastPage::More
+        })
     }
 
     pub(super) async fn do_list_run_bulk_writes(
@@ -893,6 +968,34 @@ mod tests {
             data: &[0; 16],
         };
         assert_eq!(part.cost().expect("cost"), WriteCost::write(16));
+    }
+
+    #[test]
+    fn purge_pages_sort_by_typed_source_columns() {
+        for table in &PURGE_TABLES {
+            let (select, tail) = table.select_page.split_once(" FROM ").unwrap();
+            let (_, order) = tail.split_once(" ORDER BY ").unwrap();
+            let (order, _) = order.split_once(" LIMIT ").unwrap();
+            let columns = select
+                .strip_prefix("SELECT ")
+                .unwrap()
+                .split(',')
+                .map(|column| {
+                    column
+                        .trim()
+                        .strip_suffix("::text")
+                        .unwrap_or(column.trim())
+                });
+            let expected = columns
+                .map(|column| format!("{}.{column}", table.table))
+                .collect::<Vec<_>>();
+            let actual = order.split(',').map(str::trim).collect::<Vec<_>>();
+            assert_eq!(
+                actual, expected,
+                "{} must sort the source keys, never their text output names",
+                table.table
+            );
+        }
     }
 
     #[test]

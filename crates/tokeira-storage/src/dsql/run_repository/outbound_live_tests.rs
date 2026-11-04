@@ -6,6 +6,7 @@ use super::{bulk_write_tests::Fixture, *};
 use crate::{
     DefinitiveOutcome, DeliveryGuard, ExecutionHomeFence, IntentKind, IntentRetirement,
     PublicationResult, RecoveryError, RunPreparation, ScanBound,
+    bulk_write_tests::{Backend, OwnedRows},
     dsql::value_parts,
     memory::projection_accumulator_tests::{applied, fresh_transition},
     outbound_upgrade::{
@@ -584,15 +585,37 @@ async fn outbound_live_reset_conflict_preserves_all_participants() -> Result<()>
             .await?,
         Some(source.run_key)
     );
+    // Publication stages one history header today. Extend the abandoned
+    // fixture directly so cleanup must also handle keys across decimal widths.
+    let mut tx = fixture.pool.begin().await?;
+    for event_id in 3..=122 {
+        let events = [tokeira_kernel::HistoryEvent {
+            event_id,
+            happened_at: source.started_at,
+            kind: crate::bulk_write_tests::signal(event_id as usize, 16),
+        }];
+        sqlx::query("INSERT INTO history_batch (run_key,first_event_id,last_event_id,transition_seq,events_data,created_at) VALUES ($1,$2,$2,1,$3,now())")
+            .bind(target.0).bind(event_id).bind(codec::encode_history_events(&events)?)
+            .execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    let keys: Vec<i64> = sqlx::query_scalar(
+        "SELECT first_event_id FROM history_batch WHERE run_key=$1 ORDER BY first_event_id",
+    )
+    .bind(target.0)
+    .fetch_all(&fixture.pool)
+    .await?;
+    assert!(keys.contains(&9) && keys.contains(&10) && keys.contains(&99) && keys.contains(&100));
     assert!(
         repo.abandon_prepared_run(token, WriteFence::Unfenced)
             .await?
     );
-    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM run_value_part WHERE run_key=$1")
+    assert_eq!(fixture.owned_rows(target).await?, OwnedRows::default());
+    let records: i64 = sqlx::query_scalar("SELECT count(*) FROM run_bulk_write WHERE run_key=$1")
         .bind(target.0)
         .fetch_one(&fixture.pool)
         .await?;
-    assert_eq!(rows, 0);
+    assert_eq!(records, 0);
     fixture.store.shutdown().await?;
     Ok(())
 }

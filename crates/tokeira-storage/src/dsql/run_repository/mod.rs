@@ -163,6 +163,8 @@ pub(crate) mod pause_point {
         HistoryParts(RunKey),
         /// A purge of this run, after each of its transactions.
         Purge(RunKey),
+        /// A refused purge page, after rollback and before the attempt stops.
+        PurgeRefused(RunKey),
         /// A load of the CHASM execution with this run id that met a node stored
         /// in parts, after its first read and before it reads the nodes again
         /// with their parts.

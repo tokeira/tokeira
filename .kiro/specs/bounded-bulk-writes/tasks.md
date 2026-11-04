@@ -98,9 +98,21 @@ Show the four defects first, on both stores, with tests that fail on the current
 - [x] 10. Checkpoint: the exploration tests pass on both stores, each negative control fails its test, the live suite passes on an ephemeral cluster, and the full bar of root `AGENTS.md` §10.4 passes
   - DONE at `6129ecf9`. The exploration tests and Properties 1 to 10 pass on the in-memory store, and the live suite passes on an ephemeral cluster (task 8). Each of the 21 negative controls on the in-memory store and the runtime failed its tests, as each of the six on DSQL did. The bar passed (3,792 tests passed, 2 skipped).
 
+- [ ] 11. Correct DSQL purge paging and preserve the cleanup record until every table is empty
+  - [x] 11.1 Sort every purge page by its key columns' own types, distinguish refusal from an empty page, and stop a refused attempt successfully
+    - _Requirements: 2.1, 2.4, 2.5_
+  - [x] 11.2 Check every purge table inside both record-deleting transactions; retry the sweep once, then report the remaining table while retaining the record
+    - _Requirements: 2.4, 2.9_
+  - [x] 11.3 Add the shared 120-batch contract, exact row-count checks for short and full DSQL pages, the deterministic DSQL refusal race and the database-free sort guard; extend preparation abandonment across decimal boundaries
+    - **Property 4: A purge finishes, removes only its run's rows, and removes history after the rows derived from it**
+    - **Validates: Requirements 2.4, 2.5, 2.9**
+  - [ ] 11.4 Run the live cases and each negative control separately: text-ordered pages; a skipped refused page plus unchecked record deletion
+    - _Requirements: 2.1, 2.4, 2.5, 2.9_
+
 ## Notes
 
 - Property tests use `proptest`, tagged `// Feature: bounded-bulk-writes, Property N: <title>`.
 - Tasks 3, 4 and 5 build on 2; task 6 on 4 and 5; tasks 7 and 8 on 3 to 6.
+- Task 11 builds on tasks 4 and 8, plus the retention holds and preparation cleanup in outbound-dispatch-recovery.
 - The contract tests share one body between the stores, so the in-memory store's model and DSQL answer the same cases.
 - DSQL's limits were observed on a live cluster. The live suite asserts them apart from the budgets, so a change in DSQL fails a test rather than a purge.

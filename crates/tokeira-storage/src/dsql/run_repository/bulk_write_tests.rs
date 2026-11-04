@@ -6,19 +6,19 @@
 use std::path::Path;
 
 use sqlx::{PgPool, postgres::PgPoolOptions};
-use tokeira_kernel::TimerState;
+use tokeira_kernel::{HistoryEvent, TimerState};
 
 use super::{
-    bulk_write::{CopyItem, PURGE_TABLES, SELECT_RECORD_FOR_UPDATE},
+    bulk_write::{CopyItem, PURGE_TABLES, PurgePage, SELECT_RECORD_FOR_UPDATE},
     *,
 };
 use crate::{
     BulkWritePhase,
     bulk_write_tests::{
-        Backend, OwnedRows, StoredBatch, delete_first, deletion_of_a_large_run, large_closed_run,
-        plain_reset_of_a_closed_workflow, reset_over_one_mib, reset_over_ten_mib,
-        reset_with_a_start_between, reset_with_many_timers, spill_of_large_entries,
-        spill_of_many_small_entries,
+        Backend, OwnedRows, StoredBatch, delete_first, deletion_across_decimal_boundaries,
+        deletion_of_a_large_run, large_closed_run, plain_reset_of_a_closed_workflow,
+        reset_over_one_mib, reset_over_ten_mib, reset_with_a_start_between, reset_with_many_timers,
+        spill_of_large_entries, spill_of_many_small_entries,
     },
     dsql::{DsqlPoolConfig, DsqlStore, MigrationConfig, ReservoirConfig},
     write_budget::MAX_ROWS_PER_TRANSACTION,
@@ -134,6 +134,18 @@ impl Backend for Fixture {
             backlog: self
                 .count(
                     "SELECT count(*) FROM dispatch_backlog WHERE run_key = $1",
+                    run_key,
+                )
+                .await?,
+            run_operation: self
+                .count(
+                    "SELECT count(*) FROM run_operation WHERE source_run_key = $1",
+                    run_key,
+                )
+                .await?,
+            outbound_upgrade_state_part: self
+                .count(
+                    "SELECT count(*) FROM outbound_upgrade_state_part WHERE run_key = $1",
                     run_key,
                 )
                 .await?,
@@ -258,9 +270,12 @@ async fn dsql_bulk_interrupted_deletion() -> Result<()> {
     let purged = repo
         .purge_page(state.run_key, request_dedupe, MAX_ROWS_PER_TRANSACTION)
         .await?;
-    assert_eq!(purged, MAX_ROWS_PER_TRANSACTION);
+    assert_eq!(purged, PurgePage::Deleted(MAX_ROWS_PER_TRANSACTION));
     let stopped = fixture.owned_rows(state.run_key).await?;
-    assert_eq!(stopped.request_dedupe, before.request_dedupe - purged);
+    assert_eq!(
+        stopped.request_dedupe,
+        before.request_dedupe - MAX_ROWS_PER_TRANSACTION
+    );
     assert_eq!(stopped.history, before.history);
     assert!(fixture.recorded(state.run_key).await?);
     assert!(matches!(
@@ -358,5 +373,135 @@ async fn dsql_bulk_abandoned_materialization_fences_its_stragglers() -> Result<(
     repo.purge_run(successor).await?;
     assert_eq!(fixture.owned_rows(successor).await?, OwnedRows::default());
     assert!(!fixture.recorded(successor).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn dsql_bulk_deletion_across_decimal_boundaries() -> Result<()> {
+    if let Some(fixture) = Fixture::connect().await? {
+        deletion_across_decimal_boundaries(&fixture).await;
+    }
+    Ok(())
+}
+
+/// A purge that a hold refuses after its first page stops there. It keeps the
+/// record and every remaining row, even though the hold clears before the
+/// attempt returns, and a later purge removes them all.
+#[tokio::test]
+async fn dsql_bulk_refused_page_stops_attempt() -> Result<()> {
+    let Some(fixture) = Fixture::connect().await? else {
+        return Ok(());
+    };
+    let repo = fixture.store.run_repository();
+    let state = large_closed_run(&fixture).await;
+    let run = state.run_key;
+    delete_first(&fixture, &state).await;
+    let before = fixture.owned_rows(run).await?;
+    let (mut paged, resume_page) = pause_point::arm(pause_point::PauseKey::Purge(run));
+    let purge = repo.purge_run(run);
+    tokio::pin!(purge);
+    tokio::select! {
+        result = &mut purge => panic!("purge finished before its first page: {result:?}"),
+        reached = &mut paged => reached?,
+    }
+    let remaining = fixture.owned_rows(run).await?;
+    assert!(remaining.request_dedupe > 0);
+    assert!(remaining.request_dedupe < before.request_dedupe);
+    assert_eq!(remaining.history, before.history);
+
+    // Only existence is relevant to this hold. Inject it after a committed page
+    // and retire it at refusal, without involving an executor or wall-clock time.
+    sqlx::query("INSERT INTO run_intent (source_run_key,intent_id,source_home,close_seq,kind,created_at,payload,payload_parts) VALUES ($1,'purge-hold',$2,$3,1,now(),$4,1)")
+        .bind(run.0).bind(DsqlRunRepository::shard_id_to_uuid(ShardId(0)))
+        .bind(i64::try_from(state.transition_seq.0)?).bind(vec![0u8])
+        .execute(&fixture.pool).await?;
+    let (mut refused, resume_refusal) = pause_point::arm(pause_point::PauseKey::PurgeRefused(run));
+    drop(resume_page);
+    tokio::select! {
+        result = &mut purge => panic!("purge finished before observing the hold: {result:?}"),
+        reached = &mut refused => reached?,
+    }
+    assert!(fixture.recorded(run).await?);
+    assert_eq!(fixture.owned_rows(run).await?, remaining);
+    sqlx::query("DELETE FROM run_intent WHERE source_run_key=$1 AND intent_id='purge-hold'")
+        .bind(run.0)
+        .execute(&fixture.pool)
+        .await?;
+    drop(resume_refusal);
+    purge.await?;
+    assert!(
+        fixture.recorded(run).await?,
+        "a refused attempt keeps its record even after the hold clears"
+    );
+    assert_eq!(fixture.owned_rows(run).await?, remaining);
+    repo.purge_run(run).await?;
+    assert_eq!(fixture.owned_rows(run).await?, OwnedRows::default());
+    assert!(!fixture.recorded(run).await?);
+    Ok(())
+}
+
+/// One history page of a run with 120 batches, and of one with 3,000, deletes
+/// exactly the rows it selected: none left when the keys cross decimal widths,
+/// and none extra when the page is full.
+#[tokio::test]
+async fn dsql_bulk_purge_pages_delete_exact_rows() -> Result<()> {
+    let Some(fixture) = Fixture::connect().await? else {
+        return Ok(());
+    };
+    let repo = fixture.store.run_repository();
+    let history = PURGE_TABLES
+        .iter()
+        .find(|table| table.table == "history_batch")
+        .expect("purge includes history");
+    for count in [120usize, 3_000] {
+        let run = RunKey::new();
+        let shard = ShardId(0);
+        let happened_at = OffsetDateTime::now_utc();
+        let batches = (1..=count)
+            .map(|index| {
+                let event_id = i64::try_from(index)?;
+                Ok(CopyItem::Batch {
+                    first_event_id: event_id,
+                    last_event_id: event_id,
+                    events_data: codec::encode_history_events(&[HistoryEvent {
+                        event_id,
+                        happened_at,
+                        kind: crate::bulk_write_tests::signal(index, 16),
+                    }])?,
+                    principals_data: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        repo.record_materialization(run, shard, &WriteFence::Unfenced)
+            .await?;
+        for page in batches.chunks(900) {
+            repo.copy_materialization_page(
+                run,
+                shard,
+                TransitionSeq(1),
+                page,
+                &WriteFence::Unfenced,
+            )
+            .await?;
+        }
+        repo.abandon_materialization(run, WriteFence::Unfenced)
+            .await?;
+        assert_eq!(fixture.owned_rows(run).await?.history, count);
+        let limit = MAX_ROWS_PER_TRANSACTION - 2;
+        let selected = count.min(limit);
+        assert_eq!(
+            repo.purge_page(run, history, limit).await?,
+            PurgePage::Deleted(selected)
+        );
+        assert_eq!(
+            fixture.owned_rows(run).await?.history,
+            count - selected,
+            "a purge page must delete exactly its selected rows for {count} batches"
+        );
+        assert!(fixture.recorded(run).await?);
+        repo.purge_run(run).await?;
+        assert_eq!(fixture.owned_rows(run).await?, OwnedRows::default());
+        assert!(!fixture.recorded(run).await?);
+    }
     Ok(())
 }

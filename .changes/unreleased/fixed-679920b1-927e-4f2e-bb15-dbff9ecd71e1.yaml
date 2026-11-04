@@ -1,0 +1,5 @@
+kind: fixed
+body: Deleting a workflow run on DSQL now removes all of its rows; earlier versions could leave part of its history behind.
+time: 2026-11-04T11:18:44.926216+00:00
+custom:
+    Slice: 679920b1-927e-4f2e-bb15-dbff9ecd71e1

@@ -351,8 +351,9 @@ No separate specification PR is planned.
     guards, stale-incarnation preservation, and deterministic runtime metadata conflict,
     resolution, source-outcome and exhaustion cases. Update peer/local and wire coverage.
     - Tag: `// Feature: outbound-dispatch-recovery, Property 22: A source's unrelated commits don't void its deliveries.`
-  - Added live storage cases for a parent closing before child creation and for an unrelated
-    parent commit before child creation. Run the ignored memory fan-out and record its figures.
+  - Add live storage cases for a parent closing before child creation and for an unrelated
+    parent commit before child creation. Run the ignored memory and live DSQL fan-outs before
+    and after the fix, and record their figures in the ledger.
   - _Requirements: 2.6, 2.7, 3.4, 3.8, 10.4, 10.5, 10.6, 10.7._
 
 ## Verification evidence

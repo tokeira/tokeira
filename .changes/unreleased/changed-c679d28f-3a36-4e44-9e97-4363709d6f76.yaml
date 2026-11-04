@@ -1,0 +1,5 @@
+kind: changed
+body: Older binaries cannot read TKW4 state; rollback requires a compatible binary or restoration of the pre-upgrade database, not an in-place schema downgrade.
+time: 2026-11-02T13:00:04Z
+custom:
+    Slice: c679d28f-3a36-4e44-9e97-4363709d6f76

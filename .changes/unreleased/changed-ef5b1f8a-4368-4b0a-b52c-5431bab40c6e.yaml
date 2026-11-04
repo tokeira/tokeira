@@ -1,5 +1,0 @@
-kind: changed
-body: Upgrade a DSQL database that holds runs with every writer stopped, then run `tokeirad storage outbound-recovery` plan and apply; see docs/operations/outbound-recovery-cutover.md.
-time: 2026-11-04T14:48:39.068257+00:00
-custom:
-    Slice: ef5b1f8a-4368-4b0a-b52c-5431bab40c6e

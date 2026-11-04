@@ -1,5 +1,0 @@
-kind: changed
-body: Deliver activities through bounded queue-home discovery and fenced execution-owner starts, with durable request receipts for lost replies and complete acquisition repair.
-time: 2026-11-02T13:00:00Z
-custom:
-    Slice: 57f76558-bfd7-470b-b9f6-6edc947d70e7

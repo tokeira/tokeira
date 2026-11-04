@@ -91,8 +91,9 @@ _For any_ interleaving of deletions, purges and materializations, each stopped a
 
 Property 4: A purge finishes, removes only its run's rows, and removes history after the rows derived from it
 
-_For any_ run with any mix of owned rows, beside other runs' rows, and any sequence of purge attempts, each stopped after any transaction and some running at the same time, once an attempt returns success:
-- no row of the run and no record SHALL remain;
+_For any_ run with any mix of owned rows, beside other runs' rows, and any sequence of purge attempts, each stopped after any transaction and some running at the same time:
+- an attempt that a retention hold refuses SHALL return success and keep the record and every remaining row, even if the hold clears before the attempt returns ([outbound-dispatch-recovery, Property 19](../outbound-dispatch-recovery/design.md#property-19-retention-cannot-erase-outstanding-proof));
+- once an attempt that no hold refused returns success, no row of the run and no record SHALL remain;
 - every other run's rows SHALL be unchanged;
 - at no point SHALL the run have lost a history row while it still had a row in another owned table but `run_value_part`, nor a row of `run_value_part` while it still had a history row ([large-value-parts](../large-value-parts/design.md)).
 
@@ -205,6 +206,8 @@ The memory store mirrors this under its lock: it removes the run, its pointers a
 - `purge_run(run_key)` does nothing and succeeds when the run has no record. A run without a record either has mutable state, so it isn't to be purged, or is already purged.
 - If the record says `materializing`, it first switches it to `purging` in a transaction of its own, through `abandon_materialization(run_key)`, which does nothing to a record already `purging` or to none. Through the checks of the materialization's transactions, the switch fences any of them still running. A caller must pass a `materializing` record only when its materialization will never finish (see *Runtime*).
 - It then removes the run's rows table by table, one table per transaction, at most 1,000 rows per transaction:
+  - `outbound_upgrade_state_part`, immutable state parts from the bounded upgrade preparation ([outbound-dispatch-recovery](../outbound-dispatch-recovery/design.md#upgrade-and-legacy-resolution), using the [large-value-parts](../large-value-parts/design.md) storage pattern);
+  - `run_operation`, the derived outbound operation index ([outbound-dispatch-recovery](../outbound-dispatch-recovery/design.md#physical-storage));
   - `request_dedupe`;
   - `timer_bucket`;
   - `activity_dispatch`;
@@ -212,8 +215,9 @@ The memory store mirrors this under its lock: it removes the run, its pointers a
   - `history_batch`;
   - `run_value_part`, the parts of the run's values over the part size, last ([large-value-parts](../large-value-parts/design.md)). A batch's parts outlast every batch row of the run, so a history read that finds a batch finds its parts.
 
-  Each transaction selects a page of the table's keys for the run, in key order, and deletes the run's rows up to the page's last key, which are exactly the page.
-- The transaction that deletes the run's last parts also deletes the record, within the same 1,000 rows. A run with no parts left has its record deleted alone.
+  Each transaction selects a page of the table's keys for the run, ordered by each key column's own type, so event 10 follows event 9. It deletes the run's rows up to the page's last key, which are exactly the page. The keys are selected as text, so the page's `ORDER BY` names the table's columns, which a text output can't shadow.
+- A page that a retention hold refuses ends the attempt, which succeeds and keeps the record and every remaining row. It doesn't go on to the next table, even if the hold clears meanwhile.
+- The transaction that deletes the run's last parts also deletes the record, within the same 1,000 rows, once it finds no row of the run in any purge table. A run with no parts left has its record deleted alone, after the same check. Abandoning a staged preparation makes the same check before it deletes its record. If a row remains, the transaction rolls back and keeps the record, and the purge goes through the tables again. After a second pass it fails, naming the table. A purge that finds the record already gone does nothing and succeeds.
 - Every step is a delete of rows that no one recreates: the run has no mutable state, so no commit writes to it. Repeating a step, or running two purges of the run at once, deletes nothing twice. A transaction refused with a serialization conflict, as one of two concurrent purges can be, is retried, as the materialization's are. The record goes only when every table is empty, so a purge that stops early leaves the record for the next attempt (Property 4).
 
 ### Materialization (`materialize_reset_successor`)
@@ -323,6 +327,16 @@ The fix changes these specs:
 
   Each must fail the test that covers it.
 
+### Purge paging and refusals
+
+- **Keys across decimal widths.** `deletion_across_decimal_boundaries` runs on both stores. A closed run of 120 one-signal history batches, crossing events 10 and 100, with values split into parts at events 9, 10, 99 and 100, is deleted and purged. It leaves no row in any purge table and no record. On the code before the fix, DSQL leaves history rows.
+- **Exact pages.** In `dsql_bulk_purge_pages_delete_exact_rows`, one history page of a run with 120 batches, and of one with 3,000, deletes exactly the rows it selected.
+- **A refusal.** In `dsql_bulk_refused_page_stops_attempt`, a hold added after a committed page refuses the next one, and is cleared before the attempt goes on. The attempt keeps the record and every remaining row, and a later purge removes them all.
+- **Abandoning a preparation.** The preparation-abandonment case stages history across events 10 and 100, and leaves no row and no record.
+- **Negative controls on DSQL, each patched in alone:**
+  - pages sorted by their text output names. The typed-order unit test and the exact-pages case fail it. The second pass can still finish the 120-batch case, so the exact-pages case is the one that catches it;
+  - a refused page skipped, and the record deleted without the check. The refusal case fails it.
+
 ### Live DSQL
 
 The live suite runs on an ephemeral cluster under the `dsql-live` profile ([docs/testing/dsql-live-suites.md](../../../docs/testing/dsql-live-suites.md)). It covers:
@@ -347,6 +361,7 @@ The live suite runs on an ephemeral cluster under the `dsql-live` profile ([docs
 
 - The first transaction changes only the rows the design lists.
 - The purge's table order, and the purge of an abandoned materialization, which has only history, timer and part rows.
+- Every `PURGE_TABLES` page orders by qualified source key columns, never by a text output name; this regression guard runs without a database in CI.
 - The listing of a shard's records in run-key order.
 - `delete_workflow` returns after the first transaction, and the purger removes the run's rows. With `purge_inline`, the rows are gone when it returns, and an inline purge that fails is handed to the purger.
 - The recovery switches a `materializing` record before it hands the record's run to the purger, and a takeover leaves no record `materializing` once the shard is activated. The recovery hands the shard's records to the purger without waiting for them.

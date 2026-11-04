@@ -37,6 +37,9 @@ pub(crate) struct OwnedRows {
     /// Parts of the run's values over the part size, which only DSQL stores
     /// (`large-value-parts`): the in-memory store has none.
     pub(crate) parts: usize,
+    /// Physical outbound index and upgrade rows, counted only on DSQL.
+    pub(crate) run_operation: usize,
+    pub(crate) outbound_upgrade_state_part: usize,
 }
 
 /// One stored history batch: how many events it holds, and its encoded size.
@@ -340,6 +343,57 @@ pub(crate) async fn deletion_of_a_large_run(backend: &impl Backend) {
             .unwrap(),
         None
     );
+}
+
+/// The deletion of a closed run whose history batches start on both sides of
+/// events 10 and 100, with values split into parts at events 9, 10, 99 and
+/// 100. Its purge leaves no row and no record.
+pub(crate) async fn deletion_across_decimal_boundaries(backend: &impl Backend) {
+    let mut state = applied(commit(backend, fresh_transition(RunKey::new())).await);
+    for index in 0..120 {
+        let first = state.last_event_id + 1;
+        let input = if matches!(first, 9 | 10 | 99 | 100) {
+            1_100_000
+        } else {
+            16
+        };
+        state = applied(
+            commit(
+                backend,
+                with_events(following(&state), first, vec![signal(index, input)]),
+            )
+            .await,
+        );
+    }
+    let mut close = following(&state);
+    close.next_state.status = ExecutionStatus::Completed;
+    close.next_state.closed_at = Some(close.next_state.started_at);
+    close.next_state.pending_workflow_task = None;
+    let state = applied(commit(backend, close).await);
+    assert_eq!(
+        backend.owned_rows(state.run_key).await.unwrap().history,
+        120
+    );
+    delete_and_purge(backend, &state).await;
+    assert_eq!(
+        backend.owned_rows(state.run_key).await.unwrap(),
+        OwnedRows::default()
+    );
+    assert!(matches!(
+        backend.repo().load_run(state.run_key).await.unwrap(),
+        LoadedRun::Absent
+    ));
+    let mut after = None;
+    loop {
+        let records = backend
+            .repo()
+            .list_run_bulk_writes(bundle(backend, &state), after, 100)
+            .await
+            .unwrap();
+        assert!(records.iter().all(|record| record.run_key != state.run_key));
+        let Some(last) = records.last() else { break };
+        after = Some(last.run_key);
+    }
 }
 
 /// Materialize a reset successor of `base`, replacing `expected` as current.

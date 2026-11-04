@@ -340,6 +340,22 @@ No separate specification PR is planned.
     batch expansion cuts, and add compilable live DSQL close/expansion regressions.
   - _Requirements: 6.1, 6.9, 9.1, 9.2, 10.5, 10.6._
 
+- [x] 22. Preserve delivery incarnations across unrelated source commits
+  - Remove the captured source sequence from both operation guards, receiver hydration
+    and the internal wire mapping; reserve the removed proto field and name. Keep the
+    DSQL source row lock, home checks, incarnation re-derivation and ownership fences.
+  - Retry seed selection and release retirement after OCC conflicts by reloading through
+    `operation_source`, using the lane's configured OCC retry bound. Preserve winning
+    seeds and registry-read validation against the sequence actually committed.
+  - Implement **Property 22** with at least 100 generated memory storage cases for both
+    guards, stale-incarnation preservation, and deterministic runtime metadata conflict,
+    resolution, source-outcome and exhaustion cases. Update peer/local and wire coverage.
+    - Tag: `// Feature: outbound-dispatch-recovery, Property 22: A source's unrelated commits don't void its deliveries.`
+  - Add live storage cases for a parent closing before child creation and for an unrelated
+    parent commit before child creation. Run the ignored memory and live DSQL fan-outs before
+    and after the fix, and record their figures in the ledger.
+  - _Requirements: 2.6, 2.7, 3.4, 3.8, 10.4, 10.5, 10.6, 10.7._
+
 ## Verification evidence
 
 The [delivery ledger](../../../docs/readiness/outbound-recovery.md) records the
@@ -372,7 +388,8 @@ one upstream skip and four existing registry exclusions are reported separately.
   "18": ["17"],
   "19": ["18"],
   "20": ["18"],
-  "21": ["20"]
+  "21": ["20"],
+  "22": ["21"]
 }
 ```
 

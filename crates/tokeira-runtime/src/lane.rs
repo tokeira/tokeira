@@ -136,6 +136,8 @@ pub trait DispatchPublisher: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct LaneHandle {
     lane_id: usize,
+    /// Retry budget shared by command execution and outbound metadata updates.
+    pub(crate) max_occ_retries: u32,
     tx: mpsc::Sender<LaneMessage>,
     identity_tx: mpsc::Sender<IdentityRequest>,
     metadata_tx: mpsc::Sender<OutboundMetadataRequest>,
@@ -546,6 +548,7 @@ where
     let (tx, mut rx) = mpsc::channel::<LaneMessage>(1024);
     let (identity_tx, mut identity_rx) = mpsc::channel::<IdentityRequest>(1024);
     let (metadata_tx, mut metadata_rx) = mpsc::channel::<OutboundMetadataRequest>(64);
+    let max_occ_retries = config.max_occ_retries;
     tokio::spawn(async move {
         // One lane-local cache shared across activations: a run's loaded state
         // survives between commands so repeated work on the same run avoids a
@@ -624,6 +627,7 @@ where
     });
     LaneHandle {
         lane_id,
+        max_occ_retries,
         tx,
         identity_tx,
         metadata_tx,
@@ -3535,6 +3539,7 @@ mod tests {
         let (metadata_tx, _) = mpsc::channel(1);
         let handle = LaneHandle {
             lane_id: 0,
+            max_occ_retries: LaneConfig::default().max_occ_retries,
             tx,
             identity_tx,
             metadata_tx,

@@ -50,7 +50,7 @@ proptest! {
 
     // Feature: outbound-dispatch-recovery, Property 18: Remote delivery grants no extra authority.
     #[test]
-    fn peer_and_local_hydration_agree_under_owner_and_reference_changes(bytes in proptest::collection::vec(any::<u8>(), 0..128), mutation in 0u8..5) {
+    fn peer_and_local_hydration_agree_under_owner_and_reference_changes(bytes in proptest::collection::vec(any::<u8>(), 0..128), mutation in prop_oneof![Just(0u8), 2u8..5]) {
         tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap().block_on(async {
             let initial = InMemoryStore::with_shard_count(8);
             let repo = InMemoryStore::from_snapshot(&initial.snapshot().await.unwrap()).unwrap();
@@ -85,11 +85,10 @@ proptest! {
             repo.try_acquire_bundle(source_home, "source".into(), "source:1".into()).await.unwrap();
             repo.try_acquire_bundle(destination_home, "destination".into(), "destination:1".into()).await.unwrap();
             let row = tokeira_storage::derive_operations(&state, source_home).unwrap().into_iter().find(|row| row.incarnation.key.kind == OperationKind::ExternalSignal).unwrap();
-            let mut reference = OutboundDeliveryReference { authority: DeliveryGuard::Operation { incarnation: row.incarnation, source_seq: state.transition_seq },
+            let mut reference = OutboundDeliveryReference { authority: DeliveryGuard::Operation { incarnation: row.incarnation },
                 source_fence: WriteFence::Lease(ExecutionHomeFence { home: source_home, owner: "source".into(), epoch: ShardEpoch(1) }),
                 phase: DeliveryPhase::External, destination: target.run_key, destination_home };
             match mutation {
-                1 => { if let DeliveryGuard::Operation { source_seq, .. } = &mut reference.authority { source_seq.0 += 1; } },
                 2 => reference.destination_home = source_home,
                 3 | 4 => {
                     let (home, owner) = if mutation == 3 { (source_home, "source") } else { (destination_home, "destination") };

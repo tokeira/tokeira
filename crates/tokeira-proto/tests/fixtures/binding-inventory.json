@@ -23137,16 +23137,6 @@
         "type_name": ""
       },
       {
-        "field": "source_transition_seq",
-        "label": "LABEL_OPTIONAL",
-        "message": "tokeira.internal.runtime.v1.OutboundOperationReference",
-        "number": 5,
-        "oneof": null,
-        "proto3_optional": false,
-        "type": "TYPE_UINT64",
-        "type_name": ""
-      },
-      {
         "field": "source_tree_hash",
         "label": "LABEL_OPTIONAL",
         "message": "tokeira.compatibility.v1.BuildInfo",

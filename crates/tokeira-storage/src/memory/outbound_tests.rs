@@ -351,7 +351,7 @@ proptest! {
                 links: Vec::new(), request, now: target.started_at,
             })).unwrap();
             let target = applied(store.commit_outbound_transition(target.run_key, signal, DeliveryGuard::Operation {
-                incarnation: row.incarnation, source_seq: source.transition_seq,
+                incarnation: row.incarnation,
             }, WriteFence::Unfenced, WriteFence::Unfenced).await.unwrap());
             let target = applied(store.commit_transition(target.run_key, close(&target), WriteFence::Unfenced).await.unwrap());
             store.delete_run_for_bundle(target.run_key, home(&target), crate::DeleteRunRequest { expected_seq: target.transition_seq, deleted_at: target.started_at }, WriteFence::Unfenced).await.unwrap();
@@ -399,7 +399,7 @@ proptest! {
             }
             let before = store.snapshot().await.unwrap();
             let result = store.commit_outbound_transition(target.next_state.run_key, target,
-                DeliveryGuard::Operation { incarnation: row.incarnation, source_seq: source.transition_seq }, source_fence, target_fence).await;
+                DeliveryGuard::Operation { incarnation: row.incarnation }, source_fence, target_fence).await;
             if lost_source || lost_target {
                 prop_assert!(result.unwrap_err().downcast_ref::<crate::LeaseFenceLost>().is_some());
                 prop_assert_eq!(store.snapshot().await.unwrap(), before);
@@ -426,7 +426,7 @@ proptest! {
                 applied(store.commit_transition(state.run_key, close(&state), WriteFence::Unfenced).await.unwrap());
                 Some(state.run_key)
             } else { None };
-            let guard = DeliveryGuard::ChildStart { incarnation: operation.incarnation, source_seq: source.transition_seq, expected_current: prior };
+            let guard = DeliveryGuard::ChildStart { incarnation: operation.incarnation, expected_current: prior };
             let mut competing = first;
             competing.next_state.run_key = RunKey::new(); competing.next_state.run_id = RunId::new();
             competing.request_dedupe_ops.clear();
@@ -498,6 +498,57 @@ proptest! {
         })?;
     }
 
+    // Feature: outbound-dispatch-recovery, Property 22: A source's unrelated commits don't void its deliveries.
+    #[test]
+    fn unrelated_source_commits_preserve_delivery_incarnations(seed in any::<u32>(), advances in 0usize..32) {
+        block_on(async {
+            for child_start in [false, true] {
+                let store = InMemoryStore::default();
+                let initial = source(seed, 1, 2);
+                let mut source = applied(store.commit_transition(initial.next_state.run_key, initial, WriteFence::Unfenced).await.unwrap());
+                let incarnation = crate::derive_operations(&source, home(&source)).unwrap().remove(0).incarnation;
+                let guard = if child_start {
+                    DeliveryGuard::ChildStart { incarnation, expected_current: None }
+                } else { DeliveryGuard::Operation { incarnation } };
+                for _ in 0..advances {
+                    source = applied(store.commit_transition(source.run_key, following(&source), WriteFence::Unfenced).await.unwrap());
+                }
+                let target = fresh_transition(RunKey::new());
+                let key = target.next_state.run_key;
+                let delivered = store.commit_outbound_transition(key, target, guard, WriteFence::Unfenced, WriteFence::Unfenced).await.unwrap();
+                prop_assert!(matches!(delivered, CommitResult::Applied { .. }), "pending incarnation permits delivery");
+                prop_assert!(matches!(store.load_run(key).await.unwrap(), LoadedRun::Existing(_)));
+            }
+            Ok(())
+        })?;
+    }
+
+    // Feature: outbound-dispatch-recovery, Property 22: A source's unrelated commits don't void its deliveries.
+    #[test]
+    fn confirmed_child_incarnation_cannot_create_a_late_destination(seed in any::<u32>()) {
+        block_on(async {
+            for child_start in [false, true] {
+                let store = InMemoryStore::default();
+                let initial = source(seed, 1, 2);
+                let source = applied(store.commit_transition(initial.next_state.run_key, initial, WriteFence::Unfenced).await.unwrap());
+                let incarnation = crate::derive_operations(&source, home(&source)).unwrap().remove(0).incarnation;
+                let confirmed = BasicKernel.apply(LoadedRun::Existing(source.clone()), Command::ChildStartConfirmed(tokeira_kernel::ChildStartConfirmedRequest {
+                    child_workflow_id: WorkflowId("target-1".into()), initiated_event_id: 1,
+                    result: tokeira_kernel::ChildStartResult::Started { child_run_id: RunId::new(), workflow_type: WorkflowType("child".into()) }, now: source.started_at,
+                })).unwrap();
+                applied(store.commit_transition(source.run_key, confirmed, WriteFence::Unfenced).await.unwrap());
+                let guard = if child_start { DeliveryGuard::ChildStart { incarnation, expected_current: None } }
+                    else { DeliveryGuard::Operation { incarnation } };
+                let target = fresh_transition(RunKey::new());
+                let before = store.snapshot().await.unwrap();
+                let error = store.commit_outbound_transition(target.next_state.run_key, target, guard, WriteFence::Unfenced, WriteFence::Unfenced).await.unwrap_err();
+                prop_assert!(matches!(error.downcast_ref::<crate::RecoveryError>(), Some(crate::RecoveryError::Obsolete)));
+                prop_assert_eq!(store.snapshot().await.unwrap(), before);
+            }
+            Ok(())
+        })?;
+    }
+
     // Feature: outbound-dispatch-recovery, Property 4: Ownership changes cannot authorize stale commits.
     #[test]
     fn obsolete_source_cannot_commit_a_late_destination(seed in any::<u32>(), category in 0u8..3) {
@@ -506,7 +557,7 @@ proptest! {
             let start = source(seed, 1, category);
             let source = applied(store.commit_transition(start.next_state.run_key, start, WriteFence::Unfenced).await.unwrap());
             let operation = store.read_operation_page(home(&source), kind(category), ScanBound::Capture, None, 1).await.unwrap().rows.remove(0);
-            let guard = DeliveryGuard::Operation { incarnation: operation.incarnation, source_seq: source.transition_seq };
+            let guard = DeliveryGuard::Operation { incarnation: operation.incarnation };
             let mut target = fresh_transition(RunKey::new()); target.next_state.workflow_id = WorkflowId("guarded-target".into());
             applied(store.commit_transition(source.run_key, close(&source), WriteFence::Unfenced).await.unwrap());
             let before = store.snapshot().await.unwrap();

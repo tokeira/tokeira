@@ -155,15 +155,8 @@ pub(super) async fn validate_guard(
         }
     }
     match guard {
-        DeliveryGuard::Operation {
-            incarnation,
-            source_seq,
-        }
-        | DeliveryGuard::ChildStart {
-            incarnation,
-            source_seq,
-            ..
-        } => {
+        DeliveryGuard::Operation { incarnation }
+        | DeliveryGuard::ChildStart { incarnation, .. } => {
             let source = read_source(tx, incarnation.key.source_run)
                 .await?
                 .ok_or(RecoveryError::Obsolete)?;
@@ -173,10 +166,9 @@ pub(super) async fn validate_guard(
                 shard_count,
             );
             source_fence.ensure_home(home)?;
-            if source.transition_seq != source_seq
-                || !crate::derive_operations(&source, home)?
-                    .iter()
-                    .any(|row| row.incarnation == incarnation)
+            if !crate::derive_operations(&source, home)?
+                .iter()
+                .any(|row| row.incarnation == incarnation)
             {
                 return Err(RecoveryError::Obsolete.into());
             }

@@ -108,8 +108,8 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
         {
             return Ok(state);
         }
-        // Reclaim only a missing or underived cause. A later source-sequence
-        // guard failure says nothing about index staleness and needs no scan.
+        // Reclaim only a missing or underived cause. A later current-pointer
+        // guard refusal says nothing about index staleness and needs no scan.
         // Closed sources may be absent from acquisition's recovery scan, so
         // discovery must finish their bounded deletions under the original fence.
         attempt.validate(owner)?;
@@ -137,7 +137,6 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
                     source_fence: attempt.fence.clone(),
                     authority: DeliveryGuard::Operation {
                         incarnation: row.incarnation,
-                        source_seq: state.transition_seq,
                     },
                 },
             )
@@ -236,10 +235,9 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
     }
 }
 
-fn authority(row: &OperationRow, source: &WorkflowState) -> DeliveryGuard {
+fn authority(row: &OperationRow) -> DeliveryGuard {
     DeliveryGuard::Operation {
         incarnation: row.incarnation,
-        source_seq: source.transition_seq,
     }
 }
 

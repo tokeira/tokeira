@@ -496,7 +496,7 @@ proptest! {
                         Command::Signal(signal(&delivery_request_id))).unwrap();
                     assert!(matches!(store.commit_outbound_transition(target_run, transition,
                         tokeira_storage::DeliveryGuard::Operation {
-                            incarnation: row.incarnation, source_seq: source.transition_seq,
+                            incarnation: row.incarnation,
                         }, WriteFence::Unfenced, WriteFence::Unfenced).await.unwrap(), CommitResult::Applied { .. }));
                 }
                 if target == 1 {

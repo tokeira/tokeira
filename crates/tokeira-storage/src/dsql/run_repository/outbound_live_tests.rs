@@ -128,7 +128,6 @@ async fn outbound_live_original_fences_and_retained_destination_proof() -> Resul
         )?;
         let guard = DeliveryGuard::Operation {
             incarnation: row.incarnation,
-            source_seq: source.transition_seq,
         };
         let before = repo.read_history(target.run_key, 0, 100).await?;
         let delivered = repo
@@ -1016,4 +1015,132 @@ async fn outbound_live_close_batch_expands_within_budget() -> Result<()> {
     retire_pending_child_limit_intents(repo, &closed).await?;
     fixture.store.shutdown().await?;
     Ok(())
+}
+
+async fn child_start_after_parent_commit(closed: bool) -> Result<()> {
+    let Some(fixture) = Fixture::connect().await? else {
+        return Ok(());
+    };
+    let repo = fixture.store.run_repository();
+    let mut initial = fresh_transition(RunKey::new());
+    let mut child = fresh_transition(RunKey::new());
+    child.next_state.namespace_id = initial.next_state.namespace_id;
+    child.next_state.workflow_id =
+        WorkflowId(format!("guarded-child-{}", child.next_state.run_key.0));
+    let child_id = child.next_state.workflow_id.clone();
+    let child_key = child.next_state.run_key;
+    initial.next_state.children.insert(
+        child_id.clone(),
+        tokeira_kernel::ChildWorkflowState {
+            child_workflow_id: child_id.clone(),
+            namespace_id: initial.next_state.namespace_id,
+            namespace: None,
+            workflow_type: child.next_state.workflow_type.clone(),
+            header: None,
+            child_run_id: None,
+            initiated_event_id: 10,
+            started_event_id: None,
+            parent_close_policy: tokeira_kernel::ParentClosePolicy::Abandon,
+        },
+    );
+    let source = applied(
+        repo.commit_transition(initial.next_state.run_key, initial, WriteFence::Unfenced)
+            .await?,
+    );
+    let incarnation = crate::derive_operations(&source, ShardId(0))?
+        .remove(0)
+        .incarnation;
+    let guard = DeliveryGuard::ChildStart {
+        incarnation,
+        expected_current: None,
+    };
+    let concurrent = if closed {
+        close(&source)
+    } else {
+        BasicKernel.apply(
+            LoadedRun::Existing(source.clone()),
+            Command::Signal(tokeira_kernel::SignalRequest {
+                signal_name: "unrelated".into(),
+                input: Payloads::default(),
+                header: None,
+                links: Vec::new(),
+                request: RequestContext {
+                    request_id: RequestId(format!("unrelated-{}", source.run_key.0)),
+                    ..RequestContext::unattributed(source.started_at)
+                },
+                now: source.started_at,
+            }),
+        )?
+    };
+    let source = applied(
+        repo.commit_transition(source.run_key, concurrent, WriteFence::Unfenced)
+            .await?,
+    );
+    let result = repo
+        .commit_outbound_transition(
+            child_key,
+            child,
+            guard,
+            WriteFence::Unfenced,
+            WriteFence::Unfenced,
+        )
+        .await;
+    let child = if closed {
+        assert!(matches!(
+            result
+                .expect_err("closed source must refuse child creation")
+                .downcast_ref::<RecoveryError>(),
+            Some(RecoveryError::Obsolete)
+        ));
+        assert_eq!(repo.load_run(child_key).await?, LoadedRun::Absent);
+        assert!(repo.read_history(child_key, 0, 100).await?.is_empty());
+        assert!(
+            repo.find_latest_run(source.namespace_id, &child_id)
+                .await?
+                .is_none()
+        );
+        None
+    } else {
+        assert!(
+            crate::derive_operations(&source, ShardId(0))?
+                .iter()
+                .any(|row| row.incarnation == incarnation)
+        );
+        let child = applied(result?);
+        assert_eq!(
+            repo.load_run(child_key).await?,
+            LoadedRun::Existing(child.clone())
+        );
+        Some(child)
+    };
+    let source = if source.is_open() {
+        applied(
+            repo.commit_transition(source.run_key, close(&source), WriteFence::Unfenced)
+                .await?,
+        )
+    } else {
+        source
+    };
+    // Closing the source first releases the destination's retained delivery proof.
+    if let Some(child) = child {
+        let child = applied(
+            repo.commit_transition(child_key, close(&child), WriteFence::Unfenced)
+                .await?,
+        );
+        delete_and_purge(repo, &child).await?;
+    }
+    delete_and_purge(repo, &source).await?;
+    fixture.store.shutdown().await
+}
+
+// Feature: outbound-dispatch-recovery, Property 22: A source's unrelated commits don't void its deliveries.
+#[tokio::test]
+async fn outbound_live_child_start_refused_after_parent_close() -> Result<()> {
+    child_start_after_parent_commit(true).await
+}
+
+// Feature: outbound-dispatch-recovery, Property 22: A source's unrelated commits don't void its deliveries.
+#[tokio::test]
+async fn outbound_live_child_start_survives_unrelated_parent_commit() -> Result<()> {
+    child_start_after_parent_commit(false).await
 }

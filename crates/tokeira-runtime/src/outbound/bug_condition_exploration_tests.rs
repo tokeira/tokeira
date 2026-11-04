@@ -40,7 +40,7 @@ use crate::{
     wft_timeout::WftTimeoutTrackingState,
 };
 
-use super::test_repository::Repository;
+use super::{fan_out_measurement::FanOutMeasurement, test_repository::Repository};
 
 #[derive(Debug, Default)]
 struct HeldCallbackClient {
@@ -163,6 +163,10 @@ fn applied(result: CommitResult) -> WorkflowState {
 
 impl Fixture {
     async fn new(seed: u64) -> Self {
+        Self::with_config(seed, LaneConfig::default()).await
+    }
+
+    async fn with_config(seed: u64, config: LaneConfig) -> Self {
         let repo = Arc::new(Repository::default());
         let mut owner = ShardOwner::new(1);
         owner.record_acquired(ShardId(0), ShardEpoch::ZERO);
@@ -178,7 +182,7 @@ impl Fixture {
             WftTimeoutTrackingState::default(),
             NexusTimeoutTrackingState::default(),
             UpdateRegistry::new(),
-            LaneConfig::default(),
+            config,
         );
         let source = request("source", seed);
         let mut target = request("target", seed);
@@ -417,6 +421,55 @@ impl Fixture {
     }
 }
 
+// Feature: outbound-dispatch-recovery, Property 20: End-to-end crash refinement.
+#[tokio::test]
+#[ignore = "measurement: run explicitly"]
+async fn child_fan_out_starts_every_child() -> Result<()> {
+    let fixture = Fixture::new(0).await;
+    let children: Vec<_> = (0..100)
+        .map(|index| WorkflowId(format!("fan-out-child-{index}")))
+        .collect();
+    let commands = children
+        .iter()
+        .map(|id| {
+            let mut command = fixture.child_command(Vec::new());
+            if let WorkflowCommand::StartChildWorkflow {
+                child_workflow_id,
+                parent_close_policy,
+                ..
+            } = &mut command
+            {
+                *child_workflow_id = id.clone();
+                *parent_close_policy = ParentClosePolicy::Abandon;
+            }
+            command
+        })
+        .collect();
+    let parent = fixture.complete(&fixture.source, commands).await;
+    assert_eq!(parent.children.len(), children.len());
+    let measurement = FanOutMeasurement::new(Some(fixture.repo.outbound_committed.clone()));
+    let runtime = TokeiraRuntime::new_with_config(fixture.repo.clone(), RuntimeConfig::default());
+    let result = measurement
+        .run(
+            "memory",
+            fixture.repo.as_ref(),
+            &fixture.source,
+            ShardId(0),
+            &children,
+            std::time::Duration::from_secs(10 * 60),
+            runtime.ready(),
+        )
+        .await;
+    let shutdown = runtime.shutdown_handle();
+    shutdown.begin_shutdown();
+    let stopped = shutdown
+        .wait(std::time::Instant::now() + std::time::Duration::from_secs(10))
+        .await;
+    result?;
+    stopped?;
+    Ok(())
+}
+
 // Feature: outbound-dispatch-recovery, Property 21: A close's outbound writes stay within budget
 #[test]
 fn obsolete_leftover_operation_reconciles_source() {
@@ -496,9 +549,9 @@ fn obsolete_leftover_operation_reconciles_source() {
     });
 }
 
-// Feature: outbound-dispatch-recovery, Property 21: A close's outbound writes stay within budget
+// Feature: outbound-dispatch-recovery, Property 22: A source's unrelated commits don't void its deliveries.
 #[test]
-fn obsolete_outcome_after_source_advance_does_not_reconcile() {
+fn source_outcome_survives_unrelated_source_advance() {
     executor().block_on(async {
         let fixture = Fixture::new(0).await;
         let before = fixture
@@ -534,9 +587,304 @@ fn obsolete_outcome_after_source_advance_does_not_reconcile() {
             .lock()
             .unwrap() = Some(concurrent);
         let attempt = super::driver::Attempt::capture(&fixture.owner, ShardId(0)).unwrap();
-        let error = fixture
+        fixture
             .publisher()
             .drive_outbound_operation(operations[0].clone(), attempt, &fixture.owner)
+            .await
+            .unwrap();
+        let after = state(&fixture.repo, fixture.source.run_key).await;
+        assert!(after.transition_seq > before.transition_seq);
+        assert!(
+            tokeira_storage::derive_operations(&after, ShardId(0))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fixture.repo.reconcile_calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+fn sibling_transition(source: &WorkflowState) -> tokeira_kernel::Transition {
+    BasicKernel
+        .apply(
+            LoadedRun::Existing(source.clone()),
+            Command::Signal(tokeira_kernel::SignalRequest {
+                signal_name: "sibling commit".into(),
+                input: Payloads::default(),
+                header: None,
+                links: Vec::new(),
+                request: RequestContext {
+                    request_id: tokeira_types::RequestId(format!(
+                        "sibling-{}",
+                        source.transition_seq.0
+                    )),
+                    ..RequestContext::unattributed(source.started_at)
+                },
+                now: source.started_at,
+            }),
+        )
+        .unwrap()
+}
+
+async fn metadata_fixture(release: bool, retries: u32) -> Fixture {
+    let mut fixture = Fixture::with_config(
+        0,
+        LaneConfig {
+            max_occ_retries: retries,
+            ..Default::default()
+        },
+    )
+    .await;
+    if release {
+        fixture
+            .create_confirmed_child_with_owed_release(ParentClosePolicy::Abandon)
+            .await;
+    } else {
+        fixture
+            .complete(&fixture.source, vec![fixture.child_command(Vec::new())])
+            .await;
+    }
+    fixture
+}
+
+// Feature: outbound-dispatch-recovery, Property 22: A source's unrelated commits don't void its deliveries.
+#[test]
+fn child_metadata_retries_sibling_commits_within_the_attempt() {
+    executor().block_on(async {
+        for release in [false, true] {
+            let fixture = metadata_fixture(release, 2).await;
+            let before = state(&fixture.repo, fixture.source.run_key).await;
+            let row = tokeira_storage::derive_operations(&before, ShardId(0))
+                .unwrap()
+                .remove(0);
+            let mut concurrent = sibling_transition(&before);
+            concurrent.next_state.root_workflow_id = Some(WorkflowId("fresh-root".into()));
+            fixture
+                .repo
+                .metadata_before_commit
+                .lock()
+                .unwrap()
+                .push_back(concurrent);
+            let attempt = super::driver::Attempt::capture(&fixture.owner, ShardId(0)).unwrap();
+            // One successful executor call is an advanced outcome; the driver
+            // never sees the metadata OCC loss and never backs this attempt off.
+            fixture
+                .publisher()
+                .drive_outbound_operation(row.clone(), attempt, &fixture.owner)
+                .await
+                .unwrap();
+            assert_eq!(fixture.repo.metadata_commit_calls.load(Ordering::SeqCst), 2);
+            let after = state(&fixture.repo, fixture.source.run_key).await;
+            assert!(
+                !tokeira_storage::derive_operations(&after, ShardId(0))
+                    .unwrap()
+                    .contains(&row)
+            );
+            if release {
+                assert!(after.outbound.as_ref().unwrap().child_releases.is_empty());
+            } else {
+                let child = &after.children[&fixture.target.workflow_id];
+                let seed = &after.outbound.as_ref().unwrap().child_seeds[&child.initiated_event_id];
+                assert_eq!(seed.root_workflow_id, Some(WorkflowId("fresh-root".into())));
+                assert!(child.started_event_id.is_some());
+                let target = state(
+                    &fixture.repo,
+                    RunKey::derive(
+                        after.namespace_id,
+                        &child.child_workflow_id,
+                        seed.child_run_id,
+                    ),
+                )
+                .await;
+                assert_eq!(target.root_workflow_id, seed.root_workflow_id);
+            }
+            assert_eq!(fixture.repo.reconcile_calls.load(Ordering::SeqCst), 0);
+        }
+    });
+}
+
+// Feature: outbound-dispatch-recovery, Property 22: A source's unrelated commits don't void its deliveries.
+#[test]
+fn child_metadata_retry_refuses_a_resolved_operation_without_writing() {
+    executor().block_on(async {
+        for release in [false, true] {
+            let fixture = metadata_fixture(release, 2).await;
+            let before = state(&fixture.repo, fixture.source.run_key).await;
+            let row = tokeira_storage::derive_operations(&before, ShardId(0))
+                .unwrap()
+                .remove(0);
+            let mut concurrent = sibling_transition(&before);
+            if release {
+                concurrent
+                    .next_state
+                    .outbound
+                    .as_mut()
+                    .unwrap()
+                    .child_releases
+                    .clear();
+            } else {
+                concurrent.next_state.children.clear();
+            }
+            let resolved = concurrent.next_state.clone();
+            fixture
+                .repo
+                .metadata_before_commit
+                .lock()
+                .unwrap()
+                .push_back(concurrent);
+            let attempt = super::driver::Attempt::capture(&fixture.owner, ShardId(0)).unwrap();
+            let error = fixture
+                .publisher()
+                .drive_outbound_operation(row, attempt, &fixture.owner)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<tokeira_storage::RecoveryError>(),
+                Some(tokeira_storage::RecoveryError::Obsolete)
+            ));
+            assert_eq!(fixture.repo.metadata_commit_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.repo.reconcile_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(state(&fixture.repo, fixture.source.run_key).await, resolved);
+            if !release {
+                assert!(
+                    fixture
+                        .repo
+                        .find_latest_run(fixture.target.namespace_id, &fixture.target.workflow_id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    });
+}
+
+// Feature: outbound-dispatch-recovery, Property 22: A source's unrelated commits don't void its deliveries.
+#[test]
+fn child_metadata_retry_exhaustion_uses_the_lane_budget() {
+    executor().block_on(async {
+        for release in [false, true] {
+            for retries in [0, 2] {
+                let fixture = metadata_fixture(release, retries).await;
+                let before = state(&fixture.repo, fixture.source.run_key).await;
+                let row = tokeira_storage::derive_operations(&before, ShardId(0))
+                    .unwrap()
+                    .remove(0);
+                let mut concurrent_state = before;
+                for _ in 0..=retries {
+                    let concurrent = sibling_transition(&concurrent_state);
+                    concurrent_state = concurrent.next_state.clone();
+                    fixture
+                        .repo
+                        .metadata_before_commit
+                        .lock()
+                        .unwrap()
+                        .push_back(concurrent);
+                }
+                let attempt = super::driver::Attempt::capture(&fixture.owner, ShardId(0)).unwrap();
+                let error = fixture
+                    .publisher()
+                    .drive_outbound_operation(row.clone(), attempt, &fixture.owner)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("outbound transition did not apply: Conflict")
+                );
+                assert!(
+                    error
+                        .downcast_ref::<tokeira_storage::RecoveryError>()
+                        .is_none(),
+                    "ordinary errors remain retryable by the driver"
+                );
+                assert_eq!(
+                    fixture.repo.metadata_commit_calls.load(Ordering::SeqCst),
+                    retries as usize + 1
+                );
+                assert_eq!(
+                    state(&fixture.repo, fixture.source.run_key).await,
+                    concurrent_state
+                );
+                assert!(
+                    tokeira_storage::derive_operations(&concurrent_state, ShardId(0))
+                        .unwrap()
+                        .contains(&row)
+                );
+            }
+        }
+    });
+}
+
+// Feature: outbound-dispatch-recovery, Property 22: A source's unrelated commits don't void its deliveries.
+#[test]
+fn child_metadata_retry_adopts_the_committed_seed() {
+    executor().block_on(async {
+        let fixture = metadata_fixture(false, 2).await;
+        let before = state(&fixture.repo, fixture.source.run_key).await;
+        let row = tokeira_storage::derive_operations(&before, ShardId(0))
+            .unwrap()
+            .remove(0);
+        let initiation = row.incarnation.key.initiating_event;
+        let winning = tokeira_kernel::ChildStartSeed {
+            child_run_id: RunId::new(),
+            request_id: tokeira_types::RequestId("winning-seed".into()),
+            prepared_at: before.started_at,
+            parent_namespace_name: None,
+            root_workflow_id: Some(before.workflow_id.clone()),
+            root_run_id: Some(before.run_id),
+            effective_priority: None,
+            versioning_info: None,
+        };
+        let mut concurrent = sibling_transition(&before);
+        concurrent
+            .next_state
+            .outbound
+            .as_mut()
+            .unwrap()
+            .child_seeds
+            .insert(initiation, winning.clone());
+        fixture
+            .repo
+            .metadata_before_commit
+            .lock()
+            .unwrap()
+            .push_back(concurrent);
+        let attempt = super::driver::Attempt::capture(&fixture.owner, ShardId(0)).unwrap();
+        fixture
+            .publisher()
+            .drive_outbound_operation(row, attempt, &fixture.owner)
+            .await
+            .unwrap();
+        assert_eq!(fixture.repo.metadata_commit_calls.load(Ordering::SeqCst), 1);
+        let after = state(&fixture.repo, fixture.source.run_key).await;
+        assert_eq!(
+            after.outbound.as_ref().unwrap().child_seeds[&initiation],
+            winning
+        );
+        assert_eq!(
+            after.children[&fixture.target.workflow_id].child_run_id,
+            Some(winning.child_run_id)
+        );
+    });
+}
+
+// Feature: outbound-dispatch-recovery, Property 22: A source's unrelated commits don't void its deliveries.
+#[test]
+fn obsolete_destination_after_current_pointer_moves_does_not_reconcile() {
+    executor().block_on(async {
+        let fixture = metadata_fixture(false, 2).await;
+        let before = state(&fixture.repo, fixture.source.run_key).await;
+        let row = tokeira_storage::derive_operations(&before, ShardId(0))
+            .unwrap()
+            .remove(0);
+        let competing = BasicKernel
+            .apply(LoadedRun::Absent, Command::Start(fixture.target.clone()))
+            .unwrap();
+        *fixture.repo.transition_before_destination.lock().unwrap() = Some(competing);
+        let attempt = super::driver::Attempt::capture(&fixture.owner, ShardId(0)).unwrap();
+        let error = fixture
+            .publisher()
+            .drive_outbound_operation(row.clone(), attempt, &fixture.owner)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -544,10 +892,21 @@ fn obsolete_outcome_after_source_advance_does_not_reconcile() {
             Some(tokeira_storage::RecoveryError::Obsolete)
         ));
         let after = state(&fixture.repo, fixture.source.run_key).await;
-        assert!(after.transition_seq > before.transition_seq);
+        assert!(
+            tokeira_storage::derive_operations(&after, ShardId(0))
+                .unwrap()
+                .contains(&row)
+        );
+        let seed =
+            &after.outbound.as_ref().unwrap().child_seeds[&row.incarnation.key.initiating_event];
+        let losing_child = RunKey::derive(
+            after.namespace_id,
+            &fixture.target.workflow_id,
+            seed.child_run_id,
+        );
         assert_eq!(
-            tokeira_storage::derive_operations(&after, ShardId(0)).unwrap(),
-            operations,
+            fixture.repo.load_run(losing_child).await.unwrap(),
+            LoadedRun::Absent
         );
         assert_eq!(fixture.repo.reconcile_calls.load(Ordering::SeqCst), 0);
     });

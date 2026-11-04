@@ -151,7 +151,7 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
                     target,
                     (namespace_id, workflow_id),
                     crate::DeliveryPhase::External,
-                    authority(&row, &source),
+                    authority(&row),
                     &attempt,
                     owner,
                 )

@@ -1107,7 +1107,6 @@ where
                     attempt: authority.attempt,
                     authority: tokeira_storage::DeliveryGuard::Operation {
                         incarnation: row.incarnation,
-                        source_seq: state.transition_seq,
                     },
                 },
             )

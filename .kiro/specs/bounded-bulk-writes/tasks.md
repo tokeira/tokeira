@@ -98,7 +98,7 @@ Show the four defects first, on both stores, with tests that fail on the current
 - [x] 10. Checkpoint: the exploration tests pass on both stores, each negative control fails its test, the live suite passes on an ephemeral cluster, and the full bar of root `AGENTS.md` §10.4 passes
   - DONE at `6129ecf9`. The exploration tests and Properties 1 to 10 pass on the in-memory store, and the live suite passes on an ephemeral cluster (task 8). Each of the 21 negative controls on the in-memory store and the runtime failed its tests, as each of the six on DSQL did. The bar passed (3,792 tests passed, 2 skipped).
 
-- [ ] 11. Correct DSQL purge paging and preserve the cleanup record until every table is empty
+- [x] 11. Correct DSQL purge paging and preserve the cleanup record until every table is empty
   - [x] 11.1 Sort every purge page by its key columns' own types, distinguish refusal from an empty page, and stop a refused attempt successfully
     - _Requirements: 2.1, 2.4, 2.5_
   - [x] 11.2 Check every purge table inside both record-deleting transactions; retry the sweep once, then report the remaining table while retaining the record
@@ -106,8 +106,9 @@ Show the four defects first, on both stores, with tests that fail on the current
   - [x] 11.3 Add the shared 120-batch contract, exact row-count checks for short and full DSQL pages, the deterministic DSQL refusal race and the database-free sort guard; extend preparation abandonment across decimal boundaries
     - **Property 4: A purge finishes, removes only its run's rows, and removes history after the rows derived from it**
     - **Validates: Requirements 2.4, 2.5, 2.9**
-  - [ ] 11.4 Run the live cases and each negative control separately: text-ordered pages; a skipped refused page plus unchecked record deletion
+  - [x] 11.4 Run the live cases and each negative control separately: text-ordered pages; a skipped refused page plus unchecked record deletion
     - _Requirements: 2.1, 2.4, 2.5, 2.9_
+    - DONE on an ephemeral cluster, from archives. The four new cases passed, and so did the two runtime child-release cases and the bulk-write (10), large-value (9), outbound (7) and lease-fence (14) suites. Built on the code before the fix, the 120-batch case left 21 history rows and a value part. With pages sorted as text, the typed-order unit test and the exact-pages case failed: 21 of 120 rows stayed. With a refused page skipped, the refusal case failed: the record went while rows remained.
 
 ## Notes
 

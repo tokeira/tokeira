@@ -1,0 +1,5 @@
+kind: changed
+body: "Upgrade with every node stopped: apply migrations V128–V132 and use TKW4/snapshot-8 capable binaries throughout."
+time: 2026-11-02T13:00:01Z
+custom:
+    Slice: bb822d84-5d9d-46ba-be16-b03e6f9761d6

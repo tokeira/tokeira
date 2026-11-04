@@ -1,13 +1,5 @@
 kind: changed
-body: >-
-    Deliver activities through bounded queue-home discovery and fenced execution-owner
-    starts, with durable request receipts for lost replies and complete acquisition
-    repair. Upgrade with every node stopped: apply migrations V128–V132 and use
-    TKW4/snapshot-8 capable binaries throughout. Remove BacklogConfig,
-    RuntimeConfig.backlog and max_dispatch_reconciliations_per_scan settings. The
-    legacy backlog table remains for bounded conditional disposal. Older binaries
-    cannot read TKW4 state; rollback requires a compatible binary or restoration
-    of the pre-upgrade database, not an in-place schema downgrade.
+body: Deliver activities through bounded queue-home discovery and fenced execution-owner starts, with durable request receipts for lost replies and complete acquisition repair.
 time: 2026-11-02T13:00:00Z
 custom:
     Slice: 57f76558-bfd7-470b-b9f6-6edc947d70e7

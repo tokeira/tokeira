@@ -2594,8 +2594,8 @@ pub(crate) mod tests {
     async fn eager_start_retry_reconstructs_live_task_and_omits_expired() {
         // Feature: edge-eager-dispatch, Property 6: Request-ID retry reconstruction.
         // v1.31.0 returns the first eager WFT only while attempt 1 remains live;
-        // reconstructing an elapsed task before the coarse timeout sweep runs
-        // would hand the SDK an already-invalid token.
+        // reconstructing an elapsed task before its timeout commits would hand
+        // the SDK an already-invalid token.
         let repo = Arc::new(InMemoryStore::default());
         let runtime = TokeiraRuntime::new(
             repo.clone(),
@@ -2605,7 +2605,9 @@ pub(crate) mod tests {
             WorkflowTimeoutScannerConfig::default(),
         );
         let mut request = sample_start_request(None, None);
-        let accepted_at = OffsetDateTime::UNIX_EPOCH + Duration::hours(1);
+        // Advance only the request's supplied clock below, keeping the real-time
+        // scanner from expiring the fixture before reconstruction is exercised.
+        let accepted_at = OffsetDateTime::now_utc() + Duration::hours(1);
         request.now = accepted_at;
         request.request.received_at = accepted_at;
         request.request.caller_identity = Some("eager-worker".to_string());

@@ -262,6 +262,7 @@ normal queue even across a restart, so that affinity cannot strand execution.
 6. WHEN a valid schedule-to-start timeout commits for an unstarted sticky task in a running run, THE resulting transition SHALL make its replacement discoverable on the normal queue.
 7. IF a timeout targets an already-started or superseded task, THEN THE transition SHALL leave the newer task unchanged.
 8. THE delivery path SHALL preserve compatible normal fallback without using a broker read to mutate durable sticky affinity.
+9. WHEN a tracked schedule-to-start or start-to-close deadline passes, THE runtime SHALL submit its timeout at that deadline, not at a later periodic scan (`service/history/queues/queue_scheduled.go:159-224,269 @ v1.31.0`).
 
 ### Requirement 8: Complete fenced acquisition
 

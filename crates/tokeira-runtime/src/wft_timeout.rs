@@ -6,8 +6,6 @@
 //! sweep from reinstalling authority, and revision-checked retirement prevents an
 //! awaited timeout result from removing a worker start's replacement entry.
 
-use tokeira_kernel::deadline_after;
-
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, RwLock},
@@ -16,9 +14,12 @@ use std::{
 use anyhow::Result;
 use time::{Duration, OffsetDateTime};
 use tokeira_clock::Clock;
-use tokeira_kernel::{Command, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType};
+use tokeira_kernel::{
+    Command, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, deadline_after,
+};
 use tokeira_observability::OutcomeLabel;
 use tokeira_types::{LogicalTaskSeq, RunKey, ShardId};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -68,10 +69,11 @@ pub struct WftTimeoutEntry {
 /// [`SpeculativeTimerSet`](crate::speculative_timer::SpeculativeTimerSet)
 /// (behind a shared `OnceLock` backfilled once the lanes exist) so the lane's
 /// post-commit hook can arm/disarm the precise speculative timers through the
-/// same handle it already holds for the coarse sweep.
+/// same handle it already holds for the deadline scanner.
 #[derive(Clone, Default, Debug)]
 pub struct WftTimeoutTrackingState {
     inner: Arc<Mutex<TimeoutEntries>>,
+    wake: Arc<Notify>,
     owner: Arc<std::sync::OnceLock<Arc<RwLock<ShardOwner>>>>,
     acquisition: Option<ShardAcquisition>,
     #[cfg(test)]
@@ -97,6 +99,18 @@ struct TrackedTimeout {
 struct TimeoutEntries {
     entries: HashMap<RunKey, TrackedTimeout>,
     revision: u64,
+    // The selected wake while sleeping, the actual wake time while scanning,
+    // and None only before the first plan. Future inserts during a scan need no
+    // notification: the next plan sees them, including any that just became due.
+    planned_wake: Option<OffsetDateTime>,
+    // Distinguishes newly overdue inserts from older entries retained for retry.
+    scan_started_revision: Option<u64>,
+}
+
+fn acquisition_active(owner: Option<&ShardOwner>, acquisition: Option<&ShardAcquisition>) -> bool {
+    owner.is_none_or(|owner| {
+        acquisition.is_some_and(|acquisition| owner.acquisition_active(acquisition))
+    })
 }
 
 impl WftTimeoutTrackingState {
@@ -178,6 +192,14 @@ impl WftTimeoutTrackingState {
             .checked_add(1)
             .expect("timeout revision exhausted");
         let revision = inner.revision;
+        // Planning and installation share this lock, so an entry cannot fall
+        // between the deadline snapshot and sleeping. During a scan, only a due
+        // time before that scan's wake notifies; planning sees future inserts and
+        // uses their revision to catch any that become overdue during the scan.
+        let wakes_scanner = acquisition_active(owner.as_deref(), acquisition.as_ref())
+            && inner
+                .planned_wake
+                .is_none_or(|wake| wft_timeout_due_at(&entry) < wake);
         inner.entries.insert(
             entry.run_key,
             TrackedTimeout {
@@ -186,6 +208,9 @@ impl WftTimeoutTrackingState {
                 acquisition,
             },
         );
+        if wakes_scanner {
+            self.wake.notify_one();
+        }
     }
 
     fn remove_submitted(&self, submitted: &TrackedTimeout) {
@@ -200,14 +225,19 @@ impl WftTimeoutTrackingState {
     }
 
     fn active(&self, entry: &TrackedTimeout) -> bool {
-        match (self.owner.get(), &entry.acquisition) {
-            (Some(owner), Some(acquisition)) => owner
-                .read()
-                .expect("shard owner lock poisoned")
-                .acquisition_active(acquisition),
-            (None, _) => true,
-            _ => false,
-        }
+        let owner = self
+            .owner
+            .get()
+            .map(|owner| owner.read().expect("shard owner lock poisoned"));
+        acquisition_active(owner.as_deref(), entry.acquisition.as_ref())
+    }
+
+    fn start_scan(&self, now: OffsetDateTime) {
+        let mut inner = self.inner.lock().expect("inner lock poisoned");
+        // Capture both under the installation lock so the next plan can recover
+        // every newly overdue insert without waking on every future insert.
+        inner.planned_wake = Some(now);
+        inner.scan_started_revision = Some(inner.revision);
     }
 
     /// Number of started workflow tasks still awaiting a worker's reply.
@@ -309,7 +339,7 @@ impl WftTimeoutTrackingState {
 /// Tuning for the workflow-task timeout scanner loop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WftTimeoutScannerConfig {
-    /// Delay between scans of the tracking set.
+    /// Maximum delay between scans; earlier active deadlines shorten it.
     pub scan_interval: tokio::time::Duration,
     /// Upper bound on timeouts submitted per scan, bounding the work one tick can
     /// do when many tasks expire together.
@@ -348,19 +378,13 @@ pub(crate) async fn scan_wft_timeouts_once<F, Fut>(
     tracking: &WftTimeoutTrackingState,
     shard_id: Option<ShardId>,
     config: &WftTimeoutScannerConfig,
+    clock: &dyn Clock,
     submit_timeout: F,
 ) where
     F: FnMut(WftTimeoutEntry, OffsetDateTime) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    scan_wft_timeouts_at(
-        tracking,
-        shard_id,
-        config,
-        OffsetDateTime::now_utc(),
-        submit_timeout,
-    )
-    .await;
+    scan_wft_timeouts_at(tracking, shard_id, config, clock.now(), submit_timeout).await;
 }
 
 async fn scan_wft_timeouts_at<F, Fut>(
@@ -431,8 +455,8 @@ async fn scan_wft_timeouts_at<F, Fut>(
     }
 }
 
-/// Background loop: every `scan_interval`, fail any started workflow task that
-/// has timed out, for each shard this node currently owns.
+/// Background loop: submit timeouts at tracked deadlines for owned shards.
+/// `scan_interval` bounds discovery and retries of failed submissions.
 ///
 /// The active-shard set is re-read each tick so ownership changes (handoff, fresh
 /// sweep) are picked up without restarting the task. Each firing routes by
@@ -448,12 +472,109 @@ pub(crate) async fn run_wft_timeout_scanner(
     cancel: CancellationToken,
     clock: Arc<dyn Clock>,
 ) {
+    run_wft_timeout_scanner_with_submit(
+        tracking,
+        shard_owner,
+        config,
+        cancel,
+        clock,
+        |entry, now| {
+            let lane = pick_lane_for_run_key(&lanes, lane_count, entry.run_key).clone();
+            async move {
+                let timeout_type = match entry.kind {
+                    WftTimeoutKind::StartToClose => WorkflowTaskTimeoutType::StartToClose,
+                    WftTimeoutKind::ScheduleToStart => WorkflowTaskTimeoutType::ScheduleToStart,
+                };
+                lane.submit(
+                    entry.run_key,
+                    Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                        logical_seq: entry.logical_seq,
+                        started_event_id: entry.started_event_id,
+                        timeout_type,
+                        now,
+                    }),
+                )
+                .await
+                .map(|_| ())
+            }
+        },
+    )
+    .await;
+}
+
+// Match the evaluator's inclusive schedule-to-start and zero-timeout boundaries,
+// and its strict start-to-close boundary, without overflowing legacy deadlines.
+fn wft_timeout_due_at(entry: &WftTimeoutEntry) -> OffsetDateTime {
+    let deadline = deadline_after(entry.started_at, entry.workflow_task_timeout);
+    if entry.kind == WftTimeoutKind::StartToClose && !entry.workflow_task_timeout.is_zero() {
+        deadline_after(deadline, Duration::NANOSECOND)
+    } else {
+        deadline
+    }
+}
+
+// Temporal moves its timer gate to the next fire time and advances it when an
+// earlier task arrives (service/history/queues/queue_scheduled.go:159-224,269 @
+// v1.31.0). Publish the selected wake under the installation lock so either the
+// planner sees an insert or the insert notifies it. An overdue revision newer
+// than the scan's starting revision needs an immediate pass; older overdue
+// revisions retain the retry interval, so failed submissions cannot spin. Keep
+// ownership before tracking in the lock order, as insert and cleanup do.
+fn wft_timeout_scan_delay(
+    tracking: &WftTimeoutTrackingState,
+    now: OffsetDateTime,
+    maximum: tokio::time::Duration,
+) -> tokio::time::Duration {
+    let owner = tracking
+        .owner
+        .get()
+        .map(|owner| owner.read().expect("shard owner lock poisoned"));
+    let mut inner = tracking.inner.lock().expect("inner lock poisoned");
+    let delay = inner
+        .entries
+        .values()
+        .filter(|tracked| acquisition_active(owner.as_deref(), tracked.acquisition.as_ref()))
+        .filter_map(|tracked| {
+            let remaining = wft_timeout_due_at(&tracked.entry) - now;
+            if remaining > Duration::ZERO {
+                tokio::time::Duration::try_from(remaining).ok()
+            } else if inner
+                .scan_started_revision
+                .is_some_and(|revision| tracked.revision > revision)
+                && evaluate_wft_timeout(&tracked.entry, now)
+            {
+                Some(tokio::time::Duration::ZERO)
+            } else {
+                None
+            }
+        })
+        .fold(maximum, std::cmp::min);
+    inner.planned_wake = Some(deadline_after(
+        now,
+        Duration::try_from(delay).unwrap_or(Duration::MAX),
+    ));
+    delay
+}
+
+async fn run_wft_timeout_scanner_with_submit<F, Fut>(
+    tracking: WftTimeoutTrackingState,
+    shard_owner: Arc<RwLock<ShardOwner>>,
+    config: WftTimeoutScannerConfig,
+    cancel: CancellationToken,
+    clock: Arc<dyn Clock>,
+    mut submit_timeout: F,
+) where
+    F: FnMut(WftTimeoutEntry, OffsetDateTime) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     loop {
+        let delay = wft_timeout_scan_delay(&tracking, clock.now(), config.scan_interval);
         tokio::select! {
             _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(config.scan_interval) => {}
+            _ = tokio::time::sleep(delay) => {}
+            _ = tracking.wake.notified() => {}
         }
-
+        tracking.start_scan(clock.now());
         let active_shards: Vec<_> = shard_owner
             .read()
             .expect("shard_owner lock poisoned")
@@ -468,26 +589,7 @@ pub(crate) async fn run_wft_timeout_scanner(
                 clock.now(),
                 |entry, now| {
                     runtime_metrics::record_scanner_dispatched("wft_timeout", shard_id.0);
-                    let lane = pick_lane_for_run_key(&lanes, lane_count, entry.run_key).clone();
-                    async move {
-                        let timeout_type = match entry.kind {
-                            WftTimeoutKind::StartToClose => WorkflowTaskTimeoutType::StartToClose,
-                            WftTimeoutKind::ScheduleToStart => {
-                                WorkflowTaskTimeoutType::ScheduleToStart
-                            }
-                        };
-                        lane.submit(
-                            entry.run_key,
-                            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
-                                logical_seq: entry.logical_seq,
-                                started_event_id: entry.started_event_id,
-                                timeout_type,
-                                now,
-                            }),
-                        )
-                        .await
-                        .map(|_| ())
-                    }
+                    submit_timeout(entry, now)
                 },
             )
             .await;
@@ -496,9 +598,13 @@ pub(crate) async fn run_wft_timeout_scanner(
 }
 
 #[cfg(test)]
+mod deadline_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use tokeira_clock::system_clock;
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
@@ -596,11 +702,11 @@ mod tests {
         assert!(tracking.snapshot().is_empty());
     }
 
-    fn fixed_now() -> OffsetDateTime {
+    pub(super) fn fixed_now() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
     }
 
-    fn sample_entry(run_key: RunKey, started_at: OffsetDateTime) -> WftTimeoutEntry {
+    pub(super) fn sample_entry(run_key: RunKey, started_at: OffsetDateTime) -> WftTimeoutEntry {
         WftTimeoutEntry {
             kind: WftTimeoutKind::StartToClose,
             run_key,
@@ -629,7 +735,8 @@ mod tests {
     #[tokio::test]
     async fn scan_wft_timeouts_once_submits_and_removes_only_expired_entries() {
         let tracking = WftTimeoutTrackingState::default();
-        let now = OffsetDateTime::now_utc();
+        let clock = system_clock();
+        let now = clock.now();
         let expired = sample_entry(RunKey::new(), now - Duration::seconds(6));
         let fresh = sample_entry(RunKey::new(), now - Duration::seconds(1));
         tracking.insert(expired.clone());
@@ -640,6 +747,7 @@ mod tests {
             &tracking,
             Some(ShardId(0)),
             &WftTimeoutScannerConfig::default(),
+            clock.as_ref(),
             {
                 let submitted = submitted.clone();
                 move |entry, _| {
@@ -677,6 +785,7 @@ mod tests {
             &tracking,
             Some(ShardId(0)),
             &WftTimeoutScannerConfig::default(),
+            system_clock().as_ref(),
             |_entry, _| async move {
                 panic!("completed workflow task should not be submitted");
                 #[allow(unreachable_code)]

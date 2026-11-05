@@ -6,11 +6,9 @@
 //! runtime-in-memory timers, mirroring v1.31.0's `memoryScheduledQueue`
 //! (`service/history/queues/speculative_workflow_task_timeout_queue.go` +
 //! `tasks.WorkflowTaskTimeoutTask{InMemory:true}` @ v1.31.0; spec speculative-wft
-//! R.2). Unlike the coarse [`crate::wft_timeout`] sweep (which polls on a fixed
-//! interval and is fine for durable, long-timeout tasks), speculative timeouts
-//! must fire at the *exact* deadline: the corpus polls only ~100 ms after a 1 s
-//! start-to-close / 5 s schedule-to-start deadline and asserts the timeout has
-//! already fired, which a 1 s sweep cannot guarantee.
+//! R.2). The [`crate::wft_timeout`] scanner also wakes at active tracked deadlines;
+//! these per-task timers retain speculative-task replacement and cancellation
+//! independently of its bounded per-shard scans.
 //!
 //! Each timer is a per-run `tokio` task that sleeps until the deadline and then
 //! submits `Command::WorkflowTaskTimedOut` on the run's lane. The kernel fences

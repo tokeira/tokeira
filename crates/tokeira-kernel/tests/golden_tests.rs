@@ -2672,14 +2672,8 @@ fn wft_failed_paused_workflow_no_redispatch() {
         HistoryEventKind::WorkflowTaskFailed { .. }
     ));
     assert!(transition.dispatch_ops.is_empty());
-    assert_eq!(
-        transition
-            .next_state
-            .pending_workflow_task
-            .unwrap()
-            .started_event_id,
-        None
-    );
+    assert!(transition.next_state.pending_workflow_task.is_none());
+    assert_eq!(transition.next_state.workflow_task_attempt, 2);
 }
 
 #[test]
@@ -2716,14 +2710,8 @@ fn wft_timed_out_paused_workflow_no_redispatch() {
         HistoryEventKind::WorkflowTaskTimedOut { .. }
     ));
     assert!(transition.dispatch_ops.is_empty());
-    assert_eq!(
-        transition
-            .next_state
-            .pending_workflow_task
-            .unwrap()
-            .started_event_id,
-        None
-    );
+    assert!(transition.next_state.pending_workflow_task.is_none());
+    assert_eq!(transition.next_state.workflow_task_attempt, 2);
 }
 
 #[test]

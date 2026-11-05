@@ -350,7 +350,7 @@ fn heartbeat_failure_retry_is_fresh_but_history_only_transient_has_no_origin() {
 }
 
 #[derive(Clone, Copy)]
-enum PausedRetention {
+enum PausedTaskProblem {
     Failure,
     StartToClose,
     ScheduleToStart,
@@ -409,14 +409,14 @@ fn start_at(state: WorkflowState, at: OffsetDateTime) -> WorkflowState {
         .next_state
 }
 
-fn retain_during_pause(
+fn fail_during_pause(
     state: WorkflowState,
-    path: PausedRetention,
+    path: PausedTaskProblem,
     at: OffsetDateTime,
 ) -> WorkflowState {
     let pending = state.pending_workflow_task.as_ref().unwrap();
     let command = match path {
-        PausedRetention::Failure => Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+        PausedTaskProblem::Failure => Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
             logical_seq: pending.logical_seq,
             started_event_id: pending.started_event_id.unwrap(),
             failure_cause: WorkflowTaskFailedCause::NonDeterminismError,
@@ -429,11 +429,11 @@ fn retain_during_pause(
             reset_reapply: Vec::new(),
             terminate_reason: None,
         }),
-        PausedRetention::StartToClose | PausedRetention::ScheduleToStart => {
+        PausedTaskProblem::StartToClose | PausedTaskProblem::ScheduleToStart => {
             Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
                 logical_seq: pending.logical_seq,
                 started_event_id: pending.started_event_id.unwrap_or(0),
-                timeout_type: if matches!(path, PausedRetention::StartToClose) {
+                timeout_type: if matches!(path, PausedTaskProblem::StartToClose) {
                     WorkflowTaskTimeoutType::StartToClose
                 } else {
                     WorkflowTaskTimeoutType::ScheduleToStart
@@ -448,9 +448,9 @@ fn retain_during_pause(
         .next_state
 }
 
-fn resumed_window(path: PausedRetention, with_heartbeat: bool, cycles: u32) {
+fn resumed_window(path: PausedTaskProblem, with_heartbeat: bool, cycles: u32) {
     let mut state = state(Some(now()));
-    if matches!(path, PausedRetention::ScheduleToStart) {
+    if matches!(path, PausedTaskProblem::ScheduleToStart) {
         let pending = state.pending_workflow_task.as_mut().unwrap();
         pending.started_at = None;
         pending.started_event_id = None;
@@ -463,25 +463,14 @@ fn resumed_window(path: PausedRetention, with_heartbeat: bool, cycles: u32) {
     }
     for cycle in 0..cycles {
         let base = now() + Duration::hours(i64::from(cycle));
-        let retained_at = base + Duration::minutes(2);
-        let resumed_at = retained_at + Duration::minutes(30);
-        state = retain_during_pause(
+        let failed_at = base + Duration::minutes(2);
+        let resumed_at = failed_at + Duration::minutes(30);
+        state = fail_during_pause(
             pause_at(state, base + Duration::minutes(1)),
             path,
-            retained_at,
+            failed_at,
         );
-        if !with_heartbeat {
-            let retained = state.pending_workflow_task.as_ref().unwrap();
-            assert_eq!(
-                retained.scheduled_at, retained_at,
-                "retention schedule time"
-            );
-            assert_eq!(
-                retained.original_scheduled_at,
-                Some(retained_at),
-                "retention original time"
-            );
-        }
+        assert!(state.pending_workflow_task.is_none());
         state = unpause_at(state, resumed_at);
         if !with_heartbeat {
             let resumed = state.pending_workflow_task.as_ref().unwrap();
@@ -492,7 +481,7 @@ fn resumed_window(path: PausedRetention, with_heartbeat: bool, cycles: u32) {
                 "unpause original time"
             );
         }
-        let heartbeat_at = retained_at + Duration::minutes(31);
+        let heartbeat_at = failed_at + Duration::minutes(31);
         state = start_at(state, heartbeat_at - Duration::seconds(1));
         if with_heartbeat {
             let request = heartbeat(&state, heartbeat_at);
@@ -523,7 +512,7 @@ macro_rules! paused_window_test {
     ($name:ident, $path:ident, $heartbeat:expr, $cycles:expr) => {
         #[test]
         fn $name() {
-            resumed_window(PausedRetention::$path, $heartbeat, $cycles);
+            resumed_window(PausedTaskProblem::$path, $heartbeat, $cycles);
         }
     };
 }
@@ -605,10 +594,10 @@ fn paused_preexisting_schedule_heartbeat_uses_unchanged_window() {
 }
 
 #[test]
-fn paused_prior_retention_does_not_reset_on_a_second_pause_without_failure() {
-    let state = retain_during_pause(
+fn paused_previous_failure_does_not_reset_on_a_second_pause_without_failure() {
+    let state = fail_during_pause(
         pause_at(state(Some(now())), now() + Duration::minutes(1)),
-        PausedRetention::Failure,
+        PausedTaskProblem::Failure,
         now() + Duration::minutes(2),
     );
     let first_resume = now() + Duration::minutes(32);

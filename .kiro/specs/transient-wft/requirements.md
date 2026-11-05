@@ -272,9 +272,9 @@ bounded, so that it cannot retain a worker indefinitely without progress.
 4. WHEN heartbeat-only completion remains within the limit, THE next heartbeat
    task SHALL inherit the original scheduled timestamp unchanged. A task scheduled
    after progress or a timeout SHALL use its fresh schedule time. WHEN a failure
-   or timeout leaves a task pending during a pause, THE task SHALL take the unpause
-   time as both its schedule and original time; a task scheduled before the pause
-   SHALL keep both times.
+   or timeout occurs during a pause, THE task subsequently scheduled by unpause
+   SHALL take the unpause time as both its schedule and original time; a task
+   scheduled before the pause SHALL keep both times.
 5. WHEN loading a task written without an original scheduled timestamp, THE decoder
    SHALL use absence; THE heartbeat check SHALL never time out that task or its
    no-progress heartbeat chain by inventing a timestamp.

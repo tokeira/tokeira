@@ -633,3 +633,34 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn paused_buffer_overflow_preserves_failure_attempt_without_scheduling() {
+    for sticky in [false, true] {
+        let mut state = started(open_state());
+        state.status = ExecutionStatus::Paused;
+        if sticky {
+            state.sticky = Some(tokeira_types::StickyAffinity {
+                sticky_queue: TaskQueueName("cache".into()),
+                worker_identity: WorkerIdentity("worker".into()),
+                schedule_to_start_timeout: Duration::seconds(5),
+            });
+        }
+        for index in 0..MAXIMUM_BUFFERED_EVENTS_BATCH {
+            state = signal(state, index, payloads_of(4)).next_state;
+        }
+        let result = signal(state, MAXIMUM_BUFFERED_EVENTS_BATCH, payloads_of(4));
+        assert!(force_closed(&result));
+        assert!(result.next_state.pending_workflow_task.is_none());
+        assert!(result.dispatch_ops.is_empty());
+        assert_eq!(
+            result.next_state.workflow_task_attempt,
+            if sticky { 1 } else { 2 }
+        );
+        assert_eq!(
+            result.next_state.workflow_task_attempts_since_last_success,
+            u32::from(!sticky)
+        );
+        assert!(result.next_state.sticky.is_none());
+    }
+}

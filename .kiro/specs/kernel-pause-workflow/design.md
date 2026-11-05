@@ -88,6 +88,16 @@ For a paused workflow, unpause emits `WorkflowExecutionUnpaused`, sets
 updated standard status field, and schedules one WFT through
 `builder.schedule_workflow_task()` if no WFT is already pending.
 
+Failures and timeouts while paused clear the pending WFT after recording their
+usual events and attempt bookkeeping; flushing buffered events does not reset the
+attempt because no replacement is scheduled in that transaction. Unpause then
+schedules at that attempt: attempt 1 writes a fresh Scheduled event, higher attempts
+remain transient until successful completion materializes Scheduled and Started.
+The new schedule and heartbeat origin are the unpause time. An unstarted task that
+survived the pause is re-dispatched with its existing event and times unchanged.
+This implements criteria 7.7–7.8 and their cited v1.31.0 authority, while retaining
+Tokeira's deliberate timeout/re-dispatch difference described in Requirement 7.
+
 `Reject::NotPaused` remains in the kernel and maps to gRPC
 `FAILED_PRECONDITION`.
 
@@ -325,15 +335,17 @@ because it transitions the run to `Running` before scheduling the wakeup WFT.
 The generated command set SHALL cover the full command enum, including cancel
 requests, external signal/cancel resolutions, Nexus terminal resolutions, timer
 due, activity and child resolutions, query-task scheduling, and workflow-command
-follow-up scheduling.
+follow-up scheduling. Generated traces SHALL include workflow-task failures and
+both timeouts, checking that each leaves no pending WFT while paused.
 
-**Validates: Requirements 1.1, 7.1, 7.2, 7.3**
+**Validates: Requirements 1.1, 7.1, 7.2, 7.3, 7.7**
 
 ### Property 5: Unpause Wakes Workflow
 
 For any paused workflow with no pending WFT, applying `UnpauseWorkflow` SHALL
 emit `WorkflowExecutionUnpaused`, set status to `Running`, clear pause info,
 write a running-status projection update, and enqueue one WFT through the
-standard dispatch op.
+standard dispatch op. Traces through workflow-task failure and both timeouts SHALL
+check that unpause leaves exactly one pending task at the preserved attempt.
 
-**Validates: Requirements 1.5, 4.3, 6.3, 7.4**
+**Validates: Requirements 1.5, 4.3, 6.3, 7.4, 7.7, 7.8**

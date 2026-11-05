@@ -2,6 +2,9 @@
 #![allow(clippy::unwrap_used)]
 use std::collections::BTreeMap;
 
+#[path = "support/paused_workflow_tasks.rs"]
+mod paused_workflow_tasks;
+
 #[path = "support/workflow_dispatch.rs"]
 mod workflow_dispatch;
 
@@ -4127,12 +4130,15 @@ proptest! {
         prop_assert_eq!(transition.dispatch_ops.iter().all(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. })), true);
     }
 
+    // Feature: kernel-pause-workflow, Property 5: every resume schedules exactly one task.
     #[test]
     fn property_59_unpause_workflow_produces_correct_state_and_dispatches(
         req in arb_unpause_workflow_request(fixed_now()),
         extra_activities in 0usize..3usize,
         has_pending_wft in any::<bool>(),
+        problems in prop::collection::vec((0u8..3, any::<bool>(), 0u8..3), 1..8),
     ) {
+        paused_workflow_tasks::trace(&problems);
         let now = fixed_now();
         let mut state = with_paused_status(make_open_state(now), now, "pause-req");
         for idx in 0..extra_activities {
@@ -4203,11 +4209,14 @@ proptest! {
     //   - ExternalSignalResolved
     //   - ExternalCancelResolved
     //   - NexusOperationResolved (terminal)
+    // Feature: kernel-pause-workflow, Property 4: failures and timeouts leave no paused task.
     #[test]
     fn property_61_paused_workflows_suppress_wft_scheduling(
         signal_input in arb_payloads(),
         completed in arb_payloads(),
+        problems in prop::collection::vec((0u8..3, any::<bool>(), 0u8..3), 1..8),
     ) {
+        paused_workflow_tasks::trace(&problems);
         let now = fixed_now();
         let paused = with_paused_status(make_open_state(now), now, "pause-req");
 

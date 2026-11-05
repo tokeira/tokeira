@@ -112,6 +112,8 @@ mod membership;
 mod outbound_delivery;
 #[cfg(test)]
 mod outbound_tests;
+#[cfg(test)]
+mod paused_workflow_task_tests;
 mod query;
 #[cfg(test)]
 mod queue_home_delivery_exploration_tests;

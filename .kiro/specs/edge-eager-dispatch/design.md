@@ -5,7 +5,7 @@
 Eager dispatch returns work inline with the RPC that made it ready. This design covers two independent paths:
 
 1. **Eager workflow start.** `StartWorkflowExecution(request_eager_execution=true)` is pre-gated by the runtime. When enabled and free of first-WFT backoff, the existing reserved-start kernel branch commits `WorkflowExecutionStarted`, `WorkflowTaskScheduled`, and `WorkflowTaskStarted` together. The runtime builds the inline poll response from that committed state; the workflow broker is not part of the correctness path.
-2. **Eager activity dispatch.** Eager-eligible activities authored by `RespondWorkflowTaskCompleted` are committed first, published as a derived effect, then targeted-claimed from the activity broker for the inline response.
+2. **Eager activity dispatch.** Eligible activities are started inside `RespondWorkflowTaskCompleted` after command processing, without dispatch rows or offers, and returned from that committed result.
 
 Wire shape comes from `proto/upstream/`. Behaviour is grounded in `service/history/api/startworkflow/api.go`, `service/history/api/create_workflow_util.go`, and `service/history/historybuilder/event_factory.go @ v1.31.0`. In particular, the API handler decides acceptance and the history event records that already-gated decision. A server-observed active poller is not an acceptance condition.
 
@@ -13,9 +13,9 @@ Wire shape comes from `proto/upstream/`. Behaviour is grounded in `service/histo
 
 - Poll response fidelity and task-token encoding remain owned by the existing poll path.
 - Workflow-task start-to-close recovery and activity timeout recovery remain unchanged.
-- The eager-enable value is the pinned v1.31.0 default `true`; this work does not add an operator configuration knob.
+- Eager workflow start retains its pinned enabled default. Eager activities use a typed deployment-wide setting, default false, with a per-test harness override; see [configuration-policy](../configuration-policy/design.md#completion-inline-start-policy-amendment).
 - `WorkflowCommand::ScheduleActivity.request_eager_execution` is eager **activity** dispatch and remains distinct from workflow-start acceptance.
-- Targeted workflow-broker claims remain available for non-start direct-delivery paths, but eager workflow start no longer depends on them.
+- Broker claims are not used for eager workflow start or the new WFT returned by completion. The latter is owned by [api-conformance-wft-completion](../api-conformance-wft-completion/design.md).
 
 ## Architecture
 
@@ -26,7 +26,6 @@ sequenceDiagram
     participant Runtime as Runtime
     participant Kernel as Pure kernel
     participant Repo as Run repository
-    participant ABroker as Activity broker
 
     Note over SDK,Repo: Path 1 — eager workflow start
     SDK->>Edge: StartWorkflowExecution(request_eager_execution=true)
@@ -40,13 +39,14 @@ sequenceDiagram
     Runtime-->>Edge: Started { eager_workflow_task: Some(...) }
     Edge-->>SDK: StartWorkflowExecutionResponse { eager_workflow_task }
 
-    Note over SDK,ABroker: Path 2 — eager activities
+    Note over SDK,Repo: Path 2 — eager activities
     SDK->>Edge: RespondWorkflowTaskCompleted(eager activity commands)
     Edge->>Runtime: complete_workflow_task
     Runtime->>Kernel: completion transition
-    Kernel-->>Repo: committed pending activities
-    Runtime->>ABroker: derived publications
-    Edge->>ABroker: targeted activity claims
+    Kernel->>Kernel: process commands, then start eligible survivors
+    Kernel-->>Repo: completion and started activities in one transition
+    Repo-->>Runtime: committed state, no inline dispatch rows
+    Runtime-->>Edge: started activity results
     Edge-->>SDK: RespondWorkflowTaskCompletedResponse { activity_tasks }
 ```
 
@@ -97,9 +97,25 @@ Because the v1.31.0 default is enabled and Tier 3.18 exercises the behaviour, `G
 
 ### Activity Broker Path
 
-The activity path retains `try_claim_activity_task(queue, run_key, activity_id)`. Claims occur only after the completion transition and derived publication. A failed claim leaves correctness in the authoritative pending activity and normal polling remains the fallback.
+This section supersedes the original publish/claim design. The activity broker is
+absent from completion-inline delivery. Preflight SDK exclusion, scope, enable
+policy and response admission; pass explicit operands into the pure completion.
+The runtime supplies request IDs; the kernel selects at schedule and checks survival after all commands,
+and storage commits the completion and starts atomically. Remove the eager use of
+`try_claim_activity_task`, `collect_eager_activity_specs`' cap and `EagerDispatchConfig`.
+The shared [activity-dispatch design](../activity-dispatch/design.md#offers-and-eager-start)
+owns the start mutation, receipts, absent rows/offers and rule bypass. Ordinary
+activity polling retains the owner-start protocol.
 
-`try_claim_workflow_task` remains a supported direct-delivery primitive for callers other than eager workflow start. Its targeted-removal and dedup-set invariants remain covered.
+The response reuses scheduling-command input/header and committed start metadata.
+A dropped response leaves started state intact; the applicable activity timeout
+recovers it. No schedule-to-start timer applies after eager start. More than three
+eligible activities are returned; eager selection is independent of return-new-WFT.
+
+`try_claim_workflow_task` is also removed from the completion's inline WFT path;
+[the completion design](../api-conformance-wft-completion/design.md#return-new-wft-safety)
+owns its normal/speculative behavior, sticky history and update/query barriers.
+Existing broker primitives may remain only for independent callers/tests.
 
 ## Data Models
 
@@ -129,7 +145,7 @@ pub enum HistoryEventKind {
 }
 ```
 
-No new `WorkflowState` field or storage table is required. The acceptance value is authoritative in event 1, and the pending started WFT already exists in durable state.
+Eager workflow start itself needs no new `WorkflowState` field or storage table. The acceptance value is authoritative in event 1, and the pending started WFT already exists in durable state.
 
 ### Runtime Start Result
 
@@ -195,23 +211,27 @@ pub enum StartWorkflowResult {
 
 **Validates: Requirements 4.3, 4.4**
 
-### Property 8: Activity targeted-claim correctness
+### Property 8: Completion owns eager starts
 
-*For any* sequence of activity tasks, `try_claim_activity_task` SHALL remove only the requested `(run_key, activity_id)` entry and its dedup key, leaving all other entries available.
+*For any* eligible activity incarnation and competing poll trace, its only start
+commit SHALL be the completion; no enqueue operation, dispatch row or offer SHALL
+exist for that inline start, including after repair or response loss.
 
-**Validates: Requirements 6.1, 6.2, 6.3, 10.1, 10.2, 10.3, 10.4**
+**Validates: Requirements 6.1–6.6, 10.1–10.5, 11.2–11.3, 12.2–12.4**
 
-### Property 9: Eager activity limit
+### Property 9: Eager activity policy and cardinality
 
-*For any* count of eager-eligible activity commands, the inline response SHALL contain no more than the configured maximum.
+*For any* command set, SDK identity, versioning and policy inputs, the response SHALL
+contain exactly the authorized eligible surviving starts without a count cap;
+when disabled it SHALL contain none and preserve ordinary dispatch eligibility.
 
-**Validates: Requirements 7.1, 7.2**
+**Validates: Requirements 5.4, 6.1–6.3, 7.1–7.4**
 
 ### Property 10: Eager activity flag preservation
 
-*For any* `ScheduleActivityTask` command, translation SHALL preserve `request_eager_execution` exactly.
+*For any* `ScheduleActivityTask` command, translation SHALL preserve `request_eager_execution` and `use_workflow_build_id`, except for the specified old-SDK eager-flag exclusion.
 
-**Validates: Requirements 5.1, 5.2, 5.3**
+**Validates: Requirements 5.1, 5.2, 5.3, 5.4**
 
 ### Property 11: Response translation fidelity
 
@@ -219,11 +239,13 @@ pub enum StartWorkflowResult {
 
 **Validates: Requirements 4.1, 4.2, 8.1, 8.2**
 
-### Property 12: Claimed tasks are excluded from normal polling
+### Property 12: Inline exclusion from normal polling
 
-*For any* broker task successfully targeted-claimed, a later normal poll SHALL not return that same broker entry.
+*For any* completion-inline activity and waiting poll, the poll SHALL never receive
+that started incarnation, whether it was waiting before or after completion.
+Unselected ordinary work SHALL remain deliverable.
 
-**Validates: Requirements 9.2, 9.4, 10.2, 10.4**
+**Validates: Requirements 10.1–10.5**
 
 ### Property 13: Workflow broker targeted-claim correctness
 
@@ -247,7 +269,8 @@ pub enum StartWorkflowResult {
 | Immediate request-ID retry | Return the authoritative first started WFT without mutation. |
 | Retry after deadline/timeout/fallback | Return the deduped start response without an eager WFT, even before the coarse timeout scanner authors its transition. |
 | Eager response lost after commit | Start-to-close timeout recovery reschedules from durable pending state. |
-| Activity targeted claim misses | Omit that inline activity; normal polling remains available. |
+| Eager activity disabled/ineligible/out of scope | Leave otherwise dispatchable work unstarted for normal polling; paused workflows generate no task. |
+| Failed completion or same-completion cancellation/close | Return no affected inline activity. |
 
 ## Testing Strategy
 
@@ -255,7 +278,7 @@ pub enum StartWorkflowResult {
 
 - Runtime admission truth table (Property 2), including disabled, `Duration::ZERO`, and positive backoff.
 - Kernel clamp and atomic event sequence (Properties 3 and 4).
-- Existing broker, activity-limit, flag, translation, and capability properties (Properties 8-14).
+- Revised inline-start, uncapped policy, flag, translation, broker-primitive and capability properties (Properties 8-14).
 
 Every property test runs at least 100 cases and carries `// Feature: edge-eager-dispatch, Property N`.
 
@@ -278,3 +301,11 @@ Every property test runs at least 100 cases and carries `// Feature: edge-eager-
 - Workflow retry successors are not themselves eager.
 - Temporal `TestEagerWorkflowTestSuite` passes clean except the cited `OverrideDynamicConfig(WorkflowIdReuseMinimalInterval=0)` leaf, which is a classified skip.
 - Earlier clean workflow, WFT-timeout, retry, conflict-policy, history, and activity cohorts remain green.
+
+Completion-inline coverage adds a parked-poll reproducer that must fail on `main`
+first, a publish-then-start negative control, default-off polling, old-SDK and
+versioning eligibility, workflow pause, same-completion cancel/close, lost responses
+and more than three activities. The orchestrator runs the corpus eager activity
+cases with the override, plus `TestWorkflowTaskTestSuite` (both heartbeat tests),
+`TestEagerWorkflowTestSuite` and `TestStickyTqTestSuite`. These are pending checks,
+not new conformance evidence.

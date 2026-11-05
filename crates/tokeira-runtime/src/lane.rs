@@ -28,7 +28,8 @@ use async_trait::async_trait;
 use smallvec::SmallVec;
 use tokeira_clock::{Clock, system_clock};
 use tokeira_kernel::{
-    Command, DispatchOp, HistoryEvent, HistoryEventKind, Kernel, LoadedRun, StartRequest,
+    ActivityOp, Command, DispatchOp, HistoryEvent, HistoryEventKind, Kernel, LoadedRun,
+    StartRequest,
 };
 use tokeira_observability::{
     ChannelTraceContext, ErrorBiasedSamplingReason, NotShardOwnerOperationLabel, RetryOutcomeLabel,
@@ -832,7 +833,7 @@ where
 
         let stop_draining = result.is_err() || breach.is_some();
         let reply = match result {
-            Ok((commit_result, mut dispatch_ops, history_events)) => {
+            Ok((commit_result, mut dispatch_ops, history_events, activity_starts)) => {
                 if let CommitResult::Applied { new_state } = &commit_result {
                     // Clear on every committed started-task closure, including
                     // transient failures with no history event. Do this in the
@@ -883,6 +884,26 @@ where
                 if let CommitResult::Applied { new_state } = &commit_result {
                     let shard_id = shard_id.expect("applied transition has an execution home");
                     activity_tracking.eligibility.refresh(new_state, shard_id);
+                    // Only this commit's starts need new deadlines. Existing
+                    // started activities keep their tracking across unrelated commits.
+                    for activity_id in activity_starts {
+                        let Some(activity) = new_state.activities.get(&activity_id) else {
+                            continue;
+                        };
+                        activity_tracking.insert(crate::activity_timeout::ActivityTrackingEntry {
+                            run_key: new_state.run_key,
+                            shard_id,
+                            activity_id: activity.activity_id.clone(),
+                            original_scheduled_at: activity.scheduled_at,
+                            last_dispatched_at: activity
+                                .current_attempt_scheduled_at
+                                .unwrap_or(activity.scheduled_at),
+                            started_at: activity.started_at,
+                            last_heartbeat_at: activity.last_heartbeat_at,
+                            cancel_requested: activity.cancel_requested,
+                        });
+                    }
+
                     track_committed_run(
                         new_state,
                         &history_events,
@@ -1178,6 +1199,7 @@ where
         &tokeira_clock::SystemClock,
     )
     .await
+    .map(|(result, dispatch, history, _)| (result, dispatch, history))
 }
 
 /// Bring the loaded state and the command up to date with the update requests
@@ -1242,6 +1264,7 @@ async fn handle_message_with_cache<K, R>(
     CommitResult,
     SmallVec<[DispatchOp; 4]>,
     SmallVec<[HistoryEvent; 8]>,
+    SmallVec<[String; 4]>,
 )>
 where
     K: Kernel + Send + Sync + 'static,
@@ -1286,6 +1309,7 @@ async fn handle_message_with_successor<K, R>(
     CommitResult,
     SmallVec<[DispatchOp; 4]>,
     SmallVec<[HistoryEvent; 8]>,
+    SmallVec<[String; 4]>,
 )>
 where
     K: Kernel + Send + Sync + 'static,
@@ -1367,6 +1391,7 @@ where
                     },
                     SmallVec::new(),
                     SmallVec::new(),
+                    SmallVec::new(),
                 ));
             };
             let fence = owner.fence_at(execution_home_bundle, acquisition.epoch);
@@ -1407,6 +1432,7 @@ where
                     CommitResult::Conflict {
                         reason: "observed run image changed".into(),
                     },
+                    SmallVec::new(),
                     SmallVec::new(),
                     SmallVec::new(),
                 ));
@@ -1451,10 +1477,12 @@ where
                 },
                 SmallVec::new(),
                 SmallVec::new(),
+                SmallVec::new(),
             ));
         }
         let dispatch_ops = transition.dispatch_ops.clone();
         let history_events = transition.history_events.clone();
+        let activity_starts = newly_started_activity_ids(&transition.activity_ops);
 
         let commit_result = if let Some(submission) = outbound {
             repo.commit_outbound_transition(
@@ -1541,10 +1569,16 @@ where
                     CommitResult::Applied { new_state },
                     dispatch_ops,
                     history_events,
+                    activity_starts,
                 ));
             }
             CommitResult::Duplicate => {
-                return Ok((CommitResult::Duplicate, SmallVec::new(), SmallVec::new()));
+                return Ok((
+                    CommitResult::Duplicate,
+                    SmallVec::new(),
+                    SmallVec::new(),
+                    SmallVec::new(),
+                ));
             }
             CommitResult::CurrentExecutionConflict {
                 existing_run_key,
@@ -1561,6 +1595,7 @@ where
                         existing_status,
                         request_ids,
                     },
+                    SmallVec::new(),
                     SmallVec::new(),
                     SmallVec::new(),
                 ));
@@ -1590,6 +1625,28 @@ where
             }
         }
     }
+}
+
+// Lane-owned starts are completion starts: scheduling emits an unstarted upsert
+// before the shared start mutation emits its started upsert. Ordinary starts
+// commit outside the lane and own their tracking. Matching that pair avoids both
+// a scan of every running activity and refreshing an existing start's clocks when
+// another upsert changes its options or cancellation bit. No history event is
+// required, so transient retry-policy starts are included.
+fn newly_started_activity_ids(ops: &[ActivityOp]) -> SmallVec<[String; 4]> {
+    let mut unstarted = HashSet::new();
+    let mut started = SmallVec::new();
+    for op in ops {
+        if let ActivityOp::Upsert(activity) = op {
+            let incarnation = (activity.activity_id.as_str(), activity.schedule_event_id);
+            if activity.started_at.is_none() {
+                unstarted.insert(incarnation);
+            } else if unstarted.remove(&incarnation) {
+                started.push(activity.activity_id.clone());
+            }
+        }
+    }
+    started
 }
 
 fn storage_commit_span(
@@ -3321,7 +3378,7 @@ mod tests {
 
         let kernel = MockKernel::new(SmallVec::new());
         let mut cache = LaneCache::new(&config);
-        let (result, _, _) = handle_message_with_cache(
+        let (result, _, _, _) = handle_message_with_cache(
             &kernel,
             &repo,
             &owner,
@@ -3362,7 +3419,7 @@ mod tests {
             .unwrap()
             .push("loser".into());
         cache.insert(key, LoadedRun::Existing(loser));
-        let (result, _, _) = handle_message_with_cache(
+        let (result, _, _, _) = handle_message_with_cache(
             &kernel,
             &repo,
             &owner,
@@ -3389,7 +3446,7 @@ mod tests {
             LoadedRun::Existing(new_state)
         );
         cache.evict(key);
-        let (result, _, _) = handle_message_with_cache(
+        let (result, _, _, _) = handle_message_with_cache(
             &kernel,
             &repo,
             &owner,

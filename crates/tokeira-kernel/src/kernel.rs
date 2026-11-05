@@ -1893,154 +1893,8 @@ impl BasicKernel {
         req: StartWorkflowTaskRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
-        if state.status != ExecutionStatus::Running {
-            return Err(Reject::WorkflowPaused);
-        }
-        let pending = state
-            .pending_workflow_task
-            .clone()
-            .ok_or(Reject::NoPendingWorkflowTask)?;
-
-        if pending.logical_seq != req.logical_seq {
-            return Err(Reject::WorkflowTaskSeqMismatch {
-                expected: pending.logical_seq.0,
-                got: req.logical_seq.0,
-            });
-        }
-        if pending.started_event_id.is_some() {
-            return Err(Reject::WorkflowTaskAlreadyStarted {
-                logical_seq: pending.logical_seq.0,
-            });
-        }
-
         let mut builder = TransitionBuilder::new(state, req.now, None);
-        let target_version_changed_enabled = req.target_version_changed_enabled;
-        let target_deployment_version = req.target_deployment_version.clone();
-        let target_worker_deployment_version_changed =
-            builder.state.apply_target_version_observation(
-                target_version_changed_enabled,
-                target_deployment_version.clone(),
-            );
-        let attempt = pending.attempt.max(1);
-        // The count operand is the id the next event would receive at this
-        // moment (`GetNextEventID()`, workflow_task_state_machine.go:1452 @
-        // v1.31.0): the started id for a persisted start and the virtual
-        // scheduled id for a suppressed one. It is fixed before anything is
-        // emitted so the conversion branch below matches v1.31.0, which decides
-        // before adding its events. In-flight updates are the admitted set plus
-        // the accepted set; acceptance moves an id from one to the other, so
-        // the sum never double-counts.
-        let in_flight_updates =
-            builder.state.admitted_updates.len() + builder.state.pending_updates.len();
-        let advice = crate::advice::continue_as_new_advice(
-            req.history_size_bytes,
-            builder.state.last_event_id + 1,
-            in_flight_updates,
-            builder.state.completed_update_count,
-            req.advice_policy,
-        );
-        // Transient (attempt>1) and SPECULATIVE starts persist no
-        // WorkflowTaskStarted event: the started id is virtual
-        // (scheduled_event_id + 1) and last_event_id is unchanged — v1.31.0
-        // suppresses the pair for both modes with one predicate
-        // (`!IsTransientWorkflowTask() && Type != SPECULATIVE`,
-        // workflow_task_state_machine.go:556-558 @ v1.31.0; spec
-        // speculative-wft, one predicate / three modes per Invariant I.2).
-        // Conversion (rule ii): if new events landed after the virtual
-        // scheduling — the virtual scheduled id no longer equals
-        // last_event_id + 1 — convert back to a NORMAL attempt-1 task with
-        // real Scheduled + Started, since the frozen virtual suffix is now
-        // invalid (workflow_task_state_machine.go:559-576 @ v1.31.0; the same
-        // branch also flips a speculative task's `Type` to NORMAL).
-        let suppressed = attempt > 1 || pending.task_type == WorkflowTaskType::Speculative;
-        let new_events_since_schedule =
-            suppressed && pending.scheduled_event_id != builder.state.last_event_id + 1;
-        let (scheduled_event_id, started_event_id) = if suppressed && !new_events_since_schedule {
-            (pending.scheduled_event_id, pending.scheduled_event_id + 1)
-        } else if new_events_since_schedule {
-            builder.state.workflow_task_attempt = 1;
-            let scheduled = builder.emit(HistoryEventKind::WorkflowTaskScheduled {
-                logical_seq: pending.logical_seq,
-                task_queue: builder.state.task_queue.clone(),
-                workflow_task_timeout: builder.state.workflow_task_timeout,
-                attempt: 1,
-            });
-            let started = builder.emit(HistoryEventKind::WorkflowTaskStarted {
-                logical_seq: pending.logical_seq,
-                scheduled_event_id: scheduled,
-                attempt: 1,
-                identity: req.worker_identity.clone(),
-                request_id: req.request_id,
-                history_size_bytes: advice.history_size_bytes,
-                suggest_continue_as_new: advice.suggest_continue_as_new,
-                suggest_continue_as_new_reasons: advice.suggest_continue_as_new_reasons.clone(),
-                target_worker_deployment_version_changed,
-                target_version_changed_enabled,
-                target_deployment_version: target_deployment_version.clone(),
-            });
-            (scheduled, started)
-        } else {
-            let started = builder.emit(HistoryEventKind::WorkflowTaskStarted {
-                logical_seq: pending.logical_seq,
-                scheduled_event_id: pending.scheduled_event_id,
-                attempt,
-                identity: req.worker_identity.clone(),
-                request_id: req.request_id,
-                history_size_bytes: advice.history_size_bytes,
-                suggest_continue_as_new: advice.suggest_continue_as_new,
-                suggest_continue_as_new_reasons: advice.suggest_continue_as_new_reasons.clone(),
-                target_worker_deployment_version_changed,
-                target_version_changed_enabled,
-                target_deployment_version: target_deployment_version.clone(),
-            });
-            (pending.scheduled_event_id, started)
-        };
-
-        let current = builder
-            .state
-            .pending_workflow_task
-            .as_mut()
-            .expect("validated pending workflow task must still exist");
-        current.scheduled_event_id = scheduled_event_id;
-        current.started_event_id = Some(started_event_id);
-        current.started_at = Some(req.now);
-        current.attempt = builder.state.workflow_task_attempt;
-        current.target_worker_deployment_version_changed = target_worker_deployment_version_changed;
-        current.target_version_changed_enabled = target_version_changed_enabled;
-        current.target_deployment_version = target_deployment_version;
-        // Recorded so a suppressed start's later materialization or synthesis
-        // carries exactly this decision (Requirement 2.6).
-        current.advice = advice;
-        if new_events_since_schedule {
-            // The conversion branch persisted real Scheduled/Started — the
-            // task is normal from here on (`workflowTask.Type = NORMAL`,
-            // workflow_task_state_machine.go:564-566 @ v1.31.0).
-            current.task_type = WorkflowTaskType::Normal;
-        }
-
-        // Sticky metadata survives an unavailable-worker fallback and clears
-        // only when the derived task actually starts outside the sticky queue
-        // (`recordworkflowtaskstarted/api.go:115-149 @ v1.31.0`).
-        if builder.state.sticky.as_ref().is_some_and(|sticky| {
-            !sticky.sticky_queue.0.is_empty() && sticky.sticky_queue != req.polled_task_queue
-        }) {
-            builder.state.sticky = None;
-        }
-
-        if let Some(target) = req.deployment_transition {
-            builder
-                .state
-                .start_version_transition(
-                    target,
-                    req.deployment_transition_revision_number
-                        .unwrap_or_default(),
-                )
-                .map_err(|error| match error {
-                    crate::state::VersionTransitionError::PinnedWorkflowCannotTransition => {
-                        Reject::PinnedWorkflowCannotTransition
-                    }
-                })?;
-        }
+        builder.start_workflow_task(req)?;
 
         builder.finish()
     }
@@ -2109,6 +1963,8 @@ impl BasicKernel {
         retry_continuation: Option<RetryContinuation>,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
+        let inline_identity = req.identity.clone();
+        let inline_worker_version = req.worker_version.clone();
         let pending = state
             .pending_workflow_task
             .clone()
@@ -2228,9 +2084,34 @@ impl BasicKernel {
                 // update its event delivers needs none: it reaches the worker
                 // in history (`needToSend`, `update/update.go:404-437 @
                 // v1.31.0`).
-                if builder.state.has_admitted_update_to_send() {
-                    builder.schedule_speculative_workflow_task();
+                builder.state.sticky = req
+                    .sticky
+                    .as_ref()
+                    .filter(|sticky| !sticky.queue.0.is_empty())
+                    .map(|sticky| StickyAffinity {
+                        worker_identity: inline_identity.clone(),
+                        sticky_queue: sticky.queue.clone(),
+                        schedule_to_start_timeout: sticky.schedule_to_start_timeout,
+                    });
+                if builder
+                    .state
+                    .versioning_info
+                    .as_ref()
+                    .is_some_and(|info| info.version_transition.is_some())
+                {
+                    builder.schedule_workflow_task();
+                } else if builder.state.has_admitted_update_to_send() {
+                    if req.inline_workflow_task.is_some() {
+                        builder.schedule_speculative_workflow_task();
+                    } else {
+                        builder.schedule_workflow_task();
+                    }
                 }
+                builder.start_completion_workflow_task(
+                    req.inline_workflow_task.as_ref(),
+                    &inline_identity,
+                    inline_worker_version.as_ref(),
+                )?;
                 return builder.finish();
             }
         }
@@ -2263,7 +2144,7 @@ impl BasicKernel {
                     pending.scheduled_at,
                     HistoryEventKind::WorkflowTaskScheduled {
                         logical_seq: pending.logical_seq,
-                        task_queue: builder.state.task_queue.clone(),
+                        task_queue: builder.state.current_workflow_task_queue().clone(),
                         workflow_task_timeout: builder.state.workflow_task_timeout,
                         attempt: pending.attempt,
                     },
@@ -2346,15 +2227,16 @@ impl BasicKernel {
             req.deployment_version,
             req.worker_deployment_name,
         );
-        // Sticky raise S1: the completion's sticky attributes carry the
-        // sticky QUEUE and the per-dispatch schedule-to-start timeout; a
-        // completion without them clears the affinity (`ClearStickyTaskQueue`
-        // on nil StickyAttributes @ v1.31.0).
+
+        // Materialize the task with the queue current before this completion;
+        // only then apply the request's sticky attributes for its commands and
+        // successor (service/history/api/respondworkflowtaskcompleted/api.go:316-342;
+        // service/history/workflow/workflow_task_state_machine.go:766-772 @ v1.31.0).
         builder.state.sticky = req
             .sticky
             .filter(|spec| !spec.queue.0.is_empty())
             .map(|spec| StickyAffinity {
-                worker_identity: req.identity,
+                worker_identity: inline_identity.clone(),
                 sticky_queue: spec.queue,
                 schedule_to_start_timeout: spec.schedule_to_start_timeout,
             });
@@ -2362,6 +2244,7 @@ impl BasicKernel {
         let limits = req.limits;
         let command_sizes = req.command_sizes;
         builder.resurrection = UpdateSlots::at_completion(&builder.state);
+        let mut eager = Vec::new();
         let mut closed = false;
         for (index, command) in req.commands.into_iter().enumerate() {
             if closed {
@@ -2373,6 +2256,33 @@ impl BasicKernel {
             // between the command handler (collects `wtFailedCause`) and the
             // API layer (`failWorkflowTask` + error return,
             // respondworkflowtaskcompleted/api.go:455-485,739-742).
+            if let WorkflowCommand::ScheduleActivity {
+                activity_id,
+                request_eager_execution,
+                use_workflow_build_id,
+                ..
+            } = command.semantic_command()
+            {
+                // Completed has already recorded the worker stamp. Deployment
+                // versioning alone does not disable eager starts
+                // (workflow_task_completed_handler.go:489-502 @ v1.31.0).
+                let old_versioned = builder.state.effective_behavior()
+                    == crate::state::VersioningBehavior::Unspecified
+                    && builder
+                        .state
+                        .versioning_info
+                        .as_ref()
+                        .and_then(|info| info.most_recent_worker_version_stamp.as_ref())
+                        .is_some_and(|stamp| stamp.use_versioning);
+                let assigned = builder.state.assigned_build_id().is_some();
+                if *request_eager_execution
+                    && req.eager_activities.enabled
+                    && (!(old_versioned || assigned) || *use_workflow_build_id)
+                    && let Some(request_id) = req.eager_activities.request_ids.get(activity_id)
+                {
+                    eager.push((activity_id.clone(), *request_id));
+                }
+            }
             closed = apply_workflow_command(
                 &mut builder,
                 command,
@@ -2381,6 +2291,15 @@ impl BasicKernel {
                 cron_continuation.as_ref(),
                 retry_continuation.as_ref(),
                 &limits,
+            )?;
+        }
+
+        for (activity_id, request_id) in eager {
+            builder.start_completion_activity(
+                &activity_id,
+                request_id,
+                &inline_identity,
+                req.eager_activities.scope.as_ref(),
             )?;
         }
 
@@ -2415,7 +2334,12 @@ impl BasicKernel {
 
         // Schedule a new WFT when the worker explicitly requests one
         // (heartbeat / local-activity keep-alive).
-        if req.force_new_workflow_task
+        if (req.force_new_workflow_task
+            || builder
+                .state
+                .versioning_info
+                .as_ref()
+                .is_some_and(|info| info.version_transition.is_some()))
             && builder.state.is_open()
             && builder.state.pending_workflow_task.is_none()
         {
@@ -2449,8 +2373,17 @@ impl BasicKernel {
             && builder.state.pending_workflow_task.is_none()
             && builder.state.has_admitted_update_to_send()
         {
-            builder.schedule_speculative_workflow_task();
+            if req.inline_workflow_task.is_some() {
+                builder.schedule_speculative_workflow_task();
+            } else {
+                builder.schedule_workflow_task();
+            }
         }
+        builder.start_completion_workflow_task(
+            req.inline_workflow_task.as_ref(),
+            &inline_identity,
+            inline_worker_version.as_ref(),
+        )?;
 
         // M.1: a speculative task that reached the materialize path (rather than
         // the rejection-only drop at the top) committed into history — count a
@@ -2487,55 +2420,8 @@ impl BasicKernel {
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         let prior = PriorRun::of(&state);
-        let activity = state
-            .activities
-            .get(&req.activity_id)
-            .cloned()
-            .ok_or_else(|| Reject::UnknownActivity(req.activity_id.clone()))?;
-
-        let mut builder = TransitionBuilder::new(state, req.now, req.principal);
-        let started_event_id =
-            if req.mode == ActivityStartMode::Poll && activity.retry_policy.is_some() {
-                // A retry-policy start is transient: the start is recorded on
-                // the activity but consumes no history event until the
-                // activity resolves (`AddActivityTaskStartedEvent`,
-                // mutable_state_impl.go:4082-4152 @ v1.31.0), so a retryable
-                // failure leaves neither Started nor Failed for that attempt.
-                TRANSIENT_ACTIVITY_STARTED_EVENT_ID
-            } else {
-                // Buffers to `BUFFERED_EVENT_ID` while a WFT is started; the
-                // resolution then carries that sentinel as its
-                // `started_event_id` and the flush wires the real id in
-                // (TestBufferedEventsOutOfOrder).
-                builder.append_external(HistoryEventKind::ActivityTaskStarted {
-                    activity_id: req.activity_id.clone(),
-                    scheduled_event_id: activity.schedule_event_id,
-                    attempt: activity.attempt,
-                    identity: req.identity.clone(),
-                    request_id: req.request_id.map_or_else(
-                        || format!("activity-start-{}-{}", req.activity_id, activity.attempt),
-                        |id| id.to_string(),
-                    ),
-                    last_failure: activity.last_failure.clone(),
-                })
-            };
-
-        let started = builder
-            .state
-            .activities
-            .get_mut(&req.activity_id)
-            .expect("activity was read from this state above");
-        // The stamp bump fences any other outstanding offer for this attempt
-        // (`ObsoleteMatchingTask`, recordactivitytaskstarted/api.go @ v1.31.0).
-        started.stamp += 1;
-        started.started_event_id = Some(started_event_id);
-        started.started_at = Some(req.now);
-        // `ai.StartedIdentity` — Describe's primary `LastWorkerIdentity`
-        // source (workflow/activity.go:159 @ v1.31.0). Stored verbatim, even
-        // when empty.
-        started.started_identity = Some(req.identity);
-        let snapshot = started.clone();
-        builder.activity_ops.push(ActivityOp::Upsert(snapshot));
+        let mut builder = TransitionBuilder::new(state, req.now, req.principal.clone());
+        builder.start_activity(req)?;
 
         let transition = builder.finish_without_buffered_limits();
         check_transition(&prior, &transition)?;
@@ -4219,7 +4105,7 @@ impl BasicKernel {
                     pending.scheduled_at,
                     HistoryEventKind::WorkflowTaskScheduled {
                         logical_seq: pending.logical_seq,
-                        task_queue: builder.state.task_queue.clone(),
+                        task_queue: builder.state.current_workflow_task_queue().clone(),
                         workflow_task_timeout: builder.state.workflow_task_timeout,
                         attempt: pending.attempt,
                     },
@@ -5769,6 +5655,7 @@ fn apply_workflow_command(
             input,
             header,
             request_eager_execution: _,
+            use_workflow_build_id: _,
             retry_policy,
             deployment,
             build_id,
@@ -5871,36 +5758,40 @@ fn apply_workflow_command(
             builder
                 .activity_ops
                 .push(ActivityOp::Upsert(activity.clone()));
-            builder.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
-                queue: QueueKey {
-                    namespace_id: builder.state.namespace_id,
-                    task_queue,
-                    task_kind: tokeira_types::TaskKind::Activity,
-                    deployment: activity.deployment.clone(),
-                    build_id: activity.build_id.clone(),
-                },
-                activity_id,
-                schedule_event_id,
-                attempt: 1,
-                dispatch_revision: builder
-                    .state
-                    .versioning_info
-                    .as_ref()
-                    .map(|info| info.revision_number)
-                    .unwrap_or_default(),
-                // A freshly scheduled activity is at stamp 0; a later pause or
-                // options update bumps it and fences this initial dispatch.
-                stamp: 0,
-                // The hint carries the same schedule clock as authority.
-                // An epoch sentinel would make timeout reconstruction treat a
-                // freshly scheduled activity as already overdue.
-                dispatch_at: builder.now,
-                schedule_to_close_timeout,
-                schedule_to_start_timeout,
-                start_to_close_timeout,
-                heartbeat_timeout,
-                priority: effective_priority,
-            });
+            // Paused runs suppress generation; unpause re-enqueues pending work
+            // (workflow_task_completed_handler.go:504-509 @ v1.31.0).
+            if builder.state.status != ExecutionStatus::Paused {
+                builder.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
+                    queue: QueueKey {
+                        namespace_id: builder.state.namespace_id,
+                        task_queue,
+                        task_kind: tokeira_types::TaskKind::Activity,
+                        deployment: activity.deployment.clone(),
+                        build_id: activity.build_id.clone(),
+                    },
+                    activity_id,
+                    schedule_event_id,
+                    attempt: 1,
+                    dispatch_revision: builder
+                        .state
+                        .versioning_info
+                        .as_ref()
+                        .map(|info| info.revision_number)
+                        .unwrap_or_default(),
+                    // A freshly scheduled activity is at stamp 0; a later pause or
+                    // options update bumps it and fences this initial dispatch.
+                    stamp: 0,
+                    // The hint carries the same schedule clock as authority.
+                    // An epoch sentinel would make timeout reconstruction treat a
+                    // freshly scheduled activity as already overdue.
+                    dispatch_at: builder.now,
+                    schedule_to_close_timeout,
+                    schedule_to_start_timeout,
+                    start_to_close_timeout,
+                    heartbeat_timeout,
+                    priority: effective_priority,
+                });
+            }
             Ok(false)
         }
         WorkflowCommand::StartTimer { timer_id, fire_at } => {
@@ -8048,7 +7939,7 @@ impl TransitionBuilder {
             pending.scheduled_at,
             HistoryEventKind::WorkflowTaskScheduled {
                 logical_seq: pending.logical_seq,
-                task_queue: self.state.task_queue.clone(),
+                task_queue: self.state.current_workflow_task_queue().clone(),
                 workflow_task_timeout: self.state.workflow_task_timeout,
                 attempt: pending.attempt,
             },
@@ -8413,6 +8304,422 @@ impl TransitionBuilder {
             speculative: task_type == WorkflowTaskType::Speculative,
             priority: self.state.priority.clone(),
         });
+    }
+
+    /// Shared start semantics keep virtual history, advice and sticky handling
+    /// identical for polled tasks and completion-owned starts.
+    fn start_workflow_task(&mut self, req: StartWorkflowTaskRequest) -> Result<(), Reject> {
+        if self.state.status != ExecutionStatus::Running {
+            return Err(Reject::WorkflowPaused);
+        }
+        let pending = self
+            .state
+            .pending_workflow_task
+            .clone()
+            .ok_or(Reject::NoPendingWorkflowTask)?;
+
+        if pending.logical_seq != req.logical_seq {
+            return Err(Reject::WorkflowTaskSeqMismatch {
+                expected: pending.logical_seq.0,
+                got: req.logical_seq.0,
+            });
+        }
+        if pending.started_event_id.is_some() {
+            return Err(Reject::WorkflowTaskAlreadyStarted {
+                logical_seq: pending.logical_seq.0,
+            });
+        }
+
+        let target_version_changed_enabled = req.target_version_changed_enabled;
+        let target_deployment_version = req.target_deployment_version.clone();
+        let target_worker_deployment_version_changed = self.state.apply_target_version_observation(
+            target_version_changed_enabled,
+            target_deployment_version.clone(),
+        );
+        let attempt = pending.attempt.max(1);
+        // The count operand is the id the next event would receive at this
+        // moment (`GetNextEventID()`, workflow_task_state_machine.go:1452 @
+        // v1.31.0): the started id for a persisted start and the virtual
+        // scheduled id for a suppressed one. It is fixed before anything is
+        // emitted so the conversion branch below matches v1.31.0, which decides
+        // before adding its events. In-flight updates are the admitted set plus
+        // the accepted set; acceptance moves an id from one to the other, so
+        // the sum never double-counts.
+        let in_flight_updates =
+            self.state.admitted_updates.len() + self.state.pending_updates.len();
+        let advice = crate::advice::continue_as_new_advice(
+            req.history_size_bytes,
+            self.state.last_event_id + 1,
+            in_flight_updates,
+            self.state.completed_update_count,
+            req.advice_policy,
+        );
+        // Transient (attempt>1) and SPECULATIVE starts persist no
+        // WorkflowTaskStarted event: the started id is virtual
+        // (scheduled_event_id + 1) and last_event_id is unchanged — v1.31.0
+        // suppresses the pair for both modes with one predicate
+        // (`!IsTransientWorkflowTask() && Type != SPECULATIVE`,
+        // workflow_task_state_machine.go:556-558 @ v1.31.0; spec
+        // speculative-wft, one predicate / three modes per Invariant I.2).
+        // Conversion (rule ii): if new events landed after the virtual
+        // scheduling — the virtual scheduled id no longer equals
+        // last_event_id + 1 — convert back to a NORMAL attempt-1 task with
+        // real Scheduled + Started, since the frozen virtual suffix is now
+        // invalid (workflow_task_state_machine.go:559-576 @ v1.31.0; the same
+        // branch also flips a speculative task's `Type` to NORMAL).
+        let suppressed = attempt > 1 || pending.task_type == WorkflowTaskType::Speculative;
+        let new_events_since_schedule =
+            suppressed && pending.scheduled_event_id != self.state.last_event_id + 1;
+        let (scheduled_event_id, started_event_id) = if suppressed && !new_events_since_schedule {
+            (pending.scheduled_event_id, pending.scheduled_event_id + 1)
+        } else if new_events_since_schedule {
+            self.state.workflow_task_attempt = 1;
+            let scheduled = self.emit(HistoryEventKind::WorkflowTaskScheduled {
+                logical_seq: pending.logical_seq,
+                task_queue: self.state.task_queue.clone(),
+                workflow_task_timeout: self.state.workflow_task_timeout,
+                attempt: 1,
+            });
+            let started = self.emit(HistoryEventKind::WorkflowTaskStarted {
+                logical_seq: pending.logical_seq,
+                scheduled_event_id: scheduled,
+                attempt: 1,
+                identity: req.worker_identity.clone(),
+                request_id: req.request_id,
+                history_size_bytes: advice.history_size_bytes,
+                suggest_continue_as_new: advice.suggest_continue_as_new,
+                suggest_continue_as_new_reasons: advice.suggest_continue_as_new_reasons.clone(),
+                target_worker_deployment_version_changed,
+                target_version_changed_enabled,
+                target_deployment_version: target_deployment_version.clone(),
+            });
+            (scheduled, started)
+        } else {
+            let started = self.emit(HistoryEventKind::WorkflowTaskStarted {
+                logical_seq: pending.logical_seq,
+                scheduled_event_id: pending.scheduled_event_id,
+                attempt,
+                identity: req.worker_identity.clone(),
+                request_id: req.request_id,
+                history_size_bytes: advice.history_size_bytes,
+                suggest_continue_as_new: advice.suggest_continue_as_new,
+                suggest_continue_as_new_reasons: advice.suggest_continue_as_new_reasons.clone(),
+                target_worker_deployment_version_changed,
+                target_version_changed_enabled,
+                target_deployment_version: target_deployment_version.clone(),
+            });
+            (pending.scheduled_event_id, started)
+        };
+
+        let current = self
+            .state
+            .pending_workflow_task
+            .as_mut()
+            .expect("validated pending workflow task must still exist");
+        current.scheduled_event_id = scheduled_event_id;
+        current.started_event_id = Some(started_event_id);
+        current.started_at = Some(req.now);
+        current.attempt = self.state.workflow_task_attempt;
+        current.target_worker_deployment_version_changed = target_worker_deployment_version_changed;
+        current.target_version_changed_enabled = target_version_changed_enabled;
+        current.target_deployment_version = target_deployment_version;
+        // Recorded so a suppressed start's later materialization or synthesis
+        // carries exactly this decision (Requirement 2.6).
+        current.advice = advice;
+        if new_events_since_schedule {
+            // The conversion branch persisted real Scheduled/Started — the
+            // task is normal from here on (`workflowTask.Type = NORMAL`,
+            // workflow_task_state_machine.go:564-566 @ v1.31.0).
+            current.task_type = WorkflowTaskType::Normal;
+        }
+
+        // Sticky metadata survives an unavailable-worker fallback and clears
+        // only when the derived task actually starts outside the sticky queue
+        // (`recordworkflowtaskstarted/api.go:115-149 @ v1.31.0`).
+        if self.state.sticky.as_ref().is_some_and(|sticky| {
+            !sticky.sticky_queue.0.is_empty() && sticky.sticky_queue != req.polled_task_queue
+        }) {
+            self.state.sticky = None;
+        }
+
+        if let Some(target) = req.deployment_transition {
+            self.state
+                .start_version_transition(
+                    target,
+                    req.deployment_transition_revision_number
+                        .unwrap_or_default(),
+                )
+                .map_err(|error| match error {
+                    crate::state::VersionTransitionError::PinnedWorkflowCannotTransition => {
+                        Reject::PinnedWorkflowCannotTransition
+                    }
+                })?;
+        }
+
+        Ok(())
+    }
+
+    /// Shared mutation for ordinary polls and completion-owned starts. Retry
+    /// starts stay transient on both paths (AddActivityTaskStartedEvent,
+    /// service/history/workflow/mutable_state_impl.go @ v1.31.0).
+    fn start_activity(&mut self, req: ActivityStartRequest) -> Result<(), Reject> {
+        let activity = self
+            .state
+            .activities
+            .get(&req.activity_id)
+            .cloned()
+            .ok_or_else(|| Reject::UnknownActivity(req.activity_id.clone()))?;
+
+        let started_event_id =
+            if req.mode == ActivityStartMode::Poll && activity.retry_policy.is_some() {
+                // A retry-policy start is transient: the start is recorded on
+                // the activity but consumes no history event until the
+                // activity resolves (`AddActivityTaskStartedEvent`,
+                // mutable_state_impl.go:4082-4152 @ v1.31.0), so a retryable
+                // failure leaves neither Started nor Failed for that attempt.
+                TRANSIENT_ACTIVITY_STARTED_EVENT_ID
+            } else {
+                // Buffers to `BUFFERED_EVENT_ID` while a WFT is started; the
+                // resolution then carries that sentinel as its
+                // `started_event_id` and the flush wires the real id in
+                // (TestBufferedEventsOutOfOrder).
+                self.append_external(HistoryEventKind::ActivityTaskStarted {
+                    activity_id: req.activity_id.clone(),
+                    scheduled_event_id: activity.schedule_event_id,
+                    attempt: activity.attempt,
+                    identity: req.identity.clone(),
+                    request_id: req.request_id.map_or_else(
+                        || format!("activity-start-{}-{}", req.activity_id, activity.attempt),
+                        |id| id.to_string(),
+                    ),
+                    last_failure: activity.last_failure.clone(),
+                })
+            };
+
+        let started = self
+            .state
+            .activities
+            .get_mut(&req.activity_id)
+            .expect("activity was read from this state above");
+        // The stamp bump fences any other outstanding offer for this attempt
+        // (`ObsoleteMatchingTask`, recordactivitytaskstarted/api.go @ v1.31.0).
+        started.stamp += 1;
+        started.started_event_id = Some(started_event_id);
+        started.started_at = Some(req.now);
+        // `ai.StartedIdentity` — Describe's primary `LastWorkerIdentity`
+        // source (workflow/activity.go:159 @ v1.31.0). Stored verbatim, even
+        // when empty.
+        started.started_identity = Some(req.identity);
+        let snapshot = started.clone();
+        self.activity_ops.push(ActivityOp::Upsert(snapshot));
+
+        Ok(())
+    }
+
+    fn start_completion_activity(
+        &mut self,
+        activity_id: &str,
+        request_id: tokeira_types::Uuid,
+        identity: &WorkerIdentity,
+        scope: Option<&crate::command::CompletionWorkflowTaskScope>,
+    ) -> Result<(), Reject> {
+        if !self.state.is_open() || self.state.status == ExecutionStatus::Paused {
+            return Ok(());
+        }
+        let Some(activity) = self.state.activities.get(activity_id) else {
+            return Ok(());
+        };
+        let schedule_event_id = activity.schedule_event_id;
+        let Some((index, mut queue, dispatch_revision)) = self
+            .dispatch_ops
+            .iter()
+            .enumerate()
+            .find_map(|(index, op)| match op {
+                DispatchOp::EnqueueActivityTask {
+                    activity_id: id,
+                    schedule_event_id: scheduled,
+                    queue,
+                    dispatch_revision,
+                    ..
+                } if id == activity_id && *scheduled == schedule_event_id => {
+                    Some((index, queue.clone(), *dispatch_revision))
+                }
+                _ => None,
+            })
+        else {
+            return Ok(());
+        };
+        if let Some(version) = self.state.effective_deployment() {
+            queue.deployment = Some(tokeira_types::DeploymentId(version.deployment_name.clone()));
+            queue.build_id = Some(tokeira_types::BuildId(version.build_id.clone()));
+        }
+        if scope.is_some_and(|scope| {
+            scope.namespace_id != queue.namespace_id
+                || !scope.normal_task_queues.contains(&queue.task_queue)
+                || queue.deployment.as_ref() != Some(&scope.deployment)
+                || queue.build_id.as_ref() != Some(&scope.build_id)
+        }) {
+            return Ok(());
+        }
+        // No runtime start gate is involved: workflow rules only match ordinary
+        // starts and retries (workflow_task_completed_handler.go:533-565 @ v1.31.0).
+        self.start_activity(ActivityStartRequest {
+            activity_id: activity_id.to_owned(),
+            request_id: Some(request_id),
+            identity: identity.clone(),
+            principal: None,
+            mode: ActivityStartMode::Poll,
+            now: self.now,
+        })?;
+        self.state.activity_start_receipts.insert(
+            activity_id.to_owned(),
+            crate::state::ActivityStartReceipt {
+                request_id,
+                schedule_event_id,
+                attempt: 1,
+                offered_stamp: 0,
+                worker_identity: identity.clone(),
+                selected_queue: queue,
+                dispatch_revision,
+            },
+        );
+        // Removing the exact incarnation's effect prevents both durable dispatch
+        // and publication. The receipt reports the start in the committed image.
+        self.dispatch_ops.remove(index);
+        Ok(())
+    }
+
+    /// Decide inline admission only after commands have selected the actual
+    /// successor and its queue. This runs again against fresh state on OCC retry.
+    fn start_completion_workflow_task(
+        &mut self,
+        inline: Option<&crate::command::CompletionWorkflowTaskStart>,
+        identity: &WorkerIdentity,
+        worker_version: Option<&crate::command::WorkflowTaskWorkerVersion>,
+    ) -> Result<(), Reject> {
+        let Some(pending) = self.state.pending_workflow_task.as_ref() else {
+            return Ok(());
+        };
+        let Some(inline) = inline else {
+            return Ok(());
+        };
+        if pending.started_event_id.is_some() {
+            return Ok(());
+        }
+        let logical_seq = pending.logical_seq;
+        // The stamp gate is only for Normal successors. An old stamp without
+        // an assigned build is deliberately not a start operand; recording it
+        // on Completed must not assign a build
+        // (service/history/api/respondworkflowtaskcompleted/api.go:547-568,708-713 @ v1.31.0).
+        if pending.task_type == WorkflowTaskType::Normal {
+            let stamp = worker_version.and_then(|version| version.stamp.as_ref());
+            if self
+                .state
+                .versioning_info
+                .as_ref()
+                .is_some_and(|info| info.version_transition.is_some())
+                || stamp.is_some_and(|stamp| {
+                    stamp.use_versioning
+                        && self
+                            .state
+                            .assigned_build_id()
+                            .is_some_and(|assigned| assigned.0 != stamp.build_id)
+                })
+            {
+                return Ok(());
+            }
+        }
+        let Some(mut queue) = self.dispatch_ops.iter().find_map(|op| match op {
+            DispatchOp::EnqueueWorkflowTask {
+                queue,
+                logical_seq: seq,
+                ..
+            } if *seq == logical_seq => Some(queue.clone()),
+            _ => None,
+        }) else {
+            // Every current completion scheduling path calls
+            // schedule_workflow_task_typed, which emits the matching enqueue.
+            // Without that selected queue, leave the successor unstarted.
+            return Ok(());
+        };
+        // Completion may have changed effective deployment. Ordinary dispatch
+        // resolves it later, but inline scope and provenance use this final target.
+        if let Some(version) = self.state.effective_deployment() {
+            queue.deployment = Some(tokeira_types::DeploymentId(version.deployment_name.clone()));
+            queue.build_id = Some(tokeira_types::BuildId(version.build_id.clone()));
+        }
+        if let Some(scope) = &inline.scope {
+            // Authorize the selected sticky queue through its authoritative
+            // normal alias, never a request's guessed normal queue. Both the
+            // alias and version are from this transition's selected dispatch.
+            let normal_queue = if self
+                .state
+                .sticky
+                .as_ref()
+                .is_some_and(|sticky| sticky.sticky_queue == queue.task_queue)
+            {
+                &self.state.task_queue
+            } else {
+                &queue.task_queue
+            };
+            if scope.namespace_id != queue.namespace_id
+                || !scope.normal_task_queues.contains(normal_queue)
+                || queue.deployment.as_ref() != Some(&scope.deployment)
+                || queue.build_id.as_ref() != Some(&scope.build_id)
+            {
+                // A speculative candidate needs ordinary task generation when
+                // scope prevents bypass, just like ReturnNewWorkflowTask=false.
+                if pending.task_type == WorkflowTaskType::Speculative {
+                    let scheduled = self.emit(HistoryEventKind::WorkflowTaskScheduled {
+                        logical_seq,
+                        task_queue: queue.task_queue.clone(),
+                        workflow_task_timeout: self.state.workflow_task_timeout,
+                        attempt: 1,
+                    });
+                    let current = self
+                        .state
+                        .pending_workflow_task
+                        .as_mut()
+                        .expect("successor exists");
+                    current.task_type = WorkflowTaskType::Normal;
+                    current.scheduled_event_id = scheduled;
+                    if queue.task_queue == self.state.task_queue {
+                        current.schedule_to_start_deadline = None;
+                    }
+                    for op in &mut self.dispatch_ops {
+                        if let DispatchOp::EnqueueWorkflowTask {
+                            logical_seq: seq,
+                            speculative,
+                            ..
+                        } = op
+                            && *seq == logical_seq
+                        {
+                            *speculative = false;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        }
+        self.start_workflow_task(StartWorkflowTaskRequest {
+            logical_seq,
+            worker_identity: identity.clone(),
+            request_id: "request-from-RespondWorkflowTaskCompleted".into(),
+            history_size_bytes: inline.history_size_bytes,
+            advice_policy: inline.advice_policy,
+            deployment_transition: None,
+            deployment_transition_revision_number: None,
+            polled_task_queue: queue.task_queue,
+            now: self.now,
+            target_version_changed_enabled: false,
+            target_deployment_version: None,
+        })?;
+        // Publication consumes explicit ops, so final-state row derivation alone
+        // cannot prevent the poll race. Remove the only offer-producing effect
+        // before this transition can commit
+        // (service/history/api/respondworkflowtaskcompleted/api.go:533-604 @ v1.31.0).
+        self.dispatch_ops.retain(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { logical_seq: seq, .. } if *seq == logical_seq));
+        Ok(())
     }
 
     /// Start the just-scheduled WFT in the same transition for runtime-owned

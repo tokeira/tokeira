@@ -375,7 +375,7 @@ Start and signal-with-start are accepted as core surfaces, but the server compat
 
 ### Workflow task lifecycle (`workflow-task-lifecycle`)
 
-Workflow task polling and completion are core SDK paths. The current matrix shape records sdk_metadata as the primary capability; upsert_memo is preserved by the baseline until multi-capability matrix entries are introduced.
+Workflow task polling and completion are core SDK paths. Completion-owned eager activities use the deployment-wide policy.compatibility.enable_activity_eager_execution setting, off by default, with no per-response limit. The current matrix shape records sdk_metadata as the primary capability; upsert_memo is preserved by the baseline until multi-capability matrix entries are introduced.
 
 - Guidance: Enabled with an empty production configuration.
 - Prerequisites: none
@@ -468,6 +468,7 @@ All accepted production leaves are listed below. Fields are startup-static; chan
 | `policy.authorization.jwt.issuers[].worker_scopes[].namespace` | Tokeira native | `""` | yes | yes | `scoped-worker-authorization` | Exact namespace name authorized for the scoped Worker. |
 | `policy.authorization.jwt.issuers[].worker_scopes[].task_queues` | Tokeira native | `[]` | yes | yes | `scoped-worker-authorization` | Non-empty exact normal task-queue allowlist; sticky aliases are not configured. |
 | `policy.authorization.principal_attribution` | configured parity | `false` | no | yes | `authorization` | Write the authenticated principal to server-authored history metadata. |
+| `policy.compatibility.enable_activity_eager_execution` | configured parity | `false` | no | yes | `workflow-task-lifecycle` | Enable eager activity execution for every namespace; off by default. |
 | `policy.compatibility.enable_standalone_activities` | configured parity | `false` | no | yes | `activity-executions` | Enable the v1.31.0 preview standalone-activity surface. |
 | `policy.compatibility.enable_standalone_activity_callbacks` | configured parity | `false` | no | yes | `activity-executions` | Enable standalone-activity callbacks; requires standalone activities. |
 | `policy.default_retention_days` | stock parity | `30` | no | yes | `namespace-management` | Default workflow-history retention for newly created namespaces. |

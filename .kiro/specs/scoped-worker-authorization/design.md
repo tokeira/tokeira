@@ -618,10 +618,13 @@ The same provenance-before-exposure rule applies to:
 - eager Activity tasks in `RespondWorkflowTaskCompleted.activity_tasks`; and
 - Nexus poll responses.
 
-Before claiming an optional eager or inline task for a Scoped_Identity, the edge compares its
-actual target with the scope. An out-of-scope optional return is skipped and its normal durable
-dispatch remains available to a correctly scoped poller. If an in-scope optional task is claimed
-but provenance insertion fails, it is withheld and recovers through normal timeout.
+Before the completion chooses an optional inline start for a Scoped_Identity, admission
+compares its actual target with the scope. Pass that decision into the completion; do not start
+out-of-scope work and then try to undo it. Such work stays unstarted for ordinary authorized
+dispatch. The [completion-inline contract](../api-conformance-wft-completion/design.md)
+and [eager activity contract](../activity-dispatch/design.md#offers-and-eager-start) replace
+post-commit claims. If an authorized inline task commits but provenance insertion fails,
+withhold its token and recover through its started timeout; never republish it immediately.
 
 The CHASM standalone-activity bridge remains before the workflow-activity broker only after full
 scoped admission. Because standalone activities are unversioned, a Scoped_Identity never enters

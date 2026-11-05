@@ -18,8 +18,8 @@ the current worker deployment/versioning fields are translated and persisted
 where durable; `return_new_workflow_task` is implemented to Temporal semantics.
 **Applying** deployment/versioning fields to dispatch routing is owned by
 `worker-deployments`; this spec only preserves and threads them into
-history/state. The deprecated `binary_checksum` / `worker_version_stamp` /
-`deployment` fields are accepted for back-compat and do not drive new behavior.
+history/state. Deprecated metadata remains accepted; the structured `worker_version_stamp` also
+participates in the pinned inline-task compatibility gate below.
 
 ## Evidence From Current Code
 
@@ -37,8 +37,8 @@ history/state. The deprecated `binary_checksum` / `worker_version_stamp` /
 | `task_token`, `commands`, `identity`, `namespace` | Supported | Preserve | existing token/command errors | Kernel transition/history |
 | `query_results` (8) | Supported | Preserve | existing query errors | Query response delivery |
 | `messages` (11) | Supported | Preserve (update protocol transport) | existing update errors | Owned jointly with `api-conformance-update-lifecycle` |
-| `force_create_new_workflow_task` (6) | Supported | Preserve forced-WFT behavior | n/a | Runtime WFT scheduling |
-| `return_new_workflow_task` (5) | Partial | Implement inline next-WFT delivery when safely available | n/a | Runtime response |
+| `force_create_new_workflow_task` (6) | Partial | Preserve forced scheduling and apply the heartbeat-only limit in transient-wft Item C | `NOT_FOUND` after a committed heartbeat timeout | Original scheduled time and timeout transition |
+| `return_new_workflow_task` (5) | Partial | Start an eligible follow-up in the completion transition for the completing worker | Existing completion errors | Started pending state; no dispatch row or offer |
 | `sdk_metadata` (12) | Partially threaded | Complete durable persistence into `WorkflowTaskCompleted` | n/a | `WorkflowTaskCompleted` event |
 | `metering_metadata` (13) | Not supported | Preserve as informational completion metadata | n/a | `WorkflowTaskCompleted` event |
 | `sticky_attributes` (4) | Not supported | Persist sticky task queue attributes and update sticky routing | validation errors only | Sticky routing state |
@@ -49,7 +49,7 @@ history/state. The deprecated `binary_checksum` / `worker_version_stamp` /
 | `worker_instance_key` (19) | Not modeled | Empty until worker-lifecycle tracking exists | n/a | Owned by worker lifecycle/heartbeat |
 | `worker_control_task_queue` (20) | Not modeled | Empty until per-worker Nexus control transport exists | n/a | Owned by Nexus task transport |
 | `binary_checksum` (7, deprecated) | Accepted | Accept for back-compat only; no new behavior | n/a | None |
-| `worker_version_stamp` (10, deprecated) | Partial | Accept `build_id` for back-compat; superseded by `deployment_options` | validation errors only | History metadata (legacy) |
+| `worker_version_stamp` (10, deprecated) | Partial | Preserve stamp and use the pinned assigned-build compatibility gate for inline return | validation errors only | History metadata and inline eligibility |
 | `deployment` (15, deprecated) | Not supported | Accept for back-compat only; superseded by `deployment_options` | n/a | None |
 
 ## Requirements
@@ -63,7 +63,7 @@ history/state. The deprecated `binary_checksum` / `worker_version_stamp` /
 1. WHEN `sdk_metadata` is present, THE Edge SHALL serialize and thread it into `WorkflowTaskCompletedRequest` and durably persist it on the `WorkflowTaskCompleted` history event.
 2. WHEN `metering_metadata` is present, THE Edge SHALL preserve it as informational completion metadata on the history event.
 3. WHEN `deployment_options` (current) or `versioning_behavior` is present, THE Edge SHALL persist it as worker deployment/versioning metadata; applying it to dispatch routing is owned by `worker-deployments` and is out of scope here.
-4. WHEN the deprecated `binary_checksum`, `worker_version_stamp`, or `deployment` fields are present, THE Edge SHALL accept them for back-compat only and SHALL NOT drive new behavior; they are superseded by `deployment_options`.
+4. WHEN deprecated metadata is present, THE Edge SHALL preserve its existing treatment; THE runtime SHALL additionally use the structured `worker_version_stamp` for Requirement 3.5’s inline compatibility gate.
 5. WHEN `resource_id` is present, THE Edge SHALL treat it as routing-envelope data only and SHALL NOT derive new workflow semantics from it.
 6. WHERE `worker_instance_key` or `worker_control_task_queue` is present, THE Edge SHALL leave the corresponding worker-lifecycle / Nexus-control behavior default; these are owned by worker lifecycle and Nexus task transport respectively.
 
@@ -84,10 +84,27 @@ history/state. The deprecated `binary_checksum` / `worker_version_stamp` /
 
 #### Acceptance Criteria
 
-1. WHEN `return_new_workflow_task` is false, THE response SHALL preserve existing behavior.
-2. WHEN `return_new_workflow_task` is true and an immediately available WFT exists for the same worker/task queue, THE response SHALL include it.
-3. WHEN no immediate WFT exists, THE response SHALL return without inventing an empty started task.
-4. Returned inline WFTs SHALL carry the same token, history, sticky, and versioning metadata as a normal poll response.
+1. WHEN `return_new_workflow_task` is false, THE completion SHALL dispatch any required follow-up normally and return no real inline task; an update-driven speculative candidate SHALL become Normal when task generation cannot be bypassed.
+2. WHEN `return_new_workflow_task` is true, the completion succeeds, and an eligible follow-up is required, THE kernel SHALL schedule and start it for the completing identity on the new task's selected queue within the completion's transition.
+3. WHEN no follow-up is required or the run closes, THE response SHALL contain no fabricated real started task.
+4. WHEN the response carries a real inline task, THE task SHALL carry the committed token, attempt, scheduled/started IDs and times, incremental history after the previous started event, and applicable versioning, query and update metadata.
+5. WHEN the completion stamp has `use_versioning=true`, the assigned build ID is nonempty, and the stamp build differs, THE completion SHALL dispatch the normal follow-up rather than start it inline; an ongoing deployment transition SHALL likewise prevent inline start.
+6. WHEN the workflow uses only old stamp-based versioning with no assigned build ID, THE inline start SHALL omit that stamp from its start operands, as v1.31.0 does.
+7. WHEN the completion fails the workflow task, THE runtime SHALL expose no inline task and SHALL preserve the pinned failure/retry dispatch behavior.
+8. WHEN the completion starts a real task inline, THE kernel SHALL emit no enqueue operation and THE runtime/storage SHALL create neither offer nor workflow dispatch row for it, independent of parked normal or sticky polls.
+9. WHEN outgoing updates alone require a speculative follow-up and inline return is permitted, THE completion SHALL start that speculative task for its caller without an offer or dispatch row, preserving virtual IDs, discard/materialization and timeout behavior.
+10. IF the inline response is lost, THEN THE task SHALL stay started until its applicable timeout; the runtime SHALL NOT immediately make it available to other polls.
+11. WHEN an inline task is exposed, THE runtime/edge SHALL preserve update delivery ordering, buffered-query barriers and scoped worker provenance; a query-only response SHALL NOT substitute for a required real WFT.
+
+Authority: `service/history/api/respondworkflowtaskcompleted/api.go:512-600,702-725,731-773 @ v1.31.0`.
+The build-ID comparison is inside the `use_versioning` and assigned-build guards,
+not a blanket comparison of every build string. A deployment transition forces a
+Normal follow-up before speculative selection. Temporal creates/starts speculative
+tasks after persistence; Tokeira's durable pending-state mapping is explained in
+[the design](design.md#return-new-wft-safety). The heartbeat-timeout successor
+follows Requirement 3 but is not returned; its exact timeout, sticky, update/query
+and retry behavior is owned by
+[transient-wft Item C](../transient-wft/requirements.md#item-c--wft-heartbeat-timeout).
 
 ### Requirement 4: Error and Token Validation
 

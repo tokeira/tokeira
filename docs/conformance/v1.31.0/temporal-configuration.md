@@ -17,8 +17,8 @@ Counts below include dynamic settings and the separately audited static groups.
 
 | Tokeira treatment | Count |
 |---|---:|
-| deployment policy | 10 |
-| pinned behavioral constant | 203 |
+| deployment policy | 11 |
+| pinned behavioral constant | 202 |
 | auto-tuned mechanical setting | 355 |
 | conformance-only override | 49 |
 | architecturally irrelevant or excluded | 8 |
@@ -553,7 +553,7 @@ Counts below include dynamic settings and the separately audited static groups.
 | `system.deadlock.Interval` | global / `Duration` | `60 * time.Second` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:296` |
 | `system.deadlock.MaxWorkersPerRoot` | global / `Int` | `10` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:301` |
 | `system.disallowQuery` | namespace / `Bool` | `false` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:143` |
-| `system.enableActivityEagerExecution` | namespace / `Bool` | `false` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:193` |
+| `system.enableActivityEagerExecution` | namespace / `Bool` | `false` | deployment policy — Startup-static policy.compatibility.enable_activity_eager_execution, false by default, applies to every namespace. A per-test bool override takes precedence. Eligible activities start in the completion transition without a count cap. | wired | `common/dynamicconfig/constants.go:193` |
 | `system.enableActivityRetryStampIncrement` | global / `Bool` | `false` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:208` |
 | `system.enableCrossNamespaceCommands` | global / `Bool` | `false` | conformance-only override — No production raw-key control; a typed conformance consult site exercises the supported behavior. | wired | `common/dynamicconfig/constants.go:148` |
 | `system.enableDataLossMetrics` | global / `Bool` | `false` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:273` |

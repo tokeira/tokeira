@@ -931,38 +931,6 @@ where
         )
     }
 
-    pub async fn try_claim_workflow_task(
-        &self,
-        queue: QueueKey,
-        normal_queue: Option<QueueKey>,
-        run_key: RunKey,
-        worker_identity: WorkerIdentity,
-    ) -> Result<Option<StartedWorkflowTask>> {
-        let Some(offered) = self
-            .broker
-            .try_claim_workflow_task_for_worker_with_normal(
-                &queue,
-                normal_queue.as_ref(),
-                run_key,
-                Some(&worker_identity),
-            )
-            .await
-        else {
-            return Ok(None);
-        };
-        self.delivery_metrics.record_poll_success(&queue);
-        match self
-            .start_polled_workflow_task(offered.0, offered.1, worker_identity)
-            .await
-        {
-            Ok(started) => Ok(Some(started)),
-            Err(error) => {
-                tracing::debug!(?error, "eager workflow task claim did not start");
-                Ok(None)
-            }
-        }
-    }
-
     async fn resolve_polled_workflow_task_target(
         &self,
         offered: &DispatchableWorkflowTask,
@@ -1191,6 +1159,18 @@ where
         &self,
         req: WorkflowTaskCompletedRequest,
     ) -> Result<CommitResult> {
+        Ok(self.complete_workflow_task_with_result(req).await?.commit)
+    }
+
+    /// Complete and return the successor started in that same fenced commit.
+    /// Update rejection/acceptance processing finishes before exposing the result.
+    pub async fn complete_workflow_task_with_result(
+        &self,
+        req: WorkflowTaskCompletedRequest,
+    ) -> Result<WorkflowTaskCompletionOutcome> {
+        let inline_requested = req.inline_workflow_task.is_some();
+        let inline_identity = req.identity.clone();
+        let completed_seq = req.token.logical_seq;
         if let Err(error) = self.validate_workflow_task_token(&req.token).await {
             runtime_metrics::record_workflow_task_completed(OutcomeLabel::Rejected);
             return Err(error);
@@ -1209,6 +1189,34 @@ where
         // task — K7). Read now, before the commit processes the worker's
         // accept/reject commands (spec speculative-wft Req 9).
         let mut req = req;
+        #[cfg(feature = "conformance")]
+        let eager_enabled =
+            crate::conformance::activity_eager_execution(self.enable_activity_eager_execution);
+        #[cfg(not(feature = "conformance"))]
+        let eager_enabled = self.enable_activity_eager_execution;
+        req.eager_activities.enabled = eager_enabled;
+        // Generate randomness before submission, never in the pure kernel or
+        // an OCC retry. Command payloads build the exact committed response
+        // without a scheduled-event read (workflow_task_completed_handler.go:594-615 @ v1.31.0).
+        let eager_commands: Vec<_> = req
+            .commands
+            .iter()
+            .filter_map(|command| match command.semantic_command() {
+                WorkflowCommand::ScheduleActivity {
+                    activity_id,
+                    request_eager_execution: true,
+                    ..
+                } => {
+                    let request_id = Uuid::new_v4();
+                    req.eager_activities
+                        .request_ids
+                        .insert(activity_id.clone(), request_id);
+                    Some((command.semantic_command().clone(), request_id))
+                }
+                _ => None,
+            })
+            .collect();
+
         // Registry membership is mutable runtime state, so resolve it before
         // invoking the pure transition. The resulting decision is committed on
         // the predecessor close event and becomes the sole successor-start
@@ -1225,6 +1233,12 @@ where
         // until every required successor input is ready, so a retry can resolve them.
         let (retry_continuation, cron_continuation, successor_plan) =
             self.prepare_completion_successor(run_key, &req).await?;
+        if let Some(inline) = &mut req.inline_workflow_task {
+            // Like a poll start, read advice before submission and reuse it on
+            // OCC retries. Scope still uses the lane's authoritative run image.
+            let (_, stats) = self.repo.load_run_with_stats(run_key).await?;
+            inline.history_size_bytes = stats.history_size_bytes;
+        }
         req.delivered_update_ids = self.update_registry.sent_update_ids(run_key);
         // Rejections write NO history event (v1.31.0's
         // RejectWorkflowExecutionUpdate is a documented no-op), so the lane's
@@ -1269,6 +1283,9 @@ where
         // The pure kernel receives concrete transition input and never reads
         // the conformance registry or retains configuration.
         req.limits = workflow_task_completion_limits();
+        if let Some(inline) = &mut req.inline_workflow_task {
+            inline.advice_policy = continue_as_new_advice_policy();
+        }
         let command = match (retry_continuation, cron_continuation) {
             (Some(retry_continuation), _) => Command::WorkflowTaskCompletedWithRetry {
                 request: req,
@@ -1473,7 +1490,77 @@ where
                 runtime_metrics::record_workflow_task_completed(OutcomeLabel::Failure);
             }
         }
-        result
+        let commit = result?;
+        let workflow_task = match &commit {
+            CommitResult::Applied { new_state }
+                if inline_requested
+                    && new_state
+                        .pending_workflow_task
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            pending.logical_seq != completed_seq
+                                && pending.started_event_id.is_some()
+                        }) =>
+            {
+                let mut started = self
+                    .started_workflow_task_from_state(new_state, true, inline_identity)
+                    .await?;
+                if let Some(version) = new_state.effective_deployment() {
+                    started.origin.deployment =
+                        tokeira_types::DeploymentId(version.deployment_name.clone());
+                    started.origin.build_id = tokeira_types::BuildId(version.build_id.clone());
+                }
+                Some(started)
+            }
+            _ => None,
+        };
+        let mut activity_tasks = Vec::new();
+        if let CommitResult::Applied { new_state } = &commit
+            && !eager_commands.is_empty()
+        {
+            let epoch = self.current_shard_epoch(new_state).await?;
+            for (command, request_id) in eager_commands {
+                if let WorkflowCommand::ScheduleActivity {
+                    activity_id,
+                    input,
+                    header,
+                    ..
+                } = command
+                    && let Some(receipt) = new_state.activity_start_receipts.get(&activity_id)
+                    && receipt.request_id == request_id
+                    && let Some(activity) = new_state.activities.get(&activity_id)
+                {
+                    let mut task =
+                        super::activity::activity_dispatch_task(run_key, new_state, activity);
+                    task.queue = receipt.selected_queue.clone();
+                    task.dispatch_revision = receipt.dispatch_revision;
+                    let scheduled = super::activity::ActivitySchedule {
+                        input,
+                        header,
+                        scheduled_time: activity.scheduled_at,
+                        // v1.31.0 normalizes command attributes before its eager
+                        // response reads them (command_attr_validator.go:112-131;
+                        // workflow_task_completed_handler.go:605-608 @ v1.31.0).
+                        schedule_to_close_timeout: activity.schedule_to_close_timeout,
+                        start_to_close_timeout: activity.start_to_close_timeout,
+                        heartbeat_timeout: activity.heartbeat_timeout,
+                    };
+                    let mut response = super::activity::activity_start_response(
+                        new_state, activity, &task, &scheduled, epoch, false,
+                    );
+                    // Eager dispatch sends the activity's own priority; ordinary
+                    // starts inherit workflow fields (workflow_task_completed_handler.go:614;
+                    // recordactivitytaskstarted/api.go:147 @ v1.31.0).
+                    response.priority = activity.priority.clone();
+                    activity_tasks.push(response);
+                }
+            }
+        }
+        Ok(WorkflowTaskCompletionOutcome {
+            commit,
+            workflow_task,
+            activity_tasks,
+        })
     }
 
     /// `RespondWorkflowTaskFailed`: route on the reported cause.
@@ -1694,7 +1781,7 @@ where
     }
 
     /// Atomically transition a polled workflow task into the Started state.
-    async fn start_polled_workflow_task(
+    pub(super) async fn start_polled_workflow_task(
         &self,
         offered: DispatchableWorkflowTask,
         entered_at: tokio::time::Instant,
@@ -1901,6 +1988,7 @@ where
             WorkerTaskClass::Workflow,
         );
         Ok(StartedWorkflowTask {
+            scheduled_task_queue: new_state.current_workflow_task_queue().clone(),
             advice: pending.advice.clone(),
             run_key: new_state.run_key,
             run_id: new_state.run_id,
@@ -1965,6 +2053,7 @@ pub(crate) fn started_workflow_task(
         build_id: state.build_id.clone(),
     };
     Ok(StartedWorkflowTask {
+        scheduled_task_queue: state.current_workflow_task_queue().clone(),
         advice: pending.advice.clone(),
         run_key: state.run_key,
         run_id: state.run_id,

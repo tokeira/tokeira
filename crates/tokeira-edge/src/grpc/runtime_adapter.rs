@@ -37,11 +37,17 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct RuntimeAdapter<R> {
     runtime: Arc<TokeiraRuntime<R>>,
+    #[cfg(test)]
+    pub(crate) completion_barrier: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 impl<R> RuntimeAdapter<R> {
     pub fn new(runtime: Arc<TokeiraRuntime<R>>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            #[cfg(test)]
+            completion_barrier: None,
+        }
     }
 
     fn worker_deployment_registry(&self) -> EdgeResult<DeploymentRegistry>
@@ -230,48 +236,39 @@ where
         self.runtime.broker().is_worker_denied(queue, worker).await
     }
 
-    async fn try_claim_workflow_task(
-        &self,
-        queue: tokeira_types::QueueKey,
-        normal_queue: Option<tokeira_types::QueueKey>,
-        run_key: tokeira_types::RunKey,
-        worker_identity: tokeira_types::WorkerIdentity,
-    ) -> Result<Option<tokeira_runtime::StartedWorkflowTask>> {
-        self.runtime
-            .try_claim_workflow_task(queue, normal_queue, run_key, worker_identity)
-            .await
-    }
-
     async fn complete_workflow_task(
         &self,
         req: WorkflowTaskCompletedRequest,
     ) -> Result<WorkflowMutationOutcome> {
-        let schedules: Vec<_> = req
-            .commands
-            .iter()
-            .filter_map(|command| match command {
-                tokeira_kernel::WorkflowCommand::ScheduleActivity { activity_id, .. } => {
-                    Some(activity_id.clone())
-                }
-                _ => None,
-            })
-            .collect();
         let started_event_id = req.token.started_event_id;
-        let result = self.runtime.complete_workflow_task(req).await?;
-        let mut scheduled_activity_event_ids = std::collections::BTreeMap::new();
-        if let CommitResult::Applied { new_state } = &result {
-            for id in schedules {
-                if let Some(activity) = new_state.activities.get(&id)
-                    && activity.schedule_event_id > started_event_id
-                    && activity.attempt == 1
-                    && activity.stamp == 0
-                {
-                    scheduled_activity_event_ids.insert(id, activity.schedule_event_id);
-                }
-            }
-        }
+        let completed = self.runtime.complete_workflow_task_with_result(req).await?;
+        let result = completed.commit;
+        let details = match &result {
+            CommitResult::Applied { new_state } => Some(Box::new(
+                crate::workflow_service::WorkflowCompletionDetails {
+                    workflow_task: completed.workflow_task,
+                    activity_tasks: completed.activity_tasks,
+                    quiescent_state: (new_state.is_open()
+                        && new_state.pending_workflow_task.is_none())
+                    .then(|| new_state.clone()),
+                    reset_history_event_id: if new_state.previous_started_event_id
+                        < started_event_id
+                    {
+                        new_state.previous_started_event_id
+                    } else {
+                        0
+                    },
+                },
+            )),
+            _ => None,
+        };
         let mut outcome = commit_result_to_outcome(result)?;
-        outcome.scheduled_activity_event_ids = scheduled_activity_event_ids;
+        outcome.completion = details;
+        #[cfg(test)]
+        if let Some((committed, release)) = &self.completion_barrier {
+            committed.notify_one();
+            release.notified().await;
+        }
         Ok(outcome)
     }
 
@@ -407,29 +404,6 @@ where
     ) -> bool {
         self.runtime
             .cancel_outstanding_worker_polls(namespace_id, task_queue, worker, task_classes)
-            .await
-    }
-
-    async fn try_claim_activity_task(
-        &self,
-        queue: tokeira_types::QueueKey,
-        run_key: tokeira_types::RunKey,
-        activity_id: String,
-        schedule_event_id: i64,
-        worker_identity: tokeira_types::WorkerIdentity,
-        input: tokeira_types::Payloads,
-        header: Option<tokeira_types::Headers>,
-    ) -> Result<Option<StartedActivityTask>> {
-        self.runtime
-            .try_claim_activity_task(
-                queue,
-                run_key,
-                activity_id,
-                schedule_event_id,
-                worker_identity,
-                input,
-                header,
-            )
             .await
     }
 
@@ -1099,7 +1073,8 @@ pub fn commit_result_to_outcome(result: CommitResult) -> Result<WorkflowMutation
                 None
             };
             Ok(WorkflowMutationOutcome {
-                scheduled_activity_event_ids: Default::default(),
+                completion: None,
+
                 transition_seq: new_state.transition_seq.0,
                 last_event_id: new_state.last_event_id,
                 was_duplicate: false,
@@ -1108,7 +1083,8 @@ pub fn commit_result_to_outcome(result: CommitResult) -> Result<WorkflowMutation
             })
         }
         CommitResult::Duplicate => Ok(WorkflowMutationOutcome {
-            scheduled_activity_event_ids: Default::default(),
+            completion: None,
+
             transition_seq: 0,
             last_event_id: 0,
             was_duplicate: true,

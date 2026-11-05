@@ -291,6 +291,7 @@ fn schedule_activity(index: usize, input_size: usize) -> WorkflowCommand {
         input: Payloads(vec![Payload::new(vec![7; input_size])]),
         header: None,
         request_eager_execution: false,
+        use_workflow_build_id: false,
         retry_policy: None,
         deployment: None,
         build_id: None,
@@ -352,6 +353,8 @@ async fn a_completion_over_the_batch_limit_terminates_the_run() -> Result<()> {
             commands: (0..3)
                 .map(|index| schedule_activity(index, 3 * 1024 * 1024 / 2))
                 .collect(),
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
@@ -461,6 +464,8 @@ async fn run_with_activity(
             worker_deployment_name: None,
             sticky: None,
             commands: vec![command],
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),

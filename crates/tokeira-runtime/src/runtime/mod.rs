@@ -94,6 +94,10 @@ mod activity_backlog_tests;
 mod activity_retirement_tests;
 mod commit;
 #[cfg(test)]
+mod completion_eager_tests;
+#[cfg(test)]
+mod completion_inline_tests;
+#[cfg(test)]
 mod discovery_tests;
 #[cfg(all(test, feature = "dsql-integration"))]
 mod dsql_tests;
@@ -255,6 +259,7 @@ pub struct TokeiraRuntime<R> {
     lanes: Vec<LaneHandle>,
     /// Lane configuration shared across all lanes.
     config: LaneConfig,
+    enable_activity_eager_execution: bool,
     /// Background timer scanner task.
     timer_scanner_handle: Option<tokio::task::JoinHandle<()>>,
     /// Cancellation token for the timer scanner loop.
@@ -1066,6 +1071,7 @@ where
         ));
         runtime_shutdown.close_registration();
         let runtime = Self {
+            enable_activity_eager_execution: false,
             activity_discovery,
             repo,
             outbound_publisher: completion_scanner_publisher,
@@ -1149,8 +1155,14 @@ where
             .expect("activity starter lock poisoned") = Some(starter);
     }
 
-    /// Set the queue partition cardinalities published by placement before
-    /// admitting traffic. Workflow edge routing uses these same hash inputs.
+    /// Select startup-static eager activity policy for every namespace.
+    /// The conformance-only read seam may override this per completion.
+    pub fn with_activity_eager_execution(mut self, enabled: bool) -> Self {
+        self.enable_activity_eager_execution = enabled;
+        self
+    }
+
+    /// Set queue placement before admitting traffic. Edge routing uses these hashes.
     pub fn with_queue_placement(self, partition_count: u32, bundle_count: u32) -> Self {
         assert!(
             partition_count > 0 && bundle_count > 0,
@@ -1924,6 +1936,19 @@ fn mutation_metadata(state: &WorkflowState) -> MutationMetadata {
     }
 }
 
+/// A completion's durable result and its optional completion-owned successor.
+/// No task is returned for duplicates or rejected commits; callers must not
+/// reload and substitute a newer pending task for this committed incarnation.
+#[derive(Clone, Debug)]
+pub struct WorkflowTaskCompletionOutcome {
+    /// Authoritative persistence outcome, including the exact committed image.
+    pub commit: CommitResult,
+    /// Successor started by this completion, exposed only after update processing.
+    pub workflow_task: Option<StartedWorkflowTask>,
+    /// Activities started by this completion, in scheduling command order.
+    pub activity_tasks: Vec<StartedActivityTask>,
+}
+
 /// A workflow task that has been polled and started.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StartedWorkflowTask {
@@ -1935,8 +1960,11 @@ pub struct StartedWorkflowTask {
     pub run_id: tokeira_types::RunId,
     /// Human-readable workflow identifier.
     pub workflow_id: tokeira_types::WorkflowId,
-    /// Task queue the task was dispatched on.
+    /// Execution's normal task queue, as carried by the poll response.
     pub task_queue: TaskQueueName,
+    /// Queue recorded by a virtual Scheduled event, which may be sticky. The
+    /// response's execution task queue above remains the run's normal queue.
+    pub scheduled_task_queue: TaskQueueName,
     /// started_event_id of the most recently completed
     /// workflow task.
     pub previous_started_event_id: i64,
@@ -2014,7 +2042,7 @@ pub struct ActivityTaskOffer {
 }
 
 /// An activity task that has been polled and started.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StartedActivityTask {
     /// Same-request recovery has the narrower public response of Temporal's
     /// duplicate-start branch (`recordactivitytaskstarted/api.go @ v1.31.0`).
@@ -2981,6 +3009,8 @@ pub(crate) mod tests {
             worker_deployment_name: None,
             sticky: None,
             commands: Vec::new(),
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),

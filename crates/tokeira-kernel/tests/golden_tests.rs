@@ -1052,6 +1052,8 @@ fn complete_wft_with_nexus_cancel(state: WorkflowState) -> Transition {
                 commands: vec![WorkflowCommand::CancelNexusOperation {
                     scheduled_event_id: 12,
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -1502,6 +1504,8 @@ fn sticky_completion_dispatches_next_wft_sticky_then_s2s_times_out() {
                     schedule_to_start_timeout: Duration::seconds(2),
                 }),
                 commands: vec![],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -1945,6 +1949,7 @@ fn replayed_close_keeps_pending_activities() {
             input: payloads("act"),
             header: None,
             request_eager_execution: false,
+            use_workflow_build_id: false,
             retry_policy: None,
             deployment: None,
             build_id: None,
@@ -2753,6 +2758,8 @@ fn wft_completed_paused_workflow_no_force_wft() {
                 worker_deployment_name: None,
                 sticky: None,
                 commands: vec![],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: true,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -2794,6 +2801,8 @@ fn wft_completion_tracks_previous_started_event_id() {
                 worker_deployment_name: None,
                 sticky: None,
                 commands: vec![],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -3406,6 +3415,7 @@ fn workflow_task_completed_with_activity_and_timer() {
                         input: payloads("act"),
                         header: None,
                         request_eager_execution: false,
+                        use_workflow_build_id: false,
                         retry_policy: None,
                         deployment: None,
                         build_id: None,
@@ -3420,6 +3430,8 @@ fn workflow_task_completed_with_activity_and_timer() {
                         fire_at: now() + Duration::seconds(45),
                     },
                 ],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -3497,6 +3509,8 @@ fn workflow_task_completed_with_complete_workflow() {
                 commands: vec![WorkflowCommand::CompleteWorkflow {
                     result: payloads("done"),
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -3545,6 +3559,8 @@ fn workflow_task_completed_with_fail_workflow() {
                 commands: vec![WorkflowCommand::FailWorkflow {
                     failure: payload("nope"),
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -3632,6 +3648,8 @@ fn continue_as_new_closes_run() {
                 worker_deployment_name: None,
                 sticky: None,
                 commands: vec![command.clone()],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -3707,6 +3725,8 @@ fn continue_as_new_then_another_command() {
                     make_continue_as_new_command(),
                     WorkflowCommand::RequestNewWorkflowTask,
                 ],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -3883,6 +3903,8 @@ fn fail_workflow_with_retry_policy() {
                 commands: vec![WorkflowCommand::FailWorkflow {
                     failure: payload("nope"),
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -3932,6 +3954,8 @@ fn fail_workflow_without_retry_policy() {
                 commands: vec![WorkflowCommand::FailWorkflow {
                     failure: payload("nope"),
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -4505,6 +4529,8 @@ fn reject_wft_completed_no_pending() {
                 worker_deployment_name: None,
                 sticky: None,
                 commands: vec![],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -4542,6 +4568,8 @@ fn reject_wft_completed_not_started() {
                 worker_deployment_name: None,
                 sticky: None,
                 commands: vec![],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -4580,6 +4608,8 @@ fn reject_wft_completed_seq_mismatch() {
                 worker_deployment_name: None,
                 sticky: None,
                 commands: vec![],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -4621,6 +4651,8 @@ fn reject_wft_completed_token_mismatch() {
                 worker_deployment_name: None,
                 sticky: None,
                 commands: vec![],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -4701,6 +4733,7 @@ fn reject_duplicate_activity_id() {
                     input: payloads("a"),
                     header: None,
                     request_eager_execution: false,
+                    use_workflow_build_id: false,
                     retry_policy: None,
                     deployment: None,
                     build_id: None,
@@ -4710,6 +4743,8 @@ fn reject_duplicate_activity_id() {
                     heartbeat_timeout: None,
                     priority: None,
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -4760,6 +4795,8 @@ fn reject_duplicate_timer_id() {
                     timer_id: "dup".into(),
                     fire_at: now()
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -5090,6 +5127,8 @@ fn reject_commands_after_close() {
                     },
                     WorkflowCommand::RequestNewWorkflowTask,
                 ],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -5128,6 +5167,8 @@ fn cancel_workflow_command() {
                 worker_deployment_name: None,
                 sticky: None,
                 commands: vec![WorkflowCommand::CancelWorkflow { details: None }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -5184,6 +5225,8 @@ fn cancel_workflow_then_another_command() {
                     WorkflowCommand::CancelWorkflow { details: None },
                     WorkflowCommand::RequestNewWorkflowTask,
                 ],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -5224,6 +5267,8 @@ fn request_cancel_activity() {
                 commands: vec![WorkflowCommand::RequestCancelActivity {
                     scheduled_event_id: 7,
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -5284,6 +5329,8 @@ fn request_cancel_activity_started_sets_durable_cancel_requested() {
                 commands: vec![WorkflowCommand::RequestCancelActivity {
                     scheduled_event_id: 7,
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -5340,6 +5387,8 @@ fn request_cancel_activity_unknown() {
             commands: vec![WorkflowCommand::RequestCancelActivity {
                 scheduled_event_id: 999,
             }],
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
@@ -5408,6 +5457,8 @@ fn close_command_with_buffered_events_is_unhandled_command() {
             commands: vec![WorkflowCommand::CompleteWorkflow {
                 result: payloads("done"),
             }],
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
@@ -5451,6 +5502,8 @@ fn cancel_timer() {
                 commands: vec![WorkflowCommand::CancelTimer {
                     timer_id: "timer-1".into(),
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -5499,6 +5552,8 @@ fn cancel_timer_unknown() {
             commands: vec![WorkflowCommand::CancelTimer {
                 timer_id: "missing".into(),
             }],
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
@@ -5557,6 +5612,8 @@ fn record_marker_missing_name_fails_wft() {
                 failure: None,
                 header: None,
             }],
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
@@ -5642,6 +5699,8 @@ fn workflow_property_and_search_attribute_patches_record_merge_and_replay() {
                     WorkflowCommand::UpsertMemoPatch(memo_patch.clone()),
                     WorkflowCommand::UpsertSearchAttributesPatch(search_patch.clone()),
                 ],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -5725,6 +5784,8 @@ fn invalid_search_attribute_uses_bad_search_attributes_failure_cause() {
                 message: "Namespace default has no mapping defined for search attribute INVALIDKEY"
                     .into(),
             }],
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
@@ -5798,6 +5859,8 @@ fn transient_completion_materializes_scheduled_started_with_task_times() {
                 worker_deployment_name: None,
                 sticky: None,
                 commands: vec![],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -5905,6 +5968,8 @@ fn cancel_timer_fired_and_buffered_deletes_buffered_fired_event() {
                 commands: vec![WorkflowCommand::CancelTimer {
                     timer_id: "timer-1".into(),
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -5957,6 +6022,8 @@ fn request_cancel_activity_then_resolved_canceled() {
                 commands: vec![WorkflowCommand::RequestCancelActivity {
                     scheduled_event_id: 7,
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -6068,6 +6135,8 @@ fn cancel_then_cancel_workflow_e2e() {
                 worker_deployment_name: None,
                 sticky: None,
                 commands: vec![WorkflowCommand::CancelWorkflow { details: None }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -6268,6 +6337,8 @@ fn start_child_workflow_happy_path() {
                     reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
                     priority: None,
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -6441,6 +6512,8 @@ fn signal_external_workflow_happy_path() {
                     header: None,
                     control: "ctl".into(),
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -6521,6 +6594,8 @@ fn request_cancel_external_workflow_happy_path() {
                     target_run_id: Some(RunId::new()),
                     control: "ctl".into(),
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -6765,6 +6840,8 @@ fn update_completed_happy_path() {
                     update_id: "update-1".into(),
                     result: payloads("done"),
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -6822,6 +6899,8 @@ fn update_rejected_happy_path() {
                     update_id: "update-1".into(),
                     failure: payload("nope"),
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -6877,6 +6956,8 @@ fn update_completed_unknown_update() {
                     update_id: "missing".into(),
                     result: payloads("done"),
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -6919,6 +7000,8 @@ fn update_rejected_unknown_update_is_tolerated() {
                     update_id: "missing".into(),
                     failure: payload("nope"),
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -6974,6 +7057,8 @@ fn protocol_message_accepted_body() {
                         sequencing_event_id: 1,
                     },
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -7030,6 +7115,8 @@ fn protocol_message_completed_body() {
                         failure: None,
                     },
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -7089,6 +7176,8 @@ fn protocol_message_rejected_body() {
                         failure: payload("nope"),
                     },
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -7156,6 +7245,8 @@ fn complete_workflow_clears_pending_updates() {
                 commands: vec![WorkflowCommand::CompleteWorkflow {
                     result: payloads("done"),
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -7202,6 +7293,8 @@ fn record_marker_happy_path() {
                     failure: Some(payload("failure")),
                     header: header.clone(),
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -7265,6 +7358,8 @@ fn record_marker_after_close_rejected() {
                         header: None,
                     },
                 ],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -7596,6 +7691,8 @@ fn close_via_wft(state: WorkflowState, commands: Vec<WorkflowCommand>) -> Transi
                 worker_deployment_name: None,
                 sticky: None,
                 commands,
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -7896,6 +7993,8 @@ fn schedule_nexus_operation_happy_path() {
                     schedule_to_start_timeout: None,
                     start_to_close_timeout: None,
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -7960,6 +8059,8 @@ fn schedule_nexus_operation_duplicate_rejected() {
                     schedule_to_start_timeout: None,
                     start_to_close_timeout: None,
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -8002,6 +8103,8 @@ fn cancel_nexus_operation_happy_path() {
                 commands: vec![WorkflowCommand::CancelNexusOperation {
                     scheduled_event_id: 12,
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -8281,6 +8384,8 @@ fn cancel_nexus_operation_unknown() {
                 commands: vec![WorkflowCommand::CancelNexusOperation {
                     scheduled_event_id: 12,
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -8853,6 +8958,8 @@ fn close_via_complete_clears_pending_nexus_operations() {
                 commands: vec![WorkflowCommand::CompleteWorkflow {
                     result: payloads("done"),
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -9116,6 +9223,8 @@ fn speculative_completion_request(
         worker_deployment_name: None,
         sticky: None,
         commands,
+        eager_activities: Default::default(),
+        inline_workflow_task: None,
         force_new_workflow_task: false,
         limits: Default::default(),
         delivered_update_ids: Vec::new(),
@@ -9197,7 +9306,7 @@ fn speculative_rejection_only_completion_drops_without_trace() {
     ));
 
     // K7 follow-up: a second update admitted while the task ran keeps a
-    // delivery vehicle — the drop schedules a fresh speculative task.
+    // delivery vehicle; without return-new the successor is Normal.
     let with_second = admit_update(started.clone(), "update-2");
     let dropped = kernel()
         .apply(
@@ -9214,21 +9323,21 @@ fn speculative_rejection_only_completion_drops_without_trace() {
             )),
         )
         .unwrap();
-    assert!(dropped.history_events.is_empty());
-    assert_eq!(dropped.next_state.last_event_id, 4);
+    assert_eq!(dropped.history_events.len(), 1);
+    assert_eq!(dropped.next_state.last_event_id, 5);
     let follow_up = dropped.next_state.pending_workflow_task.as_ref().unwrap();
     assert_eq!(
         follow_up.task_type,
-        tokeira_kernel::WorkflowTaskType::Speculative
+        tokeira_kernel::WorkflowTaskType::Normal
     );
     assert_eq!(follow_up.scheduled_event_id, 5);
     assert!(dropped.next_state.admitted_updates.contains("update-2"));
     // The drop still rolls back (M.1) and, because another update remains
-    // admitted, schedules a fresh speculative follow-up (K7).
+    // admitted, schedules a fresh Normal follow-up (K7).
     assert!(dropped.dispatch_ops.iter().any(|op| matches!(
         op,
         DispatchOp::EnqueueWorkflowTask {
-            speculative: true,
+            speculative: false,
             ..
         }
     )));
@@ -10546,4 +10655,444 @@ proptest::proptest! {
             proptest::prop_assert_eq!(actual, expected);
         }
     }
+}
+
+#[test]
+fn completion_without_return_converts_update_only_followup_to_normal() {
+    let state = admit_update(make_open_state_with_started_wft(), "new-update");
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(speculative_completion_request(&state, Vec::new())),
+        )
+        .unwrap();
+    assert_eq!(
+        transition
+            .next_state
+            .pending_workflow_task
+            .unwrap()
+            .task_type,
+        tokeira_kernel::WorkflowTaskType::Normal,
+        "ReturnNewWorkflowTask=false cannot bypass task generation"
+    );
+}
+
+#[test]
+fn completion_inline_stamp_gate_and_start_operands() {
+    for assigned in [None, Some(""), Some("assigned")] {
+        for use_versioning in [false, true] {
+            for build in ["assigned", "different"] {
+                for speculative in [false, true] {
+                    let mut state = make_open_state_with_started_wft();
+                    state.build_id = assigned.map(|id| tokeira_types::BuildId(id.into()));
+                    if speculative {
+                        state = admit_update(state, "new");
+                    }
+                    let mut request = speculative_completion_request(&state, Vec::new());
+                    request.force_new_workflow_task = !speculative;
+                    request.worker_version = Some(WorkflowTaskWorkerVersion {
+                        binary_checksum: String::new(),
+                        stamp: Some(WorkerVersionStamp {
+                            build_id: build.into(),
+                            use_versioning,
+                        }),
+                    });
+                    request.inline_workflow_task =
+                        Some(tokeira_kernel::CompletionWorkflowTaskStart {
+                            scope: None,
+                            history_size_bytes: 123,
+                            advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
+                        });
+                    let completed = kernel()
+                        .apply(
+                            LoadedRun::Existing(state),
+                            Command::WorkflowTaskCompleted(request),
+                        )
+                        .unwrap();
+                    let pending = completed.next_state.pending_workflow_task.as_ref().unwrap();
+                    let bypass = speculative
+                        || !use_versioning
+                        || assigned.is_none_or(|id| id.is_empty() || id == build);
+                    assert_eq!(pending.started_event_id.is_some(), bypass);
+                    assert_eq!(
+                        completed
+                            .next_state
+                            .build_id
+                            .as_ref()
+                            .map(|id| id.0.as_str()),
+                        assigned
+                    );
+                    if bypass {
+                        assert_eq!(pending.advice.history_size_bytes, 123);
+                        assert!(
+                            !completed
+                                .dispatch_ops
+                                .iter()
+                                .any(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. }))
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn completion_inline_cancellation_requires_normal_followup() {
+    let state = with_pending_activity_started_wft();
+    let mut request = speculative_completion_request(
+        &state,
+        vec![WorkflowCommand::RequestCancelActivity {
+            scheduled_event_id: 7,
+        }],
+    );
+    request.inline_workflow_task = Some(tokeira_kernel::CompletionWorkflowTaskStart {
+        scope: None,
+        history_size_bytes: 0,
+        advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
+    });
+    let completed = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::WorkflowTaskCompleted(request),
+        )
+        .unwrap();
+    let pending = completed.next_state.pending_workflow_task.unwrap();
+    assert_eq!(pending.task_type, tokeira_kernel::WorkflowTaskType::Normal);
+    assert!(pending.started_event_id.is_some());
+    assert!(
+        !completed
+            .dispatch_ops
+            .iter()
+            .any(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. }))
+    );
+}
+
+#[test]
+fn completion_inline_speculative_materialization_uses_pre_completion_queue() {
+    for set_sticky in [false, true] {
+        let state = admit_update(make_open_state_with_started_wft(), "new");
+        let mut request = speculative_completion_request(&state, Vec::new());
+        request.sticky = Some(tokeira_kernel::StickySpec {
+            queue: TaskQueueName("old-cache".into()),
+            schedule_to_start_timeout: Duration::seconds(5),
+        });
+        request.inline_workflow_task = Some(tokeira_kernel::CompletionWorkflowTaskStart {
+            scope: None,
+            history_size_bytes: 0,
+            advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
+        });
+        let state = kernel()
+            .apply(
+                LoadedRun::Existing(state),
+                Command::WorkflowTaskCompleted(request),
+            )
+            .unwrap()
+            .next_state;
+        let mut request = speculative_completion_request(
+            &state,
+            vec![WorkflowCommand::CompleteWorkflow {
+                result: Payloads::default(),
+            }],
+        );
+        request.sticky = set_sticky.then(|| tokeira_kernel::StickySpec {
+            queue: TaskQueueName("new-cache".into()),
+            schedule_to_start_timeout: Duration::seconds(5),
+        });
+        let completed = kernel()
+            .apply(
+                LoadedRun::Existing(state),
+                Command::WorkflowTaskCompleted(request),
+            )
+            .unwrap();
+        let queue = completed
+            .history_events
+            .iter()
+            .find_map(|event| match &event.kind {
+                HistoryEventKind::WorkflowTaskScheduled { task_queue, .. } => Some(task_queue),
+                _ => None,
+            })
+            .expect("materialized schedule");
+        assert_eq!(queue, &TaskQueueName("old-cache".into()));
+    }
+}
+
+#[test]
+fn completion_with_ongoing_deployment_transition_schedules_normal_followup() {
+    let mut state = make_open_state_with_started_wft();
+    state
+        .start_version_transition(
+            WorkerDeploymentVersionRef {
+                deployment_name: "workers".into(),
+                build_id: "next".into(),
+            },
+            1,
+        )
+        .unwrap();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(speculative_completion_request(&state, Vec::new())),
+        )
+        .unwrap();
+    assert!(
+        transition.next_state.pending_workflow_task.is_some(),
+        "an ongoing deployment transition requires a normal follow-up"
+    );
+}
+
+#[test]
+fn completion_inline_drop_with_transition_schedules_normal_successor() {
+    let state = admit_update(make_quiescent_state_after_first_wft(), "update");
+    let mut state = start_pending_task(state).next_state;
+    state
+        .start_version_transition(
+            WorkerDeploymentVersionRef {
+                deployment_name: "workers".into(),
+                build_id: "next".into(),
+            },
+            1,
+        )
+        .unwrap();
+    let mut request = speculative_completion_request(
+        &state,
+        vec![WorkflowCommand::ProtocolMessage {
+            message_id: "reject".into(),
+            body: UpdateProtocolBody::Rejected {
+                update_id: "update".into(),
+                failure: payload("reject"),
+            },
+        }],
+    );
+    request.inline_workflow_task = Some(tokeira_kernel::CompletionWorkflowTaskStart {
+        scope: None,
+        history_size_bytes: 0,
+        advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
+    });
+    let completed = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::WorkflowTaskCompleted(request),
+        )
+        .unwrap();
+    let pending = completed
+        .next_state
+        .pending_workflow_task
+        .expect("transition still needs a successor after speculative drop");
+    assert_eq!(pending.task_type, tokeira_kernel::WorkflowTaskType::Normal);
+    assert!(pending.started_event_id.is_none());
+}
+
+fn eager_command(id: &str, eager: bool, compatible: bool, retry: bool) -> WorkflowCommand {
+    WorkflowCommand::ScheduleActivity {
+        activity_id: id.into(),
+        activity_type: "eager-type".into(),
+        task_queue: TaskQueueName("activities".into()),
+        input: Payloads::default(),
+        header: None,
+        request_eager_execution: eager,
+        use_workflow_build_id: compatible,
+        retry_policy: retry.then(|| tokeira_types::RetryPolicy {
+            initial_interval: Duration::ZERO,
+            backoff_coefficient: 1.0,
+            maximum_interval: None,
+            maximum_attempts: 3,
+            non_retryable_error_types: Vec::new(),
+        }),
+        deployment: None,
+        build_id: None,
+        schedule_to_close_timeout: Some(Duration::minutes(5)),
+        schedule_to_start_timeout: None,
+        start_to_close_timeout: Some(Duration::minutes(1)),
+        heartbeat_timeout: Some(Duration::seconds(10)),
+        priority: None,
+    }
+}
+
+// Independent oracle: command intent, configured policy, versioning and final
+// survival determine the eager set; rows/offers must have no enqueue source.
+fn eager_completion_case(
+    enabled: bool,
+    version: u8,
+    compatible: bool,
+    paused: bool,
+    ending: u8,
+    retry: bool,
+    count: usize,
+) {
+    let mut state = make_open_state_with_started_wft();
+    if paused {
+        state.status = tokeira_types::ExecutionStatus::Paused;
+    }
+    if version == 2 {
+        state.build_id = Some(tokeira_types::BuildId("assigned".into()));
+    }
+    if version == 3 {
+        state.deployment = Some(tokeira_types::DeploymentId("deployment".into()));
+        state.build_id = Some(tokeira_types::BuildId("worker".into()));
+    }
+    let mut commands: Vec<_> = (0..count)
+        .map(|i| eager_command(&format!("eager-{i}"), true, compatible, retry))
+        .collect();
+    commands.push(eager_command("ordinary", false, false, retry));
+    if ending == 1 {
+        commands.push(WorkflowCommand::RequestCancelActivity {
+            scheduled_event_id: state.last_event_id + 2,
+        });
+    }
+    if ending == 2 {
+        commands.push(WorkflowCommand::CompleteWorkflow {
+            result: Payloads::default(),
+        });
+    }
+    let mut request = speculative_completion_request(&state, commands);
+    request.eager_activities.enabled = enabled;
+    for i in 0..count {
+        request.eager_activities.request_ids.insert(
+            format!("eager-{i}"),
+            tokeira_types::Uuid::from_u128(i as u128 + 1),
+        );
+    }
+    if version == 1 || version == 3 {
+        request.worker_version = Some(WorkflowTaskWorkerVersion {
+            binary_checksum: String::new(),
+            stamp: Some(WorkerVersionStamp {
+                build_id: "worker".into(),
+                use_versioning: true,
+            }),
+        });
+    }
+    if version == 3 {
+        request.versioning_behavior = tokeira_kernel::VersioningBehavior::Pinned;
+        request.deployment_version = Some(tokeira_kernel::WorkerDeploymentVersionRef {
+            deployment_name: "deployment".into(),
+            build_id: "worker".into(),
+        });
+    }
+    let now = request.now;
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(request),
+        )
+        .unwrap();
+    let expected =
+        enabled && !paused && ending != 2 && (version == 0 || version == 3 || compatible);
+    for i in 0..count {
+        let id = format!("eager-{i}");
+        let started = expected && !(ending == 1 && i == 0);
+        let activity = transition.next_state.activities.get(&id);
+        assert_eq!(activity.is_some_and(|a| a.started_at.is_some()), started);
+        let enqueued = transition.dispatch_ops.iter().any(|op| matches!(op, tokeira_kernel::DispatchOp::EnqueueActivityTask { activity_id, .. } if *activity_id == id));
+        if activity.is_some() && ending != 2 {
+            assert_eq!(enqueued, !paused && !started);
+        }
+        if started || paused {
+            assert!(!enqueued);
+        }
+        if started {
+            let activity = activity.unwrap();
+            let receipt = &transition.next_state.activity_start_receipts[&id];
+            assert_eq!(
+                receipt.request_id,
+                tokeira_types::Uuid::from_u128(i as u128 + 1)
+            );
+            assert_eq!(receipt.offered_stamp, 0);
+            assert_eq!(receipt.attempt, 1);
+            assert_eq!(activity.stamp, 1);
+            assert_eq!(activity.started_at, Some(now));
+            assert_eq!(
+                activity.started_identity.as_ref(),
+                Some(&receipt.worker_identity)
+            );
+            assert_eq!(receipt.schedule_event_id, activity.schedule_event_id);
+            assert_eq!(receipt.selected_queue.task_queue.0, "activities");
+            let persisted = transition.history_events.iter().any(|event| matches!(&event.kind, HistoryEventKind::ActivityTaskStarted { activity_id, .. } if activity_id == &id));
+            assert_eq!(persisted, !retry);
+        }
+    }
+    assert_eq!(
+        transition.next_state.transition_seq.0,
+        state.transition_seq.0 + 1
+    );
+}
+
+#[test]
+fn completion_eager_eligibility_and_survival_matrix() {
+    for version in 0..4 {
+        for compatible in [false, true] {
+            for paused in [false, true] {
+                for ending in 0..3 {
+                    eager_completion_case(true, version, compatible, paused, ending, true, 5);
+                }
+            }
+        }
+    }
+    eager_completion_case(false, 0, false, false, 0, false, 5);
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config::with_cases(100))]
+    // Feature: activity-dispatch, Property 7
+    // Feature: activity-dispatch, Property 12
+    // Feature: edge-eager-dispatch, Property 8
+    // Feature: edge-eager-dispatch, Property 9
+    // Feature: edge-eager-dispatch, Property 12
+    #[test]
+    fn completion_eager_atomic_eligibility_properties(
+        enabled in proptest::prelude::any::<bool>(), version in 0u8..4,
+        compatible in proptest::prelude::any::<bool>(), paused in proptest::prelude::any::<bool>(),
+        ending in 0u8..3, retry in proptest::prelude::any::<bool>(), count in 1usize..9,
+    ) {
+        eager_completion_case(enabled, version, compatible, paused, ending, retry, count);
+    }
+}
+
+#[test]
+fn completion_inline_deployment_routing_build_is_not_assigned_build() {
+    let mut state = make_open_state_with_started_wft();
+    state.deployment = Some(tokeira_types::DeploymentId("deployment".into()));
+    state.build_id = Some(tokeira_types::BuildId("routing-build".into()));
+    let mut request = speculative_completion_request(&state, Vec::new());
+    request.force_new_workflow_task = true;
+    request.worker_version = Some(WorkflowTaskWorkerVersion {
+        binary_checksum: String::new(),
+        stamp: Some(WorkerVersionStamp {
+            build_id: "different".into(),
+            use_versioning: true,
+        }),
+    });
+    request.inline_workflow_task = Some(tokeira_kernel::CompletionWorkflowTaskStart {
+        scope: None,
+        history_size_bytes: 0,
+        advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
+    });
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::WorkflowTaskCompleted(request),
+        )
+        .unwrap();
+    assert!(
+        transition
+            .next_state
+            .pending_workflow_task
+            .unwrap()
+            .started_event_id
+            .is_some()
+    );
+}
+
+#[test]
+fn legacy_schedule_command_defaults_use_workflow_build_id() {
+    let command = eager_command("a", true, false, false);
+    let mut encoded = serde_json::to_value(&command).unwrap();
+    encoded["ScheduleActivity"]
+        .as_object_mut()
+        .unwrap()
+        .remove("use_workflow_build_id");
+    assert_eq!(
+        serde_json::from_value::<WorkflowCommand>(encoded).unwrap(),
+        command
+    );
 }

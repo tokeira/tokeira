@@ -5337,6 +5337,7 @@ mod tests {
         let run_key = RunKey::new();
         let now = OffsetDateTime::now_utc();
         StartedWorkflowTask {
+            scheduled_task_queue: queue.task_queue.clone(),
             run_key,
             run_id: tokeira_types::RunId::new(),
             workflow_id: tokeira_types::WorkflowId("reserved-start".into()),

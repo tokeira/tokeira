@@ -1,7 +1,7 @@
 //! Activity-task lifecycle methods of [`TokeiraRuntime`].
 //!
 //! This `impl` continuation owns the worker-facing activity-task surface:
-//! long-poll / eager-claim delivery, the atomic poll→Started transition, and
+//! ordinary local and forwarded delivery, the atomic poll→Started transition, and
 //! the completion / failure / cancel / heartbeat resolutions that feed an
 //! activity outcome back into its owning run. Every mutating path applies a
 //! kernel command on the run's owned shard via
@@ -44,21 +44,17 @@ use tokeira_observability::OutcomeLabel;
 use tokeira_types::{TaskKind, WorkerTaskClass, WorkerTaskOrigin};
 use tracing::Instrument as _;
 
-/// An activity's input and header, which live only in its ActivityTaskScheduled
-/// event (`activity-inputs-from-history`).
-type ScheduledInput = (Payloads, Option<Headers>);
-
 #[derive(Clone, Debug)]
-struct ActivitySchedule {
-    input: Payloads,
-    header: Option<Headers>,
-    scheduled_time: OffsetDateTime,
-    schedule_to_close_timeout: Option<Duration>,
-    start_to_close_timeout: Option<Duration>,
-    heartbeat_timeout: Option<Duration>,
+pub(super) struct ActivitySchedule {
+    pub(super) input: Payloads,
+    pub(super) header: Option<Headers>,
+    pub(super) scheduled_time: OffsetDateTime,
+    pub(super) schedule_to_close_timeout: Option<Duration>,
+    pub(super) start_to_close_timeout: Option<Duration>,
+    pub(super) heartbeat_timeout: Option<Duration>,
 }
 
-fn activity_start_response(
+pub(super) fn activity_start_response(
     state: &WorkflowState,
     activity: &tokeira_kernel::ActivityState,
     task: &DispatchableActivityTask,
@@ -401,7 +397,6 @@ where
             offer.request_id,
             offer.entered_at,
             &worker_identity,
-            None,
         )
         .await
     }
@@ -418,7 +413,6 @@ where
             request.request_id,
             tokio::time::Instant::now(),
             &request.worker,
-            None,
         )
         .await
     }
@@ -479,48 +473,6 @@ where
             now,
             rule_id: Some(rule_id),
         })))
-    }
-
-    /// Start a just-committed schedule directly on its execution owner.
-    ///
-    /// `schedule_event_id`, `input` and `header` must come from the same successful
-    /// workflow-task completion. The event identity prevents an old completion
-    /// callback from supplying payloads to a replacement using the same activity ID.
-    /// An ordinary poll may win first; the common fenced start then returns no task.
-    #[allow(clippy::too_many_arguments)] // The completion carries one exact schedule and its payload.
-    pub async fn try_claim_activity_task(
-        &self,
-        queue: QueueKey,
-        run_key: RunKey,
-        activity_id: String,
-        schedule_event_id: i64,
-        worker_identity: WorkerIdentity,
-        input: Payloads,
-        header: Option<Headers>,
-    ) -> Result<Option<StartedActivityTask>> {
-        self.ready().await?;
-        let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
-            return Ok(None);
-        };
-        let Some(activity) = state.activities.get(&activity_id) else {
-            return Ok(None);
-        };
-        if activity.schedule_event_id != schedule_event_id
-            || activity.attempt != 1
-            || activity.stamp != 0
-        {
-            return Ok(None);
-        }
-        let mut task = activity_dispatch_task(run_key, &state, activity);
-        task.queue = queue;
-        self.start_activity_task(
-            &task,
-            Uuid::new_v4(),
-            tokio::time::Instant::now(),
-            &worker_identity,
-            Some((input, header)),
-        )
-        .await
     }
 
     /// Record a successful activity completion and
@@ -1322,23 +1274,20 @@ where
     /// returns a retryable owner error. The same request can retry, and canonical
     /// discovery recovers the work if that poll ends.
     ///
-    /// The task's input and header are `scheduled` when the caller has them, as
-    /// an eager start does; otherwise the start reads them from the activity's
-    /// ActivityTaskScheduled event.
+    /// The input and header come from the immutable ActivityTaskScheduled event.
     async fn start_activity_task(
         &self,
         task: &DispatchableActivityTask,
         request_id: Uuid,
         entered_at: tokio::time::Instant,
         worker_identity: &WorkerIdentity,
-        scheduled: Option<ScheduledInput>,
     ) -> Result<Option<StartedActivityTask>> {
-        self.start_activity_task_traced(task, request_id, entered_at, worker_identity, scheduled)
+        self.start_activity_task_traced(task, request_id, entered_at, worker_identity)
             .await
             .map(ActivityStartOutcome::into_task)
     }
 
-    // Local eager claims and forwarded owner starts share the same span boundary:
+    // Local polls and forwarded owner starts share the same span boundary:
     // changing placement must not remove host-owned activity processing telemetry.
     async fn start_activity_task_traced(
         &self,
@@ -1346,7 +1295,6 @@ where
         request_id: Uuid,
         entered_at: tokio::time::Instant,
         worker_identity: &WorkerIdentity,
-        scheduled: Option<ScheduledInput>,
     ) -> Result<ActivityStartOutcome> {
         let span = tracing::info_span!(
             "activity_task.process",
@@ -1360,17 +1308,12 @@ where
             tokeira.attempt = i64::from(task.attempt),
         );
         // Owner processing retains whole run images across awaits. Keeping its
-        // future on the heap prevents eager/poll/forwarding wrappers from
+        // future on the heap prevents poll/forwarding wrappers from
         // multiplying that state on the caller's stack in unoptimized builds.
-        let result = Box::pin(self.start_activity_task_inner(
-            task,
-            request_id,
-            entered_at,
-            worker_identity,
-            scheduled,
-        ))
-        .instrument(span.clone())
-        .await;
+        let result =
+            Box::pin(self.start_activity_task_inner(task, request_id, entered_at, worker_identity))
+                .instrument(span.clone())
+                .await;
         if let Ok(
             ActivityStartOutcome::Started(started) | ActivityStartOutcome::Replayed(started),
         ) = &result
@@ -1388,7 +1331,6 @@ where
         request_id: Uuid,
         entered_at: tokio::time::Instant,
         worker_identity: &WorkerIdentity,
-        eager: Option<ScheduledInput>,
     ) -> Result<ActivityStartOutcome> {
         ActivityTaskStartRequest {
             offered: task.clone(),
@@ -1533,9 +1475,9 @@ where
                 return Ok(ActivityStartOutcome::Stale);
             }
 
-            // All delivery shapes converge here: ordinary long-poll and eager claim both call
-            // `start_activity_task`. Reading durable rules immediately before Started avoids the
-            // frontend gate/poll-admission race and mirrors
+            // Ordinary local and forwarded polls evaluate rules immediately
+            // before Started. Completion-owned eager starts bypass this gate.
+            // Reading durable rules here avoids the frontend admission race and mirrors
             // `recordactivitytaskstarted/api.go:332-372 @ v1.31.0`. The
             // backoff interval is derived from durable state so a
             // `BackoffInterval` rule created after publication but before
@@ -1679,21 +1621,7 @@ where
             // event never changes, so a retry after a conflict keeps what the
             // first pass read.
             if scheduled.is_none() {
-                scheduled = Some(if let Some((input, header)) = eager.as_ref() {
-                    if current.attempt != 1 {
-                        return Ok(ActivityStartOutcome::Stale);
-                    }
-                    ActivitySchedule {
-                        input: input.clone(),
-                        header: header.clone(),
-                        scheduled_time: current.scheduled_at,
-                        schedule_to_close_timeout: current.schedule_to_close_timeout,
-                        start_to_close_timeout: current.start_to_close_timeout,
-                        heartbeat_timeout: current.heartbeat_timeout,
-                    }
-                } else {
-                    self.read_scheduled_input(task).await?
-                });
+                scheduled = Some(self.read_scheduled_input(task).await?);
             }
 
             let started = activity_start_response(
@@ -3170,7 +3098,6 @@ mod tests {
                 Uuid::new_v4(),
                 tokio::time::Instant::now(),
                 &WorkerIdentity("activity-worker".to_string()),
-                None,
             )
             .await
             .expect("activity poll should be evaluated");
@@ -3322,66 +3249,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_and_eager_starts_apply_the_same_rule_before_started() {
-        for eager in [false, true] {
-            let repo = Arc::new(InMemoryStore::default());
-            let runtime = TokeiraRuntime::new(
-                repo.clone(),
-                1,
-                LaneConfig::default(),
-                TimerScannerConfig::default(),
-                WorkflowTimeoutScannerConfig::default(),
-            );
-            let (state, queue, task) = seed_scheduled_activity(&runtime, &repo).await;
-            assert_eq!(
-                repo.create_workflow_rule(
-                    state.namespace_id,
-                    pause_rule("pause", "ActivityType = 'activity-type'"),
-                    10,
-                )
-                .await
-                .expect("store rule"),
-                WorkflowRuleCreateResult::Created,
-            );
+    async fn ordinary_starts_apply_rules_before_started() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+        );
+        let (state, queue, task) = seed_scheduled_activity(&runtime, &repo).await;
+        assert_eq!(
+            repo.create_workflow_rule(
+                state.namespace_id,
+                pause_rule("pause", "ActivityType = 'activity-type'"),
+                10,
+            )
+            .await
+            .expect("store rule"),
+            WorkflowRuleCreateResult::Created,
+        );
 
-            let started = if eager {
-                runtime
-                    .try_claim_activity_task(
-                        queue,
-                        task.run_key,
-                        task.activity_id.clone(),
-                        task.schedule_event_id,
-                        WorkerIdentity("worker".to_string()),
-                        Payloads::default(),
-                        None,
-                    )
-                    .await
-                    .expect("eager claim")
-            } else {
-                runtime
-                    .poll_activity_task(
-                        queue,
-                        WorkerIdentity("worker".to_string()),
-                        tokio::time::Duration::from_millis(100),
-                    )
-                    .await
-                    .expect("ordinary poll")
-            };
-            assert!(started.is_none());
-            let LoadedRun::Existing(after) = repo.load_run(task.run_key).await.unwrap() else {
-                panic!("seeded run should exist");
-            };
-            let pause = after.activities[&task.activity_id]
-                .pause_info
-                .as_ref()
-                .expect("rule must pause before Started");
-            assert_eq!(pause.rule_id.as_deref(), Some("pause"));
-            assert!(
-                after.activities[&task.activity_id]
-                    .started_event_id
-                    .is_none()
-            );
-        }
+        let started = runtime
+            .poll_activity_task(
+                queue,
+                WorkerIdentity("worker".into()),
+                tokio::time::Duration::from_millis(100),
+            )
+            .await
+            .expect("ordinary poll");
+        assert!(started.is_none());
+        let LoadedRun::Existing(after) = repo.load_run(task.run_key).await.unwrap() else {
+            panic!("seeded run should exist");
+        };
+        let pause = after.activities[&task.activity_id]
+            .pause_info
+            .as_ref()
+            .expect("rule must pause before Started");
+        assert_eq!(pause.rule_id.as_deref(), Some("pause"));
+        assert!(
+            after.activities[&task.activity_id]
+                .started_event_id
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -4043,7 +3953,6 @@ mod tests {
                                 Uuid::new_v4(),
                                 tokio::time::Instant::now(),
                                 &WorkerIdentity("poller".into()),
-                                None,
                             )
                             .await
                             .unwrap()
@@ -5233,7 +5142,6 @@ mod tests {
                     Uuid::new_v4(),
                     tokio::time::Instant::now(),
                     &WorkerIdentity("poller".into()),
-                    None,
                 )
                 .await;
             assert!(
@@ -5241,35 +5149,6 @@ mod tests {
                 "refusal {refusal} answered {started:?}"
             );
         }
-    }
-
-    /// An eager start answers with the input and header of the command that
-    /// scheduled the activity, and reads nothing (criterion 2.2).
-    #[tokio::test]
-    async fn an_eager_start_answers_from_its_command() {
-        let repo = Arc::new(InMemoryStore::default());
-        let runtime = inputs_runtime(repo.clone());
-        let (_state, queue, task) =
-            seed_scheduled_activity_lacking_its_event(&runtime, &repo).await;
-        let input = payloads(b"from-the-command");
-        let header = Some(Headers(BTreeMap::from([(
-            "trace".to_string(),
-            payload(b"command"),
-        )])));
-        let started = runtime
-            .try_claim_activity_task(
-                queue,
-                task.run_key,
-                task.activity_id.clone(),
-                task.schedule_event_id,
-                WorkerIdentity("worker".into()),
-                input.clone(),
-                header.clone(),
-            )
-            .await
-            .expect("an eager start reads no event")
-            .expect("claims the task");
-        assert_eq!((started.input, started.header), (input, header));
     }
 
     proptest! {

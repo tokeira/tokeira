@@ -399,6 +399,17 @@ pub struct RequestIdInfo {
 }
 
 impl WorkflowState {
+    /// Queue named in workflow-task history: the current sticky queue while
+    /// affinity is set, otherwise the execution's normal queue. Virtual events
+    /// and their later materialization must use the same routing rule
+    /// (`service/history/workflow/workflow_task_state_machine.go:768-770,941-943 @ v1.31.0`).
+    pub fn current_workflow_task_queue(&self) -> &TaskQueueName {
+        self.sticky
+            .as_ref()
+            .filter(|sticky| !sticky.sticky_queue.0.is_empty())
+            .map_or(&self.task_queue, |sticky| &sticky.sticky_queue)
+    }
+
     /// Returns `true` when the execution is still in progress
     /// (`Running` or `Paused`).
     pub fn is_open(&self) -> bool {
@@ -620,6 +631,18 @@ impl WorkflowState {
                 .unwrap_or(versions.len());
             versions.drain(..fits);
         }
+    }
+
+    /// Legacy assigned build, excluding the deployment/build routing pair.
+    ///
+    /// Start translation also stores deployment versions in `build_id`; those
+    /// carry `deployment` and are not Temporal's AssignedBuildId. Completion
+    /// version updates live in `versioning_info` and never assign this value
+    /// (`workflow_task_completed_handler.go:489-502 @ v1.31.0`).
+    pub fn assigned_build_id(&self) -> Option<&BuildId> {
+        self.build_id
+            .as_ref()
+            .filter(|id| self.deployment.is_none() && !id.0.is_empty())
     }
 
     /// Record the legacy worker stamp and its visibility-index values from a

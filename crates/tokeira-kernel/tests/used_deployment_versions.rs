@@ -236,6 +236,8 @@ impl Run {
                 sticky: None,
                 commands,
                 command_sizes: Vec::new(),
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
                 force_new_workflow_task: false,
                 limits: WorkflowTaskCompletionLimits {
                     search_attribute_value_size_limit: limit,

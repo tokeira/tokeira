@@ -280,6 +280,8 @@ fn completion(
         sticky: None,
         commands,
         command_sizes: Vec::new(),
+        eager_activities: Default::default(),
+        inline_workflow_task: None,
         force_new_workflow_task: false,
         limits: WorkflowTaskCompletionLimits {
             total_updates,
@@ -451,7 +453,7 @@ proptest! {
             finished
                 .pending_workflow_task
                 .as_ref()
-                .is_some_and(|task| task.task_type == WorkflowTaskType::Speculative),
+                .is_some_and(|task| task.task_type == WorkflowTaskType::Normal),
             undelivered
         );
         prop_assert_eq!(finished.pending_workflow_task.is_some(), undelivered);

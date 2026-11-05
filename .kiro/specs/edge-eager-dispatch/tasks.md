@@ -2,7 +2,7 @@
 
 ## Overview
 
-Tasks 1-5 record the original eager workflow/activity implementation. Tier 3.18 proved that the workflow-start half used the wrong contract: it required a live `PollerRegistry` entry and reclaimed a published task, while v1.31.0 atomically starts the first WFT for the requesting caller. Tasks 6-10 are the reviewed correction and supersede the workflow-start portions of tasks 1 and 3. The activity path remains unchanged.
+Tasks 1-5 record the original eager workflow/activity implementation. Tier 3.18 proved that the workflow-start half used the wrong contract: it required a live `PollerRegistry` entry and reclaimed a published task, while v1.31.0 atomically starts the first WFT for the requesting caller. Tasks 6-10 are the reviewed correction and supersede the workflow-start portions of tasks 1 and 3. Tasks 11–13 now supersede the activity claim/cap portions of tasks 1, 4 and 8.5: activities start in the completion transition, with no dispatch row or offer. Checked legacy tasks describe prior work, not the corrected contract.
 
 ## Tasks
 
@@ -83,14 +83,14 @@ Tasks 1-5 record the original eager workflow/activity implementation. Tier 3.18 
   - [x] 4.1 Add eager activity DTO fields and config
     - Add `activity_tasks: Vec<PollActivityTaskQueueResponse>` field to `RespondWorkflowTaskCompletedResponse` in `translate/mod.rs`
     - Thread `request_eager_execution: bool` through the `ScheduleActivityTask` command representation in the kernel
-    - Add `EagerDispatchConfig` with `max_eager_activity_tasks_per_response: usize` (default 3) to the edge layer config
+    - Superseded by task 11: typed default-off eager policy has no response-count limit.
     - Serialize `activity_tasks` in `completed_response_to_proto` using the existing `poll_activity_response_to_proto` path in `grpc/translate.rs`
     - _Requirements: 5.1, 5.2, 5.3, 7.3, 8.1, 8.2_
 
   - [x] 4.2 Implement eager activity dispatch in `respond_workflow_task_completed`
     - After the runtime commit in `respond_workflow_task_completed` in `workflow_service.rs`:
     - Collect eager-eligible activity commands (those with `request_eager_execution=true`)
-    - For each eligible command (up to `max_eager_activity_tasks_per_response`), call `self.activity_broker.try_claim_activity_task(&queue_key, run_key, &activity_id)` — targeted by the specific activity's identity
+    - Superseded by task 12: start eligible activities in the completion transition.
     - For each claimed task, build a `PollActivityTaskQueueResponse` using `from_internal::poll_activity_response`
     - Attach the list to the response's `activity_tasks` field
     - _Requirements: 5.1, 5.2, 6.1, 6.2, 6.3, 6.4, 6.5, 7.1, 7.2, 12.2, 12.3_
@@ -188,9 +188,46 @@ Tasks 1-5 record the original eager workflow/activity implementation. Tier 3.18 
   - [x] 10.2 Run `TestEagerWorkflowTestSuite` to 5 pass / 0 fail / 1 classified skip three consecutive times
   - [x] 10.3 Re-run the earlier workflow-start, WFT-timeout, retry, conflict-policy, history, and activity cohorts
 
+- [x] 11. Prepare completion-inline policy and response operands
+  - First run the three baseline reproductions from activity-dispatch 15.1,
+    api-conformance-wft-completion 6.1 and transient-wft C.2; retain their failures
+    before any production policy or start-path changes.
+  - Preserve `use_workflow_build_id`; clear eager flags for the four excluded Python
+    versions and parseable TypeScript below 1.4.4 using the actual SDK headers.
+  - Add `policy.compatibility.enable_activity_eager_execution=false`, thread it to
+    runtime/server assembly, and wire the per-test bool override. No namespace knob.
+  - Preflight actual optional worker origins before selecting inline work; preserve
+    provenance-before-token exposure and response-size admission.
+  - _Requirements: 5.1–5.4, 7.1–7.4, 10.5, 12.4_
+
+- [x] 12. Replace the activity claim and completion-inline WFT claim
+  - Depend on the reproductions in activity-dispatch task 15.1 and
+    api-conformance-wft-completion task 6.1 before changing production code.
+  - Return started tasks from the completion outcome; remove its
+    `try_claim_activity_task` use, `EagerDispatchConfig` and count-limited collection.
+    Replace the completion's `try_claim_workflow_task` with its committed result.
+  - Preserve transient activity history, retry metadata, full response translation,
+    incremental WFT history, query barriers, update attachments and scoped provenance.
+  - _Requirements: 6.1–6.6, 7.3–7.4, 8.1–8.2, 10.1–10.5, 11.1–11.3, 12.1–12.4_
+
+- [ ] 13. Verify the corrected completion paths
+  - Required PBTs: revised Properties 8, 9, 10, 11 and 12, at least 100 cases per
+    property with the existing feature tags. Keep broker-primitive coverage distinct
+    from completion correctness. Run activity-dispatch task 15's eligibility, lost
+    response, default-off and no-cap fixtures, including authorization failures.
+  - Confirm all three reproductions fail on `main` first and pass after the fix;
+    retain their negative controls. Have the orchestrator run the named workflow,
+    heartbeat, sticky and eager-activity corpus suites with the required overrides.
+  - Update classification data and regenerate/check configuration docs only with
+    implemented consult sites; run root §10.4 before the combined PR.
+  - _Requirements: 5.1–5.4, 6.1–6.6, 7.1–7.4, 8.1–8.2, 10.1–10.5, 11.1–11.3, 12.1–12.4_
+
 ## Task Dependency Graph
 
 ```text
+10 -> 11 -> 12 -> 13
+12 also depends on activity-dispatch 15.1 and api-conformance-wft-completion 6.1.
+
 6.1 ─┬─> 7.1 ─> 7.2 ─> 7.3 ─┐
 6.2 ─┘                        ├─> 8.2 ─> 8.3 ─> 8.4 ─> 9.2 ─> 10
              7.2 ─> 8.1 ─────┘              └─> 8.5 ────────┘

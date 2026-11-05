@@ -174,13 +174,13 @@ proptest! {
             if kind != 0 { prop_assert_eq!(inputs.header, header); }
             match outcome {
                 0 => {
-                    prop_assert!(matches!(result, Ok((CommitResult::Applied { .. }, _, _))), "applied close");
+                    prop_assert!(matches!(result, Ok((CommitResult::Applied { .. }, ..))), "applied close");
                     let Some(SuccessorEffect::Committed(actual)) = effect else { panic!("pair effects") };
                     prop_assert_eq!(actual.state, first.next_state.clone());
                     prop_assert_eq!(recorded.commit_calls, 0);
                 }
                 1 => {
-                    prop_assert!(matches!(result, Ok((CommitResult::Applied { .. }, _, _))), "applied close");
+                    prop_assert!(matches!(result, Ok((CommitResult::Applied { .. }, ..))), "applied close");
                     prop_assert!(effect.is_none());
                     let start = recorded.fallbacks.first().expect("persisted fallback start").clone();
                     let fallback = tokeira_kernel::BasicKernel.apply(LoadedRun::Absent, Command::Start(start)).unwrap();
@@ -191,7 +191,7 @@ proptest! {
                     prop_assert_eq!(recorded.commit_calls, 1);
                 }
                 _ => {
-                    prop_assert!(if outcome == 2 { matches!(result, Ok((CommitResult::Duplicate, _, _))) } else { result.is_err() }, "duplicate or rejected pair");
+                    prop_assert!(if outcome == 2 { matches!(result, Ok((CommitResult::Duplicate, ..))) } else { result.is_err() }, "duplicate or rejected pair");
                     prop_assert!(effect.is_none());
                     prop_assert_eq!(&recorded.loaded, &LoadedRun::Existing(state));
                     prop_assert_eq!(recorded.commit_calls, 0);

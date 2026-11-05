@@ -6648,13 +6648,15 @@
       "temporal_key": "system.enableActivityEagerExecution",
       "temporal_default": "false",
       "temporal_scope": "Namespace",
-      "classification": "pinned-behavioral-constant",
-      "tokeira_treatment": "No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog.",
+      "classification": "deployment-policy",
+      "tokeira_treatment": "Startup-static policy.compatibility.enable_activity_eager_execution, false by default, applies to every namespace. A per-test bool override takes precedence. Eligible activities start in the completion transition without a count cap.",
       "owner": ".kiro/specs/configuration-policy",
-      "conformance_override": "none",
+      "conformance_override": "wired",
       "evidence": [
         "common/dynamicconfig/constants.go:193",
-        ".kiro/specs/configuration-policy/requirements.md"
+        "crates/tokeira-config/src/lib.rs",
+        "crates/tokeira-runtime/src/runtime/workflow_task.rs",
+        ".kiro/specs/activity-dispatch/requirements.md"
       ]
     },
     {

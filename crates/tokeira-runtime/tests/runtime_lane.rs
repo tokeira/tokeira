@@ -76,6 +76,8 @@ async fn start_and_signal_publish_workflow_tasks() -> Result<()> {
             worker_deployment_name: None,
             sticky: None,
             commands: Vec::new(),
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
@@ -458,6 +460,8 @@ async fn cron_terminal_completion_authors_delayed_successor_run() -> Result<()> 
             commands: vec![WorkflowCommand::CompleteWorkflow {
                 result: Payloads::default(),
             }],
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
@@ -620,6 +624,8 @@ async fn restart_preserves_delayed_start_callbacks_and_versioning_route() -> Res
             commands: vec![WorkflowCommand::CompleteWorkflow {
                 result: Payloads::default(),
             }],
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
@@ -682,6 +688,8 @@ async fn restart_preserves_cron_state_before_terminal_successor() -> Result<()> 
             commands: vec![WorkflowCommand::CompleteWorkflow {
                 result: Payloads::default(),
             }],
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
@@ -783,6 +791,8 @@ async fn restart_preserves_wft_completion_routing_metadata() -> Result<()> {
                 schedule_to_start_timeout: Duration::seconds(60),
             }),
             commands: Vec::new(),
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
             force_new_workflow_task: true,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
@@ -1010,6 +1020,8 @@ async fn retryable_failure_starts_attempt_two_successor() -> Result<()> {
             commands: vec![WorkflowCommand::FailWorkflow {
                 failure: retryable_app_failure("BoomError"),
             }],
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
@@ -1108,6 +1120,8 @@ async fn non_retryable_failure_is_terminal_without_successor() -> Result<()> {
             commands: vec![WorkflowCommand::FailWorkflow {
                 failure: retryable_app_failure("FatalError"),
             }],
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),

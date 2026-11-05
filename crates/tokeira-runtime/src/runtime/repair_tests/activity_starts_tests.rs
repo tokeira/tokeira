@@ -246,18 +246,16 @@ proptest! {
                     assert!(matches!(runtime.start_forwarded_activity_task(competing).await.unwrap(), ActivityStartOutcome::Started(_)));
                 }
                 1 => {
-                    let task = &request.offered;
-                    let eager = runtime.try_claim_activity_task(task.queue.clone(), task.run_key, task.activity_id.clone(), task.schedule_event_id,
-                        WorkerIdentity("eager".into()), Payloads::default(), None).await.unwrap();
-                    assert!(eager.is_some());
+                    let mut competing = request.clone();
+                    competing.request_id = Uuid::new_v4();
+                    competing.worker = WorkerIdentity("competing".into());
+                    assert!(matches!(runtime.start_forwarded_activity_task(competing).await.unwrap(), ActivityStartOutcome::Started(_)));
                 }
                 2 => {
                     let mut replacement = state.clone();
                     replacement.activities.get_mut("activity-0").unwrap().schedule_event_id += replacement_delta;
                     write_state(&repo, replacement, Vec::new()).await;
-                    let task = &request.offered;
-                    assert!(runtime.try_claim_activity_task(task.queue.clone(), task.run_key, task.activity_id.clone(), task.schedule_event_id,
-                        WorkerIdentity("late-eager".into()), Payloads::default(), None).await.unwrap().is_none());
+                    assert!(matches!(runtime.start_forwarded_activity_task(request.clone()).await.unwrap(), ActivityStartOutcome::Stale));
                 }
                 3 => { transfer(&repo, epoch).await; }
                 _ => { write_state(&repo, state.clone(), Vec::new()).await; }

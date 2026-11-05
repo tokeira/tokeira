@@ -60,6 +60,39 @@ Complete `RespondWorkflowTaskCompleted` field handling and return-new-workflow-t
   - Run `cargo test -p tokeira-runtime`.
   - Run `cargo test -p tokeira-kernel`.
 
+- [ ] 6. Start completion-returned tasks atomically
+  - [x] 6.1 Before production edits, park worker B on the normal queue while worker A
+    completes with return-new enabled. Synchronize the old publisher/claim gap and
+    assert only A receives the new task, including a force-new local-activity
+    heartbeat with no sticky poll. Record failure on `main`; with return-new false,
+    B must receive ordinary work. Retain a negative control that restores the gap.
+  - [x] 6.2 Add explicit inline operands/results across completion command, pure
+    builder, runtime, edge port and adapter. Start Normal tasks in the completion
+    transition with no enqueue/row/offer. Apply the guarded build-ID mismatch,
+    old-version stamp handling, deployment transition and failed-completion cases.
+    Introduce transition-time scope operands here; edge-eager-dispatch task 11
+    reuses the admission contract for activities.
+  - [x] 6.3 Include a speculative update-only follow-up in the same committed
+    pending-state result, with virtual history and no dispatch. Test rejection-only
+    drop/reset-history, materialization, timeout and reload; document the existing
+    Tokeira durability mapping to Temporal's post-persistence speculative start.
+  - [x] 6.4 Remove the completion's inline `try_claim_workflow_task` call. Preserve
+    actual scheduled queue, incremental history, advice, query barriers, heartbeat
+    update non-redelivery, new update attachment and scoped provenance. Test a lost
+    response stays started until timeout and can then recover through normal polls.
+  - [x] 6.5 Required PBT — revised Property 3, at least 100 generated completion,
+    routing, failure, poll and owner-reload traces, tagged
+    `// Feature: api-conformance-wft-completion, Property 3`.
+    Assert one start per logical incarnation and zero rows/offers for inline work
+    across memory/DSQL derivation; use committed-state and publication-call oracles.
+  - [ ] 6.6 Integrate transient-wft task C.2's heartbeat-limit reproduction/controls;
+    orchestrator runs `TestWorkflowTaskTestSuite` including both heartbeat tests,
+    `TestEagerWorkflowTestSuite` and `TestStickyTqTestSuite`. Run root §10.4 for the
+    combined change. The timeout successor follows Requirement 3 but is not returned;
+    test the exact sticky reapplication, update/query barriers and successor timeout
+    specified in Item C.
+  - _Requirements: 1.4, 2.1–2.3, 3.1–3.11, 4.1–4.3_
+
 ## Task Dependency Graph
 
 ```json
@@ -69,7 +102,10 @@ Complete `RespondWorkflowTaskCompleted` field handling and return-new-workflow-t
     { "id": 1, "tasks": ["1.2", "2.1", "2.2"] },
     { "id": 2, "tasks": ["2.3", "2.4", "3.1"] },
     { "id": 3, "tasks": ["4.1", "4.2", "4.3", "4.4", "4.5"] },
-    { "id": 4, "tasks": ["5"] }
+    { "id": 4, "tasks": ["5"] },
+    { "id": 5, "tasks": ["6.1"] },
+    { "id": 6, "tasks": ["6.2", "6.3", "6.4"] },
+    { "id": 7, "tasks": ["6.5", "6.6"] }
   ]
 }
 ```
@@ -80,5 +116,5 @@ Complete `RespondWorkflowTaskCompleted` field handling and return-new-workflow-t
 - `deployment_options` (field 17) is the current worker deployment/versioning field; `binary_checksum`, `worker_version_stamp`, and `deployment` are deprecated and accepted for back-compat only.
 - This spec preserves and threads `deployment_options` / `versioning_behavior` into history/state. **Applying** them to dispatch routing is owned by `worker-deployments` and is explicitly out of scope.
 - `capabilities` (speculative-WFT discard) is preserved for the `speculative-wft` feature; `messages` is the update protocol transport shared with `api-conformance-update-lifecycle`.
-- Return-new-WFT returns a task only after it has been durably scheduled and started, preserving query-consistency barriers; no synthetic task is fabricated.
+- Task 6 supersedes task 3.1’s post-completion scheduling/start and the old Property 3; prior checked tasks remain historical. Inline real tasks start in the completion, preserving query/update barriers.
 - Property tests are required, not optional.

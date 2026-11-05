@@ -289,6 +289,8 @@ fn completion(command: WorkflowCommand) -> (WorkflowState, WorkflowTaskCompleted
         sticky: None,
         commands: vec![command],
         command_sizes: vec![],
+        eager_activities: Default::default(),
+        inline_workflow_task: None,
         force_new_workflow_task: false,
         limits: Default::default(),
         delivered_update_ids: vec![],

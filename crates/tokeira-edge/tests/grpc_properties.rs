@@ -426,6 +426,7 @@ proptest! {
     }
 
     #[test]
+    // Feature: edge-eager-dispatch, Property 10
     fn property_schedule_activity_preserves_request_eager_execution(
         cmd in arb_schedule_activity_command()
     ) {
@@ -1216,6 +1217,7 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
                 input,
                 header: None,
                 request_eager_execution: false,
+                use_workflow_build_id: false,
                 retry_policy: None,
                 deployment: None,
                 build_id: None,
@@ -1395,9 +1397,10 @@ fn arb_schedule_activity_command() -> impl Strategy<Value = WorkflowCommand> {
         arb_small_string(),
         arb_payloads(),
         any::<bool>(),
+        any::<bool>(),
     )
         .prop_map(
-            |(activity_id, task_queue, input, request_eager_execution)| {
+            |(activity_id, task_queue, input, request_eager_execution, use_workflow_build_id)| {
                 WorkflowCommand::ScheduleActivity {
                     activity_id,
                     activity_type: "activity-type".into(),
@@ -1405,6 +1408,7 @@ fn arb_schedule_activity_command() -> impl Strategy<Value = WorkflowCommand> {
                     input,
                     header: None,
                     request_eager_execution,
+                    use_workflow_build_id,
                     retry_policy: None,
                     deployment: None,
                     build_id: None,
@@ -1583,6 +1587,7 @@ proptest! {
         );
     }
 
+    // Feature: edge-eager-dispatch, Property 11
     #[test]
     fn property_completed_response_projection(
         edge in arb_completed_response()

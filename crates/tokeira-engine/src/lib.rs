@@ -3756,6 +3756,12 @@ where
         effective_config.infrastructure.placement.partition_count,
         effective_config.infrastructure.placement.bundle_count,
     )
+    .with_activity_eager_execution(
+        effective_config
+            .policy
+            .compatibility
+            .enable_activity_eager_execution,
+    )
     .with_worker_deployment_repository(worker_deployment_repository)
     .with_task_queue_config_store(task_queue_config_store.clone())
     .with_delivery_mode_provider(Arc::new(

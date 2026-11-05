@@ -80,6 +80,7 @@
 # @field policy.authorization.jwt.issuers[].worker_scopes[].namespace | Tokeira native | default="" | Exact namespace name authorized for the scoped Worker.
 # @field policy.authorization.jwt.issuers[].worker_scopes[].task_queues | Tokeira native | default=[] | Non-empty exact normal task-queue allowlist; sticky aliases are not configured.
 # @field policy.authorization.principal_attribution | configured parity | default=false | Write the authenticated principal to server-authored history metadata.
+# @field policy.compatibility.enable_activity_eager_execution | configured parity | default=false | Enable eager activity execution for every namespace; off by default.
 # @field policy.compatibility.enable_standalone_activities | configured parity | default=false | Enable the v1.31.0 preview standalone-activity surface.
 # @field policy.compatibility.enable_standalone_activity_callbacks | configured parity | default=false | Enable standalone-activity callbacks; requires standalone activities.
 # @field policy.default_retention_days | stock parity | default=30 | Default workflow-history retention for newly created namespaces.
@@ -111,11 +112,6 @@ region = "us-east-1"
 storage = "in-memory"
 
 [infrastructure.dsql]
-
-# Required only when a placement controller is configured. Generate one file,
-# stop every node, and securely install that same file on each runtime node.
-# [infrastructure.peer]
-# path = "/etc/tokeira/peer.json"
 
 [infrastructure.placement]
 heartbeat_interval_ms = 5000
@@ -164,6 +160,7 @@ max_workflow_timeout_seconds = 315360000
 max_signal_payload_bytes = 4194304
 
 [policy.compatibility]
+enable_activity_eager_execution = false
 enable_standalone_activities = false
 enable_standalone_activity_callbacks = false
 

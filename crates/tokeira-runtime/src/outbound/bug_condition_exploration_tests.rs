@@ -276,6 +276,8 @@ impl Fixture {
                         worker_deployment_name: None,
                         sticky: None,
                         commands,
+                        eager_activities: Default::default(),
+                        inline_workflow_task: None,
                         force_new_workflow_task: false,
                         limits: Default::default(),
                         delivered_update_ids: Vec::new(),

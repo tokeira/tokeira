@@ -37,12 +37,12 @@ flowchart LR
     Poll["waiting activity poll"] --> Offer["activity offer"]
     Offer --> Evaluator
     Retry["retryable failure or retry timer"] --> Evaluator
-    Eager["eager activity start"] --> Evaluator
+    Eager["completion-inline eager first start"] --> Bypass["no rule evaluation"]
     Evaluator --> Pause["existing PauseActivity transition"]
     Pause --> Describe["pending-activity projection"]
 ```
 
-CRUD reads/writes one namespace registry. Activity offer, eager start, retryable-failure, and retry
+CRUD reads/writes one namespace registry. Ordinary activity offer, retryable-failure, and retry
 timer processing read an immutable current rule snapshot, skip expired rules, evaluate workflow then
 activity predicates, and request a rule-derived pause before dispatch. A long poll never chooses
 whether rules apply: it only waits for an offer. The authoritative activity state stores the rule
@@ -78,7 +78,7 @@ pub fn matching_pause_rule(
 
 The pure decision helper uses the existing visibility-expression machinery for the restricted
 workflow query and a dedicated activity predicate context. Runtime call sites invoke it at ordinary
-and eager start boundaries, after a failure is known to be retryable, and before a retry timer
+first-start boundaries, after a failure is known to be retryable, and before a retry timer
 enqueues work. A matching rule id is threaded into the activity pause transition; storage and
 dispatch remain consequences of the ordinary committed transition.
 
@@ -87,8 +87,10 @@ dispatch remain consequences of the ordinary committed transition.
 Poll admission always enters the ordinary offer path. When an offer arrives, that path reads the
 current namespace rules and evaluates them before starting the activity. The evaluator has no CRUD
 gate input. Under tonic, this also ensures a poll admitted while the gate is disabled cannot later
-bypass a rule created after the gate is enabled. Eager dispatch is required to call the same policy
-seam rather than claiming directly from the broker.
+bypass a rule created after the gate is enabled. Completion-inline eager first starts bypass this seam, matching
+`service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:533-565 @ v1.31.0`.
+The [activity-dispatch amendment](../activity-dispatch/design.md#offers-and-eager-start)
+supersedes the earlier eager/ordinary equivalence; retry rule evaluation remains.
 
 ### gRPC handlers (`crates/tokeira-edge/src/grpc/workflow_service.rs`)
 
@@ -161,11 +163,11 @@ rule while Describe/List retain it; only explicit Delete or capacity eviction ma
 
 **Validates: Requirements 2.6, 3.1, 3.5, 3.7, 4.6**
 
-### Property 8: Activity-start path equivalence
+### Property 8: Rule application by start path
 
-*For any* activity and current rule set, ordinary offer, eager start, retryable-failure, and
-retry-timer paths SHALL reach the same pause decision before dispatch. A terminal failure SHALL not
-apply retry-rule pause state.
+*For any* activity and current rule set, ordinary first-start, retryable-failure and
+retry-timer paths SHALL evaluate the applicable rule set; an eager first start SHALL
+perform no evaluation. A terminal failure SHALL not apply retry-rule pause state.
 
 **Validates: Requirements 4.2, 4.3, 4.4, 4.9, 4.10, 4.11**
 
@@ -186,7 +188,7 @@ apply retry-rule pause state.
   first as the exploration test and must reproduce the confirmed failure before the correction.
 - **Unit tests:** exact v1.31.0 messages, force-scan/request-id ignored behavior, unspecified List
   order, expiration selection and CRUD retention, and Trigger's fixed response.
-- **Integration tests:** gate-independent offer-time pause, pre-start/eager pause, pause after a
+- **Integration tests:** gate-independent offer-time pause, ordinary pre-start pause, eager first-start bypass, pause after a
   retryable but not terminal failure, retry-timer pause, and delete rule then explicit type-based
   Unpause.
 - **Functional corpus:** two clean `TestActivityApiRulesClientTestSuite` runs in the rule-enabled mode.

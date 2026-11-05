@@ -1206,7 +1206,9 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 .map(Self::forwarded_workflow_reply_response)
                 .map_err(Self::forwarded_workflow_reply_error);
         }
-        let edge_req = translate::respond_completed_request_to_edge(request.into_inner())
+        let mut request = request.into_inner();
+        translate::disable_eager_activity_for_buggy_clients(&mut request, &headers);
+        let edge_req = translate::respond_completed_request_to_edge(request)
             .map_err(proto_conversion_status)?;
         debug!(
             num_commands = edge_req.commands.len(),

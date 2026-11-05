@@ -1373,7 +1373,7 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         capability_field: Some("sdk_metadata"),
         dynamic_config_key: None,
         rpcs: WORKFLOW_TASK_LIFECYCLE_RPCS,
-        notes: "Workflow task polling and completion are core SDK paths. The current matrix shape records sdk_metadata as the primary capability; upsert_memo is preserved by the baseline until multi-capability matrix entries are introduced.",
+        notes: "Workflow task polling and completion are core SDK paths. Completion-owned eager activities use the deployment-wide policy.compatibility.enable_activity_eager_execution setting, off by default, with no per-response limit. The current matrix shape records sdk_metadata as the primary capability; upsert_memo is preserved by the baseline until multi-capability matrix entries are introduced.",
         evidence: START_EVIDENCE,
     },
     FeatureEntry {

@@ -1,0 +1,5 @@
+kind: changed
+body: A completion is no longer limited to three eager activities.
+time: 2026-11-05T16:13:36.242370+00:00
+custom:
+    Slice: f331af42-7ee4-4d14-9af9-c3f0774b8ea7

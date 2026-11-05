@@ -73,6 +73,16 @@
   - [x] 6.2 Build `tokeirad` with conformance support and run
     `TestActivityApiRulesClientTestSuite` twice against fresh rule-enabled processes.
 
+- [x] 7. Correct eager first-start rule treatment with completion-inline delivery
+  - Supersede task 4.2's eager evaluation and task 5.7's eager/ordinary equivalence
+    when activity-dispatch task 15 replaces the post-commit eager start.
+  - Required revised Property 8 PBT, at least 100 cases: a matching pause rule
+    suppresses an ordinary first start and a retry, but is not consulted for an
+    eligible eager first start. Preserve actual workflow/activity pause gates.
+  - Use `// Feature: workflow-rules, Property 8: rule application by start path`;
+    include the former eager-pause behavior as a negative control.
+  - _Requirements: 4.1–4.4, 4.9–4.11_
+
 ## Task Dependency Graph
 
 ```json
@@ -86,7 +96,8 @@
     { "id": 5, "tasks": ["4.2", "4.3", "4.4", "4.5"] },
     { "id": 6, "tasks": ["4.6", "5.1", "5.2", "5.3", "5.4", "5.5", "5.6", "5.7"] },
     { "id": 7, "tasks": ["6.1"] },
-    { "id": 8, "tasks": ["6.2"] }
+    { "id": 8, "tasks": ["6.2"] },
+    { "id": 9, "tasks": ["7"] }
   ]
 }
 ```

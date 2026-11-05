@@ -8,6 +8,7 @@ use std::{
     time::Duration as StdDuration,
 };
 
+use tokeira_clock::Clock;
 use tokeira_storage::{InMemoryStore, LeaseOutcome, LeaseRepository};
 use tokeira_types::{Memo, RequestId, SearchAttributes, WorkflowId, WorkflowType};
 
@@ -19,6 +20,29 @@ pub(super) const HOME: ShardId = ShardId(0);
 pub(super) const NODE_A: &str = "lease-fence-node-a";
 /// Another node, which takes the home over.
 pub(super) const NODE_B: &str = "lease-fence-node-b";
+
+/// A clock that follows tokio's paused time from when it was made, so a store
+/// on it judges lease expiry on the time a test advances.
+#[derive(Debug)]
+struct PausedTokioClock {
+    started_at: OffsetDateTime,
+    started: tokio::time::Instant,
+}
+
+impl PausedTokioClock {
+    fn new() -> Self {
+        Self {
+            started_at: OffsetDateTime::now_utc(),
+            started: tokio::time::Instant::now(),
+        }
+    }
+}
+
+impl Clock for PausedTokioClock {
+    fn now(&self) -> OffsetDateTime {
+        self.started_at + self.started.elapsed()
+    }
+}
 
 /// A controller-managed runtime over `store` that fences its writes with the
 /// leases it acquires as `NODE_A`.
@@ -257,15 +281,18 @@ async fn a_lost_fence_ends_a_deletion() {
 #[tokio::test(start_paused = true)]
 async fn a_lapsed_owner_admits_nothing_and_is_taken_over() {
     const LEASE: StdDuration = StdDuration::from_secs(10);
-    let store =
-        Arc::new(InMemoryStore::with_shard_count(1).with_lease_duration(Duration::seconds(10)));
+    let store = Arc::new(
+        InMemoryStore::with_shard_count(1)
+            .with_lease_duration(Duration::seconds(10))
+            .with_clock(Arc::new(PausedTokioClock::new())),
+    );
     let runtime = fenced_runtime(store.clone());
     let acquired_at = tokio::time::Instant::now();
     let epoch = runtime.acquire_shard(HOME).await.unwrap();
     let request = start_request();
     let run_key = request.run_key;
     runtime.start_workflow(request).await.unwrap();
-    store.stall_lease_renewals().await;
+    store.stall_lease_renewals();
 
     let deadline = acquired_at + LEASE;
     let mut admitted_late = 0;

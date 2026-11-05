@@ -30,22 +30,22 @@
 //! lease until both nodes have registered, then hands them back, and the
 //! controller's next placement splits them between the two.
 //!
-//! Known limits, so they are not mistaken for oversights:
-//! - Node incarnation ids are random UUIDs, not drawn from turmoil's seeded
-//!   RNG, and the controller orders nodes by id. Placement, and with it the
-//!   queue and workflow a cluster workload picks, can differ between two runs
-//!   of one seed, so cluster runs are not yet replayable.
-//! - The controller times node heartbeats with `std::time::Instant`, which
-//!   turmoil does not move, so a node's heartbeat cannot lapse at the
-//!   controller in simulated time.
-//! - The in-memory store times lease expiry with tokio `Instant`s, which each
-//!   host's runtime counts from its own start, and grants leases with no
-//!   expiry unless it is given a lease duration. Scenarios that need a lease
-//!   to lapse wait on a change to that.
+//! # Leases and node ids
+//!
+//! The cluster's store grants leases for [`LEASE`], as DSQL grants them for a
+//! duration, and judges their expiry on [`SimClock`]. Each node has its own
+//! handle on the store, so a fault can stall one node's lease renewals
+//! while the others renew.
+//!
+//! Each node's incarnation id is drawn from the seed and the host's name. The
+//! controller orders nodes by id, so this fixes which bundles each node owns
+//! for a seed, and with it the queue and workflow a cluster workload picks.
 
 use std::{
+    collections::BTreeMap,
     error::Error,
     future::Future,
+    hash::{DefaultHasher, Hash as _, Hasher as _},
     io::Write as _,
     net::{IpAddr, Ipv4Addr},
     os::unix::fs::PermissionsExt as _,
@@ -75,6 +75,7 @@ use tokeira_types::{IncarnationId, PlacementConfig, ShardEpoch, ShardId};
 use tokio::sync::Semaphore;
 use tonic::transport::Endpoint;
 use turmoil::{Sim, net::TcpListener};
+use uuid::Uuid;
 
 use crate::{
     PORT, SimClock, Trace, WORKER, epoch,
@@ -92,6 +93,10 @@ pub const NODES: [&str; 2] = ["node-a", "node-b"];
 pub const OBSERVER: &str = "observer";
 /// Port the controller serves on, inside the simulated network.
 pub const CONTROLLER_PORT: u16 = 7240;
+
+/// How long the cluster's store grants a lease for. A node renews its leases
+/// every second, so a lease lapses only when its owner stops renewing.
+pub const LEASE: Duration = Duration::from_secs(10);
 
 /// Small enough that two nodes split the bundles visibly; `shard_count` must
 /// equal `bundle_count`, which the node's config validation enforces.
@@ -119,6 +124,9 @@ pub struct Run {
     sim: Sim<'static>,
     trace: Arc<Mutex<Trace>>,
     store: InMemoryStore,
+    /// Each node's own handle on the store, by host, for the faults that act
+    /// on one node's store calls.
+    node_stores: BTreeMap<&'static str, InMemoryStore>,
     /// Kept for the run's length: the cluster's nodes read it at start.
     _peer_file: Option<PeerFile>,
 }
@@ -178,7 +186,7 @@ impl Run {
                     .expect("trace lock is never poisoned")
                     .steps,
             );
-            for applied in schedule.apply_due(&mut self.sim, now) {
+            for applied in schedule.apply_due(&mut self.sim, &self.node_stores, now) {
                 record(&self.trace, now, applied);
             }
         }
@@ -201,14 +209,24 @@ impl Run {
 pub fn single_node(seed: u64) -> Run {
     let store = InMemoryStore::default();
     let mut sim = build_sim(seed, SINGLE_NODE_DURATION);
-    let node_store = store.clone();
+    let node_store = store.clone().with_own_renewal_stall();
+    let node_stores = BTreeMap::from([(NODE, node_store.clone())]);
+    let starts = AtomicU64::new(0);
     sim.host(NODE, move || {
-        serve_piped_node(node_store.clone(), single_node_config(), None, || {})
+        let node_id = incarnation(seed, NODE, starts.fetch_add(1, Ordering::Relaxed));
+        serve_piped_node(
+            node_store.clone(),
+            single_node_config(),
+            None,
+            node_id,
+            || {},
+        )
     });
     Run {
         sim,
         trace: Arc::default(),
         store,
+        node_stores,
         _peer_file: None,
     }
 }
@@ -219,7 +237,9 @@ pub fn cluster(seed: u64) -> anyhow::Result<Run> {
     let peer_file = PeerFile::generate()?;
     // The store homes each run by its own shard count, which must match the
     // nodes' or a fenced write lands at a home its lease doesn't cover.
-    let store = InMemoryStore::with_shard_count(BUNDLES);
+    let store = InMemoryStore::with_shard_count(BUNDLES).with_lease_duration(
+        time::Duration::try_from(LEASE).expect("the lease duration fits a time::Duration"),
+    );
     let mut sim = build_sim(seed, CLUSTER_DURATION);
     // Each node adds one permit once it has started.
     let started = Arc::new(Semaphore::new(0));
@@ -235,18 +255,24 @@ pub fn cluster(seed: u64) -> anyhow::Result<Run> {
         // shared store reads the same simulated time theirs do.
         serve_controller(
             controller_store.clone().with_clock(Arc::new(SimClock)),
+            incarnation(seed, PREVIOUS_GENERATION, 0),
+            incarnation(seed, CONTROLLER, 0),
             Arc::clone(&nodes_started),
         )
     });
+    let mut node_stores = BTreeMap::new();
     for node in NODES {
-        let node_store = store.clone();
+        let node_store = store.clone().with_own_renewal_stall();
+        node_stores.insert(node, node_store.clone());
         let peer_path = peer_file.path.clone();
         let node_started = Arc::clone(&started);
+        let starts = AtomicU64::new(0);
         sim.host(node, move || {
             serve_cluster_node(
                 node,
                 node_store.clone(),
                 peer_path.clone(),
+                incarnation(seed, node, starts.fetch_add(1, Ordering::Relaxed)),
                 Arc::clone(&node_started),
             )
         });
@@ -255,8 +281,20 @@ pub fn cluster(seed: u64) -> anyhow::Result<Run> {
         sim,
         trace: Arc::default(),
         store,
+        node_stores,
         _peer_file: Some(peer_file),
     })
+}
+
+/// The incarnation id of `host`'s `start`th start in a run of `seed`.
+///
+/// `DefaultHasher::new` hashes with fixed keys, so one seed and host give one
+/// id on every run. A restart is a new incarnation, as a restarted process
+/// is, so the start count is part of the id.
+fn incarnation(seed: u64, host: &str, start: u64) -> IncarnationId {
+    let mut hasher = DefaultHasher::new();
+    (seed, host).hash(&mut hasher);
+    IncarnationId(Uuid::from_u64_pair(hasher.finish(), start))
 }
 
 fn build_sim(seed: u64, duration: Duration) -> Sim<'static> {
@@ -282,6 +320,8 @@ fn single_node_config() -> TokeiraConfig {
 /// composes it, minus process signals, metrics and the DSQL connection.
 async fn serve_controller(
     store: InMemoryStore,
+    previous: IncarnationId,
+    allocator: IncarnationId,
     nodes_started: Arc<Semaphore>,
 ) -> Result<(), Box<dyn Error>> {
     let config = ControllerConfig {
@@ -294,7 +334,7 @@ async fn serve_controller(
     let leases: Arc<dyn LeaseRepository> = Arc::new(store.clone());
     // Taken before the controller listens, so no node can register while a
     // bundle is still unowned.
-    let previous = IncarnationId::new().to_string();
+    let previous = previous.to_string();
     let held = hold_every_bundle(leases.as_ref(), &previous).await?;
     tokio::spawn(hand_back_once_nodes_start(
         Arc::clone(&leases),
@@ -305,7 +345,7 @@ async fn serve_controller(
     let control: Arc<dyn ControlRepository> = Arc::new(store);
     let state = PlacementControllerState::new(config, leases, control);
     tokio::spawn(placement_loop(state.clone()));
-    tokio::spawn(budget_loop(state.clone()));
+    tokio::spawn(budget_loop(state.clone(), allocator));
 
     let router =
         Arc::new(ConnectPlacementController::new(state)).register(connectrpc::Router::new());
@@ -351,8 +391,7 @@ async fn placement_loop(state: PlacementControllerState) {
 }
 
 /// `run_budget_loop` in `apps/tokeira-controller`.
-async fn budget_loop(state: PlacementControllerState) {
-    let allocator = IncarnationId::new();
+async fn budget_loop(state: PlacementControllerState, allocator: IncarnationId) {
     let mut ticker = tokio::time::interval(BUDGET_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -412,20 +451,22 @@ async fn serve_cluster_node(
     host: &'static str,
     store: InMemoryStore,
     peer_file: PathBuf,
+    node_id: IncarnationId,
     started: Arc<Semaphore>,
 ) -> Result<(), Box<dyn Error>> {
     serve_piped_node(
         store,
         cluster_node_config(host, &peer_file)?,
         Some(controller_connection()),
+        node_id,
         || started.add_permits(1),
     )
     .await
 }
 
-/// Listen on [`PORT`], start a node on `store` that reads [`SimClock`], call
-/// `started`, then hand every accepted connection to the node as an
-/// in-memory pipe.
+/// Listen on [`PORT`], start a node as `node_id` on `store` that reads
+/// [`SimClock`], call `started`, then hand every accepted connection to the
+/// node as an in-memory pipe.
 ///
 /// `controller` must be set exactly when `config` names a controller, as
 /// [`TokeiradHandle::start_in_memory_with_transport`] requires.
@@ -433,6 +474,7 @@ async fn serve_piped_node(
     store: InMemoryStore,
     config: TokeiraConfig,
     controller: Option<SharedHttp2Connection>,
+    node_id: IncarnationId,
     started: impl FnOnce(),
 ) -> Result<(), Box<dyn Error>> {
     // Bound before the node starts, so a peer that learns this node's address
@@ -450,6 +492,7 @@ async fn serve_piped_node(
         transport,
         config,
         Arc::new(SimClock),
+        node_id,
     )
     .await?;
     started();

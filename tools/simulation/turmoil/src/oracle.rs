@@ -12,18 +12,19 @@
 //!   recorded in the [`Trace`].
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use anyhow::{anyhow, ensure};
+use tokeira_clock::Clock as _;
 use tokeira_proto::enums::EventType;
 use tokeira_storage::{InMemoryStore, LeaseRepository as _};
 use tokeira_types::ShardId;
 
-use crate::{Event, Trace, observe};
+use crate::{Event, SimClock, Trace, observe};
 
 /// How often the observer reads the store: turmoil's default tick, so it
 /// sees every state the store passes through between two steps' worth of
@@ -35,8 +36,10 @@ const OBSERVE_EVERY: Duration = Duration::from_millis(1);
 /// `spec/tla/30_bundle_lease`).
 ///
 /// It records each change of a bundle's owner in the trace, naming owners by
-/// the host their endpoint names rather than by incarnation id, and returns
-/// an error, which fails the run, at the first violation.
+/// the host their endpoint names rather than by incarnation id, and each
+/// owned lease whose expiry has passed, when the store grants leases for a
+/// duration. It returns an error, which fails the run, at the first
+/// violation.
 pub async fn one_owner_per_epoch(
     store: InMemoryStore,
     trace: Arc<Mutex<Trace>>,
@@ -46,8 +49,13 @@ pub async fn one_owner_per_epoch(
     // owned rows are kept.
     let mut owners: BTreeMap<(ShardId, u64), String> = BTreeMap::new();
     let mut latest: BTreeMap<ShardId, (u64, Option<String>)> = BTreeMap::new();
+    let mut lapsed: BTreeSet<(ShardId, u64)> = BTreeSet::new();
+    // Without a lease duration a lease never lapses, and the store reports
+    // the time of the read as every lease's expiry.
+    let leases_lapse = store.bundle_lease_duration().is_some();
     loop {
         let mut leases = store.list_bundle_leases().await?;
+        let now = SimClock.now();
         // The store lists leases in hash-map order, which differs between
         // runs; sorted, the trace records same-tick changes in one order.
         leases.sort_by_key(|lease| lease.bundle_id.0);
@@ -75,6 +83,16 @@ pub async fn one_owner_per_epoch(
                     )
                     .into());
                 }
+            }
+            if leases_lapse
+                && owner.is_some()
+                && lease.lease_until <= now
+                && lapsed.insert((bundle, epoch))
+            {
+                observe(
+                    &trace,
+                    format!("bundle {}'s lease at epoch {epoch} lapsed", bundle.0),
+                );
             }
             let state = (epoch, owner);
             if latest.get(&bundle) != Some(&state) {

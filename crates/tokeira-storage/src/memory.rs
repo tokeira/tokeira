@@ -31,7 +31,7 @@ use tokeira_types::{
     ExecutionRef, GenerationCounter, NamespaceId, QueueKey, RequestId, RunId, RunKey, ShardEpoch,
     ShardId, TaskKind, TransitionSeq, WorkflowId, WorkflowRuleRecord,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 #[cfg(test)]
 use crate::DeliveryOrder;
@@ -125,6 +125,11 @@ pub struct InMemoryStore {
     /// stamped with. It must be the clock the runtime and the edge stamp
     /// deadlines with; see [`tokeira_clock`].
     clock: Arc<dyn Clock>,
+    /// Whether this handle's lease renewals wait, as if its owner couldn't
+    /// reach storage. Clones share it, so one runtime and the test driving it
+    /// see one switch; [`InMemoryStore::with_own_renewal_stall`] gives a handle
+    /// its own, so a harness can cut one node of several off.
+    renewal_stall: Arc<watch::Sender<bool>>,
 }
 
 impl Default for InMemoryStore {
@@ -222,12 +227,14 @@ struct StoreState {
     projection_image_lookups: AtomicUsize,
     /// Shard lease state keyed by shard id.
     bundle_leases: HashMap<ShardId, BundleLeaseRow>,
-    /// When each lease expires, under a lease duration. It follows the tokio
-    /// clock, so a test can advance it, and snapshots don't carry it.
-    bundle_lease_expiries: HashMap<ShardId, tokio::time::Instant>,
-    /// Test-only: renewals never complete, as if the owner couldn't reach
-    /// storage.
-    lease_renewals_stalled: bool,
+    /// When each lease expires, under a lease duration, on the store's clock.
+    /// Snapshots don't carry it.
+    ///
+    /// Expiries are judged where every node's calls meet, on one clock, as
+    /// DSQL judges them on its own. Each caller's tokio clock would not do: a
+    /// tokio `Instant` counts from its own runtime's start, so an expiry one
+    /// node writes and another judges need not line up.
+    bundle_lease_expiries: HashMap<ShardId, OffsetDateTime>,
     /// Controller routing generation singleton.
     routing_generation: GenerationCounter,
     /// CAS version for controller connection-budget allocation.
@@ -650,12 +657,13 @@ impl InMemoryStore {
             placement_ready: Arc::new(AtomicBool::new(true)),
             lease_duration: None,
             clock: system_clock(),
+            renewal_stall: Arc::new(watch::Sender::new(false)),
         }
     }
 
     /// Grant leases for `duration`, as DSQL does: a lease its owner hasn't
-    /// renewed in time can be taken over (`bundle-lease-fence`). Expiry follows
-    /// the tokio clock, so a test can advance it.
+    /// renewed in time can be taken over (`bundle-lease-fence`). Expiry is
+    /// judged on the store's clock ([`InMemoryStore::with_clock`]).
     pub fn with_lease_duration(mut self, duration: time::Duration) -> Self {
         assert!(duration.is_positive(), "a lease duration must be positive");
         self.lease_duration = Some(duration);
@@ -670,10 +678,8 @@ impl InMemoryStore {
     }
 
     /// When a lease granted at `now` expires, under a lease duration.
-    fn lease_expiry(&self, now: tokio::time::Instant) -> Option<tokio::time::Instant> {
-        self.lease_duration.map(|duration| {
-            now + std::time::Duration::try_from(duration).expect("a positive lease duration")
-        })
+    fn lease_expiry(&self, now: OffsetDateTime) -> Option<OffsetDateTime> {
+        self.lease_duration.map(|duration| now + duration)
     }
 
     /// Inject `count` synthetic OCC conflicts for
@@ -686,11 +692,28 @@ impl InMemoryStore {
         store.conflict_injections.insert(run_key, count);
     }
 
-    /// Make every later lease renewal wait forever, as if its owner couldn't
+    /// This handle on the same store, with a renewal stall of its own:
+    /// [`InMemoryStore::stall_lease_renewals`] on it stalls only the renewals
+    /// made through it. A harness gives one node such a handle to cut that
+    /// node, and no other, off from renewing.
+    pub fn with_own_renewal_stall(mut self) -> Self {
+        self.renewal_stall = Arc::new(watch::Sender::new(false));
+        self
+    }
+
+    /// Make every lease renewal through this handle, and its clones, wait
+    /// until [`InMemoryStore::resume_lease_renewals`], as if its owner couldn't
     /// reach storage, so its lease lapses while it keeps working. Tests use it
-    /// for the owner's local deadline (`bundle-lease-fence`).
-    pub async fn stall_lease_renewals(&self) {
-        self.inner.lock().await.lease_renewals_stalled = true;
+    /// for the owner's local deadline and for a takeover (`bundle-lease-fence`).
+    pub fn stall_lease_renewals(&self) {
+        self.renewal_stall.send_replace(true);
+    }
+
+    /// Let the renewals [`InMemoryStore::stall_lease_renewals`] holds go on.
+    /// Each then runs as it would have arriving now, so it is refused if
+    /// another owner took the lease over meanwhile.
+    pub fn resume_lease_renewals(&self) {
+        self.renewal_stall.send_replace(false);
     }
 
     /// Make the covered bulk writes (`bounded-bulk-writes`) fail after
@@ -878,6 +901,7 @@ impl InMemoryStore {
             placement_ready: Arc::new(AtomicBool::new(false)),
             lease_duration: None,
             clock: system_clock(),
+            renewal_stall: Arc::new(watch::Sender::new(false)),
         })
     }
 }
@@ -1133,7 +1157,6 @@ impl SnapshotDoc {
                 projection_image_lookups: _,
             bundle_leases,
             bundle_lease_expiries: _,
-            lease_renewals_stalled: _,
             routing_generation,
             budget_version,
             activity_dispatch,
@@ -1272,7 +1295,6 @@ impl SnapshotDoc {
             projection_image_lookups: AtomicUsize::new(0),
             bundle_leases: self.bundle_leases.into_iter().collect(),
             bundle_lease_expiries: HashMap::new(),
-            lease_renewals_stalled: false,
             routing_generation: self.routing_generation,
             budget_version: self.budget_version,
             activity_dispatch: self.activity_dispatch.into_iter().collect(),
@@ -3314,7 +3336,7 @@ impl LeaseRepository for InMemoryStore {
         owner: String,
         node_endpoint: String,
     ) -> Result<LeaseOutcome> {
-        let now = tokio::time::Instant::now();
+        let now = self.clock.now();
         let expiry = self.lease_expiry(now);
         let mut guard = self.inner.lock().await;
         let StoreState {
@@ -3368,12 +3390,17 @@ impl LeaseRepository for InMemoryStore {
         epoch: ShardEpoch,
         node_endpoint: String,
     ) -> Result<LeaseOutcome> {
-        let expiry = self.lease_expiry(tokio::time::Instant::now());
+        // A stalled renewal waits before it reaches the store, as a statement
+        // that can't reach DSQL does, and runs as if it arrived when it goes
+        // on: its expiry is stamped then, and its owner and epoch are checked
+        // against the lease as it is then.
+        self.renewal_stall
+            .subscribe()
+            .wait_for(|stalled| !*stalled)
+            .await
+            .expect("the handle keeps its renewal stall's sender");
+        let expiry = self.lease_expiry(self.clock.now());
         let mut guard = self.inner.lock().await;
-        if guard.lease_renewals_stalled {
-            drop(guard);
-            match std::future::pending::<std::convert::Infallible>().await {}
-        }
         let StoreState {
             bundle_leases,
             bundle_lease_expiries,
@@ -3404,7 +3431,7 @@ impl LeaseRepository for InMemoryStore {
 
     async fn list_bundle_leases(&self) -> Result<Vec<BundleLease>> {
         let store = self.inner.lock().await;
-        let (now, wall) = (tokio::time::Instant::now(), self.clock.now());
+        let now = self.clock.now();
         Ok(store
             .bundle_leases
             .iter()
@@ -3415,7 +3442,8 @@ impl LeaseRepository for InMemoryStore {
                 lease_until: store
                     .bundle_lease_expiries
                     .get(bundle_id)
-                    .map_or(wall, |expiry| wall + expiry.saturating_duration_since(now)),
+                    .copied()
+                    .unwrap_or(now),
                 node_endpoint: endpoint.clone(),
             })
             .collect())

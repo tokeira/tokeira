@@ -53,7 +53,7 @@ use tonic::{
 use crate::{
     IDENTITY, NAMESPACE, PORT, Trace, elapsed, observe, record_history, text_payloads,
     topology::{
-        BUNDLES, NODE, NODES, PARTITIONS, controller_connection, controller_endpoint,
+        BUNDLES, LEASE, NODE, NODES, PARTITIONS, controller_connection, controller_endpoint,
         placement_config,
     },
     turmoil_connector,
@@ -68,6 +68,16 @@ pub const ACTIVITY_TIMEOUT: Duration = Duration::from_secs(10);
 pub const FIRST_ATTEMPT_RECEIVED: &str = "activity attempt 1 received";
 
 const TASK_QUEUE: &str = "turmoil-queue";
+/// The node [`work_on_a_lapsed_home`] homes its workflow on, for a fault
+/// schedule to cut off.
+pub const CUT_NODE: &str = NODES[0];
+/// The step [`work_on_a_lapsed_home`] records once it has chosen a workflow
+/// homed on [`CUT_NODE`], for a fault schedule to trigger on.
+pub const HOME_CHOSEN: &str = "the workflow will be homed on";
+/// How long [`work_on_a_lapsed_home`] waits, after [`HOME_CHOSEN`], before it
+/// starts its workflow: a lease, and a margin for the renewal the node made
+/// just before a fault cut it off.
+const LAPSE_WAIT: Duration = Duration::from_secs(LEASE.as_secs() + 2);
 /// How long the activity in [`late_completion`] works on each attempt.
 const ACTIVITY_WORK: Duration = Duration::from_secs(2);
 /// How long the worker waits for both nodes of a cluster to own bundles.
@@ -82,6 +92,11 @@ const RETRY_DELAY: Duration = Duration::from_millis(500);
 /// How long one poll may wait on a node for a task, when there is another
 /// node to try.
 const POLL_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the worker waits on one node's reply, when there is another node
+/// to try, before it counts the call as refused. It outlasts a poll, so it
+/// cuts off only a node that will never answer, such as a crashed one, as a
+/// real client's own deadline would.
+const CALL_TIMEOUT: Duration = Duration::from_secs(POLL_TIMEOUT.as_secs() + 5);
 
 /// Where a scenario puts its task queue, relative to the two places that
 /// decide an activity queue's home.
@@ -118,7 +133,7 @@ pub async fn one_activity_across_nodes(
     let routing = settled_placement().await?;
     let snapshot = routing.snapshot();
     worker.observe(describe_placement(&snapshot));
-    let (queue, edge_host, home_host) = pick_queue(&routing, &snapshot, placement).await?;
+    let (queue, edge_host, home_host) = pick_queue(&routing, &snapshot, placement, "").await?;
     worker.observe(format!(
         "task queue {queue}: the edge sends activity polls to {edge_host}, the runtime serves \
          them on {home_host}"
@@ -128,6 +143,51 @@ pub async fn one_activity_across_nodes(
         "workflow {workflow_id} is homed on {workflow_host}"
     ));
     run_one_activity(&worker, &queue, &workflow_id).await
+}
+
+/// One workflow on the cluster, started only once its home's lease has had
+/// time to lapse.
+///
+/// The workflow is homed on [`CUT_NODE`], and its task queue on the other
+/// node. The worker records [`HOME_CHOSEN`], waits a lease and a margin, so
+/// that a fault applied on that step (a stall of the node's renewals, or a
+/// crash) has lapsed the lease, then starts the workflow and completes it on
+/// its first task. Whether it gets that far shows whether another node took
+/// the home over.
+pub async fn work_on_a_lapsed_home(trace: Arc<Mutex<Trace>>) -> anyhow::Result<()> {
+    let worker = Worker::new(&NODES, trace)?;
+    let routing = settled_placement().await?;
+    let snapshot = routing.snapshot();
+    worker.observe(describe_placement(&snapshot));
+    let (queue, _, queue_host) =
+        pick_queue(&routing, &snapshot, QueuePlacement::Agreeing, CUT_NODE).await?;
+    let other = NODES
+        .into_iter()
+        .find(|host| *host != CUT_NODE)
+        .expect("the cluster has a second node");
+    let (workflow_id, home) = pick_workflow(&routing, "turmoil-lapse", other)?;
+    worker.observe(format!(
+        "{HOME_CHOSEN} {home}: {workflow_id}, with task queue {queue} on {queue_host}"
+    ));
+    tokio::time::sleep(LAPSE_WAIT).await;
+    worker.observe(format!(
+        "waited {} s for the lease on {home} to lapse",
+        LAPSE_WAIT.as_secs()
+    ));
+    if !worker.start(&workflow_id, "lapse", &queue).await {
+        return Ok(());
+    }
+    let Some(task) = worker.poll_workflow_task(&queue).await else {
+        return Ok(());
+    };
+    if !worker
+        .complete_workflow_task(task.task_token, vec![complete_workflow("finished")])
+        .await
+    {
+        return Ok(());
+    }
+    worker.record_history("workflow", &workflow_id).await;
+    Ok(())
 }
 
 async fn run_one_activity(worker: &Worker, queue: &str, workflow_id: &str) -> anyhow::Result<()> {
@@ -309,7 +369,7 @@ pub async fn child_across_homes(trace: Arc<Mutex<Trace>>) -> anyhow::Result<()> 
     let routing = settled_placement().await?;
     let snapshot = routing.snapshot();
     worker.observe(describe_placement(&snapshot));
-    let (queue, _, _) = pick_queue(&routing, &snapshot, QueuePlacement::Agreeing).await?;
+    let (queue, _, _) = pick_queue(&routing, &snapshot, QueuePlacement::Agreeing, "").await?;
     let (parent_id, parent_host) = pick_workflow(&routing, "turmoil-parent", "")?;
     let (child_id, child_host) = pick_workflow(&routing, "turmoil-child", &parent_host)?;
     worker.observe(format!(
@@ -409,8 +469,10 @@ impl Worker {
     /// `served`.
     ///
     /// Each distinct refusal is traced once, so the trace shows how nodes
-    /// refuse without one line per retry. Returns `None`, after tracing that
-    /// it gave up, if no node served the call within two simulated minutes.
+    /// refuse without one line per retry. With more than one node, a node
+    /// that doesn't answer within fifteen simulated seconds counts as
+    /// refusing. Returns `None`, after tracing that it gave up, if no node
+    /// served the call within two simulated minutes.
     pub async fn call<T, F, Fut>(
         &self,
         what: &str,
@@ -428,7 +490,19 @@ impl Worker {
             let mut refused = false;
             for (host, client) in &self.nodes {
                 attempts += 1;
-                match call(client.clone()).await {
+                let reply = if self.nodes.len() > 1 {
+                    tokio::time::timeout(CALL_TIMEOUT, call(client.clone()))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(Status::deadline_exceeded(format!(
+                                "no reply within {} s",
+                                CALL_TIMEOUT.as_secs()
+                            )))
+                        })
+                } else {
+                    call(client.clone()).await
+                };
+                match reply {
                     Ok(reply) => {
                         let reply = reply.into_inner();
                         if served(&reply) {
@@ -753,9 +827,9 @@ fn describe_placement(snapshot: &RoutingSnapshot) -> String {
 }
 
 /// Find a queue name whose activity polls the edge sends to the runtime's
-/// queue home (`Agreeing`) or away from it (`Disagreeing`). Returns the
-/// queue, the host the edge sends its activity polls to, and the host the
-/// runtime serves them on.
+/// queue home (`Agreeing`) or away from it (`Disagreeing`), and whose home is
+/// not on `avoid_host`. Returns the queue, the host the edge sends its
+/// activity polls to, and the host the runtime serves them on.
 ///
 /// The edge's side is asked of the edge's own router. The runtime's side uses
 /// the function the runtime's queue-home provider calls
@@ -764,6 +838,7 @@ async fn pick_queue(
     routing: &Arc<RoutingCache>,
     snapshot: &RoutingSnapshot,
     placement: QueuePlacement,
+    avoid_host: &str,
 ) -> anyhow::Result<(String, String, String)> {
     // An id no node has, so every route names the node it goes to.
     let router = CacheBackedRouter::new(Arc::clone(routing), IncarnationId::new());
@@ -783,11 +858,13 @@ async fn pick_queue(
         let home_host = owner_host(snapshot, home)
             .context("a settled placement owns every bundle")?
             .to_owned();
-        if (edge_host == home_host) == (placement == QueuePlacement::Agreeing) {
+        if (edge_host == home_host) == (placement == QueuePlacement::Agreeing)
+            && home_host != avoid_host
+        {
             return Ok((queue, edge_host, home_host));
         }
     }
-    bail!("no queue name among 256 gives {placement:?} placement")
+    bail!("no queue name among 256 gives {placement:?} placement away from {avoid_host:?}")
 }
 
 /// Find a workflow id starting `prefix` that is homed away from

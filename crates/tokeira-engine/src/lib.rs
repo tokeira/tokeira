@@ -2356,11 +2356,18 @@ impl TokeiradHandle {
     /// on `store` all stamp and judge deadlines on it. A simulation passes a
     /// clock that follows its own time; every node sharing `store` should get
     /// the same one.
+    ///
+    /// The node registers with its controller and owns leases as `node_id`.
+    /// Every other start mints a fresh [`IncarnationId`]. A simulation draws
+    /// one from its seed, because the controller orders nodes by id and so
+    /// places bundles by it, and gives a restarted node a new one, as a
+    /// restarted process gets.
     pub async fn start_in_memory_with_transport(
         store: InMemoryStore,
         transport: NodeTransport,
         mut config: TokeiraConfig,
         clock: Arc<dyn Clock>,
+        node_id: IncarnationId,
     ) -> Result<Self> {
         config.infrastructure.storage = ConfigStorageKind::InMemory;
         config
@@ -2391,7 +2398,7 @@ impl TokeiradHandle {
             None => None,
         };
         let stack = build_in_memory_stack(
-            StackTransport::Provided(transport),
+            StackTransport::Provided { transport, node_id },
             Arc::new(config),
             store,
             false,
@@ -2813,9 +2820,12 @@ enum StackTransport {
     Network(SocketAddr),
     Embedded,
     /// Listener-backed in every respect except the connections, which the
-    /// caller's network supplies ([`NodeTransport`]). Advertises the
-    /// configured `node_port`.
-    Provided(NodeTransport),
+    /// caller's network supplies ([`NodeTransport`]), and the incarnation id,
+    /// which the caller chooses. Advertises the configured `node_port`.
+    Provided {
+        transport: NodeTransport,
+        node_id: IncarnationId,
+    },
 }
 
 /// The connections a listener-backed node accepts, from its TCP listener or
@@ -3537,11 +3547,16 @@ where
     let declared = declared_search_attributes(&registry);
     // Build the authoritative store first, then wrap it with the
     // history-notifying repository used by edge long-poll.
-    let node_id = IncarnationId::new();
+    // A node on a supplied network is given its id, so a simulation can draw
+    // it from its seed; every other node mints a fresh one.
+    let node_id = match &transport {
+        StackTransport::Provided { node_id, .. } => *node_id,
+        StackTransport::Network(_) | StackTransport::Embedded => IncarnationId::new(),
+    };
     let advertised_addr = match transport {
         StackTransport::Network(addr) => addr,
         StackTransport::Embedded => SocketAddr::from(([127, 0, 0, 1], 0)),
-        StackTransport::Provided(_) => SocketAddr::from((
+        StackTransport::Provided { .. } => SocketAddr::from((
             [0, 0, 0, 0],
             effective_config
                 .infrastructure
@@ -3553,9 +3568,10 @@ where
     // A supplied network carries peer and controller calls too. Without one
     // these stay `None`, and every client dials over TCP as it always has.
     let (peer_connector, controller_connection) = match &transport {
-        StackTransport::Provided(provided) => {
-            (Some(provided.peers.clone()), provided.controller.clone())
-        }
+        StackTransport::Provided {
+            transport: provided,
+            ..
+        } => (Some(provided.peers.clone()), provided.controller.clone()),
         StackTransport::Network(_) | StackTransport::Embedded => (None, None),
     };
     let node_endpoint = configured_node_endpoint(&effective_config, advertised_addr);
@@ -3676,7 +3692,7 @@ where
         // A supplied network has no loopback socket to post system callbacks
         // to, so it closes the loop in process as embedded mode does. The
         // listener-backed path posts to its own node too, so routing is alike.
-        StackTransport::Embedded | StackTransport::Provided(_) => {
+        StackTransport::Embedded | StackTransport::Provided { .. } => {
             // A weak runtime attachment closes the system-callback loop without a
             // socket and without creating a runtime→client→runtime ownership cycle.
             let client = Arc::new(InProcessNexusCompletionClient::new());
@@ -4389,7 +4405,10 @@ where
                 .map(|accepted| accepted.map(ServedConnection::Tcp));
             (Box::pin(accepted), bound_addr)
         }
-        StackTransport::Provided(provided) => {
+        StackTransport::Provided {
+            transport: provided,
+            ..
+        } => {
             let accepted =
                 ReceiverStream::new(provided.incoming).map(|pipe| Ok(ServedConnection::Pipe(pipe)));
             (Box::pin(accepted), advertised_addr)

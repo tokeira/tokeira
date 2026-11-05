@@ -17,15 +17,17 @@ A scenario has four parts, each in its own module:
   engine nodes, `node-a` and `node-b`. Every node is a full listener-backed node: its gRPC
   listener, its calls to the other node and its calls to the controller all cross turmoil's
   network, and it reads the time from the simulation. The store is created outside the
-  hosts and stands in for the DSQL database, so it outlives a crashed node.
+  hosts and stands in for the DSQL database, so it outlives a crashed node. The cluster's
+  store grants leases for 10 seconds, as DSQL grants them for a duration, and each node has
+  its own handle on it. Each node's incarnation id is drawn from the seed.
 - **Workload** ([`src/workload.rs`](src/workload.rs)): what the `worker` host does, through
   the public gRPC API. Each workload is a scripted worker for one kind of workflow: one
   activity, a timer, an activity whose completion arrives late, a parent and a child. Like
   a client behind a load balancer, the worker offers each call to one node and, if that
   node refuses, to the other.
 - **Faults** ([`src/faults.rs`](src/faults.rs)): what goes wrong, and when. A fault
-  partitions or holds the traffic between two hosts, repairs or releases it, or crashes or
-  bounces a host. It is applied at a simulated time, or after the worker records a given
+  partitions or holds the traffic between two hosts, repairs or releases it, crashes or
+  bounces a host, or stalls or resumes one node's lease renewals. It is applied at a simulated time, or after the worker records a given
   line. The second kind keeps landing at the right moment when the code's timing changes.
 - **Oracle** ([`src/oracle.rs`](src/oracle.rs)): what must hold. Some checks run on every
   tick, reading the shared store from an observer host that no fault cuts off. Others run
@@ -66,6 +68,14 @@ TLA+ model the property comes from.
   receives the task it caused, which shows the node's clock is the simulation's.
 - **The same seed replays the same trace.** Two timer runs of one seed give the same
   trace, event times included.
+- **The same seed replays the same cluster trace.** Two cluster runs of one seed give the
+  worker the same trace. The controller places bundles by node id, so this holds because
+  ids come from the seed.
+- **The same seed replays the same lease handovers.** This test is `#[ignore]`d and fails
+  about half the time. The controller sends its placement directives in hash-map order,
+  and turmoil draws each message's latency in the order messages are sent. So which node
+  takes its bundles first, 56 ms before the other, differs between processes. The worker
+  acts only after placement settles, which is why its own trace still replays.
 
 ### `routing`: task routing and queue homes across two nodes
 
@@ -91,6 +101,23 @@ Property: at most one node owns a bundle at an epoch, and a bundle's epoch never
   lease from the shared store every simulated millisecond while each bundle passes from
   the previous generation, through no owner, to `node-a` or `node-b`. A one-activity
   workflow runs across the nodes meanwhile.
+
+The three lapse scenarios choose a workflow homed on `node-a`, cut `node-a` off, wait out
+its lease, then start the workflow. The observer records each lease that lapses. All three
+are `#[ignore]`d and fail on current code:
+
+- **A node that cannot renew admits nothing once its leases lapse.** `node-a`'s renewals
+  stall, so its leases lapse at 13 005 ms. At 15 493 ms `node-a` still accepts the start,
+  and runs the workflow to completion on the lapsed lease. Its runtime never sets the
+  local deadline that should stop it (`bundle-lease-fence`, Property 3). The runtime reads
+  the lease length from its repository, and the edge's `HistoryNotifyingRepository`,
+  which wraps every node's store, does not pass the length on.
+- **A lapsed home is taken over and its workflow completes.** No other node takes the home
+  over. The controller offers a node only bundles nobody owns
+  (`compute_desired_placement`), and a lapsed lease still names its owner.
+- **A crashed node's home is taken over and its workflow completes.** The same, with
+  `node-a` crashed. Its leases lapse, `node-b` still routes the start to `node-a`, and the
+  worker gives up after two simulated minutes.
 
 ### `dispatch`: activity attempts, timeouts, retries and completions
 
@@ -138,7 +165,7 @@ them, for example `bundle 2 at epoch 3 is owned by node-a`.
 
 ## What the spike added to production code
 
-Two sets of seams, neither of which changes production behaviour:
+Three sets of seams, none of which changes production behaviour:
 
 - **The node's connections.** `TokeiradHandle::start_in_memory_with_transport` in
   `tokeira-engine` accepts a `NodeTransport`. It carries the node's incoming connections as
@@ -153,6 +180,12 @@ Two sets of seams, neither of which changes production behaviour:
   it. Production passes the host's clock. The spike passes `SimClock`, which reads
   turmoil's simulated time from the fixed epoch, so that one seed stamps the same times on
   every run.
+- **The node's leases and identity.** The in-memory store judges lease expiry on its own
+  clock rather than the tokio clock of whichever node calls, so an expiry one node writes
+  and another judges line up. `InMemoryStore::with_own_renewal_stall` gives one node a
+  handle whose lease renewals can be stalled and resumed on their own.
+  `start_in_memory_with_transport` takes the node's incarnation id, so a simulation can
+  draw it from its seed.
 
 ## Why the cluster forms as a rolling replacement
 
@@ -198,29 +231,17 @@ cargo run -- 42 timer
 
 ## Limits
 
-Three scenarios wait on changes to production code:
-
-- **A lease that lapses.** The in-memory store grants leases with no expiry unless it is
-  given a lease duration, and it times expiry with tokio `Instant`s, which each host counts
-  from its own start. A node that crashes, or loses its store, therefore keeps its bundles.
-  Timing lease expiry on the engine's clock would let a scenario check that another node
-  takes the bundles over at a higher epoch, and that the old owner's writes are fenced.
-- **A node cut off from its store.** The store is shared memory, not network, so no
-  partition reaches it. A fault at the store's boundary for one node would let a scenario
-  partition a node from the database while it can still reach its peers.
-- **Replayable cluster runs.** Node incarnation ids are random UUIDs, not drawn from
-  turmoil's seeded random numbers, and the controller orders nodes by id. A seed always
-  gives a two-and-two split, but which bundles land on which node can differ between runs,
-  and so can the queue and workflow the worker picks. Seeded incarnation ids would make a
-  cluster run replay exactly.
-
-Other limits:
-
-- **Controller heartbeat faults are not reachable yet.** The controller times node
-  heartbeats with `std::time::Instant`, which turmoil does not move.
+- **A node can't be cut off from the whole store.** The store is shared memory, not
+  network, so no partition reaches it. A fault can stall one node's lease renewals, which
+  is what the lease scenarios need, but not the rest of its store calls.
+- **Nothing expires a node at the controller.** The controller stamps heartbeats with
+  `std::time::Instant`, but nothing calls `LiveMembership::expire_grace_periods`. A node
+  whose connection drops leaves the active set at once.
 - **Some times stay on the host's clock.** These include fairness snapshots, membership
   budgets, peer tokens and health reports. Each is stamped and judged on host clocks only,
   or never judged at all. The full list is in
   [the clock crate's page](../../../docs/crates/clock.md#what-stays-on-the-hosts-clock).
 - **Calls are not forwarded between nodes.** A call that reaches a node that does not own
-  its work is refused, and the worker offers it to the other node.
+  its work is refused, and the worker offers it to the other node. With more than one node,
+  the worker counts a node that hasn't answered within 15 simulated seconds as refusing,
+  as a real client's own deadline would.

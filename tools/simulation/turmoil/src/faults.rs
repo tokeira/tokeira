@@ -1,7 +1,7 @@
 //! What goes wrong in a run, and when.
 //!
-//! A [`Fault`] pairs an [`Action`] on turmoil's network or hosts with a
-//! [`Trigger`]. [`topology::Run::drive`](crate::topology::Run::drive) checks
+//! A [`Fault`] pairs an [`Action`] on turmoil's network, its hosts or one
+//! node's store calls with a [`Trigger`]. [`topology::Run::drive`](crate::topology::Run::drive) checks
 //! the triggers between simulation steps and applies each fault once, so a
 //! fault lands at the same step on every run of one seed, and the trace
 //! records it.
@@ -10,8 +10,9 @@
 //! and timing shift when the code changes, and a fault meant for "while the
 //! activity is running" should still land there.
 
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
+use tokeira_storage::InMemoryStore;
 use turmoil::Sim;
 
 /// One fault: what happens, and when.
@@ -53,6 +54,12 @@ pub enum Action {
     Crash(&'static str),
     /// Restart a host from scratch: a crash followed by a fresh start.
     Bounce(&'static str),
+    /// Make a node's lease renewals wait, as if it couldn't reach the store,
+    /// while the rest of its store calls and all of its network traffic go on.
+    /// Its leases lapse unless it is resumed first.
+    StallRenewals(&'static str),
+    /// Let a node's stalled renewals go on, each as if it arrived now.
+    ResumeRenewals(&'static str),
 }
 
 impl Fault {
@@ -81,7 +88,12 @@ impl Fault {
 }
 
 impl Action {
-    fn apply(&self, sim: &mut Sim<'_>) {
+    fn apply(&self, sim: &mut Sim<'_>, node_stores: &BTreeMap<&'static str, InMemoryStore>) {
+        let node_store = |host: &str| {
+            node_stores
+                .get(host)
+                .unwrap_or_else(|| panic!("the topology has no store handle for {host}"))
+        };
         match *self {
             Self::Partition(a, b) => sim.partition(a, b),
             Self::Repair(a, b) => sim.repair(a, b),
@@ -89,6 +101,8 @@ impl Action {
             Self::Release(a, b) => sim.release(a, b),
             Self::Crash(host) => sim.crash(host),
             Self::Bounce(host) => sim.bounce(host),
+            Self::StallRenewals(host) => node_store(host).stall_lease_renewals(),
+            Self::ResumeRenewals(host) => node_store(host).resume_lease_renewals(),
         }
     }
 
@@ -100,6 +114,8 @@ impl Action {
             Self::Release(a, b) => format!("fault: release traffic between {a} and {b}"),
             Self::Crash(host) => format!("fault: crash {host}"),
             Self::Bounce(host) => format!("fault: bounce {host}"),
+            Self::StallRenewals(host) => format!("fault: stall {host}'s lease renewals"),
+            Self::ResumeRenewals(host) => format!("fault: resume {host}'s lease renewals"),
         }
     }
 }
@@ -156,7 +172,12 @@ impl Schedule {
     ///
     /// The caller must not hold the trace's lock: crashing or bouncing a
     /// host runs host code, which records into the trace.
-    pub(crate) fn apply_due(&mut self, sim: &mut Sim<'_>, now: Duration) -> Vec<String> {
+    pub(crate) fn apply_due(
+        &mut self,
+        sim: &mut Sim<'_>,
+        node_stores: &BTreeMap<&'static str, InMemoryStore>,
+        now: Duration,
+    ) -> Vec<String> {
         let mut applied = Vec::new();
         for pending in self.pending.iter_mut().filter(|pending| !pending.applied) {
             let due_at = match pending.fault.trigger {
@@ -164,7 +185,7 @@ impl Schedule {
                 Trigger::Seen { delay, .. } => pending.seen_at.map(|seen| seen + delay),
             };
             if due_at.is_some_and(|due_at| now >= due_at) {
-                pending.fault.action.apply(sim);
+                pending.fault.action.apply(sim, node_stores);
                 pending.applied = true;
                 applied.push(pending.fault.action.describe());
             }

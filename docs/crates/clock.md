@@ -32,8 +32,9 @@ and leaving this crate out of its dependencies means it has no clock to read.
 One node holds one clock, and everything below reads that clock.
 
 - **Storage.** `InMemoryStore::with_clock` and
-  `InMemoryWorkerComputeRepository::with_clock` judge expiries and stamp reset
-  successors. The DSQL stores are given `SystemClock`.
+  `InMemoryWorkerComputeRepository::with_clock` judge expiries, bundle lease
+  expiry among them, and stamp reset successors. The DSQL stores are given
+  `SystemClock`.
 - **Runtime.** `TokeiraRuntime` takes the clock when it is built and passes it
   to the lanes, the broker, the publishers, the timer and timeout scanners,
   heartbeat maintenance, speculative workflow-task timeouts, the deployment
@@ -61,9 +62,9 @@ stamped and judged on host clocks only, or never judged at all:
   `update_time`, which are reported and never judged.
 - Cron schedule validation at the edge, and log throttling for run growth.
 
-A simulation that runs a node on its own clock also needs the placement
-controller on that clock before a node's heartbeat can lapse in simulated time.
-The controller times heartbeats with `std::time::Instant`.
+The placement controller stamps node heartbeats with `std::time::Instant`.
+Nothing judges them yet: no caller expires a node's grace period, so they can
+stay on the host's clock until something does.
 
 ## It does not own
 

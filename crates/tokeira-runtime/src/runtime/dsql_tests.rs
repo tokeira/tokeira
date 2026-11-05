@@ -1037,7 +1037,7 @@ async fn child_fan_out_live_starts_every_child() -> Result<()> {
                     .join("../tokeira-storage/migrations"),
             },
             reservoir: ReservoirConfig::default(),
-            shard_count: 8,
+            shard_count: 32,
             projection_partition_count: 16,
             ..Default::default()
         },
@@ -1051,23 +1051,14 @@ async fn child_fan_out_live_starts_every_child() -> Result<()> {
     parent.run_key = RunKey::derive(parent.namespace_id, &parent.workflow_id, parent.run_id);
     parent.workflow_task_timeout = Duration::minutes(5);
     let home_for = |id: &WorkflowId| {
-        execution_home_bundle(parent.namespace_id.0.as_bytes(), id.0.as_bytes(), 8)
+        execution_home_bundle(parent.namespace_id.0.as_bytes(), id.0.as_bytes(), 32)
     };
     let home = home_for(&parent.workflow_id);
     let children: Vec<_> = (0..100)
         .map(|index| WorkflowId(format!("fan-out-{}-{index}", parent.run_id.0)))
         .collect();
     let child_queue = TaskQueueName(format!("fan-out-{}", parent.run_id.0));
-    let mut homes: Vec<_> = children.iter().map(home_for).collect();
-    homes.push(home);
-    for queue in [&parent.task_queue, &child_queue] {
-        homes.push(tokeira_types::bundle_for_partition(
-            tokeira_types::workflow_queue_partition(parent.namespace_id, &queue.0, 8),
-            8,
-        ));
-    }
-    homes.sort();
-    homes.dedup();
+    let homes: Vec<_> = (0..32).map(ShardId).collect();
     let setup: Result<()> = async {
         child_release_fixture_apply(
             repo.as_ref(),
@@ -1120,7 +1111,7 @@ async fn child_fan_out_live_starts_every_child() -> Result<()> {
         NexusEndpointRegistry::default(),
         Arc::new(NoopNexusHttpClient),
         NexusCompletionDeps::default(),
-        8,
+        32,
         format!("live-fan-out-{}", Uuid::new_v4()),
         "127.0.0.1:0".into(),
         false,

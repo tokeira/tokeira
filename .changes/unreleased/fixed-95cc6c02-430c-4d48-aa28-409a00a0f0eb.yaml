@@ -1,0 +1,5 @@
+kind: fixed
+body: On a node that owns many shards, outbound work, such as starting a child workflow, no longer waits many seconds to be picked up.
+time: 2026-11-05T00:47:44.916086+00:00
+custom:
+    Slice: 95cc6c02-430c-4d48-aa28-409a00a0f0eb

@@ -29,9 +29,21 @@ spec/
     40_dispatch_handoff_order.cfg
     40_dispatch_handoff_migration.cfg
     40_dispatch_handoff_stale_rows.cfg
+    41_dispatch_repair.tla
+    41_dispatch_repair.cfg
+    41_dispatch_repair_pages.cfg
+    42_outbound_discovery.tla
+    42_outbound_discovery.cfg
+    42_outbound_discovery_one_home.cfg
     negative/
       30_bundle_lease_*.cfg
       40_dispatch_handoff_*.cfg
+      41_dispatch_repair_restart_slices.cfg
+      41_dispatch_repair_retained_retry.cfg
+      41_dispatch_repair_skips_deletes.cfg
+      42_outbound_discovery_continue.cfg
+      42_outbound_discovery_full_sweeps.cfg
+      42_outbound_discovery_reset.cfg
 ```
 
 ### `refinement/kernel.md`
@@ -204,6 +216,74 @@ also repeated each negative with only its target in `PROPERTIES`. All four targe
 checks failed: bare limit, durable cursor and restart-every-slice on
 `EventuallyResolved`, and disabled sticky timeouts on `StickyConverts`.
 
+### `tla/42_outbound_discovery.tla`
+
+This models the outbound driver's discovery rounds over a fixed set of active
+home/kind streams, bounded by pages per round, global admission and admission per
+home. Rows arrive without fairness; admitted attempts weakly fairly retire or fail
+back to pending, and completions can interleave with visits. A full home is visited
+without reading a page. Payloads, row cursors, backoff, wakes and ownership changes
+are outside this scheduling model.
+
+Four rules choose the next stream:
+
+- `reset`: walk in home/kind key order, then set `previous` to the round's first
+  stream after every round. The next round starts after that stream.
+- `continue`: keep walking after the last stream, across round boundaries.
+- `full`: use `reset` only when the round visited every stream; otherwise continue.
+- `home`: walk homes in key order. Read each home's kinds in key order from its
+  offset, wrapping within the home, then advance that offset by one. Carry a
+  partial home visit into the next round.
+
+`TypeOK` checks the state domains. `AdmissionBounded` checks both admission caps.
+`BoundedWait` checks the maximum number of other stream visits between reads:
+N + K − 2 visits, or 2N − 2 when a round can visit every stream. With one home,
+the two bounds are equal. `FirstPickRotates` requires every kind to lead its home
+infinitely often under weakly fair rounds and attempt completion. The Rust property
+also checks the stronger bound: every kind leads once in every K home visits.
+
+`EventuallyOffered` fails under every rule. A home's kinds share its admission,
+and nothing is reserved: another kind can take the available slots before a
+pending row is offered. Fair stream visits and rotating first picks do not imply
+fair delivery of every row. This property is retained in the module as a limit,
+not enabled in the five configurations.
+
+| Configuration | What it exercises | Expected |
+|---|---|---|
+| `42_outbound_discovery.cfg` | `home`, two homes, two kinds, two visits per round | pass |
+| `42_outbound_discovery_one_home.cfg` | `home`, one home, three kinds, up to a full sweep per round | pass |
+| `negative/42_outbound_discovery_continue.cfg` | `continue`, one home and full sweeps | `FirstPickRotates` fails |
+| `negative/42_outbound_discovery_full_sweeps.cfg` | `full`, two homes and partial rounds | `FirstPickRotates` fails |
+| `negative/42_outbound_discovery_reset.cfg` | `reset`, two homes and partial rounds | `BoundedWait` fails |
+
+Code anchors below are in `crates/tokeira-runtime/src/outbound/` unless stated otherwise.
+
+| Action/property | Code and test anchor |
+|---|---|
+| `Init` | `driver.rs::Discovery::default`; empty admission and attempt maps in `run` |
+| `Arrive` | `RunRepository::commit_transition`; `driver_tests.rs::many_homes_discover_new_row_within_one_cycle` commits after discovery has started |
+| `Tick`, `EndKeep` | `driver.rs::run`, tick/wake selection and bounded round; partial visits survive the round |
+| `VisitHomeWithin`, `VisitHomeLast` | `driver.rs::Discovery::next`; `driver_tests.rs::discovery_rotates_each_homes_starting_kind` checks order, wrap and offset advancement |
+| `VisitKeyOrder`, `EndFirst` | Comparison rules with no current code: `reset` is the driver's rule before per-home rotation; `continue` and `full` are alternatives the model rejects |
+| `VisitStream`, `AdmissionBounded` | `driver.rs::run`, `MAX_IN_FLIGHT` and `MAX_PER_HOME`; `admission_is_bounded_and_shutdown_drops_blocked_attempts`, `blocked_home_cannot_take_another_homes_admission` |
+| `Retire`, `Fail` | `driver.rs::run`, joined attempts and retry backoff; `finite_rounds_find_lower_insertions_and_pass_failing_first_rows` |
+| `TypeOK` | `driver.rs::Discovery`, `StreamKind`, typed work keys and counters |
+| `BoundedWait` | `discovery_rotates_each_homes_starting_kind`, `many_homes_discover_new_row_within_one_cycle` |
+| `FirstPickRotates` | `discovery_rotates_each_homes_starting_kind`, `backlogged_first_kind_cannot_starve_another_kind`: 32 homes, 128 first-kind rows and one cancellation, delivered within four home visits |
+| `EventuallyOffered` (not guaranteed) | Shared home admission in `driver.rs::run`; the starvation regression checks immediate completions, not all possible interleavings |
+
+TLC 1.7.4 and tla-rs 0.24.11 agree on every configuration.
+Each liveness negative lists only its target in `PROPERTIES`, so TLC's generic
+temporal violation identifies that property.
+
+| Configuration | Both checkers |
+|---|---|
+| `42_outbound_discovery.cfg` | Pass; 2,088 distinct states |
+| `42_outbound_discovery_one_home.cfg` | Pass; 640 distinct states |
+| `negative/42_outbound_discovery_continue.cfg` | `FirstPickRotates` fails |
+| `negative/42_outbound_discovery_full_sweeps.cfg` | `FirstPickRotates` fails |
+| `negative/42_outbound_discovery_reset.cfg` | `BoundedWait` fails |
+
 ## What this first spec does **not** model
 
 This is just as important as what it *does* model.
@@ -320,7 +400,7 @@ Run every configuration of a module. Those at the top level must pass, and each 
 
 ```bash
 cd spec/tla
-for module in 30_bundle_lease 40_dispatch_handoff; do
+for module in 30_bundle_lease 40_dispatch_handoff 41_dispatch_repair 42_outbound_discovery; do
   for cfg in "$module"*.cfg negative/"$module"_*.cfg; do
     java -cp /path/to/tla2tools.jar tlc2.TLC -workers auto -metadir /tmp/tlc -config "$cfg" "$module.tla"
   done
@@ -336,10 +416,12 @@ It is useful for fast feedback and for its interactive explorer (`-i`).
 Treat TLC as the reference, and record a result only when both agree.
 
 ```bash
-cargo install tla-checker --version 0.21.2 --locked
+cargo install tla-checker --version 0.24.11 --locked
 cd spec/tla
 tla 40_dispatch_handoff.tla --config 40_dispatch_handoff.cfg --max-states 20000000 --max-depth 10000
 ```
+
+With 0.24.11, tla-rs and TLC 1.7.4 agree on every configuration of every module here: each positive configuration passes with the same number of distinct states, and each negative fails on its target.
 
 Its default limits (1,000,000 states and depth 100) are smaller than models like this may need, so set them explicitly.
 It runs on one thread, so the largest configurations take a few minutes.
@@ -370,7 +452,9 @@ As Tokeira evolves, the intended spec sequence is:
 3. `20_current_execution.tla`
 4. `30_bundle_lease.tla`, written.
 5. `40_dispatch_handoff.tla`, written. It replaces the planned `40_broker_reservations.tla`: claiming a task writes nothing, so there are no broker reservations to model.
-6. `70_projection_prefix.tla`
+6. `41_dispatch_repair.tla`, written.
+7. `42_outbound_discovery.tla`, written.
+8. `70_projection_prefix.tla`
 
 Each later spec should either:
 

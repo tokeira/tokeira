@@ -204,7 +204,9 @@ impl Cursor {
 #[derive(Default)]
 struct Discovery {
     streams: BTreeMap<Stream, (u64, Cursor)>,
-    previous: Option<Stream>,
+    offsets: BTreeMap<ShardId, usize>,
+    home: Option<ShardId>,
+    within: usize,
 }
 
 impl Discovery {
@@ -216,9 +218,15 @@ impl Discovery {
                 .filter_map(|home| owner.acquisition(home).map(|a| (home, a.generation)))
                 .collect::<BTreeMap<_, _>>()
         };
+        self.offsets.retain(|home, _| active.contains_key(home));
+        if self.home.is_some_and(|home| !active.contains_key(&home)) {
+            // Keep the departed key so the next visit starts at its successor.
+            self.within = 0;
+        }
         self.streams
             .retain(|(home, _), (generation, _)| active.get(home) == Some(generation));
         for (home, generation) in active {
+            self.offsets.entry(home).or_default();
             for kind in kinds
                 .iter()
                 .copied()
@@ -233,17 +241,42 @@ impl Discovery {
     }
 
     fn next(&mut self) -> Option<Stream> {
-        let next = self
-            .previous
-            .and_then(|last| {
-                self.streams
-                    .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
-                    .next()
-            })
-            .or_else(|| self.streams.first_key_value())
-            .map(|(key, _)| *key);
-        self.previous = next;
-        next
+        // Walk homes in key order, and each home's kinds from its own offset,
+        // wrapping within that home. Advance the offset only after all its kinds
+        // have been visited; a short round carries on where it stopped. Every
+        // stream is read once a cycle, and each kind takes its turn to read first
+        // in its home, which takes the home's admission first. Nothing is reserved
+        // for a kind. See spec/tla/42_outbound_discovery.tla, Rule = "home".
+        if self.within == 0 {
+            self.home = self
+                .home
+                .and_then(|last| {
+                    self.offsets
+                        .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+                        .next()
+                })
+                .or_else(|| self.offsets.first_key_value())
+                .map(|(&home, _)| home);
+        }
+        let home = self.home?;
+        let offset = self
+            .offsets
+            .get_mut(&home)
+            .expect("selected home is active");
+        let mut streams = self
+            .streams
+            .keys()
+            .filter(|(stream_home, _)| *stream_home == home);
+        let count = streams.clone().count();
+        let stream = *streams
+            .nth((*offset + self.within) % count)
+            .expect("active home has streams");
+        self.within += 1;
+        if self.within >= count {
+            *offset = (*offset + 1) % count;
+            self.within = 0;
+        }
+        Some(stream)
     }
 }
 
@@ -297,11 +330,9 @@ pub(super) async fn run<R: RunRepository + 'static, E: Executor>(
                 } else { tick.tick().await; }
             } => {
                 discovery.refresh(&owner, executor.operation_kinds());
-                let mut first_stream = None;
                 for _ in 0..PAGES_PER_TICK.min(discovery.streams.len()) {
                     if tasks.len() >= MAX_IN_FLIGHT { break; }
                     let Some(stream) = discovery.next() else { break; };
-                    first_stream.get_or_insert(stream);
                     let remaining = MAX_PER_HOME.saturating_sub(home_in_flight.get(&stream.0).copied().unwrap_or(0));
                     if remaining == 0 { continue; }
                     let Some(attempt) = Attempt::capture(&owner, stream.0) else { continue; };
@@ -338,11 +369,6 @@ pub(super) async fn run<R: RunRepository + 'static, E: Executor>(
                         *home_in_flight.entry(stream.0).or_default() += 1;
                     }
                 }
-                // Completing a full stream sweep must not always restart at the
-                // same kind: that kind could consume all per-home admission on
-                // every tick. Rotate the starting stream even when every row is
-                // permanently pending and earlier streams fill their allowance.
-                if let Some(first) = first_stream { discovery.previous = Some(first); }
             }
         }
     }

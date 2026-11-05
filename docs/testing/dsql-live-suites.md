@@ -46,15 +46,24 @@ The activity-input runtime fixture also prepares placement and belongs before
 lease-taking suites. Its repository and runtime use the same eight homes as
 the placement and acquisition fixtures.
 The child-release runtime cases also prepare placement, and run after the activity-input suite.
-So does the child fan-out measurement, which runs after them; `--no-capture` shows its report.
 
 ```bash
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_generated_complete_repair)'
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(placement_live_)'
 cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --test dsql_activity_inputs --test-threads 1
 cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --run-ignored all --test-threads 1 -E 'test(child_release_live_)'
-cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --run-ignored all --test-threads 1 --no-capture -E 'test(child_fan_out_live_starts_every_child)'
 cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --test-threads 1 -E 'test(workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs)'
+```
+
+Run the child fan-out measurement against a **separate freshly migrated disposable
+database**, selected through `TOKEIRA_DSQL_TEST_DATABASE_URL`. It prepares placement
+for DSQL's default 32 homes and acquires all of them, so the outbound driver has 256
+streams. The placement marker records the shard count and refuses another, so this
+measurement can't share the eight-home sequence's database. It releases all 32
+homes, and deletes and purges every run it made; `--no-capture` shows its report.
+
+```bash
+cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --run-ignored all --test-threads 1 --no-capture -E 'test(child_fan_out_live_starts_every_child)'
 ```
 
 Run the queue-home remote-start read baseline against a **separate freshly
@@ -155,7 +164,7 @@ point them at a database holding application data.
 | Storage `workflow_dispatch_live_fenced_repair_*` | 2 | Property 9: 100 generated repair interleavings plus ten fixed insertion/deletion controls; takeover and release in both commit orders, renewal, successor writes and terminal fence loss; `dsql-integration`, URL gate only |
 | Runtime `workflow_dispatch_live_fenced_repair_final_gate` | 1 | Property 9: 100 generated empty-home final-gate interleavings with real lease changes and matching local cancellation, expiry or replacement; `dsql-integration`, URL gate only |
 | Runtime `child_release_live_` | 2 | Property 20: a deleted parent's owed release reaches a real poll, and a release intent reaching a child that a cancel request already opened retires without a second workflow task; real time; ignored by default; runtime `dsql-integration`; run after storage schema bootstrap, in the preparation-sensitive order above |
-| Runtime `child_fan_out_live_starts_every_child` | 1 | A measurement: one parent whose single workflow task starts 100 children. It reports the time to a ready runtime, the time until every child exists and the parent has recorded every start, the outbound driver's attempt outcomes, the parent's commits, the lane's OCC retries and commit latency, and fails if the children haven't all started within 15 minutes. It then deletes and purges every run it made. Real time; ignored by default; runtime `dsql-integration`; run after storage schema bootstrap, in the preparation-sensitive order above |
+| Runtime `child_fan_out_live_starts_every_child` | 1 | A measurement: one parent whose single workflow task starts 100 children, with all 32 default DSQL homes acquired and 256 outbound streams. It reports the time to a ready runtime, the time until every child exists and the parent has recorded every start, the outbound driver's attempt outcomes, the parent's commits, the lane's OCC retries and commit latency, and fails if the children haven't all started within 15 minutes. It releases all 32 homes and deletes and purges every run it made across them. Real time; ignored by default; runtime `dsql-integration`; run it on its own freshly migrated disposable database, as above |
 | Runtime `workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs` | 1 | Real lease acquisition, interrupted recovery and rejected old-generation installs in all recovery trackers; runtime `dsql-integration`, URL gate only; run after storage schema bootstrap |
 | Storage `workflow_dispatch_live_query_plans` | 1 | Before/after queue Live/Exact and actual home page SQL, including full traversal of deep equal-time pages, with 16,384 seeded rows; set `TOKEIRA_WORKFLOW_DISPATCH_PLAN_OUTPUT` to save plans, selectivity, returned-row/page-statement counts and traversal durations; `dsql-integration`, URL gate only |
 | Storage `placement_live_` | 4 | Stopped-cluster hot/timer relocation, concurrent starters and late-page exclusion, raw legacy-encoded lease refusal, corruption diagnostics, reset preservation, duplicates/orphans, exact joined continuation plans and screening latency; `dsql-integration`, URL gate only |

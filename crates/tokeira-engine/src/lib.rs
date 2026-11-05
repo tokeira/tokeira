@@ -48,7 +48,10 @@ use tokio::{
     sync::{broadcast, mpsc, oneshot},
     task::JoinHandle,
 };
-use tokio_stream::wrappers::TcpListenerStream;
+use tokio_stream::{
+    StreamExt as _,
+    wrappers::{ReceiverStream, TcpListenerStream},
+};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tonic_web::GrpcWebLayer;
@@ -77,6 +80,7 @@ mod http_api_transport;
 mod listener;
 mod nexus_http_transport;
 mod node_claim;
+mod node_transport;
 pub mod observability;
 mod peer;
 #[cfg(all(test, feature = "dsql-integration"))]
@@ -84,15 +88,18 @@ mod single_node_claim_live_tests;
 mod storage_maintenance;
 
 pub use listener::{EngineListenError, EngineListener, EngineListenerShutdownError};
+pub use node_transport::NodeTransport;
 
 use http_api_transport::HttpApiLayer;
 use nexus_http_transport::NexusHttpLayer;
+use node_transport::ServedConnection;
 use tokeira_auth::{
     Authorizer, ClaimMapper, DefaultAuthorizer, GrantRule, GrantRules, JwksKeyProvider,
     JwtAuthenticator, JwtIssuerProfile, MultiSourceClaimMapper, StsAuthenticator, WorkerScope,
     WorkerScopeRule, WorkerScopeRules,
 };
 use tokeira_chasm::Library as _;
+use tokeira_clock::{Clock, system_clock};
 use tokeira_config::{Cli, CliCommand, ConfigStorageKind, PeerCredentialCommand};
 pub use tokeira_config::{
     DsqlMigrationPolicy, EmbeddedEngineConfig, EmbeddedStorageConfig, SnapshotPolicyConfig,
@@ -273,10 +280,10 @@ use tokeira_runtime::{
     NexusNamespaceResolver, NexusWorkerComputeProvider, OBSERVATION_CHANNEL_CAPACITY,
     RECONCILE_CHANNEL_CAPACITY, RepositoryBackedTaskQueueConfigStore, RuntimeConfig,
     RuntimeShutdownHandle, ScheduleEngineConfig, ScheduleStore, SweepResult,
-    SystemWorkerComputeClock, TEMPORAL_CALLBACK_TOKEN_HEADER, TokeiraRuntime,
-    WorkerComputeControllerService, WorkerComputeOutbox, WorkerComputeReconciler,
-    WorkflowTaskReportedProblem, nexus_payload_to_body, reported_problem_from_state,
-    run_schedule_engine, system_callback_post_url,
+    TEMPORAL_CALLBACK_TOKEN_HEADER, TokeiraRuntime, WorkerComputeControllerService,
+    WorkerComputeOutbox, WorkerComputeReconciler, WorkflowTaskReportedProblem,
+    nexus_payload_to_body, reported_problem_from_state, run_schedule_engine,
+    system_callback_post_url,
 };
 use tokeira_storage::{
     ConnectionDirector, DbClass, InMemoryStore, InMemoryWorkerComputeRepository, LeaseOutcome,
@@ -2327,6 +2334,102 @@ impl TokeiradHandle {
         Self::start_in_memory_with_config(addr, config).await
     }
 
+    /// Start an in-memory node on a store and a network the caller supplies.
+    ///
+    /// The node is built as [`Self::start_in_memory_with_config`] builds one,
+    /// including peer bootstrap and controller membership when the
+    /// configuration names a controller, with three differences:
+    ///
+    /// - `store` is the authoritative store. Several nodes and a placement
+    ///   controller may share one, as a cluster shares its DSQL database.
+    /// - Every connection goes through `transport` (see [`NodeTransport`]), and
+    ///   Nexus completion callbacks close in process, so the node opens no
+    ///   socket of its own.
+    /// - The node advertises `infrastructure.placement.node_host` and
+    ///   `node_port`, which must name it on the caller's network. Nothing is
+    ///   bound, so [`Self::bound_addr`] reports the unspecified address with
+    ///   that port.
+    ///
+    /// Snapshots are refused, because the caller owns the store.
+    ///
+    /// The node reads the time from `clock`: its runtime, edge and its handle
+    /// on `store` all stamp and judge deadlines on it. A simulation passes a
+    /// clock that follows its own time; every node sharing `store` should get
+    /// the same one.
+    ///
+    /// The node registers with its controller and owns leases as `node_id`.
+    /// Every other start mints a fresh [`IncarnationId`]. A simulation draws
+    /// one from its seed, because the controller orders nodes by id and so
+    /// places bundles by it, and gives a restarted node a new one, as a
+    /// restarted process gets.
+    pub async fn start_in_memory_with_transport(
+        store: InMemoryStore,
+        transport: NodeTransport,
+        mut config: TokeiraConfig,
+        clock: Arc<dyn Clock>,
+        node_id: IncarnationId,
+    ) -> Result<Self> {
+        config.infrastructure.storage = ConfigStorageKind::InMemory;
+        config
+            .validate()
+            .context("invalid in-memory server config")?;
+        let placement = &config.infrastructure.placement;
+        if config.policy.snapshot.is_some() {
+            return Err(anyhow!(
+                "policy.snapshot is configured, but a node on a supplied store does not own \
+                 its store: remove policy.snapshot"
+            ));
+        }
+        if placement.node_port.is_none() {
+            return Err(anyhow!(
+                "infrastructure.placement.node_port is unset: a node on a supplied network \
+                 binds no port, so set the port other hosts reach it on"
+            ));
+        }
+        if placement.controller_endpoint.is_some() != transport.controller.is_some() {
+            return Err(anyhow!(
+                "infrastructure.placement.controller_endpoint and NodeTransport::controller \
+                 must be set together: the node reaches its controller only through the \
+                 supplied connection"
+            ));
+        }
+        let peer = match placement.controller_endpoint {
+            Some(_) => Some(peer::bootstrap(config.infrastructure.peer.as_ref())?),
+            None => None,
+        };
+        let stack = build_in_memory_stack(
+            StackTransport::Provided { transport, node_id },
+            Arc::new(config),
+            store,
+            false,
+            ChasmExtensions::default(),
+            peer,
+            clock,
+        )
+        .await?;
+        let ConstructedStack::Network((
+            server_task,
+            bound_addr,
+            shutdown_tx,
+            background_cancel,
+            log_broadcast,
+            _recorder,
+        )) = stack
+        else {
+            return Err(anyhow!(
+                "network service construction returned an embedded stack"
+            ));
+        };
+        Ok(Self {
+            bound_addr,
+            shutdown_tx: Some(shutdown_tx),
+            server_task: Some(server_task),
+            background_cancel,
+            log_broadcast,
+            snapshot_policy: None,
+        })
+    }
+
     /// The socket address the server is bound to after startup.
     pub fn bound_addr(&self) -> SocketAddr {
         self.bound_addr
@@ -2712,11 +2815,23 @@ type ServerStack = (
     Option<Arc<WireCoverageRecorder>>,
 );
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 enum StackTransport {
     Network(SocketAddr),
     Embedded,
+    /// Listener-backed in every respect except the connections, which the
+    /// caller's network supplies ([`NodeTransport`]), and the incarnation id,
+    /// which the caller chooses. Advertises the configured `node_port`.
+    Provided {
+        transport: NodeTransport,
+        node_id: IncarnationId,
+    },
 }
+
+/// The connections a listener-backed node accepts, from its TCP listener or
+/// from a supplied network.
+type ServedIncoming =
+    Pin<Box<dyn tokio_stream::Stream<Item = std::io::Result<ServedConnection>> + Send>>;
 
 #[derive(Debug)]
 enum ConstructedStack {
@@ -2955,6 +3070,7 @@ async fn build_and_serve(
                 restored,
                 ChasmExtensions::default(),
                 peer,
+                system_clock(),
             )
             .await
         }
@@ -3139,6 +3255,8 @@ async fn build_dsql_stack(
         budget_applier,
         extensions,
         peer,
+        // DSQL stores judge their deadlines on the host's clock.
+        system_clock(),
     )
     .await
 }
@@ -3156,6 +3274,7 @@ async fn build_embedded(
         recover_self_assigned_shard,
         extensions,
         None,
+        system_clock(),
     )
     .await?
     {
@@ -3173,7 +3292,11 @@ async fn build_in_memory_stack(
     recover_self_assigned_shard: bool,
     extensions: ChasmExtensions,
     peer: Option<Arc<tokeira_edge::grpc::workflow_offer::PeerOfferEndpoint>>,
+    clock: Arc<dyn Clock>,
 ) -> Result<ConstructedStack> {
+    // Every handle on the store below is cloned from this one, so the store
+    // judges its deadlines on the node's clock.
+    let store = store.with_clock(clock.clone());
     let visibility_store = InMemoryVisibilityStore::default();
     let chasm_node_repo: Arc<dyn tokeira_storage::ChasmNodeRepository> =
         Arc::new(tokeira_storage::InMemoryChasmNodeStore::new());
@@ -3185,7 +3308,8 @@ async fn build_in_memory_stack(
     let worker_deployment_repository: Arc<dyn WorkerDeploymentRepository> = Arc::new(store.clone());
     let worker_task_provenance: Arc<dyn WorkerTaskProvenanceStore> = Arc::new(store.clone());
     let worker_compute_repository = effective_config.policy.worker_compute.enabled.then(|| {
-        Arc::new(InMemoryWorkerComputeRepository::default()) as Arc<dyn WorkerComputeRepository>
+        Arc::new(InMemoryWorkerComputeRepository::default().with_clock(clock.clone()))
+            as Arc<dyn WorkerComputeRepository>
     });
     build_service_stack_with_storage(
         transport,
@@ -3208,6 +3332,7 @@ async fn build_in_memory_stack(
         Arc::new(NoopConnectionBudgetApplier),
         extensions,
         peer,
+        clock,
     )
     .await
 }
@@ -3230,6 +3355,7 @@ fn spawn_worker_task_provenance_cleanup(
     tasks: &RuntimeShutdownHandle,
     store: Arc<dyn WorkerTaskProvenanceStore>,
     cancel: CancellationToken,
+    clock: Arc<dyn Clock>,
 ) -> JoinHandle<()> {
     tasks.spawn(async move {
         let mut interval = tokio::time::interval(WORKER_TASK_PROVENANCE_CLEANUP_INTERVAL);
@@ -3239,10 +3365,7 @@ fn spawn_worker_task_provenance_cleanup(
                 _ = cancel.cancelled() => break,
                 _ = interval.tick() => {
                     if let Err(error) = store
-                        .delete_expired(
-                            time::OffsetDateTime::now_utc(),
-                            WORKER_TASK_PROVENANCE_CLEANUP_BATCH,
-                        )
+                        .delete_expired(clock.now(), WORKER_TASK_PROVENANCE_CLEANUP_BATCH)
                         .await
                     {
                         tracing::warn!(
@@ -3397,6 +3520,7 @@ async fn build_service_stack_with_storage<R, L, S, V, F>(
     budget_applier: Arc<dyn ConnectionBudgetApplier>,
     extensions: ChasmExtensions,
     peer: Option<Arc<tokeira_edge::grpc::workflow_offer::PeerOfferEndpoint>>,
+    clock: Arc<dyn Clock>,
 ) -> Result<ConstructedStack>
 where
     R: LeaseRepository + RunRepository + 'static,
@@ -3423,10 +3547,32 @@ where
     let declared = declared_search_attributes(&registry);
     // Build the authoritative store first, then wrap it with the
     // history-notifying repository used by edge long-poll.
-    let node_id = IncarnationId::new();
+    // A node on a supplied network is given its id, so a simulation can draw
+    // it from its seed; every other node mints a fresh one.
+    let node_id = match &transport {
+        StackTransport::Provided { node_id, .. } => *node_id,
+        StackTransport::Network(_) | StackTransport::Embedded => IncarnationId::new(),
+    };
     let advertised_addr = match transport {
         StackTransport::Network(addr) => addr,
         StackTransport::Embedded => SocketAddr::from(([127, 0, 0, 1], 0)),
+        StackTransport::Provided { .. } => SocketAddr::from((
+            [0, 0, 0, 0],
+            effective_config
+                .infrastructure
+                .placement
+                .node_port
+                .unwrap_or(0),
+        )),
+    };
+    // A supplied network carries peer and controller calls too. Without one
+    // these stay `None`, and every client dials over TCP as it always has.
+    let (peer_connector, controller_connection) = match &transport {
+        StackTransport::Provided {
+            transport: provided,
+            ..
+        } => (Some(provided.peers.clone()), provided.controller.clone()),
+        StackTransport::Network(_) | StackTransport::Embedded => (None, None),
     };
     let node_endpoint = configured_node_endpoint(&effective_config, advertised_addr);
     let history_waits = HistoryWaitRegistry::default();
@@ -3475,7 +3621,11 @@ where
         let cache = Arc::new(RoutingCache::new(placement_config(&effective_config)));
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            tokeira_edge::subscribe_routing_once(cache.clone(), endpoint.clone()),
+            tokeira_edge::subscribe_routing_once(
+                cache.clone(),
+                endpoint.clone(),
+                controller_connection.clone(),
+            ),
         )
         .await
         .context("timed out waiting for controller placement snapshot")??;
@@ -3539,7 +3689,10 @@ where
                 callback_url,
             )
         }
-        StackTransport::Embedded => {
+        // A supplied network has no loopback socket to post system callbacks
+        // to, so it closes the loop in process as embedded mode does. The
+        // listener-backed path posts to its own node too, so routing is alike.
+        StackTransport::Embedded | StackTransport::Provided { .. } => {
             // A weak runtime attachment closes the system-callback loop without a
             // socket and without creating a runtime→client→runtime ownership cycle.
             let client = Arc::new(InProcessNexusCompletionClient::new());
@@ -3594,6 +3747,7 @@ where
         Some(Arc::new(CacheNexusNamespaceResolver {
             namespaces: namespaces.clone(),
         }) as Arc<dyn NexusNamespaceResolver>),
+        clock.clone(),
     )
     // The edge always exposes Worker Deployment v2 RPCs. Wiring the
     // repository here keeps their registry durable for both in-memory and
@@ -3687,6 +3841,7 @@ where
         &engine_tasks,
         worker_task_provenance.clone(),
         background_cancel.clone(),
+        clock.clone(),
     );
 
     let _worker_compute_service = if effective_config.policy.worker_compute.enabled {
@@ -3714,7 +3869,6 @@ where
                 reconcile_sender,
             )));
 
-        let clock = Arc::new(SystemWorkerComputeClock);
         let catalog = Arc::new(WorkerComputeNamespaceCatalogAdapter::new(
             namespaces.clone(),
         ));
@@ -3744,7 +3898,7 @@ where
             reconciler,
             sampler,
             outbox,
-            clock,
+            clock.clone(),
             active_shards,
             observation_receiver,
             reconcile_receiver,
@@ -3773,6 +3927,7 @@ where
                     controller_endpoint,
                 ),
                 budget_applier,
+                controller_connection.clone(),
                 background_cancel.clone(),
             )
         });
@@ -3788,11 +3943,14 @@ where
     let _schedule_engine = engine_tasks.track_join(schedule_engine);
 
     let authorization = build_authorization_stack(&effective_config).await?;
-    let interceptors = Arc::new(EdgeInterceptors::configured(
-        namespaces.clone(),
-        authorization.grpc,
-        authorization.principal_attribution,
-    ));
+    let interceptors = Arc::new(
+        EdgeInterceptors::configured(
+            namespaces.clone(),
+            authorization.grpc,
+            authorization.principal_attribution,
+        )
+        .with_clock(clock.clone()),
+    );
     let router: Arc<dyn tokeira_edge::EdgeRouter> = if let Some(controller_endpoint) =
         effective_config
             .infrastructure
@@ -3813,10 +3971,15 @@ where
         let subscription_cancel = background_cancel.clone();
         let routing_shutdown = runtime.shutdown_handle();
         let routing_cancel = background_cancel.clone();
+        let subscription_connection = controller_connection.clone();
         let _routing_subscription = engine_tasks.spawn(async move {
-            if let Err(error) =
-                run_routing_subscription(subscription_cache, routing_config, subscription_cancel)
-                    .await
+            if let Err(error) = run_routing_subscription(
+                subscription_cache,
+                routing_config,
+                subscription_connection,
+                subscription_cancel,
+            )
+            .await
             {
                 tracing::error!(
                     ?error,
@@ -3826,24 +3989,31 @@ where
                 routing_cancel.cancel();
             }
         });
-        runtime.set_workflow_task_starter(Arc::new(
+        let mut workflow_starter =
             tokeira_edge::grpc::workflow_dispatch::RemoteWorkflowTaskStarter::new(
                 routing_cache.clone(),
-            ),
-        ));
+            );
+        if let Some(connector) = &peer_connector {
+            workflow_starter = workflow_starter.with_peer_connector(connector.clone());
+        }
+        runtime.set_workflow_task_starter(Arc::new(workflow_starter));
         if let Some(peer) = &peer {
-            runtime.set_activity_task_starter(Arc::new(
+            let mut activity_starter =
                 tokeira_edge::grpc::activity_dispatch::RemoteActivityTaskStarter::new(
                     routing_cache.clone(),
                     peer.clone(),
-                ),
-            ));
-            runtime.set_outbound_delivery_transport(Arc::new(
+                );
+            let mut outbound_delivery =
                 tokeira_edge::grpc::outbound_delivery::RemoteOutboundDelivery::new(
                     routing_cache.clone(),
                     peer.clone(),
-                ),
-            ));
+                );
+            if let Some(connector) = &peer_connector {
+                activity_starter = activity_starter.with_peer_connector(connector.clone());
+                outbound_delivery = outbound_delivery.with_peer_connector(connector.clone());
+            }
+            runtime.set_activity_task_starter(Arc::new(activity_starter));
+            runtime.set_outbound_delivery_transport(Arc::new(outbound_delivery));
         }
         Arc::new(CacheBackedRouter::new(routing_cache, node_id))
     } else {
@@ -3975,14 +4145,16 @@ where
             Some(wrap) => wrap(production_nexus_authorizer),
             None => production_nexus_authorizer,
         };
-    let nexus_http_layer =
-        NexusHttpLayer::new(Arc::new(tokeira_edge::nexus_http::NexusHttpHandler::new(
+    let nexus_http_layer = NexusHttpLayer::new(Arc::new(
+        tokeira_edge::nexus_http::NexusHttpHandler::new(
             namespaces.clone(),
             nexus_store,
             nexus_task_broker,
             nexus_http_waiters,
             nexus_http_authorizer,
-        )));
+        )
+        .with_clock(clock.clone()),
+    ));
     let http_api_layer = HttpApiLayer::new(
         HttpApiCatalog::pinned().context("failed to build Temporal HTTP API route catalog")?,
         HttpApiPolicy::new(
@@ -4038,9 +4210,13 @@ where
             multiplexer.clone(),
             chasm_visibility_sink,
         );
-        if let Some(clock) = extensions.clock {
-            chasm_engine = chasm_engine.with_clock(clock);
-        }
+        // An embedder's CHASM clock wins; otherwise CHASM reads the node's clock
+        // in the Unix nanoseconds its timers are stamped with.
+        let chasm_clock = extensions.clock.unwrap_or_else(|| {
+            let clock = clock.clone();
+            Arc::new(move || i64::try_from(clock.now().unix_timestamp_nanos()).unwrap_or(i64::MAX))
+        });
+        chasm_engine = chasm_engine.with_clock(chasm_clock);
         let chasm_engine = Arc::new(chasm_engine);
         let activity_config = tokeira_chasm_activity::ActivityConfig {
             enable_standalone: effective_config
@@ -4155,6 +4331,10 @@ where
             chasm_engine,
         )
     };
+    let workflow_grpc = match &peer_connector {
+        Some(connector) => workflow_grpc.with_peer_connector(connector.clone()),
+        None => workflow_grpc,
+    };
     // Minimal AdminService (DescribeMutableState) shares the WorkflowService's
     // run repository — the reset conformance suite reads a run's ResetRunId/status.
     let admin_grpc = AdminServiceGrpc::new(workflow_service);
@@ -4196,7 +4376,7 @@ where
     }
 
     let log_broadcast = broadcast::Sender::<LogEvent>::new(LOG_BROADCAST_CAPACITY);
-    let addr = match transport {
+    let (incoming, bound_addr): (ServedIncoming, SocketAddr) = match transport {
         StackTransport::Embedded => {
             startup_guard.disarm();
             return Ok(ConstructedStack::Embedded(EmbeddedStack {
@@ -4214,7 +4394,25 @@ where
                 shard_cleanup,
             }));
         }
-        StackTransport::Network(addr) => addr,
+        StackTransport::Network(addr) => {
+            let listener = TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("failed to bind tokeirad gRPC listener on {addr}"))?;
+            let bound_addr = listener
+                .local_addr()
+                .context("failed to resolve bound local address for tokeirad gRPC listener")?;
+            let accepted = TcpListenerStream::new(listener)
+                .map(|accepted| accepted.map(ServedConnection::Tcp));
+            (Box::pin(accepted), bound_addr)
+        }
+        StackTransport::Provided {
+            transport: provided,
+            ..
+        } => {
+            let accepted =
+                ReceiverStream::new(provided.incoming).map(|pipe| Ok(ServedConnection::Pipe(pipe)));
+            (Box::pin(accepted), advertised_addr)
+        }
     };
 
     // Both reflection protocols are served: `v1alpha` is what the previous
@@ -4228,13 +4426,6 @@ where
         .register_encoded_file_descriptor_set(tokeira_proto::public::FILE_DESCRIPTOR_SET)
         .build_v1alpha()
         .context("failed to build gRPC reflection service")?;
-
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind tokeirad gRPC listener on {addr}"))?;
-    let bound_addr = listener
-        .local_addr()
-        .context("failed to resolve bound local address for tokeirad gRPC listener")?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -4285,7 +4476,7 @@ where
                     .add_service(outbound_grpc.into_service())
                     .add_service(reflection_v1)
                     .add_service(reflection_v1alpha)
-                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal)
+                    .serve_with_incoming_shutdown(incoming, shutdown_signal)
                     .await
             }
             None => {
@@ -4303,7 +4494,7 @@ where
                     .add_service(outbound_grpc.into_service())
                     .add_service(reflection_v1)
                     .add_service(reflection_v1alpha)
-                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal)
+                    .serve_with_incoming_shutdown(incoming, shutdown_signal)
                     .await
             }
         }
@@ -6340,6 +6531,7 @@ mod tests {
             "127.0.0.1:7233".to_owned(),
             false,
             None,
+            system_clock(),
         ))
     }
 

@@ -21,6 +21,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use time::OffsetDateTime;
+use tokeira_clock::Clock;
 use tokeira_kernel::{
     Command, Reject, TimerDueRequest, WORKFLOW_START_DELAY_TIMER_ID,
     WorkflowStartDelayElapsedRequest,
@@ -181,13 +182,13 @@ where
 pub(crate) async fn scan_due_timers_once<R, F, Fut>(
     repo: &R,
     config: &TimerScannerConfig,
+    fired_at: OffsetDateTime,
     mut submit_due_timer: F,
 ) where
     R: RunRepository + ?Sized,
     F: FnMut(DueTimer, OffsetDateTime) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let fired_at = OffsetDateTime::now_utc();
     let due_timers = match repo
         .list_due_timers(fired_at, config.max_timers_per_scan)
         .await
@@ -210,13 +211,13 @@ pub(crate) async fn scan_due_timers_once_for_shard<R, F, Fut>(
     repo: &R,
     shard_id: ShardId,
     config: &TimerScannerConfig,
+    fired_at: OffsetDateTime,
     mut submit_due_timer: F,
 ) where
     R: RunRepository + ?Sized,
     F: FnMut(DueTimer, OffsetDateTime) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let fired_at = OffsetDateTime::now_utc();
     let due_timers = match repo
         .list_due_timers_for_shard(shard_id, fired_at, None, config.max_timers_per_scan)
         .await
@@ -258,6 +259,7 @@ pub(crate) async fn run_timer_scanner<R>(
     shard_owner: Arc<RwLock<ShardOwner>>,
     config: TimerScannerConfig,
     cancel: CancellationToken,
+    clock: Arc<dyn Clock>,
 ) where
     R: RunRepository + 'static,
 {
@@ -274,16 +276,22 @@ pub(crate) async fn run_timer_scanner<R>(
             .collect();
         for shard_id in active_shards {
             runtime_metrics::record_scanner_tick("timer", shard_id.0);
-            scan_due_timers_once_for_shard(&*repo, shard_id, &config, |due, fired_at| {
-                runtime_metrics::record_scanner_dispatched("timer", shard_id.0);
-                let lane = pick_lane_for_run_key(&lanes, lane_count, due.run_key).clone();
-                async move {
-                    let run_key = due.run_key;
-                    lane.submit(run_key, command_for_due_timer(due, fired_at))
-                        .await
-                        .map(|_| ())
-                }
-            })
+            scan_due_timers_once_for_shard(
+                &*repo,
+                shard_id,
+                &config,
+                clock.now(),
+                |due, fired_at| {
+                    runtime_metrics::record_scanner_dispatched("timer", shard_id.0);
+                    let lane = pick_lane_for_run_key(&lanes, lane_count, due.run_key).clone();
+                    async move {
+                        let run_key = due.run_key;
+                        lane.submit(run_key, command_for_due_timer(due, fired_at))
+                            .await
+                            .map(|_| ())
+                    }
+                },
+            )
             .await;
         }
     }

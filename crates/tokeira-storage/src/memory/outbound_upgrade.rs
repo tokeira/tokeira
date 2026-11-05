@@ -9,6 +9,7 @@ use crate::outbound_upgrade::{
     validate_write,
 };
 use anyhow::{Result, ensure};
+use time::OffsetDateTime;
 
 pub(super) fn ready(store: &StoreState) -> bool {
     store
@@ -18,7 +19,8 @@ pub(super) fn ready(store: &StoreState) -> bool {
         && store.runs.values().all(|state| state.outbound.is_some())
 }
 
-fn live_leases(store: &StoreState) -> u64 {
+/// The leases with an owner that haven't lapsed at `now`, on the store's clock.
+fn live_leases(store: &StoreState, now: OffsetDateTime) -> u64 {
     store
         .bundle_leases
         .iter()
@@ -27,7 +29,7 @@ fn live_leases(store: &StoreState) -> u64 {
                 && store
                     .bundle_lease_expiries
                     .get(home)
-                    .is_none_or(|expiry| *expiry > tokio::time::Instant::now())
+                    .is_none_or(|expiry| *expiry > now)
         })
         .count() as u64
 }
@@ -37,7 +39,7 @@ impl InMemoryStore {
         let store = self.inner.lock().await;
         Ok(OutboundUpgradeStatus {
             progress: store.outbound_upgrade.clone(),
-            live_leases: live_leases(&store),
+            live_leases: live_leases(&store, self.clock.now()),
             pending_intents: store.outbound_intents.len() as u64,
             oldest_intent_at: store
                 .outbound_intents
@@ -55,7 +57,7 @@ impl InMemoryStore {
     ) -> Result<()> {
         let mut store = self.inner.lock().await;
         ensure!(
-            live_leases(&store) == 0,
+            live_leases(&store, self.clock.now()) == 0,
             "live leases prevent stopped-cluster preparation"
         );
         ensure!(

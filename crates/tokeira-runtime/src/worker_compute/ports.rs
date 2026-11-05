@@ -6,7 +6,6 @@
 
 use async_trait::async_trait;
 use thiserror::Error;
-use time::OffsetDateTime;
 use tokeira_types::{ControllerInstanceKey, NamespaceId};
 use tokio::sync::mpsc;
 
@@ -129,22 +128,6 @@ pub trait WorkerComputeNamespaceCatalog: Send + Sync {
         &self,
         namespace_id: NamespaceId,
     ) -> Result<Option<String>, WorkerComputeCatalogError>;
-}
-
-/// Explicit clock used by pure controller steps and deterministic tests.
-pub trait WorkerComputeClock: Send + Sync {
-    /// Return the current controller time.
-    fn now(&self) -> OffsetDateTime;
-}
-
-/// Production wall clock; tests substitute a deterministic implementation.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SystemWorkerComputeClock;
-
-impl WorkerComputeClock for SystemWorkerComputeClock {
-    fn now(&self) -> OffsetDateTime {
-        OffsetDateTime::now_utc()
-    }
 }
 
 #[cfg(test)]

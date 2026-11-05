@@ -1338,7 +1338,7 @@ where
                             failure_details: Some(server_failure_payload(&wire_message)),
                             worker_identity: completion_identity,
                             request: failure_request.clone(),
-                            now: OffsetDateTime::now_utc(),
+                            now: self.clock.now(),
                             reset_reapply: Vec::new(),
                             // Consulted only when a reset synthesizes a started
                             // event; a worker-reported failure never does.
@@ -1411,7 +1411,7 @@ where
                             failure_details: Some(server_failure_payload(&persisted_message)),
                             worker_identity: completion_identity,
                             request: failure_request,
-                            now: OffsetDateTime::now_utc(),
+                            now: self.clock.now(),
                             reset_reapply: Vec::new(),
                             // Consulted only when a reset synthesizes a started
                             // event; a worker-reported failure never does.
@@ -1807,7 +1807,7 @@ where
             pinned = target.resolved.pinned,
             "resolved worker deployment target for polled workflow task"
         );
-        let now = OffsetDateTime::now_utc();
+        let now = self.clock.now();
         let request = StartWorkflowTaskRequest {
             logical_seq: offered.logical_seq,
             worker_identity: worker_identity.clone(),

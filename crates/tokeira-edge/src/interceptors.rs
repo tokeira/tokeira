@@ -26,6 +26,7 @@ use tokeira_auth::{
     Access, AuthPrincipal, Authorizer, AuthzDecision, CallClassification, CallTarget, ClaimMapper,
     Claims, Scope, WorkerCallTarget, WorkerOperation, WorkerScopeDenyReason, WorkerTarget,
 };
+use tokeira_clock::{Clock, system_clock};
 use tokeira_types::{EventPrincipal, NamespaceId, WorkerTaskClass};
 
 use crate::{
@@ -1111,6 +1112,10 @@ pub struct EdgeInterceptors {
     authenticator: Arc<dyn Authenticator>,
     namespaces: Arc<dyn NamespaceCache>,
     principal_attribution: bool,
+    /// The edge's clock: it stamps `received_at`, and every edge service that
+    /// holds these interceptors reads the time from it. It must be the
+    /// runtime's clock, so a deadline the edge stamps is judged on the same time.
+    clock: Arc<dyn Clock>,
 }
 
 impl std::fmt::Debug for EdgeInterceptors {
@@ -1135,6 +1140,7 @@ impl EdgeInterceptors {
             authenticator,
             namespaces,
             principal_attribution: false,
+            clock: system_clock(),
         }
     }
 
@@ -1144,6 +1150,7 @@ impl EdgeInterceptors {
             authenticator: Arc::new(AllowAllAuthenticator),
             namespaces,
             principal_attribution: false,
+            clock: system_clock(),
         }
     }
 
@@ -1158,7 +1165,20 @@ impl EdgeInterceptors {
             authenticator,
             namespaces,
             principal_attribution,
+            clock: system_clock(),
         }
+    }
+
+    /// Read the time from `clock` instead of the system clock. Pass the
+    /// runtime's clock.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The edge's clock.
+    pub fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
     }
 
     /// Perform the standard edge pipeline:
@@ -1289,7 +1309,7 @@ impl EdgeInterceptors {
             claims,
             auth_principal,
             namespace,
-            received_at: OffsetDateTime::now_utc(),
+            received_at: self.clock.now(),
             is_long_poll,
         })
     }
@@ -1478,7 +1498,7 @@ impl EdgeInterceptors {
                 // context carries no active-namespace resolution, exactly as
                 // on the by-name path.
                 namespace: None,
-                received_at: OffsetDateTime::now_utc(),
+                received_at: self.clock.now(),
                 is_long_poll: false,
             },
             namespace,

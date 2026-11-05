@@ -356,7 +356,7 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
     R: RunRepository + 'static,
 {
     let tracking = &deps.tracking;
-    let now = OffsetDateTime::now_utc();
+    let now = deps.clock.now();
     let mut submitted = 0usize;
 
     let entries = tracking.inner.snapshot(shard_id);
@@ -744,7 +744,7 @@ pub(crate) async fn run_activity_timeout_scanner<R>(
             crate::activity_eligibility::scan_activity_eligibility_once(
                 &deps,
                 shard_id,
-                OffsetDateTime::now_utc(),
+                deps.clock.now(),
             )
             .await;
         }

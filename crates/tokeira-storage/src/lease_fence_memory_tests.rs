@@ -20,6 +20,35 @@ impl MemoryLeases {
     fn new() -> Self {
         Self(InMemoryStore::with_shard_count(1).with_lease_duration(time::Duration::seconds(30)))
     }
+
+    /// As [`MemoryLeases::new`], judging expiry on tokio's paused time, so a
+    /// test can advance the clock its leases lapse by.
+    fn on_paused_tokio_time() -> Self {
+        let store = Self::new().0.with_clock(Arc::new(PausedTokioClock::new()));
+        Self(store)
+    }
+}
+
+/// A clock that follows tokio's paused time from when it was made.
+#[derive(Debug)]
+struct PausedTokioClock {
+    started_at: OffsetDateTime,
+    started: tokio::time::Instant,
+}
+
+impl PausedTokioClock {
+    fn new() -> Self {
+        Self {
+            started_at: OffsetDateTime::now_utc(),
+            started: tokio::time::Instant::now(),
+        }
+    }
+}
+
+impl Clock for PausedTokioClock {
+    fn now(&self) -> OffsetDateTime {
+        self.started_at + self.started.elapsed()
+    }
 }
 
 const HOME: ShardId = ShardId(0);
@@ -53,9 +82,7 @@ impl LeaseBackend for MemoryLeases {
     async fn expire_lease(&self) -> Result<()> {
         let mut store = self.0.inner.lock().await;
         if store.bundle_leases.contains_key(&HOME) {
-            store
-                .bundle_lease_expiries
-                .insert(HOME, tokio::time::Instant::now());
+            store.bundle_lease_expiries.insert(HOME, self.0.clock.now());
         }
         Ok(())
     }
@@ -146,10 +173,10 @@ async fn a_materialization_under_a_lost_fence_writes_nothing() {
 }
 
 /// With a lease duration, the memory store's acquisition takes over an expired
-/// lease and refuses an unexpired one, by the tokio clock.
+/// lease and refuses an unexpired one, by the store's clock.
 #[tokio::test(start_paused = true)]
 async fn an_unrenewed_lease_lapses_after_its_duration() {
-    let backend = MemoryLeases::new();
+    let backend = MemoryLeases::on_paused_tokio_time();
     let epoch = acquire(&backend, OWNERS[0]).await;
     let refused = backend
         .0

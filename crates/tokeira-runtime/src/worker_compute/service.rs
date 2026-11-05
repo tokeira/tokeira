@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use time::OffsetDateTime;
+use tokeira_clock::Clock;
 use tokeira_storage::{RunRepository, WorkerComputeHealthFilter, WorkerComputeRepository};
 use tokeira_types::{ControllerInstanceKey, ShardId, WorkerComputeControllerLifecycle};
 use tokio::{sync::mpsc, task::JoinSet};
@@ -16,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     ACTION_DELIVERY_IDLE_INTERVAL, CATALOG_RECONCILE_INTERVAL, DemandObservation,
-    ObservationBatcher, QUEUE_SAMPLE_INTERVAL, WorkerComputeClock, WorkerComputeNamespace,
+    ObservationBatcher, QUEUE_SAMPLE_INTERVAL, WorkerComputeNamespace,
     WorkerComputeNamespaceCatalog, WorkerComputeOutbox, WorkerComputeQueueSampler,
     WorkerComputeReconciler,
 };
@@ -32,7 +33,7 @@ pub struct WorkerComputeControllerService<R> {
     reconciler: WorkerComputeReconciler,
     sampler: Arc<WorkerComputeQueueSampler<R>>,
     outbox: WorkerComputeOutbox,
-    clock: Arc<dyn WorkerComputeClock>,
+    clock: Arc<dyn Clock>,
     active_shards: WorkerComputeActiveShards,
     observations: mpsc::Receiver<DemandObservation>,
     reconcile_hints: mpsc::Receiver<ControllerInstanceKey>,
@@ -60,7 +61,7 @@ where
         reconciler: WorkerComputeReconciler,
         sampler: WorkerComputeQueueSampler<R>,
         outbox: WorkerComputeOutbox,
-        clock: Arc<dyn WorkerComputeClock>,
+        clock: Arc<dyn Clock>,
         active_shards: WorkerComputeActiveShards,
         observations: mpsc::Receiver<DemandObservation>,
         reconcile_hints: mpsc::Receiver<ControllerInstanceKey>,
@@ -123,7 +124,7 @@ where
 async fn run_reconciliation_loop(
     reconciler: WorkerComputeReconciler,
     catalog: Arc<dyn WorkerComputeNamespaceCatalog>,
-    clock: Arc<dyn WorkerComputeClock>,
+    clock: Arc<dyn Clock>,
     mut hints: mpsc::Receiver<ControllerInstanceKey>,
     shutdown: CancellationToken,
 ) {
@@ -191,7 +192,7 @@ async fn reconcile_hint(
 async fn run_observation_loop(
     reconciler: WorkerComputeReconciler,
     catalog: Arc<dyn WorkerComputeNamespaceCatalog>,
-    clock: Arc<dyn WorkerComputeClock>,
+    clock: Arc<dyn Clock>,
     mut observations: mpsc::Receiver<DemandObservation>,
     shutdown: CancellationToken,
 ) {
@@ -257,7 +258,7 @@ async fn run_sampling_loop<R>(
     catalog: Arc<dyn WorkerComputeNamespaceCatalog>,
     repository: Arc<dyn WorkerComputeRepository>,
     sampler: Arc<WorkerComputeQueueSampler<R>>,
-    clock: Arc<dyn WorkerComputeClock>,
+    clock: Arc<dyn Clock>,
     active_shards: WorkerComputeActiveShards,
     shutdown: CancellationToken,
 ) where
@@ -419,8 +420,8 @@ mod tests {
     use crate::{
         DemandObservationSink, DisabledWorkerComputeSink, InMemoryActivityBroker, InMemoryBroker,
         NexusEndpointRegistry, NexusTaskBroker, ObserveResult, ProviderActionInput,
-        RemoteNexusProvider, SystemWorkerComputeClock, WorkerComputeProvider,
-        WorkerComputeProviderAction, WorkerComputeProviderAttempt, WorkerComputeProviderOutcome,
+        RemoteNexusProvider, WorkerComputeProvider, WorkerComputeProviderAction,
+        WorkerComputeProviderAttempt, WorkerComputeProviderOutcome,
         WorkerComputeProviderTargetKind, WorkerComputeQueueMetrics, WorkerComputeReconcileSink,
         build_provider_action,
     };
@@ -630,7 +631,7 @@ mod tests {
         let outbox = WorkerComputeOutbox::new(
             controller_repository.clone(),
             provider.clone(),
-            Arc::new(SystemWorkerComputeClock),
+            tokeira_clock::system_clock(),
             owner,
         );
         let (_observation_sender, observation_receiver) = mpsc::channel(1);
@@ -641,7 +642,7 @@ mod tests {
             reconciler,
             sampler,
             outbox,
-            Arc::new(SystemWorkerComputeClock),
+            tokeira_clock::system_clock(),
             Arc::new(Vec::new),
             observation_receiver,
             reconcile_receiver,

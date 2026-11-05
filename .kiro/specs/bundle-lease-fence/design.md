@@ -191,8 +191,9 @@ changes. No statement of a refresh or a renewal SHALL write the epoch, and no re
   `FOR UPDATE`.
 - **Release** stays an update that clears the owner and advances the epoch.
 - **The in-memory store** follows the same statements under its lock. Built with a lease duration
-  (`InMemoryStore::with_lease_duration`), it also expires a lease its owner hasn't renewed, by the tokio clock,
-  so tests can take a lapsed lease over; without one, a lease lasts until it is released. A renewal of a lease it
+  (`InMemoryStore::with_lease_duration`), it also expires a lease its owner hasn't renewed, judged on the store's
+  clock (`InMemoryStore::with_clock`), so tests can take a lapsed lease over; without one, a lease lasts until it is
+  released. A renewal of a lease it
   doesn't hold is refused, as on DSQL.
 - A renewal and a takeover update the same row, so DSQL commits at most one of them if they overlap. A renewal that
   loses answers a conflict, and the renewer's next attempt answers `Rejected`.

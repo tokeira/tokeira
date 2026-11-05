@@ -37,11 +37,12 @@ shape.
 |---|---|
 | [`tokeira-projection`](projection.md) | Derived visibility rows, SQL-native advanced visibility, rollups, and checkpoints |
 
-## Cross-cutting — 5 crates
+## Cross-cutting — 6 crates
 
 | Crate | Role |
 |---|---|
 | [`tokeira-build-info`](build-info.md) | Immutable build, compatibility, toolchain, and schema provenance |
+| [`tokeira-clock`](clock.md) | The wall clock storage, the runtime, and the edge read the current time from |
 | [`tokeira-config`](config.md) | Typed daemon and embedded-engine configuration, loading, overlays, validation, and secret references |
 | [`tokeira-engine`](engine.md) | Embeddable engine facade and the shared `tokeirad` service bootstrap |
 | [`tokeira-managed-dsql`](managed-dsql.md) | Crash-safe lifecycle ownership for a dedicated embedded Aurora DSQL cluster |

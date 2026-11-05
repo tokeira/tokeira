@@ -12,6 +12,7 @@ members = [
     "crates/tokeira-conformance-proto",
     "crates/tokeira-conformance-control",
     "crates/tokeira-auth",
+    "crates/tokeira-clock",
     "crates/tokeira-types",
     "crates/tokeira-proto",
     "crates/tokeira-kernel",
@@ -193,6 +194,7 @@ tokeira-conformance = { path = "crates/tokeira-conformance" }
 tokeira-conformance-proto = { path = "crates/tokeira-conformance-proto" }
 tokeira-conformance-control = { path = "crates/tokeira-conformance-control" }
 tokeira-auth = { path = "crates/tokeira-auth", version = "0.7.0" }
+tokeira-clock = { path = "crates/tokeira-clock", version = "0.7.0" }
 tokeira-build = { path = "crates/tokeira-build" }
 # Deployment-repository machinery (spec-sanctioned dependency additions):
 # TUF client/authoring, KMS-held role keys, and the timestamp types tough's

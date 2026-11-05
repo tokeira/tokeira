@@ -13,7 +13,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -1112,7 +1112,9 @@ impl Engine for ChasmEngine {
 
     async fn poll_component(&self, req: PollRequest) -> Result<PollOutcome, ChasmError> {
         let notify = self.poller_notify(&req.key);
-        let deadline = Instant::now()
+        // tokio's clock, not std's: a simulation pauses and advances tokio time,
+        // and a std deadline judged against it would never arrive.
+        let deadline = tokio::time::Instant::now()
             + self
                 .config
                 .long_poll_timeout
@@ -1128,11 +1130,10 @@ impl Engine for ChasmEngine {
                 return Ok(PollOutcome::Advanced(outcome));
             }
 
-            let now = Instant::now();
-            if now >= deadline {
+            if tokio::time::Instant::now() >= deadline {
                 return Ok(PollOutcome::Empty);
             }
-            let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+            let sleep = tokio::time::sleep_until(deadline);
             tokio::select! {
                 _ = notified => {}
                 _ = sleep => return Ok(PollOutcome::Empty),

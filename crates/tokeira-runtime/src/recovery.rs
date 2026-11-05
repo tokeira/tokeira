@@ -678,6 +678,7 @@ mod tests {
             tracking: ActivityTrackingState::default(),
             worker_deployment_registry: Arc::new(RwLock::new(None)),
             lanes: Vec::new(),
+            clock: tokeira_clock::system_clock(),
         }
     }
 
@@ -2194,6 +2195,7 @@ mod tests {
                     &store,
                     target_shard,
                     &config,
+                    OffsetDateTime::now_utc(),
                     |due, _fired_at| {
                         let submitted =
                             submitted_clone.clone();

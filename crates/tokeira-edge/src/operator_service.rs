@@ -359,6 +359,7 @@ impl OperatorService {
 
         let delay = namespace_delete_delay(req.namespace_delete_delay);
         let response_name = deleted_name.clone();
+        let clock = self.interceptors.clock().clone();
         tokio::spawn(async move {
             if let Err(error) = config.deletion.reclaim_namespace_runs(namespace_id).await {
                 // Retaining the tombstone makes incomplete reclaim observable and lets an
@@ -376,10 +377,13 @@ impl OperatorService {
                 // A client-supplied delete delay can exceed Instant's range.
                 // Preserve the deadline through the same bounded waits used by
                 // recovered workflow timers.
-                tokeira_runtime::deadline::sleep_until(deadline_after(
-                    time::OffsetDateTime::now_utc(),
-                    time::Duration::try_from(delay).unwrap_or(time::Duration::MAX),
-                ))
+                tokeira_runtime::deadline::sleep_until(
+                    clock.as_ref(),
+                    deadline_after(
+                        clock.now(),
+                        time::Duration::try_from(delay).unwrap_or(time::Duration::MAX),
+                    ),
+                )
                 .await;
             } else {
                 // Temporal waits for namespace-cache refresh before reclaim even when the

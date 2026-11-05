@@ -26,7 +26,7 @@ use std::{
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use smallvec::SmallVec;
-use time::OffsetDateTime;
+use tokeira_clock::{Clock, system_clock};
 use tokeira_kernel::{
     Command, DispatchOp, HistoryEvent, HistoryEventKind, Kernel, LoadedRun, StartRequest,
 };
@@ -523,6 +523,7 @@ where
         update_registry,
         Arc::new(Mutex::new(HashSet::new())),
         config,
+        system_clock(),
     )
 }
 
@@ -539,6 +540,7 @@ pub(crate) fn spawn_lane_with_id<K, R, P>(
     update_registry: UpdateRegistry,
     close_attempt_tracking: Arc<Mutex<HashSet<RunKey>>>,
     config: LaneConfig,
+    clock: Arc<dyn Clock>,
 ) -> LaneHandle
 where
     K: Kernel + Send + Sync + 'static,
@@ -612,6 +614,7 @@ where
                 message,
                 &config,
                 &mut cache,
+                clock.as_ref(),
             ))
             .await;
             if carry_over.is_some() {
@@ -705,6 +708,7 @@ where
         first_message,
         config,
         &mut cache,
+        &tokeira_clock::SystemClock,
     ))
     .await
 }
@@ -737,6 +741,7 @@ async fn run_activation_with_cache<K, R, P>(
     first_message: LaneMessage,
     config: &LaneConfig,
     cache: &mut LaneCache,
+    clock: &dyn Clock,
 ) -> Option<LaneMessage>
 where
     K: Kernel + Send + Sync + 'static,
@@ -779,6 +784,7 @@ where
             config.max_occ_retries,
             cache,
             &mut write_admission,
+            clock,
         ))
         .instrument(processing_span.clone())
         .await;
@@ -795,7 +801,8 @@ where
         });
         let (result, committed_command) = match &breach {
             Some(breach) => {
-                let terminate = crate::run_growth::terminate_command(message.run_key, breach);
+                let terminate =
+                    crate::run_growth::terminate_command(message.run_key, breach, clock.now());
                 let terminated = handle_message_with_cache(
                     kernel,
                     repo,
@@ -806,6 +813,7 @@ where
                     config.max_occ_retries,
                     cache,
                     &mut write_admission,
+                    clock,
                 )
                 .instrument(processing_span.clone())
                 .await;
@@ -1167,6 +1175,7 @@ where
         max_retries,
         &mut cache,
         &mut None,
+        &tokeira_clock::SystemClock,
     )
     .await
 }
@@ -1228,6 +1237,7 @@ async fn handle_message_with_cache<K, R>(
     max_retries: u32,
     cache: &mut LaneCache,
     write_admission: &mut Option<crate::serving_gate::WritePermit>,
+    clock: &dyn Clock,
 ) -> Result<(
     CommitResult,
     SmallVec<[DispatchOp; 4]>,
@@ -1251,6 +1261,7 @@ where
         max_retries,
         cache,
         write_admission,
+        clock,
     ))
     .await
 }
@@ -1270,6 +1281,7 @@ async fn handle_message_with_successor<K, R>(
     max_retries: u32,
     cache: &mut LaneCache,
     write_admission: &mut Option<crate::serving_gate::WritePermit>,
+    clock: &dyn Clock,
 ) -> Result<(
     CommitResult,
     SmallVec<[DispatchOp; 4]>,
@@ -1289,7 +1301,7 @@ where
     }
     // Start timing is frozen across OCC retries, independently of the retry/cron
     // delay evaluation clock carried in the plan (see successor::build_successor_start).
-    let successor_now = OffsetDateTime::now_utc();
+    let successor_now = clock.now();
     let mut attempts = 0u32;
     let mut original_acquisition = outbound
         .map(|submission| &submission.attempt)
@@ -2092,6 +2104,7 @@ mod tests {
         task::Poll,
         time::{Duration as StdDuration, Instant},
     };
+    use tokeira_clock::SystemClock;
     use tokeira_storage::WriteFence;
 
     use opentelemetry::trace::TracerProvider;
@@ -3248,6 +3261,7 @@ mod tests {
             config.max_occ_retries,
             &mut cache,
             &mut None,
+            &SystemClock,
         )
         .await
         .unwrap();
@@ -3263,6 +3277,7 @@ mod tests {
             config.max_occ_retries,
             &mut cache,
             &mut None,
+            &SystemClock,
         )
         .await
         .unwrap();
@@ -3316,6 +3331,7 @@ mod tests {
             2,
             &mut cache,
             &mut None,
+            &SystemClock,
         )
         .await
         .unwrap();
@@ -3356,6 +3372,7 @@ mod tests {
             2,
             &mut cache,
             &mut None,
+            &SystemClock,
         )
         .await
         .unwrap();
@@ -3382,6 +3399,7 @@ mod tests {
             2,
             &mut cache,
             &mut None,
+            &SystemClock,
         )
         .await
         .unwrap();
@@ -3447,6 +3465,7 @@ mod tests {
             config.max_occ_retries,
             &mut cache,
             &mut None,
+            &SystemClock,
         )
         .await
         .unwrap();

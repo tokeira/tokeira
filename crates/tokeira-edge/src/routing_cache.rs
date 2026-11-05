@@ -8,11 +8,13 @@ use std::{future::Future, sync::Arc};
 
 use anyhow::{Result, anyhow};
 use arc_swap::ArcSwap;
+use connectrpc::client::ClientTransport;
 use thiserror::Error;
 use tokeira_proto::connect::tokeira::internal::controller::v1::{
     self as pb, PlacementControllerClient, RefreshBundleRequest, RoutingUpdateView,
     SubscribeRoutingRequest, bundle_ownership_entry, node_endpoint_entry,
 };
+use tokeira_runtime::ControllerConnection;
 use tokeira_storage::LeaseRepository;
 use tokeira_types::{
     BundleId, BundleOwner, GenerationCounter, IncarnationId, NamespaceId, NodeEndpoint,
@@ -193,11 +195,32 @@ pub struct RoutedBundle {
 // ── Subscription ────────────────────────────────────────────────────────────
 
 /// Connect to the controller and apply the first routing snapshot.
+///
+/// `connection` is `None` in production, which dials `controller_endpoint`
+/// over TCP; see [`ControllerConnection`].
 pub async fn subscribe_routing_once(
     cache: Arc<RoutingCache>,
     controller_endpoint: String,
+    connection: Option<ControllerConnection>,
 ) -> Result<()> {
-    let client = make_client(&controller_endpoint);
+    let config = client_config(&controller_endpoint);
+    match connection {
+        None => first_routing_snapshot(cache, plaintext_client(config)).await,
+        Some(connection) => {
+            first_routing_snapshot(cache, PlacementControllerClient::new(connection, config)).await
+        }
+    }
+}
+
+async fn first_routing_snapshot<T>(
+    cache: Arc<RoutingCache>,
+    client: PlacementControllerClient<T>,
+) -> Result<()>
+where
+    T: ClientTransport,
+    T::ResponseBody: Unpin,
+    <T::ResponseBody as connectrpc::http_body::Body>::Error: std::fmt::Display,
+{
     let mut stream = client
         .subscribe_routing(SubscribeRoutingRequest::default())
         .await
@@ -214,9 +237,13 @@ pub async fn subscribe_routing_once(
 }
 
 /// Long-running subscription loop with reconnect backoff.
+///
+/// `connection` is `None` in production, which dials the configured endpoint
+/// over TCP on every reconnect; see [`ControllerConnection`].
 pub async fn run_routing_subscription(
     cache: Arc<RoutingCache>,
     config: EdgeRoutingConfig,
+    connection: Option<ControllerConnection>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let mut backoff = std::time::Duration::from_secs(1);
@@ -224,13 +251,26 @@ pub async fn run_routing_subscription(
         if shutdown.is_cancelled() {
             return Ok(());
         }
-        match subscribe_until_disconnect(
-            Arc::clone(&cache),
-            config.controller_endpoint.clone(),
-            shutdown.clone(),
-        )
-        .await
-        {
+        let client_config = client_config(&config.controller_endpoint);
+        let subscribed = match &connection {
+            None => {
+                subscribe_until_disconnect(
+                    Arc::clone(&cache),
+                    plaintext_client(client_config),
+                    shutdown.clone(),
+                )
+                .await
+            }
+            Some(connection) => {
+                subscribe_until_disconnect(
+                    Arc::clone(&cache),
+                    PlacementControllerClient::new(connection.clone(), client_config),
+                    shutdown.clone(),
+                )
+                .await
+            }
+        };
+        match subscribed {
             Ok(()) => return Ok(()),
             Err(error) if error.is::<PlacementConfigurationMismatch>() => return Err(error),
             Err(error) => {
@@ -245,12 +285,16 @@ pub async fn run_routing_subscription(
     }
 }
 
-async fn subscribe_until_disconnect(
+async fn subscribe_until_disconnect<T>(
     cache: Arc<RoutingCache>,
-    controller_endpoint: String,
+    client: PlacementControllerClient<T>,
     shutdown: tokio_util::sync::CancellationToken,
-) -> Result<()> {
-    let client = make_client(&controller_endpoint);
+) -> Result<()>
+where
+    T: ClientTransport,
+    T::ResponseBody: Unpin,
+    <T::ResponseBody as connectrpc::http_body::Body>::Error: std::fmt::Display,
+{
     let mut stream = client
         .subscribe_routing(SubscribeRoutingRequest::default())
         .await
@@ -277,7 +321,7 @@ pub async fn refresh_bundle_from_controller(
     controller_endpoint: String,
     bundle_id: BundleId,
 ) -> Result<Option<(NodeEndpoint, ShardEpoch)>, RoutingError> {
-    let client = make_client(&controller_endpoint);
+    let client = plaintext_client(client_config(&controller_endpoint));
     let response = client
         .refresh_bundle(RefreshBundleRequest {
             bundle_id: bundle_id.0,
@@ -381,14 +425,18 @@ where
 
 // ── Internal helpers ────────────────────────────────────────────────────────
 
-/// Construct a connect-rust client for the controller.
-/// HttpClient handles connection pooling internally.
-fn make_client(endpoint: &str) -> PlacementControllerClient<connectrpc::client::HttpClient> {
-    let http = connectrpc::client::HttpClient::plaintext();
-    let config = connectrpc::client::ClientConfig::new(
+fn client_config(endpoint: &str) -> connectrpc::client::ClientConfig {
+    connectrpc::client::ClientConfig::new(
         endpoint.parse().expect("invalid controller endpoint URI"),
-    );
-    PlacementControllerClient::new(http, config)
+    )
+}
+
+/// The production controller client. HttpClient handles connection pooling
+/// internally.
+fn plaintext_client(
+    config: connectrpc::client::ClientConfig,
+) -> PlacementControllerClient<connectrpc::client::HttpClient> {
+    PlacementControllerClient::new(connectrpc::client::HttpClient::plaintext(), config)
 }
 
 /// Apply a routing update working directly from the zero-copy view.

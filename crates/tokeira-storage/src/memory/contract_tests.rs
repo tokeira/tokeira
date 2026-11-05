@@ -208,10 +208,12 @@ impl ContractBackend for InMemoryStore {
     }
 
     async fn expire_lease(&self, home: ShardId) -> Result<()> {
-        self.inner.lock().await.bundle_lease_expiries.insert(
-            home,
-            tokio::time::Instant::now() - std::time::Duration::from_secs(1),
-        );
+        let lapsed = self.clock.now() - time::Duration::seconds(1);
+        self.inner
+            .lock()
+            .await
+            .bundle_lease_expiries
+            .insert(home, lapsed);
         Ok(())
     }
 

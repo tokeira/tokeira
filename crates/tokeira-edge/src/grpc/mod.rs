@@ -14,3 +14,4 @@ pub mod workflow_dispatch;
 pub mod workflow_offer;
 
 pub(crate) mod peer_transport;
+pub use peer_transport::PeerConnector;

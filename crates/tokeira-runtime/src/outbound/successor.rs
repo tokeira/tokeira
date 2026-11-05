@@ -212,6 +212,7 @@ pub(crate) async fn run<R: RunRepository + 'static>(
     cancel: CancellationToken,
     shutdown: crate::shutdown::RuntimeShutdownHandle,
 ) {
+    let clock = publisher.clock.clone();
     let executor = Arc::new(Recovery {
         repo: repo.clone(),
         publisher,
@@ -220,5 +221,5 @@ pub(crate) async fn run<R: RunRepository + 'static>(
         wft_timeouts,
         shutdown,
     });
-    driver::run(repo, executor, owner, cancel).await;
+    driver::run(repo, executor, owner, cancel, clock).await;
 }

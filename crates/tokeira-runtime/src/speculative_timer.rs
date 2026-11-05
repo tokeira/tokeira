@@ -28,6 +28,7 @@ use std::{
 };
 
 use time::OffsetDateTime;
+use tokeira_clock::Clock;
 use tokeira_kernel::{Command, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType};
 use tokeira_types::{LogicalTaskSeq, RunKey, ShardId};
 use tokio_util::sync::CancellationToken;
@@ -54,14 +55,21 @@ pub struct SpeculativeTimerSet {
     /// and populated by the time any timer actually fires.
     lanes: Arc<Mutex<Vec<LaneHandle>>>,
     lane_count: usize,
+    /// The clock the speculative deadlines were stamped with.
+    clock: Arc<dyn Clock>,
 }
 
 impl SpeculativeTimerSet {
-    pub fn new(lanes: Arc<Mutex<Vec<LaneHandle>>>, lane_count: usize) -> Self {
+    pub fn new(
+        lanes: Arc<Mutex<Vec<LaneHandle>>>,
+        lane_count: usize,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             lanes,
             lane_count,
+            clock,
         }
     }
 
@@ -83,10 +91,11 @@ impl SpeculativeTimerSet {
         let task_cancel = cancel.clone();
         let lanes = self.lanes.clone();
         let lane_count = self.lane_count;
+        let clock = self.clock.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = task_cancel.cancelled() => return,
-                _ = crate::deadline::sleep_until(deadline) => {}
+                _ = crate::deadline::sleep_until(clock.as_ref(), deadline) => {}
             }
             let timeout_type = match kind {
                 WftTimeoutKind::StartToClose => WorkflowTaskTimeoutType::StartToClose,
@@ -114,7 +123,7 @@ impl SpeculativeTimerSet {
                         logical_seq,
                         started_event_id,
                         timeout_type,
-                        now: OffsetDateTime::now_utc(),
+                        now: clock.now(),
                     }),
                 )
                 .await;

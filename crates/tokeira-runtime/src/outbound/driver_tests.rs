@@ -244,7 +244,7 @@ proptest! {
 
             let executor = Arc::new(RecordingExecutor::new(false));
             let cancel = CancellationToken::new();
-            let worker = tokio::spawn(run(repo, executor.clone(), owner(), cancel.clone()));
+            let worker = tokio::spawn(run(repo, executor.clone(), owner(), cancel.clone(), tokeira_clock::system_clock()));
             for _ in 0..40 {
                 tokio::time::advance(Duration::from_millis(200)).await;
                 for _ in 0..16 { tokio::task::yield_now().await; }
@@ -322,7 +322,13 @@ async fn admission_is_bounded_and_shutdown_drops_blocked_attempts() {
     let (repo, _) = fixture(100).await;
     let executor = Arc::new(RecordingExecutor::new(true));
     let cancel = CancellationToken::new();
-    let worker = tokio::spawn(run(repo, executor.clone(), owner(), cancel.clone()));
+    let worker = tokio::spawn(run(
+        repo,
+        executor.clone(),
+        owner(),
+        cancel.clone(),
+        tokeira_clock::system_clock(),
+    ));
     tokio::time::timeout(Duration::from_secs(10), executor.reached.notified())
         .await
         .unwrap();
@@ -373,6 +379,7 @@ async fn blocked_home_cannot_take_another_homes_admission() {
         executor.clone(),
         Arc::new(RwLock::new(ownership)),
         cancel.clone(),
+        tokeira_clock::system_clock(),
     ));
     tokio::time::timeout(Duration::from_secs(10), async {
         while executor.active.load(Ordering::SeqCst) < 2 * MAX_PER_HOME {
@@ -442,6 +449,7 @@ async fn many_homes_discover_new_row_within_one_cycle() {
         executor.clone(),
         Arc::new(RwLock::new(ownership)),
         cancel.clone(),
+        tokeira_clock::system_clock(),
     ));
     for _ in 0..17 {
         executor.round_started.notified().await;
@@ -566,6 +574,7 @@ async fn backlogged_first_kind_cannot_starve_another_kind() {
         executor.clone(),
         Arc::new(RwLock::new(ownership)),
         cancel.clone(),
+        tokeira_clock::system_clock(),
     ));
     // Home zero is visited in rounds 1, 9, 17 and 25. Stop after that fourth
     // visit, before round 33 could give a broken walk a fifth opportunity.

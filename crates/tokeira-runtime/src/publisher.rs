@@ -21,6 +21,7 @@ use opentelemetry::{
     trace::TraceContextExt as _,
 };
 use time::OffsetDateTime;
+use tokeira_clock::{Clock, system_clock};
 use tokeira_kernel::{
     CallbackAttemptOutcome, CallbackCompletionOutcome, CallbackSpec, CallbackState, Command,
     CompletionCallback, CompletionCallbackAttemptedRequest, DispatchOp, Link, LoadedRun,
@@ -188,6 +189,9 @@ pub struct RuntimeDispatchPublisher<R> {
     /// Resolves the originator namespace name for the External-endpoint outbound metric.
     /// `None` outside the full server (unit harnesses), where the metric is then omitted.
     namespace_resolver: Option<Arc<dyn NexusNamespaceResolver>>,
+    /// Stamps and judges callback, outbound and delayed-dispatch deadlines; the
+    /// runtime's clock, so the lanes and scanners judge what this stamps.
+    pub(crate) clock: Arc<dyn Clock>,
 }
 
 // Manual impl: composed of trait objects with no `Debug` bound.
@@ -222,6 +226,7 @@ impl<R> Clone for RuntimeDispatchPublisher<R> {
             delivery_metrics: self.delivery_metrics.clone(),
             worker_deployment_registry: self.worker_deployment_registry.clone(),
             namespace_resolver: self.namespace_resolver.clone(),
+            clock: self.clock.clone(),
         }
     }
 }
@@ -268,6 +273,7 @@ where
             delivery_metrics,
             worker_deployment_registry: None,
             namespace_resolver: None,
+            clock: system_clock(),
         }
     }
 
@@ -405,6 +411,12 @@ where
 
     pub(crate) fn with_outbound_wake(mut self, wake: Arc<tokio::sync::Notify>) -> Self {
         self.outbound_wake = wake;
+        self
+    }
+
+    /// Read deadlines through `clock` instead of the system clock.
+    pub(crate) fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -583,7 +595,7 @@ where
             || (callback.state == CallbackState::BackingOff
                 && callback
                     .next_attempt_at
-                    .is_none_or(|due| due > OffsetDateTime::now_utc()))
+                    .is_none_or(|due| due > self.clock.now()))
         {
             return;
         }
@@ -634,7 +646,7 @@ where
         )) => result.unwrap_or_else(|_| Err(anyhow::anyhow!("callback delivery timed out"))),
         };
 
-        let now = OffsetDateTime::now_utc();
+        let now = self.clock.now();
         let attempt_outcome = match delivery {
             Ok(CompletionDeliveryOutcome::Delivered) => CallbackAttemptOutcome::Succeeded,
             Ok(CompletionDeliveryOutcome::NonRetryableError { detail }) => {
@@ -1179,7 +1191,7 @@ where
                         );
                         // The owner's eligibility index evaluates delayed rules;
                         // queue-home discovery supplies offers once the row is due.
-                        if *dispatch_at <= OffsetDateTime::now_utc()
+                        if *dispatch_at <= self.clock.now()
                             && let Err(error) = async {
                                 #[cfg(test)]
                                 self.fail_publication(tokeira_types::TaskKind::Activity)?;
@@ -1291,7 +1303,7 @@ pub(crate) async fn scan_completion_callbacks_once<R>(
 ) where
     R: RunRepository + 'static,
 {
-    let now = OffsetDateTime::now_utc();
+    let now = publisher.clock.now();
     let entries = tracking.inner.snapshot(shard_id);
     let mut fired = 0usize;
 

@@ -111,9 +111,12 @@ snapshot restart support.
 `EngineBuilder::clock` sets the CHASM plane's nanosecond time source. It is the
 plane's definitive clock: transitions, pure deadlines, delayed dispatch, callback
 registration and sweeper passes all read it, which is what makes a simulated
-clock usable in tests. Workflow time is unchanged, and two real-time uses are
+clock usable in tests. Workflow time is unchanged, and two uses outside it are
 sanctioned and named in the spec — a component long poll's transport deadline,
-and the task-token provenance lifetime that storage enforces on real time.
+and the task-token provenance lifetime that storage enforces on the node's
+clock. Without `EngineBuilder::clock`, the plane reads the node's clock (see
+[tokeira-clock](clock.md)): the host's in production, or the one a harness
+passes to `TokeiradHandle::start_in_memory_with_transport`.
 
 ## Contracts
 

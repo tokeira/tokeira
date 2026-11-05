@@ -158,6 +158,15 @@ impl WorkflowServiceGrpc {
         self
     }
 
+    /// Forward workflow-task replies to their owner through `connector`
+    /// instead of a TCP dial.
+    pub fn with_peer_connector(mut self, connector: super::peer_transport::PeerConnector) -> Self {
+        self.peer_channels = Arc::new(super::peer_transport::PeerChannels::with_connector(
+            connector,
+        ));
+        self
+    }
+
     async fn workflow_reply_client(
         &self,
         headers: &http::HeaderMap,
@@ -1308,14 +1317,15 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             {
                 if let Some(target) = &task.version_target {
                     let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
-                    // Provenance is a real-time storage lifetime: get() in
-                    // crates/tokeira-storage/src/memory.rs and
+                    // Provenance is a storage lifetime judged on the node's clock: get()
+                    // in crates/tokeira-storage/src/memory.rs and
                     // crates/tokeira-storage/src/dsql/worker_task_provenance.rs filters
                     // expiry; DSQL's delete_expired also purges it. Sample after pickup:
-                    // neither a simulated CHASM start nor admission before a waiting poll
-                    // can anchor the lifetime of the task just served to this worker.
+                    // neither a CHASM start, which reads an embedder's own CHASM clock
+                    // when one is set, nor admission before a waiting poll can anchor the
+                    // lifetime of the task just served to this worker.
                     let expires_at = standalone_provenance_expiry(
-                        OffsetDateTime::now_utc(),
+                        self.inner.clock().now(),
                         task.start_to_close_nanos,
                     )
                     // Invalid/overflowing durations reach the common expired-provenance
@@ -2524,7 +2534,10 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     ) -> Result<Response<workflowservice::CreateScheduleResponse>, Status> {
         let store = self.inner.schedule_store();
         let (namespace_id, schedule_id, entry, initial_patch) =
-            schedule::create_schedule_request_to_edge(request.into_inner())?;
+            schedule::create_schedule_request_to_edge(
+                request.into_inner(),
+                self.inner.clock().now(),
+            )?;
         let conflict_token = match store.create(entry) {
             Ok(token) => token,
             Err(ScheduleError::AlreadyExists) => {
@@ -2562,7 +2575,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             .describe(namespace_id, &schedule_id)
             .map_err(schedule_error_status)?;
         entry.info.future_action_times =
-            compute_next_times(&entry.spec, OffsetDateTime::now_utc(), 10, &schedule_id);
+            compute_next_times(&entry.spec, self.inner.clock().now(), 10, &schedule_id);
         Ok(Response::new(
             schedule::describe_schedule_response_to_proto(&entry),
         ))
@@ -2583,7 +2596,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         }
         let replace_search_attributes = request.search_attributes.is_some();
         let (namespace_id, schedule_id, token, replacement) =
-            schedule::update_schedule_request_to_edge(request)?;
+            schedule::update_schedule_request_to_edge(request, self.inner.clock().now())?;
         let store = self.inner.schedule_store();
         store
             .update(namespace_id, &schedule_id, &token, |entry| {
@@ -2597,7 +2610,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 if replace_search_attributes {
                     entry.search_attributes = replacement.search_attributes;
                 }
-                entry.info.update_time = OffsetDateTime::now_utc();
+                entry.info.update_time = self.inner.clock().now();
             })
             .map_err(schedule_error_status)?;
         Ok(Response::new(workflowservice::UpdateScheduleResponse {}))
@@ -2686,7 +2699,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 (!query.is_empty()).then_some(query),
             )
             .map_err(|_| Status::invalid_argument("unsupported schedule query"))?;
-        let now = OffsetDateTime::now_utc();
+        let now = self.inner.clock().now();
         for entry in &mut entries {
             entry.info.future_action_times =
                 compute_next_times(&entry.spec, now, 10, &entry.schedule_id);
@@ -2929,9 +2942,8 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             .map_err(nexus_translate_error_status)?;
         let edge_resp = self.inner.poll_nexus_task_queue(&headers, edge_req).await?;
         Ok(Response::new(match edge_resp {
-            Some(resp) => {
-                nexus::poll_response_to_proto(resp).map_err(nexus_translate_error_status)?
-            }
+            Some(resp) => nexus::poll_response_to_proto(resp, self.inner.clock().now())
+                .map_err(nexus_translate_error_status)?,
             None => workflowservice::PollNexusTaskQueueResponse::default(),
         }))
     }
@@ -3471,7 +3483,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 return Err(Status::invalid_argument("task queue type is required"));
             }
         };
-        let now = OffsetDateTime::now_utc();
+        let now = self.inner.clock().now();
         let metadata = |reason: String| TaskQueueConfigMetadata {
             reason,
             update_identity: req.identity.clone(),

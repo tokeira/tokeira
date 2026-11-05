@@ -49,6 +49,7 @@ tokeira-edge = { path = "../tokeira-edge", version = "0.7.0" }
 tokeira-build-info = { path = "../tokeira-build-info", version = "0.7.0" }
 tokeira-chasm = { path = "../tokeira-chasm", version = "0.7.0" }
 tokeira-chasm-activity = { path = "../tokeira-chasm-activity", version = "0.7.0" }
+tokeira-clock = { path = "../tokeira-clock", version = "0.7.0" }
 # The derive an extension library reaches through `tokeira_engine::chasm`; only
 # the opt-in embedder surface needs it, so the default build carries no proc-macro edge.
 tokeira-chasm-derive = { path = "../tokeira-chasm-derive", version = "0.7.0", optional = true }

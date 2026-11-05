@@ -199,6 +199,12 @@ impl RemoteWorkflowTaskStarter {
             channels: Default::default(),
         }
     }
+
+    /// Reach execution owners through `connector` instead of a TCP dial.
+    pub fn with_peer_connector(mut self, connector: super::peer_transport::PeerConnector) -> Self {
+        self.channels = super::peer_transport::PeerChannels::with_connector(connector);
+        self
+    }
 }
 
 #[async_trait]
@@ -754,7 +760,11 @@ mod tests {
             received_at: time::OffsetDateTime::now_utc(),
             is_long_poll: false,
         };
-        let request = crate::translate::to_internal::start_request(start_dto(), &context);
+        let request = crate::translate::to_internal::start_request(
+            start_dto(),
+            &context,
+            time::OffsetDateTime::now_utc(),
+        );
         let key = request.run_key;
         let queue = QueueKey {
             namespace_id: request.namespace_id,
@@ -1102,7 +1112,11 @@ mod tests {
         );
         let mut future_dto = start_dto();
         future_dto.workflow_id = "future-query-barrier".into();
-        let future_request = crate::translate::to_internal::start_request(future_dto, &context);
+        let future_request = crate::translate::to_internal::start_request(
+            future_dto,
+            &context,
+            time::OffsetDateTime::now_utc(),
+        );
         let future_key = future_request.run_key;
         runtime.start_workflow(future_request).await.unwrap();
         let _future_reply = buffer_query(&runtime, future_key, i64::MAX, Vec::new());
@@ -1150,7 +1164,11 @@ mod tests {
         )));
         let mut large_dto = start_dto();
         large_dto.workflow_id = "oversized-attachments".into();
-        let large_request = crate::translate::to_internal::start_request(large_dto, &context);
+        let large_request = crate::translate::to_internal::start_request(
+            large_dto,
+            &context,
+            time::OffsetDateTime::now_utc(),
+        );
         let large_key = large_request.run_key;
         runtime.start_workflow(large_request).await.unwrap();
         let _large_reply = buffer_query(&runtime, large_key, 0, vec![255; 1_100_000]);

@@ -26,6 +26,7 @@ use http::HeaderMap;
 use prost::Message as _;
 use serde::de::DeserializeOwned;
 use time::OffsetDateTime;
+use tokeira_clock::Clock;
 use tokeira_compatibility::{FEATURE_MATRIX, FeatureState};
 use tokeira_kernel::{
     ActivityRetryPolicyPatch, CancelRequest, FieldChange, HistoryEvent, HistoryEventKind,
@@ -259,6 +260,7 @@ fn validate_activity_jitter(jitter: Option<time::Duration>) -> EdgeResult<()> {
 fn build_update_activity_options_command(
     ctx: &EdgeContext,
     req: &UpdateActivityOptionsRequest,
+    now: OffsetDateTime,
 ) -> EdgeResult<UpdateActivitiesOptionsRequest> {
     let patch = build_activity_options_patch(
         req.target.clone(),
@@ -288,7 +290,7 @@ fn build_update_activity_options_command(
             principal: ctx.event_principal(),
             received_at: ctx.received_at,
         },
-        now: OffsetDateTime::now_utc(),
+        now,
     })
 }
 
@@ -1494,8 +1496,11 @@ impl Default for EagerDispatchConfig {
 /// task correctness.
 #[derive(Clone, Debug, Default)]
 struct TaskQueueRateLimiter {
-    next_dispatch:
-        Arc<tokio::sync::Mutex<HashMap<(tokeira_types::NamespaceId, TaskQueueName), Instant>>>,
+    next_dispatch: Arc<
+        tokio::sync::Mutex<
+            HashMap<(tokeira_types::NamespaceId, TaskQueueName), tokio::time::Instant>,
+        >,
+    >,
 }
 
 fn worker_rate_limit_when_api_unset(
@@ -1522,7 +1527,7 @@ impl TaskQueueRateLimiter {
             return false;
         }
         let interval = Duration::from_secs_f64(1.0 / requests_per_second);
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         let wait = {
             let mut next_dispatch = self.next_dispatch.lock().await;
             let next = next_dispatch
@@ -1593,6 +1598,12 @@ fn apply_matrix_capability_field(
 }
 
 impl WorkflowService {
+    /// The clock this service stamps admission times and deadlines with: the
+    /// interceptors' clock, which also stamps every request's `received_at`.
+    pub(crate) fn clock(&self) -> &Arc<dyn Clock> {
+        self.interceptors.clock()
+    }
+
     /// Admit a transport handler that cannot yet delegate through a domain DTO.
     ///
     /// Standalone-activity and AdminService adapters use this narrow bridge so
@@ -2026,7 +2037,7 @@ impl WorkflowService {
             WorkerVersionMetadata {
                 deployment: deployment.cloned(),
                 build_id: build_id.cloned(),
-                last_seen_at: Some(OffsetDateTime::now_utc()),
+                last_seen_at: Some(self.clock().now()),
             },
         )
     }
@@ -3152,7 +3163,7 @@ impl WorkflowService {
                         &pending,
                         failure,
                         retryable,
-                        OffsetDateTime::now_utc(),
+                        self.clock().now(),
                     );
                     tokeira_runtime::metrics::record_nexus_outbound_request(
                         &req.namespace,
@@ -3216,7 +3227,7 @@ impl WorkflowService {
                                 op.attempt,
                                 op.scheduled_at,
                                 op.schedule_to_close_timeout,
-                                OffsetDateTime::now_utc(),
+                                self.clock().now(),
                             )
                         })
                     } else {
@@ -3313,7 +3324,7 @@ impl WorkflowService {
                         spec,
                         identity,
                         description,
-                        OffsetDateTime::now_utc(),
+                        self.clock().now(),
                     )
                     .await
                     .map_err(workflow_rule_error_to_edge)
@@ -3441,7 +3452,7 @@ impl WorkflowService {
                     operation_type: req.operation_type,
                     operation_params: req.operation_params,
                     state: tokeira_runtime::BatchOperationState::Running,
-                    start_time: OffsetDateTime::now_utc(),
+                    start_time: self.clock().now(),
                     close_time: None,
                     counters: Arc::new(BatchProgressCounters::default()),
                     visibility_query: req.visibility_query,
@@ -3611,7 +3622,7 @@ impl WorkflowService {
                     identity,
                     links: Vec::new(),
                     request: batch_request_context(ctx),
-                    now: OffsetDateTime::now_utc(),
+                    now: self.clock().now(),
                 },
             )
             .await
@@ -3642,7 +3653,7 @@ impl WorkflowService {
                     external_initiated_event_id: 0,
                     links: Vec::new(),
                     request: batch_request_context(ctx),
-                    now: OffsetDateTime::now_utc(),
+                    now: self.clock().now(),
                 },
             )
             .await
@@ -3675,7 +3686,7 @@ impl WorkflowService {
                     header: None,
                     links: Vec::new(),
                     request: batch_request_context(ctx),
-                    now: OffsetDateTime::now_utc(),
+                    now: self.clock().now(),
                 },
             )
             .await
@@ -3703,7 +3714,7 @@ impl WorkflowService {
                 run_key,
                 DeleteWorkflowRequest {
                     request: batch_request_context(ctx),
-                    now: OffsetDateTime::now_utc(),
+                    now: self.clock().now(),
                     // A batch purges each run before it deletes the next, so
                     // the work it leaves queued stays bounded.
                     purge_inline: true,
@@ -3755,7 +3766,7 @@ impl WorkflowService {
                     expected_current_run_key: None,
                     reason,
                     request: batch_request_context(ctx),
-                    now: OffsetDateTime::now_utc(),
+                    now: self.clock().now(),
                 },
             )
             .await
@@ -3781,7 +3792,7 @@ impl WorkflowService {
         )?;
         validate_activity_jitter(jitter)?;
         let run_key = self.resolve_batch_run_key(ctx, workflow_ref).await?;
-        let now = OffsetDateTime::now_utc();
+        let now = self.clock().now();
         let outcome = self
             .runtime
             .unpause_activities(
@@ -3883,7 +3894,7 @@ impl WorkflowService {
                 .await?,
         )?;
         let run_key = self.resolve_batch_run_key(ctx, workflow_ref).await?;
-        let now = OffsetDateTime::now_utc();
+        let now = self.clock().now();
         let outcome = self
             .runtime
             .update_activity_options(
@@ -3932,7 +3943,7 @@ impl WorkflowService {
             return resolve_build_id_reset_point(
                 &state.auto_reset_points,
                 build_id,
-                OffsetDateTime::now_utc(),
+                self.clock().now(),
             );
         }
         resolve_reset_target_from_history(&history, target)
@@ -3944,7 +3955,7 @@ impl WorkflowService {
         schedule_id: &tokeira_runtime::ScheduleId,
         patch: SchedulePatch,
     ) -> EdgeResult<()> {
-        let now = OffsetDateTime::now_utc();
+        let now = self.clock().now();
         self.schedule_store
             .describe(namespace_id, schedule_id)
             .map_err(|err| EdgeError::BadRequest(err.to_string()))?;
@@ -4402,7 +4413,7 @@ impl WorkflowService {
         state: &tokeira_kernel::WorkflowState,
         barrier: i64,
     ) {
-        let now = OffsetDateTime::now_utc();
+        let now = self.clock().now();
         let sticky_affinity = state
             .sticky
             .as_ref()
@@ -4568,7 +4579,7 @@ impl WorkflowService {
 
                 ensure_local(self.router.route_workflow(&namespace, &workflow_id).await?)?;
 
-                let internal = to_internal::start_request(req, &ctx);
+                let internal = to_internal::start_request(req, &ctx, self.clock().now());
                 let pinned = self
                     .validate_pinned_override(
                         internal.namespace_id,
@@ -4790,7 +4801,7 @@ impl WorkflowService {
                     )
                     .await?;
 
-                let internal = to_internal::signal_request(req, &ctx);
+                let internal = to_internal::signal_request(req, &ctx, self.clock().now());
                 let outcome = self
                     .runtime
                     .signal_workflow(run_key, internal)
@@ -4898,6 +4909,7 @@ impl WorkflowService {
                         req.build_id.clone(),
                     ),
                     WorkerIdentity(req.worker_identity.clone()),
+                    self.clock().now(),
                 );
                 self.record_worker_poll(
                     &req.namespace,
@@ -4976,7 +4988,7 @@ impl WorkflowService {
                 {
                     poller.cancelled();
                 } else {
-                    poller.completed();
+                    poller.completed(self.clock().now());
                 }
                 let scaling_decision = if activation.is_some() {
                     self.runtime
@@ -5365,7 +5377,7 @@ impl WorkflowService {
                 let saved_task_token = req.task_token.clone();
                 let wants_eager_return = req.return_new_workflow_task;
 
-                let internal = to_internal::workflow_task_completed_request(req, &context)
+                let internal = to_internal::workflow_task_completed_request(req, &context, self.clock().now())
                     .map_err(EdgeError::from)?;
                 let run_key = internal.token.run_key;
                 let speculative_token_started_event_id = internal.token.started_event_id;
@@ -6302,7 +6314,7 @@ impl WorkflowService {
                 Ok(DescribeTaskQueueResponse {
                     pollers: self
                         .poller_registry
-                        .pollers(&queue)
+                        .pollers(&queue, self.clock().now())
                         .into_iter()
                         .map(active_poller_to_edge)
                         .collect(),
@@ -6447,7 +6459,7 @@ impl WorkflowService {
                     request_id: RequestId(Uuid::new_v4().to_string()),
                     caller_identity: (!req.identity.is_empty()).then(|| req.identity.clone()),
                     principal: ctx.event_principal(),
-                    received_at: OffsetDateTime::now_utc(),
+                    received_at: self.clock().now(),
                 };
 
                 self.runtime
@@ -6547,7 +6559,7 @@ impl WorkflowService {
                         req.run_id.as_deref(),
                     )
                     .await?;
-                let now = OffsetDateTime::now_utc();
+                let now = self.clock().now();
                 let deletion = self
                     .runtime
                     .delete_workflow(
@@ -6683,7 +6695,7 @@ impl WorkflowService {
                 // mutable state. Replace its explicit-only reduction with the
                 // state-aware sequence resolved above.
                 req.post_reset_versioning_overrides.clear();
-                let mut internal = to_internal::reset_request(req, &ctx);
+                let mut internal = to_internal::reset_request(req, &ctx, self.clock().now());
                 internal.post_reset_versioning_overrides = resolved_post_reset;
                 let outcome = self
                     .runtime
@@ -6733,7 +6745,8 @@ impl WorkflowService {
                         .route_workflow(&req.namespace, &req.workflow_id)
                         .await?,
                 )?;
-                let internal = to_internal::signal_with_start_request(req.clone(), &ctx);
+                let internal =
+                    to_internal::signal_with_start_request(req.clone(), &ctx, self.clock().now());
                 let pinned = self
                     .validate_pinned_override(
                         internal.namespace_id,
@@ -6826,7 +6839,7 @@ impl WorkflowService {
                 )?;
 
                 let workflow_id = req.start.workflow_id.clone();
-                let internal = to_internal::start_request(req.start, &ctx);
+                let internal = to_internal::start_request(req.start, &ctx, self.clock().now());
 
                 // Wait-policy defaulting mirrors standalone update
                 // (`update_workflow_execution` above): Unspecified waits for
@@ -6853,7 +6866,7 @@ impl WorkflowService {
                     request_id: tokeira_types::RequestId(uuid::Uuid::new_v4().to_string()),
                     caller_identity: req.update_identity,
                     principal: ctx.event_principal(),
-                    received_at: time::OffsetDateTime::now_utc(),
+                    received_at: self.clock().now(),
                 };
 
                 match self
@@ -7042,6 +7055,7 @@ impl WorkflowService {
                         req.build_id.clone(),
                     ),
                     WorkerIdentity(req.worker_identity.clone()),
+                    self.clock().now(),
                 );
                 self.record_worker_poll(
                     &req.namespace,
@@ -7119,7 +7133,7 @@ impl WorkflowService {
                             )
                             .await
                         {
-                            poller.completed();
+                            poller.completed(self.clock().now());
                             return Ok(None);
                         }
                     } else {
@@ -7147,7 +7161,7 @@ impl WorkflowService {
                 // refresh, while client cancellation drops the future before
                 // this explicit completion (`task_queue_partition_manager.go:
                 // 617-621 @ v1.31.0`).
-                poller.completed();
+                poller.completed(self.clock().now());
                 let started = started.map_err(EdgeError::from)?;
                 let scaling_decision = if started.is_some() {
                     self.runtime
@@ -7339,9 +7353,9 @@ impl WorkflowService {
                             ),
                             caller_identity: None,
                             principal: ctx.event_principal(),
-                            received_at: time::OffsetDateTime::now_utc(),
+                            received_at: self.clock().now(),
                         },
-                        time::OffsetDateTime::now_utc(),
+                        self.clock().now(),
                     )
                     .await
                     .map_err(EdgeError::from)?;
@@ -7760,7 +7774,8 @@ impl WorkflowService {
                         req.run_id.as_deref(),
                     )
                     .await?;
-                let command = build_update_activity_options_command(&ctx, &req)?;
+                let command =
+                    build_update_activity_options_command(&ctx, &req, self.clock().now())?;
                 let outcome = self
                     .runtime
                     .update_activity_options(run_key, command)
@@ -7807,7 +7822,7 @@ impl WorkflowService {
                         req.run_id.as_deref(),
                     )
                     .await?;
-                let now = time::OffsetDateTime::now_utc();
+                let now = self.clock().now();
                 let outcome = self
                     .runtime
                     .pause_activities(
@@ -7860,7 +7875,7 @@ impl WorkflowService {
                         req.run_id.as_deref(),
                     )
                     .await?;
-                let now = time::OffsetDateTime::now_utc();
+                let now = self.clock().now();
                 let outcome = self
                     .runtime
                     .unpause_activities(
@@ -7908,7 +7923,7 @@ impl WorkflowService {
                         req.run_id.as_deref(),
                     )
                     .await?;
-                let now = time::OffsetDateTime::now_utc();
+                let now = self.clock().now();
                 let outcome = self
                     .runtime
                     .reset_activities(
@@ -8008,7 +8023,7 @@ impl WorkflowService {
                     .resolve_run_key(&req.namespace, &req.workflow_id)
                     .await?;
 
-                let internal = to_internal::terminate_request(req, &ctx);
+                let internal = to_internal::terminate_request(req, &ctx, self.clock().now());
                 let outcome = self
                     .runtime
                     .terminate_workflow(run_key, internal)
@@ -8061,7 +8076,7 @@ impl WorkflowService {
                     .resolve_run_key(&req.namespace, &req.workflow_id)
                     .await?;
 
-                let internal = to_internal::pause_request(req, &ctx);
+                let internal = to_internal::pause_request(req, &ctx, self.clock().now());
                 let outcome = self
                     .runtime
                     .pause_workflow(run_key, internal)
@@ -8114,7 +8129,7 @@ impl WorkflowService {
                     .resolve_run_key(&req.namespace, &req.workflow_id)
                     .await?;
 
-                let internal = to_internal::unpause_request(req, &ctx);
+                let internal = to_internal::unpause_request(req, &ctx, self.clock().now());
                 let outcome = self
                     .runtime
                     .unpause_workflow(run_key, internal)
@@ -8161,7 +8176,7 @@ impl WorkflowService {
                     .resolve_run_key(&req.namespace, &req.workflow_id)
                     .await?;
 
-                let internal = to_internal::cancel_request(req, &ctx);
+                let internal = to_internal::cancel_request(req, &ctx, self.clock().now());
                 let outcome = self
                     .runtime
                     .cancel_workflow(run_key, internal)
@@ -8358,7 +8373,7 @@ impl WorkflowService {
                     request_id: tokeira_types::RequestId(uuid::Uuid::new_v4().to_string()),
                     caller_identity: None,
                     principal: ctx.event_principal(),
-                    received_at: time::OffsetDateTime::now_utc(),
+                    received_at: self.clock().now(),
                 };
 
                 let outcome = self
@@ -8951,9 +8966,9 @@ impl crate::operator_service::NamespaceDeletionApi for WorkflowService {
                                 )),
                                 caller_identity: Some("tokeira-namespace-reclaimer".to_owned()),
                                 principal: None,
-                                received_at: OffsetDateTime::now_utc(),
+                                received_at: self.clock().now(),
                             },
-                            now: OffsetDateTime::now_utc(),
+                            now: self.clock().now(),
                             // The reclaim purges each run before it deletes the
                             // next, so the work it leaves queued stays bounded.
                             purge_inline: true,
@@ -12071,7 +12086,7 @@ mod tests {
                 activity_type: None,
             };
 
-            let command = build_update_activity_options_command(&test_edge_context(), &req)
+            let command = build_update_activity_options_command(&test_edge_context(), &req, time::OffsetDateTime::now_utc())
             .expect("non-empty mask should select at least one field");
 
             prop_assert_eq!(
@@ -12128,7 +12143,7 @@ mod tests {
                 activity_type: None,
             };
 
-            let command = build_update_activity_options_command(&test_edge_context(), &req)
+            let command = build_update_activity_options_command(&test_edge_context(), &req, time::OffsetDateTime::now_utc())
                 .expect("nested Priority source is present");
             prop_assert_eq!(
                 command.priority,
@@ -12168,6 +12183,7 @@ mod tests {
                 }),
                 "priority",
             ),
+            time::OffsetDateTime::now_utc(),
         )
         .expect("whole Priority replacement");
         assert!(matches!(
@@ -12181,6 +12197,7 @@ mod tests {
         let error = build_update_activity_options_command(
             &test_edge_context(),
             &request(None, "priority.priority_key"),
+            time::OffsetDateTime::now_utc(),
         )
         .expect_err("nested Priority masks require a source message");
         assert!(matches!(

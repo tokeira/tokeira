@@ -32,6 +32,7 @@ use std::{
 
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
+use tokeira_clock::{Clock, system_clock};
 use tokeira_storage::{
     BuildId, ComputeConfig, ComputeConfigScalingGroup, ComputeProvider, ComputeScaler,
     ConflictToken, DeploymentCasResult, DeploymentKey, DeploymentName, DeploymentTaskQueueType,
@@ -202,28 +203,13 @@ fn drainage_refresh_interval() -> Duration {
         .unwrap_or(DRAINAGE_REFRESH_INTERVAL)
 }
 
-/// Clock used by the registry to stamp caller-visible state transitions.
-pub trait RegistryClock: Send + Sync {
-    fn now(&self) -> OffsetDateTime;
-}
-
-/// Production registry clock backed by the system UTC clock.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SystemRegistryClock;
-
-impl RegistryClock for SystemRegistryClock {
-    fn now(&self) -> OffsetDateTime {
-        OffsetDateTime::now_utc()
-    }
-}
-
 /// Runtime owner for Worker Deployment registry state.
 #[derive(Clone)]
 pub struct DeploymentRegistry {
     repository: Arc<dyn WorkerDeploymentRepository>,
     run_repository: Option<Arc<dyn RunRepository>>,
     worker_registry: WorkerRegistry,
-    clock: Arc<dyn RegistryClock>,
+    clock: Arc<dyn Clock>,
     membership_cache: Arc<Mutex<HashMap<VersionMembershipCacheKey, CachedMembership>>>,
     reactivation_cache: Arc<Mutex<HashMap<VersionReactivationCacheKey, OffsetDateTime>>>,
     worker_compute_reconcile_sink: Arc<Mutex<Arc<dyn WorkerComputeReconcileSink>>>,
@@ -234,13 +220,13 @@ impl DeploymentRegistry {
         repository: Arc<dyn WorkerDeploymentRepository>,
         worker_registry: WorkerRegistry,
     ) -> Self {
-        Self::with_clock(repository, worker_registry, Arc::new(SystemRegistryClock))
+        Self::with_clock(repository, worker_registry, system_clock())
     }
 
     pub fn with_clock(
         repository: Arc<dyn WorkerDeploymentRepository>,
         worker_registry: WorkerRegistry,
-        clock: Arc<dyn RegistryClock>,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             repository,
@@ -264,7 +250,7 @@ impl DeploymentRegistry {
             repository,
             run_repository,
             worker_registry,
-            Arc::new(SystemRegistryClock),
+            system_clock(),
         )
     }
 
@@ -272,7 +258,7 @@ impl DeploymentRegistry {
         repository: Arc<dyn WorkerDeploymentRepository>,
         run_repository: Arc<dyn RunRepository>,
         worker_registry: WorkerRegistry,
-        clock: Arc<dyn RegistryClock>,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             repository,
@@ -3378,7 +3364,7 @@ mod tests {
     #[derive(Debug)]
     struct FixedClock(OffsetDateTime);
 
-    impl RegistryClock for FixedClock {
+    impl Clock for FixedClock {
         fn now(&self) -> OffsetDateTime {
             self.0
         }
@@ -3394,7 +3380,7 @@ mod tests {
         }
     }
 
-    impl RegistryClock for AdjustableClock {
+    impl Clock for AdjustableClock {
         fn now(&self) -> OffsetDateTime {
             *self.0.lock().expect("test clock lock poisoned")
         }

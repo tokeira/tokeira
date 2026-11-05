@@ -13,6 +13,7 @@ use std::{
 use anyhow::Result;
 use async_trait::async_trait;
 use time::OffsetDateTime;
+use tokeira_clock::Clock;
 use tokeira_kernel::LoadedRun;
 use tokeira_storage::{
     ActivityDiscoveryRange, ActivityDispatchPage, ActivityDispatchPosition, ActivityDispatchRow,
@@ -49,6 +50,8 @@ pub(crate) struct ActivityDiscovery<R> {
     pub(crate) source: Arc<ActivitySource<R>>,
     pub(crate) registry: ActivityDiscoveryRegistry,
     pub(crate) broker: InMemoryActivityBroker,
+    /// Judges activity dispatch deadlines; the runtime's clock.
+    pub(crate) clock: Arc<dyn Clock>,
 }
 
 impl<R: RunRepository + 'static> ActivityDiscovery<R> {
@@ -60,8 +63,7 @@ impl<R: RunRepository + 'static> ActivityDiscovery<R> {
         cancel: &CancellationToken,
         now: Instant,
     ) -> bool {
-        let Some((key, home, mut pass)) = self.registry.select(now, OffsetDateTime::now_utc())
-        else {
+        let Some((key, home, mut pass)) = self.registry.select(now, self.clock.now()) else {
             return false;
         };
         let source = self.source.clone();

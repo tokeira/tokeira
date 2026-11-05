@@ -106,6 +106,12 @@ impl RemoteOutboundDelivery {
             channels: PeerChannels::default(),
         }
     }
+
+    /// Reach destination owners through `connector` instead of a TCP dial.
+    pub fn with_peer_connector(mut self, connector: super::peer_transport::PeerConnector) -> Self {
+        self.channels = PeerChannels::with_connector(connector);
+        self
+    }
 }
 
 #[async_trait]

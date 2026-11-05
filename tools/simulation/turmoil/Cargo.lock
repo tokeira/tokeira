@@ -4055,6 +4055,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokeira-controller"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "buffa",
+ "connectrpc",
+ "futures",
+ "metrics",
+ "prost-types",
+ "serde",
+ "thiserror 2.0.18",
+ "time",
+ "tokeira-observability",
+ "tokeira-proto",
+ "tokeira-storage",
+ "tokeira-types",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "tokeira-edge"
 version = "0.7.0"
 dependencies = [
@@ -4674,17 +4699,25 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "connectrpc",
  "http 1.4.0",
  "http-body-util",
  "hyper",
  "hyper-util",
  "prost-types",
+ "tokeira-auth",
+ "tokeira-config",
+ "tokeira-controller",
+ "tokeira-edge",
  "tokeira-engine",
  "tokeira-proto",
+ "tokeira-storage",
+ "tokeira-types",
  "tokio",
  "tonic",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "turmoil",
 ]
 

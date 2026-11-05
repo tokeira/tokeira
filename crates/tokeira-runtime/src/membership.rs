@@ -44,6 +44,20 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{LaneHandle, RuntimeDrain, RuntimeDrainState, ShardOwner};
 
+/// One HTTP/2 connection to the placement controller, opened through a
+/// connector the caller supplies instead of a TCP dial.
+///
+/// Production never builds one: without it, the membership stream and the
+/// edge's routing subscription each dial the controller endpoint with a fresh
+/// pooled [`connectrpc::client::HttpClient`]. A harness that carries the
+/// cluster's traffic over its own network, such as the turmoil simulator in
+/// `tools/simulation/turmoil`, builds one with
+/// `Http2Connection::lazy_with_connector(..).shared(..)` and hands it in. The
+/// calls and messages are the same either way; only the connection underneath
+/// differs, and a dialed connection redials through its connector when it
+/// breaks rather than through a connection pool.
+pub type ControllerConnection = connectrpc::client::SharedHttp2Connection;
+
 /// Runtime-side placement-controller stream configuration.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MembershipConfig {
@@ -116,6 +130,8 @@ pub struct MembershipClient {
     drain: Arc<RuntimeDrain>,
     budget_applier: Arc<dyn ConnectionBudgetApplier>,
     last_budget_valid_until: Arc<Mutex<Option<BudgetExpiry>>>,
+    /// `None` in production: each stream dials the endpoint afresh.
+    controller_connection: Option<ControllerConnection>,
 }
 
 /// Tracks when the last connection budget directive expires.
@@ -133,6 +149,7 @@ impl Clone for MembershipClient {
             drain: Arc::clone(&self.drain),
             budget_applier: Arc::clone(&self.budget_applier),
             last_budget_valid_until: Arc::clone(&self.last_budget_valid_until),
+            controller_connection: self.controller_connection.clone(),
         }
     }
 }
@@ -161,7 +178,16 @@ impl MembershipClient {
             drain,
             budget_applier,
             last_budget_valid_until: Arc::new(Mutex::new(None)),
+            controller_connection: None,
         }
+    }
+
+    /// Carry the membership stream over `connection` instead of dialing
+    /// [`MembershipConfig::controller_endpoint`] over TCP. The endpoint still
+    /// names the controller in each request; see [`ControllerConnection`].
+    pub fn with_controller_connection(mut self, connection: ControllerConnection) -> Self {
+        self.controller_connection = Some(connection);
+        self
     }
 
     /// Run the membership stream until `shutdown` fires, reconnecting with
@@ -194,15 +220,38 @@ impl MembershipClient {
     }
 
     async fn run_once(&self, shutdown: CancellationToken) -> Result<()> {
-        let http = connectrpc::client::HttpClient::plaintext();
         let config = connectrpc::client::ClientConfig::new(
             self.config
                 .controller_endpoint
                 .parse()
                 .map_err(|e| anyhow!("invalid controller endpoint: {e}"))?,
         );
-        let client = PlacementControllerClient::new(http, config);
+        match &self.controller_connection {
+            None => {
+                let http = connectrpc::client::HttpClient::plaintext();
+                self.run_stream(PlacementControllerClient::new(http, config), shutdown)
+                    .await
+            }
+            Some(connection) => {
+                self.run_stream(
+                    PlacementControllerClient::new(connection.clone(), config),
+                    shutdown,
+                )
+                .await
+            }
+        }
+    }
 
+    async fn run_stream<T>(
+        &self,
+        client: PlacementControllerClient<T>,
+        shutdown: CancellationToken,
+    ) -> Result<()>
+    where
+        T: connectrpc::client::ClientTransport,
+        T::ResponseBody: Unpin,
+        <T::ResponseBody as connectrpc::http_body::Body>::Error: std::fmt::Display,
+    {
         let mut bidi = client
             .runtime_membership()
             .await

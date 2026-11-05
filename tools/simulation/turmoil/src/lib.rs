@@ -1,25 +1,27 @@
 //! Tokeira's real engine code on turmoil's simulated hosts and network.
 //!
-//! This is step one of the turmoil spike. One simulated host runs the embedded
-//! in-memory [`Engine`] and serves its Temporal endpoint over turmoil's
-//! simulated TCP. A simulated client host drives a one-activity workflow
-//! through the public gRPC API with a scripted worker, then reads the
-//! workflow's history. [`run_one_activity_workflow`] returns what the client
-//! observed as a [`Trace`], so a test can compare two runs from one seed.
+//! Step one, in this module: one simulated host runs the embedded in-memory
+//! [`Engine`] and serves its Temporal endpoint over turmoil's simulated TCP. A
+//! simulated client host drives a one-activity workflow through the public
+//! gRPC API with a scripted worker, then reads the workflow's history.
+//! [`run_one_activity_workflow`] returns what the client observed as a
+//! [`Trace`], so a test can compare two runs from one seed.
 //!
-//! Tokeira's production code is untouched. The bridge in this module frames
-//! gRPC by hand and hands each call to [`TemporalEndpoint::call`], the same
-//! in-process entry point the engine's own integration tests drive. Everything
-//! between that call and the store is the code that runs in production.
+//! The bridge in this module frames gRPC by hand and hands each call to
+//! [`TemporalEndpoint::call`], the same in-process entry point the engine's own
+//! integration tests drive. Everything between that call and the store is the
+//! code that runs in production.
 //!
-//! What this step deliberately avoids, so its limits are not mistaken for
-//! oversights:
-//! - **Timers, retries and backoffs.** The engine reads the wall clock when it
-//!   decides whether something is due, while turmoil moves only tokio's clock.
-//!   A workflow that waits on a timer would wait on real time. A clock the
-//!   simulation can drive is a prerequisite for step two.
-//! - **More than one node.** Two nodes need the placement controller and
-//!   connection seams in shared code; see the crate README.
+//! Step two, in [`cluster`]: a placement controller and two listener-backed
+//! nodes, with every connection between them on turmoil's network.
+//!
+//! What neither step does yet, so its limits are not mistaken for oversights:
+//! timers, retries and backoffs. The engine reads the wall clock when it
+//! decides whether something is due, while turmoil moves only tokio's clock,
+//! so a workflow that waits on a timer would wait on real time. That needs a
+//! clock the simulation can drive.
+
+pub mod cluster;
 
 use std::{
     convert::Infallible,
@@ -256,21 +258,46 @@ fn ok_reply(response: InProcessGrpcResponse) -> Response<ReplyBody> {
 
 type ConnectFuture = Pin<Box<dyn Future<Output = std::io::Result<TokioIo<TcpStream>>> + Send>>;
 
-/// A tonic channel to the engine node over turmoil's simulated TCP.
-async fn connect() -> anyhow::Result<WorkflowServiceClient<Channel>> {
-    let connector = tower::service_fn(|uri: Uri| {
+/// Dials the host and port a URI names over turmoil's simulated TCP. tonic
+/// and connect-rust both accept it as a connector.
+fn turmoil_connector() -> impl tower::Service<
+    Uri,
+    Response = TokioIo<TcpStream>,
+    Error = std::io::Error,
+    Future = ConnectFuture,
+> + Clone
++ Send
++ 'static {
+    tower::service_fn(|uri: Uri| {
         Box::pin(async move {
-            let host = uri.host().unwrap_or(NODE);
-            let port = uri.port_u16().unwrap_or(PORT);
+            let host = uri.host().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "the URI names no host")
+            })?;
+            let port = uri.port_u16().unwrap_or(80);
             let stream = TcpStream::connect(format!("{host}:{port}")).await?;
             Ok(TokioIo::new(stream))
         }) as ConnectFuture
-    });
+    })
+}
+
+/// A tonic channel to the engine node over turmoil's simulated TCP.
+async fn connect() -> anyhow::Result<WorkflowServiceClient<Channel>> {
     let channel = Endpoint::from_shared(format!("http://{NODE}:{PORT}"))?
-        .connect_with_connector(connector)
+        .connect_with_connector(turmoil_connector())
         .await
         .context("could not connect to the engine node")?;
     Ok(WorkflowServiceClient::new(channel))
+}
+
+/// Record that the client saw `what`, stamped with the simulated time.
+fn observe(trace: &Mutex<Trace>, what: impl Into<String>) {
+    let at = turmoil::sim_elapsed().unwrap_or_default().as_millis();
+    let what = what.into();
+    trace
+        .lock()
+        .expect("trace lock is never poisoned")
+        .steps
+        .push(format!("{at:>7} ms  {what}"));
 }
 
 /// The scripted worker: start the workflow, schedule one activity, run it,
@@ -282,14 +309,7 @@ async fn run_worker_script(
     client: &mut WorkflowServiceClient<Channel>,
     trace: &Mutex<Trace>,
 ) -> anyhow::Result<()> {
-    let observe = |what: String| {
-        let at = turmoil::sim_elapsed().unwrap_or_default().as_millis();
-        trace
-            .lock()
-            .expect("trace lock is never poisoned")
-            .steps
-            .push(format!("{at:>7} ms  {what}"));
-    };
+    let observe = |what: String| observe(trace, what);
 
     client
         .start_workflow_execution(StartWorkflowExecutionRequest {

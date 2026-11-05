@@ -427,20 +427,25 @@ where
     /// renewal, durable recovery, and activation; budget and drain state use the
     /// supplied collaborators. It runs until `shutdown` is cancelled. Available
     /// only when the repository is also a [`LeaseRepository`], since acting on
-    /// placement directives requires lease operations.
+    /// placement directives requires lease operations. `controller_connection`
+    /// is `None` in production; see [`crate::ControllerConnection`].
     pub fn spawn_membership_client(
         self: &Arc<Self>,
         config: MembershipConfig,
         budget_applier: Arc<dyn ConnectionBudgetApplier>,
+        controller_connection: Option<crate::ControllerConnection>,
         shutdown: CancellationToken,
     ) -> tokio::task::JoinHandle<Result<()>> {
-        let client = MembershipClient::new(
+        let mut client = MembershipClient::new(
             config,
             Arc::clone(self) as Arc<dyn MembershipShardLifecycle>,
             self.shard_owner.clone(),
             self.runtime_drain.clone(),
             budget_applier,
         );
+        if let Some(connection) = controller_connection {
+            client = client.with_controller_connection(connection);
+        }
         tokio::spawn(client.run(shutdown))
     }
 }

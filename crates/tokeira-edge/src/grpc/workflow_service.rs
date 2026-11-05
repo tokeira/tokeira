@@ -158,6 +158,15 @@ impl WorkflowServiceGrpc {
         self
     }
 
+    /// Forward workflow-task replies to their owner through `connector`
+    /// instead of a TCP dial.
+    pub fn with_peer_connector(mut self, connector: super::peer_transport::PeerConnector) -> Self {
+        self.peer_channels = Arc::new(super::peer_transport::PeerChannels::with_connector(
+            connector,
+        ));
+        self
+    }
+
     async fn workflow_reply_client(
         &self,
         headers: &http::HeaderMap,

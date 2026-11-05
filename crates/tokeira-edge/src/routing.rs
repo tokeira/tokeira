@@ -14,7 +14,6 @@
 use async_trait::async_trait;
 use tokeira_types::{
     IncarnationId, NodeEndpoint, QueuePartitionKey, TaskKind, TaskQueueName, WorkflowId,
-    queue_partition_for,
 };
 
 use crate::{
@@ -134,19 +133,13 @@ impl EdgeRouter for CacheBackedRouter {
         task_kind: TaskKind,
     ) -> EdgeResult<RouteTarget> {
         let snapshot = self.cache.snapshot();
-        let placement_key = format!("{namespace}\0{task_queue}\0{}", task_kind.to_db_smallint());
-        let partition = if task_kind == TaskKind::Workflow {
-            tokeira_types::workflow_queue_partition(
-                crate::translate::to_internal::namespace_id_for(namespace),
-                task_queue,
-                snapshot.placement_config.partition_count,
-            )
-        } else {
-            queue_partition_for(
-                placement_key.as_bytes(),
-                snapshot.placement_config.partition_count,
-            )
-        };
+        // Workflow, activity and Nexus tasks share a queue home: use the same
+        // workflow-key partition as PlacementQueueHomes::local_home for every kind.
+        let partition = tokeira_types::workflow_queue_partition(
+            crate::translate::to_internal::namespace_id_for(namespace),
+            task_queue,
+            snapshot.placement_config.partition_count,
+        );
         drop(snapshot);
 
         let key = QueuePartitionKey {
@@ -176,13 +169,18 @@ pub fn ensure_local(route: RouteTarget) -> EdgeResult<()> {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
+    use proptest::prelude::*;
     use tokeira_types::{
-        BundleOwner, GenerationCounter, PlacementConfig, RoutingSnapshot, ShardEpoch,
-        bundle_for_partition, execution_home_bundle,
+        BundleOwner, GenerationCounter, PlacementConfig, RoutingSnapshot, ShardEpoch, ShardId,
+        bundle_for_partition, execution_home_bundle, queue_partition_for, workflow_queue_partition,
     };
     use uuid::Uuid;
 
     use super::*;
+
+    // Nexus polls pass TaskKind::Workflow in poll_nexus_task_queue, so these two
+    // kinds cover every poll.
+    const POLL_TASK_KINDS: [TaskKind; 2] = [TaskKind::Workflow, TaskKind::Activity];
 
     fn placement_config() -> PlacementConfig {
         PlacementConfig {
@@ -241,7 +239,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_router_routes_task_kind_specific_queue_home() {
+    async fn cache_router_routes_all_task_kinds_to_workflow_queue_home() {
         let config = placement_config();
         let local = incarnation(1);
         let remote = incarnation(2);
@@ -251,8 +249,16 @@ mod tests {
             "{namespace}\0{task_queue}\0{}",
             TaskKind::Activity.to_db_smallint()
         );
-        let partition = queue_partition_for(placement_key.as_bytes(), config.partition_count);
+        let old_activity_partition =
+            queue_partition_for(placement_key.as_bytes(), config.partition_count);
+        let old_activity_bundle = bundle_for_partition(old_activity_partition, config.bundle_count);
+        let partition = workflow_queue_partition(
+            crate::translate::to_internal::namespace_id_for(namespace),
+            task_queue,
+            config.partition_count,
+        );
         let bundle_id = bundle_for_partition(partition, config.bundle_count);
+        assert_ne!(old_activity_bundle, bundle_id);
         let mut snapshot = RoutingSnapshot {
             execution_bundle_owners: HashMap::new(),
             node_endpoints: HashMap::new(),
@@ -260,26 +266,96 @@ mod tests {
             generation: GenerationCounter(1),
         };
         snapshot.execution_bundle_owners.insert(
+            old_activity_bundle,
+            BundleOwner {
+                node_id: local,
+                epoch: ShardEpoch(11),
+            },
+        );
+        snapshot.execution_bundle_owners.insert(
             bundle_id,
             BundleOwner {
                 node_id: remote,
                 epoch: ShardEpoch(12),
             },
         );
+        assert_ne!(
+            snapshot.execution_bundle_owners[&old_activity_bundle].node_id,
+            snapshot.execution_bundle_owners[&bundle_id].node_id,
+        );
+        snapshot.node_endpoints.insert(local, endpoint(8233));
         snapshot.node_endpoints.insert(remote, endpoint(8234));
 
         let cache = Arc::new(RoutingCache::new(config));
         cache.replace_snapshot(snapshot);
         let router = CacheBackedRouter::new(cache, local);
 
-        assert_eq!(
-            router
-                .route_task_queue(namespace, task_queue, TaskKind::Activity)
-                .await
-                .unwrap(),
-            RouteTarget::Remote {
-                target: "127.0.0.1:8234".to_owned()
+        for kind in POLL_TASK_KINDS {
+            assert_eq!(
+                router
+                    .route_task_queue(namespace, task_queue, kind)
+                    .await
+                    .unwrap(),
+                RouteTarget::Remote {
+                    target: "127.0.0.1:8234".to_owned()
+                },
+                "{kind:?} must reach the workflow-key queue home",
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Every task kind reaches the workflow-key bundle owner from every node.
+        #[test]
+        fn cache_router_task_kinds_match_workflow_queue_home(
+            namespace in "[a-zA-Z0-9_-]{1,40}",
+            task_queue in "[a-zA-Z0-9_/-]{1,80}",
+            partition_count in 1u32..257,
+            owners in prop::collection::vec(0u16..4, 1..33),
+        ) {
+            let config = PlacementConfig {
+                shard_count: owners.len() as u32,
+                bundle_count: owners.len() as u32,
+                partition_count,
+                hash_version: 1,
+            };
+            let mut snapshot = RoutingSnapshot::new(config);
+            for node in 0u16..4 {
+                snapshot.node_endpoints.insert(incarnation(u128::from(node)), endpoint(8234 + node));
             }
-        );
+            for (bundle, node) in owners.iter().enumerate() {
+                snapshot.execution_bundle_owners.insert(
+                    ShardId(bundle as u32),
+                    BundleOwner { node_id: incarnation(u128::from(*node)), epoch: ShardEpoch(1) },
+                );
+            }
+            let home = bundle_for_partition(
+                workflow_queue_partition(
+                    crate::translate::to_internal::namespace_id_for(&namespace),
+                    &task_queue,
+                    partition_count,
+                ),
+                config.bundle_count,
+            );
+            let expected_owner = owners[home.0 as usize];
+            let cache = Arc::new(RoutingCache::new(config));
+            cache.replace_snapshot(snapshot);
+            let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+
+            for local in 0u16..4 {
+                let router = CacheBackedRouter::new(cache.clone(), incarnation(u128::from(local)));
+                let expected = if local == expected_owner {
+                    RouteTarget::Local
+                } else {
+                    RouteTarget::Remote { target: endpoint(8234 + expected_owner).as_authority() }
+                };
+                for kind in POLL_TASK_KINDS {
+                    let actual = runtime.block_on(router.route_task_queue(&namespace, &task_queue, kind)).unwrap();
+                    prop_assert_eq!(&actual, &expected, "kind={:?}, local={}", kind, local);
+                }
+            }
+        }
     }
 }

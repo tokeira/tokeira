@@ -99,12 +99,7 @@ struct TrackedTimeout {
 struct TimeoutEntries {
     entries: HashMap<RunKey, TrackedTimeout>,
     revision: u64,
-    // The selected wake while sleeping, the actual wake time while scanning,
-    // and None only before the first plan. Future inserts during a scan need no
-    // notification: the next plan sees them, including any that just became due.
-    planned_wake: Option<OffsetDateTime>,
-    // Distinguishes newly overdue inserts from older entries retained for retry.
-    scan_started_revision: Option<u64>,
+    plan: crate::deadline_wake::DeadlinePlan,
 }
 
 fn acquisition_active(owner: Option<&ShardOwner>, acquisition: Option<&ShardAcquisition>) -> bool {
@@ -197,9 +192,7 @@ impl WftTimeoutTrackingState {
         // time before that scan's wake notifies; planning sees future inserts and
         // uses their revision to catch any that become overdue during the scan.
         let wakes_scanner = acquisition_active(owner.as_deref(), acquisition.as_ref())
-            && inner
-                .planned_wake
-                .is_none_or(|wake| wft_timeout_due_at(&entry) < wake);
+            && inner.plan.should_notify(Some(wft_timeout_due_at(&entry)));
         inner.entries.insert(
             entry.run_key,
             TrackedTimeout {
@@ -236,8 +229,8 @@ impl WftTimeoutTrackingState {
         let mut inner = self.inner.lock().expect("inner lock poisoned");
         // Capture both under the installation lock so the next plan can recover
         // every newly overdue insert without waking on every future insert.
-        inner.planned_wake = Some(now);
-        inner.scan_started_revision = Some(inner.revision);
+        let revision = inner.revision;
+        inner.plan.start_scan(now, revision);
     }
 
     /// Number of started workflow tasks still awaiting a worker's reply.
@@ -535,24 +528,14 @@ fn wft_timeout_scan_delay(
         .values()
         .filter(|tracked| acquisition_active(owner.as_deref(), tracked.acquisition.as_ref()))
         .filter_map(|tracked| {
-            let remaining = wft_timeout_due_at(&tracked.entry) - now;
-            if remaining > Duration::ZERO {
-                tokio::time::Duration::try_from(remaining).ok()
-            } else if inner
-                .scan_started_revision
-                .is_some_and(|revision| tracked.revision > revision)
-                && evaluate_wft_timeout(&tracked.entry, now)
-            {
-                Some(tokio::time::Duration::ZERO)
-            } else {
-                None
+            let due = wft_timeout_due_at(&tracked.entry);
+            if due <= now && !evaluate_wft_timeout(&tracked.entry, now) {
+                return None;
             }
+            inner.plan.remaining(now, due, tracked.revision)
         })
         .fold(maximum, std::cmp::min);
-    inner.planned_wake = Some(deadline_after(
-        now,
-        Duration::try_from(delay).unwrap_or(Duration::MAX),
-    ));
+    inner.plan.set_wake(now, delay);
     delay
 }
 

@@ -91,6 +91,8 @@ pub(crate) mod activity;
 #[cfg(test)]
 mod activity_backlog_tests;
 #[cfg(test)]
+mod activity_deadline_tests;
+#[cfg(test)]
 mod activity_retirement_tests;
 #[cfg(test)]
 mod buffered_force_close_tests;

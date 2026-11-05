@@ -183,3 +183,15 @@ All code lives in `tokeira-runtime`, in a new `activity_timeout.rs` module (foll
 
 - [x] Verify Property 16 with the required property and regression tests: `stored_retry_backoff_is_total`, `command_durations_preserve_failure_cause_and_message`.
   _Requirements: 9._
+
+- [x] 9. Wake activity timeout scanning at deadlines
+  - Cache timeout configuration and pause state at scheduling, start, committed
+    updates and recovery; retain it across re-anchoring.
+  - Share wake planning with workflow-task deadlines and retry eligibility; reload
+    due entries in stable deadline order and reconcile all entries each interval.
+  - Continue capped passes immediately for unattempted work; defer failed attempts
+    to the full pass without losing concurrent inserts or acquisition fencing.
+  - Reproduce both deadline loops and the buffered-event history before the fix.
+    Cover each due-time rule, overflow, notifications, counted cache refreshes,
+    ordering/caps, failures and Property 17 with at least 100 generated cases.
+  - _Requirements: 7.1, 7.3, 7.6–7.8._

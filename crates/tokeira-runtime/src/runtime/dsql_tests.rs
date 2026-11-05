@@ -571,6 +571,7 @@ async fn workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs(
     workflow.insert(stale);
     assert_eq!(runtime.workflow_timeout_tracking.snapshot(), before);
     activity.insert(ActivityTrackingEntry {
+        timeouts: None,
         run_key,
         shard_id: execution_home,
         activity_id: "old".into(),

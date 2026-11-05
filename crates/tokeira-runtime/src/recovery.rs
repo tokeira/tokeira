@@ -345,6 +345,10 @@ where
                 // original schedule, which stays the schedule-to-close anchor
                 // spanning the whole retry chain (retry.go:108-110 @ v1.31.0).
                 activity_tracking.insert(ActivityTrackingEntry {
+                    timeouts: state
+                        .activities
+                        .get(&entry.activity_id)
+                        .map(crate::activity_timeout::ActivityTimeouts::from),
                     run_key: entry.run_key,
                     shard_id,
                     activity_id: entry.activity_id,

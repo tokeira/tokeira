@@ -8,7 +8,7 @@ The feature has two distinct halves:
 
 1. **Heartbeat endpoint.** A new `record_activity_heartbeat` method on `TokeiraRuntime` that accepts an `ActivityTaskToken` and heartbeat details, updates a runtime-local timestamp, and returns a cancellation indicator. This is a purely runtime-side operation — no kernel command, no history event, no storage commit. The heartbeat path reuses the existing token validation logic from Feature 2.
 
-2. **Timeout scanner.** A background `tokio::spawn` task (`ActivityTimeoutScanner`) that periodically iterates over runtime-local tracking state, loads timeout configuration from the kernel's `ActivityState` via storage, and submits `Command::ActivityResolved(TimedOut)` through the lane when a timeout is detected. The scanner is non-authoritative: the kernel is the final arbiter. If the activity was already resolved or the run is closed, the kernel rejects the command harmlessly.
+2. **Timeout scanner.** A background `tokio::spawn` task (`ActivityTimeoutScanner`) that wakes at cached deadlines, reconciles all entries every interval, and loads authoritative timeout configuration from the kernel's `ActivityState` via storage, and submits `Command::ActivityResolved(TimedOut)` through the lane when a timeout is detected. The scanner is non-authoritative: the kernel is the final arbiter. If the activity was already resolved or the run is closed, the kernel rejects the command harmlessly.
 
 The runtime-local tracking state (`ActivityTrackingState`) is a new in-memory structure keyed by `(RunKey, String)` (run_key, activity_id). It records `scheduled_at`, `started_at`, `last_heartbeat_at`, and `cancel_requested` per activity. This state is populated by hooks in the existing activity lifecycle: dispatch publication sets `scheduled_at`, the activity-task-start transaction sets `started_at`, heartbeat calls update `last_heartbeat_at`, and activity resolution removes the entry.
 
@@ -58,13 +58,13 @@ flowchart TD
 
 **Heartbeat is a pure runtime operation.** `record_activity_heartbeat` validates the token (reusing `validate_activity_token` from Feature 2), updates `last_heartbeat_at` in the tracking state, reads `cancel_requested`, and returns. No kernel command, no history event, no storage write. This keeps heartbeat latency minimal and avoids amplifying write pressure on storage.
 
-**Scanner reads timeout config from storage, not from tracking state.** The tracking state only holds timestamps and cancellation status. Timeout durations (`heartbeat_timeout`, `schedule_to_start_timeout`, etc.) are read from the kernel's `ActivityState` via `repo.load_run()`. This ensures the scanner always uses the authoritative timeout configuration, even if it was updated via `UpdateActivityOptions` after the activity was scheduled.
+**Cached configuration selects wakes; storage authorizes decisions.** Tracking caches all four timeout durations and the pause flag beside the anchors. Each due entry reloads its `ActivityState` before evaluation and refreshes that cache, including when no timeout fires. A full pass every interval repairs a cache later than the real deadline; `UpdateActivityOptions` and other lane commits also refresh tracked configuration.
 
 **Schedule-to-close takes precedence.** When multiple timeouts fire for the same activity in a single scan cycle, only the `SCHEDULE_TO_CLOSE` resolution is submitted. This matches Temporal's semantics: schedule-to-close is the outer bound that subsumes all other timeouts.
 
 **Scanner submits through the lane, not directly to the kernel.** The scanner uses the same `self.submit(run_key, Command::ActivityResolved(...))` path as completions and failures. This preserves the lane's single-writer serialization for each run and ensures the kernel's fenced transition logic handles conflicts correctly.
 
-**Bounded batches per scan cycle.** The scanner processes at most `max_timeouts_per_scan` activities per cycle to avoid starving other lane work. Remaining timed-out activities are picked up in the next cycle.
+**Bounded batches per scan cycle.** The scanner processes at most `max_timeouts_per_scan` activities per cycle to avoid starving other lane work. Unattempted due activities continue immediately in the next pass; attempted failures wait for the reconciliation interval.
 
 **Graceful lifecycle management.** The scanner is spawned as a `tokio::JoinHandle` during `TokeiraRuntime::new` and cancelled via a `CancellationToken` on shutdown. Transient storage errors during scanning are logged and the scanner continues to the next cycle.
 
@@ -82,6 +82,8 @@ In-memory state for timeout detection and heartbeat processing.
 /// heartbeat endpoint and timeout scanner.
 #[derive(Clone, Debug)]
 pub struct ActivityTrackingEntry {
+    /// Four timeout durations and pause state; None requests an immediate reload.
+    pub timeouts: Option<ActivityTimeouts>,
     pub run_key: RunKey,
     pub activity_id: String,
     /// Set once on first scheduling (attempt 1). Never
@@ -158,7 +160,7 @@ Background task that detects timeout violations:
 
 ```rust
 pub struct ActivityTimeoutScannerConfig {
-    /// How often the scanner runs. Default: 1 second.
+    /// Full reconciliation interval. Default: 1 second.
     pub scan_interval: tokio::time::Duration,
     /// Maximum number of timeout commands to submit per scan cycle.
     pub max_timeouts_per_scan: usize,
@@ -175,15 +177,39 @@ impl Default for ActivityTimeoutScannerConfig {
 ```
 
 The scanner loop:
-1. Sleep for `scan_interval`.
-2. Take a snapshot of `ActivityTrackingState`.
-3. For each entry (up to `max_timeouts_per_scan`):
-   a. Load the run's `WorkflowState` from storage to get the `ActivityState` with timeout config.
-   b. If the activity is no longer in the run's activities map, remove it from tracking and skip.
-   c. Evaluate timeouts in precedence order: schedule-to-close first, then heartbeat / schedule-to-start / start-to-close.
-   d. If a timeout is detected, submit `Command::ActivityResolved(TimedOut { timeout_type })` via `self.submit()`.
-   e. On success or harmless rejection, remove the entry from tracking state.
-   f. On transient error, log and continue.
+1. Plan the earliest active timeout or unevaluated retry-eligibility deadline,
+   bounded by the next full pass (`scan_interval`, one second by default).
+2. Sleep until that time, cancellation, or an earlier-deadline notification.
+3. Snapshot due entries in deadline order, with run/activity identity as the stable
+   tie-break. Every interval, include all entries to reconcile stale caches.
+4. Before each await, mark the captured entry revision attempted. Reload its run,
+   refresh cached timeouts and pause state, then evaluate authoritative activity
+   state using the existing precedence, retry decisions and lane submission.
+5. Retire successful/stale entries conditionally on revision and acquisition.
+   Failed attempts wait for the next interval. A bounded pass leaves unattempted
+   due entries ready for an immediate continuation, independently for timeout and
+   eligibility caps; eligibility cursors remain acquisition-scoped.
+
+Cache all four timeout values and the pause flag beside the timing anchors. Unknown
+configuration is immediately due for one reload. Paused activities and zero/unset
+timeouts have no deadline. Otherwise the earliest applicable strict deadline is
+one nanosecond after the saturating deadline: schedule-to-close always applies;
+started activities add start-to-close and heartbeat (the later of start and last
+heartbeat); unstarted activities add schedule-to-start. Saturated deadlines cannot
+expire. Publisher scheduling, committed state, ordinary starts and recovery supply
+the cache; re-anchoring preserves it. Every lane commit refreshes changed options
+and pause state of tracked activities without rearming unchanged entries.
+
+Wake planning shares the workflow-task scanner's notification rule. During a scan,
+the planned wake is the scan's wake time, so future inserts do not trigger a rescan.
+Unattempted overdue entries, including those inserted after the scan began, plan an
+immediate continuation. Attempted overdue entries keep the interval. A revision
+check across both index snapshots prevents an insert racing planning from being
+lost. A stale-early cache costs one reload and refresh; a stale-late cache is repaired
+by the full pass. These caches never authorize a timeout (Requirement 7.3).
+
+Authority: `service/history/workflow/timer_sequence.go:108-154` and
+`service/history/queues/queue_scheduled.go:159-224,269 @ v1.31.0`.
 
 ### Timeout evaluation (pure function)
 
@@ -305,8 +331,9 @@ evaluate_activity_timeout(entry, activity_state, now):
 ```
 TokeiraRuntime::new:
   1. Create ActivityTrackingState (shared across runtime and publisher)
-  2. Spawn ActivityTimeoutScanner with clone of repo, tracking state, lane submit fn, cancel token
-  3. Store JoinHandle and CancellationToken
+  2. Spawn ActivityTimeoutScanner with repo, shared timeout/eligibility wake, lane submit fn, cancel token
+  3. Track the next full-pass time independently of earlier deadline wakes
+  4. Store JoinHandle and CancellationToken
 
 TokeiraRuntime::shutdown (or Drop):
   1. Cancel the CancellationToken
@@ -511,3 +538,16 @@ For any wire seconds/nanos pair or stored duration in this feature, conversion a
 Ground truth: `chasm/lib/activity/validator.go:149-160`, `common/retrypolicy/retry_policy.go:65-77`, and `service/history/workflow/retry.go:96-110 @ v1.31.0`. Existing timeout normalization and retry-boundary comparisons are unchanged; saturation protects legacy rows.
 
 Verification: `stored_retry_backoff_is_total`, `command_durations_preserve_failure_cause_and_message`. Admission uses `validate_and_cap_proto_duration`; stored deadlines use saturating arithmetic because earlier rows did not pass that admission boundary. No schema or dependency changes are required.
+
+### Property 17: Deadline-bounded wake
+
+For any active future timeout or retry-eligibility deadline, the planned sleep
+shall end no later than that deadline or the next full-pass interval. Inactive
+entries do not shorten it; attempted overdue entries wait for the interval, while
+unattempted due entries continue immediately.
+
+**Validates: Requirements 7.1, 7.7, 7.8.**
+
+Verification uses at least 100 generated cases, supplied-clock deadline and
+notification tests, counted reloads, cap/failure controls, and real scanner loops
+with a one-hour interval, including the buffered activity/workflow timeout history.

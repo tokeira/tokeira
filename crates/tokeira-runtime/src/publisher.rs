@@ -1163,6 +1163,10 @@ where
                         stamp,
                         dispatch_at,
                         priority,
+                        schedule_to_close_timeout,
+                        schedule_to_start_timeout,
+                        start_to_close_timeout,
+                        heartbeat_timeout,
                         ..
                     } = op
                     {
@@ -1183,11 +1187,18 @@ where
                         // Durable eligibility also anchors schedule-to-start after
                         // a delayed publication. Rehydration must not grant another
                         // timeout window merely because the owner recovered late.
-                        self.activity_tracking.record_scheduled(
+                        self.activity_tracking.record_scheduled_with_timeouts(
                             run_key,
                             execution_home,
                             activity_id.clone(),
                             *dispatch_at,
+                            Some(crate::activity_timeout::ActivityTimeouts {
+                                schedule_to_close: *schedule_to_close_timeout,
+                                schedule_to_start: *schedule_to_start_timeout,
+                                start_to_close: *start_to_close_timeout,
+                                heartbeat: *heartbeat_timeout,
+                                paused: false,
+                            }),
                         );
                         // The owner's eligibility index evaluates delayed rules;
                         // queue-home discovery supplies offers once the row is due.

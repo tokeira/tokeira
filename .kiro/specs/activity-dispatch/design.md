@@ -225,6 +225,11 @@ The companion inline workflow-task contract is in
 
 ### Retry eligibility and workflow rules
 
+Retry eligibility shares the activity timeout scanner's earliest-deadline wake,
+including earlier-insert notifications and immediate continuation of unattempted
+capped work, so backoff expiry is evaluated at its due time without changing offer
+discovery (`service/history/workflow/task_generator.go:567-577 @ v1.31.0`).
+
 Split `prepare_activity_dispatch_publish` into read-only candidate inspection and
 execution-owner rule application. Discovery does not suppress an otherwise valid
 hint merely because a new workflow rule might pause it: doing so could prevent

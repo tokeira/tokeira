@@ -34,13 +34,38 @@ struct Eligibility {
     evaluated: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct ActivityEligibility {
     entries: AcquisitionEntries<(RunKey, String), Eligibility>,
     cursors: Arc<Mutex<HashMap<(ShardId, u64), Position>>>,
 }
 
+impl Default for ActivityEligibility {
+    fn default() -> Self {
+        Self::with_wake(crate::deadline_wake::DeadlineWake::default())
+    }
+}
+
 impl ActivityEligibility {
+    pub(crate) fn with_wake(wake: crate::deadline_wake::DeadlineWake) -> Self {
+        Self {
+            entries: AcquisitionEntries::with_deadlines(wake, |entry: &Eligibility| {
+                (!entry.evaluated).then_some(entry.due)
+            }),
+            cursors: Arc::default(),
+        }
+    }
+    pub(crate) fn begin_full_pass(&self) {
+        self.entries.begin_full_pass(false);
+    }
+    pub(crate) fn deadline_delay(
+        &self,
+        now: OffsetDateTime,
+        maximum: std::time::Duration,
+    ) -> std::time::Duration {
+        self.entries.deadline_delay(now, maximum)
+    }
+
     pub(crate) fn set_owner(&self, owner: Arc<RwLock<ShardOwner>>) {
         self.entries.set_owner(owner);
     }
@@ -155,14 +180,9 @@ pub(crate) async fn scan_activity_eligibility_once<R: RunRepository + 'static>(
         cursors.retain(|(id, old), _| *id != home || *old == generation);
         cursors.get(&(home, generation)).cloned()
     };
-    let mut entries: Vec<_> = tracking
-        .entries
-        .snapshot(Some(home))
-        .into_iter()
-        .filter(|entry| {
-            !entry.value.evaluated && entry.value.due <= now && tracking.entries.active(entry)
-        })
-        .collect();
+    let mut entries = tracking.entries.select_active(Some(home), |entry| {
+        entry.deadline_pending && !entry.value.evaluated && entry.value.due <= now
+    });
     entries.sort_by_key(|entry| (entry.value.due, incarnation(&entry.value.task)));
     let mut examined = 0;
     let mut last = None;
@@ -177,6 +197,15 @@ pub(crate) async fn scan_activity_eligibility_once<R: RunRepository + 'static>(
     {
         if attempt.validate(&deps.shard_owner).is_err() {
             return;
+        }
+        if !tracking.entries.mark_attempted(
+            &(
+                entry.value.task.run_key,
+                entry.value.task.activity_id.clone(),
+            ),
+            &entry,
+        ) {
+            continue;
         }
         examined += 1;
         last = Some((entry.value.due, incarnation(&entry.value.task)));
@@ -240,6 +269,54 @@ mod tests {
             priority: None,
             order: None,
         }
+    }
+
+    #[tokio::test]
+    async fn eligibility_shares_earliest_wake_and_later_insert_is_quiet() {
+        let tracking = crate::activity_timeout::ActivityTrackingState::default();
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let maximum = std::time::Duration::from_secs(10);
+        assert_eq!(tracking.scan_delay(now, maximum), maximum);
+        tracking.record_scheduled_with_timeouts(
+            task(0, 2).run_key,
+            ShardId(0),
+            "timeout",
+            now,
+            Some(crate::activity_timeout::ActivityTimeouts {
+                schedule_to_start: Some(time::Duration::seconds(5)),
+                ..Default::default()
+            }),
+        );
+        tracking
+            .eligibility
+            .record(task(0, 2), ShardId(0), now + time::Duration::seconds(2));
+        let notified = tracking.wake.notify.notified();
+        tokio::pin!(notified);
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(notified.as_mut(), cx).is_ready()
+            ))
+            .await
+        );
+        assert_eq!(
+            tracking.scan_delay(now, maximum),
+            std::time::Duration::from_secs(2)
+        );
+        tracking
+            .eligibility
+            .record(task(1, 2), ShardId(0), now + time::Duration::seconds(20));
+        let notified = tracking.wake.notify.notified();
+        tokio::pin!(notified);
+        assert!(
+            !std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(notified.as_mut(), cx).is_ready()
+            ))
+            .await
+        );
+        assert_eq!(
+            tracking.scan_delay(now, maximum),
+            std::time::Duration::from_secs(5) + std::time::Duration::from_nanos(1)
+        );
     }
 
     proptest! {

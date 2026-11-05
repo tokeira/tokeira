@@ -722,6 +722,7 @@ mod tests {
         // Tracking the failed sweep had already rebuilt.
         let now = OffsetDateTime::now_utc();
         runtime.activity_tracking.insert(ActivityTrackingEntry {
+            timeouts: None,
             run_key: RunKey::new(),
             shard_id: ShardId(0),
             activity_id: "activity-1".to_owned(),

@@ -1078,10 +1078,17 @@ where
             )
             .await?
             {
-                CommitResult::Applied { .. } => {
+                CommitResult::Applied { new_state } => {
                     runtime_metrics::record_activity_task_started(OutcomeLabel::Success);
-                    self.activity_tracking
-                        .record_started(run_key, activity_id, self.clock.now());
+                    self.activity_tracking.record_started_with_timeouts(
+                        run_key,
+                        activity_id,
+                        self.clock.now(),
+                        new_state
+                            .activities
+                            .get(activity_id)
+                            .map(crate::activity_timeout::ActivityTimeouts::from),
+                    );
                     return Ok(token);
                 }
                 CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
@@ -1673,7 +1680,14 @@ where
                         .record_latency(&task.queue, entered_at.elapsed());
                     // Callback authority stays with the acquisition that committed;
                     // a replacement owner must reconstruct its own timeout tracking.
-                    start_tracking.record_started(task.run_key, &next_activity.activity_id, now);
+                    start_tracking.record_started_with_timeouts(
+                        task.run_key,
+                        &next_activity.activity_id,
+                        now,
+                        Some(crate::activity_timeout::ActivityTimeouts::from(
+                            &next_activity,
+                        )),
+                    );
                     return Ok(ActivityStartOutcome::Started(started));
                 }
                 CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
@@ -2178,7 +2192,15 @@ where
                     tracking.remove(run_key, activity_id);
                     return Ok(());
                 }
-                tracking.record_retry(run_key, activity_id, dispatch_at);
+                tracking.record_retry_with_timeouts(
+                    run_key,
+                    activity_id,
+                    dispatch_at,
+                    new_state
+                        .activities
+                        .get(activity_id)
+                        .map(crate::activity_timeout::ActivityTimeouts::from),
+                );
                 // The committed canonical row is discoverable independently of
                 // this callback; eligibility tracking applies later owner rules.
                 return Ok(());
@@ -3749,6 +3771,7 @@ mod tests {
         let long_ago = OffsetDateTime::now_utc() - Duration::hours(1);
         let deps = runtime.activity_retry_deps();
         deps.tracking.insert(ActivityTrackingEntry {
+            timeouts: None,
             run_key: token.run_key,
             shard_id: ShardId(0),
             activity_id: token.activity_id.clone(),
@@ -4220,6 +4243,7 @@ mod tests {
         let activity = &state.activities[&token.activity_id];
         let deps = runtime.activity_retry_deps();
         deps.tracking.insert(ActivityTrackingEntry {
+            timeouts: None,
             run_key: token.run_key,
             shard_id: ShardId(0),
             activity_id: token.activity_id.clone(),

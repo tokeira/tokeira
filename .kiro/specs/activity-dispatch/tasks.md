@@ -448,3 +448,11 @@ historical link correction in the older workflow-dispatch requirements passes
 the full repository offline Markdown check with zero errors. Deletion of the
 original disposable devbox and database is verified; their replacements remain
 active for the live campaign. No implementation commit or PR exists yet.
+
+- [x] 16. Evaluate retry eligibility at its deadline
+  - Share the activity timeout wake and preserve acquisition-scoped cursors,
+    stable deadline order, the eligibility quantum and retry/rule decisions.
+  - Reproduce eligibility waking with a one-hour interval before the fix; test
+    earlier/later notifications, shared planning and bounded continuation.
+  - Dependency: runtime-activity-timeouts task 9.
+  - _Requirements: 6.9._

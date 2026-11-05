@@ -1,8 +1,9 @@
 //! Acquisition-scoped volatile indexes shared by recovery and timer scanners.
 //!
 //! Ownership is locked before entries so replacement cannot interleave validation
-//! with installation. Every mutation advances a revision: an awaited scan may
+//! with installation. Every authoritative tracking mutation advances a revision: an awaited scan may
 //! retire only the exact value it submitted, even when its logical key is reused.
+//! Scanner-only cache refreshes preserve that revision and never replace anchors.
 
 use std::{
     collections::HashMap,
@@ -10,6 +11,8 @@ use std::{
     sync::{Arc, Mutex, OnceLock, RwLock},
 };
 
+use crate::deadline_wake::DeadlineWake;
+use time::OffsetDateTime;
 use tokeira_types::ShardId;
 
 use crate::shard::{ShardAcquisition, ShardOwner};
@@ -20,6 +23,9 @@ pub(crate) struct Tracked<V> {
     home: ShardId,
     revision: u64,
     acquisition: Option<ShardAcquisition>,
+    // Unattempted work survives a bounded pass; failed attempts wait for the next full pass.
+    pub(crate) deadline_pending: bool,
+    pub(crate) refresh_pending: bool,
 }
 
 impl<V> Tracked<V> {
@@ -37,11 +43,18 @@ struct Entries<K, V> {
 }
 
 #[derive(Clone, Debug)]
+struct DeadlineIndex<V> {
+    wake: DeadlineWake,
+    due: fn(&V) -> Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct AcquisitionEntries<K, V> {
     entries: Arc<Mutex<Entries<K, V>>>,
     owner: Arc<OnceLock<Arc<RwLock<ShardOwner>>>>,
     acquisition: Option<ShardAcquisition>,
     submitted_revision: Option<u64>,
+    deadlines: Option<DeadlineIndex<V>>,
 }
 
 impl<K, V> Default for AcquisitionEntries<K, V> {
@@ -54,11 +67,118 @@ impl<K, V> Default for AcquisitionEntries<K, V> {
             owner: Arc::new(OnceLock::new()),
             acquisition: None,
             submitted_revision: None,
+            deadlines: None,
         }
     }
 }
 
 impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
+    pub(crate) fn with_deadlines(
+        wake: DeadlineWake,
+        due: fn(&V) -> Option<OffsetDateTime>,
+    ) -> Self {
+        Self {
+            deadlines: Some(DeadlineIndex { wake, due }),
+            ..Self::default()
+        }
+    }
+
+    fn changed_deadline(
+        &self,
+        value: &V,
+        owner: Option<&ShardOwner>,
+        acquisition: Option<&ShardAcquisition>,
+    ) {
+        if let Some(index) = &self.deadlines {
+            let active = owner.is_none_or(|owner| {
+                acquisition.is_some_and(|acquisition| owner.acquisition_active(acquisition))
+            });
+            index
+                .wake
+                .changed(if active { (index.due)(value) } else { None });
+        }
+    }
+
+    /// Start a periodic reconciliation without rearming failed entries on every deadline wake.
+    pub(crate) fn begin_full_pass(&self, refresh: bool) {
+        let mut entries = self.entries.lock().expect("tracking lock poisoned");
+        for entry in entries.values.values_mut() {
+            entry.deadline_pending = true;
+            entry.refresh_pending = refresh;
+        }
+    }
+
+    /// Record an examination before awaiting I/O. Never consume a replacement's work.
+    pub(crate) fn mark_attempted(&self, key: &K, submitted: &Tracked<V>) -> bool {
+        let mut entries = self.entries.lock().expect("tracking lock poisoned");
+        let Some(entry) = entries
+            .values
+            .get_mut(key)
+            .filter(|entry| entry.revision == submitted.revision)
+        else {
+            return false;
+        };
+        entry.deadline_pending = false;
+        entry.refresh_pending = false;
+        true
+    }
+
+    /// Refresh only derived timing data after a scan, preserving the submission's
+    /// revision so its completion cannot retire a concurrent start or heartbeat.
+    pub(crate) fn refresh_scanned(
+        &self,
+        key: &K,
+        submitted: &Tracked<V>,
+        now: OffsetDateTime,
+        update: impl FnOnce(&mut V),
+    ) {
+        let mut entries = self.entries.lock().expect("tracking lock poisoned");
+        let Some(entry) = entries
+            .values
+            .get_mut(key)
+            .filter(|entry| entry.revision == submitted.revision)
+        else {
+            return;
+        };
+        update(&mut entry.value);
+        if let Some(index) = &self.deadlines {
+            entry.deadline_pending = (index.due)(&entry.value).is_some_and(|due| due > now);
+        }
+    }
+
+    pub(crate) fn deadline_delay(
+        &self,
+        now: OffsetDateTime,
+        maximum: std::time::Duration,
+    ) -> std::time::Duration {
+        let Some(index) = &self.deadlines else {
+            return maximum;
+        };
+        // Match installation's lock order; planning borrows values so every
+        // deadline wake need not copy the entire activity/eligibility index.
+        let owner = self
+            .owner
+            .get()
+            .map(|owner| owner.read().expect("shard owner lock poisoned"));
+        let entries = self.entries.lock().expect("tracking lock poisoned");
+        entries
+            .values
+            .values()
+            .filter(|entry| Self::active_with_owner(owner.as_deref(), entry))
+            .filter_map(|entry| {
+                if entry.refresh_pending {
+                    return Some(std::time::Duration::ZERO);
+                }
+                let due = (index.due)(&entry.value)?;
+                if due > now {
+                    std::time::Duration::try_from(due - now).ok()
+                } else {
+                    entry.deadline_pending.then_some(std::time::Duration::ZERO)
+                }
+            })
+            .fold(maximum, std::cmp::min)
+    }
+
     pub(crate) fn set_owner(&self, owner: Arc<RwLock<ShardOwner>>) {
         let _ = self.owner.set(owner);
     }
@@ -167,6 +287,7 @@ impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
             .checked_add(1)
             .expect("tracking revision exhausted");
         let revision = inner.revision;
+        self.changed_deadline(&value, owner.as_deref(), acquisition.as_ref());
         inner.values.insert(
             key,
             Tracked {
@@ -174,6 +295,8 @@ impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
                 home,
                 revision,
                 acquisition,
+                deadline_pending: self.deadlines.is_some(),
+                refresh_pending: false,
             },
         );
     }
@@ -205,7 +328,11 @@ impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
         let revision = inner.revision;
         let entry = inner.values.get_mut(key).expect("entry remains under lock");
         entry.revision = revision;
-        Some(update(&mut entry.value))
+        let result = update(&mut entry.value);
+        entry.deadline_pending = self.deadlines.is_some();
+        entry.refresh_pending = false;
+        self.changed_deadline(&entry.value, owner.as_deref(), entry.acquisition.as_ref());
+        Some(result)
     }
 
     pub(crate) fn get(&self, key: &K) -> Option<V> {
@@ -283,15 +410,42 @@ impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
             .collect()
     }
 
-    pub(crate) fn active(&self, entry: &Tracked<V>) -> bool {
-        match (self.owner.get(), &entry.acquisition) {
-            (Some(owner), Some(acquisition)) => owner
-                .read()
-                .expect("shard owner lock poisoned")
-                .acquisition_active(acquisition),
+    /// Clone only selected active descriptors before a scanner releases its
+    /// locks for I/O. The predicate must not reacquire ownership or entries.
+    pub(crate) fn select_active(
+        &self,
+        home: Option<ShardId>,
+        mut select: impl FnMut(&Tracked<V>) -> bool,
+    ) -> Vec<Tracked<V>> {
+        let owner = self
+            .owner
+            .get()
+            .map(|owner| owner.read().expect("shard owner lock poisoned"));
+        let entries = self.entries.lock().expect("tracking lock poisoned");
+        entries
+            .values
+            .values()
+            .filter(|entry| home.is_none_or(|home| entry.home == home))
+            .filter(|entry| Self::active_with_owner(owner.as_deref(), entry))
+            .filter(|entry| select(entry))
+            .cloned()
+            .collect()
+    }
+
+    fn active_with_owner(owner: Option<&ShardOwner>, entry: &Tracked<V>) -> bool {
+        match (owner, &entry.acquisition) {
+            (Some(owner), Some(acquisition)) => owner.acquisition_active(acquisition),
             (None, _) => true,
             _ => false,
         }
+    }
+
+    pub(crate) fn active(&self, entry: &Tracked<V>) -> bool {
+        let owner = self
+            .owner
+            .get()
+            .map(|owner| owner.read().expect("shard owner lock poisoned"));
+        Self::active_with_owner(owner.as_deref(), entry)
     }
 
     /// Capture the entry's original acquisition, never a replacement observed
@@ -328,6 +482,91 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use tokeira_types::ShardEpoch;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct CloneCountedDeadline {
+        due: OffsetDateTime,
+        clones: Arc<AtomicUsize>,
+    }
+
+    impl Clone for CloneCountedDeadline {
+        fn clone(&self) -> Self {
+            self.clones.fetch_add(1, Ordering::SeqCst);
+            Self {
+                due: self.due,
+                clones: self.clones.clone(),
+            }
+        }
+    }
+
+    #[test]
+    fn planning_borrows_and_passes_clone_only_selected_entries() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let clones = Arc::new(AtomicUsize::new(0));
+        let owner = Arc::new(RwLock::new(ShardOwner::new(2)));
+        owner
+            .write()
+            .unwrap()
+            .record_acquired(ShardId(0), ShardEpoch(1));
+        owner.write().unwrap().mark_active(ShardId(0));
+        owner
+            .write()
+            .unwrap()
+            .record_acquired(ShardId(1), ShardEpoch(1));
+        let entries = AcquisitionEntries::with_deadlines(
+            DeadlineWake::default(),
+            |entry: &CloneCountedDeadline| Some(entry.due),
+        );
+        entries.set_owner(owner);
+        for id in 0..259 {
+            entries.insert(
+                id,
+                ShardId(u32::from(id == 258)),
+                CloneCountedDeadline {
+                    due: if id < 2 || id == 258 {
+                        now
+                    } else {
+                        now + time::Duration::hours(1)
+                    },
+                    clones: clones.clone(),
+                },
+            );
+        }
+        assert_eq!(clones.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            entries.deadline_delay(now, std::time::Duration::from_secs(1)),
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            clones.load(Ordering::SeqCst),
+            0,
+            "planning must borrow every value"
+        );
+        let selected = entries.select_active(None, |entry| {
+            entry.deadline_pending && entry.value.due <= now
+        });
+        assert_eq!(selected.len(), 2);
+        assert_eq!(
+            clones.load(Ordering::SeqCst),
+            2,
+            "future and inactive values must not be cloned"
+        );
+        entries.begin_full_pass(true);
+        clones.store(0, Ordering::SeqCst);
+        assert_eq!(
+            entries
+                .select_active(Some(ShardId(0)), |entry| entry.refresh_pending)
+                .len(),
+            258
+        );
+        assert_eq!(
+            clones.load(Ordering::SeqCst),
+            258,
+            "full passes still select every active entry"
+        );
+    }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]

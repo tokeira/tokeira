@@ -6,7 +6,7 @@ This document captures the requirements for Feature 3 of the Tokeira runtime: Ac
 
 Activity heartbeat is a purely runtime-side operation — it does not go through the kernel and produces no history events. The runtime maintains a last-heartbeat timestamp in its own tracking state and uses it for heartbeat timeout detection.
 
-Activity timeouts are detected by a background scanner that periodically inspects tracked activities and submits `ActivityResolved(TimedOut)` commands through the lane when timeouts are detected. This scanner is non-authoritative: the authoritative state transition happens when the kernel processes the `ActivityResolved` command. If the scanner fires a stale timeout (activity already resolved, run already closed), the kernel rejects it harmlessly.
+Activity timeouts are detected by a background scanner that wakes at tracked deadlines and reconciles activities every scan interval and submits `ActivityResolved(TimedOut)` commands through the lane when timeouts are detected. This scanner is non-authoritative: the authoritative state transition happens when the kernel processes the `ActivityResolved` command. If the scanner fires a stale timeout (activity already resolved, run already closed), the kernel rejects it harmlessly.
 
 This feature depends on Feature 2 (Activity Pump), which provides `poll_activity_task`, `complete_activity_task`, `fail_activity_task`, the `InMemoryActivityBroker`, activity-task-start transactions, and the `ActivityTaskToken`.
 
@@ -17,7 +17,7 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 - **Runtime**: The execution shell (`tokeira-runtime`) that orchestrates command routing, kernel invocation, storage commits, and derived-effect publication.
 - **Lane**: A single-thread serial command processor hosting many run actors. Commands for a run are routed to one lane via `hash(run_key) mod lane_count`.
 - **Heartbeat**: A periodic progress report from a running activity worker to the Runtime, used for timeout detection and cancellation propagation. Heartbeats are purely runtime state — no kernel involvement, no history events.
-- **Activity_Timeout_Scanner**: A background task in the Runtime that periodically checks tracked activities for timeout violations and submits `ActivityResolved(TimedOut)` commands through the lane.
+- **Activity_Timeout_Scanner**: A background task in the Runtime that checks tracked activities at their deadlines and every scan interval and submits `ActivityResolved(TimedOut)` commands through the lane.
 - **Heartbeat_Timeout**: The maximum allowed interval between consecutive heartbeats for a started activity. Configured per activity via `ActivityState.heartbeat_timeout`.
 - **Schedule_To_Start_Timeout**: The maximum allowed time between activity scheduling and activity start. Configured per activity via `ActivityState.schedule_to_start_timeout`.
 - **Start_To_Close_Timeout**: The maximum allowed time between activity start and activity completion. Configured per activity via `ActivityState.start_to_close_timeout`.
@@ -109,11 +109,11 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 
 ### Requirement 7: Activity Timeout Scanner Background Task
 
-**User Story:** As a Tokeira developer, I want a background scanner that periodically checks activities for timeout violations, so that timeouts are detected without polling from external callers.
+**User Story:** As a Tokeira developer, I want a background scanner that checks activities at their deadlines, so that timeouts are detected without polling from external callers.
 
 #### Acceptance Criteria
 
-1. THE Runtime SHALL run a background task (Activity_Timeout_Scanner) that periodically iterates over all entries in the Activity_Tracking_State and checks each activity against its configured timeouts.
+1. THE Runtime SHALL run a background task (Activity_Timeout_Scanner) that wakes at the earliest tracked deadline, reloads the due entries, and makes a full pass every scan interval.
 2. THE Activity_Timeout_Scanner SHALL use a configurable scan interval with a sensible default (e.g. 1 second).
 3. THE Activity_Timeout_Scanner SHALL read timeout configuration (heartbeat_timeout, schedule_to_start_timeout, start_to_close_timeout, schedule_to_close_timeout) from the kernel's `ActivityState` via storage, not from the Activity_Tracking_State.
 4. WHEN the Activity_Timeout_Scanner detects a timeout violation, THE Activity_Timeout_Scanner SHALL submit the `ActivityResolved(TimedOut)` command to the owning run's lane using the same `submit` path used by other runtime commands.
@@ -121,6 +121,9 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 6. THE Activity_Timeout_Scanner SHALL process timeout violations in bounded batches per scan cycle to avoid starving other lane work.
 
 ---
+
+7. WHEN a tracked activity's schedule-to-start, start-to-close, heartbeat or schedule-to-close deadline passes, THE Activity_Timeout_Scanner SHALL submit its timeout at that deadline rather than at a later periodic scan (`service/history/workflow/timer_sequence.go:108-154`; `service/history/queues/queue_scheduled.go:159-224,269 @ v1.31.0`).
+8. THE Activity_Timeout_Scanner SHALL submit due timeouts in deadline order with a stable tie-break, and a pass that stops at its cap SHALL leave no due entry it never attempted waiting for the interval.
 
 ### Requirement 8: Timeout Scanner Lifecycle
 

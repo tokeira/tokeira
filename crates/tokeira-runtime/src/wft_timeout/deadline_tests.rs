@@ -5,19 +5,12 @@ use std::{future::Future, task::Poll};
 use proptest::prelude::*;
 use tokio::sync::mpsc;
 
+use crate::test_clock::TestClock;
+
 use super::{
     tests::{fixed_now, sample_entry},
     *,
 };
-
-#[derive(Debug)]
-struct TestClock(tokio::time::Instant);
-
-impl Clock for TestClock {
-    fn now(&self) -> OffsetDateTime {
-        fixed_now() + Duration::try_from(self.0.elapsed()).unwrap()
-    }
-}
 
 fn active_tracking() -> (WftTimeoutTrackingState, Arc<RwLock<ShardOwner>>) {
     let owner = Arc::new(RwLock::new(ShardOwner::new(8)));
@@ -150,7 +143,7 @@ proptest! {
 }
 
 async fn deadline_loop(insert_while_asleep: bool) {
-    let clock: Arc<dyn Clock> = Arc::new(TestClock(tokio::time::Instant::now()));
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::new());
     let (tracking, owner) = active_tracking();
     let cancel = CancellationToken::new();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -233,7 +226,7 @@ async fn insert_notifies_only_when_it_advances_the_planned_wake() {
 
 #[tokio::test]
 async fn future_insert_during_scan_does_not_store_a_wake() {
-    let clock: Arc<dyn Clock> = Arc::new(TestClock(tokio::time::Instant::now()));
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::new());
     let (tracking, owner) = active_tracking();
     let mut due = sample_entry(RunKey::new(), clock.now());
     due.workflow_task_timeout = Duration::ZERO;
@@ -318,7 +311,7 @@ async fn scan_delay_keeps_the_interval_for_a_pre_scan_entry_whose_submission_fai
 
 #[tokio::test]
 async fn loop_does_not_lose_an_insert_during_submission() {
-    let clock: Arc<dyn Clock> = Arc::new(TestClock(tokio::time::Instant::now()));
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::new());
     let (tracking, owner) = active_tracking();
     let cancel = CancellationToken::new();
     let config = WftTimeoutScannerConfig {

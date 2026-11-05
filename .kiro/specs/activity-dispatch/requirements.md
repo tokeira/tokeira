@@ -359,6 +359,10 @@ semantics, so that reconciliation does not change workflow results.
 8. WHEN activity timeout processing is due, THE retirement of reconciliation and
    backlog loops SHALL leave timeout scanning and deadline reconstruction intact.
 
+9. WHEN a retry's backoff ends, THE execution owner SHALL evaluate the retry's
+   eligibility at that time rather than at a later periodic scan
+   (`service/history/workflow/task_generator.go:567-577 @ v1.31.0`).
+
 ### Requirement 7: Cut over and retire duplicate delivery mechanisms
 
 **User Story:** As a maintainer, I want one durable activity discovery mechanism,

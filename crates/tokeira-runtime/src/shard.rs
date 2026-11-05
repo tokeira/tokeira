@@ -637,6 +637,7 @@ mod tests {
                     has_retry_policy: false,
                 });
                 ats.insert(ActivityTrackingEntry {
+                    timeouts: None,
                     run_key: rk,
                     shard_id: shard_a,
                     activity_id: format!("a-{i}"),
@@ -669,6 +670,7 @@ mod tests {
                     has_retry_policy: false,
                 });
                 ats.insert(ActivityTrackingEntry {
+                    timeouts: None,
                     run_key: rk,
                     shard_id: shard_b,
                     activity_id: format!("b-{i}"),
@@ -771,6 +773,7 @@ mod tests {
                     has_retry_policy: false,
                 });
                 ats.insert(ActivityTrackingEntry {
+                    timeouts: None,
                     run_key: rk,
                     shard_id: shard_a,
                     activity_id: format!("a-{i}"),
@@ -803,6 +806,7 @@ mod tests {
                     has_retry_policy: false,
                 });
                 ats.insert(ActivityTrackingEntry {
+                    timeouts: None,
                     run_key: rk,
                     shard_id: shard_b,
                     activity_id: format!("b-{i}"),

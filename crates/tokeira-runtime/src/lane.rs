@@ -890,6 +890,9 @@ where
                 if let CommitResult::Applied { new_state } = &commit_result {
                     let shard_id = shard_id.expect("applied transition has an execution home");
                     activity_tracking.eligibility.refresh(new_state, shard_id);
+                    // Option updates, pause and reset may move a deadline without
+                    // starting an attempt. Unchanged caches do not rearm failed work.
+                    activity_tracking.refresh_timeouts(new_state);
                     // Only this commit's starts need new deadlines. Existing
                     // started activities keep their tracking across unrelated commits.
                     for activity_id in activity_starts {
@@ -897,6 +900,9 @@ where
                             continue;
                         };
                         activity_tracking.insert(crate::activity_timeout::ActivityTrackingEntry {
+                            timeouts: Some(crate::activity_timeout::ActivityTimeouts::from(
+                                activity,
+                            )),
                             run_key: new_state.run_key,
                             shard_id,
                             activity_id: activity.activity_id.clone(),

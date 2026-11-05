@@ -36,6 +36,10 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
                 .get(&entry.activity_id)
                 .is_some_and(|activity| activity.cancel_requested);
             activity.insert(crate::ActivityTrackingEntry {
+                timeouts: state
+                    .activities
+                    .get(&entry.activity_id)
+                    .map(crate::activity_timeout::ActivityTimeouts::from),
                 run_key: state.run_key,
                 shard_id: home,
                 activity_id: entry.activity_id,

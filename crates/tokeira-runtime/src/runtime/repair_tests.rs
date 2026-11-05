@@ -29,7 +29,7 @@ impl std::io::Write for PlacementLogCapture {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Point {
+pub(super) enum Point {
     Load,
     Candidates,
     Repair,
@@ -51,13 +51,13 @@ struct Pause {
 }
 
 #[derive(Debug, Default)]
-struct Repo {
-    inner: InMemoryStore,
-    fail: Mutex<Option<Point>>,
+pub(super) struct Repo {
+    pub(super) inner: InMemoryStore,
+    pub(super) fail: Mutex<Option<Point>>,
     conflicts: AtomicUsize,
     repair_attempts: AtomicUsize,
     repair_fences: Mutex<Vec<WriteFence>>,
-    loads: AtomicUsize,
+    pub(super) loads: AtomicUsize,
     stats_loads: AtomicUsize,
     legacy_delivery_calls: AtomicUsize,
     discovery_gate: Mutex<Option<Arc<discovery_scheduler_tests::Gate>>>,
@@ -80,7 +80,7 @@ impl Repo {
         }
     }
 
-    fn pause(&self, point: Point) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    pub(super) fn pause(&self, point: Point) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (entered, observed) = oneshot::channel();
         let (resume, waiting) = oneshot::channel();
         *self.pause.lock().unwrap() = Some(Pause {

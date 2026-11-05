@@ -788,8 +788,10 @@ deadline wakes the scanner; a later deadline leaves its planned wake alone.
 Planning the wake and installing entries share the tracking lock. During a scan,
 the planned wake is the time the scanner woke, so future inserts do not notify.
 The scanner also captures the tracking revision at scan start: planning wakes at
-once for an active overdue entry with a newer revision, while older overdue
-entries keep the retry interval so failed submissions cannot spin. Future entries
+once for an active overdue entry with a newer revision or unattempted work left
+by the cap, while attempted overdue entries keep the retry interval so failed
+submissions cannot spin. Passes select only due active entries and order them by
+deadline then run key (Requirement 7.10). Future entries
 are seen by the next plan without a notification. Per-shard scans,
 submission caps, revision checks and speculative timers remain unchanged
 (`service/history/queues/queue_scheduled.go:159-224,269 @ v1.31.0`; Requirement 7.9).

@@ -90,6 +90,8 @@ struct RecoveryPause {
 
 #[derive(Clone, Debug)]
 struct TrackedTimeout {
+    attempted: bool,
+    deferred: bool,
     entry: WftTimeoutEntry,
     revision: u64,
     acquisition: Option<ShardAcquisition>,
@@ -196,6 +198,8 @@ impl WftTimeoutTrackingState {
         inner.entries.insert(
             entry.run_key,
             TrackedTimeout {
+                attempted: false,
+                deferred: false,
                 entry,
                 revision,
                 acquisition,
@@ -390,16 +394,37 @@ async fn scan_wft_timeouts_at<F, Fut>(
     F: FnMut(WftTimeoutEntry, OffsetDateTime) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let mut entries: Vec<_> = tracking
-        .inner
-        .lock()
-        .expect("inner lock poisoned")
-        .entries
-        .values()
-        .filter(|tracked| shard_id.is_none_or(|id| tracked.entry.shard_id == id))
-        .cloned()
-        .collect();
-    entries.sort_by_key(|tracked| tracked.entry.run_key);
+    let mut entries: Vec<_> = {
+        // Match installation's lock order; clone only due active work.
+        let owner = tracking
+            .owner
+            .get()
+            .map(|owner| owner.read().expect("shard owner lock poisoned"));
+        tracking
+            .inner
+            .lock()
+            .expect("inner lock poisoned")
+            .entries
+            .values()
+            .filter(|tracked| shard_id.is_none_or(|id| tracked.entry.shard_id == id))
+            .filter(|tracked| acquisition_active(owner.as_deref(), tracked.acquisition.as_ref()))
+            .filter(|tracked| !tracked.attempted && evaluate_wft_timeout(&tracked.entry, now))
+            .cloned()
+            .collect()
+    };
+    entries.sort_by_key(|tracked| (wft_timeout_due_at(&tracked.entry), tracked.entry.run_key));
+    // Only unattempted capped work asks for an immediate continuation. A failed
+    // submission remains attempted until the periodic retry pass, preventing spin.
+    {
+        let mut inner = tracking.inner.lock().expect("inner lock poisoned");
+        for tracked in entries.iter().skip(config.max_timeouts_per_scan) {
+            if let Some(current) = inner.entries.get_mut(&tracked.entry.run_key)
+                && current.revision == tracked.revision
+            {
+                current.deferred = true;
+            }
+        }
+    }
     let mut submitted = 0usize;
 
     for tracked in entries {
@@ -414,6 +439,18 @@ async fn scan_wft_timeouts_at<F, Fut>(
             continue;
         }
 
+        {
+            let mut inner = tracking.inner.lock().expect("inner lock poisoned");
+            let Some(current) = inner
+                .entries
+                .get_mut(&entry.run_key)
+                .filter(|current| current.revision == tracked.revision)
+            else {
+                continue;
+            };
+            current.attempted = true;
+            current.deferred = false;
+        }
         match submit_timeout(entry.clone(), now).await {
             Ok(()) => {
                 runtime_metrics::record_workflow_task_timed_out(OutcomeLabel::Success);
@@ -529,10 +566,14 @@ fn wft_timeout_scan_delay(
         .filter(|tracked| acquisition_active(owner.as_deref(), tracked.acquisition.as_ref()))
         .filter_map(|tracked| {
             let due = wft_timeout_due_at(&tracked.entry);
-            if due <= now && !evaluate_wft_timeout(&tracked.entry, now) {
+            if due <= now && (tracked.attempted || !evaluate_wft_timeout(&tracked.entry, now)) {
                 return None;
             }
-            inner.plan.remaining(now, due, tracked.revision)
+            if tracked.deferred {
+                Some(tokio::time::Duration::ZERO)
+            } else {
+                inner.plan.remaining(now, due, tracked.revision)
+            }
         })
         .fold(maximum, std::cmp::min);
     inner.plan.set_wake(now, delay);
@@ -550,14 +591,23 @@ async fn run_wft_timeout_scanner_with_submit<F, Fut>(
     F: FnMut(WftTimeoutEntry, OffsetDateTime) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
+    let mut full = crate::deadline_wake::FullPass::new(config.scan_interval, clock.now());
     loop {
-        let delay = wft_timeout_scan_delay(&tracking, clock.now(), config.scan_interval);
+        let now = clock.now();
+        let delay = wft_timeout_scan_delay(&tracking, now, full.remaining(now));
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = tokio::time::sleep(delay) => {}
             _ = tracking.wake.notified() => {}
         }
-        tracking.start_scan(clock.now());
+        let now = clock.now();
+        tracking.start_scan(now);
+        if full.start(now) {
+            let mut inner = tracking.inner.lock().expect("inner lock poisoned");
+            for tracked in inner.entries.values_mut() {
+                tracked.attempted = false;
+            }
+        }
         let active_shards: Vec<_> = shard_owner
             .read()
             .expect("shard_owner lock poisoned")
@@ -778,5 +828,46 @@ mod tests {
         .await;
 
         assert!(tracking.snapshot().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn task_deadline_order_cap_and_failed_attempt_spacing() {
+        let now = tests::fixed_now();
+        let tracking = WftTimeoutTrackingState::default();
+        let early = tests::sample_entry(RunKey::new(), now - Duration::seconds(30));
+        let late = tests::sample_entry(RunKey::new(), now - Duration::seconds(20));
+        tracking.insert(late.clone());
+        tracking.insert(early.clone());
+        tracking.start_scan(now);
+        let config = WftTimeoutScannerConfig {
+            max_timeouts_per_scan: 1,
+            ..Default::default()
+        };
+        let mut seen = vec![];
+        scan_wft_timeouts_at(&tracking, None, &config, now, |entry, _| {
+            seen.push(entry.run_key);
+            async { anyhow::bail!("injected submission failure") }
+        })
+        .await;
+        assert_eq!(seen, [early.run_key]);
+        assert_eq!(
+            wft_timeout_scan_delay(&tracking, now, config.scan_interval),
+            std::time::Duration::ZERO
+        );
+        scan_wft_timeouts_at(&tracking, None, &config, now, |entry, _| {
+            seen.push(entry.run_key);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(seen, [early.run_key, late.run_key]);
+        assert_eq!(
+            wft_timeout_scan_delay(&tracking, now, config.scan_interval),
+            config.scan_interval
+        );
     }
 }

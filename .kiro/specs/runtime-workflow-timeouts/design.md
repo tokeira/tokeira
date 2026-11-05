@@ -164,91 +164,18 @@ evaluate_workflow_timeout(entry, now):
 
 ### Scanner loop (async function)
 
-```rust
-async fn run_workflow_timeout_scanner<R>(
-    tracking: WorkflowTimeoutTrackingState,
-    lanes: Vec<LaneHandle>,
-    lane_count: usize,
-    config: WorkflowTimeoutScannerConfig,
-    cancel: CancellationToken,
-) where
-    R: RunRepository + 'static,
-{
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(config.scan_interval) => {}
-        }
-
-        let now = OffsetDateTime::now_utc();
-        let entries = tracking.snapshot();
-        let mut submitted = 0usize;
-
-        for entry in entries {
-            if submitted >= config.max_timeouts_per_scan {
-                break;
-            }
-
-            let violation = match evaluate_workflow_timeout(&entry, now) {
-                Some(v) => v,
-                None => continue,
-            };
-
-            let (timeout_type, retry_state) = match violation {
-                WorkflowTimeoutViolation::ExecutionTimeout => (
-                    WorkflowTimeoutType::ExecutionTimeout,
-                    if entry.has_retry_policy {
-                        RetryState::Timeout
-                    } else {
-                        RetryState::RetryPolicyNotSet
-                    },
-                ),
-                WorkflowTimeoutViolation::RunTimeout => (
-                    WorkflowTimeoutType::RunTimeout,
-                    if entry.has_retry_policy {
-                        RetryState::Timeout
-                    } else {
-                        RetryState::RetryPolicyNotSet
-                    },
-                ),
-            };
-
-            let command = Command::WorkflowExecutionTimedOut(
-                WorkflowExecutionTimedOutRequest {
-                    timeout_type,
-                    retry_state,
-                    now,
-                },
-            );
-
-            let lane = pick_lane(&lanes, lane_count, entry.run_key);
-            match lane.submit(entry.run_key, command).await {
-                Ok(_) => {
-                    tracking.remove(entry.run_key);
-                    submitted += 1;
-                }
-                Err(error) => {
-                    let msg = error.to_string();
-                    if msg.contains("kernel rejected") {
-                        tracing::debug!(
-                            ?error,
-                            run_key = ?entry.run_key,
-                            "workflow timeout scanner: kernel rejection (harmless)"
-                        );
-                        tracking.remove(entry.run_key);
-                    } else {
-                        tracing::warn!(
-                            ?error,
-                            run_key = ?entry.run_key,
-                            "workflow timeout scanner: lane submit failed"
-                        );
-                    }
-                    submitted += 1;
-                }
-            }
-        }
-    }
-}
+```text
+loop:
+  plan the earliest active deadline, bounded by the next full interval
+  wait for cancellation, that deadline, or an earlier-insert notification
+  record the scan wake; on the full interval rearm attempted entries
+  for each active shard:
+    select only due unattempted entries and sort by (deadline, run key)
+    up to the submission cap:
+      mark the exact revision attempted before awaiting submission
+      submit the workflow timeout using the existing retry/successor path
+      retire that revision on success or kernel rejection
+  immediately continue unattempted capped work; failures wait for the interval
 ```
 
 ### Updated TokeiraRuntime
@@ -330,7 +257,7 @@ WorkflowTimeoutEntry:
 
 ```
 WorkflowTimeoutScanner loop:
-  1. Sleep for scan_interval (or exit on cancellation)
+  1. Wait for the earliest active deadline, an earlier-insert wake, or the full interval
   2. now = OffsetDateTime::now_utc()
   3. entries = tracking.snapshot()
   4. For each entry (up to max_timeouts_per_scan):
@@ -510,3 +437,19 @@ For any wire seconds/nanos pair or stored duration in this feature, conversion a
 Execution expiration is chain-wide and run expiration uses execution time (start plus first-task backoff). Admission follows `common/primitives/timestamp/duration.go:67-88 @ v1.31.0`; timeout task anchors follow `service/history/workflow/task_generator.go:153-183 @ v1.31.0`. Saturation for older stored values is Tokeira's representational safeguard, not a claim about Go's date range.
 
 Verification: `stored_workflow_deadlines_are_total`, `stored_long_timeout_keeps_scan_bounded`. Admission uses `validate_and_cap_proto_duration`; stored deadlines use saturating arithmetic because earlier rows did not pass that admission boundary. No schema or dependency changes are required.
+
+### Earlier tracked deadlines
+
+The scanner uses the shared acquisition-aware deadline index and wake. Planning
+borrows entries under the ownership-then-entries locks; a deadline pass clones only
+selected active entries. It orders due work by deadline and stable identity. An
+unattempted due entry left by the cap requests an immediate continuation; an
+attempted failure waits for the full interval. During a pass, future inserts do not
+notify, but planning sees them and any new overdue work. Earlier inserts while
+sleeping notify the scanner. The one-second default and per-shard caps are unchanged.
+
+Workflow entries already contain authoritative timeout operands; no reload/cache
+refresh pass is needed. A full interval rearms failed submissions. The due function
+uses the first-run execution anchor, current-run start delay and strict nonzero
+boundary (one nanosecond after the deadline); zero is due at its anchor. Saturated
+strict deadlines cannot fire. Requirements 5.1 and 5.6 govern both planning and insertion.

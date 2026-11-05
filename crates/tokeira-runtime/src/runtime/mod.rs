@@ -122,7 +122,7 @@ mod query;
 #[cfg(test)]
 mod queue_home_delivery_exploration_tests;
 #[cfg(test)]
-mod repair_tests;
+pub(crate) mod repair_tests;
 mod reset;
 #[cfg(test)]
 mod successor_semantics_tests;

@@ -264,6 +264,8 @@ normal queue even across a restart, so that affinity cannot strand execution.
 8. THE delivery path SHALL preserve compatible normal fallback without using a broker read to mutate durable sticky affinity.
 9. WHEN a tracked schedule-to-start or start-to-close deadline passes, THE runtime SHALL submit its timeout at that deadline, not at a later periodic scan (`service/history/queues/queue_scheduled.go:159-224,269 @ v1.31.0`).
 
+10. THE workflow-task timeout scanner SHALL take due entries in deadline order with a stable tie-break, and WHEN a pass stops at its cap, THE scanner SHALL immediately continue due entries it never attempted (`service/history/queues/queue_scheduled.go:159-224,269 @ v1.31.0`).
+
 ### Requirement 8: Complete fenced acquisition
 
 The initial single-owner checkpoint established complete reconciliation,

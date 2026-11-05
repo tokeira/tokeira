@@ -50,9 +50,25 @@ struct Pause {
     resume: oneshot::Receiver<()>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OutboundRead {
+    Operation {
+        home: ShardId,
+        kind: OperationKind,
+        after: Option<OperationKey>,
+        fresh_bound: bool,
+        limit: usize,
+    },
+    Intent,
+    Publication,
+}
+
 #[derive(Debug, Default)]
-pub(super) struct Repo {
+pub(crate) struct Repo {
     pub(super) inner: InMemoryStore,
+    pub(crate) outbound_reads: Mutex<Vec<OutboundRead>>,
+    pub(crate) outbound_read: tokio::sync::Notify,
+    pub(super) history_reads: AtomicUsize,
     pub(super) fail: Mutex<Option<Point>>,
     conflicts: AtomicUsize,
     repair_attempts: AtomicUsize,
@@ -68,6 +84,13 @@ pub(super) struct Repo {
 }
 
 impl Repo {
+    pub(crate) fn with_inner(inner: InMemoryStore) -> Self {
+        Self {
+            inner,
+            ..Self::default()
+        }
+    }
+
     async fn discovery_query(
         &self,
         kind: TaskKind,
@@ -530,6 +553,11 @@ impl RunRepository for Repo {
         limit: usize,
     ) -> anyhow::Result<tokeira_storage::OutboundPage<uuid::Uuid, tokeira_storage::PreparationToken>>
     {
+        self.outbound_reads
+            .lock()
+            .unwrap()
+            .push(OutboundRead::Publication);
+        self.outbound_read.notify_one();
         self.inner
             .read_published_preparations(home, bound, after, limit)
             .await
@@ -596,6 +624,17 @@ impl RunRepository for Repo {
     ) -> anyhow::Result<
         tokeira_storage::OutboundPage<tokeira_kernel::OperationKey, tokeira_storage::OperationRow>,
     > {
+        self.outbound_reads
+            .lock()
+            .unwrap()
+            .push(OutboundRead::Operation {
+                home,
+                kind,
+                after,
+                fresh_bound: matches!(bound, ScanBound::Capture),
+                limit,
+            });
+        self.outbound_read.notify_one();
         self.inner
             .read_operation_page(home, kind, bound, after, limit)
             .await
@@ -612,6 +651,11 @@ impl RunRepository for Repo {
             tokeira_storage::IntentDescriptor,
         >,
     > {
+        self.outbound_reads
+            .lock()
+            .unwrap()
+            .push(OutboundRead::Intent);
+        self.outbound_read.notify_one();
         self.inner.read_intent_page(home, bound, after, limit).await
     }
     async fn load_intent(
@@ -756,6 +800,7 @@ impl RunRepository for Repo {
         after_event_id: i64,
         limit: usize,
     ) -> Result<Vec<HistoryEvent>> {
+        self.history_reads.fetch_add(1, Ordering::SeqCst);
         self.inner
             .read_history(run_key, after_event_id, limit)
             .await

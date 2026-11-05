@@ -282,7 +282,7 @@ in state.rs) becomes load-bearing:
   - `NonRetryableFailure { failure }` → `state = Failed` (terminal), `last_attempt_failure = failure`.
   `schedule_completion_callbacks` continues to set `Standby → Scheduled` on close and emit the dispatch
   op; the scanner re-emits for `BackingOff` callbacks past `next_attempt_at`.
-- **Runtime scanner** (`scan_completion_callbacks_once`): reconstruct the index of
+- **Runtime scanner** (`scan_completion_callbacks_at`): reconstruct the index of
   scheduled and backing-off callbacks from durable state, including closed runs.
   Reload the accepted callback and terminal payload before each due invocation.
   First delivery and the scanner share bounded attempt admission; the original
@@ -591,3 +591,28 @@ state, which carries no history events. `operation_token` is `#[serde(default)]`
 read-compat). Note: tokeira already uses the operation id as the async token for the
 `TimedOut`/`Canceled` events when the handler issued none (`kernel.rs:1966-1971`); storing the
 real handler token makes those faithful too.
+
+### Callback retry deadline wake
+
+The scanner uses the shared acquisition-aware deadline index and wake. Planning
+borrows entries under the ownership-then-entries locks; a deadline pass clones only
+selected active entries. It orders due work by deadline and stable identity. An
+unattempted due entry left by the cap requests an immediate continuation; an
+attempted failure waits for the full interval. During a pass, future inserts do not
+notify, but planning sees them and any new overdue work. Earlier inserts while
+sleeping notify the scanner. The one-second default and per-shard caps are unchanged.
+
+The callback cache holds state and next-attempt time. A known Scheduled entry from
+normal close publication has no deadline: the close path already spawns its first
+delivery, and the full pass remains its backstop. Recovery and publication rebuild
+leave a Scheduled callback's timing unknown so a potentially lost first delivery
+is due immediately; all unknown timing is due immediately. BackingOff is due at
+its next attempt, and other states have no deadline.
+Selected entries reload and refresh before delivery; full passes refresh every
+entry. Every committed attempt outcome refreshes tracking under its captured
+acquisition. Independent delivery tasks retain the existing admission permits
+(Requirement 2.10).
+
+For any active callback deadlines, the planned sleep SHALL be bounded by the
+interval and earliest future deadline, and attempted overdue work SHALL NOT spin.
+**Validates: Requirement 2.10.**

@@ -1,8 +1,8 @@
 //! Shared wake planning for volatile deadline indexes.
 //!
 //! A scan's wake time suppresses notifications for future inserts during work.
-//! Revisions recover inserts that become overdue before the next plan. Activity
-//! indexes additionally remember unattempted work when a bounded pass stops.
+//! Revisions recover inserts that become overdue before the next plan. Deadline
+//! indexes also remember unattempted work when a bounded pass stops.
 
 use std::sync::{Arc, Mutex};
 
@@ -61,7 +61,7 @@ struct WakeState {
     earliest_changed: Option<OffsetDateTime>,
 }
 
-/// One wake shared by the activity timeout and retry-eligibility indexes.
+/// A wake shared by one scanner and its deadline indexes.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DeadlineWake {
     state: Arc<Mutex<WakeState>>,
@@ -117,9 +117,58 @@ impl DeadlineWake {
     }
 }
 
+/// Periodic reconciliation remains independent of frequent deadline wakes.
+#[derive(Debug)]
+pub(crate) struct FullPass {
+    interval: std::time::Duration,
+    next: OffsetDateTime,
+}
+
+impl FullPass {
+    /// Anchor reconciliation to the same clock used for the scanner's deadlines.
+    pub(crate) fn new(interval: std::time::Duration, now: OffsetDateTime) -> Self {
+        Self {
+            interval,
+            next: deadline_after(now, Duration::try_from(interval).unwrap_or(Duration::MAX)),
+        }
+    }
+    pub(crate) fn remaining(&self, now: OffsetDateTime) -> std::time::Duration {
+        std::time::Duration::try_from(self.next - now)
+            .unwrap_or_default()
+            .min(self.interval)
+    }
+    pub(crate) fn start(&mut self, now: OffsetDateTime) -> bool {
+        if now < self.next {
+            return false;
+        }
+        self.next = deadline_after(
+            now,
+            Duration::try_from(self.interval).unwrap_or(Duration::MAX),
+        );
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_clock::TestClock;
+    use tokeira_clock::Clock;
+
+    #[tokio::test(start_paused = true)]
+    async fn full_pass_follows_the_supplied_clock() {
+        let clock = TestClock::new();
+        let interval = std::time::Duration::from_secs(1);
+        let half = interval / 2;
+        let mut full = FullPass::new(interval, clock.now());
+        assert_eq!(full.remaining(clock.now()), interval);
+        tokio::time::advance(half).await;
+        assert!(!full.start(clock.now()));
+        assert_eq!(full.remaining(clock.now()), half);
+        tokio::time::advance(half).await;
+        assert!(full.start(clock.now()));
+        assert_eq!(full.remaining(clock.now()), interval);
+    }
 
     #[test]
     fn planning_merges_racing_deadlines_without_rescanning_later_inserts() {

@@ -191,6 +191,10 @@ when it closes, so that I do not have to poll.
 9. WHEN multiple callbacks become eligible for retry in the same scan THEN the runtime SHALL dispatch
    them independently so one handler response cannot prevent the other due callbacks from starting.
 
+10. WHEN a backing-off completion callback's next attempt is due, THE runtime SHALL attempt it at
+    that time (`components/callbacks/statemachine.go:79-82`,
+    `service/history/workflow/state_machine_timers.go:18-45 @ v1.31.0`).
+
 ### Requirement 3: tokeira hosts the inbound Nexus completion endpoint
 
 **User Story:** As the handler-side callback dispatcher (tokeira itself, or a peer cluster), I want a

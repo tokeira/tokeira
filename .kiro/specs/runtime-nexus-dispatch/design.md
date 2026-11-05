@@ -81,7 +81,7 @@ unrelated work and a late outcome cannot borrow a replacement owner's authority.
 
 **Cancel failures are harmless no-ops.** If the cancel HTTP request fails or the endpoint reports the operation already completed, the publisher logs and moves on. No resolution command is submitted for failed cancels — the operation will either complete normally or time out.
 
-**Runtime-local timeout tracking (same pattern as activity timeouts and workflow timeouts).** A `NexusTimeoutTrackingState` (in-memory `HashMap<(RunKey, String), NexusTimeoutEntry>`) records pending Nexus operations with `schedule_to_close_timeout`. A background `NexusTimeoutScanner` periodically checks for violations and submits `NexusOperationResolved(TimedOut)` through the lane. The scanner is non-authoritative — the kernel is the final arbiter.
+**Runtime-local timeout tracking (same pattern as activity timeouts and workflow timeouts).** A `NexusTimeoutTrackingState` (in-memory `HashMap<(RunKey, String), NexusTimeoutEntry>`) records pending Nexus operations with `schedule_to_close_timeout`. A background `NexusTimeoutScanner` wakes at cached deadlines, with periodic full reconciliation, checks for violations and submits `NexusOperationResolved(TimedOut)` through the lane. The scanner is non-authoritative — the kernel is the final arbiter.
 
 **Tracking lifecycle mirrors activity tracking.** Entries are inserted when `ScheduleNexusOperation` dispatch ops with a timeout are published, using the authoritative `scheduled_at` from the dispatch op (not the wall-clock time at publication). Entries are removed when a terminal `NexusOperationResolved` is committed (Completed, Failed, Canceled, or TimedOut) or when the run closes. The `Started` resolution is non-terminal and does NOT remove the tracking entry — the operation is still pending and may still time out.
 
@@ -243,43 +243,11 @@ Where `pending_entry` is the `PendingNexusOperation` found by `scheduled_event_i
 
 ### NexusTimeoutTrackingState
 
-```rust
-/// Per-operation tracking entry for Nexus timeout detection.
-#[derive(Clone, Debug, PartialEq)]
-pub struct NexusTimeoutEntry {
-    pub run_key: RunKey,
-    pub operation_id: String,
-    pub scheduled_event_id: i64,
-    pub schedule_to_close_timeout: Duration,
-    pub scheduled_at: OffsetDateTime,
-}
-
-/// Thread-safe container for Nexus timeout tracking entries.
-/// Keyed by (RunKey, operation_id) for O(1) lookup.
-#[derive(Default, Clone)]
-pub struct NexusTimeoutTrackingState {
-    inner: Arc<Mutex<HashMap<(RunKey, String), NexusTimeoutEntry>>>,
-}
-
-impl NexusTimeoutTrackingState {
-    pub fn insert(&self, entry: NexusTimeoutEntry) {
-        self.inner.lock().unwrap()
-            .insert((entry.run_key, entry.operation_id.clone()), entry);
-    }
-
-    pub fn remove(&self, run_key: RunKey, operation_id: &str) {
-        self.inner.lock().unwrap().remove(&(run_key, operation_id.to_string()));
-    }
-
-    pub fn remove_all_for_run(&self, run_key: RunKey) {
-        self.inner.lock().unwrap().retain(|k, _| k.0 != run_key);
-    }
-
-    pub fn snapshot(&self) -> Vec<NexusTimeoutEntry> {
-        self.inner.lock().unwrap().values().cloned().collect()
-    }
-}
-```
+The tracker uses `AcquisitionEntries<(RunKey, String), NexusTimeoutEntry>` with a
+shared `DeadlineWake`. Each entry retains its run/home and scheduled event identity,
+scheduled time, and optional cached `NexusTimeouts` (all three durations, started
+flag and started time). Missing timing is due immediately. Acquisition and revision
+checks fence refresh/removal across awaited loads and submissions.
 
 ### NexusTimeoutScanner
 
@@ -302,17 +270,12 @@ impl Default for NexusTimeoutScannerConfig {
 
 ### Timeout evaluation (pure function)
 
-```rust
-/// Evaluate whether a Nexus operation has exceeded its schedule-to-close timeout.
-pub fn evaluate_nexus_timeout(
-    entry: &NexusTimeoutEntry,
-    now: OffsetDateTime,
-) -> bool {
-    let elapsed = now - entry.scheduled_at;
-    elapsed > entry.schedule_to_close_timeout
-        || (entry.schedule_to_close_timeout.is_zero() && now >= entry.scheduled_at)
-}
-```
+`evaluate_nexus_timeout(operation, now)` reads the authoritative pending operation.
+It chooses the earliest applicable inclusive deadline: schedule-to-close always,
+schedule-to-start until started, and start-to-close from started time. Zero or
+absent durations disable that timer. `nexus_timeout_due_at(entry)` uses the same
+rules on the cache to select reloads, with saturating deadline arithmetic
+(`components/nexusoperations/statemachine.go:144-167 @ v1.31.0`).
 
 ### RuntimeDispatchPublisher — new handler methods
 
@@ -628,10 +591,10 @@ Originator WFT Completed with CancelNexusOperation command
 ### Data flow: Nexus Timeout
 
 ```
-NexusTimeoutScanner periodic scan:
-  1. Snapshot NexusTimeoutTrackingState
-  2. For each entry (up to max_timeouts_per_scan):
-     a. evaluate_nexus_timeout(entry, now)
+NexusTimeoutScanner deadline/full pass:
+  1. Select active due entries, or full-pass refresh entries, in deadline order
+  2. For each selected entry (up to max_timeouts_per_scan submissions):
+     a. Reload authoritative state, refresh the cache, evaluate_nexus_timeout(operation, now)
      b. If timed out: submit Command::NexusOperationResolved(TimedOut) via lane
      c. On success or kernel rejection: remove tracking entry
      d. On transient error: log warn, leave entry for next cycle
@@ -830,3 +793,28 @@ Integration tests exercise the full `TokeiraRuntime` with `InMemoryStore` and a 
 proptest = "1"
 tokio-util = { version = "0.7", features = ["rt"] }
 ```
+
+### Deadline-driven operation timeouts
+
+The scanner uses the shared acquisition-aware deadline index and wake. Planning
+borrows entries under the ownership-then-entries locks; a deadline pass clones only
+selected active entries. It orders due work by deadline and stable identity. An
+unattempted due entry left by the cap requests an immediate continuation; an
+attempted failure waits for the full interval. During a pass, future inserts do not
+notify, but planning sees them and any new overdue work. Earlier inserts while
+sleeping notify the scanner. The one-second default and per-shard caps are unchanged.
+
+Entries cache all three timeouts and the scheduled/started anchors. Inclusive
+boundaries match `evaluate_nexus_timeout`; zero/unset timeouts have no deadline,
+and schedule-to-start stops applying after start. Unknown timing requests an
+immediate reload. Every deadline pass reloads selected operations and refreshes
+the cache even when no timeout fires; every interval refreshes all entries as a
+backstop for late cached deadlines. Publication, starts, attempt outcomes and
+recovery populate the cache from committed state (Requirements 7.3, 7.7).
+
+### Property 11: Deadline wake bound
+
+For any active Nexus deadlines, the planned sleep SHALL be bounded by the scan
+interval and the earliest future deadline; attempted overdue work SHALL NOT spin.
+
+**Validates: Requirements 7.3, 7.7.**

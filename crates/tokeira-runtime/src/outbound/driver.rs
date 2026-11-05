@@ -10,6 +10,7 @@ use std::{
 
 use anyhow::Result;
 use async_trait::async_trait;
+use time::OffsetDateTime;
 use tokeira_clock::Clock;
 use tokeira_kernel::{OperationKey, OperationKind};
 use tokeira_storage::{
@@ -114,6 +115,42 @@ enum StreamKind {
 }
 type Stream = (ShardId, StreamKind);
 
+// A deadline read captures a fresh upper bound but resumes immediately before
+// its row. It never changes the finite discovery cursor or the home rotation.
+#[derive(Clone, Copy, Debug)]
+enum PageStart {
+    Operation(Option<OperationKey>),
+    Intent(Option<IntentKey>),
+    Publication(Option<uuid::Uuid>),
+}
+
+impl PageStart {
+    fn after(work: &Work) -> Self {
+        match work {
+            Work::Operation(row) => Self::Operation(Some(row.incarnation.key)),
+            Work::Intent(row) => Self::Intent(Some(row.key)),
+            Work::Publication(token) => Self::Publication(Some(token.id)),
+        }
+    }
+
+    fn cursor(self) -> Cursor {
+        match self {
+            Self::Operation(after) => Cursor::Operation {
+                bound: ScanBound::Capture,
+                after,
+            },
+            Self::Intent(after) => Cursor::Intent {
+                bound: ScanBound::Capture,
+                after,
+            },
+            Self::Publication(after) => Cursor::Publication {
+                bound: ScanBound::Capture,
+                after,
+            },
+        }
+    }
+}
+
 enum Cursor {
     Publication {
         bound: ScanBound<uuid::Uuid>,
@@ -130,6 +167,14 @@ enum Cursor {
 }
 
 impl Cursor {
+    fn start(&self) -> PageStart {
+        match self {
+            Self::Operation { after, .. } => PageStart::Operation(*after),
+            Self::Intent { after, .. } => PageStart::Intent(*after),
+            Self::Publication { after, .. } => PageStart::Publication(*after),
+        }
+    }
+
     fn new(kind: StreamKind) -> Self {
         match kind {
             StreamKind::Operation(_) => Self::Operation {
@@ -280,6 +325,31 @@ impl Discovery {
     }
 }
 
+#[derive(Debug)]
+struct RowDeadline {
+    // Compare authoritative due times across pages, without clock-conversion jitter.
+    due_at: OffsetDateTime,
+    due: Instant,
+    after: PageStart,
+}
+
+#[derive(Debug)]
+struct Retry {
+    failures: u32,
+    due: Instant,
+    after: PageStart,
+    stream: Stream,
+    // A consumed gate is not retried at storage speed if its page misses the row.
+    // The ordinary tick remains the backstop, and retains the failure count.
+    pending: bool,
+}
+
+#[derive(Clone, Copy)]
+enum DeadlineSource {
+    Row(Stream),
+    Retry(Key),
+}
+
 /// One runtime-owned worker pool; shutdown cancels attempts, never obligations.
 pub(super) async fn run<R: RunRepository + 'static, E: Executor>(
     repo: Arc<R>,
@@ -288,17 +358,48 @@ pub(super) async fn run<R: RunRepository + 'static, E: Executor>(
     cancel: CancellationToken,
     clock: Arc<dyn Clock>,
 ) {
+    run_with_interval(repo, executor, owner, cancel, clock, TICK).await;
+}
+
+async fn run_with_interval<R: RunRepository + 'static, E: Executor>(
+    repo: Arc<R>,
+    executor: Arc<E>,
+    owner: Arc<RwLock<ShardOwner>>,
+    cancel: CancellationToken,
+    clock: Arc<dyn Clock>,
+    interval: Duration,
+) {
     let wakeup = executor.wakeup();
     let mut discovery = Discovery::default();
     let mut tasks = JoinSet::<Result<()>>::new();
-    let mut task_keys = HashMap::<Id, (Key, ShardId)>::new();
+    let mut task_keys = HashMap::<Id, (Key, Stream, PageStart)>::new();
     let mut home_in_flight = BTreeMap::<ShardId, usize>::new();
     let mut busy = BTreeSet::new();
-    let mut retry = BTreeMap::<Key, (u32, Instant)>::new();
-    let mut tick = tokio::time::interval(TICK);
+    let mut retry = BTreeMap::<Key, Retry>::new();
+    // One skipped deadline per stream, plus the existing bounded retry slots.
+    // Each gate buys one targeted page, not another discovery round.
+    let mut row_deadlines = BTreeMap::<Stream, RowDeadline>::new();
+    let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        tokio::select! {
+        let deadline = (tasks.len() < MAX_IN_FLIGHT)
+            .then(|| {
+                let available =
+                    |home| home_in_flight.get(&home).copied().unwrap_or(0) < MAX_PER_HOME;
+                row_deadlines
+                    .iter()
+                    .filter(|((home, _), _)| available(*home))
+                    .map(|(stream, row)| (row.due, DeadlineSource::Row(*stream)))
+                    .chain(
+                        retry
+                            .iter()
+                            .filter(|(_, retry)| retry.pending && available(retry.stream.0))
+                            .map(|(key, retry)| (retry.due, DeadlineSource::Retry(*key))),
+                    )
+                    .min_by_key(|(due, _)| *due)
+            })
+            .flatten();
+        let deadline_read = tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
             Some(result) = tasks.join_next_with_id(), if !tasks.is_empty() => {
@@ -314,50 +415,145 @@ pub(super) async fn run<R: RunRepository + 'static, E: Executor>(
                 };
                 crate::metrics::record_outbound_attempt(outcome);
                 let failed = outcome == "retrying" || outcome == "blocked_by_data";
-                if let Some((key, home)) = task_keys.remove(&id) {
+                if let Some((key, stream, after)) = task_keys.remove(&id) {
+                    let home = stream.0;
                     let count = home_in_flight.get_mut(&home).expect("admitted home count exists");
                     *count -= 1;
                     if *count == 0 { home_in_flight.remove(&home); }
                     busy.remove(&key);
-                    let failures = if failed { retry.get(&key).map_or(1, |(n, _)| n.saturating_add(1).min(6)) } else { 0 };
+                    let failures = if failed { retry.get(&key).map_or(1, |retry| retry.failures.saturating_add(1).min(6)) } else { 0 };
                     if retry.len() >= RETRY_SLOTS { retry.pop_first(); }
-                    retry.insert(key, (failures, Instant::now() + Duration::from_secs(1 << failures)));
+                    let due = Instant::now() + Duration::from_secs(1 << failures);
+                    // Settled rows are normally gone. Retain their cooldown for
+                    // stale discovery snapshots, but leave any recheck to the tick.
+                    retry.insert(key, Retry { failures, stream, due, after, pending: failed });
                     if failed { tracing::debug!("outbound attempt did not settle; committed obligation retained"); }
                 }
+                continue;
             }
-            _ = async {
-                if let Some(wakeup) = &wakeup {
-                    tokio::select! { _ = tick.tick() => {}, _ = wakeup.notified() => {} }
-                } else { tick.tick().await; }
-            } => {
-                discovery.refresh(&owner, executor.operation_kinds());
-                for _ in 0..PAGES_PER_TICK.min(discovery.streams.len()) {
-                    if tasks.len() >= MAX_IN_FLIGHT { break; }
-                    let Some(stream) = discovery.next() else { break; };
-                    let remaining = MAX_PER_HOME.saturating_sub(home_in_flight.get(&stream.0).copied().unwrap_or(0));
-                    if remaining == 0 { continue; }
-                    let Some(attempt) = Attempt::capture(&owner, stream.0) else { continue; };
-                    let cursor = &mut discovery.streams.get_mut(&stream).expect("selected stream exists").1;
-                    let page = tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => break,
-                        page = cursor.page(repo.as_ref(), stream, remaining.min(MAX_IN_FLIGHT - tasks.len())) => page,
-                    };
-                    let Ok(page) = page else {
-                        tracing::warn!(home = stream.0.0, "outbound discovery failed; retrying a later scan");
+            _ = tick.tick() => None,
+            _ = async { if let Some(wakeup) = &wakeup { wakeup.notified().await; } else { std::future::pending::<()>().await; } } => None,
+            source = async {
+                if let Some((due, source)) = deadline {
+                    tokio::time::sleep_until(due).await;
+                    source
+                } else { std::future::pending::<DeadlineSource>().await }
+            } => Some(source),
+        };
+        if deadline_read.is_none() {
+            discovery.refresh(&owner, executor.operation_kinds());
+            row_deadlines.retain(|stream, _| discovery.streams.contains_key(stream));
+            retry.retain(|_, retry| discovery.streams.contains_key(&retry.stream));
+        }
+        let mut targeted = match deadline_read {
+            Some(DeadlineSource::Row(stream)) => row_deadlines
+                .remove(&stream)
+                .map(|row| (stream, row.after.cursor())),
+            Some(DeadlineSource::Retry(key)) => retry.get_mut(&key).map(|retry| {
+                retry.pending = false;
+                (retry.stream, retry.after.cursor())
+            }),
+            None => None,
+        };
+        let pages = if deadline_read.is_some() {
+            usize::from(targeted.is_some())
+        } else {
+            PAGES_PER_TICK.min(discovery.streams.len())
+        };
+        for _ in 0..pages {
+            if tasks.len() >= MAX_IN_FLIGHT {
+                break;
+            }
+            let Some(stream) = targeted
+                .as_ref()
+                .map(|(stream, _)| *stream)
+                .or_else(|| discovery.next())
+            else {
+                break;
+            };
+            let remaining =
+                MAX_PER_HOME.saturating_sub(home_in_flight.get(&stream.0).copied().unwrap_or(0));
+            if remaining == 0 {
+                continue;
+            }
+            let Some(attempt) = Attempt::capture(&owner, stream.0) else {
+                continue;
+            };
+            let cursor = match targeted.as_mut() {
+                Some((_, cursor)) => cursor,
+                None => {
+                    &mut discovery
+                        .streams
+                        .get_mut(&stream)
+                        .expect("selected stream exists")
+                        .1
+                }
+            };
+            let mut preceding = cursor.start();
+            let page = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                page = cursor.page(repo.as_ref(), stream, remaining.min(MAX_IN_FLIGHT - tasks.len())) => page,
+            };
+            let Ok(page) = page else {
+                // A failed targeted read consumes its gate. The tick retries
+                // discovery, rather than spinning during a storage outage.
+                tracing::warn!(
+                    home = stream.0.0,
+                    "outbound discovery failed; retrying a later scan"
+                );
+                continue;
+            };
+            crate::metrics::record_outbound_pending(page.len());
+            // One wall/monotonic anchor per page keeps equal due times tied in
+            // key order. Per-row clock sampling could choose a later row and
+            // leave earlier equal-deadline rows outside the targeted page.
+            let observed_at = clock.now();
+            let observed_instant = Instant::now();
+            for work in page {
+                let after = preceding;
+                preceding = PageStart::after(&work);
+                if matches!(&work, Work::Intent(row) if !executor.accepts_intent(row.key.kind)) {
+                    continue;
+                }
+                if let Work::Operation(row) = &work {
+                    let remaining = row.due_at - observed_at;
+                    if remaining.is_positive() {
+                        // Discovery stays fair and bounded; remember a skipped
+                        // row's timer without holding its payload or reserving admission.
+                        // Nexus backoff tasks fire at NextAttemptScheduleTime
+                        // (components/nexusoperations/statemachine.go:132,552 @ v1.31.0).
+                        if let Ok(delay) = Duration::try_from(remaining)
+                            && let Some(due) = observed_instant.checked_add(delay)
+                            && row_deadlines
+                                .get(&stream)
+                                .is_none_or(|old| row.due_at < old.due_at)
+                        {
+                            row_deadlines.insert(
+                                stream,
+                                RowDeadline {
+                                    due_at: row.due_at,
+                                    due,
+                                    after,
+                                },
+                            );
+                        }
                         continue;
-                    };
-                    crate::metrics::record_outbound_pending(page.len());
-                    for work in page {
-                        if matches!(&work, Work::Intent(row) if !executor.accepts_intent(row.key.kind))
-                            || matches!(&work, Work::Operation(row) if row.due_at > clock.now()) { continue; }
-                        let key = work.key();
-                        if busy.contains(&key) || retry.get(&key).is_some_and(|(_, due)| *due > Instant::now()) { continue; }
-                        let executor = executor.clone();
-                        let attempt = attempt.clone();
-                        let token = cancel.clone();
-                        let span = tracing::info_span!("runtime.outbound", tokeira.home = stream.0.0, ?key);
-                        let handle = tasks.spawn(async move {
+                    }
+                }
+                let key = work.key();
+                if busy.contains(&key)
+                    || retry
+                        .get(&key)
+                        .is_some_and(|retry| retry.due > Instant::now())
+                {
+                    continue;
+                }
+                let executor = executor.clone();
+                let attempt = attempt.clone();
+                let token = cancel.clone();
+                let span = tracing::info_span!("runtime.outbound", tokeira.home = stream.0.0, ?key);
+                let handle = tasks.spawn(async move {
                             tokio::select! {
                                 biased;
                                 _ = token.cancelled() => anyhow::bail!("outbound runtime stopped"),
@@ -365,11 +561,9 @@ pub(super) async fn run<R: RunRepository + 'static, E: Executor>(
                                 result = tokio::time::timeout(Duration::from_secs(60), executor.deliver(work, attempt.clone())) => result?,
                             }
                         }.instrument(span));
-                        busy.insert(key);
-                        task_keys.insert(handle.id(), (key, stream.0));
-                        *home_in_flight.entry(stream.0).or_default() += 1;
-                    }
-                }
+                busy.insert(key);
+                task_keys.insert(handle.id(), (key, stream, after));
+                *home_in_flight.entry(stream.0).or_default() += 1;
             }
         }
     }

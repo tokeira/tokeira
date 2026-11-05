@@ -722,6 +722,23 @@ where
                 .await
             {
                 Ok(CommitResult::Conflict { .. }) => continue,
+                Ok(CommitResult::Applied { new_state }) => {
+                    // The attempt's committed backoff, not the pre-HTTP snapshot,
+                    // sets the next wake. Retain its acquisition across the await.
+                    if let Some(callback) = new_state.completion_callbacks.get(callback_index) {
+                        self.completion_callback_tracking
+                            .for_acquisition(attempt.acquisition.clone())
+                            .insert(CompletionCallbackTrackingEntry {
+                                run_key,
+                                shard_id: attempt.acquisition.shard_id,
+                                callback_index,
+                                timing: Some(crate::nexus::CompletionCallbackTiming::from(
+                                    callback,
+                                )),
+                            });
+                    }
+                    return;
+                }
                 Ok(_) => return,
                 Err(error) => {
                     // Ambiguous failure remains scanner-discoverable; never
@@ -1238,6 +1255,13 @@ where
                         || start_to_close_timeout.is_some()
                     {
                         self.nexus_timeout_tracking.insert(NexusTimeoutEntry {
+                            timeouts: Some(crate::nexus::NexusTimeouts {
+                                schedule_to_close: *schedule_to_close_timeout,
+                                schedule_to_start: *schedule_to_start_timeout,
+                                start_to_close: *start_to_close_timeout,
+                                started: false,
+                                started_at: None,
+                            }),
                             run_key: *originator_run_key,
                             shard_id: execution_home,
                             operation_id: operation_id.clone(),
@@ -1253,12 +1277,14 @@ where
                     callback,
                     outcome,
                 } => {
-                    // Fire the callback off the dispatch loop (it does HTTP I/O), mirror
-                    // the cancel-nexus arm above.
+                    // A known Scheduled entry leaves this first delivery to the
+                    // spawned task. Only the full pass retries a lost publication;
+                    // no deadline reload should race every newly closed run.
                     let publisher = RuntimeDispatchPublisher::clone(self);
                     let callback_index = *callback_index;
                     self.completion_callback_tracking
                         .insert(CompletionCallbackTrackingEntry {
+                            timing: Some(crate::nexus::CompletionCallbackTiming::from(callback)),
                             run_key,
                             shard_id: execution_home,
                             callback_index,
@@ -1300,22 +1326,33 @@ where
 }
 
 /// Re-fire `BackingOff` completion callbacks whose `next_attempt_at` has passed, capped at
-/// `max_per_scan`. Mirrors `scan_nexus_timeouts_once`: the durable `CompletionCallback` is
+/// `max_per_scan`. Mirrors `scan_nexus_timeouts_at`: the durable `CompletionCallback` is
 /// the authority for the current lifecycle state and deadline, so each entry's run is
 /// reloaded; a stale entry (run absent, callback gone, or no longer backing off) is
 /// dropped. Delivery reuses [`RuntimeDispatchPublisher::deliver_completion_callback`],
 /// while entries remain until a scan observes a committed terminal state.
-pub(crate) async fn scan_completion_callbacks_once<R>(
+pub(crate) async fn scan_completion_callbacks_at<R>(
     repo: &R,
     tracking: &CompletionCallbackTrackingState,
     shard_id: Option<ShardId>,
     publisher: &RuntimeDispatchPublisher<R>,
     config: &CompletionCallbackScannerConfig,
+    now: OffsetDateTime,
 ) where
     R: RunRepository + 'static,
 {
-    let now = publisher.clock.now();
-    let entries = tracking.inner.snapshot(shard_id);
+    let mut entries = tracking.inner.select_active(shard_id, |entry| {
+        entry.refresh_pending
+            || (entry.deadline_pending
+                && crate::nexus::callback_due_at(&entry.value).is_some_and(|due| due <= now))
+    });
+    entries.sort_by_key(|entry| {
+        (
+            crate::nexus::callback_due_at(&entry.value),
+            entry.value.run_key,
+            entry.value.callback_index,
+        )
+    });
     let mut fired = 0usize;
 
     for tracked in entries {
@@ -1325,6 +1362,10 @@ pub(crate) async fn scan_completion_callbacks_once<R>(
         let entry = tracked.value.clone();
         if fired >= config.max_per_scan {
             break;
+        }
+        let key = (entry.run_key, entry.callback_index);
+        if !tracking.inner.mark_attempted(&key, &tracked) {
+            continue;
         }
         let state = match repo.load_run(entry.run_key).await {
             Ok(LoadedRun::Existing(state)) => state,
@@ -1350,12 +1391,17 @@ pub(crate) async fn scan_completion_callbacks_once<R>(
                 .remove_submitted(&(entry.run_key, entry.callback_index), &tracked);
             continue;
         };
+        tracking
+            .inner
+            .refresh_scanned(&key, &tracked, now, |entry| {
+                entry.timing = Some(crate::nexus::CompletionCallbackTiming::from(callback))
+            });
         match callback.state {
-            // `Scheduled` means the first delivery was lost (the firing task died, or its
-            // attempt-commit failed) — re-drive it immediately. This is what closes the
-            // crash-before-first-attempt recovery gap (mirrors v1.31.0 `RegenerateTasks`
-            // re-issuing an invocation task for a `SCHEDULED` callback,
-            // `components/callbacks/statemachine.go:76-96 @ v1.31.0`).
+            // Recovery selects Scheduled immediately to regenerate a potentially
+            // lost invocation; normal close publication reaches this branch on
+            // full passes. The attempt permit protects a first call still in flight.
+            // Mirrors RegenerateTasks re-issuing an invocation for SCHEDULED:
+            // `components/callbacks/statemachine.go:76-96 @ v1.31.0`.
             CallbackState::Scheduled => {}
             // `BackingOff` is re-fired only once its backoff deadline has passed.
             CallbackState::BackingOff => match callback.next_attempt_at {
@@ -1443,8 +1489,8 @@ pub(crate) async fn scan_completion_callbacks_once<R>(
     }
 }
 
-/// Background loop that drives `scan_completion_callbacks_once` per active shard on a
-/// fixed cadence until cancelled (mirrors `run_nexus_timeout_scanner`).
+/// Background loop that drives `scan_completion_callbacks_at` per active shard on a
+/// tracked deadline, with periodic full reconciliation of cached lifecycle state.
 pub async fn run_completion_callback_scanner<R>(
     repo: Arc<R>,
     tracking: CompletionCallbackTrackingState,
@@ -1455,10 +1501,21 @@ pub async fn run_completion_callback_scanner<R>(
 ) where
     R: RunRepository + 'static,
 {
+    let mut full = crate::deadline_wake::FullPass::new(config.scan_interval, publisher.clock.now());
     loop {
+        let now = publisher.clock.now();
+        let revision = tracking.wake.begin_plan();
+        let delay = tracking.inner.deadline_delay(now, full.remaining(now));
+        let delay = tracking.wake.plan(now, revision, delay);
         tokio::select! {
             _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(config.scan_interval) => {}
+            _ = tokio::time::sleep(delay) => {},
+            _ = tracking.wake.notify.notified() => {}
+        }
+        let now = publisher.clock.now();
+        tracking.wake.start_scan(now);
+        if full.start(now) {
+            tracking.inner.begin_full_pass(true);
         }
 
         let active_shards: Vec<_> = shard_owner
@@ -1468,12 +1525,13 @@ pub async fn run_completion_callback_scanner<R>(
             .collect();
         for shard_id in active_shards {
             runtime_metrics::record_scanner_tick("completion_callback", shard_id.0);
-            scan_completion_callbacks_once(
+            scan_completion_callbacks_at(
                 repo.as_ref(),
                 &tracking,
                 Some(shard_id),
                 &publisher,
                 &config,
+                publisher.clock.now(),
             )
             .await;
         }

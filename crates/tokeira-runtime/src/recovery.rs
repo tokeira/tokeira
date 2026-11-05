@@ -364,6 +364,10 @@ where
             }
             for entry in entries.nexus_timeouts {
                 nexus_timeout_tracking.insert(NexusTimeoutEntry {
+                    timeouts: state
+                        .pending_nexus_operations
+                        .get(&entry.operation_id)
+                        .map(crate::nexus::NexusTimeouts::from),
                     run_key: entry.run_key,
                     shard_id,
                     operation_id: entry.operation_id,
@@ -374,6 +378,15 @@ where
             }
             for entry in entries.completion_callbacks {
                 completion_callback_tracking.insert(CompletionCallbackTrackingEntry {
+                    timing: state
+                        .completion_callbacks
+                        .get(entry.callback_index)
+                        // Recovery may have lost the Scheduled invocation. Unknown
+                        // timing requests an immediate authoritative reload.
+                        .filter(|callback| {
+                            callback.state != tokeira_kernel::CallbackState::Scheduled
+                        })
+                        .map(crate::nexus::CompletionCallbackTiming::from),
                     run_key: entry.run_key,
                     shard_id,
                     callback_index: entry.callback_index,

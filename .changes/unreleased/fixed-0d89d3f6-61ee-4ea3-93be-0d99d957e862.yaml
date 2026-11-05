@@ -1,0 +1,5 @@
+kind: fixed
+body: Nexus operation timeouts and retries, completion callback retries, and newly started workflows' timeouts now fire at their deadline rather than up to a second late.
+time: 2026-11-05T22:45:55.944964+00:00
+custom:
+    Slice: 0d89d3f6-61ee-4ea3-93be-0d99d957e862

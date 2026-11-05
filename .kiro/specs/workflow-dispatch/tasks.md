@@ -547,3 +547,7 @@ unrelated lease work in this feature.
 - Each implementation PR starts with a code/tests commit and a spec-alignment
   commit recording completed tasks and actual evidence. Review fixes follow as
   additional commits. Run the full completion bar for each implementation PR.
+
+- [x] 20. Fire tracked deadlines without periodic-tick delay
+  - Order due tasks by deadline and stable identity; immediately continue unattempted capped work without spinning on failed submissions. Preserve earlier loop and acquisition tests.
+  - _Requirements: 7.10_

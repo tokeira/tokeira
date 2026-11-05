@@ -232,3 +232,7 @@ Add a background workflow timeout scanner to `tokeira-runtime` that periodically
 
 - [x] Verify Property 9 with the required property and regression tests: `stored_workflow_deadlines_are_total`, `stored_long_timeout_keeps_scan_bounded`.
   _Requirements: 10._
+
+- [x] 11. Fire tracked deadlines without periodic-tick delay
+  - Use the shared deadline index for earlier-insert notification, due ordering and cap continuation. Verify the sleeping one-hour scanner, strict boundaries and failed-submission retry spacing.
+  - _Requirements: 5.1, 5.6_

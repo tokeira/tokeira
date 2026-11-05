@@ -1060,17 +1060,20 @@ where
                         }
                         // Retry authority lives in durable operation discovery. Keep
                         // timeout tracking aligned with the original deadline while
-                        // the operation is backing off.
+                        // backing off, and replace schedule-to-start with the committed
+                        // start-to-close anchor after an asynchronous start.
                         if let Command::NexusOperationResolved(request) = &committed_command
                             && matches!(
                                 request.resolution,
                                 tokeira_kernel::NexusResolution::AttemptFailed { .. }
+                                    | tokeira_kernel::NexusResolution::Started { .. }
                             )
                             && let Some(op) = new_state
                                 .pending_nexus_operations
                                 .get(&request.operation_id)
                         {
                             nexus_timeout_tracking.insert(crate::nexus::NexusTimeoutEntry {
+                                timeouts: Some(crate::nexus::NexusTimeouts::from(op)),
                                 run_key: message.run_key,
                                 shard_id,
                                 operation_id: request.operation_id.clone(),

@@ -827,3 +827,17 @@ evidence, the full root completion bar, the change record and a path-by-path led
 Review risks are the new required persisted format, stopped-writer cutover, multi-run
 reset cache invalidation, cross-home transport and legacy records lacking original
 intent. Tests and checkpoints are ordered to expose those before the final combined PR.
+
+### Discovered Nexus backoff deadlines
+
+The driver also waits for the earliest due time it has seen on a skipped operation
+row, and for the earliest volatile retry delay to end. It remembers one deadline
+per stream plus the bounded retry slots, each with the key preceding its row in
+the page where it was observed (or that page's `after` key). No payload or admission
+is reserved. A deadline reads one page of that stream from the saved preceding key,
+with a fresh bound and the usual page and admission limits. It attempts due rows
+with the ordinary busy, retry and intent checks, and remembers the next skipped
+deadline in that page. The read never moves discovery's cursor or rotation, so
+Property 23 is unchanged. If intervening insertions push the row beyond the page,
+ordinary discovery finds it. There is no overdue traversal or immediate rescan;
+the tick and its bounded rounds remain the backstop (Requirement 5.9).

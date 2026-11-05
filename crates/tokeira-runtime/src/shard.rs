@@ -648,6 +648,7 @@ mod tests {
                     cancel_requested: false,
                 });
                 nts.insert(NexusTimeoutEntry {
+                    timeouts: None,
                     run_key: rk,
                     shard_id: shard_a,
                     operation_id: format!("n-{i}"),
@@ -681,6 +682,7 @@ mod tests {
                     cancel_requested: false,
                 });
                 nts.insert(NexusTimeoutEntry {
+                    timeouts: None,
                     run_key: rk,
                     shard_id: shard_b,
                     operation_id: format!("nb-{i}"),
@@ -784,6 +786,7 @@ mod tests {
                     cancel_requested: false,
                 });
                 nts.insert(NexusTimeoutEntry {
+                    timeouts: None,
                     run_key: rk,
                     shard_id: shard_a,
                     operation_id: format!("n-{i}"),
@@ -817,6 +820,7 @@ mod tests {
                     cancel_requested: false,
                 });
                 nts.insert(NexusTimeoutEntry {
+                    timeouts: None,
                     run_key: rk,
                     shard_id: shard_b,
                     operation_id: format!("nb-{i}"),

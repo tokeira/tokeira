@@ -115,12 +115,13 @@ token, attempt and deadline independently of operation completion.
 
 #### Acceptance Criteria
 
-1. WHEN a Nexus operation has a configured `schedule_to_close_timeout` and the elapsed time since the `NexusOperationScheduled` event exceeds the timeout, THE Runtime SHALL submit a `Command::NexusOperationResolved` with a `NexusResolution::TimedOut` to the originating run.
+1. WHEN a Nexus operation has a configured `schedule_to_close_timeout` and the elapsed time since the `NexusOperationScheduled` event reaches the timeout, THE Runtime SHALL submit a `Command::NexusOperationResolved` with a `NexusResolution::TimedOut` to the originating run.
 2. THE Runtime SHALL maintain runtime-local tracking state for pending Nexus operations that have a `schedule_to_close_timeout`, recording the originator run_key, operation_id, scheduled_event_id, schedule_to_close_timeout, and the authoritative `scheduled_at` timestamp from the committed transition (not the wall-clock time at dispatch publication).
-3. THE Runtime SHALL run a Nexus_Timeout_Scanner background task that periodically checks tracked Nexus operations for timeout violations.
+3. THE Runtime SHALL run a Nexus_Timeout_Scanner that wakes at the earliest active tracked deadline, reloads only due entries on deadline passes, and refreshes every tracked entry each scan interval.
 4. THE Nexus_Timeout_Scanner SHALL use a configurable scan interval.
 5. THE Nexus_Timeout_Scanner SHALL use a configurable maximum number of timeouts processed per scan cycle.
 6. WHEN a `Command::NexusOperationResolved` with a TimedOut resolution is rejected by the kernel (e.g., `UnknownNexusOperation` because the operation was already resolved), THE Runtime SHALL treat the rejection as a harmless no-op and remove the entry from tracking state.
+7. WHEN a tracked Nexus operation's deadline passes, THE scanner SHALL submit its timeout at that deadline, not at a later periodic scan (`components/nexusoperations/statemachine.go:144-167`, `service/history/workflow/state_machine_timers.go:18-45`, `service/history/queues/queue_scheduled.go:159-224,269 @ v1.31.0`).
 
 ### Requirement 8: Nexus Timeout Tracking Lifecycle
 

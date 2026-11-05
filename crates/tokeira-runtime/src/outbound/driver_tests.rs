@@ -146,6 +146,49 @@ impl Executor for RecordingExecutor {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
+    // Partial rounds traverse one ordered cycle; full sweeps rotate their first stream.
+    // Feature: outbound-dispatch-recovery, Property 23: Discovery reads every stream within a bounded number of rounds.
+    #[test]
+    fn discovery_reads_every_stream_within_bounded_rounds(
+        count in 1usize..=512,
+        rounds in prop::collection::vec(1usize..=16, 1..100),
+    ) {
+        let ordered: Vec<_> = (0..count)
+            .map(|home| (ShardId(u32::try_from(home).unwrap()), StreamKind::Intent))
+            .collect();
+        let mut discovery = Discovery {
+            streams: ordered.iter().map(|&stream| (stream, (1, Cursor::new(stream.1)))).collect(),
+            previous: None,
+        };
+        let mut expected = 0;
+        for budget in rounds {
+            let visited = budget.min(count);
+            let first = expected;
+            for _ in 0..visited {
+                prop_assert_eq!(discovery.next(), Some(ordered[expected]));
+                expected = (expected + 1) % count;
+            }
+            discovery.finish_round(Some(ordered[first]), visited);
+            if visited == count {
+                expected = (first + 1) % count;
+            }
+        }
+        prop_assert_eq!(discovery.next(), Some(ordered[expected]));
+
+        let mut seen = BTreeSet::new();
+        for _ in 0..count.div_ceil(PAGES_PER_TICK) {
+            let mut first = None;
+            let visited = PAGES_PER_TICK.min(count);
+            for _ in 0..visited {
+                let stream = discovery.next().unwrap();
+                first.get_or_insert(stream);
+                seen.insert(stream);
+            }
+            discovery.finish_round(first, visited);
+        }
+        prop_assert_eq!(seen.len(), count);
+    }
+
     // Feature: outbound-dispatch-recovery, Property 3: Bounded discovery makes progress after volatile loss
     #[test]
     fn finite_rounds_find_lower_insertions_and_pass_failing_first_rows(count in 33i64..70, lower in 1i64..12) {
@@ -270,4 +313,98 @@ async fn blocked_home_cannot_take_another_homes_admission() {
     cancel.cancel();
     worker.await.unwrap();
     assert_eq!(executor.peak.load(Ordering::SeqCst), 2 * MAX_PER_HOME);
+}
+
+#[derive(Default)]
+struct ManyHomesExecutor {
+    round_started: tokio::sync::Notify,
+    delivered: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl Executor for ManyHomesExecutor {
+    fn operation_kinds(&self) -> &'static [OperationKind] {
+        // The driver asks for kinds once per round during stream refresh, so this marks a round.
+        self.round_started.notify_one();
+        &[
+            OperationKind::ChildStart,
+            OperationKind::ChildRelease,
+            OperationKind::ExternalSignal,
+            OperationKind::ExternalCancel,
+            OperationKind::NexusStart,
+            OperationKind::NexusCancel,
+        ]
+    }
+
+    fn accepts_intent(&self, _: IntentKind) -> bool {
+        false
+    }
+
+    async fn deliver(&self, work: Work, _: Attempt) -> Result<()> {
+        let Work::Operation(row) = work else {
+            panic!("fixture has one operation");
+        };
+        assert_eq!(row.source_home, ShardId(31));
+        assert_eq!(row.incarnation.key.kind, OperationKind::ExternalSignal);
+        self.delivered.notify_one();
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn many_homes_discover_new_row_within_one_cycle() {
+    let repo = Arc::new(InMemoryStore::with_shard_count(32));
+    let mut ownership = ShardOwner::new(32);
+    for home in (0..32).map(ShardId) {
+        ownership.record_acquired(home, ShardEpoch(1));
+        ownership.mark_active(home);
+    }
+    let executor = Arc::new(ManyHomesExecutor::default());
+    let cancel = CancellationToken::new();
+    let worker = tokio::spawn(run(
+        repo.clone(),
+        executor.clone(),
+        Arc::new(RwLock::new(ownership)),
+        cancel.clone(),
+    ));
+    for _ in 0..17 {
+        executor.round_started.notified().await;
+    }
+
+    let mut start = crate::runtime::tests::sample_start_request(None, None);
+    start.workflow_id = (0..10_000)
+        .map(|n| WorkflowId(format!("home-{n}")))
+        .find(|id| {
+            tokeira_types::execution_home_bundle(
+                start.namespace_id.0.as_bytes(),
+                id.0.as_bytes(),
+                32,
+            ) == ShardId(31)
+        })
+        .unwrap();
+    start.run_key = RunKey::derive(start.namespace_id, &start.workflow_id, start.run_id);
+    let mut transition = BasicKernel
+        .apply(LoadedRun::Absent, Command::Start(start))
+        .unwrap();
+    insert(&mut transition.next_state, 101);
+    transition.next_state.pending_external_cancels.clear();
+    assert!(matches!(
+        repo.commit_transition(
+            transition.next_state.run_key,
+            transition,
+            WriteFence::Unfenced,
+        )
+        .await
+        .unwrap(),
+        CommitResult::Applied { .. }
+    ));
+
+    let delivered = tokio::time::timeout(
+        TICK * (256u32.div_ceil(16) + 1),
+        executor.delivered.notified(),
+    )
+    .await;
+    cancel.cancel();
+    worker.await.unwrap();
+    assert!(delivered.is_ok(), "row was not discovered within 17 ticks");
 }

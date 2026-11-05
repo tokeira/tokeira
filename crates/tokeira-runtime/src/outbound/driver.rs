@@ -245,6 +245,16 @@ impl Discovery {
         self.previous = next;
         next
     }
+
+    fn finish_round(&mut self, first: Option<Stream>, visited: usize) {
+        // A complete sweep rotates past its first stream so the same kind cannot
+        // take all per-home admission every tick. Partial rounds resume after the
+        // last visited stream, so streams are read in turn and none waits more
+        // than one cycle of rounds.
+        if visited != 0 && visited == self.streams.len() {
+            self.previous = first;
+        }
+    }
 }
 
 /// One runtime-owned worker pool; shutdown cancels attempts, never obligations.
@@ -298,10 +308,12 @@ pub(super) async fn run<R: RunRepository + 'static, E: Executor>(
             } => {
                 discovery.refresh(&owner, executor.operation_kinds());
                 let mut first_stream = None;
+                let mut visited = 0;
                 for _ in 0..PAGES_PER_TICK.min(discovery.streams.len()) {
                     if tasks.len() >= MAX_IN_FLIGHT { break; }
                     let Some(stream) = discovery.next() else { break; };
                     first_stream.get_or_insert(stream);
+                    visited += 1;
                     let remaining = MAX_PER_HOME.saturating_sub(home_in_flight.get(&stream.0).copied().unwrap_or(0));
                     if remaining == 0 { continue; }
                     let Some(attempt) = Attempt::capture(&owner, stream.0) else { continue; };
@@ -338,11 +350,7 @@ pub(super) async fn run<R: RunRepository + 'static, E: Executor>(
                         *home_in_flight.entry(stream.0).or_default() += 1;
                     }
                 }
-                // Completing a full stream sweep must not always restart at the
-                // same kind: that kind could consume all per-home admission on
-                // every tick. Rotate the starting stream even when every row is
-                // permanently pending and earlier streams fill their allowance.
-                if let Some(first) = first_stream { discovery.previous = Some(first); }
+                discovery.finish_round(first_stream, visited);
             }
         }
     }

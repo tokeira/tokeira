@@ -249,11 +249,22 @@ they can tune throughput without changing semantic guarantees. Individual attemp
 have bounded timeouts and exponential backoff; exhausted local retries leave durable
 work discoverable. An unresolved record is reported without stalling unrelated work.
 
-Every discovery round captures a finite greatest key, walks keyset pages to that bound,
-then starts a new round at the head. New lower keys wait only for the next round.
-Persisted due times filter eligibility, not correctness of a one-way cursor. Local
-in-flight/backoff maps suppress excess retries only; they vanish safely on takeover.
-One failing record cannot monopolize the first page or prevent later records running.
+The driver visits at most 16 streams per scheduling round. A round visiting every
+stream starts the next round one stream after its first, so the same kind cannot
+consume all per-home admission on every tick. A partial round, whether limited by
+pages or in-flight admission, resumes after its last visited stream. Across consecutive
+partial rounds, streams therefore form a cycle in key order without repeats before
+every stream is visited. For a stable set of N streams, rounds with the full 16-stream
+budget visit every stream within ⌈N/16⌉ rounds; admission can shorten a round without
+resetting its progress. These are scheduling visits, not a promise to read a page
+while a home's admission is exhausted.
+
+Each stream's discovery sweep captures a finite greatest key, walks keyset pages
+to that bound, then starts a new sweep at the head. New lower keys wait only for
+the next sweep. Persisted due times filter eligibility, not correctness of a
+one-way cursor. Local in-flight/backoff maps suppress excess retries only; they
+vanish safely on takeover. One failing record cannot monopolize the first page
+or prevent later records running.
 
 Acquisition includes all legacy candidates and new source-only pending states, under
 the existing exclusive writer barrier. Reconcile operations using the acquisition's
@@ -764,6 +775,17 @@ sequence for child delivery.
 
 **Validates: Requirements 2.6, 2.7, 3.4, 3.8, 10.4, 10.5, 10.6, 10.7.**
 
+### Property 23: Discovery reads every stream within a bounded number of rounds
+
+For any stable ordered set of N streams and sequence of scheduling rounds visiting
+between one and 16 streams (capped at N), consecutive partial rounds SHALL traverse
+the set in key order without skipping a stream or repeating one before all others
+have been visited. A round visiting every stream SHALL start the next round one
+stream after its first. With the full 16-stream budget and available admission,
+every stream SHALL be read within ⌈N/16⌉ rounds, independently of notifications.
+
+**Validates: Requirements 2.1, 2.3, 2.8, 10.4, 10.6.**
+
 ## Testing and completion evidence
 
 | Placement | Required coverage |
@@ -772,6 +794,7 @@ sequence for child delivery.
 | `tokeira-storage/src/outbound_tests.rs`, memory and DSQL repository suites | Properties 1, 2, 4, 12, 14, 15, 16, 19; shared semantic cases, injected conflicts/refusals, live fence and large-value cases |
 | `tokeira-kernel` child/reset/Nexus test modules and codec tests | Properties 5, 6, 8, 11, 13, 17; deterministic generated identities/times and old/new encoded fixtures |
 | `tokeira-runtime/src/outbound/tests.rs` | Properties 3, 5–11, 13, 14, 20; controlled executor, owner and transport faults |
+| `tokeira-runtime/src/outbound/driver_tests.rs` | Property 23: at least 100 generated cases over 1–512 streams and 1–16 visits per round, full-sweep rotation and ⌈N/16⌉ coverage; paused-time driver over 32 active homes/256 streams, with delivery within 17 ticks; both tests fail with unconditional first-stream reset |
 | `tokeira-edge` internal RPC and `tokeira-auth::peer` tests | Property 18; purpose separation, bounded metadata, absent no-peer route, local/remote parity |
 | Existing completion-callback and successor suites | Preservation regression evidence alongside focused new properties |
 

@@ -356,6 +356,22 @@ No separate specification PR is planned.
     and after the fix, and record their figures in the ledger.
   - _Requirements: 2.6, 2.7, 3.4, 3.8, 10.4, 10.5, 10.6, 10.7._
 
+- [x] 23. Bound discovery latency across partial scheduling rounds
+  - Resume partial rounds after their last visited stream; rotate after the first
+    stream only when the round visits every stream. Preserve admission limits,
+    tick duration, retry backoff and wake behavior.
+  - Implement **Property 23** with at least 100 generated cases over 1–512 streams
+    and 1–16 visits per round, checking ordered cycles, full-sweep rotation and
+    coverage within ⌈N/16⌉ full-budget rounds.
+    - Tag: `// Feature: outbound-dispatch-recovery, Property 23: Discovery reads every stream within a bounded number of rounds.`
+  - Run the paused-time driver with 32 active homes and 256 streams; commit one
+    operation after its home has been visited and require delivery within 17 ticks.
+    Run both negative controls with unconditional first-stream reset, preserve the
+    existing discovery/admission tests, and record the memory fan-out measurement.
+  - Run the live fan-out at DSQL's default 32 shards, with every home acquired and
+    on its own database, before and after the fix, and record its figures in the ledger.
+  - _Requirements: 2.1, 2.3, 2.8, 10.4, 10.6._
+
 ## Verification evidence
 
 The [delivery ledger](../../../docs/readiness/outbound-recovery.md) records the
@@ -389,7 +405,8 @@ one upstream skip and four existing registry exclusions are reported separately.
   "19": ["18"],
   "20": ["18"],
   "21": ["20"],
-  "22": ["21"]
+  "22": ["21"],
+  "23": ["22"]
 }
 ```
 

@@ -17,6 +17,7 @@ use opentelemetry::KeyValue;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
+use tokeira_clock::Clock;
 use tokeira_kernel::{
     Command, Link, LoadedRun, NexusOperationResolvedRequest, NexusResolution, NexusTimeoutType,
     PendingNexusOperation, WorkerDeploymentVersionRef,
@@ -2531,10 +2532,10 @@ pub(crate) async fn scan_nexus_timeouts_once<R>(
     lanes: &[LaneHandle],
     lane_count: usize,
     config: &NexusTimeoutScannerConfig,
+    now: OffsetDateTime,
 ) where
     R: RunRepository + 'static,
 {
-    let now = OffsetDateTime::now_utc();
     let entries = tracking.inner.snapshot(shard_id);
     let mut submitted = 0usize;
 
@@ -2639,6 +2640,7 @@ pub(crate) async fn run_nexus_timeout_scanner<R>(
     shard_owner: Arc<RwLock<ShardOwner>>,
     config: NexusTimeoutScannerConfig,
     cancel: CancellationToken,
+    clock: Arc<dyn Clock>,
 ) where
     R: RunRepository + 'static,
 {
@@ -2662,6 +2664,7 @@ pub(crate) async fn run_nexus_timeout_scanner<R>(
                 &lanes,
                 lane_count,
                 &config,
+                clock.now(),
             )
             .await;
         }

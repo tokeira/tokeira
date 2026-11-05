@@ -148,7 +148,7 @@ where
                 .timers
                 .get(tokeira_kernel::WORKFLOW_START_DELAY_TIMER_ID)
                 .filter(|_| state.pending_workflow_task.is_none())
-                && deadline_after(OffsetDateTime::now_utc(), timeout_after) < delay_timer.fire_at
+                && deadline_after(self.clock.now(), timeout_after) < delay_timer.fire_at
             {
                 return Err(crate::errors::WorkflowNotReady {
                     message: "Workflow task is not scheduled yet.",
@@ -207,7 +207,7 @@ where
                 .map(|version| BuildId(version.build_id.clone()));
         }
 
-        let now = OffsetDateTime::now_utc();
+        let now = self.clock.now();
         let deadline = now
             .checked_add(timeout_after)
             .ok_or_else(|| anyhow!("query deadline exceeds the supported time range"))?;
@@ -416,7 +416,7 @@ where
             update_name,
             input,
             request,
-            now: OffsetDateTime::now_utc(),
+            now: self.clock.now(),
             limits: crate::update::update_limits(),
             request_bytes,
             in_flight_request_bytes: 0,

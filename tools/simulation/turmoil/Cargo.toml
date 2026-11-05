@@ -29,6 +29,7 @@ hyper = { version = "1", features = ["http2", "server"] }
 hyper-util = { version = "0.1", features = ["service", "tokio"] }
 prost-types = "0.14"
 tokeira-auth = { path = "../../../crates/tokeira-auth" }
+tokeira-clock = { path = "../../../crates/tokeira-clock" }
 tokeira-config = { path = "../../../crates/tokeira-config" }
 tokeira-controller = { path = "../../../crates/tokeira-controller" }
 tokeira-edge = { path = "../../../crates/tokeira-edge" }
@@ -36,6 +37,7 @@ tokeira-engine = { path = "../../../crates/tokeira-engine", default-features = f
 tokeira-proto = { path = "../../../crates/tokeira-proto" }
 tokeira-storage = { path = "../../../crates/tokeira-storage" }
 tokeira-types = { path = "../../../crates/tokeira-types" }
+time = "0.3"
 tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.14", features = ["transport"] }
 tower = { version = "0.5", features = ["util"] }

@@ -43,8 +43,8 @@ pub use observation::ObservationBatcher;
 pub use outbox::{WorkerComputeOutbox, WorkerComputeOutboxSweep, action_retry_delay};
 pub use ports::{
     ChannelDemandObservationSink, ChannelWorkerComputeReconcileSink, DemandObservationSink,
-    DisabledWorkerComputeSink, ObserveResult, SystemWorkerComputeClock, WorkerComputeCatalogError,
-    WorkerComputeClock, WorkerComputeNamespaceCatalog, WorkerComputeReconcileSink,
+    DisabledWorkerComputeSink, ObserveResult, WorkerComputeCatalogError,
+    WorkerComputeNamespaceCatalog, WorkerComputeReconcileSink,
 };
 pub use provider::{
     NexusWorkerComputeProvider, WorkerComputeProvider, WorkerComputeProviderAttempt,

@@ -49,6 +49,7 @@ tokeira-observability = { path = "../tokeira-observability", version = "0.7.0" }
 tokeira-projection = { path = "../tokeira-projection", version = "0.7.0" }
 tokeira-proto = { path = "../tokeira-proto", version = "0.7.0" }
 tokeira-storage = { path = "../tokeira-storage", version = "0.7.0" }
+tokeira-clock = { path = "../tokeira-clock", version = "0.7.0" }
 tokeira-types = { path = "../tokeira-types", version = "0.7.0" }
 tokeira-chasm = { path = "../tokeira-chasm", version = "0.7.0" }
 prost = "0.14"

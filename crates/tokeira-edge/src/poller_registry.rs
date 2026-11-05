@@ -188,11 +188,7 @@ impl PollerRegistry {
     /// Call [`PollerGuard::completed`] after the poll future resolves, including
     /// the long-poll timeout case. Dropping the guard without completing it is
     /// the cancellation path and intentionally leaves the admission timestamp.
-    pub fn register(&self, queue: QueueKey, identity: WorkerIdentity) -> PollerGuard {
-        self.register_at(queue, identity, OffsetDateTime::now_utc())
-    }
-
-    fn register_at(
+    pub fn register(
         &self,
         queue: QueueKey,
         identity: WorkerIdentity,
@@ -210,9 +206,8 @@ impl PollerRegistry {
 
     /// Return identities observed on `queue` during the five-minute history
     /// window, deduplicated by worker identity.
-    pub fn pollers(&self, queue: &QueueKey) -> Vec<ActivePoller> {
-        self.state
-            .pollers_at(queue, OffsetDateTime::now_utc(), poller_history_ttl())
+    pub fn pollers(&self, queue: &QueueKey, now: OffsetDateTime) -> Vec<ActivePoller> {
+        self.state.pollers_at(queue, now, poller_history_ttl())
     }
 
     /// Eagerly remove one worker identity from every physical version and task
@@ -253,8 +248,8 @@ pub struct PollerGuard {
 impl PollerGuard {
     /// Refresh the identity after the poll resolves normally, including a
     /// deadline/long-poll timeout that returns no task.
-    pub fn completed(self) {
-        self.completed_at(OffsetDateTime::now_utc());
+    pub fn completed(self, observed_at: OffsetDateTime) {
+        self.completed_at(observed_at);
     }
 
     /// Consume a poll finalizer without refreshing history because matching
@@ -305,7 +300,7 @@ mod tests {
         let queue = queue();
         let admission = OffsetDateTime::UNIX_EPOCH + Duration::hours(1);
 
-        let guard = registry.register_at(
+        let guard = registry.register(
             queue.clone(),
             WorkerIdentity("worker".to_string()),
             admission,
@@ -325,7 +320,7 @@ mod tests {
         let admission = OffsetDateTime::UNIX_EPOCH + Duration::hours(1);
 
         registry
-            .register_at(
+            .register(
                 queue.clone(),
                 WorkerIdentity("worker".to_string()),
                 admission,
@@ -346,7 +341,7 @@ mod tests {
         let admission = OffsetDateTime::UNIX_EPOCH + Duration::hours(1);
         let completion = admission + Duration::seconds(30);
 
-        let guard = registry.register_at(
+        let guard = registry.register(
             queue.clone(),
             WorkerIdentity("worker".to_string()),
             admission,

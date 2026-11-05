@@ -247,6 +247,7 @@ async fn acquisition_spans_recovery_pages(activities: bool) -> Result<()> {
         "127.0.0.1:0".into(),
         false,
         None,
+        tokeira_clock::system_clock(),
     ));
     let result: Result<()> = async {
         let mut expected = Vec::new();
@@ -514,6 +515,7 @@ async fn workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs(
         "127.0.0.1:0".into(),
         false,
         None,
+        tokeira_clock::system_clock(),
     ));
     let checking_runtime = runtime.clone();
     let checking_repo = repo.clone();
@@ -857,6 +859,7 @@ async fn live_dispatch_observation(lost: Option<TaskKind>) -> Result<()> {
         "127.0.0.1:0".into(),
         false,
         None,
+        tokeira_clock::system_clock(),
     ));
     let checking = runtime.clone();
     let checking_homes = homes.clone();
@@ -1116,6 +1119,7 @@ async fn child_fan_out_live_starts_every_child() -> Result<()> {
         "127.0.0.1:0".into(),
         false,
         None,
+        tokeira_clock::system_clock(),
     );
     let result = measurement
         .run(
@@ -1596,6 +1600,7 @@ async fn child_release_live_case(case: ChildReleaseCase) -> Result<()> {
         "127.0.0.1:0".into(),
         false,
         None,
+        tokeira_clock::system_clock(),
     ));
     let result: Result<()> = async {
         setup?;

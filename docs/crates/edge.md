@@ -71,12 +71,13 @@ served it, and a token issued to one release cannot be redeemed by another.
 
 The provenance record backing that check has a deliberate seam. It expires one
 start-to-close timeout after the instant the task is **served**, sampled from
-real time rather than from the CHASM clock. Two reasons: the stores enforce the
-lifetime on real time — the in-memory store filters expired rows on read and the
-DSQL store purges them on a maintenance sweep — and a poll can block until a
-delayed retry is released, so a record anchored at admission could be born past
-its own lifetime. Under the default clock this is the same instant the activity
-records as its start; only a simulated clock diverges.
+the node's clock rather than from the CHASM clock. Two reasons: the stores
+enforce the lifetime on the node's clock — the in-memory store filters expired
+rows on read and the DSQL store purges them on a maintenance sweep — and a poll
+can block until a delayed retry is released, so a record anchored at admission
+could be born past its own lifetime. Unless an embedder sets its own CHASM
+clock, the CHASM plane reads the node's clock too, so this is the same instant
+the activity records as its start; only an embedder's own clock diverges.
 
 ## It does not own
 

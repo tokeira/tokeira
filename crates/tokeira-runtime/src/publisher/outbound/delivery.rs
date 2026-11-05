@@ -103,7 +103,7 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
         tokeira_types::NamespaceId,
         tokeira_types::WorkflowId,
     )> {
-        let now = OffsetDateTime::now_utc();
+        let now = self.clock.now();
         let target = reference.destination;
         let mut guard = reference.authority;
         let (command, namespace, workflow) = match guard {

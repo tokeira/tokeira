@@ -116,7 +116,11 @@ fn capped_start_durations_are_recorded_in_history() {
         received_at: OffsetDateTime::UNIX_EPOCH,
         is_long_poll: false,
     };
-    let internal = crate::translate::to_internal::start_request(request, &context);
+    let internal = crate::translate::to_internal::start_request(
+        request,
+        &context,
+        time::OffsetDateTime::now_utc(),
+    );
     let transition = BasicKernel
         .apply(LoadedRun::Absent, Command::Start(internal))
         .unwrap();
@@ -239,6 +243,7 @@ fn completion(command: WorkflowCommand) -> (WorkflowState, WorkflowTaskCompleted
     let request = crate::translate::to_internal::start_request(
         start_request_to_edge(start()).unwrap(),
         &context,
+        time::OffsetDateTime::now_utc(),
     );
     let started = BasicKernel
         .apply(LoadedRun::Absent, Command::Start(request.clone()))

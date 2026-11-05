@@ -535,7 +535,7 @@ The workspace `Cargo.toml` member list is the authority; this is orientation
 ```
 apps/       tokeirad (server) · tkr (operator CLI) · controller · autoscaler · bench
 crates/     engine   types · proto · kernel · chasm{,-derive,-activity} · storage ·
-                     runtime · projection · edge · observability · auth
+                     runtime · projection · edge · observability · auth · clock
             compat   build-info · compatibility{,-proto,-service} ·
                      conformance{,-proto,-control}
             deploy   state · iac · deploy-engine · config · orchestrator ·

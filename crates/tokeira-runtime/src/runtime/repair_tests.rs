@@ -151,6 +151,7 @@ fn runtime(repo: Arc<Repo>) -> Arc<TokeiraRuntime<Repo>> {
         "127.0.0.1:0".into(),
         false,
         None,
+        tokeira_clock::system_clock(),
     ))
 }
 
@@ -447,6 +448,7 @@ async fn acquisition_drains_an_admitted_lane_commit_before_reading_repair_pages(
         "127.0.0.1:0".into(),
         false,
         None,
+        tokeira_clock::system_clock(),
     ));
     {
         let mut owner = runtime.shard_owner.write().unwrap();
@@ -1170,6 +1172,7 @@ pub(super) fn home_runtime<R: RunRepository + 'static>(
         "127.0.0.1:0".into(),
         false,
         None,
+        tokeira_clock::system_clock(),
     ));
     {
         let mut owner = runtime.shard_owner.write().unwrap();

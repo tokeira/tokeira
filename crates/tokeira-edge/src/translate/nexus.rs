@@ -152,12 +152,15 @@ pub fn poll_request_to_edge(
     })
 }
 
+/// `now` is when the poll answers: an HTTP task's `request-timeout` header
+/// carries what is left of its dispatch deadline from then.
 pub fn poll_response_to_proto(
     resp: PollNexusTaskQueueResponse,
+    now: OffsetDateTime,
 ) -> Result<workflowservice::PollNexusTaskQueueResponse, NexusTranslateError> {
     Ok(workflowservice::PollNexusTaskQueueResponse {
         task_token: resp.task_token,
-        request: Some(nexus_task_to_proto_request(&resp.request)?),
+        request: Some(nexus_task_to_proto_request(&resp.request, now)?),
         poller_group_id: String::new(),
         poller_group_infos: Vec::new(),
         poller_scaling_decision: resp.poller_scaling_decision.map(|delta| {
@@ -204,6 +207,7 @@ pub fn failed_request_to_edge(
 #[allow(deprecated)]
 pub fn nexus_task_to_proto_request(
     task_request: &NexusTaskRequest,
+    now: OffsetDateTime,
 ) -> Result<nexus_v1::Request, NexusTranslateError> {
     match task_request {
         NexusTaskRequest::StartOperation {
@@ -272,7 +276,7 @@ pub fn nexus_task_to_proto_request(
         }),
         NexusTaskRequest::Http(request) => {
             let mut header = request.header.clone();
-            let remaining = (request.dispatch_deadline - OffsetDateTime::now_utc())
+            let remaining = (request.dispatch_deadline - now)
                 .max(time::Duration::ZERO)
                 .whole_milliseconds();
             let timeout = format!("{remaining}ms");
@@ -1075,7 +1079,8 @@ mod tests {
             },
         });
 
-        let translated = nexus_task_to_proto_request(&request).expect("translation");
+        let translated = nexus_task_to_proto_request(&request, time::OffsetDateTime::now_utc())
+            .expect("translation");
         assert_eq!(translated.header.get("x-caller"), Some(&"value".to_owned()));
         let canonical = translated
             .header
@@ -1268,7 +1273,7 @@ mod tests {
                 callback_token: None,
             };
 
-            let proto = nexus_task_to_proto_request(&request).expect("translation should succeed");
+            let proto = nexus_task_to_proto_request(&request, time::OffsetDateTime::now_utc()).expect("translation should succeed");
             let start = match proto.variant.expect("variant") {
                 nexus_v1::request::Variant::StartOperation(start) => start,
                 other => panic!("unexpected variant: {other:?}"),
@@ -1298,7 +1303,7 @@ mod tests {
                 operation_token: operation_id.clone(),
             };
 
-            let proto = nexus_task_to_proto_request(&request).expect("translation should succeed");
+            let proto = nexus_task_to_proto_request(&request, time::OffsetDateTime::now_utc()).expect("translation should succeed");
             let cancel = match proto.variant.expect("variant") {
                 nexus_v1::request::Variant::CancelOperation(cancel) => cancel,
                 other => panic!("unexpected variant: {other:?}"),

@@ -14,6 +14,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use tokeira_clock::{Clock, system_clock};
 use tokeira_types::{
     ConfigurationFingerprint, ControllerInstanceKey, IncarnationId, NamespaceId, ScalingGroupId,
     WorkerComputeControllerLifecycle, WorkerComputeFailureCategory, WorkerComputeGroupEligibility,
@@ -397,9 +398,30 @@ pub trait WorkerComputeRepository: Send + Sync {
 }
 
 /// Lock-based semantic reference implementation used by local runtime and tests.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct InMemoryWorkerComputeRepository {
     state: Arc<Mutex<InMemoryWorkerComputeState>>,
+    /// What a controller claim's lease is judged against. It must be the clock
+    /// the controller stamps `lease_until` with; see [`tokeira_clock`].
+    clock: Arc<dyn Clock>,
+}
+
+impl Default for InMemoryWorkerComputeRepository {
+    fn default() -> Self {
+        Self {
+            state: Arc::default(),
+            clock: system_clock(),
+        }
+    }
+}
+
+impl InMemoryWorkerComputeRepository {
+    /// Judge controller leases with `clock` instead of the system clock, for a
+    /// harness that runs the controller in simulated time.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
 }
 
 #[derive(Debug, Default)]
@@ -565,7 +587,7 @@ impl WorkerComputeRepository for InMemoryWorkerComputeRepository {
         if current.owner != Some(claim.owner)
             || current.owner_epoch != claim.owner_epoch
             || current.lease_until != Some(claim.lease_until)
-            || claim.lease_until <= OffsetDateTime::now_utc()
+            || claim.lease_until <= self.clock.now()
         {
             return Ok(WorkerComputeControllerCommitResult::Fenced);
         }

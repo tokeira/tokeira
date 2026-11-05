@@ -12,7 +12,7 @@ use std::{
     collections::{HashMap, VecDeque},
     hash::{Hash, Hasher},
     sync::Arc,
-    time::{Duration as StdDuration, Instant},
+    time::Duration as StdDuration,
 };
 
 use chrono::{DateTime, Offset as _, Utc};
@@ -265,7 +265,7 @@ pub enum ScheduleError {
 #[derive(Default, Debug)]
 pub struct ScheduleStore {
     schedules: DashMap<(NamespaceId, ScheduleId), ScheduleEntry>,
-    next_start: tokio::sync::Mutex<HashMap<NamespaceId, Instant>>,
+    next_start: tokio::sync::Mutex<HashMap<NamespaceId, tokio::time::Instant>>,
 }
 
 #[derive(Debug, Error)]
@@ -440,7 +440,7 @@ impl ScheduleStore {
     pub async fn acquire_start_permit(&self, namespace_id: NamespaceId) {
         let requests_per_second = schedule_namespace_start_workflow_rps();
         let interval = StdDuration::from_secs_f64(1.0 / requests_per_second);
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         let wait = {
             let mut next_start = self.next_start.lock().await;
             let next = next_start.entry(namespace_id).or_insert(now);
@@ -1029,13 +1029,13 @@ where
     R: RunRepository + 'static,
 {
     tokio::spawn(async move {
-        let mut last_tick = OffsetDateTime::now_utc();
+        let mut last_tick = runtime.clock().now();
         let mut ticker = tokio::time::interval(config.tick_interval);
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = ticker.tick() => {
-                    let now = OffsetDateTime::now_utc();
+                    let now = runtime.clock().now();
                     evaluate_all_schedules(&store, runtime.as_ref(), last_tick, now).await;
                     last_tick = now;
                 }
@@ -1281,7 +1281,7 @@ where
                 &entry.schedule_id,
                 buffered.nominal_time,
                 buffered.overlap_policy_override,
-                OffsetDateTime::now_utc(),
+                runtime.clock().now(),
             )
             .await;
         }
@@ -1490,7 +1490,7 @@ pub async fn cancel_workflows<R>(
                     external_initiated_event_id: 0,
                     links: Vec::new(),
                     request: request.clone(),
-                    now: OffsetDateTime::now_utc(),
+                    now: runtime.clock().now(),
                 },
             )
             .await;
@@ -1518,7 +1518,7 @@ pub async fn terminate_workflows<R>(
                     identity: request.caller_identity.clone().unwrap_or_default(),
                     links: Vec::new(),
                     request: request.clone(),
-                    now: OffsetDateTime::now_utc(),
+                    now: runtime.clock().now(),
                 },
             )
             .await;

@@ -4,7 +4,6 @@
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Result, ensure};
-use time::OffsetDateTime;
 use tokeira_kernel::{
     Command, ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
     ExternalSignalResult, HistoryEventKind, OperationKind,
@@ -183,7 +182,7 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
         } else {
             Some(TerminalCause::MissingExecution)
         };
-        let now = OffsetDateTime::now_utc();
+        let now = self.clock.now();
         let command = if signal {
             Command::ExternalSignalResolvedV2 {
                 metadata,

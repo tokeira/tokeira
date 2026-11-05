@@ -205,7 +205,7 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
                     "child-start:{}:{initiating_event}",
                     source.run_key.0
                 )),
-                prepared_at: OffsetDateTime::now_utc(),
+                prepared_at: self.clock.now(),
                 parent_namespace_name: match &self.namespace_resolver {
                     Some(resolver) => {
                         Some(resolver.name_for_id(source.namespace_id).await?.ok_or(
@@ -391,7 +391,7 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
                     child_workflow_id,
                     initiated_event_id: row.incarnation.key.initiating_event,
                     result,
-                    now: OffsetDateTime::now_utc(),
+                    now: self.clock.now(),
                 }),
                 attempt,
                 owner,

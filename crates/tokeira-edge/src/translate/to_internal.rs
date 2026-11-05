@@ -49,8 +49,12 @@ pub fn namespace_id_for(name: &str) -> NamespaceId {
     NamespaceId(Uuid::from_bytes(bytes))
 }
 
-pub fn start_request(req: StartWorkflowExecutionRequest, context: &EdgeContext) -> StartRequest {
-    let now = req.now.unwrap_or_else(OffsetDateTime::now_utc);
+pub fn start_request(
+    req: StartWorkflowExecutionRequest,
+    context: &EdgeContext,
+    now: OffsetDateTime,
+) -> StartRequest {
+    let now = req.now.unwrap_or(now);
     let run_id = req.run_id.unwrap_or_default();
     let namespace_id = namespace_id_for(&req.namespace);
     let workflow_id = WorkflowId(req.workflow_id);
@@ -159,8 +163,8 @@ pub fn start_request(req: StartWorkflowExecutionRequest, context: &EdgeContext) 
 pub fn signal_with_start_request(
     req: crate::translate::SignalWithStartWorkflowExecutionRequest,
     context: &EdgeContext,
+    now: OffsetDateTime,
 ) -> SignalWithStartRequest {
-    let now = OffsetDateTime::now_utc();
     let run_id = RunId::new();
     let namespace_id = namespace_id_for(&req.namespace);
     let workflow_id = WorkflowId(req.workflow_id);
@@ -373,8 +377,12 @@ fn start_versioning(
     }
 }
 
-pub fn signal_request(req: SignalWorkflowExecutionRequest, context: &EdgeContext) -> SignalRequest {
-    let now = req.now.unwrap_or_else(OffsetDateTime::now_utc);
+pub fn signal_request(
+    req: SignalWorkflowExecutionRequest,
+    context: &EdgeContext,
+    now: OffsetDateTime,
+) -> SignalRequest {
+    let now = req.now.unwrap_or(now);
     SignalRequest {
         signal_name: req.signal_name,
         input: req.input,
@@ -420,6 +428,7 @@ pub fn poll_request(req: PollWorkflowTaskQueueRequest) -> PollInternalRequest {
 pub fn workflow_task_completed_request(
     req: RespondWorkflowTaskCompletedRequest,
     context: &EdgeContext,
+    now: OffsetDateTime,
 ) -> Result<WorkflowTaskCompletedRequest> {
     let (token, _) = crate::task_token::decode::<WorkflowTaskToken>(&req.task_token)?;
     let caller_identity = (!req.identity.is_empty()).then(|| req.identity.clone());
@@ -447,7 +456,7 @@ pub fn workflow_task_completed_request(
             principal: context.event_principal(),
             received_at: context.received_at,
         },
-        now: OffsetDateTime::now_utc(),
+        now,
         command_sizes: req.command_sizes,
     })
 }
@@ -473,8 +482,8 @@ pub fn poll_activity_request(
 pub fn terminate_request(
     req: crate::translate::TerminateWorkflowExecutionRequest,
     context: &EdgeContext,
+    now: OffsetDateTime,
 ) -> tokeira_kernel::TerminateRequest {
-    let now = OffsetDateTime::now_utc();
     tokeira_kernel::TerminateRequest {
         reason: req.reason,
         details: req.details,
@@ -493,8 +502,8 @@ pub fn terminate_request(
 pub fn pause_request(
     req: crate::translate::PauseWorkflowExecutionRequest,
     context: &EdgeContext,
+    now: OffsetDateTime,
 ) -> tokeira_kernel::PauseWorkflowRequest {
-    let now = OffsetDateTime::now_utc();
     // Prefer the client-supplied request_id so idempotent pause retries are
     // recognised by the kernel's request-id-gated pause check; fall back to the
     // edge-assigned request id when the client omits one.
@@ -518,8 +527,8 @@ pub fn pause_request(
 pub fn unpause_request(
     req: crate::translate::UnpauseWorkflowExecutionRequest,
     context: &EdgeContext,
+    now: OffsetDateTime,
 ) -> tokeira_kernel::UnpauseWorkflowRequest {
-    let now = OffsetDateTime::now_utc();
     let effective_request_id = req
         .request_id
         .filter(|id| !id.is_empty())
@@ -540,8 +549,8 @@ pub fn unpause_request(
 pub fn cancel_request(
     req: crate::translate::RequestCancelWorkflowExecutionRequest,
     context: &EdgeContext,
+    now: OffsetDateTime,
 ) -> tokeira_kernel::CancelRequest {
-    let now = OffsetDateTime::now_utc();
     tokeira_kernel::CancelRequest {
         reason: req.reason,
         external_initiator: None,
@@ -560,8 +569,11 @@ pub fn cancel_request(
     }
 }
 
-pub fn reset_request(req: ResetWorkflowExecutionRequest, context: &EdgeContext) -> ResetRequest {
-    let now = OffsetDateTime::now_utc();
+pub fn reset_request(
+    req: ResetWorkflowExecutionRequest,
+    context: &EdgeContext,
+    now: OffsetDateTime,
+) -> ResetRequest {
     ResetRequest {
         fork_event_id: req.workflow_task_finish_event_id,
         new_run_id: RunId::new(),
@@ -1001,7 +1013,12 @@ mod tests {
             messages: Vec::new(),
         };
 
-        let internal = workflow_task_completed_request(req, &edge_context("wft-complete")).unwrap();
+        let internal = workflow_task_completed_request(
+            req,
+            &edge_context("wft-complete"),
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
 
         assert_eq!(internal.token.shard_epoch, token.shard_epoch);
         assert_eq!(internal.token, token);
@@ -1015,7 +1032,7 @@ mod tests {
             build_id: "pinned-build".to_string(),
         });
 
-        let internal = start_request(dto, &edge_context("req"));
+        let internal = start_request(dto, &edge_context("req"), time::OffsetDateTime::now_utc());
 
         assert_eq!(
             internal.deployment,
@@ -1026,7 +1043,11 @@ mod tests {
 
     #[test]
     fn start_request_without_pinned_override_is_unversioned() {
-        let internal = start_request(start_dto(), &edge_context("req"));
+        let internal = start_request(
+            start_dto(),
+            &edge_context("req"),
+            time::OffsetDateTime::now_utc(),
+        );
 
         assert_eq!(internal.deployment, None);
         assert_eq!(internal.build_id, None);
@@ -1040,13 +1061,17 @@ mod tests {
             build_id: "eager-build".to_string(),
         });
 
-        let non_eager = start_request(dto.clone(), &edge_context("req"));
+        let non_eager = start_request(
+            dto.clone(),
+            &edge_context("req"),
+            time::OffsetDateTime::now_utc(),
+        );
         assert_eq!(non_eager.deployment, None);
         assert_eq!(non_eager.build_id, None);
         assert!(!non_eager.eager_execution_accepted);
 
         dto.request_eager_execution = true;
-        let eager = start_request(dto, &edge_context("req"));
+        let eager = start_request(dto, &edge_context("req"), time::OffsetDateTime::now_utc());
         assert_eq!(
             eager.deployment,
             Some(DeploymentId("eager-deployment".to_string()))
@@ -1092,7 +1117,7 @@ mod tests {
             fairness_weight: 1.5,
         });
 
-        let internal = start_request(dto, &edge_context("req"));
+        let internal = start_request(dto, &edge_context("req"), time::OffsetDateTime::now_utc());
 
         assert_eq!(
             internal.workflow_start_delay,
@@ -1152,7 +1177,11 @@ mod tests {
             now: Some(OffsetDateTime::UNIX_EPOCH),
         };
 
-        let internal = signal_request(dto, &edge_context("fallback"));
+        let internal = signal_request(
+            dto,
+            &edge_context("fallback"),
+            time::OffsetDateTime::now_utc(),
+        );
 
         assert_eq!(internal.header, Some(Headers(header)));
         assert_eq!(internal.links.len(), 1);
@@ -1196,7 +1225,7 @@ mod tests {
             dto.workflow_task_timeout = workflow_task_timeout;
             dto.retry_policy = retry_policy.clone();
 
-            let internal = start_request(dto, &edge_context("prop-start"));
+            let internal = start_request(dto, &edge_context("prop-start"), time::OffsetDateTime::now_utc());
 
             prop_assert_eq!(internal.input, input);
             prop_assert_eq!(internal.memo, memo);
@@ -1276,8 +1305,8 @@ mod tests {
             signal.workflow_task_timeout = workflow_task_timeout;
             signal.retry_policy = retry_policy;
 
-            let start_internal = start_request(start, &edge_context("prop-start"));
-            let signal_internal = signal_with_start_request(signal, &edge_context("prop-signal"));
+            let start_internal = start_request(start, &edge_context("prop-start"), time::OffsetDateTime::now_utc());
+            let signal_internal = signal_with_start_request(signal, &edge_context("prop-signal"), time::OffsetDateTime::now_utc());
 
             prop_assert_eq!(start_internal.workflow_type, signal_internal.workflow_type);
             prop_assert_eq!(start_internal.task_queue, signal_internal.task_queue);
@@ -1300,7 +1329,11 @@ mod tests {
 
     #[test]
     fn signal_with_start_without_pinned_override_is_unversioned() {
-        let internal = signal_with_start_request(signal_with_start_dto(), &edge_context("req"));
+        let internal = signal_with_start_request(
+            signal_with_start_dto(),
+            &edge_context("req"),
+            time::OffsetDateTime::now_utc(),
+        );
 
         assert_eq!(internal.deployment, None);
         assert_eq!(internal.build_id, None);

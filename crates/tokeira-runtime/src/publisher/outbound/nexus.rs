@@ -5,7 +5,6 @@
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Result, ensure};
-use time::OffsetDateTime;
 use tokeira_kernel::{
     Command, NexusCancellationAttemptOutcome, NexusCancellationAttemptedRequest,
     NexusCancellationRetryRequest, NexusOperationResolvedRequest, NexusOperationRetryRequest,
@@ -45,7 +44,7 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
             .find(|operation| operation.scheduled_event_id == row.incarnation.key.initiating_event)
             .cloned()
             .ok_or(RecoveryError::Obsolete)?;
-        let now = OffsetDateTime::now_utc();
+        let now = self.clock.now();
         // Invocation timeout precedence follows executeInvocationTask in
         // components/nexusoperations/executors.go @ v1.31.0. Discovery can be
         // delayed indefinitely without granting a new timeout anchor.
@@ -328,7 +327,7 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
             operation_id,
             scheduled_event_id,
             resolution,
-            now: OffsetDateTime::now_utc(),
+            now: self.clock.now(),
         });
         self.source_outcome(row, command, acquisition, owner)
             .await?;
@@ -415,7 +414,7 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
                 )
                 .await;
 
-                let now = OffsetDateTime::now_utc();
+                let now = self.clock.now();
                 let outcome = match result {
                     Ok(NexusCancelResult::Succeeded) => NexusCancellationAttemptOutcome::Succeeded,
                     Ok(NexusCancelResult::HandlerError {
@@ -500,7 +499,7 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
                 scheduled_event_id: pending.scheduled_event_id,
                 requested_event_id,
                 outcome,
-                now: OffsetDateTime::now_utc(),
+                now: self.clock.now(),
             }),
             acquisition,
             owner,

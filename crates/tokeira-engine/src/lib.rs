@@ -99,6 +99,7 @@ use tokeira_auth::{
     WorkerScopeRule, WorkerScopeRules,
 };
 use tokeira_chasm::Library as _;
+use tokeira_clock::{Clock, system_clock};
 use tokeira_config::{Cli, CliCommand, ConfigStorageKind, PeerCredentialCommand};
 pub use tokeira_config::{
     DsqlMigrationPolicy, EmbeddedEngineConfig, EmbeddedStorageConfig, SnapshotPolicyConfig,
@@ -279,10 +280,10 @@ use tokeira_runtime::{
     NexusNamespaceResolver, NexusWorkerComputeProvider, OBSERVATION_CHANNEL_CAPACITY,
     RECONCILE_CHANNEL_CAPACITY, RepositoryBackedTaskQueueConfigStore, RuntimeConfig,
     RuntimeShutdownHandle, ScheduleEngineConfig, ScheduleStore, SweepResult,
-    SystemWorkerComputeClock, TEMPORAL_CALLBACK_TOKEN_HEADER, TokeiraRuntime,
-    WorkerComputeControllerService, WorkerComputeOutbox, WorkerComputeReconciler,
-    WorkflowTaskReportedProblem, nexus_payload_to_body, reported_problem_from_state,
-    run_schedule_engine, system_callback_post_url,
+    TEMPORAL_CALLBACK_TOKEN_HEADER, TokeiraRuntime, WorkerComputeControllerService,
+    WorkerComputeOutbox, WorkerComputeReconciler, WorkflowTaskReportedProblem,
+    nexus_payload_to_body, reported_problem_from_state, run_schedule_engine,
+    system_callback_post_url,
 };
 use tokeira_storage::{
     ConnectionDirector, DbClass, InMemoryStore, InMemoryWorkerComputeRepository, LeaseOutcome,
@@ -2350,10 +2351,16 @@ impl TokeiradHandle {
     ///   that port.
     ///
     /// Snapshots are refused, because the caller owns the store.
+    ///
+    /// The node reads the time from `clock`: its runtime, edge and its handle
+    /// on `store` all stamp and judge deadlines on it. A simulation passes a
+    /// clock that follows its own time; every node sharing `store` should get
+    /// the same one.
     pub async fn start_in_memory_with_transport(
         store: InMemoryStore,
         transport: NodeTransport,
         mut config: TokeiraConfig,
+        clock: Arc<dyn Clock>,
     ) -> Result<Self> {
         config.infrastructure.storage = ConfigStorageKind::InMemory;
         config
@@ -2390,6 +2397,7 @@ impl TokeiradHandle {
             false,
             ChasmExtensions::default(),
             peer,
+            clock,
         )
         .await?;
         let ConstructedStack::Network((
@@ -3052,6 +3060,7 @@ async fn build_and_serve(
                 restored,
                 ChasmExtensions::default(),
                 peer,
+                system_clock(),
             )
             .await
         }
@@ -3236,6 +3245,8 @@ async fn build_dsql_stack(
         budget_applier,
         extensions,
         peer,
+        // DSQL stores judge their deadlines on the host's clock.
+        system_clock(),
     )
     .await
 }
@@ -3253,6 +3264,7 @@ async fn build_embedded(
         recover_self_assigned_shard,
         extensions,
         None,
+        system_clock(),
     )
     .await?
     {
@@ -3270,7 +3282,11 @@ async fn build_in_memory_stack(
     recover_self_assigned_shard: bool,
     extensions: ChasmExtensions,
     peer: Option<Arc<tokeira_edge::grpc::workflow_offer::PeerOfferEndpoint>>,
+    clock: Arc<dyn Clock>,
 ) -> Result<ConstructedStack> {
+    // Every handle on the store below is cloned from this one, so the store
+    // judges its deadlines on the node's clock.
+    let store = store.with_clock(clock.clone());
     let visibility_store = InMemoryVisibilityStore::default();
     let chasm_node_repo: Arc<dyn tokeira_storage::ChasmNodeRepository> =
         Arc::new(tokeira_storage::InMemoryChasmNodeStore::new());
@@ -3282,7 +3298,8 @@ async fn build_in_memory_stack(
     let worker_deployment_repository: Arc<dyn WorkerDeploymentRepository> = Arc::new(store.clone());
     let worker_task_provenance: Arc<dyn WorkerTaskProvenanceStore> = Arc::new(store.clone());
     let worker_compute_repository = effective_config.policy.worker_compute.enabled.then(|| {
-        Arc::new(InMemoryWorkerComputeRepository::default()) as Arc<dyn WorkerComputeRepository>
+        Arc::new(InMemoryWorkerComputeRepository::default().with_clock(clock.clone()))
+            as Arc<dyn WorkerComputeRepository>
     });
     build_service_stack_with_storage(
         transport,
@@ -3305,6 +3322,7 @@ async fn build_in_memory_stack(
         Arc::new(NoopConnectionBudgetApplier),
         extensions,
         peer,
+        clock,
     )
     .await
 }
@@ -3327,6 +3345,7 @@ fn spawn_worker_task_provenance_cleanup(
     tasks: &RuntimeShutdownHandle,
     store: Arc<dyn WorkerTaskProvenanceStore>,
     cancel: CancellationToken,
+    clock: Arc<dyn Clock>,
 ) -> JoinHandle<()> {
     tasks.spawn(async move {
         let mut interval = tokio::time::interval(WORKER_TASK_PROVENANCE_CLEANUP_INTERVAL);
@@ -3336,10 +3355,7 @@ fn spawn_worker_task_provenance_cleanup(
                 _ = cancel.cancelled() => break,
                 _ = interval.tick() => {
                     if let Err(error) = store
-                        .delete_expired(
-                            time::OffsetDateTime::now_utc(),
-                            WORKER_TASK_PROVENANCE_CLEANUP_BATCH,
-                        )
+                        .delete_expired(clock.now(), WORKER_TASK_PROVENANCE_CLEANUP_BATCH)
                         .await
                     {
                         tracing::warn!(
@@ -3494,6 +3510,7 @@ async fn build_service_stack_with_storage<R, L, S, V, F>(
     budget_applier: Arc<dyn ConnectionBudgetApplier>,
     extensions: ChasmExtensions,
     peer: Option<Arc<tokeira_edge::grpc::workflow_offer::PeerOfferEndpoint>>,
+    clock: Arc<dyn Clock>,
 ) -> Result<ConstructedStack>
 where
     R: LeaseRepository + RunRepository + 'static,
@@ -3714,6 +3731,7 @@ where
         Some(Arc::new(CacheNexusNamespaceResolver {
             namespaces: namespaces.clone(),
         }) as Arc<dyn NexusNamespaceResolver>),
+        clock.clone(),
     )
     // The edge always exposes Worker Deployment v2 RPCs. Wiring the
     // repository here keeps their registry durable for both in-memory and
@@ -3807,6 +3825,7 @@ where
         &engine_tasks,
         worker_task_provenance.clone(),
         background_cancel.clone(),
+        clock.clone(),
     );
 
     let _worker_compute_service = if effective_config.policy.worker_compute.enabled {
@@ -3834,7 +3853,6 @@ where
                 reconcile_sender,
             )));
 
-        let clock = Arc::new(SystemWorkerComputeClock);
         let catalog = Arc::new(WorkerComputeNamespaceCatalogAdapter::new(
             namespaces.clone(),
         ));
@@ -3864,7 +3882,7 @@ where
             reconciler,
             sampler,
             outbox,
-            clock,
+            clock.clone(),
             active_shards,
             observation_receiver,
             reconcile_receiver,
@@ -3909,11 +3927,14 @@ where
     let _schedule_engine = engine_tasks.track_join(schedule_engine);
 
     let authorization = build_authorization_stack(&effective_config).await?;
-    let interceptors = Arc::new(EdgeInterceptors::configured(
-        namespaces.clone(),
-        authorization.grpc,
-        authorization.principal_attribution,
-    ));
+    let interceptors = Arc::new(
+        EdgeInterceptors::configured(
+            namespaces.clone(),
+            authorization.grpc,
+            authorization.principal_attribution,
+        )
+        .with_clock(clock.clone()),
+    );
     let router: Arc<dyn tokeira_edge::EdgeRouter> = if let Some(controller_endpoint) =
         effective_config
             .infrastructure
@@ -4108,14 +4129,16 @@ where
             Some(wrap) => wrap(production_nexus_authorizer),
             None => production_nexus_authorizer,
         };
-    let nexus_http_layer =
-        NexusHttpLayer::new(Arc::new(tokeira_edge::nexus_http::NexusHttpHandler::new(
+    let nexus_http_layer = NexusHttpLayer::new(Arc::new(
+        tokeira_edge::nexus_http::NexusHttpHandler::new(
             namespaces.clone(),
             nexus_store,
             nexus_task_broker,
             nexus_http_waiters,
             nexus_http_authorizer,
-        )));
+        )
+        .with_clock(clock.clone()),
+    ));
     let http_api_layer = HttpApiLayer::new(
         HttpApiCatalog::pinned().context("failed to build Temporal HTTP API route catalog")?,
         HttpApiPolicy::new(
@@ -4171,9 +4194,13 @@ where
             multiplexer.clone(),
             chasm_visibility_sink,
         );
-        if let Some(clock) = extensions.clock {
-            chasm_engine = chasm_engine.with_clock(clock);
-        }
+        // An embedder's CHASM clock wins; otherwise CHASM reads the node's clock
+        // in the Unix nanoseconds its timers are stamped with.
+        let chasm_clock = extensions.clock.unwrap_or_else(|| {
+            let clock = clock.clone();
+            Arc::new(move || i64::try_from(clock.now().unix_timestamp_nanos()).unwrap_or(i64::MAX))
+        });
+        chasm_engine = chasm_engine.with_clock(chasm_clock);
         let chasm_engine = Arc::new(chasm_engine);
         let activity_config = tokeira_chasm_activity::ActivityConfig {
             enable_standalone: effective_config
@@ -6485,6 +6512,7 @@ mod tests {
             "127.0.0.1:7233".to_owned(),
             false,
             None,
+            system_clock(),
         ))
     }
 

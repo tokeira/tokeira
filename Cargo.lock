@@ -8728,6 +8728,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokeira-clock"
+version = "0.7.0"
+dependencies = [
+ "time",
+]
+
+[[package]]
 name = "tokeira-compatibility"
 version = "0.7.0"
 dependencies = [
@@ -9053,6 +9060,7 @@ dependencies = [
  "tokeira-build-info",
  "tokeira-chasm",
  "tokeira-chasm-activity",
+ "tokeira-clock",
  "tokeira-compatibility",
  "tokeira-conformance",
  "tokeira-kernel",
@@ -9133,6 +9141,7 @@ dependencies = [
  "tokeira-chasm",
  "tokeira-chasm-activity",
  "tokeira-chasm-derive",
+ "tokeira-clock",
  "tokeira-config",
  "tokeira-edge",
  "tokeira-kernel",
@@ -9433,6 +9442,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokeira-chasm",
+ "tokeira-clock",
  "tokeira-conformance",
  "tokeira-kernel",
  "tokeira-observability",
@@ -9506,6 +9516,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokeira-chasm",
+ "tokeira-clock",
  "tokeira-kernel",
  "tokeira-observability",
  "tokeira-types",

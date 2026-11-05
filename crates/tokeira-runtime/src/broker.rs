@@ -54,6 +54,7 @@ use std::{
 
 use anyhow::Result;
 use time::OffsetDateTime;
+use tokeira_clock::{Clock, system_clock};
 use tokeira_storage::{DeliveryOrder, DispatchableActivityTask, DispatchableWorkflowTask};
 use tokeira_types::{
     LogicalTaskSeq, NamespaceId, QueueKey, RunKey, TaskQueueName, WorkerComputeQueueKey,
@@ -92,6 +93,9 @@ pub struct InMemoryBroker {
     policy: Arc<BrokerPolicy>,
     queue_homes: Option<Arc<dyn QueueHomeProvider>>,
     capacity_changed: Arc<Notify>,
+    /// Judges sticky-query deadlines and backlog age. It must be the clock the
+    /// runtime stamps those deadlines and `scheduled_at` with.
+    clock: Arc<dyn Clock>,
 }
 
 // Manual impl: summarizes without taking the interior lock — a `Debug` that
@@ -400,6 +404,7 @@ impl Default for InMemoryBroker {
             policy: Arc::new(BrokerPolicy::default()),
             queue_homes: None,
             capacity_changed: Arc::new(Notify::new()),
+            clock: system_clock(),
         }
     }
 }
@@ -658,6 +663,13 @@ impl InMemoryBroker {
         }
     }
 
+    /// Read deadlines through `clock`. Set before the broker is cloned: each
+    /// clone keeps the clock it was cloned with.
+    pub(crate) fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
     fn forget_offers(inner: &mut BrokerState, keys: &[OfferKey]) {
         if keys.is_empty() {
             return;
@@ -834,7 +846,7 @@ impl InMemoryBroker {
                 task.task
                     .order
                     .map_or(3, |order| i32::from(order.priority_key)),
-                (OffsetDateTime::now_utc() - task.scheduled_at)
+                (self.clock.now() - task.scheduled_at)
                     .try_into()
                     .unwrap_or_default(),
             );
@@ -894,7 +906,7 @@ impl InMemoryBroker {
                 task.task
                     .order
                     .map_or(3, |order| i32::from(order.priority_key)),
-                (OffsetDateTime::now_utc() - task.scheduled_at)
+                (self.clock.now() - task.scheduled_at)
                     .try_into()
                     .unwrap_or_default(),
             );
@@ -1388,7 +1400,7 @@ impl InMemoryBroker {
         let timestamped = TimestampedWorkflowTask {
             task,
             entered_at: now,
-            scheduled_at: scheduled_at.unwrap_or_else(OffsetDateTime::now_utc),
+            scheduled_at: scheduled_at.unwrap_or_else(|| self.clock.now()),
         };
 
         if timestamped.task.sticky_preferred.is_some() {
@@ -1634,7 +1646,12 @@ impl InMemoryBroker {
     }
 
     async fn try_take_query(&self, queue: &QueueKey, worker: &WorkerIdentity) -> Option<QueryTask> {
-        Self::take_query_locked(&mut *self.inner.lock().await, queue, worker)
+        Self::take_query_locked(
+            &mut *self.inner.lock().await,
+            queue,
+            worker,
+            self.clock.now(),
+        )
     }
 
     /// A direct query for the poll holding waiter `waiter_id`, taken only while
@@ -1651,7 +1668,7 @@ impl InMemoryBroker {
         if !Self::waiter_registered(&inner, queue, waiter_id) {
             return None;
         }
-        let task = Self::take_query_locked(&mut inner, queue, worker)?;
+        let task = Self::take_query_locked(&mut inner, queue, worker, self.clock.now())?;
         Self::deregister_waiter_locked(&mut inner, queue, normal_queue, waiter_id);
         Some(task)
     }
@@ -1660,13 +1677,13 @@ impl InMemoryBroker {
         inner: &mut BrokerState,
         queue: &QueueKey,
         worker: &WorkerIdentity,
+        now: OffsetDateTime,
     ) -> Option<QueryTask> {
         // Expire sticky preferences FIRST: past the sticky deadline v1.31.0
         // abandons the sticky attempt and re-dispatches on the normal queue
         // with full history (queryworkflow/api.go:355-385) — even the
         // preferred worker must then receive the task as a NON-sticky
         // delivery (its cache may be gone; empty history would strand it).
-        let now = OffsetDateTime::now_utc();
         for ready in inner.query_ready.values_mut() {
             for task in ready.iter_mut() {
                 if task.sticky_deadline.is_some_and(|deadline| deadline <= now) {
@@ -1728,7 +1745,7 @@ impl InMemoryBroker {
     /// published to wake the broker.
     async fn query_fallback_wait(&self, queue: &QueueKey) -> Option<Duration> {
         let inner = self.inner.lock().await;
-        let now = OffsetDateTime::now_utc();
+        let now = self.clock.now();
         inner
             .query_ready
             .get(queue)?

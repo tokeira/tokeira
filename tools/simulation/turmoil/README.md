@@ -79,6 +79,49 @@ run tried before the harness staged startup ended with one node owning all four.
 So the previous generation holds every lease until both nodes have registered, then hands
 them back. The controller's next placement splits the bundles two and two.
 
+## What step three does
+
+Step three runs a workflow timer in simulated time ([`src/timer.rs`](src/timer.rs)).
+
+This step adds a production crate, `tokeira-clock`, which storage, the runtime, the edge
+and the engine depend on. It gives the engine one clock to read. A node gets it from
+`TokeiradHandle::start_in_memory_with_transport` and passes it to its runtime, its edge
+and its handle on the store. Deadlines are stamped and judged on that clock, so timers,
+timeouts, retries and backoffs come due on it. Production passes the host's clock.
+
+The spike passes `SimClock`, which reads turmoil's simulated time from a fixed epoch,
+2026-01-01T00:00:00Z. Without the fixed start, every run would stamp different times. The
+nodes in steps two and three use `SimClock`, and so does the controller's handle on the
+shared store. Step one's embedded `Engine` takes no clock, so it still reads the host's.
+
+Two hosts run in step three. `node` is one piped node with no controller, which owns its
+single bundle. `worker` runs this script:
+
+1. Start a workflow.
+2. Answer the first workflow task with a 60-second timer.
+3. Wait for the workflow task the timer causes, then complete the workflow.
+4. Read the history.
+
+The run checks the history's own times. The timer must fire no sooner than 60 seconds
+after it started. The node's firing stamp must be no later than the moment the worker
+received the task that firing caused. If both hold, the node's clock is the simulation's.
+
+The run takes about a second and a half of real time. These lines are from its trace for
+seed 42:
+
+```text
+    148 ms  started a 60-second timer
+  60202 ms  workflow task 1 received
+  60267 ms  history event 5 stamped 123 ms: EVENT_TYPE_TIMER_STARTED
+  60267 ms  history event 6 stamped 60200 ms: EVENT_TYPE_TIMER_FIRED
+```
+
+The left column is when the worker saw each line. "Stamped" is the time the node wrote on
+the event. Both count simulated milliseconds from the epoch. The timer was due at
+60 123 ms, and the timer scanner, which runs every 200 ms, fired it at 60 200 ms. The tests
+in [`tests/timer.rs`](tests/timer.rs) check that the workflow completes, and that one
+seed gives the same trace twice, history event times included.
+
 ## Running it
 
 From this directory:
@@ -99,13 +142,23 @@ cargo run -- 42
 
 This one prints the step-one trace for seed 42.
 
+```bash
+cargo run -- 42 timer
+```
+
+This one prints the step-three trace.
+
 ## Limits
 
-- **No timers, retries or backoffs.** The engine reads the wall clock to decide whether
-  something is due, and turmoil moves only tokio's clock. A workflow that waits on a timer
-  would wait on real time. Fixing that needs a clock seam the simulation can drive.
-- **Heartbeat faults wait on the same seam.** The controller times node heartbeats with
-  `std::time::Instant`, which turmoil does not move.
+- **Step one runs no timers.** Its embedded `Engine` reads the host's clock, so a timer
+  there would wait on real time. Steps two and three run on `SimClock`.
+- **Some times stay on the host's clock.** These include fairness snapshots, membership
+  budgets, peer tokens and health reports. Each is stamped and judged on host clocks only,
+  or never judged at all. The full list is in
+  [the clock crate's page](../../../docs/crates/clock.md#what-stays-on-the-hosts-clock).
+- **Controller heartbeat faults are not reachable yet.** The controller times node
+  heartbeats with `std::time::Instant`, which turmoil does not move. So a node's heartbeat
+  cannot lapse in simulated time until the controller reads a simulated clock too.
 - **Two-node runs are not yet replayable.** Node incarnation ids are random UUIDs, and the
   controller orders nodes by id. A seed always gives a two-and-two split, but which
   bundles land on which node can differ between runs, and so can the queue and workflow the

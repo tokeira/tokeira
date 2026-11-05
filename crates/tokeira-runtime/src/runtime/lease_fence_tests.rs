@@ -42,6 +42,7 @@ pub(super) fn fenced_runtime(store: Arc<InMemoryStore>) -> Arc<TokeiraRuntime<In
         "127.0.0.1:7233".to_owned(),
         false,
         None,
+        tokeira_clock::system_clock(),
     ))
 }
 

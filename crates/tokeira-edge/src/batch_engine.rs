@@ -6,7 +6,6 @@
 
 use std::sync::{Arc, atomic::Ordering};
 
-use time::OffsetDateTime;
 use tokeira_runtime::{
     BatchOperationParams, BatchOperationState, BatchOperationStore, BatchResetTarget, JobId,
     WorkflowExecutionRef,
@@ -30,6 +29,7 @@ pub async fn run_batch_operation(
     job_id: JobId,
     cancellation_token: CancellationToken,
 ) {
+    let clock = service.clock().clone();
     let result = run_batch_operation_inner(
         store.clone(),
         service,
@@ -45,12 +45,7 @@ pub async fn run_batch_operation(
     } else {
         BatchOperationState::Failed
     };
-    let _ = store.set_state(
-        namespace_id,
-        &job_id,
-        state,
-        Some(OffsetDateTime::now_utc()),
-    );
+    let _ = store.set_state(namespace_id, &job_id, state, Some(clock.now()));
 }
 
 async fn run_batch_operation_inner(

@@ -38,7 +38,8 @@
 //!   seed, so these runs are not yet replayable.
 //! - The controller times node heartbeats with `std::time::Instant`, which
 //!   turmoil does not move. Faults that depend on a node's heartbeat lapsing
-//!   need the clock seam first.
+//!   at the controller need the controller on simulated time too. The nodes
+//!   and every store handle already read [`SimClock`].
 
 use std::{
     collections::BTreeSet,
@@ -97,7 +98,9 @@ use tonic::{
 };
 use turmoil::net::TcpListener;
 
-use crate::{IDENTITY, NAMESPACE, PORT, Trace, observe, text_payloads, turmoil_connector};
+use crate::{
+    IDENTITY, NAMESPACE, PORT, SimClock, Trace, epoch, observe, text_payloads, turmoil_connector,
+};
 
 /// Simulated host name of the placement controller.
 pub const CONTROLLER: &str = "controller";
@@ -174,6 +177,7 @@ pub fn run_two_node_activity_workflow(
     let mut builder = turmoil::Builder::new();
     builder
         .rng_seed(seed)
+        .epoch(epoch())
         .simulation_duration(SIMULATION_DURATION);
     let mut sim = builder.build();
     // Each node adds one permit once it has started.
@@ -186,7 +190,12 @@ pub fn run_two_node_activity_workflow(
     let controller_store = store.clone();
     let nodes_started = Arc::clone(&started);
     sim.host(CONTROLLER, move || {
-        serve_controller(controller_store.clone(), Arc::clone(&nodes_started))
+        // The controller judges leases the nodes renew, so its handle on the
+        // shared store reads the same simulated time theirs do.
+        serve_controller(
+            controller_store.clone().with_clock(Arc::new(SimClock)),
+            Arc::clone(&nodes_started),
+        )
     });
     for node in NODES {
         let node_store = store.clone();
@@ -340,13 +349,34 @@ async fn hand_back_once_nodes_start(
     }
 }
 
-/// An engine node host's software: listen on [`PORT`], start the node, then
-/// hand every accepted connection to it as an in-memory pipe.
+/// An engine node host's software in the cluster: a piped node that reaches
+/// the controller.
 async fn serve_node(
     host: &'static str,
     store: InMemoryStore,
     peer_file: PathBuf,
     started: Arc<Semaphore>,
+) -> Result<(), Box<dyn Error>> {
+    serve_piped_node(
+        store,
+        node_config(host, &peer_file)?,
+        Some(controller_connection()),
+        || started.add_permits(1),
+    )
+    .await
+}
+
+/// Listen on [`PORT`], start a node on `store` that reads [`SimClock`], call
+/// `started`, then hand every accepted connection to the node as an
+/// in-memory pipe.
+///
+/// `controller` must be set exactly when `config` names a controller, as
+/// [`TokeiradHandle::start_in_memory_with_transport`] requires.
+pub(crate) async fn serve_piped_node(
+    store: InMemoryStore,
+    config: TokeiraConfig,
+    controller: Option<SharedHttp2Connection>,
+    started: impl FnOnce(),
 ) -> Result<(), Box<dyn Error>> {
     // Bound before the node starts, so a peer that learns this node's address
     // from the controller never finds the port closed.
@@ -355,16 +385,17 @@ async fn serve_node(
     let transport = NodeTransport {
         incoming,
         peers: peer_connector(),
-        controller: Some(controller_connection()),
+        controller,
     };
     // Dropping the handle stops the node, so it lives as long as the host.
     let _node = TokeiradHandle::start_in_memory_with_transport(
         store,
         transport,
-        node_config(host, &peer_file)?,
+        config,
+        Arc::new(SimClock),
     )
     .await?;
-    started.add_permits(1);
+    started();
     loop {
         let (mut stream, _) = listener.accept().await?;
         let (node_end, mut host_end) = tokio::io::duplex(PIPE_BUFFER);

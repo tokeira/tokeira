@@ -124,8 +124,11 @@ pub(crate) fn terminating_breach(
 /// `history-service` identity (`forceTerminateWorkflow`, context.go:1115-1155;
 /// `respondworkflowtaskcompleted/api.go:655-662 @ v1.31.0`). A run is
 /// terminated once, so its key makes the request id.
-pub(crate) fn terminate_command(run_key: RunKey, breach: &RunLimitExceeded) -> Command {
-    let now = OffsetDateTime::now_utc();
+pub(crate) fn terminate_command(
+    run_key: RunKey,
+    breach: &RunLimitExceeded,
+    now: OffsetDateTime,
+) -> Command {
     let details =
         (breach.limit == RunLimit::TransactionSize).then(|| json_string_payloads(&breach.message));
     Command::Terminate(TerminateRequest {
@@ -254,18 +257,22 @@ mod tests {
     #[test]
     fn the_terminate_carries_v1_31_0_s_reason_details_and_identity() {
         let run_key = RunKey::new();
-        let Command::Terminate(size) =
-            terminate_command(run_key, &RunLimitExceeded::of(RunLimit::HistorySize))
-        else {
+        let Command::Terminate(size) = terminate_command(
+            run_key,
+            &RunLimitExceeded::of(RunLimit::HistorySize),
+            OffsetDateTime::now_utc(),
+        ) else {
             panic!("expected a terminate");
         };
         assert_eq!(size.reason, "Workflow history size exceeds limit.");
         assert_eq!(size.details, None);
         assert_eq!(size.identity, "history-service");
 
-        let Command::Terminate(batch) =
-            terminate_command(run_key, &RunLimitExceeded::transaction_size(5, 4))
-        else {
+        let Command::Terminate(batch) = terminate_command(
+            run_key,
+            &RunLimitExceeded::transaction_size(5, 4),
+            OffsetDateTime::now_utc(),
+        ) else {
             panic!("expected a terminate");
         };
         assert_eq!(batch.reason, "Transaction size exceeds limit.");

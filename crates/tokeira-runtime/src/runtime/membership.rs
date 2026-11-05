@@ -556,6 +556,7 @@ mod tests {
             endpoint.as_authority(),
             false,
             None,
+            tokeira_clock::system_clock(),
         ));
         let client = MembershipClient::new(
             MembershipConfig {

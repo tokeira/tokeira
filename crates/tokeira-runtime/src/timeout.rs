@@ -25,6 +25,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use time::{Duration, OffsetDateTime};
+use tokeira_clock::Clock;
 use tokeira_kernel::{Command, RetryState, WorkflowExecutionTimedOutRequest, WorkflowTimeoutType};
 use tokeira_types::{RunKey, ShardId};
 use tokio_util::sync::CancellationToken;
@@ -302,10 +303,10 @@ pub(crate) async fn run_workflow_timeout_scanner<R: tokeira_storage::RunReposito
     shard_owner: Arc<RwLock<ShardOwner>>,
     config: WorkflowTimeoutScannerConfig,
     cancel: CancellationToken,
+    clock: Arc<dyn Clock>,
 ) {
     loop {
-        let delay =
-            workflow_timeout_scan_delay(&tracking, OffsetDateTime::now_utc(), config.scan_interval);
+        let delay = workflow_timeout_scan_delay(&tracking, clock.now(), config.scan_interval);
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = tokio::time::sleep(delay) => {}
@@ -322,7 +323,7 @@ pub(crate) async fn run_workflow_timeout_scanner<R: tokeira_storage::RunReposito
                 &tracking,
                 Some(shard_id),
                 &config,
-                OffsetDateTime::now_utc(),
+                clock.now(),
                 |entry, violation, now| {
                     runtime_metrics::record_scanner_dispatched("workflow_timeout", shard_id.0);
                     submit_workflow_timeout(

@@ -25,6 +25,7 @@ use time::{Duration, OffsetDateTime};
 use tokeira_auth::{
     Access, Authorizer, AuthzDecision, CallClassification, CallTarget, ClaimMapper, Scope,
 };
+use tokeira_clock::{Clock, system_clock};
 use tokeira_proto::{
     conversions::common::payload_to_domain,
     public::temporal::api::{
@@ -401,6 +402,9 @@ pub struct NexusHttpHandler {
     broker: NexusTaskBroker,
     waiters: NexusHttpWaiterRegistry,
     authorizer: Arc<dyn NexusHttpAuthorizer>,
+    /// Stamps each request's dispatch deadline and judges the wait for it; the
+    /// runtime's clock, which also judges the deadline at the worker.
+    clock: Arc<dyn Clock>,
 }
 
 impl std::fmt::Debug for NexusHttpHandler {
@@ -427,7 +431,15 @@ impl NexusHttpHandler {
             broker,
             waiters,
             authorizer,
+            clock: system_clock(),
         }
+    }
+
+    /// Read the time from `clock` instead of the system clock. Pass the
+    /// runtime's clock.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Whether `path` belongs to a caller-facing Nexus route rather than tonic.
@@ -446,7 +458,7 @@ impl NexusHttpHandler {
     /// Process one caller-facing Nexus HTTP request through the complete
     /// v1.31.0 admission, dispatch, and response lifecycle.
     pub async fn handle(&self, request: NexusHttpRequest) -> NexusHttpResponse {
-        let request_started = OffsetDateTime::now_utc();
+        let request_started = self.clock.now();
         let metric_started = Instant::now();
 
         let preprocessed = match self.preprocess(&request.path).await {
@@ -609,7 +621,7 @@ impl NexusHttpHandler {
         let dispatch_deadline = dispatch_deadline(
             request_started,
             operation.request_timeout(),
-            OffsetDateTime::now_utc(),
+            self.clock.now(),
         );
         worker_request.dispatch_deadline = dispatch_deadline;
         let mut waiter = self.waiters.register();
@@ -622,7 +634,7 @@ impl NexusHttpHandler {
                 NexusTaskRequest::Http(worker_request),
             )
             .await;
-        let wait_for = (dispatch_deadline - OffsetDateTime::now_utc())
+        let wait_for = (dispatch_deadline - self.clock.now())
             .max(Duration::ZERO)
             .try_into()
             .unwrap_or(StdDuration::ZERO);

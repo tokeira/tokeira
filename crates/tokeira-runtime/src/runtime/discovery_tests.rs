@@ -31,6 +31,7 @@ pub(super) fn runtime(
         "127.0.0.1:0".into(),
         false,
         None,
+        tokeira_clock::system_clock(),
     );
     {
         let mut owner = runtime.shard_owner.write().unwrap();

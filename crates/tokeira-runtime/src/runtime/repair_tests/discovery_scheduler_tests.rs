@@ -70,6 +70,7 @@ proptest! {
                 crate::activity_discovery::ActivityDiscovery {
                     source: Arc::new(crate::activity_discovery::ActivitySource { repo: repo.clone(), registry: Arc::new(RwLock::new(None)), owner }),
                     registry: activity, broker: InMemoryActivityBroker::with_discovery(homes),
+                    clock: tokeira_clock::system_clock(),
                 }, cancel.clone(),
             ));
             let mut held = VecDeque::new();

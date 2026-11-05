@@ -23,7 +23,7 @@ proptest! {
             let kernel = MockKernel::new(SmallVec::new()).with_noop();
             let updates = UpdateRegistry::new();
             let mut admission = None;
-            let pending = handle_message_with_cache(&kernel, &repo, &owner, &updates, run, sample_command("noop"), 1, &mut cache, &mut admission);
+            let pending = handle_message_with_cache(&kernel, &repo, &owner, &updates, run, sample_command("noop"), 1, &mut cache, &mut admission, &SystemClock);
             tokio::pin!(pending);
             tokio::select! {
                 biased;

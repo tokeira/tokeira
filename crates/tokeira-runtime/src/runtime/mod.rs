@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::{Result, anyhow};
 use smallvec::{SmallVec, smallvec};
 use time::{Duration, OffsetDateTime};
+use tokeira_clock::{Clock, system_clock};
 use tokeira_kernel::{
     ActivityControlTarget, ActivityOp, ActivityResolution, ActivityResolvedRequest,
     ActivityRetryPolicyPatch, BasicKernel, Command, CronContinuation, DispatchOp, FieldChange,
@@ -346,6 +347,9 @@ pub struct TokeiraRuntime<R> {
     runtime_shutdown: RuntimeShutdownHandle,
     /// Finishes the purges of deleted runs and abandoned materializations.
     purger: crate::purge::RunPurger,
+    /// The clock every deadline this runtime stamps or judges is read from:
+    /// lanes, brokers, publishers and scanners all hold this one.
+    clock: Arc<dyn Clock>,
 }
 
 // Manual impl: the runtime root aggregates trait-object stores and the
@@ -728,6 +732,7 @@ where
             "127.0.0.1:0".to_owned(),
             seed_default_shard,
             None,
+            system_clock(),
         )
     }
 
@@ -754,6 +759,9 @@ where
         // Resolves originator namespace names for the External-endpoint outbound metric;
         // wired by the server bootstrap, `None` for the simpler constructors and tests.
         namespace_resolver: Option<Arc<dyn NexusNamespaceResolver>>,
+        // The clock deadlines are stamped and judged by. The simpler constructors
+        // pass the system clock; a simulation passes one that follows its own time.
+        clock: Arc<dyn Clock>,
     ) -> Self {
         assert!(
             repo.placement_ready() && repo.outbound_ready(),
@@ -765,7 +773,7 @@ where
             owner: shard_owner.clone(),
             counts: RwLock::new((shard_count, shard_count)),
         });
-        let broker = InMemoryBroker::with_discovery(homes.clone());
+        let broker = InMemoryBroker::with_discovery(homes.clone()).with_clock(clock.clone());
         let activity_broker = InMemoryActivityBroker::with_discovery(homes.clone());
         let activity_discovery = crate::activity_discovery::ActivityDiscoveryRegistry::default();
         let discovery = (crate::discovery::DiscoveryRegistry::default(), homes);
@@ -822,6 +830,7 @@ where
         wft_timeout_tracking.set_speculative(crate::speculative_timer::SpeculativeTimerSet::new(
             shared_lanes.clone(),
             lane_count,
+            clock.clone(),
         ));
         #[cfg(test)]
         let publication_failure = Arc::new(Mutex::new(None));
@@ -846,7 +855,8 @@ where
                 )
                 .with_outbound_wake(outbound_wake.clone())
                 .with_namespace_resolver(namespace_resolver.clone())
-                .with_worker_deployment_registry(worker_deployment_registry.clone());
+                .with_worker_deployment_registry(worker_deployment_registry.clone())
+                .with_clock(clock.clone());
                 #[cfg(test)]
                 let publisher = {
                     let mut publisher = publisher;
@@ -866,6 +876,7 @@ where
                     update_registry.clone(),
                     close_attempt_tracking.clone(),
                     config.clone(),
+                    clock.clone(),
                 )
             })
             .collect();
@@ -891,6 +902,7 @@ where
             shard_owner.clone(),
             timer_config,
             timer_scanner_cancel.clone(),
+            clock.clone(),
         )));
         let workflow_timeout_scanner_cancel = CancellationToken::new();
         runtime_shutdown.register_cancellation(workflow_timeout_scanner_cancel.clone());
@@ -903,6 +915,7 @@ where
                 shard_owner.clone(),
                 workflow_timeout_config,
                 workflow_timeout_scanner_cancel.clone(),
+                clock.clone(),
             )));
         let wft_timeout_scanner_cancel = CancellationToken::new();
         runtime_shutdown.register_cancellation(wft_timeout_scanner_cancel.clone());
@@ -913,6 +926,7 @@ where
             shard_owner.clone(),
             WftTimeoutScannerConfig::default(),
             wft_timeout_scanner_cancel.clone(),
+            clock.clone(),
         )));
         let activity_timeout_scanner_cancel = CancellationToken::new();
         runtime_shutdown.register_cancellation(activity_timeout_scanner_cancel.clone());
@@ -928,6 +942,7 @@ where
                     tracking: activity_tracking.clone(),
                     worker_deployment_registry: worker_deployment_registry.clone(),
                     lanes: lanes.clone(),
+                    clock: clock.clone(),
                 },
                 lanes.clone(),
                 lane_count,
@@ -952,6 +967,7 @@ where
         let heartbeat_maintenance_task = spawn_heartbeat_maintenance(
             heartbeat_store.clone(),
             heartbeat_maintenance_cancel.clone(),
+            clock.clone(),
         );
         let heartbeat_maintenance_handle = Some(runtime_shutdown.spawn(async move {
             let _ = heartbeat_maintenance_task.await;
@@ -966,6 +982,7 @@ where
             shard_owner.clone(),
             nexus_timeout_config,
             nexus_timeout_scanner_cancel.clone(),
+            clock.clone(),
         )));
         // The completion-callback scanner re-fires `BackingOff` callbacks. It reuses the
         // publisher's delivery path, so it gets its own publisher handle (mirrors how the
@@ -988,7 +1005,8 @@ where
         )
         .with_outbound_wake(outbound_wake.clone())
         .with_namespace_resolver(namespace_resolver.clone())
-        .with_worker_deployment_registry(worker_deployment_registry.clone());
+        .with_worker_deployment_registry(worker_deployment_registry.clone())
+        .with_clock(clock.clone());
         #[cfg(test)]
         let completion_scanner_publisher = {
             let mut publisher = completion_scanner_publisher;
@@ -1034,6 +1052,7 @@ where
                     }),
                     registry: activity_discovery.clone(),
                     broker: activity_broker.clone(),
+                    clock: clock.clone(),
                 },
                 cancel,
             ));
@@ -1098,11 +1117,19 @@ where
             worker_deployment_repository: None,
             worker_deployment_registry,
             purger,
+            clock,
         };
         if needs_recovery {
             runtime.start_seeded_recovery(startup_tx);
         }
         runtime
+    }
+
+    /// The clock this runtime stamps and judges deadlines with. The edge and
+    /// the engine's other stores must share it, so a deadline stamped by one
+    /// is judged by the same clock in another.
+    pub fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
     }
 
     /// Attach the placement-aware transport before network polls are accepted.
@@ -1185,10 +1212,11 @@ where
             .worker_deployment_registry
             .write()
             .expect("worker deployment registry lock poisoned") =
-            Some(DeploymentRegistry::with_repositories(
+            Some(DeploymentRegistry::with_clock_and_repositories(
                 repository.clone(),
                 self.repo.clone(),
                 self.worker_registry.clone(),
+                self.clock.clone(),
             ));
         self.worker_deployment_repository = Some(repository);
         self
@@ -1357,7 +1385,7 @@ where
                                 && let Some(task) = source.resolve(&row).await?
                                 && task.queue == *queue
                             {
-                                add_dispatch_stat(stats, &row);
+                                add_dispatch_stat(stats, &row, self.clock.now());
                             }
                         }
                         if keys.len() < limit.get() as usize {
@@ -1395,7 +1423,7 @@ where
                                 && let Some(task) = source.resolve(row).await?
                                 && task.queue == *queue
                             {
-                                add_dispatch_stat(stats, row);
+                                add_dispatch_stat(stats, row, self.clock.now());
                             }
                         }
                         if page.exhausted {
@@ -1427,7 +1455,7 @@ where
             namespace_id: queue.namespace_id,
             queue_name: queue.task_queue.clone(),
         };
-        let now = OffsetDateTime::now_utc();
+        let now = self.clock.now();
         // Matching counts persisted work, including offers handed out but not
         // started (service/matching/backlog_manager.go:200-207 @ v1.31.0). Future rows
         // still represent history timers there. Keep this observation bounded
@@ -1576,7 +1604,7 @@ where
             WorkerVersionMetadata {
                 deployment,
                 build_id,
-                last_seen_at: Some(OffsetDateTime::now_utc()),
+                last_seen_at: Some(self.clock.now()),
             },
         );
     }
@@ -2121,8 +2149,9 @@ pub struct ResetActivitiesRequest {
 fn add_dispatch_stat(
     stats: &mut crate::PriorityBacklogStats,
     row: &tokeira_storage::WorkflowDispatchRow,
+    now: OffsetDateTime,
 ) {
-    let age = (OffsetDateTime::now_utc() - row.scheduled_at)
+    let age = (now - row.scheduled_at)
         .try_into()
         .unwrap_or(std::time::Duration::ZERO);
     let band = stats.entry(i32::from(row.priority_key)).or_default();
@@ -2919,6 +2948,7 @@ pub(crate) mod tests {
                 "127.0.0.1:7233".to_owned(),
                 true,
                 None,
+                tokeira_clock::system_clock(),
             );
 
             assert_eq!(runtime.owner_identity(), node_id.to_string());
@@ -3715,7 +3745,7 @@ pub(crate) mod tests {
                     max_timers_per_scan: 500,
                 };
 
-                scan_due_timers_once(&repo, &config, move |due, fired_at| {
+                scan_due_timers_once(&repo, &config, OffsetDateTime::now_utc(), move |due, fired_at| {
                     let captured = captured_clone.clone();
                     async move {
                         captured.lock().expect("captured lock poisoned").push((
@@ -3754,7 +3784,7 @@ pub(crate) mod tests {
                     scan_interval: tokio::time::Duration::from_millis(1),
                     max_timers_per_scan: limit,
                 };
-                scan_due_timers_once(&repo, &config, |_due, _fired_at| async move { Ok(()) }).await;
+                scan_due_timers_once(&repo, &config, OffsetDateTime::now_utc(), |_due, _fired_at| async move { Ok(()) }).await;
                 let recorded = repo.recorded_limits();
                 prop_assert_eq!(recorded, vec![limit]);
                 Ok::<(), proptest::test_runner::TestCaseError>(())
@@ -3781,7 +3811,7 @@ pub(crate) mod tests {
                 let repo = MockTimerRepo::from_responses(vec![TimerListResponse::Ok(due_timers)]);
                 let fired_ats = Arc::new(Mutex::new(Vec::new()));
                 let fired_ats_clone = fired_ats.clone();
-                scan_due_timers_once(&repo, &TimerScannerConfig::default(), move |_due, fired_at| {
+                scan_due_timers_once(&repo, &TimerScannerConfig::default(), OffsetDateTime::now_utc(), move |_due, fired_at| {
                     let fired_ats = fired_ats_clone.clone();
                     async move {
                         fired_ats.lock().expect("fired_ats lock poisoned").push(fired_at);
@@ -3819,7 +3849,7 @@ pub(crate) mod tests {
                 let successes = Arc::new(Mutex::new(Vec::new()));
                 let successes_clone = successes.clone();
                 let fail_pattern_for_submit = fail_pattern.clone();
-                scan_due_timers_once(&repo, &TimerScannerConfig::default(), move |due, _fired_at| {
+                scan_due_timers_once(&repo, &TimerScannerConfig::default(), OffsetDateTime::now_utc(), move |due, _fired_at| {
                     let successes = successes_clone.clone();
                     let should_fail = fail_pattern_for_submit
                         .get(due.timer_id.trim_start_matches("timer-").parse::<usize>().unwrap_or(0) % fail_pattern_for_submit.len())
@@ -3874,8 +3904,8 @@ pub(crate) mod tests {
                 let captured_clone = captured.clone();
                 let config = TimerScannerConfig::default();
 
-                scan_due_timers_once(&repo, &config, |_due, _fired_at| async move { Ok(()) }).await;
-                scan_due_timers_once(&repo, &config, move |due, _fired_at| {
+                scan_due_timers_once(&repo, &config, OffsetDateTime::now_utc(), |_due, _fired_at| async move { Ok(()) }).await;
+                scan_due_timers_once(&repo, &config, OffsetDateTime::now_utc(), move |due, _fired_at| {
                     let captured = captured_clone.clone();
                     async move {
                         captured.lock().expect("captured lock poisoned").push(due.timer_id);
@@ -3913,6 +3943,7 @@ pub(crate) mod tests {
             &repo,
             tokeira_types::ShardId(0),
             &TimerScannerConfig::default(),
+            OffsetDateTime::now_utc(),
             |due, _fired_at| async move {
                 let reject = match due.timer_id.as_str() {
                     "closed" => tokeira_kernel::Reject::RunClosed(ExecutionStatus::Completed),

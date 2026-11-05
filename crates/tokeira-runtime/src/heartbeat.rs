@@ -24,6 +24,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use time::OffsetDateTime;
+use tokeira_clock::Clock;
 use tokeira_types::{
     EvictionReport, HeartbeatStore, HeartbeatStoreError, NamespaceId, WorkerHeartbeat,
     WorkerInstanceKey,
@@ -257,6 +258,7 @@ fn apply_heartbeat(
 pub fn spawn_heartbeat_maintenance(
     store: Arc<dyn HeartbeatStore>,
     cancel: CancellationToken,
+    clock: Arc<dyn Clock>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(DEFAULT_MAINTENANCE_INTERVAL.unsigned_abs());
@@ -264,7 +266,7 @@ pub fn spawn_heartbeat_maintenance(
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = interval.tick() => {
-                    let now = OffsetDateTime::now_utc();
+                    let now = clock.now();
                     match store.maintain(
                         now,
                         DEFAULT_ENTRY_TTL,

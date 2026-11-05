@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::Result;
 use async_trait::async_trait;
-use time::OffsetDateTime;
+use tokeira_clock::Clock;
 use tokeira_kernel::{OperationKey, OperationKind};
 use tokeira_storage::{
     IntentDescriptor, IntentKey, IntentKind, OperationRow, RunRepository, ScanBound, WriteFence,
@@ -286,6 +286,7 @@ pub(super) async fn run<R: RunRepository + 'static, E: Executor>(
     executor: Arc<E>,
     owner: Arc<RwLock<ShardOwner>>,
     cancel: CancellationToken,
+    clock: Arc<dyn Clock>,
 ) {
     let wakeup = executor.wakeup();
     let mut discovery = Discovery::default();
@@ -349,7 +350,7 @@ pub(super) async fn run<R: RunRepository + 'static, E: Executor>(
                     crate::metrics::record_outbound_pending(page.len());
                     for work in page {
                         if matches!(&work, Work::Intent(row) if !executor.accepts_intent(row.key.kind))
-                            || matches!(&work, Work::Operation(row) if row.due_at > OffsetDateTime::now_utc()) { continue; }
+                            || matches!(&work, Work::Operation(row) if row.due_at > clock.now()) { continue; }
                         let key = work.key();
                         if busy.contains(&key) || retry.get(&key).is_some_and(|(_, due)| *due > Instant::now()) { continue; }
                         let executor = executor.clone();

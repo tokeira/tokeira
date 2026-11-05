@@ -35,6 +35,7 @@ use tokio::sync::Mutex;
 
 #[cfg(test)]
 use crate::DeliveryOrder;
+use tokeira_clock::{Clock, system_clock};
 #[cfg(test)]
 use tokeira_kernel::{ActivityOp, DispatchOp};
 #[cfg(test)]
@@ -120,6 +121,10 @@ pub struct InMemoryStore {
     /// DSQL does (`bundle-lease-fence`). Without one a lease lasts until it is
     /// released.
     lease_duration: Option<time::Duration>,
+    /// What expiries are judged against and what a reset successor's start is
+    /// stamped with. It must be the clock the runtime and the edge stamp
+    /// deadlines with; see [`tokeira_clock`].
+    clock: Arc<dyn Clock>,
 }
 
 impl Default for InMemoryStore {
@@ -515,7 +520,7 @@ impl WorkerTaskProvenanceStore for InMemoryStore {
         Ok(store
             .worker_task_provenance
             .get(&token_digest)
-            .filter(|record| record.expires_at > OffsetDateTime::now_utc())
+            .filter(|record| record.expires_at > self.clock.now())
             .cloned())
     }
 
@@ -644,6 +649,7 @@ impl InMemoryStore {
             inner: Arc::new(Mutex::new(state)),
             placement_ready: Arc::new(AtomicBool::new(true)),
             lease_duration: None,
+            clock: system_clock(),
         }
     }
 
@@ -653,6 +659,13 @@ impl InMemoryStore {
     pub fn with_lease_duration(mut self, duration: time::Duration) -> Self {
         assert!(duration.is_positive(), "a lease duration must be positive");
         self.lease_duration = Some(duration);
+        self
+    }
+
+    /// Judge expiries and stamp reset successors with `clock` instead of the
+    /// system clock, for a harness that runs the store in simulated time.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -864,6 +877,7 @@ impl InMemoryStore {
             inner: Arc::new(Mutex::new(state)),
             placement_ready: Arc::new(AtomicBool::new(false)),
             lease_duration: None,
+            clock: system_clock(),
         })
     }
 }
@@ -2054,7 +2068,7 @@ impl RunRepository for InMemoryStore {
         // (TestResetWorkflowAfterTimeout resets well past the base's 1s
         // window and still expects a usable successor). Tokeira's sweep
         // derives both deadlines from these two anchors.
-        let materialized_at = time::OffsetDateTime::now_utc();
+        let materialized_at = self.clock.now();
         successor_state.started_at = materialized_at;
         successor_state.first_run_started_at = Some(materialized_at);
         let home = tokeira_types::execution_home_bundle(
@@ -3390,7 +3404,7 @@ impl LeaseRepository for InMemoryStore {
 
     async fn list_bundle_leases(&self) -> Result<Vec<BundleLease>> {
         let store = self.inner.lock().await;
-        let (now, wall) = (tokio::time::Instant::now(), OffsetDateTime::now_utc());
+        let (now, wall) = (tokio::time::Instant::now(), self.clock.now());
         Ok(store
             .bundle_leases
             .iter()

@@ -15,6 +15,7 @@ use std::{
 
 use anyhow::Result;
 use time::{Duration, OffsetDateTime};
+use tokeira_clock::Clock;
 use tokeira_kernel::{Command, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType};
 use tokeira_observability::OutcomeLabel;
 use tokeira_types::{LogicalTaskSeq, RunKey, ShardId};
@@ -342,6 +343,7 @@ pub fn evaluate_wft_timeout(entry: &WftTimeoutEntry, now: OffsetDateTime) -> boo
 /// closure so the pass is testable without a live lane. An entry is removed only
 /// after the submit resolves (or is rejected as stale), so transient failures are
 /// retried on the next scan.
+#[cfg(test)]
 pub(crate) async fn scan_wft_timeouts_once<F, Fut>(
     tracking: &WftTimeoutTrackingState,
     shard_id: Option<ShardId>,
@@ -444,6 +446,7 @@ pub(crate) async fn run_wft_timeout_scanner(
     shard_owner: Arc<RwLock<ShardOwner>>,
     config: WftTimeoutScannerConfig,
     cancel: CancellationToken,
+    clock: Arc<dyn Clock>,
 ) {
     loop {
         tokio::select! {
@@ -458,27 +461,35 @@ pub(crate) async fn run_wft_timeout_scanner(
             .collect();
         for shard_id in active_shards {
             runtime_metrics::record_scanner_tick("wft_timeout", shard_id.0);
-            scan_wft_timeouts_once(&tracking, Some(shard_id), &config, |entry, now| {
-                runtime_metrics::record_scanner_dispatched("wft_timeout", shard_id.0);
-                let lane = pick_lane_for_run_key(&lanes, lane_count, entry.run_key).clone();
-                async move {
-                    let timeout_type = match entry.kind {
-                        WftTimeoutKind::StartToClose => WorkflowTaskTimeoutType::StartToClose,
-                        WftTimeoutKind::ScheduleToStart => WorkflowTaskTimeoutType::ScheduleToStart,
-                    };
-                    lane.submit(
-                        entry.run_key,
-                        Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
-                            logical_seq: entry.logical_seq,
-                            started_event_id: entry.started_event_id,
-                            timeout_type,
-                            now,
-                        }),
-                    )
-                    .await
-                    .map(|_| ())
-                }
-            })
+            scan_wft_timeouts_at(
+                &tracking,
+                Some(shard_id),
+                &config,
+                clock.now(),
+                |entry, now| {
+                    runtime_metrics::record_scanner_dispatched("wft_timeout", shard_id.0);
+                    let lane = pick_lane_for_run_key(&lanes, lane_count, entry.run_key).clone();
+                    async move {
+                        let timeout_type = match entry.kind {
+                            WftTimeoutKind::StartToClose => WorkflowTaskTimeoutType::StartToClose,
+                            WftTimeoutKind::ScheduleToStart => {
+                                WorkflowTaskTimeoutType::ScheduleToStart
+                            }
+                        };
+                        lane.submit(
+                            entry.run_key,
+                            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                                logical_seq: entry.logical_seq,
+                                started_event_id: entry.started_event_id,
+                                timeout_type,
+                                now,
+                            }),
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                },
+            )
             .await;
         }
     }

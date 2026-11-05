@@ -15,13 +15,14 @@
 //! Step two, in [`cluster`]: a placement controller and two listener-backed
 //! nodes, with every connection between them on turmoil's network.
 //!
-//! What neither step does yet, so its limits are not mistaken for oversights:
-//! timers, retries and backoffs. The engine reads the wall clock when it
-//! decides whether something is due, while turmoil moves only tokio's clock,
-//! so a workflow that waits on a timer would wait on real time. That needs a
-//! clock the simulation can drive.
+//! Step three, in [`timer`]: a workflow timer that fires in simulated time.
+//! The listener-backed nodes of steps two and three read the time from
+//! [`SimClock`], so the deadlines they stamp and the scanners that judge them
+//! follow the simulation. Step one's embedded [`Engine`] has no clock to
+//! supply and still reads the host's clock, so it runs no timers.
 
 pub mod cluster;
+pub mod timer;
 
 use std::{
     convert::Infallible,
@@ -30,7 +31,7 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     pin::Pin,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context as _, anyhow, ensure};
@@ -39,6 +40,8 @@ use http::{HeaderMap, HeaderValue, Request, Response, Uri, header::CONTENT_TYPE}
 use http_body_util::{BodyExt as _, Full, combinators::UnsyncBoxBody};
 use hyper::{body::Incoming, server::conn::http2, service::service_fn};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use time::OffsetDateTime;
+use tokeira_clock::Clock;
 use tokeira_engine::{Engine, InProcessGrpcRequest, InProcessGrpcResponse, TemporalEndpoint};
 use tokeira_proto::{
     common::{ActivityType, Payload, Payloads, WorkflowExecution, WorkflowType},
@@ -76,6 +79,43 @@ const IDENTITY: &str = "turmoil-worker";
 /// computation takes no simulated time, so this bounds waiting, not work.
 const SIMULATION_DURATION: Duration = Duration::from_secs(120);
 
+/// The wall-clock time every simulated host starts at: 2026-01-01T00:00:00Z.
+///
+/// turmoil starts its clocks at the real time by default, so a run would
+/// stamp different times on every run. Fixing the start keeps the times the
+/// engine stamps, and with them a run's trace, the same for one seed.
+pub const EPOCH_UNIX_SECONDS: u64 = 1_767_225_600;
+
+/// [`EPOCH_UNIX_SECONDS`] as the start time turmoil's builder takes.
+pub fn epoch() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(EPOCH_UNIX_SECONDS)
+}
+
+/// The engine's clock on a simulated host: turmoil's simulated time, counted
+/// from the run's [`epoch`].
+///
+/// Every node in a run, and every store handle a node or the controller holds,
+/// gets this clock, so a deadline one of them stamps is judged against the same
+/// time by all of them. Each host reads its own simulated clock, and turmoil
+/// moves every host's clock together.
+///
+/// # Panics
+///
+/// When read off a simulated host, where there is no simulated time to read.
+/// The engine reads its clock from tasks on the host's runtime, so a panic
+/// here means some engine code read the clock from a thread turmoil does not
+/// drive.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SimClock;
+
+impl Clock for SimClock {
+    fn now(&self) -> OffsetDateTime {
+        let since_epoch =
+            turmoil::since_epoch().expect("the engine reads its clock only on a simulated host");
+        OffsetDateTime::UNIX_EPOCH + since_epoch
+    }
+}
+
 /// What the client host observed during one run, in order.
 ///
 /// Each step carries the simulated time at which the client saw it. The
@@ -107,6 +147,7 @@ pub fn run_one_activity_workflow(seed: u64) -> anyhow::Result<Trace> {
     let mut builder = turmoil::Builder::new();
     builder
         .rng_seed(seed)
+        .epoch(epoch())
         .simulation_duration(SIMULATION_DURATION);
     let mut sim = builder.build();
     sim.host(NODE, serve_engine);

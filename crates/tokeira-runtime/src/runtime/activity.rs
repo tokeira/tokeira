@@ -443,7 +443,7 @@ where
         backoff_interval_seconds: Option<i64>,
     ) -> Result<Option<Command>> {
         let rules = self.repo.list_workflow_rules(state.namespace_id).await?;
-        let now = OffsetDateTime::now_utc();
+        let now = self.clock.now();
         let Some(rule) =
             matching_pause_rule(state, activity, &rules, now, backoff_interval_seconds)
         else {
@@ -536,7 +536,7 @@ where
                     resolution: ActivityResolution::Completed { result },
                     worker_identity,
                     request,
-                    now: OffsetDateTime::now_utc(),
+                    now: self.clock.now(),
                 }),
             )
             .await?;
@@ -591,7 +591,7 @@ where
 
         // Retry-expiration anchor: the FIRST schedule + schedule-to-close (the
         // deadline spans the whole retry chain; `retry.go:108-110 @ v1.31.0`).
-        let now = OffsetDateTime::now_utc();
+        let now = self.clock.now();
         let expiration = activity
             .schedule_to_close_timeout
             .filter(|timeout| !timeout.is_zero())
@@ -654,7 +654,7 @@ where
                     },
                     worker_identity,
                     request,
-                    now: OffsetDateTime::now_utc(),
+                    now: self.clock.now(),
                 }),
             )
             .await;
@@ -698,7 +698,7 @@ where
                     resolution: ActivityResolution::Canceled { details },
                     worker_identity,
                     request,
-                    now: OffsetDateTime::now_utc(),
+                    now: self.clock.now(),
                 }),
             )
             .await?;
@@ -778,7 +778,7 @@ where
             // (mutable_state_impl.go:1964-1966 @ v1.31.0). The same instant
             // goes to volatile tracking below, so the deadline the owning node
             // evaluates and the one a new owner restores agree.
-            let now = OffsetDateTime::now_utc();
+            let now = self.clock.now();
             next_activity.last_heartbeat_at = Some(now);
             // A heartbeat carrying a non-empty identity updates the retry
             // bookkeeping identity, Describe's `LastWorkerIdentity` fallback
@@ -833,6 +833,7 @@ where
                 token.run_key,
                 committed,
                 &mut write_admission,
+                self.clock.as_ref(),
             )
             .await?
             {
@@ -987,7 +988,7 @@ where
                         identity: identity.clone(),
                         principal: request.principal.clone(),
                         mode: ActivityStartMode::CompletedById,
-                        now: OffsetDateTime::now_utc(),
+                        now: self.clock.now(),
                     },
                 )
                 .map_err(|reject| anyhow::Error::new(KernelRejected(reject)))?;
@@ -1013,16 +1014,19 @@ where
                 .commit_transition_for_bundle(run_key, bundle, transition, fence)
                 .await
                 .map_err(|error| crate::errors::lease_loss(error, &self.shard_owner));
-            match terminate_on_growth_breach(&self.lanes, run_key, committed, &mut write_admission)
-                .await?
+            match terminate_on_growth_breach(
+                &self.lanes,
+                run_key,
+                committed,
+                &mut write_admission,
+                self.clock.as_ref(),
+            )
+            .await?
             {
                 CommitResult::Applied { .. } => {
                     runtime_metrics::record_activity_task_started(OutcomeLabel::Success);
-                    self.activity_tracking.record_started(
-                        run_key,
-                        activity_id,
-                        OffsetDateTime::now_utc(),
-                    );
+                    self.activity_tracking
+                        .record_started(run_key, activity_id, self.clock.now());
                     return Ok(token);
                 }
                 CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
@@ -1079,7 +1083,7 @@ where
                 operation_id: pending.operation_id.clone(),
                 scheduled_event_id: pending.scheduled_event_id,
                 resolution,
-                now: OffsetDateTime::now_utc(),
+                now: self.clock.now(),
             }),
             (
                 tokeira_kernel::OperationKind::NexusCancel,
@@ -1091,7 +1095,7 @@ where
                     scheduled_event_id: pending.scheduled_event_id,
                     requested_event_id: row.incarnation.requested_event,
                     outcome,
-                    now: OffsetDateTime::now_utc(),
+                    now: self.clock.now(),
                 },
             ),
             _ => return Ok(false),
@@ -1147,7 +1151,7 @@ where
                     operation_id,
                     scheduled_event_id,
                     resolution,
-                    now: OffsetDateTime::now_utc(),
+                    now: self.clock.now(),
                 }),
             )
             .await
@@ -1186,7 +1190,7 @@ where
                         scheduled_event_id,
                         requested_event_id,
                         outcome,
-                        now: OffsetDateTime::now_utc(),
+                        now: self.clock.now(),
                     },
                 ),
             )
@@ -1395,7 +1399,7 @@ where
             }
             if current
                 .current_attempt_scheduled_at
-                .is_none_or(|at| at > OffsetDateTime::now_utc())
+                .is_none_or(|at| at > self.clock.now())
             {
                 return Ok(ActivityStartOutcome::Suppressed);
             }
@@ -1505,7 +1509,7 @@ where
                     tokeira_kernel::StartDeploymentTransitionRequest {
                         target,
                         revision_number: task.dispatch_revision,
-                        now: OffsetDateTime::now_utc(),
+                        now: self.clock.now(),
                     },
                 );
                 if self
@@ -1531,7 +1535,7 @@ where
             // transient, with no event until the activity resolves. The polling
             // worker's identity becomes `started_identity`, Describe's primary
             // `LastWorkerIdentity` source (workflow/activity.go:159 @ v1.31.0).
-            let now = OffsetDateTime::now_utc();
+            let now = self.clock.now();
             let mut transition = BasicKernel
                 .apply_activity_started(
                     LoadedRun::Existing(state.clone()),
@@ -1617,6 +1621,7 @@ where
                 task.run_key,
                 committed,
                 &mut write_admission,
+                self.clock.as_ref(),
             )
             .await;
             // A start refused for a growth limit terminated the run, so the poll
@@ -1810,6 +1815,7 @@ where
             tracking: self.activity_tracking.clone(),
             worker_deployment_registry: self.worker_deployment_registry.clone(),
             lanes: self.lanes.clone(),
+            clock: self.clock.clone(),
         }
     }
 }
@@ -1829,6 +1835,8 @@ pub(crate) struct ActivityRetryDeps<R> {
     /// The runtime's lanes, through which a run whose activity write was
     /// refused for a growth limit is terminated.
     pub lanes: Vec<LaneHandle>,
+    /// The runtime's clock, which stamps retry and timeout deadlines.
+    pub clock: Arc<dyn Clock>,
 }
 
 impl<R> Clone for ActivityRetryDeps<R> {
@@ -1843,6 +1851,7 @@ impl<R> Clone for ActivityRetryDeps<R> {
             tracking: self.tracking.clone(),
             worker_deployment_registry: self.worker_deployment_registry.clone(),
             lanes: self.lanes.clone(),
+            clock: self.clock.clone(),
         }
     }
 }
@@ -1856,6 +1865,7 @@ pub(crate) async fn terminate_on_growth_breach(
     run_key: RunKey,
     committed: Result<CommitResult>,
     write_admission: &mut Option<crate::serving_gate::WritePermit>,
+    clock: &dyn Clock,
 ) -> Result<CommitResult> {
     let breach = match &committed {
         Err(error) => crate::run_growth::terminating_breach(error, false),
@@ -1880,7 +1890,7 @@ pub(crate) async fn terminate_on_growth_breach(
     if let Err(error) = lane
         .submit(
             run_key,
-            crate::run_growth::terminate_command(run_key, &breach),
+            crate::run_growth::terminate_command(run_key, &breach, clock.now()),
         )
         .await
     {
@@ -1975,7 +1985,7 @@ where
         // durable retry timer, not immediately
         // (`UpdateActivityInfoForRetries`, activity.go:74 +
         // GenerateActivityRetryTasks @ v1.31.0).
-        let completed_at = OffsetDateTime::now_utc();
+        let completed_at = deps.clock.now();
         let dispatch_at = deadline_after(completed_at, backoff);
         next_activity.last_attempt_complete_time = Some(completed_at);
         next_activity.current_attempt_scheduled_at = Some(dispatch_at);
@@ -2119,8 +2129,14 @@ where
             .commit_transition_for_bundle(run_key, bundle, transition, fence)
             .await
             .map_err(|error| crate::errors::lease_loss(error, &deps.shard_owner));
-        match terminate_on_growth_breach(&deps.lanes, run_key, committed, &mut write_admission)
-            .await?
+        match terminate_on_growth_breach(
+            &deps.lanes,
+            run_key,
+            committed,
+            &mut write_admission,
+            deps.clock.as_ref(),
+        )
+        .await?
         {
             CommitResult::Applied { new_state } => {
                 let tracking = deps.tracking.for_acquisition(acquisition);
@@ -2353,8 +2369,14 @@ async fn prepare_activity_dispatch<R: RunRepository + 'static>(
             .commit_transition_for_bundle(task.run_key, bundle, transition, fence)
             .await
             .map_err(|error| crate::errors::lease_loss(error, &deps.shard_owner));
-        match terminate_on_growth_breach(&deps.lanes, task.run_key, committed, &mut write_admission)
-            .await?
+        match terminate_on_growth_breach(
+            &deps.lanes,
+            task.run_key,
+            committed,
+            &mut write_admission,
+            deps.clock.as_ref(),
+        )
+        .await?
         {
             CommitResult::Applied { .. } => {
                 // Eligibility completion retires its submitted revision in the

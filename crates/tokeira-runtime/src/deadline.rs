@@ -5,12 +5,14 @@
 //! `Instant` has a smaller range. A truncated wait must never fire a task early.
 
 use time::{Duration, OffsetDateTime};
+use tokeira_clock::Clock;
 
-/// Translate a stored deadline once, then wait in bounded monotonic segments.
-/// This preserves the existing relative-wait semantics and never truncates a
-/// distant deadline to the range of a nanosecond counter or `Instant`.
-pub async fn sleep_until(deadline: OffsetDateTime) {
-    let mut remaining = deadline - OffsetDateTime::now_utc();
+/// Translate a stored deadline once, against `clock`, then wait in bounded
+/// monotonic segments. This preserves the existing relative-wait semantics and
+/// never truncates a distant deadline to the range of a nanosecond counter or
+/// `Instant`. `clock` must be the clock that stamped `deadline`.
+pub async fn sleep_until(clock: &dyn Clock, deadline: OffsetDateTime) {
+    let mut remaining = deadline - clock.now();
     while remaining > Duration::ZERO {
         let segment = remaining.min(Duration::hours(24));
         let wait = std::time::Duration::try_from(segment)
@@ -31,7 +33,7 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_secs(2 * 86_400),
-                sleep_until(deadline)
+                sleep_until(&tokeira_clock::SystemClock, deadline)
             )
             .await
             .is_err()

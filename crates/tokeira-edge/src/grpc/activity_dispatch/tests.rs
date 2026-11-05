@@ -209,7 +209,11 @@ impl<R: RunRepository + tokeira_storage::LeaseRepository + 'static> Fixture<R> {
             },
         )
         .unwrap();
-        let start = crate::translate::to_internal::start_request(start, &context());
+        let start = crate::translate::to_internal::start_request(
+            start,
+            &context(),
+            time::OffsetDateTime::now_utc(),
+        );
         let run = start.run_key;
         let namespace_id = start.namespace_id;
         let execution_home = tokeira_types::execution_home_bundle(
@@ -310,6 +314,7 @@ impl<R: RunRepository + tokeira_storage::LeaseRepository + 'static> Fixture<R> {
                 crate::translate::to_internal::workflow_task_completed_request(
                     completion,
                     &context(),
+                    time::OffsetDateTime::now_utc(),
                 )
                 .unwrap(),
             )

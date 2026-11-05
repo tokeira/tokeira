@@ -45,6 +45,7 @@ const PER_NS_WORKER_TASK_QUEUE: &str = "temporal-sys-per-ns-tq";
 
 pub fn create_schedule_request_to_edge(
     request: workflowservice::CreateScheduleRequest,
+    now: OffsetDateTime,
 ) -> Result<
     (
         NamespaceId,
@@ -57,7 +58,7 @@ pub fn create_schedule_request_to_edge(
     if request.schedule_id.is_empty() {
         return Err(Status::invalid_argument("schedule_id must not be empty"));
     }
-    let now = OffsetDateTime::now_utc();
+
     let namespace_id = namespace_id_for(&request.namespace);
     let schedule = request
         .schedule
@@ -99,6 +100,7 @@ pub fn create_schedule_request_to_edge(
 
 pub fn update_schedule_request_to_edge(
     request: workflowservice::UpdateScheduleRequest,
+    now: OffsetDateTime,
 ) -> Result<
     (
         NamespaceId,
@@ -111,7 +113,7 @@ pub fn update_schedule_request_to_edge(
     if request.schedule_id.is_empty() {
         return Err(Status::invalid_argument("schedule_id must not be empty"));
     }
-    let now = OffsetDateTime::now_utc();
+
     let namespace_id = namespace_id_for(&request.namespace);
     let schedule = request
         .schedule
@@ -901,12 +903,15 @@ mod tests {
 
     #[test]
     fn empty_schedule_id_rejected() {
-        let err = create_schedule_request_to_edge(workflowservice::CreateScheduleRequest {
-            namespace: "default".to_string(),
-            schedule_id: String::new(),
-            schedule: Some(minimal_schedule()),
-            ..Default::default()
-        })
+        let err = create_schedule_request_to_edge(
+            workflowservice::CreateScheduleRequest {
+                namespace: "default".to_string(),
+                schedule_id: String::new(),
+                schedule: Some(minimal_schedule()),
+                ..Default::default()
+            },
+            time::OffsetDateTime::now_utc(),
+        )
         .expect_err("empty schedule id should be invalid");
 
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -915,15 +920,18 @@ mod tests {
 
     #[test]
     fn missing_spec_rejected() {
-        let err = create_schedule_request_to_edge(workflowservice::CreateScheduleRequest {
-            namespace: "default".to_string(),
-            schedule_id: "s1".to_string(),
-            schedule: Some(proto_schedule::Schedule {
-                action: Some(minimal_action()),
+        let err = create_schedule_request_to_edge(
+            workflowservice::CreateScheduleRequest {
+                namespace: "default".to_string(),
+                schedule_id: "s1".to_string(),
+                schedule: Some(proto_schedule::Schedule {
+                    action: Some(minimal_action()),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
-        })
+            },
+            time::OffsetDateTime::now_utc(),
+        )
         .expect_err("missing spec should be invalid");
 
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -958,14 +966,16 @@ mod tests {
 
     #[test]
     fn list_info_drops_timezone_data() {
-        let (_, _, entry, _) =
-            create_schedule_request_to_edge(workflowservice::CreateScheduleRequest {
+        let (_, _, entry, _) = create_schedule_request_to_edge(
+            workflowservice::CreateScheduleRequest {
                 namespace: "default".to_string(),
                 schedule_id: "s1".to_string(),
                 schedule: Some(minimal_schedule()),
                 ..Default::default()
-            })
-            .expect("valid schedule");
+            },
+            time::OffsetDateTime::now_utc(),
+        )
+        .expect("valid schedule");
 
         let response = list_schedules_response_to_proto(vec![entry], None);
         let list_spec = response.schedules[0]

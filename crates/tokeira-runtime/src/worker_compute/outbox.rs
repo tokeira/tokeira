@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use prost::Message;
+use tokeira_clock::Clock;
 use tokeira_storage::{
     ClaimedWorkerComputeProviderAction, WORKER_COMPUTE_ACTION_CLAIM_LIMIT,
     WorkerComputeActionAttemptStart, WorkerComputeActionFinalization,
@@ -20,8 +21,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     ACTION_CLAIM_LEASE, ACTION_DELIVERY_IDLE_INTERVAL, ACTION_RETRY_COEFFICIENT,
-    ACTION_RETRY_INITIAL_INTERVAL, ACTION_RETRY_MAXIMUM_INTERVAL, WorkerComputeClock,
-    WorkerComputeProvider, WorkerComputeProviderOutcome,
+    ACTION_RETRY_INITIAL_INTERVAL, ACTION_RETRY_MAXIMUM_INTERVAL, WorkerComputeProvider,
+    WorkerComputeProviderOutcome,
 };
 use crate::metrics as runtime_metrics;
 
@@ -59,7 +60,7 @@ enum AttemptDisposition {
 pub struct WorkerComputeOutbox {
     repository: Arc<dyn WorkerComputeRepository>,
     provider: Arc<dyn WorkerComputeProvider>,
-    clock: Arc<dyn WorkerComputeClock>,
+    clock: Arc<dyn Clock>,
     owner: IncarnationId,
 }
 
@@ -78,7 +79,7 @@ impl WorkerComputeOutbox {
     pub fn new(
         repository: Arc<dyn WorkerComputeRepository>,
         provider: Arc<dyn WorkerComputeProvider>,
-        clock: Arc<dyn WorkerComputeClock>,
+        clock: Arc<dyn Clock>,
         owner: IncarnationId,
     ) -> Self {
         Self {
@@ -360,7 +361,7 @@ mod tests {
         }
     }
 
-    impl WorkerComputeClock for TestClock {
+    impl Clock for TestClock {
         fn now(&self) -> OffsetDateTime {
             *self.now.lock().expect("test clock lock poisoned")
         }

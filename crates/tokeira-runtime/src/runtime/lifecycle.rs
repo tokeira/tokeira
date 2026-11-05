@@ -910,7 +910,7 @@ where
         self.submit(
             run_key,
             Command::ResetSticky(tokeira_kernel::ResetStickyRequest {
-                now: OffsetDateTime::now_utc(),
+                now: self.clock.now(),
             }),
         )
         .await
@@ -1103,7 +1103,7 @@ where
             attached_links: Vec::new(),
             attached_request_id: None,
             request,
-            now: OffsetDateTime::now_utc(),
+            now: self.clock.now(),
             completion_callback_limit: None,
         };
         self.submit(run_key, Command::UpdateExecutionOptions(update))
@@ -1296,12 +1296,13 @@ where
                     ),
                     order: None,
                 };
-                let delay = dispatch_at - OffsetDateTime::now_utc();
+                let delay = dispatch_at - self.clock.now();
                 if delay.is_positive() {
                     let broker = self.activity_broker.clone();
                     let metrics = self.delivery_metrics.clone();
+                    let clock = self.clock.clone();
                     tokio::spawn(async move {
-                        crate::deadline::sleep_until(dispatch_at).await;
+                        crate::deadline::sleep_until(clock.as_ref(), dispatch_at).await;
                         if let Err(error) = broker.publish_activity_task(task, Some(&metrics)).await
                         {
                             tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish rescheduled activity after option update");
@@ -1619,7 +1620,7 @@ where
                         principal: request.principal,
                         received_at: request.received_at,
                     },
-                    now: OffsetDateTime::now_utc(),
+                    now: self.clock.now(),
                 },
             )
             .await?

@@ -46,6 +46,7 @@ fn runtime<R: RunRepository + 'static>(repo: Arc<R>, identity: &str) -> Arc<Toke
         "127.0.0.1:0".into(),
         false,
         None,
+        tokeira_clock::system_clock(),
     ))
 }
 
@@ -144,7 +145,11 @@ async fn case<R: RunRepository + LeaseRepository + 'static>(
     };
     let mut dto = super::tests::start_dto();
     dto.task_queue = "read-baseline".into();
-    let mut request = crate::translate::to_internal::start_request(dto, &context);
+    let mut request = crate::translate::to_internal::start_request(
+        dto,
+        &context,
+        time::OffsetDateTime::now_utc(),
+    );
     let normal = QueueKey {
         namespace_id: request.namespace_id,
         task_queue: request.task_queue.clone(),

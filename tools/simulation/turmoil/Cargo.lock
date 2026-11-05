@@ -4709,10 +4709,8 @@ name = "turmoil-sim"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bytes",
  "connectrpc",
  "http 1.4.0",
- "http-body-util",
  "hyper",
  "hyper-util",
  "prost-types",

@@ -133,6 +133,11 @@ pub struct KeySpec {
 /// exactly the honesty boundary the spec requires.
 pub static KEY_CLASSIFICATION: &[KeySpec] = &[
     KeySpec {
+        key: "history.workflowTaskHeartbeatTimeout",
+        value_type: ValueType::Duration,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
         key: "system.enableActivityEagerExecution",
         value_type: ValueType::Bool,
         disposition: Disposition::Wired,
@@ -838,6 +843,18 @@ mod tests {
         for key in AUTH_BOOL_KEYS {
             assert_eq!(overrides.get_bool(key), None);
         }
+    }
+
+    #[test]
+    fn workflow_task_heartbeat_override_is_duration_and_scope_reset_drops_it() {
+        let registry = ConformanceOverrides::default();
+        let key = "history.workflowTaskHeartbeatTimeout";
+        let timeout = Duration::from_secs(5);
+        assert!(registry.set(key, OverrideValue::Duration(timeout)).is_ok());
+        assert_eq!(registry.get_duration(key), Some(timeout));
+        registry.reset();
+        assert_eq!(registry.get_duration(key), None);
+        assert!(registry.set(key, OverrideValue::Bool(true)).is_err());
     }
 
     #[test]

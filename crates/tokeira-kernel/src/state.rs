@@ -756,6 +756,11 @@ pub enum VersionTransitionError {
 /// task model.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingWorkflowTask {
+    /// Origin of this heartbeat-only chain. Persisted in an optional state-extension
+    /// section, never in the frozen positional layout. Legacy absence disables
+    /// the heartbeat check until a fresh task is scheduled.
+    #[serde(skip)]
+    pub original_scheduled_at: Option<OffsetDateTime>,
     /// Logical task sequence assigned at schedule time.
     pub logical_seq: LogicalTaskSeq,
     /// Event ID of the `WorkflowTaskScheduled` event.
@@ -1872,6 +1877,7 @@ pub(crate) mod tests {
             schedule_to_start_timeout: Duration::seconds(5),
         });
         state.pending_workflow_task = Some(PendingWorkflowTask {
+            original_scheduled_at: None,
             advice: Default::default(),
             task_type: WorkflowTaskType::Normal,
             schedule_to_start_deadline: None,
@@ -1908,6 +1914,7 @@ pub(crate) mod tests {
         let target_version = version("deployment", "target");
         let mut state = open_state();
         state.pending_workflow_task = Some(PendingWorkflowTask {
+            original_scheduled_at: None,
             advice: Default::default(),
             task_type: WorkflowTaskType::Normal,
             schedule_to_start_deadline: None,

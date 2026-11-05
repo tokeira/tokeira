@@ -1189,6 +1189,16 @@ where
         // task — K7). Read now, before the commit processes the worker's
         // accept/reject commands (spec speculative-wft Req 9).
         let mut req = req;
+        // Resolve once outside the lane; OCC retries reuse this policy operand.
+        #[cfg(feature = "conformance")]
+        {
+            req.heartbeat.timeout = crate::conformance::workflow_task_heartbeat_timeout();
+        }
+        #[cfg(not(feature = "conformance"))]
+        {
+            req.heartbeat.timeout = tokeira_kernel::WORKFLOW_TASK_HEARTBEAT_TIMEOUT;
+        }
+
         #[cfg(feature = "conformance")]
         let eager_enabled =
             crate::conformance::activity_eager_execution(self.enable_activity_eager_execution);

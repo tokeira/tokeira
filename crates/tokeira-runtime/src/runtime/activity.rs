@@ -840,6 +840,7 @@ where
                 timer_ops: SmallVec::new(),
                 dispatch_ops: SmallVec::new(),
                 events_numbered_at_close: 0,
+                workflow_task_heartbeat_timed_out: false,
                 growth_limits: Some(crate::run_growth::run_growth_limits()),
             };
 
@@ -2119,6 +2120,7 @@ where
             timer_ops: SmallVec::new(),
             dispatch_ops,
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: Some(crate::run_growth::run_growth_limits()),
         };
 
@@ -2387,6 +2389,7 @@ async fn prepare_activity_dispatch<R: RunRepository + 'static>(
             timer_ops: SmallVec::new(),
             dispatch_ops: SmallVec::new(),
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: Some(crate::run_growth::run_growth_limits()),
         };
         captured.validate(&deps.shard_owner)?;
@@ -2786,6 +2789,7 @@ mod tests {
             timer_ops: SmallVec::new(),
             dispatch_ops: SmallVec::new(),
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         };
         repo.commit_transition(run_key, transition, WriteFence::Unfenced)
@@ -2936,6 +2940,7 @@ mod tests {
                 priority: None,
             }],
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         };
         repo.commit_transition(run_key, transition, WriteFence::Unfenced)
@@ -3539,7 +3544,7 @@ mod tests {
                 }
                 repo.commit_transition(state.run_key, Transition { expected_seq, next_state: state.clone(), history_events: SmallVec::new(),
                     event_principals: SmallVec::new(), request_dedupe_ops: SmallVec::new(), activity_ops: SmallVec::new(), timer_ops: SmallVec::new(),
-                    dispatch_ops: SmallVec::new(), events_numbered_at_close: 0, growth_limits: None }, WriteFence::Unfenced).await.unwrap();
+                    dispatch_ops: SmallVec::new(), events_numbered_at_close: 0, workflow_task_heartbeat_timed_out: false, growth_limits: None }, WriteFence::Unfenced).await.unwrap();
                 runtime.activity_tracking.eligibility.refresh(&state, ShardId(0));
                 repo.create_workflow_rule(state.namespace_id, pause_rule("bounded", "Attempts >= 2"), 10).await.unwrap();
                 let deps = runtime.activity_retry_deps();
@@ -3653,6 +3658,7 @@ mod tests {
             timer_ops: SmallVec::new(),
             dispatch_ops: SmallVec::new(),
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         };
         repo.commit_transition(run_key, transition, WriteFence::Unfenced)
@@ -4182,6 +4188,7 @@ mod tests {
             timer_ops: SmallVec::new(),
             dispatch_ops: SmallVec::new(),
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         };
         repo.commit_transition(token.run_key, transition, WriteFence::Unfenced)
@@ -4670,6 +4677,7 @@ mod tests {
                 timer_ops: SmallVec::new(),
                 dispatch_ops,
                 events_numbered_at_close: 0,
+                workflow_task_heartbeat_timed_out: false,
                 growth_limits: None,
             },
             WriteFence::Unfenced,
@@ -4841,6 +4849,7 @@ mod tests {
                 priority: None,
             }],
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         };
         repo.commit_transition(zombie_run, zombie_transition, WriteFence::Unfenced)
@@ -5128,6 +5137,7 @@ mod tests {
                             timer_ops: SmallVec::new(),
                             dispatch_ops: SmallVec::new(),
                             events_numbered_at_close: 0,
+                            workflow_task_heartbeat_timed_out: false,
                             growth_limits: None,
                         },
                         WriteFence::Unfenced,
@@ -5274,6 +5284,7 @@ mod tests {
                     timer_ops: SmallVec::new(),
                     dispatch_ops: SmallVec::new(),
                     events_numbered_at_close: 0,
+                    workflow_task_heartbeat_timed_out: false,
                     growth_limits: None,
                 },
                 WriteFence::Unfenced,

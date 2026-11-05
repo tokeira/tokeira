@@ -143,6 +143,11 @@ pub const OUTBOUND_STATE_SECTION: u32 = 6;
 /// Required activity-start receipts, protected by the TKW4 state envelope.
 pub const ACTIVITY_START_RECEIPTS_SECTION: u32 = 7;
 
+/// Optional pending-task heartbeat origin. Frozen postcard payload:
+/// `(logical sequence: u64, original schedule time: OffsetDateTime)`.
+/// Older readers drop it; absence retains the pre-limit behavior.
+pub const WORKFLOW_TASK_ORIGINAL_SCHEDULE_SECTION: u32 = 8;
+
 /// Whether `state` lacks the ids of updates it has completed: an open run with
 /// completions but an empty set. Each completion this release applies adds its id,
 /// so only a state that an earlier release wrote, or rewrote and dropped the
@@ -514,6 +519,14 @@ pub(crate) fn encode_state_extension(state: &WorkflowState) -> postcard::Result<
             payload: activity_receipts::encode(state)?,
         });
     }
+    if let Some(pending) = &state.pending_workflow_task
+        && let Some(original) = pending.original_scheduled_at
+    {
+        sections.push(ExtensionSection {
+            tag: WORKFLOW_TASK_ORIGINAL_SCHEDULE_SECTION,
+            payload: postcard::to_allocvec(&(pending.logical_seq.0, original))?,
+        });
+    }
     encode_extension(WORKFLOW_STATE_EXTENSION_MAGIC, &sections)
 }
 
@@ -560,6 +573,20 @@ pub(crate) fn apply_state_extension(
             }
             ACTIVITY_START_RECEIPTS_SECTION => {
                 activity_receipts::apply(state, &section.payload)?;
+            }
+            WORKFLOW_TASK_ORIGINAL_SCHEDULE_SECTION => {
+                let (sequence, original) = decode_exact::<(u64, OffsetDateTime)>(&section.payload)
+                    .ok_or("undecodable workflow task original schedule section")?;
+                let pending = state
+                    .pending_workflow_task
+                    .as_mut()
+                    .ok_or("workflow task original schedule section has no pending task")?;
+                if pending.logical_seq.0 != sequence {
+                    return Err(
+                        "workflow task original schedule section has a different task sequence",
+                    );
+                }
+                pending.original_scheduled_at = Some(original);
             }
             // A later release's section: its data is safe to drop by rule.
             _ => {}
@@ -973,6 +1000,7 @@ mod tests {
             external_payload_size_bytes: 0,
             next_workflow_task_seq: LogicalTaskSeq(2),
             pending_workflow_task: Some(PendingWorkflowTask {
+                original_scheduled_at: None,
                 advice: Default::default(),
                 task_type: WorkflowTaskType::Normal,
                 schedule_to_start_deadline: None,
@@ -1341,6 +1369,73 @@ mod tests {
             .step_by(2)
             .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("hex"))
             .collect()
+    }
+
+    // Optional section 8 for layout_state(): logical sequence 1, origin at(0).
+    // Together with FROZEN_LAYOUT_HEX these are immutable legacy/new fixtures.
+    const FROZEN_WFT_HEARTBEAT_EXTENSION_HEX: &str = "d8aeada20501080c01ce1fbe02160d1400000000";
+
+    #[test]
+    fn workflow_task_heartbeat_frozen_bytes_and_roundtrip() {
+        let legacy = unhex(FROZEN_LAYOUT_HEX);
+        let old = decode_workflow_state(run_key(), &legacy).unwrap();
+        assert_eq!(
+            old.pending_workflow_task
+                .as_ref()
+                .unwrap()
+                .original_scheduled_at,
+            None
+        );
+        let mut bytes = legacy.clone();
+        bytes.extend(unhex(FROZEN_WFT_HEARTBEAT_EXTENSION_HEX));
+        let mut expected = old.clone();
+        expected
+            .pending_workflow_task
+            .as_mut()
+            .unwrap()
+            .original_scheduled_at = Some(at(0));
+        assert_eq!(decode_workflow_state(run_key(), &bytes).unwrap(), expected);
+        assert_eq!(
+            hex(&encode_state_extension(&expected).unwrap()),
+            FROZEN_WFT_HEARTBEAT_EXTENSION_HEX
+        );
+        // Legacy outbound metadata is prepared before any current-envelope write.
+        expected.outbound = Some(Default::default());
+        assert_eq!(
+            decode_workflow_state(run_key(), &encode_workflow_state(&expected).unwrap()).unwrap(),
+            expected
+        );
+        // An older positional reader ignores the extension and keeps its legacy policy.
+        let (_, older): (u32, WorkflowState) = decode(&bytes).unwrap();
+        assert_eq!(
+            older.pending_workflow_task.unwrap().original_scheduled_at,
+            None
+        );
+    }
+
+    #[test]
+    fn workflow_task_heartbeat_section_rejects_corruption_and_wrong_incarnation() {
+        for payload in [vec![], vec![0xff], encode(&(2u64, at(0))).unwrap(), {
+            let mut bytes = encode(&(1u64, at(0))).unwrap();
+            bytes.push(0);
+            bytes
+        }] {
+            let bytes = encode_extension(
+                WORKFLOW_STATE_EXTENSION_MAGIC,
+                &[ExtensionSection {
+                    tag: WORKFLOW_TASK_ORIGINAL_SCHEDULE_SECTION,
+                    payload,
+                }],
+            )
+            .unwrap();
+            assert!(apply_state_extension(&mut layout_state(), &bytes).is_err());
+        }
+        let mut no_task = layout_state();
+        no_task.pending_workflow_task = None;
+        assert!(
+            apply_state_extension(&mut no_task, &unhex(FROZEN_WFT_HEARTBEAT_EXTENSION_HEX))
+                .is_err()
+        );
     }
 
     #[test]
@@ -2002,9 +2097,9 @@ mod tests {
         #[test]
         fn property_unknown_sections_and_activities_are_ignored(
             state in arb_state(),
-            // Tags 1 to 7 are known; anything above is a later optional section.
+            // Tags 1 to 8 are known; anything above is a later optional section.
             unknown in proptest::collection::btree_map(
-                8u32..64,
+                9u32..64,
                 proptest::collection::vec(any::<u8>(), 0..16),
                 0..3,
             ),

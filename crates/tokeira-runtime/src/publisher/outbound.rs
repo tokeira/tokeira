@@ -256,6 +256,7 @@ fn metadata_transition(mut state: WorkflowState) -> Transition {
         timer_ops: Default::default(),
         dispatch_ops: Default::default(),
         events_numbered_at_close: 0,
+        workflow_task_heartbeat_timed_out: false,
         growth_limits: Some(crate::run_growth::run_growth_limits()),
     }
 }

@@ -4118,6 +4118,7 @@ mod tests {
             external_payload_size_bytes: 0,
             next_workflow_task_seq: LogicalTaskSeq(1),
             pending_workflow_task: Some(PendingWorkflowTask {
+                original_scheduled_at: None,
                 advice: Default::default(),
                 task_type: tokeira_kernel::WorkflowTaskType::Normal,
                 schedule_to_start_deadline: None,
@@ -4197,6 +4198,7 @@ mod tests {
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         }
     }
@@ -4347,6 +4349,7 @@ mod tests {
                                 timer_ops: Default::default(),
                                 dispatch_ops: Default::default(),
                                 events_numbered_at_close: 0,
+                                workflow_task_heartbeat_timed_out: false,
                                 growth_limits: None,
                             },
                             WriteFence::Unfenced,
@@ -4431,6 +4434,7 @@ mod tests {
                     timer_ops: Default::default(),
                     dispatch_ops: Default::default(),
                     events_numbered_at_close: 0,
+                    workflow_task_heartbeat_timed_out: false,
                     growth_limits: None,
                 },
                 WriteFence::Unfenced,
@@ -5740,6 +5744,7 @@ mod tests {
                     timer_ops: Default::default(),
                     dispatch_ops: Default::default(),
                     events_numbered_at_close: 0,
+                    workflow_task_heartbeat_timed_out: false,
                     growth_limits: None,
                 };
                 delete_transition.next_state.transition_seq = TransitionSeq(2);
@@ -5798,6 +5803,7 @@ mod tests {
                     timer_ops: Default::default(),
                     dispatch_ops: Default::default(),
                     events_numbered_at_close: 0,
+                    workflow_task_heartbeat_timed_out: false,
                     growth_limits: None,
                 };
                 conflict.next_state.namespace_id = queue.namespace_id;
@@ -6069,6 +6075,7 @@ mod tests {
                     timer_ops: Default::default(),
                     dispatch_ops: Default::default(),
                     events_numbered_at_close: 0,
+                    workflow_task_heartbeat_timed_out: false,
                     growth_limits: None,
                 };
                 delete.next_state.transition_seq = TransitionSeq(2);
@@ -6106,6 +6113,7 @@ mod tests {
                     timer_ops: Default::default(),
                     dispatch_ops: Default::default(),
                     events_numbered_at_close: 0,
+                    workflow_task_heartbeat_timed_out: false,
                     growth_limits: None,
                 };
                 close.next_state.namespace_id = namespace_id;
@@ -6385,6 +6393,7 @@ mod tests {
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         };
         close.next_state.namespace_id = namespace_id;
@@ -6670,6 +6679,7 @@ mod tests {
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         };
         duplicate.next_state.namespace_id = namespace_id;
@@ -7273,6 +7283,7 @@ mod tests {
                         timer_ops: Default::default(),
                         dispatch_ops: Default::default(),
                         events_numbered_at_close: 0,
+                        workflow_task_heartbeat_timed_out: false,
                         growth_limits: None,
                     };
                     t2.next_state.transition_seq =
@@ -7571,6 +7582,7 @@ mod tests {
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         };
         store
@@ -9142,6 +9154,7 @@ mod tests {
                 timer_ops: Default::default(),
                 dispatch_ops: Default::default(),
                 events_numbered_at_close: 0,
+                workflow_task_heartbeat_timed_out: false,
                 growth_limits: Some(growth_limits),
             }
         }

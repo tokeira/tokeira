@@ -220,6 +220,10 @@ translated command list. A positive `original_scheduled_at` expires only when
 `now > original + timeout`, never at equality. A valid heartbeat carries that
 original timestamp to its successor; progress or timeout starts a fresh chain.
 An absent/nonpositive legacy timestamp disables this check for that chain.
+A task retained by failure or timeout during a pause takes the unpause time as
+both its schedule and original time; a task scheduled before the pause keeps both.
+DescribeWorkflowExecution reports the pending task’s original time, using
+`0001-01-01T00:00:00Z` when it is absent (Item C criteria C.1.4 and C.1.12).
 
 Add `PendingWorkflowTask.original_scheduled_at: Option<OffsetDateTime>` as a
 non-positional field (`#[serde(skip)]`), encoded through a new frozen state-extension

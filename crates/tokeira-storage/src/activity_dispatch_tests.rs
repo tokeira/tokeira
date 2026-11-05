@@ -1400,6 +1400,7 @@ pub(crate) fn eager_completion_cases(backend: &impl Backend, runtime: &tokio::ru
                             })
                             .collect(),
                         command_sizes: Vec::new(),
+                        heartbeat: Default::default(),
                         force_new_workflow_task: false,
                         inline_workflow_task: None,
                         eager_activities: tokeira_kernel::CompletionActivityStarts {

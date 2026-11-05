@@ -375,13 +375,13 @@
       infer feature-catalog completeness from the suite result.
     - _Requirements: 5.1–5.10, 6.2–6.5, 7.9, 10.15_
 
-- [ ] 14. Apply completion-inline policy classifications with the code
+- [x] 14. Apply completion-inline policy classifications with the code
   - Depend on edge-eager-dispatch task 11 and transient-wft task C.2's real consult
     sites. Add the typed default-off deployment field/catalog entry, bool and
     duration `Wired` registry entries, override/reset tests and empty-config checks.
   - Change only the two owned classification rows as described in the design;
     preserve source scope/defaults and update evidence/owner/feature enablement.
-    The eager row is implemented; retain the heartbeat row until its consult site lands.
+    Both rows are implemented with their typed runtime consult sites.
   - Run ledger tests, `cargo run -p compatibility-docs --locked -- write`, then
     `cargo run -p compatibility-docs --locked -- check`; inspect all three generated
     artifacts. Run the existing required policy/renderer properties with the new

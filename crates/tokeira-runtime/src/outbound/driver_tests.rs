@@ -230,7 +230,7 @@ proptest! {
             let expected = state.transition_seq;
             state.transition_seq = expected.next();
             for id in 1..=lower { insert(&mut state, id); }
-            let transition = Transition { expected_seq: expected, next_state: state.clone(), history_events: Default::default(), event_principals: Default::default(), request_dedupe_ops: Default::default(), activity_ops: Default::default(), timer_ops: Default::default(), dispatch_ops: Default::default(), events_numbered_at_close: 0, growth_limits: None };
+            let transition = Transition { expected_seq: expected, next_state: state.clone(), history_events: Default::default(), event_principals: Default::default(), request_dedupe_ops: Default::default(), activity_ops: Default::default(), timer_ops: Default::default(), dispatch_ops: Default::default(), events_numbered_at_close: 0, workflow_task_heartbeat_timed_out: false, growth_limits: None };
             repo.commit_transition(state.run_key, transition, WriteFence::Unfenced).await.unwrap();
             let mut remaining = Vec::new();
             loop {

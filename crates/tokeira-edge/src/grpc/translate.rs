@@ -2741,6 +2741,7 @@ pub(crate) fn disable_eager_activity_for_buggy_clients(
 pub fn respond_completed_request_to_edge(
     req: workflowservice::RespondWorkflowTaskCompletedRequest,
 ) -> Result<RespondWorkflowTaskCompletedRequest, ProtoConversionError> {
+    let wire_completion_empty = req.commands.is_empty() && req.messages.is_empty();
     // Index messages by ID so ProtocolMessage commands can
     // look up their corresponding message body. The original request order
     // is preserved separately: messages NOT referenced by any command are
@@ -2895,6 +2896,7 @@ pub fn respond_completed_request_to_edge(
             .is_some_and(|capabilities| capabilities.discard_speculative_workflow_task_with_events),
         commands,
         command_sizes,
+        wire_completion_empty,
         force_create_new_workflow_task: req.force_create_new_workflow_task,
         return_new_workflow_task: req.return_new_workflow_task,
         query_results: req
@@ -3914,6 +3916,15 @@ fn pending_wft_to_proto(
             enums::PendingWorkflowTaskState::Scheduled as i32
         },
         scheduled_time: Some(to_proto_timestamp(wft.scheduled_at)),
+        // Describe encodes Go's zero time for an absent origin, not an omitted
+        // timestamp (service/history/api/describeworkflow/api.go:222-226 @ v1.31.0).
+        original_scheduled_time: Some(wft.original_scheduled_at.map_or(
+            prost_types::Timestamp {
+                seconds: -62_135_596_800,
+                nanos: 0,
+            },
+            to_proto_timestamp,
+        )),
         started_time: wft.started_at.map(to_proto_timestamp),
         attempt: wft.attempt as i32,
         ..Default::default()
@@ -7606,6 +7617,68 @@ mod tests {
     use tokeira_kernel::state::WorkflowVersioningInfo;
     use tokeira_proto::public::temporal::api::{filter::v1 as filter, taskqueue::v1 as taskqueue};
     use tokeira_types::RunKey;
+
+    #[test]
+    fn heartbeat_wire_message_progress_is_independent_of_translated_commands() {
+        let empty = respond_completed_request_to_edge(
+            workflowservice::RespondWorkflowTaskCompletedRequest {
+                force_create_new_workflow_task: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(empty.wire_completion_empty);
+        let mut progress = respond_completed_request_to_edge(
+            workflowservice::RespondWorkflowTaskCompletedRequest {
+                force_create_new_workflow_task: true,
+                messages: vec![
+                    tokeira_proto::public::temporal::api::protocol::v1::Message {
+                        id: "rejection".into(),
+                        body: Some(prost_types::Any {
+                            type_url: "type.googleapis.com/temporal.api.update.v1.Rejection".into(),
+                            value: Vec::new(),
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(progress.commands.len(), 1);
+        progress.commands.clear();
+        assert!(!progress.wire_completion_empty);
+    }
+
+    fn assert_describe_original_time(original: Option<OffsetDateTime>) {
+        let description = crate::translate::PendingWorkflowTaskDescription {
+            original_scheduled_at: original,
+            is_started: true,
+            scheduled_at: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            started_at: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::hours(2)),
+            attempt: 1,
+        };
+        let response = pending_wft_to_proto(&description);
+        assert_eq!(
+            response.original_scheduled_time,
+            Some(prost_types::Timestamp {
+                seconds: original.map_or(-62_135_596_800, |at| at.unix_timestamp()),
+                nanos: original.map_or(0, |at| at.nanosecond() as i32),
+            })
+        );
+    }
+
+    #[test]
+    fn describe_pending_workflow_task_reports_original_time() {
+        assert_describe_original_time(Some(
+            OffsetDateTime::UNIX_EPOCH + time::Duration::nanoseconds(123_456_789),
+        ));
+    }
+
+    #[test]
+    fn describe_pending_workflow_task_reports_zero_for_absent_origin() {
+        assert_describe_original_time(None);
+    }
 
     #[test]
     fn proto_duration_conversion_caps_large_values() {

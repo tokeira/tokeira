@@ -348,6 +348,8 @@ pub struct RespondWorkflowTaskCompletedRequest {
     pub command_sizes: Vec<tokeira_kernel::CommandPayloadSizes>,
     pub return_new_workflow_task: bool,
     pub force_create_new_workflow_task: bool,
+    /// Original wire emptiness, retained even if translation drops a message.
+    pub wire_completion_empty: bool,
     pub query_results: HashMap<String, QueryResultDto>,
     pub messages: Vec<ProtocolMessageDto>,
 }
@@ -531,6 +533,8 @@ pub struct PendingChildDescription {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingWorkflowTaskDescription {
+    /// Heartbeat-chain origin, absent for legacy state.
+    pub original_scheduled_at: Option<OffsetDateTime>,
     pub is_started: bool,
     pub scheduled_at: OffsetDateTime,
     pub started_at: Option<OffsetDateTime>,

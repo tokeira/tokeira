@@ -81,6 +81,7 @@ proptest! {
                         if kind == 1 { WorkflowCommand::CompleteWorkflow { result: result.clone() } } else { WorkflowCommand::FailWorkflow { failure: Payload::new(failure.encode_to_vec()) } }],
                     eager_activities: Default::default(),
                     inline_workflow_task: None,
+                    heartbeat: Default::default(),
                     force_new_workflow_task: false, limits: Default::default(), delivered_update_ids: Vec::new(), request: RequestContext::unattributed(start.now + Duration::seconds(1)), now: start.now + Duration::seconds(1), command_sizes: Vec::new(),
                 }).await.unwrap();
             }
@@ -167,6 +168,7 @@ async fn continue_as_new_task_ids_increase_across_runs() {
             }],
             eager_activities: Default::default(),
             inline_workflow_task: None,
+            heartbeat: Default::default(),
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),

@@ -460,3 +460,8 @@ fn completion_inline_atomic_start_has_no_dispatch_row() {
         &tokio::runtime::Runtime::new().unwrap(),
     );
 }
+
+#[tokio::test]
+async fn heartbeat_original_schedule_memory_roundtrip() {
+    crate::workflow_dispatch_tests::heartbeat_original_schedule_roundtrip(&InMemoryStore::default()).await;
+}

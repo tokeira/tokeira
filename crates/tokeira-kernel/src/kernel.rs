@@ -1293,6 +1293,7 @@ impl BasicKernel {
             return Err(Reject::NotPaused);
         }
 
+        let paused_at = state.pause_info.as_ref().map(|info| info.pause_time);
         let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
@@ -1346,8 +1347,16 @@ impl BasicKernel {
             let pending = builder
                 .state
                 .pending_workflow_task
-                .as_ref()
+                .as_mut()
                 .expect("retained task exists");
+            // A failure/timeout during pause retains a placeholder where v1.31.0
+            // has no pending task. Resume starts that task's scheduling window;
+            // an older, still-pending schedule keeps its original window
+            // (workflow/util.go:52-69, api/unpauseworkflow/api.go:64-76 @ v1.31.0).
+            if paused_at.is_some_and(|at| pending.scheduled_at >= at) {
+                pending.scheduled_at = req.now;
+                pending.original_scheduled_at = Some(req.now);
+            }
             let sticky = builder.state.sticky.as_ref().filter(|affinity| {
                 !affinity.sticky_queue.0.is_empty() && pending.schedule_to_start_deadline.is_some()
             });
@@ -1985,6 +1994,47 @@ impl BasicKernel {
             return Err(Reject::WorkflowTaskTokenMismatch);
         }
 
+        // Refuse after token validation, without mutating paused state
+        // (respondworkflowtaskcompleted/api.go:209-214 @ v1.31.0).
+        if state.status == ExecutionStatus::Paused && req.force_new_workflow_task {
+            return Err(Reject::ForcedWorkflowTaskWhilePaused);
+        }
+        // Only the original wire request decides progress: translation can drop
+        // messages. Equality is still inside the heartbeat window
+        // (respondworkflowtaskcompleted/api.go:288-299 @ v1.31.0).
+        let heartbeat = req.force_new_workflow_task && req.heartbeat.wire_empty;
+        let expired = heartbeat
+            && pending.original_scheduled_at.is_some_and(|original| {
+                original > OffsetDateTime::UNIX_EPOCH
+                    && original
+                        .checked_add(req.heartbeat.timeout)
+                        .is_some_and(|deadline| req.now > deadline)
+            });
+        if expired {
+            let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
+            builder.timeout_started_workflow_task(&pending, started_event_id, false);
+            // Timeout clears old affinity; completion then applies the request's
+            // attributes (respondworkflowtaskcompleted/api.go:298-342 @ v1.31.0).
+            builder.state.sticky = req
+                .sticky
+                .as_ref()
+                .filter(|sticky| !sticky.queue.0.is_empty())
+                .map(|sticky| StickyAffinity {
+                    worker_identity: inline_identity.clone(),
+                    sticky_queue: sticky.queue.clone(),
+                    schedule_to_start_timeout: sticky.schedule_to_start_timeout,
+                });
+            builder.schedule_workflow_task();
+            builder.start_completion_workflow_task(
+                req.inline_workflow_task.as_ref(),
+                &inline_identity,
+                inline_worker_version.as_ref(),
+            )?;
+            let mut transition = builder.finish()?;
+            transition.workflow_task_heartbeat_timed_out = true;
+            return Ok(transition);
+        }
+
         // K3 (spec speculative-wft): a SPECULATIVE completion that is not a
         // heartbeat and carries ONLY update rejections (an empty command set
         // counts — nothing processed ≡ all-rejections) DROPS without trace:
@@ -2378,6 +2428,9 @@ impl BasicKernel {
             } else {
                 builder.schedule_workflow_task();
             }
+        }
+        if heartbeat && let Some(next) = &mut builder.state.pending_workflow_task {
+            next.original_scheduled_at = pending.original_scheduled_at;
         }
         builder.start_completion_workflow_task(
             req.inline_workflow_task.as_ref(),
@@ -3911,6 +3964,11 @@ impl BasicKernel {
                 .expect("validated pending workflow task must still exist");
             current.started_event_id = None;
             current.started_at = None;
+            // A failed attempt starts a fresh scheduling/heartbeat window even
+            // when its Scheduled event is suppressed
+            // (workflow_task_state_machine.go:357-391 @ v1.31.0).
+            current.scheduled_at = req.now;
+            current.original_scheduled_at = Some(req.now);
             // A retained transient retry is a fresh schedule for advice
             // purposes: the next start recomputes it (Requirement 2.7;
             // workflow_task_state_machine.go:98-99, 158-159 @ v1.31.0).
@@ -4042,6 +4100,10 @@ impl BasicKernel {
                     .as_mut()
                     .expect("validated pending workflow task must still exist");
                 current.attempt = 1;
+                // Unpause recognizes this as a replacement retained during the
+                // pause, rather than the schedule that preceded it.
+                current.scheduled_at = req.now;
+                current.original_scheduled_at = Some(req.now);
                 // Disarm the fired deadline so a paused-retained task cannot
                 // time out again before resume re-dispatches it.
                 current.schedule_to_start_deadline = None;
@@ -4079,156 +4141,7 @@ impl BasicKernel {
         }
 
         let mut builder = TransitionBuilder::new(state, req.now, None);
-        // Same sticky rule as the failure path (raise S4): a start-to-close
-        // timeout while the run's REAL sticky queue is set clears the
-        // affinity and retries fresh at attempt 1 without counting —
-        // v1.31.0's `failWorkflowTask` applies its sticky override to
-        // timeout-driven calls identically
-        // (workflow_task_state_machine.go:1010-1027 @ v1.31.0).
-        let sticky_was_set = builder
-            .state
-            .sticky
-            .as_ref()
-            .is_some_and(|sticky| !sticky.sticky_queue.0.is_empty());
-        // A started SPECULATIVE task persists Scheduled + Started LATE, at
-        // its real schedule/start times, immediately before the timed-out
-        // event — v1.31.0's `AddWorkflowTaskTimedOutEvent` creates "the
-        // corresponding WorkflowTaskScheduled and WorkflowTaskStarted events
-        // for speculative WT" first (workflow_task_state_machine.go:934-960
-        // @ v1.31.0; spec speculative-wft K4, Req 5.1). Corpus shape:
-        // 5 WorkflowTaskScheduled, 6 WorkflowTaskStarted,
-        // 7 WorkflowTaskTimedOut, then the attempt-2 retry stays virtual
-        // (`TestSpeculativeWorkflowTask_StartToCloseTimeout`).
-        let (scheduled_event_id, started_event_id) =
-            if pending.task_type == WorkflowTaskType::Speculative {
-                let scheduled = builder.emit_at(
-                    pending.scheduled_at,
-                    HistoryEventKind::WorkflowTaskScheduled {
-                        logical_seq: pending.logical_seq,
-                        task_queue: builder.state.current_workflow_task_queue().clone(),
-                        workflow_task_timeout: builder.state.workflow_task_timeout,
-                        attempt: pending.attempt,
-                    },
-                );
-                let started = builder.emit_at(
-                    pending.started_at.unwrap_or(req.now),
-                    HistoryEventKind::WorkflowTaskStarted {
-                        logical_seq: pending.logical_seq,
-                        scheduled_event_id: scheduled,
-                        attempt: pending.attempt,
-                        identity: WorkerIdentity(String::new()),
-                        request_id: format!("transient-materialize-{}", pending.logical_seq.0),
-                        // Materialization copies the Advice decided at the
-                        // attempt's start; it never recomputes it against the
-                        // thresholds in force now (stored task info,
-                        // workflow_task_state_machine.go:790-794, 881-885, 954-958
-                        // @ v1.31.0).
-                        history_size_bytes: pending.advice.history_size_bytes,
-                        suggest_continue_as_new: pending.advice.suggest_continue_as_new,
-                        suggest_continue_as_new_reasons: pending
-                            .advice
-                            .suggest_continue_as_new_reasons
-                            .clone(),
-                        target_worker_deployment_version_changed: pending
-                            .target_worker_deployment_version_changed,
-                        target_version_changed_enabled: pending.target_version_changed_enabled,
-                        target_deployment_version: pending.target_deployment_version.clone(),
-                    },
-                );
-                // The events are durable now; the (about-to-be-replaced or
-                // paused-retained) task is no longer speculative.
-                let current = builder
-                    .state
-                    .pending_workflow_task
-                    .as_mut()
-                    .expect("validated pending workflow task must still exist");
-                current.task_type = WorkflowTaskType::Normal;
-                current.scheduled_event_id = scheduled;
-                current.started_event_id = Some(started);
-                (scheduled, started)
-            } else {
-                (pending.scheduled_event_id, started_event_id)
-            };
-        // Only the attempt-1 timeout persists a WorkflowTaskTimedOut event; a
-        // transient (attempt>1) timeout writes nothing
-        // (workflow_task_state_machine.go:965-967 @ v1.31.0; Req B.3).
-        if pending.attempt == 1 {
-            builder.emit(HistoryEventKind::WorkflowTaskTimedOut {
-                logical_seq: pending.logical_seq,
-                scheduled_event_id,
-                started_event_id,
-                timeout_type: req.timeout_type,
-            });
-            // The persisted (non-transient) timeout records the problem
-            // identity; v1.31.0 stores only the start-to-close type and only
-            // when the event is emitted (`workflow_task_state_machine.go:
-            // 966-979 @ v1.31.0`), so a transient retry's timeout keeps
-            // reporting the earlier attempt-1 cause.
-            builder.state.last_workflow_task_problem =
-                Some(WorkflowTaskProblem::TimedOutStartToClose);
-        }
-        // A non-sticky start-to-close timeout advances the
-        // consecutive-problem accumulator exactly like a non-sticky explicit
-        // failure — both funnel into v1.31.0's `failWorkflowTask(true)`
-        // (`ApplyWorkflowTaskTimedOutEvent`,
-        // workflow_task_state_machine.go:263-268, 1017-1027 @ v1.31.0). The
-        // sticky case counts nothing (the affinity is dropped below either
-        // way).
-        if !sticky_was_set {
-            builder.state.workflow_task_attempts_since_last_success = builder
-                .state
-                .workflow_task_attempts_since_last_success
-                .saturating_add(1);
-        }
-        // WFT timeout is a close: buffered events flush after the timed-out
-        // event and before the retry's fresh WorkflowTaskScheduled
-        // (`AddWorkflowTaskScheduledEventAsHeartbeat` flushes first,
-        // workflow_task_state_machine.go @ v1.31.0). As at WFT-failed close, a
-        // non-empty flush converts the retry back to a NORMAL attempt-1 task
-        // (rule (i), workflow_task_state_machine.go:329-338; Req B.4). A
-        // sticky-dispatched timeout also resets to attempt 1 — v1.31.0's
-        // sticky override forces `incrementAttempt = false` for timeouts too —
-        // but only when the fresh reschedule actually runs: a PAUSED retention
-        // must keep the transient shape (see the WFT-failed paused corner).
-        let flushed = builder.flush_buffered();
-        let paused = builder.state.status == ExecutionStatus::Paused;
-        if flushed > 0 || (sticky_was_set && !paused) {
-            builder.state.workflow_task_attempt = 1;
-        } else {
-            builder.state.workflow_task_attempt += 1;
-        }
-        builder.state.sticky = None;
-        if paused {
-            // Paused workflows retain the pending task (cleared of started
-            // state) so it can be re-dispatched when the workflow resumes.
-            let current = builder
-                .state
-                .pending_workflow_task
-                .as_mut()
-                .expect("validated pending workflow task must still exist");
-            current.started_event_id = None;
-            current.started_at = None;
-            current.attempt = builder.state.workflow_task_attempt;
-            // Cleared like any other schedule so the resumed start recomputes
-            // the advice (Requirement 2.7).
-            current.advice = RecordedAdvice::default();
-        } else {
-            // Active workflows get a fresh WorkflowTaskScheduled event so the
-            // SDK state machine sees the correct Scheduled→Started sequence.
-            builder.state.pending_workflow_task = None;
-            builder.schedule_workflow_task();
-        }
-        // M.1: a speculative start-to-close timeout counts a timer-task request
-        // AND the start-to-close timeout, both with the operation tag
-        // (`TestSpeculativeWorkflowTask_StartToCloseTimeout`).
-        if pending.task_type == WorkflowTaskType::Speculative {
-            builder
-                .dispatch_ops
-                .push(DispatchOp::RecordSpeculativeTimeout {
-                    namespace_id: builder.state.namespace_id,
-                    start_to_close: true,
-                });
-        }
+        builder.timeout_started_workflow_task(&pending, started_event_id, true);
         builder.finish()
     }
 
@@ -4472,6 +4385,7 @@ impl BasicKernel {
             } => {
                 state.timers.remove(WORKFLOW_START_DELAY_TIMER_ID);
                 state.pending_workflow_task = Some(PendingWorkflowTask {
+                    original_scheduled_at: Some(event.happened_at),
                     task_type: WorkflowTaskType::Normal,
                     schedule_to_start_deadline: None,
                     target_worker_deployment_version_changed: false,
@@ -4511,6 +4425,10 @@ impl BasicKernel {
                     "stored WFT target-change result must match its replay operands"
                 );
                 state.pending_workflow_task = Some(PendingWorkflowTask {
+                    original_scheduled_at: state
+                        .pending_workflow_task
+                        .as_ref()
+                        .and_then(|pending| pending.original_scheduled_at),
                     task_type: WorkflowTaskType::Normal,
                     schedule_to_start_deadline: None,
                     target_worker_deployment_version_changed:
@@ -4601,6 +4519,10 @@ impl BasicKernel {
                         .map(|pending| pending.attempt)
                         .unwrap_or(0);
                     state.pending_workflow_task = Some(PendingWorkflowTask {
+                        // No Scheduled event exists for this reconstructed transient retry.
+                        // ApplyTransientWorkflowTaskScheduled leaves its origin absent
+                        // (workflow_task_state_machine.go:141-163 @ v1.31.0).
+                        original_scheduled_at: None,
                         advice: Default::default(),
                         task_type: WorkflowTaskType::Normal,
                         schedule_to_start_deadline: None,
@@ -4648,6 +4570,10 @@ impl BasicKernel {
                     .map(|pending| pending.attempt)
                     .unwrap_or(0);
                 state.pending_workflow_task = Some(PendingWorkflowTask {
+                    // No Scheduled event exists for this reconstructed transient retry.
+                    // ApplyTransientWorkflowTaskScheduled leaves its origin absent
+                    // (workflow_task_state_machine.go:141-163 @ v1.31.0).
+                    original_scheduled_at: None,
                     advice: Default::default(),
                     task_type: WorkflowTaskType::Normal,
                     schedule_to_start_deadline: None,
@@ -8271,6 +8197,7 @@ impl TransitionBuilder {
                 })
             };
         self.state.pending_workflow_task = Some(PendingWorkflowTask {
+            original_scheduled_at: Some(self.now),
             task_type,
             logical_seq,
             scheduled_event_id,
@@ -8457,6 +8384,169 @@ impl TransitionBuilder {
         }
 
         Ok(())
+    }
+
+    // Completion heartbeat expiry and the ordinary timer share materialization,
+    // attempt/sticky handling and buffered-event ordering. Completion applies its
+    // new sticky attributes before selecting the successor queue.
+    fn timeout_started_workflow_task(
+        &mut self,
+        pending: &PendingWorkflowTask,
+        started_event_id: i64,
+        schedule_successor: bool,
+    ) {
+        // Same sticky rule as the failure path (raise S4): a start-to-close
+        // timeout while the run's REAL sticky queue is set clears the
+        // affinity and retries fresh at attempt 1 without counting —
+        // v1.31.0's `failWorkflowTask` applies its sticky override to
+        // timeout-driven calls identically
+        // (workflow_task_state_machine.go:1010-1027 @ v1.31.0).
+        let sticky_was_set = self
+            .state
+            .sticky
+            .as_ref()
+            .is_some_and(|sticky| !sticky.sticky_queue.0.is_empty());
+        // A started SPECULATIVE task persists Scheduled + Started LATE, at
+        // its real schedule/start times, immediately before the timed-out
+        // event — v1.31.0's `AddWorkflowTaskTimedOutEvent` creates "the
+        // corresponding WorkflowTaskScheduled and WorkflowTaskStarted events
+        // for speculative WT" first (workflow_task_state_machine.go:934-960
+        // @ v1.31.0; spec speculative-wft K4, Req 5.1). Corpus shape:
+        // 5 WorkflowTaskScheduled, 6 WorkflowTaskStarted,
+        // 7 WorkflowTaskTimedOut, then the attempt-2 retry stays virtual
+        // (`TestSpeculativeWorkflowTask_StartToCloseTimeout`).
+        let (scheduled_event_id, started_event_id) =
+            if pending.task_type == WorkflowTaskType::Speculative {
+                let scheduled = self.emit_at(
+                    pending.scheduled_at,
+                    HistoryEventKind::WorkflowTaskScheduled {
+                        logical_seq: pending.logical_seq,
+                        task_queue: self.state.current_workflow_task_queue().clone(),
+                        workflow_task_timeout: self.state.workflow_task_timeout,
+                        attempt: pending.attempt,
+                    },
+                );
+                let started = self.emit_at(
+                    pending.started_at.unwrap_or(self.now),
+                    HistoryEventKind::WorkflowTaskStarted {
+                        logical_seq: pending.logical_seq,
+                        scheduled_event_id: scheduled,
+                        attempt: pending.attempt,
+                        identity: WorkerIdentity(String::new()),
+                        request_id: format!("transient-materialize-{}", pending.logical_seq.0),
+                        // Materialization copies the Advice decided at the
+                        // attempt's start; it never recomputes it against the
+                        // thresholds in force now (stored task info,
+                        // workflow_task_state_machine.go:790-794, 881-885, 954-958
+                        // @ v1.31.0).
+                        history_size_bytes: pending.advice.history_size_bytes,
+                        suggest_continue_as_new: pending.advice.suggest_continue_as_new,
+                        suggest_continue_as_new_reasons: pending
+                            .advice
+                            .suggest_continue_as_new_reasons
+                            .clone(),
+                        target_worker_deployment_version_changed: pending
+                            .target_worker_deployment_version_changed,
+                        target_version_changed_enabled: pending.target_version_changed_enabled,
+                        target_deployment_version: pending.target_deployment_version.clone(),
+                    },
+                );
+                // The events are durable now; the (about-to-be-replaced or
+                // paused-retained) task is no longer speculative.
+                let current = self
+                    .state
+                    .pending_workflow_task
+                    .as_mut()
+                    .expect("validated pending workflow task must still exist");
+                current.task_type = WorkflowTaskType::Normal;
+                current.scheduled_event_id = scheduled;
+                current.started_event_id = Some(started);
+                (scheduled, started)
+            } else {
+                (pending.scheduled_event_id, started_event_id)
+            };
+        // Only the attempt-1 timeout persists a WorkflowTaskTimedOut event; a
+        // transient (attempt>1) timeout writes nothing
+        // (workflow_task_state_machine.go:965-967 @ v1.31.0; Req B.3).
+        if pending.attempt == 1 {
+            self.emit(HistoryEventKind::WorkflowTaskTimedOut {
+                logical_seq: pending.logical_seq,
+                scheduled_event_id,
+                started_event_id,
+                timeout_type: WorkflowTaskTimeoutType::StartToClose,
+            });
+            // The persisted (non-transient) timeout records the problem
+            // identity; v1.31.0 stores only the start-to-close type and only
+            // when the event is emitted (`workflow_task_state_machine.go:
+            // 966-979 @ v1.31.0`), so a transient retry's timeout keeps
+            // reporting the earlier attempt-1 cause.
+            self.state.last_workflow_task_problem = Some(WorkflowTaskProblem::TimedOutStartToClose);
+        }
+        // A non-sticky start-to-close timeout advances the
+        // consecutive-problem accumulator exactly like a non-sticky explicit
+        // failure — both funnel into v1.31.0's `failWorkflowTask(true)`
+        // (`ApplyWorkflowTaskTimedOutEvent`,
+        // workflow_task_state_machine.go:263-268, 1017-1027 @ v1.31.0). The
+        // sticky case counts nothing (the affinity is dropped below either
+        // way).
+        if !sticky_was_set {
+            self.state.workflow_task_attempts_since_last_success = self
+                .state
+                .workflow_task_attempts_since_last_success
+                .saturating_add(1);
+        }
+        // WFT timeout is a close: buffered events flush after the timed-out
+        // event and before the retry's fresh WorkflowTaskScheduled
+        // (`AddWorkflowTaskScheduledEventAsHeartbeat` flushes first,
+        // workflow_task_state_machine.go @ v1.31.0). As at WFT-failed close, a
+        // non-empty flush converts the retry back to a NORMAL attempt-1 task
+        // (rule (i), workflow_task_state_machine.go:329-338; Req B.4). A
+        // sticky-dispatched timeout also resets to attempt 1 — v1.31.0's
+        // sticky override forces `incrementAttempt = false` for timeouts too —
+        // but only when the fresh reschedule actually runs: a PAUSED retention
+        // must keep the transient shape (see the WFT-failed paused corner).
+        let flushed = self.flush_buffered();
+        let paused = self.state.status == ExecutionStatus::Paused;
+        if flushed > 0 || (sticky_was_set && !paused) {
+            self.state.workflow_task_attempt = 1;
+        } else {
+            self.state.workflow_task_attempt += 1;
+        }
+        self.state.sticky = None;
+        if paused {
+            // Paused workflows retain the pending task (cleared of started
+            // state) so it can be re-dispatched when the workflow resumes.
+            let current = self
+                .state
+                .pending_workflow_task
+                .as_mut()
+                .expect("validated pending workflow task must still exist");
+            current.started_event_id = None;
+            current.started_at = None;
+            current.scheduled_at = self.now;
+            current.original_scheduled_at = Some(self.now);
+            current.attempt = self.state.workflow_task_attempt;
+            // Cleared like any other schedule so the resumed start recomputes
+            // the advice (Requirement 2.7).
+            current.advice = RecordedAdvice::default();
+        } else {
+            // Active workflows get a fresh WorkflowTaskScheduled event so the
+            // SDK state machine sees the correct Scheduled→Started sequence.
+            self.state.pending_workflow_task = None;
+            if schedule_successor {
+                self.schedule_workflow_task();
+            }
+        }
+        // M.1: a speculative start-to-close timeout counts a timer-task request
+        // AND the start-to-close timeout, both with the operation tag
+        // (`TestSpeculativeWorkflowTask_StartToCloseTimeout`).
+        if pending.task_type == WorkflowTaskType::Speculative {
+            self.dispatch_ops
+                .push(DispatchOp::RecordSpeculativeTimeout {
+                    namespace_id: self.state.namespace_id,
+                    start_to_close: true,
+                });
+        }
     }
 
     /// Shared mutation for ordinary polls and completion-owned starts. Retry
@@ -8943,6 +9033,7 @@ impl TransitionBuilder {
             timer_ops: self.timer_ops,
             dispatch_ops: self.dispatch_ops,
             events_numbered_at_close: u32::try_from(events_numbered_at_close).unwrap_or(u32::MAX),
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         }
     }
@@ -8970,6 +9061,7 @@ impl TransitionBuilder {
             timer_ops: self.timer_ops,
             dispatch_ops: self.dispatch_ops,
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         }
     }
@@ -9303,6 +9395,9 @@ pub enum Reject {
     /// it is.
     #[error("workflow is paused")]
     WorkflowPaused,
+    /// A paused workflow cannot force a new task from completion.
+    #[error("Workflow is paused and force create new workflow task is not allowed.")]
+    ForcedWorkflowTaskWhilePaused,
     /// An update request reached a running workflow whose workflow task keeps
     /// failing: its attempt is [`crate::limits::FAIL_UPDATE_WORKFLOW_TASK_ATTEMPT`]
     /// or more. v1.31.0 answers `WorkflowNotReady` at once

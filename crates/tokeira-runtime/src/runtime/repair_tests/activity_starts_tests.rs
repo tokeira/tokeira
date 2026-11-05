@@ -121,6 +121,7 @@ async fn write_state(
                 timer_ops: SmallVec::new(),
                 dispatch_ops: SmallVec::new(),
                 events_numbered_at_close: 0,
+                workflow_task_heartbeat_timed_out: false,
                 growth_limits: None,
             },
             WriteFence::Unfenced,

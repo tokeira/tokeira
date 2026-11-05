@@ -1610,6 +1610,28 @@ pub struct CompletionActivityStarts {
     pub request_ids: BTreeMap<String, tokeira_types::Uuid>,
 }
 
+/// Fixed heartbeat-only workflow-task limit; only the harness may override it
+/// (common/dynamicconfig/constants.go:2427-2431 @ v1.31.0).
+pub const WORKFLOW_TASK_HEARTBEAT_TIMEOUT: Duration = Duration::minutes(30);
+
+/// Completion operands resolved before submission and reused across OCC retries.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowTaskHeartbeat {
+    /// Whether the original wire request had neither commands nor messages.
+    pub wire_empty: bool,
+    /// Runtime-resolved limit; the kernel performs no configuration or clock I/O.
+    pub timeout: Duration,
+}
+
+impl Default for WorkflowTaskHeartbeat {
+    fn default() -> Self {
+        Self {
+            wire_empty: false,
+            timeout: WORKFLOW_TASK_HEARTBEAT_TIMEOUT,
+        }
+    }
+}
+
 /// Request from a worker that has finished processing a
 /// workflow task and is returning a batch of commands.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1662,6 +1684,9 @@ pub struct WorkflowTaskCompletedRequest {
     /// If true, the kernel schedules a new WFT even when no
     /// commands require one.
     pub force_new_workflow_task: bool,
+    /// Original wire progress and the heartbeat-only limit for this completion.
+    #[serde(default)]
+    pub heartbeat: WorkflowTaskHeartbeat,
     /// Eager activity operands resolved before entering the lane.
     #[serde(default)]
     pub eager_activities: CompletionActivityStarts,

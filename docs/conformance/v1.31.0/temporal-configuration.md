@@ -18,8 +18,8 @@ Counts below include dynamic settings and the separately audited static groups.
 | Tokeira treatment | Count |
 |---|---:|
 | deployment policy | 11 |
-| pinned behavioral constant | 202 |
-| auto-tuned mechanical setting | 355 |
+| pinned behavioral constant | 203 |
+| auto-tuned mechanical setting | 354 |
 | conformance-only override | 49 |
 | architecturally irrelevant or excluded | 8 |
 
@@ -406,7 +406,7 @@ Counts below include dynamic settings and the separately audited static groups.
 | `history.visibilityTaskBatchSize` | global / `Int` | `100` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:2140` |
 | `history.workflowIdReuseMinimalInterval` | namespace / `Duration` | `1 * time.Second` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | kernel-excluded | `common/dynamicconfig/constants.go:2785` |
 | `history.workflowTaskCriticalAttempt` | global / `Int` | `10` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:2432` |
-| `history.workflowTaskHeartbeatTimeout` | namespace / `Duration` | `time.Minute * 30` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:2427` |
+| `history.workflowTaskHeartbeatTimeout` | namespace / `Duration` | `time.Minute * 30` | pinned behavioral constant — Fixed 30-minute workflow-task heartbeat limit in production, with no TOML field. The conformance harness may override the duration per test; completion resolves it once before submission. | wired | `common/dynamicconfig/constants.go:2427` |
 | `history.workflowTaskRetryMaxInterval` | global / `Duration` | `time.Minute * 10` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:2437` |
 | `history.xdcCacheMaxSizeBytes` | global / `Int` | `8 * 1024 * 1024` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:1663` |
 | `internal-frontend.globalNamespaceRPS` | namespace / `Int` | `0` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:736` |

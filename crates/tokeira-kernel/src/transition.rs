@@ -22,6 +22,10 @@ use crate::{
 /// faithful implementation of the architecture docs.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Transition {
+    /// Completion timed out its heartbeat chain. The runtime may expose the
+    /// corresponding error only after this transition commits; even a transient
+    /// timeout with no history event carries this result.
+    pub workflow_task_heartbeat_timed_out: bool,
     /// The `TransitionSeq` that was current when the kernel
     /// began processing. Storage uses this as an optimistic
     /// concurrency fence.

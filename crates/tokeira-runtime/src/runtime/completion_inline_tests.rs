@@ -69,6 +69,7 @@ pub(super) fn completion(
         sticky: None,
         commands: Vec::new(),
         command_sizes: Vec::new(),
+        heartbeat: Default::default(),
         force_new_workflow_task: false,
         eager_activities: Default::default(),
         inline_workflow_task: return_new.then_some(CompletionWorkflowTaskStart {

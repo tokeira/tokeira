@@ -134,6 +134,7 @@ fn pending_task(
     started_event_id: Option<i64>,
 ) -> PendingWorkflowTask {
     PendingWorkflowTask {
+        original_scheduled_at: None,
         advice: Default::default(),
         task_type,
         schedule_to_start_deadline: None,
@@ -215,6 +216,7 @@ fn completion(state: &WorkflowState, commands: Vec<WorkflowCommand>) -> Command 
         command_sizes: Vec::new(),
         eager_activities: Default::default(),
         inline_workflow_task: None,
+        heartbeat: Default::default(),
         force_new_workflow_task: false,
         limits: WorkflowTaskCompletionLimits::default(),
         delivered_update_ids: Vec::new(),

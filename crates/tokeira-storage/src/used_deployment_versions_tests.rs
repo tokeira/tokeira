@@ -62,6 +62,7 @@ pub(crate) fn with_started_task(mut state: WorkflowState) -> (WorkflowState, [Hi
     let logical_seq = state.next_workflow_task_seq;
     let scheduled_event_id = state.last_event_id + 1;
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        original_scheduled_at: None,
         advice: Default::default(),
         task_type: WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
@@ -143,6 +144,7 @@ pub(crate) fn completion(
         commands,
         eager_activities: Default::default(),
         inline_workflow_task: None,
+        heartbeat: Default::default(),
         force_new_workflow_task: false,
         limits: WorkflowTaskCompletionLimits::default(),
         delivered_update_ids: Vec::new(),

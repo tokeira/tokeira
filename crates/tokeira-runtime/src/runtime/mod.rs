@@ -96,6 +96,8 @@ mod commit;
 #[cfg(test)]
 mod completion_eager_tests;
 #[cfg(test)]
+mod completion_heartbeat_tests;
+#[cfg(test)]
 mod completion_inline_tests;
 #[cfg(test)]
 mod discovery_tests;
@@ -3011,6 +3013,7 @@ pub(crate) mod tests {
             commands: Vec::new(),
             eager_activities: Default::default(),
             inline_workflow_task: None,
+            heartbeat: Default::default(),
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
@@ -3247,6 +3250,7 @@ pub(crate) mod tests {
                 timer_ops: SmallVec::new(),
                 dispatch_ops: SmallVec::new(),
                 events_numbered_at_close: 0,
+                workflow_task_heartbeat_timed_out: false,
                 growth_limits: None,
             },
             WriteFence::Unfenced,

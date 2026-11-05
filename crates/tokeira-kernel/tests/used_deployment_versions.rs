@@ -238,6 +238,7 @@ impl Run {
                 command_sizes: Vec::new(),
                 eager_activities: Default::default(),
                 inline_workflow_task: None,
+                heartbeat: Default::default(),
                 force_new_workflow_task: false,
                 limits: WorkflowTaskCompletionLimits {
                     search_attribute_value_size_limit: limit,
@@ -580,6 +581,7 @@ fn a_dropped_speculative_completion_leaves_the_list() {
     let last_event_id = run.state.last_event_id;
     let logical_seq = run.state.next_workflow_task_seq;
     run.state.pending_workflow_task = Some(PendingWorkflowTask {
+        original_scheduled_at: None,
         advice: Default::default(),
         task_type: WorkflowTaskType::Speculative,
         schedule_to_start_deadline: None,

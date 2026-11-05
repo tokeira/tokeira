@@ -1509,6 +1509,7 @@ pub(crate) fn run_completion_inline_cases(
                         }),
                         commands: Vec::new(),
                         command_sizes: Vec::new(),
+                        heartbeat: Default::default(),
                         force_new_workflow_task: reason == 0,
                         eager_activities: Default::default(),
                         inline_workflow_task: return_new.then(|| {
@@ -1607,4 +1608,63 @@ pub(crate) fn run_completion_inline_cases(
             },
         )
         .unwrap();
+}
+
+/// Both backends preserve optional heartbeat origins without changing dispatch derivation.
+pub(crate) async fn heartbeat_original_schedule_roundtrip(backend: &impl Backend) {
+    for original in [
+        None,
+        Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()),
+    ] {
+        let key = RunKey::new();
+        let mut initial = fresh_transition(key);
+        initial.next_state.workflow_id.0 = key.0.to_string();
+        initial
+            .next_state
+            .pending_workflow_task
+            .as_mut()
+            .unwrap()
+            .original_scheduled_at = original;
+        let state = applied(commit(backend, initial).await.unwrap());
+        let LoadedRun::Existing(loaded) = backend.repo().load_run(key).await.unwrap() else {
+            panic!("run");
+        };
+        assert_eq!(
+            loaded
+                .pending_workflow_task
+                .as_ref()
+                .unwrap()
+                .original_scheduled_at,
+            original
+        );
+        assert_eq!(loaded.pending_workflow_task, state.pending_workflow_task);
+        let mut started = state.clone();
+        let expected_seq = state.transition_seq;
+        started.transition_seq = expected_seq.next();
+        let pending = started.pending_workflow_task.as_mut().unwrap();
+        pending.started_event_id = Some(state.last_event_id + 1);
+        pending.started_at = Some(pending.scheduled_at);
+        let transition = Transition {
+            expected_seq,
+            next_state: started,
+            history_events: Default::default(),
+            event_principals: Default::default(),
+            request_dedupe_ops: Default::default(),
+            activity_ops: Default::default(),
+            timer_ops: Default::default(),
+            dispatch_ops: Default::default(),
+            events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
+            growth_limits: None,
+        };
+        applied(commit(backend, transition).await.unwrap());
+        let LoadedRun::Existing(loaded) = backend.repo().load_run(key).await.unwrap() else {
+            panic!("run");
+        };
+        assert_eq!(
+            loaded.pending_workflow_task.unwrap().original_scheduled_at,
+            original
+        );
+        assert!(backend.row(key).await.unwrap().is_none());
+    }
 }

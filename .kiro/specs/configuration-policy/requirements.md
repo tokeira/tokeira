@@ -673,9 +673,9 @@ classified accurately, so that production behavior is explicit.
 4. WHEN those consult sites land, THE conformance key registry and ledger SHALL
    agree on bool/duration types and wired support, and THE renderer SHALL regenerate
    and check its owned outputs from code and data.
-5. WHILE the heartbeat consult site is pending, THE heartbeat classification data
-   and generated treatment SHALL remain unchanged; THE eager activity records SHALL
-   describe the implemented deployment setting and wired override.
+5. THE classification data and generated treatments SHALL describe both implemented
+   consult sites: the eager deployment setting and the fixed heartbeat limit, each
+   with its typed wired conformance override.
 
 ## Iteration and Feedback Notes
 

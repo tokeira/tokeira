@@ -131,6 +131,7 @@ fn with_task(
     started: bool,
 ) -> WorkflowState {
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        original_scheduled_at: None,
         advice: Default::default(),
         task_type,
         schedule_to_start_deadline: None,
@@ -282,6 +283,7 @@ fn completion(
         command_sizes: Vec::new(),
         eager_activities: Default::default(),
         inline_workflow_task: None,
+        heartbeat: Default::default(),
         force_new_workflow_task: false,
         limits: WorkflowTaskCompletionLimits {
             total_updates,

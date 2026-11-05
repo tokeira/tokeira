@@ -127,6 +127,7 @@ fn open_state(signal_count: u64) -> WorkflowState {
 /// `started`, started at 14.
 fn with_task(mut state: WorkflowState, started: bool) -> WorkflowState {
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        original_scheduled_at: None,
         advice: Default::default(),
         task_type: WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
@@ -263,6 +264,7 @@ fn completion(
         command_sizes: Vec::new(),
         eager_activities: Default::default(),
         inline_workflow_task: None,
+        heartbeat: Default::default(),
         force_new_workflow_task: false,
         limits: WorkflowTaskCompletionLimits {
             total_updates,

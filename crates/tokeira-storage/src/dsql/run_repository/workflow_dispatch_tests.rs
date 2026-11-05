@@ -1090,3 +1090,15 @@ fn completion_inline_live_atomic_start_has_no_dispatch_row() {
     runtime.block_on(fixture.store.shutdown()).unwrap();
     runtime.block_on(fixture.pool.close());
 }
+
+#[tokio::test]
+async fn heartbeat_original_schedule_live_roundtrip() -> Result<()> {
+    if std::env::var_os("TOKEIRA_DSQL_TEST_DATABASE_URL").is_none() {
+        return Ok(());
+    }
+    let fixture = Fixture::connect(1).await?;
+    crate::workflow_dispatch_tests::heartbeat_original_schedule_roundtrip(&fixture).await;
+    fixture.store.shutdown().await?;
+    fixture.pool.close().await;
+    Ok(())
+}

@@ -10694,6 +10694,7 @@ mod tests {
             resource_id: String::new(),
             worker_instance_key: "worker-instance-a".to_owned(),
             worker_control_task_queue: "worker-control-a".to_owned(),
+            wire_completion_empty: commands.is_empty(),
             commands,
             command_sizes: Vec::new(),
             return_new_workflow_task: false,
@@ -10715,6 +10716,260 @@ mod tests {
             "system.enableActivityEagerExecution",
             tokeira_conformance::OverrideValue::Bool(true),
         )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_paused_completion_is_refused_without_commit() -> Result<()> {
+        let (service, runtime, namespace_id, _, _) = update_test_service().await?;
+        let first = runtime
+            .poll_workflow_task(
+                tokeira_types::QueueKey {
+                    namespace_id,
+                    task_queue: TaskQueueName("queue-a".into()),
+                    task_kind: TaskKind::Workflow,
+                    deployment: None,
+                    build_id: None,
+                },
+                WorkerIdentity("worker-a".into()),
+                std::time::Duration::from_secs(1),
+            )
+            .await?
+            .unwrap();
+        runtime
+            .submit(
+                first.run_key,
+                tokeira_kernel::Command::PauseWorkflow(tokeira_kernel::PauseWorkflowRequest {
+                    identity: "operator".into(),
+                    reason: "pause".into(),
+                    request: RequestContext::unattributed(first.started_time),
+                    now: first.started_time,
+                }),
+            )
+            .await?;
+        let before = service.repo.load_run(first.run_key).await?;
+        let history = service.repo.read_history_to_end(first.run_key, 0).await?;
+        let mut request = scoped_workflow_completion(
+            crate::task_token::encode(first.token, namespace_id)?,
+            Vec::new(),
+        );
+        request.namespace = "default".into();
+        request.force_create_new_workflow_task = true;
+        let status = tonic::Status::from(
+            service
+                .respond_workflow_task_completed(&HeaderMap::new(), request)
+                .await
+                .expect_err("paused"),
+        );
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            status.message(),
+            "Workflow is paused and force create new workflow task is not allowed."
+        );
+        assert_eq!(service.repo.load_run(first.run_key).await?, before);
+        assert_eq!(
+            service.repo.read_history_to_end(first.run_key, 0).await?,
+            history
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_timeout_keeps_queries_buffered_and_updates_unsent() -> Result<()> {
+        let (mut service, runtime, namespace_id, workflow_id, run_id) =
+            update_test_service().await?;
+        let first = runtime
+            .poll_workflow_task(
+                tokeira_types::QueueKey {
+                    namespace_id,
+                    task_queue: TaskQueueName("queue-a".into()),
+                    task_kind: TaskKind::Workflow,
+                    deployment: None,
+                    build_id: None,
+                },
+                WorkerIdentity("worker-a".into()),
+                std::time::Duration::from_secs(1),
+            )
+            .await?
+            .unwrap();
+        runtime
+            .update_workflow(
+                ExecutionRef {
+                    namespace_id,
+                    workflow_id,
+                    run_id: Some(run_id),
+                },
+                "not-sent".into(),
+                "handler".into(),
+                Payloads::default(),
+                RequestContext {
+                    request_id: RequestId("admit-not-sent".into()),
+                    ..RequestContext::unattributed(first.scheduled_time)
+                },
+                Duration::seconds(1),
+                UpdateWaitPolicy::Admitted,
+                0,
+            )
+            .await?;
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        service
+            .buffered_queries
+            .buffer(
+                first.run_key,
+                tokeira_runtime::BufferedQuery {
+                    query_id: "waiting".into(),
+                    query_type: "read".into(),
+                    query_args: Payloads::default(),
+                    required_barrier: 0,
+                    enqueued_at: std::time::Instant::now(),
+                    deadline: first.scheduled_time + Duration::hours(1),
+                    response_tx: tx,
+                },
+            )
+            .expect("buffer");
+        let mut adapter = RuntimeAdapter::new(runtime.clone());
+        adapter.completion_now = Some(first.scheduled_time + Duration::minutes(31));
+        service.runtime = Arc::new(adapter);
+        let mut request = scoped_workflow_completion(
+            crate::task_token::encode(first.token, namespace_id)?,
+            Vec::new(),
+        );
+        request.namespace = "default".into();
+        request.return_new_workflow_task = true;
+        request.force_create_new_workflow_task = true;
+        let error = service
+            .respond_workflow_task_completed(&HeaderMap::new(), request)
+            .await
+            .expect_err("heartbeat timeout");
+        assert_eq!(
+            tonic::Status::from(error).message(),
+            "workflow task heartbeat timeout"
+        );
+        assert!(service.buffered_queries.has_buffered(first.run_key));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            runtime
+                .pending_update_transports(first.run_key, false)
+                .iter()
+                .map(|update| update.update_id.as_str())
+                .collect::<Vec<_>>(),
+            ["not-sent"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_limit_with_request_sticky() -> Result<()> {
+        heartbeat_limit_chain(true).await
+    }
+
+    #[tokio::test]
+    async fn heartbeat_limit_without_request_sticky() -> Result<()> {
+        heartbeat_limit_chain(false).await
+    }
+
+    async fn heartbeat_limit_chain(request_sticky: bool) -> Result<()> {
+        let (mut service, runtime, namespace_id, _, _) = update_test_service().await?;
+        let queue = tokeira_types::QueueKey {
+            namespace_id,
+            task_queue: TaskQueueName("queue-a".into()),
+            task_kind: TaskKind::Workflow,
+            deployment: None,
+            build_id: None,
+        };
+        let first = runtime
+            .poll_workflow_task(
+                queue.clone(),
+                WorkerIdentity("worker-a".into()),
+                std::time::Duration::from_secs(1),
+            )
+            .await?
+            .unwrap();
+        let original = first.scheduled_time;
+        let mut token = crate::task_token::encode(first.token.clone(), namespace_id)?;
+        for step in 1..=226 {
+            let now = original + Duration::seconds(step * 8);
+            let mut adapter = RuntimeAdapter::new(runtime.clone());
+            adapter.completion_now = Some(now);
+            service.runtime = Arc::new(adapter);
+            let mut req = scoped_workflow_completion(token.clone(), Vec::new());
+            req.namespace = "default".into();
+            req.return_new_workflow_task = true;
+            req.force_create_new_workflow_task = true;
+            if step < 226 || request_sticky {
+                req.sticky = Some(tokeira_kernel::StickySpec {
+                    queue: TaskQueueName("heartbeat-cache".into()),
+                    schedule_to_start_timeout: Duration::seconds(5),
+                });
+            }
+            let before = service.repo.read_history_to_end(first.run_key, 0).await?;
+            let response = service
+                .respond_workflow_task_completed(&HeaderMap::new(), req)
+                .await;
+            if step < 226 {
+                token = response?
+                    .workflow_task
+                    .expect("heartbeat successor")
+                    .task_token;
+                continue;
+            }
+            let error = response.expect_err("heartbeat-only chain past 30 minutes must time out");
+            let status = tonic::Status::from(error);
+            assert_eq!(status.code(), tonic::Code::NotFound);
+            assert_eq!(status.message(), "workflow task heartbeat timeout");
+            let tokeira_kernel::LoadedRun::Existing(state) =
+                service.repo.load_run(first.run_key).await?
+            else {
+                panic!("run")
+            };
+            let pending = state.pending_workflow_task.as_ref().unwrap();
+            assert_eq!(state.sticky.is_some(), request_sticky);
+            let history = service.repo.read_history_to_end(first.run_key, 0).await?;
+            let tail = &history[before.len()..];
+            assert_eq!(tail.len(), 3);
+            assert!(matches!(
+                tail[0].kind,
+                tokeira_kernel::HistoryEventKind::WorkflowTaskTimedOut { .. }
+            ));
+            assert!(matches!(
+                tail[1].kind,
+                tokeira_kernel::HistoryEventKind::WorkflowTaskScheduled { .. }
+            ));
+            assert!(matches!(
+                tail[2].kind,
+                tokeira_kernel::HistoryEventKind::WorkflowTaskStarted { .. }
+            ));
+            runtime
+                .submit(
+                    first.run_key,
+                    tokeira_kernel::Command::WorkflowTaskTimedOut(
+                        tokeira_kernel::WorkflowTaskTimedOutRequest {
+                            logical_seq: pending.logical_seq,
+                            started_event_id: pending.started_event_id.unwrap(),
+                            timeout_type: tokeira_kernel::WorkflowTaskTimeoutType::StartToClose,
+                            now: now + state.workflow_task_timeout + Duration::nanoseconds(1),
+                        },
+                    ),
+                )
+                .await?;
+            let history = service.repo.read_history_to_end(first.run_key, 0).await?;
+            assert!(matches!(
+                history[before.len() + 3].kind,
+                tokeira_kernel::HistoryEventKind::WorkflowTaskTimedOut { .. }
+            ));
+            let next = runtime
+                .poll_workflow_task(
+                    queue.clone(),
+                    WorkerIdentity("worker-b".into()),
+                    std::time::Duration::from_secs(1),
+                )
+                .await?
+                .expect("normal-queue retry");
+            assert_eq!(next.token.attempt, if request_sticky { 1 } else { 2 });
+        }
         Ok(())
     }
 
@@ -11524,6 +11779,7 @@ mod tests {
                 }],
                 eager_activities: Default::default(),
                 inline_workflow_task: None,
+                heartbeat: Default::default(),
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -11666,6 +11922,7 @@ mod tests {
                 ],
                 eager_activities: Default::default(),
                 inline_workflow_task: None,
+                heartbeat: Default::default(),
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),

@@ -481,6 +481,10 @@ pub fn workflow_task_completed_request(
                 advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
             },
         ),
+        heartbeat: tokeira_kernel::WorkflowTaskHeartbeat {
+            wire_empty: req.wire_completion_empty,
+            ..Default::default()
+        },
         force_new_workflow_task: req.force_create_new_workflow_task,
         limits: Default::default(),
         // Filled by the runtime from its update registry before the commit
@@ -1045,6 +1049,7 @@ mod tests {
             commands: Vec::new(),
             command_sizes: Vec::new(),
             return_new_workflow_task: false,
+            wire_completion_empty: false,
             force_create_new_workflow_task: false,
             query_results: std::collections::HashMap::new(),
             messages: Vec::new(),

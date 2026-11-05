@@ -39,6 +39,8 @@ pub struct RuntimeAdapter<R> {
     runtime: Arc<TokeiraRuntime<R>>,
     #[cfg(test)]
     pub(crate) completion_barrier: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    #[cfg(test)]
+    pub(crate) completion_now: Option<time::OffsetDateTime>,
 }
 
 impl<R> RuntimeAdapter<R> {
@@ -47,6 +49,8 @@ impl<R> RuntimeAdapter<R> {
             runtime,
             #[cfg(test)]
             completion_barrier: None,
+            #[cfg(test)]
+            completion_now: None,
         }
     }
 
@@ -240,6 +244,11 @@ where
         &self,
         req: WorkflowTaskCompletedRequest,
     ) -> Result<WorkflowMutationOutcome> {
+        #[cfg(test)]
+        let req = WorkflowTaskCompletedRequest {
+            now: self.completion_now.unwrap_or(req.now),
+            ..req
+        };
         let started_event_id = req.token.started_event_id;
         let completed = self.runtime.complete_workflow_task_with_result(req).await?;
         let result = completed.commit;

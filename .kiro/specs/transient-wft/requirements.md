@@ -271,7 +271,10 @@ bounded, so that it cannot retain a worker indefinitely without progress.
    a committed heartbeat timeout.
 4. WHEN heartbeat-only completion remains within the limit, THE next heartbeat
    task SHALL inherit the original scheduled timestamp unchanged. A task scheduled
-   after progress or a timeout SHALL use its fresh schedule time.
+   after progress or a timeout SHALL use its fresh schedule time. WHEN a failure
+   or timeout leaves a task pending during a pause, THE task SHALL take the unpause
+   time as both its schedule and original time; a task scheduled before the pause
+   SHALL keep both times.
 5. WHEN loading a task written without an original scheduled timestamp, THE decoder
    SHALL use absence; THE heartbeat check SHALL never time out that task or its
    no-progress heartbeat chain by inventing a timestamp.
@@ -295,9 +298,14 @@ bounded, so that it cannot retain a worker indefinitely without progress.
 11. WHEN that unreturned successor reaches start-to-close timeout, THE existing WFT
     timeout rules SHALL apply; on a sticky queue THE timeout SHALL clear sticky
     affinity and schedule the next task on the normal queue at the same attempt.
+12. WHEN DescribeWorkflowExecution reports a pending workflow task, THE response
+    SHALL include its original scheduled time, or `0001-01-01T00:00:00Z` when the
+    task has none (`service/history/api/describeworkflow/api.go:222-226 @ v1.31.0`).
 
 Authority: `service/history/api/respondworkflowtaskcompleted/api.go:281-342,573-604,731-737`,
-`service/history/workflow/workflow_task_state_machine.go:307-313,934-984,1010-1015`, and
+`service/history/workflow/workflow_task_state_machine.go:307-313,934-984,1010-1015`,
+`service/history/workflow/util.go:52-69`,
+`service/history/api/unpauseworkflow/api.go:64-76`, and
 `common/dynamicconfig/constants.go:2427-2431 @ v1.31.0`.
 
 The successor follows [completion Requirement 3](../api-conformance-wft-completion/requirements.md#requirement-3-return-new-workflow-task-semantics)

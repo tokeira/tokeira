@@ -113,6 +113,7 @@ fn open_state() -> WorkflowState {
 /// Attempt-1 task with persisted Scheduled(8)/Started(9) events.
 fn with_started_attempt1(mut state: WorkflowState) -> WorkflowState {
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        original_scheduled_at: None,
         advice: Default::default(),
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
@@ -133,6 +134,7 @@ fn with_started_attempt1(mut state: WorkflowState) -> WorkflowState {
 fn with_started_attempt2_virtual(mut state: WorkflowState) -> WorkflowState {
     state.workflow_task_attempt = 2;
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        original_scheduled_at: None,
         advice: Default::default(),
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
@@ -391,6 +393,7 @@ fn schedule_to_start_timeout_never_counts() {
     let mut state = open_state();
     state.sticky = Some(real_sticky());
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        original_scheduled_at: None,
         advice: Default::default(),
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: Some(now()),
@@ -456,6 +459,7 @@ fn completion_clears_count_and_recorded_problem() {
                 commands: vec![],
                 eager_activities: Default::default(),
                 inline_workflow_task: None,
+                heartbeat: Default::default(),
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -485,6 +489,7 @@ fn sticky_queue_start_preserves_real_sticky_affinity() {
     let mut state = open_state();
     state.sticky = Some(real_sticky());
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        original_scheduled_at: None,
         advice: Default::default(),
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,

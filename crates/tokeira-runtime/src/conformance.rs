@@ -102,3 +102,11 @@ pub(crate) fn activity_eager_execution(default: bool) -> bool {
         .get_bool("system.enableActivityEagerExecution")
         .unwrap_or(default)
 }
+
+/// Resolve the test-only heartbeat override once before completion submission.
+pub(crate) fn workflow_task_heartbeat_timeout() -> time::Duration {
+    reads()
+        .get_duration("history.workflowTaskHeartbeatTimeout")
+        .map(|timeout| time::Duration::try_from(timeout).unwrap_or(time::Duration::MAX))
+        .unwrap_or(tokeira_kernel::WORKFLOW_TASK_HEARTBEAT_TIMEOUT)
+}

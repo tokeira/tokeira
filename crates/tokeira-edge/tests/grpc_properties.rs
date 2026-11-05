@@ -253,6 +253,10 @@ proptest! {
             (proto.pending_workflow_task.as_ref(), edge.pending_workflow_task.as_ref())
         {
             prop_assert_eq!(actual.attempt, expected.attempt as i32);
+            prop_assert_eq!(actual.original_scheduled_time, Some(prost_types::Timestamp {
+                seconds: expected.original_scheduled_at.map_or(-62_135_596_800, |at| at.unix_timestamp()),
+                nanos: expected.original_scheduled_at.map_or(0, |at| at.nanosecond() as i32),
+            }));
             prop_assert_eq!(
                 actual.state,
                 if expected.is_started {
@@ -1110,16 +1114,21 @@ fn arb_pending_wft() -> impl Strategy<Value = PendingWorkflowTaskDescription> {
         0i64..4_000_000_000i64,
         prop::option::of(0i64..4_000_000_000i64),
         1u32..5,
+        prop::option::of(0i64..4_000_000_000i64),
     )
-        .prop_map(|(is_started, scheduled_at, started_at, attempt)| {
-            PendingWorkflowTaskDescription {
-                is_started,
-                scheduled_at: OffsetDateTime::from_unix_timestamp(scheduled_at).unwrap(),
-                started_at: started_at
-                    .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
-                attempt,
-            }
-        })
+        .prop_map(
+            |(is_started, scheduled_at, started_at, attempt, original)| {
+                PendingWorkflowTaskDescription {
+                    original_scheduled_at: original
+                        .map(|seconds| OffsetDateTime::from_unix_timestamp(seconds).unwrap()),
+                    is_started,
+                    scheduled_at: OffsetDateTime::from_unix_timestamp(scheduled_at).unwrap(),
+                    started_at: started_at
+                        .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
+                    attempt,
+                }
+            },
+        )
 }
 
 fn arb_list_response() -> impl Strategy<Value = ListWorkflowExecutionsResponse> {

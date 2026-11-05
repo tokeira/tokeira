@@ -125,6 +125,7 @@ fn open_state() -> WorkflowState {
 /// A run whose attempt-1 workflow task is started (Scheduled 13, Started 14).
 fn started(mut state: WorkflowState) -> WorkflowState {
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        original_scheduled_at: None,
         advice: Default::default(),
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
@@ -169,6 +170,7 @@ fn completion(
         command_sizes,
         eager_activities: Default::default(),
         inline_workflow_task: None,
+        heartbeat: Default::default(),
         force_new_workflow_task: false,
         limits: WorkflowTaskCompletionLimits::default(),
         delivered_update_ids: Vec::new(),

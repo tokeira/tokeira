@@ -270,13 +270,13 @@ from dynamic settings because their topology and ownership differ.
 
 ### Completion-inline start policy amendment
 
-The eager activity treatment is implemented in the checked ledger and generated
-documentation. The heartbeat treatment awaits its runtime consult site:
+Both completion-inline treatments are implemented in the checked ledger and
+generated documentation:
 
 | Temporal key | Implementation status | Treatment |
 |---|---|---|
 | `system.enableActivityEagerExecution` | Implemented | `deployment-policy`, override `wired`: typed `policy.compatibility.enable_activity_eager_execution`, default false, startup-static and applying to every namespace; per-test bool override wins. |
-| `history.workflowTaskHeartbeatTimeout` | Pending heartbeat consult site; currently `auto-tuned-mechanical-setting`, override `none` | `pinned-behavioral-constant`, override `wired`: fixed 30 minutes in production, no deployment field; per-test duration override only. |
+| `history.workflowTaskHeartbeatTimeout` | Implemented | `pinned-behavioral-constant`, override `wired`: fixed 30 minutes in production, no deployment field; per-test duration override only. |
 
 Preserve the upstream `Namespace` scope and defaults in the source inventory:
 `common/dynamicconfig/constants.go:193-197,2427-2431 @ v1.31.0`. Tokeira's deployment
@@ -306,8 +306,8 @@ then `cargo run -p compatibility-docs --locked -- write` and
 `cargo run -p compatibility-docs --locked -- check`. The renderer
 (`tools/compatibility-docs/src/main.rs`) owns `temporal-configuration.md`,
 `tokeira-configuration.md` and `config.example.toml`; never hand-edit those outputs.
-Eager activity data and generated artifacts now describe the implemented consult
-site. Keep the heartbeat data unchanged until its consult site is implemented.
+Both classification rows and generated artifacts describe their implemented consult
+sites. The heartbeat limit has no production configuration field.
 
 ### 3. Enriched Feature Catalog
 

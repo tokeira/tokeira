@@ -97,7 +97,7 @@ code comments (AGENTS §8, §9). Verify with `cargo clippy -p tokeira-kernel -p 
   `OverrideDynamicConfig` out-of-scope skip** (30m default not operationally wrong; same class as
   `MaxCallbacksPerWorkflow`; owner decision 2026-07-03). No config knob, no `original_scheduled_at`.
 
-- [ ] C.2 Implement the fixed heartbeat limit with compatible state
+- [x] C.2 Implement the fixed heartbeat limit with compatible state
   - Depends on B.6/B.8 and the completion-inline result work in
     [api-conformance-wft-completion tasks 6.2–6.4](../api-conformance-wft-completion/tasks.md).
     Match Item C's exact successor oracle: reapply request sticky attributes,
@@ -123,10 +123,10 @@ code comments (AGENTS §8, §9). Verify with `cargo clippy -p tokeira-kernel -p 
   - Integrate the parked normal-poll heartbeat race and lost-response recovery
     fixtures from the completion spec. Run focused kernel/runtime/edge/storage
     tests and root §10.4 with the combined change.
-  - Orchestrator runs the entire `TestWorkflowTaskTestSuite`, including both
+  - [ ] Orchestrator runs the entire `TestWorkflowTaskTestSuite`, including both
     heartbeat tests, with the override; remove the historical fork skip only as
     part of that verification, never edit corpus bodies or claim a skipped pass.
-  - _Requirements: C.1.1–C.1.8; Properties C1, C2_
+  - _Requirements: C.1.1–C.1.12; Properties C1, C2_
 
 ## Phase D — Docs
 

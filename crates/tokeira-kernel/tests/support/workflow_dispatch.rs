@@ -45,7 +45,8 @@ proptest! {
                     let pending = retry.next_state.pending_workflow_task.as_ref().unwrap();
                     prop_assert_eq!(pending.attempt, start_attempt + 1);
                     prop_assert_eq!(pending.scheduled_event_id, retry.next_state.last_event_id + 1);
-                    prop_assert_eq!(pending.scheduled_at, old.scheduled_at);
+                    prop_assert_eq!(pending.scheduled_at, fixed_now());
+                    prop_assert_eq!(pending.original_scheduled_at, Some(fixed_now()));
                     retry
                 }
                 1 => {

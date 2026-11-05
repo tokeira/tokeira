@@ -833,7 +833,13 @@ where
 
         let stop_draining = result.is_err() || breach.is_some();
         let reply = match result {
-            Ok((commit_result, mut dispatch_ops, history_events, activity_starts)) => {
+            Ok((
+                commit_result,
+                mut dispatch_ops,
+                history_events,
+                activity_starts,
+                heartbeat_timed_out,
+            )) => {
                 if let CommitResult::Applied { new_state } = &commit_result {
                     // Clear on every committed started-task closure, including
                     // transient failures with no history event. Do this in the
@@ -1092,7 +1098,14 @@ where
                             }
                         }
                     }
-                    Ok(commit_result)
+                    if heartbeat_timed_out && matches!(commit_result, CommitResult::Applied { .. })
+                    {
+                        // All durable and tracking effects precede this committed
+                        // outcome. In particular, no successor response is built.
+                        Err(crate::errors::WorkflowTaskHeartbeatTimedOut.into())
+                    } else {
+                        Ok(commit_result)
+                    }
                 }
             }
             Err(error) => Err(error),
@@ -1199,7 +1212,7 @@ where
         &tokeira_clock::SystemClock,
     )
     .await
-    .map(|(result, dispatch, history, _)| (result, dispatch, history))
+    .map(|(result, dispatch, history, _, _)| (result, dispatch, history))
 }
 
 /// Bring the loaded state and the command up to date with the update requests
@@ -1265,6 +1278,7 @@ async fn handle_message_with_cache<K, R>(
     SmallVec<[DispatchOp; 4]>,
     SmallVec<[HistoryEvent; 8]>,
     SmallVec<[String; 4]>,
+    bool,
 )>
 where
     K: Kernel + Send + Sync + 'static,
@@ -1310,6 +1324,7 @@ async fn handle_message_with_successor<K, R>(
     SmallVec<[DispatchOp; 4]>,
     SmallVec<[HistoryEvent; 8]>,
     SmallVec<[String; 4]>,
+    bool,
 )>
 where
     K: Kernel + Send + Sync + 'static,
@@ -1392,6 +1407,7 @@ where
                     SmallVec::new(),
                     SmallVec::new(),
                     SmallVec::new(),
+                    false,
                 ));
             };
             let fence = owner.fence_at(execution_home_bundle, acquisition.epoch);
@@ -1435,6 +1451,7 @@ where
                     SmallVec::new(),
                     SmallVec::new(),
                     SmallVec::new(),
+                    false,
                 ));
             }
         }
@@ -1478,11 +1495,13 @@ where
                 SmallVec::new(),
                 SmallVec::new(),
                 SmallVec::new(),
+                false,
             ));
         }
         let dispatch_ops = transition.dispatch_ops.clone();
         let history_events = transition.history_events.clone();
         let activity_starts = newly_started_activity_ids(&transition.activity_ops);
+        let heartbeat_timed_out = transition.workflow_task_heartbeat_timed_out;
 
         let commit_result = if let Some(submission) = outbound {
             repo.commit_outbound_transition(
@@ -1570,6 +1589,7 @@ where
                     dispatch_ops,
                     history_events,
                     activity_starts,
+                    heartbeat_timed_out,
                 ));
             }
             CommitResult::Duplicate => {
@@ -1578,6 +1598,7 @@ where
                     SmallVec::new(),
                     SmallVec::new(),
                     SmallVec::new(),
+                    false,
                 ));
             }
             CommitResult::CurrentExecutionConflict {
@@ -1598,6 +1619,7 @@ where
                     SmallVec::new(),
                     SmallVec::new(),
                     SmallVec::new(),
+                    false,
                 ));
             }
             CommitResult::Conflict { reason } => {
@@ -2153,6 +2175,7 @@ pub(crate) fn track_committed_run(
 #[cfg(test)]
 mod tests {
     mod atomic_successors;
+    mod heartbeat;
     mod outbound_publication;
     use std::{
         collections::{BTreeMap, HashMap, VecDeque},
@@ -2358,6 +2381,7 @@ mod tests {
                     timer_ops: SmallVec::new(),
                     dispatch_ops: SmallVec::new(),
                     events_numbered_at_close: 0,
+                    workflow_task_heartbeat_timed_out: false,
                     growth_limits: None,
                 });
             }
@@ -2401,6 +2425,7 @@ mod tests {
                 timer_ops: SmallVec::<[TimerOp; 4]>::new(),
                 dispatch_ops: state.dispatch_ops.clone(),
                 events_numbered_at_close: 0,
+                workflow_task_heartbeat_timed_out: false,
                 growth_limits: None,
             })
         }
@@ -3086,6 +3111,7 @@ mod tests {
                 timer_ops: SmallVec::new(),
                 dispatch_ops: SmallVec::new(),
                 events_numbered_at_close: 0,
+                workflow_task_heartbeat_timed_out: false,
                 growth_limits: None,
             })
         }
@@ -3122,6 +3148,7 @@ mod tests {
                 timer_ops: SmallVec::new(),
                 dispatch_ops: SmallVec::new(),
                 events_numbered_at_close: 0,
+                workflow_task_heartbeat_timed_out: false,
                 growth_limits: None,
             })
         }
@@ -3150,6 +3177,7 @@ mod tests {
             external_payload_size_bytes: 0,
             next_workflow_task_seq: LogicalTaskSeq::ONE,
             pending_workflow_task: Some(PendingWorkflowTask {
+                original_scheduled_at: None,
                 advice: Default::default(),
                 task_type: tokeira_kernel::WorkflowTaskType::Normal,
                 schedule_to_start_deadline: None,
@@ -3378,7 +3406,7 @@ mod tests {
 
         let kernel = MockKernel::new(SmallVec::new());
         let mut cache = LaneCache::new(&config);
-        let (result, _, _, _) = handle_message_with_cache(
+        let (result, ..) = handle_message_with_cache(
             &kernel,
             &repo,
             &owner,
@@ -3419,7 +3447,7 @@ mod tests {
             .unwrap()
             .push("loser".into());
         cache.insert(key, LoadedRun::Existing(loser));
-        let (result, _, _, _) = handle_message_with_cache(
+        let (result, ..) = handle_message_with_cache(
             &kernel,
             &repo,
             &owner,
@@ -3446,7 +3474,7 @@ mod tests {
             LoadedRun::Existing(new_state)
         );
         cache.evict(key);
-        let (result, _, _, _) = handle_message_with_cache(
+        let (result, ..) = handle_message_with_cache(
             &kernel,
             &repo,
             &owner,

@@ -7,18 +7,18 @@ use tokeira_kernel::{
 };
 use tokeira_storage::InMemoryStore;
 
-struct Fixture {
-    store: Arc<InMemoryStore>,
-    runtime: TokeiraRuntime<InMemoryStore>,
-    key: RunKey,
-    queue: QueueKey,
+pub(super) struct Fixture {
+    pub(super) store: Arc<InMemoryStore>,
+    pub(super) runtime: TokeiraRuntime<InMemoryStore>,
+    pub(super) key: RunKey,
+    pub(super) queue: QueueKey,
 }
 
-fn at(seconds: i64) -> OffsetDateTime {
+pub(super) fn at(seconds: i64) -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(2_000_000_000 + seconds).unwrap()
 }
 
-fn context(id: &str, seconds: i64) -> RequestContext {
+pub(super) fn context(id: &str, seconds: i64) -> RequestContext {
     RequestContext {
         request_id: RequestId(id.into()),
         ..RequestContext::unattributed(at(seconds))
@@ -26,7 +26,7 @@ fn context(id: &str, seconds: i64) -> RequestContext {
 }
 
 impl Fixture {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let store = Arc::new(InMemoryStore::default());
         let runtime = TokeiraRuntime::new(
             store.clone(),
@@ -55,21 +55,21 @@ impl Fixture {
         }
     }
 
-    async fn state(&self) -> WorkflowState {
+    pub(super) async fn state(&self) -> WorkflowState {
         let LoadedRun::Existing(state) = self.store.load_run(self.key).await.unwrap() else {
             panic!("existing run");
         };
         state
     }
 
-    async fn apply(&self, command: Command) {
+    pub(super) async fn apply(&self, command: Command) {
         assert!(matches!(
             self.runtime.submit(self.key, command).await.unwrap(),
             CommitResult::Applied { .. }
         ));
     }
 
-    async fn poll_and_start(&self, seconds: i64) -> StartedWorkflowTask {
+    pub(super) async fn poll_and_start(&self, seconds: i64) -> StartedWorkflowTask {
         let sequence = self
             .state()
             .await
@@ -140,7 +140,7 @@ impl Fixture {
         .await;
     }
 
-    async fn signal(&self, seconds: i64) {
+    pub(super) async fn signal(&self, seconds: i64) {
         self.apply(Command::Signal(SignalRequest {
             signal_name: "buffered".into(),
             input: Payloads::default(),
@@ -152,7 +152,7 @@ impl Fixture {
         .await;
     }
 
-    async fn complete(&self, task: &StartedWorkflowTask, seconds: i64) {
+    pub(super) async fn complete(&self, task: &StartedWorkflowTask, seconds: i64) {
         let mut request = completion(task, false);
         request.now = at(seconds);
         request.request = context(&format!("complete-{seconds}"), seconds);
@@ -162,12 +162,12 @@ impl Fixture {
             .unwrap();
     }
 
-    async fn history(&self) -> Vec<HistoryEvent> {
+    pub(super) async fn history(&self) -> Vec<HistoryEvent> {
         self.store.read_history_to_end(self.key, 0).await.unwrap()
     }
 }
 
-fn history_shape(history: &[HistoryEvent]) -> Vec<String> {
+pub(super) fn history_shape(history: &[HistoryEvent]) -> Vec<String> {
     history
         .iter()
         .enumerate()

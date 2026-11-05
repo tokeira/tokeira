@@ -7694,8 +7694,8 @@ impl TransitionBuilder {
     /// carry (`run-growth-limits` criterion 2.7), while a workflow task is
     /// started, force-fail that
     /// task with `FORCE_CLOSE_COMMAND`, flush the buffered batch, and schedule a
-    /// fresh normal task to redeliver it. The workflow SURVIVES and every
-    /// buffered event is preserved — distinct from a size-limit terminate
+    /// task at the failure's attempt (transient above 1). The workflow SURVIVES
+    /// and every buffered event is preserved — distinct from a size-limit terminate
     /// (`TestMaxBufferedEventsLimit` / `TestRateLimitBufferedEvents`: exactly
     /// one `WorkflowTaskFailed(FORCE_CLOSE_COMMAND)`, all 101 signals delivered).
     /// Returns true if it fired. [`Self::finish`] calls it at the end of every
@@ -7767,18 +7767,16 @@ impl TransitionBuilder {
                 .workflow_task_attempts_since_last_success
                 .saturating_add(1);
         }
-        // A running retry resets to attempt 1 when scheduling the buffered
-        // batch. A paused run only closes the failed task; its flush must keep
-        // the failure attempt until unpause schedules (service/history/workflow/
-        // mutable_state_impl.go:8220-8223 and
-        // workflow_task_state_machine.go:329-335,1003-1028 @ v1.31.0).
+        // The failure flushes before scheduling, so scheduling sees no buffer
+        // that could reset the attempt. This also preserves the failure attempt
+        // while paused, until unpause schedules the retry (service/history/workflow/
+        // util.go:26-69 and workflow_task_state_machine.go:332-337,1003-1028 @ v1.31.0).
         self.flush_buffered();
-        self.state.workflow_task_attempt =
-            if self.state.status == ExecutionStatus::Paused && !sticky_was_set {
-                self.state.workflow_task_attempt + 1
-            } else {
-                1
-            };
+        self.state.workflow_task_attempt = if sticky_was_set {
+            1
+        } else {
+            self.state.workflow_task_attempt + 1
+        };
         self.state.pending_workflow_task = None;
         self.schedule_workflow_task();
         true

@@ -10645,12 +10645,15 @@ fn buffer_limit_writes_a_started_speculative_task_before_failing_it() {
             ..
         }
     ));
-    // All 101 signals flush, then a fresh task redelivers them.
-    assert_eq!(shape.len(), 3 + 101 + 1);
+    // The buffer is already flushed when scheduling, so the attempt-2 retry is virtual.
+    assert_eq!(shape.len(), 3 + 101);
     assert_eq!(
         shape.last().unwrap(),
-        &(109, "WorkflowTaskScheduled".to_owned())
+        &(108, "WorkflowExecutionSignaled".to_owned())
     );
+    let retry = forced.next_state.pending_workflow_task.unwrap();
+    assert_eq!(retry.attempt, 2);
+    assert_eq!(retry.scheduled_event_id, 109);
 }
 
 proptest::proptest! {

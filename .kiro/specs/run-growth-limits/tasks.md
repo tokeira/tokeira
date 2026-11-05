@@ -57,6 +57,16 @@ Check each commit's growth in the stores against limits the runtime hands them, 
 
 - [x] 7. Checkpoint: the full bar of root `AGENTS.md` §10.4
 
+- [x] 8. Preserve the failure attempt after buffered-event force-close
+  - Correct the attempt and comments in `enforce_buffered_event_limit`; preserve
+    event materialization, failure counts, flushing and paused scheduling suppression.
+  - Reproduce normal, sticky, transient and speculative histories before the fix,
+    including poll/start, retry materialization and attempts-since-success counts.
+  - Update affected golden, property and integration expectations; verify running
+    and paused behavior, then run formatting, lint and test checks.
+  - Depends on task 7.
+  - _Requirements: 2.11, 3.3_
+
 ## Notes
 
 - Property tests use `proptest`, tagged `// Feature: run-growth-limits, Property N: <title>`.

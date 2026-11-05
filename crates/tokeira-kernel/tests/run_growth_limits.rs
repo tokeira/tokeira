@@ -489,7 +489,7 @@ fn a_force_close_for_buffered_events_is_numbered_at_close() {
     assert!(force_closed(&transition));
     assert_eq!(
         transition.history_events.len(),
-        1 + MAXIMUM_BUFFERED_EVENTS_BATCH + 1 + 1
+        1 + MAXIMUM_BUFFERED_EVENTS_BATCH + 1
     );
     assert_eq!(
         transition.events_numbered_at_close as usize,
@@ -506,14 +506,10 @@ fn buffered_events_over_the_size_limit_force_close_the_task() {
     assert!(force_closed(&second));
     assert_eq!(
         names(&second),
-        [
-            "WorkflowTaskFailed",
-            "Signaled",
-            "Signaled",
-            "WorkflowTaskScheduled"
-        ]
+        ["WorkflowTaskFailed", "Signaled", "Signaled"]
     );
     assert!(second.next_state.buffered_events.is_empty());
+    assert_eq!(second.next_state.pending_workflow_task.unwrap().attempt, 2);
 }
 
 #[test]
@@ -527,6 +523,10 @@ fn activity_results_over_the_count_limit_force_close_the_task() {
     let transition = complete_activity(state, MAXIMUM_BUFFERED_EVENTS_BATCH, payloads_of(4));
     assert!(force_closed(&transition));
     assert!(transition.next_state.buffered_events.is_empty());
+    assert_eq!(
+        transition.next_state.pending_workflow_task.unwrap().attempt,
+        2
+    );
 }
 
 #[test]
@@ -559,6 +559,7 @@ fn an_activity_start_leaves_the_buffered_limits_to_the_next_transition() {
         payloads_of(4),
     );
     assert!(force_closed(&next));
+    assert_eq!(next.next_state.pending_workflow_task.unwrap().attempt, 2);
 }
 
 /// Activities the property's runs can complete.
@@ -621,6 +622,8 @@ proptest! {
                 prop_assert!(transition.next_state.buffered_events.is_empty());
                 let pending = transition.next_state.pending_workflow_task.as_ref().unwrap();
                 prop_assert!(pending.started_event_id.is_none());
+                prop_assert_eq!(pending.attempt, 2);
+                prop_assert!(!transition.history_events.iter().any(|event| matches!(event.kind, HistoryEventKind::WorkflowTaskScheduled { .. })), "the transient retry has no scheduled event");
                 prop_assert_eq!(
                     transition.events_numbered_at_close as usize,
                     transition.history_events.len()

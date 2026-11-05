@@ -92,6 +92,8 @@ pub(crate) mod activity;
 mod activity_backlog_tests;
 #[cfg(test)]
 mod activity_retirement_tests;
+#[cfg(test)]
+mod buffered_force_close_tests;
 mod commit;
 #[cfg(test)]
 mod completion_eager_tests;

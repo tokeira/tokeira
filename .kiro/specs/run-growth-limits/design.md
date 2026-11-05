@@ -94,7 +94,7 @@ _For any_ failure, the activity's stored last failure SHALL be the failure itsel
 
 ### Buffered events (`crates/tokeira-kernel/src/kernel.rs`)
 
-- `enforce_buffered_event_limit` runs once at the end of every transition, rather than only after a signal, and also force-closes the task when the buffered events are over the size limit (criterion 2.7). What it records is unchanged (criterion 3.3).
+- `enforce_buffered_event_limit` runs once at the end of every transition, rather than only after a signal, and also force-closes the task when the buffered events are over the size limit (criterion 2.7). The replacement takes the failure's attempt under criterion 2.11: sticky resets to 1, otherwise it increments and stays transient; the already-flushed buffer does not reset it.
 - An activity's start is the exception: the runtime commits it outside the lane, which couldn't deliver the workflow task a force-close schedules, so the run's next transition checks what the start buffered. v1.31.0's own start writes no event, since its activities always carry a retry policy; only Tokeira's start of an activity without one, or by id, buffers an event.
 - A buffered event's size is the protobuf-encoded size of the payloads it carries: inputs, results, details, failures and headers (`payload_size.rs`). The kernel holds domain events, not protos, and payloads are what make events large. This errs low by each event's other fields, which v1.31.0 counts too: tens of bytes to a few hundred an event, so at most about 1% of the 2 MiB limit across 100 events.
 

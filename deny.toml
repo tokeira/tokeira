@@ -32,6 +32,14 @@ ignore = [
     # AWS profile with `login_session`. Drop this entry when the SDK moves to
     # crypto-bigint 0.7.6.
     "RUSTSEC-2026-0387", # `crypto-bigint` timing variability in constant-time operations
+    # `pin-utils` is unmaintained: its repository was archived after 0.1.1, and no
+    # release is safe to move to. It reaches the graph only through the AWS SDK's
+    # smithy crates: `aws-smithy-http` 0.63.6 and 0.64.0, `aws-smithy-runtime`
+    # 1.12.1 and `aws-smithy-types` 1.6.1. Their latest releases (0.64.3, 1.16.2 and
+    # 1.9.1) no longer use it, but `aws-config` and every `aws-sdk-*` crate in the
+    # lockfile still take `aws-smithy-http` 0.63, whose last release, 0.63.6, does.
+    # Drop this entry when an SDK update takes the smithy crates off it.
+    "RUSTSEC-2026-0441", # `pin-utils` unmaintained (transitive, via the AWS SDK)
 ]
 
 [licenses]

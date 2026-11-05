@@ -40,6 +40,49 @@ fn queue() -> QueueKey {
     }
 }
 
+#[test]
+fn placement_queue_homes_share_activity_and_workflow_home() {
+    let partitions = 16;
+    let bundles = 8;
+    let owner = Arc::new(RwLock::new(crate::shard::ShardOwner::new(bundles)));
+    let homes = PlacementQueueHomes {
+        owner: owner.clone(),
+        counts: RwLock::new((partitions, bundles)),
+    };
+    let workflow = queue();
+    let activity = QueueKey {
+        task_kind: TaskKind::Activity,
+        ..workflow.clone()
+    };
+    let id = tokeira_types::bundle_for_partition(
+        tokeira_types::workflow_queue_partition(
+            workflow.namespace_id,
+            &workflow.task_queue.0,
+            partitions,
+        ),
+        bundles,
+    );
+    owner
+        .write()
+        .unwrap()
+        .record_acquired(id, tokeira_types::ShardEpoch(3));
+    owner.write().unwrap().mark_active(id);
+
+    let workflow_home = homes.local_home(&workflow).unwrap();
+    let activity_home = homes.local_home(&activity).unwrap();
+    assert_eq!(activity_home.id, id);
+    assert_eq!(activity_home.id, workflow_home.id);
+    assert_eq!(activity_home.generation, workflow_home.generation);
+    assert!(!activity_home.cancel.is_cancelled());
+    assert!(!workflow_home.cancel.is_cancelled());
+
+    owner.write().unwrap().mark_draining(id);
+    assert!(activity_home.cancel.is_cancelled());
+    assert!(workflow_home.cancel.is_cancelled());
+    assert!(homes.local_home(&activity).is_none());
+    assert!(homes.local_home(&workflow).is_none());
+}
+
 pub(crate) fn transition(queue: &QueueKey, index: usize) -> Transition {
     let mut request = crate::runtime::tests::sample_start_request(None, None);
     request.namespace_id = queue.namespace_id;

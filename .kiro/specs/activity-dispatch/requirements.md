@@ -36,6 +36,7 @@ reviewed in the design. No dependency change is proposed.
   wanted row even before it is due; timeout and workflow-rule gates still apply.
 - **Execution home:** the bundle owning the workflow identity and its fenced writes.
 - **Queue home:** the current owner of the activity task-queue partition, which
+  is the queue's workflow-key partition, shared with its workflow tasks. This home
   serves poll demand independently of the execution home.
 - **Pass:** a traversal of a due discovery range with a fixed eligibility cutoff,
   a total-order continuation, and bounded scheduler slices.
@@ -237,6 +238,8 @@ reachable, so that a retained first page cannot hide later work.
    examine every row in that set.
 9. THE queue-home discovery path SHALL perform no activity pause/start transition
    or durable row deletion under a foreign execution home's ownership.
+10. THE edge SHALL route each activity poll, and `DescribeTaskQueue` for an activity
+    queue, to the queue home.
 
 ### Requirement 3: Offers are bounded and disposable
 

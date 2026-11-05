@@ -269,6 +269,24 @@ may retire a recovery mechanism before its replacement is verified.
     DSQL cluster, after the storage schema bootstrap, all three passed.
   - _Requirements: 7.2, 7.7, 8.4, 8.5, 8.7_
 
+- [x] 14. Route activity polls to the queue home
+  - Route every task kind by the queue's workflow-key partition in
+    `CacheBackedRouter`, the partition `PlacementQueueHomes::local_home` homes the
+    queue by. Activity polls, and `DescribeTaskQueue` for an activity queue, then
+    reach the queue home. The router's interface is unchanged.
+  - Replace the kind-specific routing test with one that routes activity and
+    workflow polls to the same remote home, on a queue whose old activity key
+    selects a bundle with a different owner. Nexus polls route as workflow polls.
+  - Add a 100-case property over namespace and queue names, partition and bundle
+    counts, and bundle owners across four nodes: from every node, both kinds route
+    to the owner of the workflow-key partition's bundle.
+  - Check that the runtime gives activity and workflow `QueueKey`s of the same
+    namespace and name the same local home.
+  - With the kind-specific key restored, both edge tests fail.
+  - Runtime placement, storage, the routing snapshot and the cache are unchanged.
+    No migration.
+  - _Requirements: 2.1, 2.10_
+
 ## Task Dependency Graph
 
 ```json
@@ -285,7 +303,8 @@ may retire a recovery mechanism before its replacement is verified.
   "10": ["5", "6", "7", "8", "9"],
   "11": ["2", "3", "5", "6", "7", "8", "9", "10"],
   "12": ["10", "11"],
-  "13": ["12"]
+  "13": ["12"],
+  "14": ["13"]
 }
 ```
 

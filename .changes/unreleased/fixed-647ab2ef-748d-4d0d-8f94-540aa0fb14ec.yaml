@@ -1,0 +1,5 @@
+kind: fixed
+body: On a cluster of more than one node, activity polls now reach the node that serves their task queue.
+time: 2026-11-05T12:37:43.704428+00:00
+custom:
+    Slice: 647ab2ef-748d-4d0d-8f94-540aa0fb14ec

@@ -1,0 +1,36 @@
+[package]
+name = "turmoil-sim"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Tokeira's real engine code on turmoil's simulated hosts and network"
+
+# Its own workspace root, with its own Cargo.lock, so the turmoil dependency
+# never enters the engine workspace's lockfile. An `exclude` entry in the root
+# manifest is not enough from a worktree nested inside the main checkout: cargo
+# keeps walking up and finds the main checkout's workspace instead.
+[workspace]
+
+[[bin]]
+name = "turmoil-sim"
+path = "src/main.rs"
+
+[lib]
+name = "turmoil_sim"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+prost-types = "0.14"
+tokeira-engine = { path = "../../../crates/tokeira-engine", default-features = false }
+tokeira-proto = { path = "../../../crates/tokeira-proto" }
+tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.14", features = ["transport"] }
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+turmoil = "=0.7.2"

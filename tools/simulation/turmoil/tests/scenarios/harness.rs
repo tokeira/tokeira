@@ -83,6 +83,6 @@ fn cluster_run(observed: bool) -> Trace {
     if observed {
         run.observe(oracle::one_owner_per_epoch);
     }
-    run.worker(|trace| workload::one_activity_across_nodes(trace, QueuePlacement::Agreeing));
+    run.worker(|trace| workload::one_activity_across_nodes(trace, QueuePlacement::Any));
     run.drive([]).expect("the simulation runs to the end")
 }

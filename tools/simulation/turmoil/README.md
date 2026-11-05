@@ -87,11 +87,11 @@ Property: every scheduled task is started or times out (`EventuallyResolved`,
 - **A workflow completes when its tasks start across nodes.** The workflow's home and its
   task queue's home are on different nodes. Its start, its tasks and its replies cross
   between them.
-- **An activity poll is served on the node the edge sends it to.** This test is
-  `#[ignore]`d and fails on current code. The edge sends an activity poll to the owner of a
-  bundle it computes from the namespace name. The runtime serves the poll only at a home it
-  computes from the namespace id. When the two bundles have different owners, both nodes
-  refuse the poll, and the worker gives up after two simulated minutes.
+- **An activity poll is served on the node the edge sends it to.** The runtime serves an
+  activity poll only at its queue's home, which it computes from the namespace id. The
+  worker picks a queue whose home is on another node than the bundle a key of the namespace
+  name picks. So the activity completes only if the edge routes the poll to the home, and
+  not by that key.
 
 ### `leases`: who owns each bundle, and at which epoch
 
@@ -268,8 +268,8 @@ done
 A seed decides which node owns which bundle, which node the worker reaches first for a
 workflow, and every message's latency. Faults still land at the same step, because each is
 triggered by a line the worker records. Every passing scenario passes on seeds 1 to 100.
-The ignored defect scenarios fail on every seed from 1 to 10, each for the reason its
-`#[ignore]` gives. The lease-handover replay fails on four of those ten seeds.
+The four ignored lease-lapse scenarios fail on every seed from 1 to 10, each for the reason
+its `#[ignore]` gives. The ignored lease-handover replay fails on three of those ten seeds.
 
 The ignored scenarios, each of which prints its trace when it fails:
 

@@ -22,7 +22,7 @@ fn bundles_keep_one_owner_per_epoch_while_the_cluster_forms() {
     logs();
     let mut run = topology::cluster(seed()).expect("the cluster builds");
     run.observe(oracle::one_owner_per_epoch);
-    run.worker(|trace| workload::one_activity_across_nodes(trace, QueuePlacement::Agreeing));
+    run.worker(|trace| workload::one_activity_across_nodes(trace, QueuePlacement::Any));
     let trace = run.drive([]).expect("the simulation runs to the end");
     assert!(
         trace.completed("workflow"),

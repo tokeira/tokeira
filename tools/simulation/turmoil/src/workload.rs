@@ -43,7 +43,7 @@ use tokeira_proto::{
 };
 use tokeira_types::{
     IncarnationId, RoutingSnapshot, ShardId, TaskKind, WorkflowId, bundle_for_partition,
-    workflow_queue_partition,
+    queue_partition_for, workflow_queue_partition,
 };
 use tonic::{
     Status,
@@ -106,21 +106,22 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 /// real client's own deadline would.
 const CALL_TIMEOUT: Duration = Duration::from_secs(POLL_TIMEOUT.as_secs() + 5);
 
-/// Where a scenario puts its task queue, relative to the two places that
-/// decide an activity queue's home.
+/// Which task queue a cluster scenario runs its activities on.
 ///
-/// The edge sends an activity poll to the node that owns the bundle it
-/// computes from the namespace *name* and the Activity kind. The runtime
-/// serves the poll only at the queue's home, which it computes from the
-/// namespace *id* and the Workflow kind for every queue. Whether the two
-/// bundles have one owner depends on the queue name and on placement, so the
-/// worker searches for a queue name that gives the scenario it was asked for.
+/// The runtime homes every task queue, activity tasks included, at the owner
+/// of the queue's workflow-key partition, computed from the namespace *id*.
+/// A key of the namespace *name*, the queue and the Activity kind picks a
+/// bundle too, and for some queue names that bundle's owner is another node.
+/// Which queue names those are depends on placement, so the worker searches
+/// for a queue name that gives the scenario it was asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueuePlacement {
-    /// The edge's choice and the runtime's home are the same node.
-    Agreeing,
-    /// The edge's choice and the runtime's home are different nodes.
-    Disagreeing,
+    /// The first queue whose home suits the scenario.
+    Any,
+    /// A queue whose home is on another node than the bundle its
+    /// namespace-name key picks. Its activities complete only if the edge
+    /// sends activity polls to the queue's home rather than by that key.
+    AwayFromNameKey,
 }
 
 /// One activity on the single node.
@@ -131,7 +132,7 @@ pub async fn one_activity(trace: Arc<Mutex<Trace>>) -> anyhow::Result<()> {
 
 /// One activity on the cluster. The workflow is homed on the node that is
 /// not its task queue's home, so its tasks start across nodes, and the queue
-/// is placed as `placement` asks.
+/// is chosen as `placement` asks.
 pub async fn one_activity_across_nodes(
     trace: Arc<Mutex<Trace>>,
     placement: QueuePlacement,
@@ -167,7 +168,7 @@ pub async fn work_a_lease_later(trace: Arc<Mutex<Trace>>) -> anyhow::Result<()> 
     let snapshot = routing.snapshot();
     worker.observe(describe_placement(&snapshot));
     let (queue, _, queue_host) =
-        pick_queue(&routing, &snapshot, QueuePlacement::Agreeing, CUT_NODE).await?;
+        pick_queue(&routing, &snapshot, QueuePlacement::Any, CUT_NODE).await?;
     let other = NODES
         .into_iter()
         .find(|host| *host != CUT_NODE)
@@ -376,7 +377,7 @@ pub async fn child_across_homes(trace: Arc<Mutex<Trace>>) -> anyhow::Result<()> 
     let routing = settled_placement().await?;
     let snapshot = routing.snapshot();
     worker.observe(describe_placement(&snapshot));
-    let (queue, _, _) = pick_queue(&routing, &snapshot, QueuePlacement::Agreeing, "").await?;
+    let (queue, _, _) = pick_queue(&routing, &snapshot, QueuePlacement::Any, "").await?;
     let (parent_id, parent_host) = pick_workflow(&routing, "turmoil-parent", "")?;
     let (child_id, child_host) = pick_workflow(&routing, "turmoil-child", &parent_host)?;
     worker.observe(format!(
@@ -835,14 +836,15 @@ fn describe_placement(snapshot: &RoutingSnapshot) -> String {
     format!("placement settled: {}", owners.join(", "))
 }
 
-/// Find a queue name whose activity polls the edge sends to the runtime's
-/// queue home (`Agreeing`) or away from it (`Disagreeing`), and whose home is
-/// not on `avoid_host`. Returns the queue, the host the edge sends its
-/// activity polls to, and the host the runtime serves them on.
+/// Find a queue name placed as `placement` asks whose home is not on
+/// `avoid_host`. Returns the queue, the host the edge sends its activity
+/// polls to, and the host the runtime serves them on.
 ///
 /// The edge's side is asked of the edge's own router. The runtime's side uses
 /// the function the runtime's queue-home provider calls
-/// (`tokeira_runtime::discovery::PlacementQueueHomes::local_home`).
+/// (`tokeira_runtime::discovery::PlacementQueueHomes::local_home`). The
+/// namespace-name key is the namespace name, the queue and the Activity
+/// kind's stored value, hashed by `queue_partition_for`.
 async fn pick_queue(
     routing: &Arc<RoutingCache>,
     snapshot: &RoutingSnapshot,
@@ -867,9 +869,23 @@ async fn pick_queue(
         let home_host = owner_host(snapshot, home)
             .context("a settled placement owns every bundle")?
             .to_owned();
-        if (edge_host == home_host) == (placement == QueuePlacement::Agreeing)
-            && home_host != avoid_host
-        {
+        let placed = match placement {
+            QueuePlacement::Any => true,
+            QueuePlacement::AwayFromNameKey => {
+                let name_key = format!(
+                    "{NAMESPACE}\0{queue}\0{}",
+                    TaskKind::Activity.to_db_smallint()
+                );
+                let name_key_bundle = bundle_for_partition(
+                    queue_partition_for(name_key.as_bytes(), PARTITIONS),
+                    BUNDLES,
+                );
+                owner_host(snapshot, name_key_bundle)
+                    .context("a settled placement owns every bundle")?
+                    != home_host
+            }
+        };
+        if placed && home_host != avoid_host {
             return Ok((queue, edge_host, home_host));
         }
     }

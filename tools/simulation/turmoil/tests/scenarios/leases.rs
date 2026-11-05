@@ -37,13 +37,13 @@ fn bundles_keep_one_owner_per_epoch_while_the_cluster_forms() {
 }
 
 /// A cluster run whose worker chooses a workflow homed on [`CUT_NODE`],
-/// applies `cut` to that node, waits out its lease, then starts the workflow.
-fn through_a_lapse(cut: Action) -> Trace {
+/// applies `fault`, waits out a lease, then starts the workflow.
+fn a_lease_after(fault: Action) -> Trace {
     logs();
     let mut run = topology::cluster(SEED).expect("the cluster builds");
     run.observe(oracle::one_owner_per_epoch);
-    run.worker(workload::work_on_a_lapsed_home);
-    run.drive([Fault::when_seen(HOME_CHOSEN, cut)])
+    run.worker(workload::work_a_lease_later);
+    run.drive([Fault::when_seen(HOME_CHOSEN, fault)])
         .expect("the simulation runs to the end")
 }
 
@@ -54,7 +54,7 @@ fn through_a_lapse(cut: Action) -> Trace {
 #[ignore = "the edge's HistoryNotifyingRepository does not pass on bundle_lease_duration, so \
             the runtime never sets its lease deadline and serves the start on a lapsed lease"]
 fn a_node_that_cannot_renew_admits_nothing_once_its_leases_lapse() {
-    let trace = through_a_lapse(Action::StallRenewals(CUT_NODE));
+    let trace = a_lease_after(Action::StallRenewals(CUT_NODE));
     assert!(
         trace.saw("lease at epoch") && trace.saw("lapsed"),
         "no lease lapsed:\n{trace}"
@@ -71,7 +71,7 @@ fn a_node_that_cannot_renew_admits_nothing_once_its_leases_lapse() {
 #[ignore = "the controller offers a node only bundles nobody owns, whether or not the lease \
             has lapsed, so no node is offered the lapsed home"]
 fn a_lapsed_home_is_taken_over_and_its_workflow_completes() {
-    let trace = through_a_lapse(Action::StallRenewals(CUT_NODE));
+    let trace = a_lease_after(Action::StallRenewals(CUT_NODE));
     taken_over(&trace);
 }
 
@@ -80,8 +80,38 @@ fn a_lapsed_home_is_taken_over_and_its_workflow_completes() {
 #[ignore = "the controller offers a node only bundles nobody owns, whether or not the lease \
             has lapsed, so no node is offered the crashed node's home"]
 fn a_crashed_nodes_home_is_taken_over_and_its_workflow_completes() {
-    let trace = through_a_lapse(Action::Crash(CUT_NODE));
+    let trace = a_lease_after(Action::Crash(CUT_NODE));
     taken_over(&trace);
+}
+
+// An abrupt restart: the node comes back as a new incarnation while its
+// leases still name the old one. Once they lapse, its home must be served
+// again, by the restarted node or the other one.
+#[test]
+#[ignore = "the controller offers only bundles nobody owns, and the lapsed leases still name \
+            the old incarnation, so no node is offered them; the restarted node's edge routes \
+            its old self's bundles as a remote node and refuses the start"]
+fn a_restarted_nodes_home_is_served_again() {
+    let trace = a_lease_after(Action::Bounce(CUT_NODE));
+    assert!(
+        trace.completed("workflow"),
+        "the workflow did not complete:\n{trace}"
+    );
+}
+
+// The controller restarts. The nodes renew their leases with the store, not
+// the controller, so every bundle keeps its owner and the home stays served.
+#[test]
+fn bundles_keep_their_owners_through_a_controller_restart() {
+    let trace = a_lease_after(Action::Bounce(topology::CONTROLLER));
+    assert!(
+        trace.saw(&format!("StartWorkflowExecution served by {CUT_NODE}")),
+        "{CUT_NODE} no longer serves its home:\n{trace}"
+    );
+    assert!(
+        trace.completed("workflow"),
+        "the workflow did not complete:\n{trace}"
+    );
 }
 
 /// The other node started the workflow, so it owned the home, and the

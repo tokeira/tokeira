@@ -1,4 +1,4 @@
-# Turmoil spike
+# Turmoil Engine Simulator
 
 Runs Tokeira's real engine code on [turmoil](https://docs.rs/turmoil/0.7.2/turmoil/)'s
 simulated hosts and network, in simulated time, from a seed.
@@ -17,7 +17,8 @@ A scenario has four parts, each in its own module:
   engine nodes, `node-a` and `node-b`. Every node is a full listener-backed node: its gRPC
   listener, its calls to the other node and its calls to the controller all cross turmoil's
   network, and it reads the time from the simulation. The store is created outside the
-  hosts and stands in for the DSQL database, so it outlives a crashed node. The cluster's
+  hosts and stands in for the DSQL database, so it outlives a crashed node or controller,
+  and a host that restarts finds it as it was. The cluster's
   store grants leases for 10 seconds, as DSQL grants them for a duration, and each node has
   its own handle on it. Each node's incarnation id is drawn from the seed.
 - **Workload** ([`src/workload.rs`](src/workload.rs)): what the `worker` host does, through
@@ -27,8 +28,9 @@ A scenario has four parts, each in its own module:
   node refuses, to the other.
 - **Faults** ([`src/faults.rs`](src/faults.rs)): what goes wrong, and when. A fault
   partitions or holds the traffic between two hosts, repairs or releases it, crashes or
-  bounces a host, or stalls or resumes one node's lease renewals. It is applied at a simulated time, or after the worker records a given
-  line. The second kind keeps landing at the right moment when the code's timing changes.
+  bounces a host, or stalls or resumes one node's lease renewals. It is applied at a
+  simulated time, or after the worker records a given line. The second kind keeps landing
+  at the right moment when the code's timing changes.
 - **Oracle** ([`src/oracle.rs`](src/oracle.rs)): what must hold. Some checks run on every
   tick, reading the shared store from an observer host that no fault cuts off. Others run
   after the run, over the histories the worker recorded.
@@ -86,11 +88,10 @@ Property: every scheduled task is started or times out (`EventuallyResolved`,
   task queue's home are on different nodes. Its start, its tasks and its replies cross
   between them.
 - **An activity poll is served on the node the edge sends it to.** This test is
-  `#[ignore]`d and fails on current code (the brief's defect 1). The edge sends an activity
-  poll to the owner of a bundle it computes from the namespace name. The runtime serves the
-  poll only at a home it computes from the namespace id. When the two bundles have
-  different owners, both nodes refuse the poll, and the worker gives up after two
-  simulated minutes.
+  `#[ignore]`d and fails on current code. The edge sends an activity poll to the owner of a
+  bundle it computes from the namespace name. The runtime serves the poll only at a home it
+  computes from the namespace id. When the two bundles have different owners, both nodes
+  refuse the poll, and the worker gives up after two simulated minutes.
 
 ### `leases`: who owns each bundle, and at which epoch
 
@@ -102,9 +103,16 @@ Property: at most one node owns a bundle at an epoch, and a bundle's epoch never
   the previous generation, through no owner, to `node-a` or `node-b`. A one-activity
   workflow runs across the nodes meanwhile.
 
-The three lapse scenarios choose a workflow homed on `node-a`, cut `node-a` off, wait out
-its lease, then start the workflow. The observer records each lease that lapses. All three
-are `#[ignore]`d and fail on current code:
+The other scenarios choose a workflow homed on `node-a` and apply one fault: to `node-a`,
+or to the controller. Then they wait out a lease and start the workflow. The observer
+records each lease that lapses.
+
+- **Bundles keep their owners through a controller restart.** The controller crashes at
+  3 438 ms and comes straight back. The nodes renew their leases with the store, not with
+  the controller, so every bundle keeps its owner and its epoch. `node-a` serves the start
+  at 15 516 ms, and the workflow completes.
+
+The other four are `#[ignore]`d and fail on current code:
 
 - **A node that cannot renew admits nothing once its leases lapse.** `node-a`'s renewals
   stall, so its leases lapse at 13 005 ms. At 15 493 ms `node-a` still accepts the start,
@@ -118,6 +126,11 @@ are `#[ignore]`d and fail on current code:
 - **A crashed node's home is taken over and its workflow completes.** The same, with
   `node-a` crashed. Its leases lapse, `node-b` still routes the start to `node-a`, and the
   worker gives up after two simulated minutes.
+- **A restarted node's home is served again.** `node-a` crashes and comes straight back
+  with a new incarnation id. Its leases still name the old id, and they lapse at 13 005 ms.
+  For the reason above, the controller never offers them to anyone. Both nodes refuse the
+  start: `node-b` routes it to `node-a`, and the restarted `node-a` treats its old self's
+  bundles as another node's. The worker gives up at 135 597 ms, after 408 attempts.
 
 ### `dispatch`: activity attempts, timeouts, retries and completions
 
@@ -134,11 +147,28 @@ activity (`AtMostOneStartPerIncarnation`,
 
 ### `outbound`: work one run starts on another run's home
 
-Property: each child starts once, and its result reaches its parent once.
+Property: each child starts once, and its result reaches its parent once, however the link
+between the two homes fails and recovers meanwhile.
 
-- **A child homed on the other node starts once and reports back once.** The parent's home
-  is on one node and the child's on the other. The parent's history has one initiated, one
-  started and one completed child event. The child's history has one start.
+The parent's home is on one node and the child's on the other. Every scenario checks the
+same outcome. The parent's history has one initiated, one started and one completed child
+event, and the child's history has one start. In the three that break the link, it goes
+down between `node-a` and `node-b` just before a node commits one step and stays down for
+10 seconds. Nothing is retried by hand: the engine recovers on its own.
+
+- **A child homed on the other node starts once and reports back once.** No faults.
+- **A child started across a held link starts once and reports back once.** The link is
+  held from just before the parent's home commits the child's start. Messages wait rather
+  than being lost. The child starts at 14 772 ms, 1.2 seconds after the link is released.
+- **A child started across a partitioned link starts once and reports back once.** As
+  above, but the link is partitioned from 3 570 ms to 13 570 ms. Messages sent meanwhile
+  are lost, and a connection open across the link stops making progress. The child starts
+  at 17 777 ms, 4.2 seconds after the repair.
+- **A child's result sent across a partitioned link reaches the parent once.** The link is
+  partitioned from just before the child's home commits the child's completion, from
+  4 856 ms to 14 856 ms, so the delivery of the result to the parent hits the partition.
+  The child completes at 5 020 ms. The parent records the result at 19 112 ms, 4.3 seconds
+  after the repair.
 
 ## Reading a trace
 
@@ -163,9 +193,19 @@ Faults appear in the trace as they are applied, for example
 `fault: hold traffic between worker and node`. Owner changes appear as the observer sees
 them, for example `bundle 2 at epoch 3 is owned by node-a`.
 
-## What the spike added to production code
+On a cluster, the worker gives each poll a 10-second deadline so it can move on to the
+other node. A poll that waits out its deadline shows as a refusal:
+`PollWorkflowTaskQueue refused by node-b: Cancelled: Timeout expired`. Temporal v1.31.0
+behaves differently here. It ends a long poll just before the caller's deadline and returns
+an empty response (`contextutil.WithDeadlineBuffer(..., returnEmptyTaskTimeBudget)` in
+`service/matching/matching_engine.go`, and `longPollTailRoom` in
+`service/frontend/workflow_handler.go`, both at v1.31.0). The worker treats the two the
+same apart from a 500 ms backoff after a refusal.
 
-Three sets of seams, none of which changes production behaviour:
+## Seams in production code
+
+The simulator reaches the engine through three sets of seams in production code. None of
+them changes production behaviour:
 
 - **The node's connections.** `TokeiradHandle::start_in_memory_with_transport` in
   `tokeira-engine` accepts a `NodeTransport`. It carries the node's incoming connections as
@@ -174,10 +214,10 @@ Three sets of seams, none of which changes production behaviour:
   `tokeira-runtime`'s membership client takes an optional `ControllerConnection`, and so
   does the edge's routing subscription. Without a transport, a node binds its TCP listener
   and dials as it always has.
-- **The node's clock.** A new crate, `tokeira-clock`, gives the engine one clock to read.
+- **The node's clock.** The `tokeira-clock` crate gives the engine one clock to read.
   A node passes it to its runtime, its edge and its handle on the store. Deadlines are
   stamped and judged on that clock, so timers, timeouts, retries and backoffs come due on
-  it. Production passes the host's clock. The spike passes `SimClock`, which reads
+  it. Production passes the host's clock. The simulator passes `SimClock`, which reads
   turmoil's simulated time from the fixed epoch, so that one seed stamps the same times on
   every run.
 - **The node's leases and identity.** The in-memory store judges lease expiry on its own
@@ -210,7 +250,7 @@ One area:
 cargo nextest run --test scenarios -E 'test(/^leases::/)'
 ```
 
-The defect-1 scenario, which prints its trace when it fails:
+The ignored scenarios, each of which prints its trace when it fails:
 
 ```bash
 cargo test --test scenarios -- --ignored

@@ -22,12 +22,12 @@ fn a_workflow_completes_when_its_tasks_start_across_nodes() {
     );
 }
 
-// Defect 1 from the brief: the edge sends an activity poll to the node it
-// computes from the namespace name and the Activity kind, and the runtime
-// serves it only at the home it computes from the namespace id and the
-// Workflow kind. When those are different nodes, neither serves the poll.
+// The edge sends an activity poll to the node it computes from the namespace
+// name and the Activity kind, and the runtime serves it only at the home it
+// computes from the namespace id and the Workflow kind. When those are
+// different nodes, neither serves the poll.
 #[test]
-#[ignore = "fails until the edge and the runtime agree on an activity queue's home (defect 1)"]
+#[ignore = "fails until the edge and the runtime agree on an activity queue's home"]
 fn an_activity_poll_is_served_on_the_node_the_edge_sends_it_to() {
     logs();
     let mut run = topology::cluster(SEED).expect("the cluster builds");

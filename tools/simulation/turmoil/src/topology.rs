@@ -250,13 +250,19 @@ pub fn cluster(seed: u64) -> anyhow::Result<Run> {
     // startup asks it for the first routing snapshot.
     let controller_store = store.clone();
     let nodes_started = Arc::clone(&started);
+    let controller_starts = AtomicU64::new(0);
     sim.host(CONTROLLER, move || {
+        let start = controller_starts.fetch_add(1, Ordering::Relaxed);
+        // The cluster forms once: a restarted controller finds the bundles
+        // owned by the nodes, so only its first start stands in for the
+        // previous generation.
+        let previous = (start == 0).then(|| incarnation(seed, PREVIOUS_GENERATION, 0));
         // The controller judges leases the nodes renew, so its handle on the
         // shared store reads the same simulated time theirs do.
         serve_controller(
             controller_store.clone().with_clock(Arc::new(SimClock)),
-            incarnation(seed, PREVIOUS_GENERATION, 0),
-            incarnation(seed, CONTROLLER, 0),
+            previous,
+            incarnation(seed, CONTROLLER, start),
             Arc::clone(&nodes_started),
         )
     });
@@ -318,9 +324,12 @@ fn single_node_config() -> TokeiraConfig {
 
 /// The controller host's software, composed as `apps/tokeira-controller`
 /// composes it, minus process signals, metrics and the DSQL connection.
+/// `previous`, when set, is the previous generation's id: the controller
+/// takes every bundle for it before it listens, then hands them back once
+/// both nodes have started.
 async fn serve_controller(
     store: InMemoryStore,
-    previous: IncarnationId,
+    previous: Option<IncarnationId>,
     allocator: IncarnationId,
     nodes_started: Arc<Semaphore>,
 ) -> Result<(), Box<dyn Error>> {
@@ -332,16 +341,18 @@ async fn serve_controller(
         ..ControllerConfig::default()
     };
     let leases: Arc<dyn LeaseRepository> = Arc::new(store.clone());
-    // Taken before the controller listens, so no node can register while a
-    // bundle is still unowned.
-    let previous = previous.to_string();
-    let held = hold_every_bundle(leases.as_ref(), &previous).await?;
-    tokio::spawn(hand_back_once_nodes_start(
-        Arc::clone(&leases),
-        previous,
-        held,
-        nodes_started,
-    ));
+    if let Some(previous) = previous {
+        // Taken before the controller listens, so no node can register while
+        // a bundle is still unowned.
+        let previous = previous.to_string();
+        let held = hold_every_bundle(leases.as_ref(), &previous).await?;
+        tokio::spawn(hand_back_once_nodes_start(
+            Arc::clone(&leases),
+            previous,
+            held,
+            nodes_started,
+        ));
+    }
     let control: Arc<dyn ControlRepository> = Arc::new(store);
     let state = PlacementControllerState::new(config, leases, control);
     tokio::spawn(placement_loop(state.clone()));

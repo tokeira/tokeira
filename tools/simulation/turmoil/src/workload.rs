@@ -68,16 +68,24 @@ pub const ACTIVITY_TIMEOUT: Duration = Duration::from_secs(10);
 pub const FIRST_ATTEMPT_RECEIVED: &str = "activity attempt 1 received";
 
 const TASK_QUEUE: &str = "turmoil-queue";
-/// The node [`work_on_a_lapsed_home`] homes its workflow on, for a fault
+/// The node [`work_a_lease_later`] homes its workflow on, for a fault
 /// schedule to cut off.
 pub const CUT_NODE: &str = NODES[0];
-/// The step [`work_on_a_lapsed_home`] records once it has chosen a workflow
+/// The step [`work_a_lease_later`] records once it has chosen a workflow
 /// homed on [`CUT_NODE`], for a fault schedule to trigger on.
 pub const HOME_CHOSEN: &str = "the workflow will be homed on";
-/// How long [`work_on_a_lapsed_home`] waits, after [`HOME_CHOSEN`], before it
+/// How long [`work_a_lease_later`] waits, after [`HOME_CHOSEN`], before it
 /// starts its workflow: a lease, and a margin for the renewal the node made
 /// just before a fault cut it off.
 const LAPSE_WAIT: Duration = Duration::from_secs(LEASE.as_secs() + 2);
+/// The step [`child_across_homes`] records just before it answers the
+/// parent's first task by starting the child, for a fault schedule to
+/// trigger on before the parent's home starts delivering the child.
+pub const STARTING_THE_CHILD: &str = "parent task: starting the child";
+/// The step [`child_across_homes`] records just before it completes the
+/// child, for a fault schedule to trigger on before the child's home starts
+/// delivering its result.
+pub const COMPLETING_THE_CHILD: &str = "child task: completing the child";
 /// How long the activity in [`late_completion`] works on each attempt.
 const ACTIVITY_WORK: Duration = Duration::from_secs(2);
 /// How long the worker waits for both nodes of a cluster to own bundles.
@@ -104,10 +112,9 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(POLL_TIMEOUT.as_secs() + 5);
 /// The edge sends an activity poll to the node that owns the bundle it
 /// computes from the namespace *name* and the Activity kind. The runtime
 /// serves the poll only at the queue's home, which it computes from the
-/// namespace *id* and the Workflow kind for every queue. This is the brief's
-/// defect 1. Whether the two bundles have one owner depends on the queue name
-/// and on placement, so the worker searches for a queue name that gives the
-/// scenario it was asked for.
+/// namespace *id* and the Workflow kind for every queue. Whether the two
+/// bundles have one owner depends on the queue name and on placement, so the
+/// worker searches for a queue name that gives the scenario it was asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueuePlacement {
     /// The edge's choice and the runtime's home are the same node.
@@ -145,16 +152,16 @@ pub async fn one_activity_across_nodes(
     run_one_activity(&worker, &queue, &workflow_id).await
 }
 
-/// One workflow on the cluster, started only once its home's lease has had
-/// time to lapse.
+/// One workflow on the cluster, started a lease after the worker chose it.
 ///
 /// The workflow is homed on [`CUT_NODE`], and its task queue on the other
-/// node. The worker records [`HOME_CHOSEN`], waits a lease and a margin, so
-/// that a fault applied on that step (a stall of the node's renewals, or a
-/// crash) has lapsed the lease, then starts the workflow and completes it on
-/// its first task. Whether it gets that far shows whether another node took
-/// the home over.
-pub async fn work_on_a_lapsed_home(trace: Arc<Mutex<Trace>>) -> anyhow::Result<()> {
+/// node. The worker records [`HOME_CHOSEN`], then waits a lease and a margin,
+/// so that a fault applied on that step has had a full lease to take effect:
+/// a stall of the node's renewals or a crash has lapsed its leases, and a
+/// restart of the node or of the controller has had time to settle. Then it
+/// starts the workflow and completes it on its first task. Whether it gets
+/// that far shows whether some node serves the home.
+pub async fn work_a_lease_later(trace: Arc<Mutex<Trace>>) -> anyhow::Result<()> {
     let worker = Worker::new(&NODES, trace)?;
     let routing = settled_placement().await?;
     let snapshot = routing.snapshot();
@@ -404,29 +411,31 @@ pub async fn child_across_homes(trace: Arc<Mutex<Trace>>) -> anyhow::Result<()> 
         let (commands, what, parent_done) = match workflow_type.as_str() {
             "child" => (
                 vec![complete_workflow("child finished")],
-                "child task: completed the child",
+                COMPLETING_THE_CHILD,
                 false,
             ),
             "parent" if has(EventType::ChildWorkflowExecutionCompleted) => (
                 vec![complete_workflow("parent finished")],
-                "parent task: the child's result is in, completed the parent",
+                "parent task: the child's result is in, completing the parent",
                 true,
             ),
             "parent" if !has(EventType::StartChildWorkflowExecutionInitiated) => (
                 vec![start_child(&child_id, &queue)],
-                "parent task: started the child",
+                STARTING_THE_CHILD,
                 false,
             ),
             "parent" => (Vec::new(), "parent task: waiting for the child", false),
             other => bail!("a task arrived for an unknown workflow type {other:?}"),
         };
+        // Recorded before the answer is sent, so a fault triggered on it
+        // lands before the node commits the answer and delivers its effect.
+        worker.observe(what);
         if !worker
             .complete_workflow_task(task.task_token, commands)
             .await
         {
             return Ok(());
         }
-        worker.observe(what);
         if parent_done {
             break;
         }

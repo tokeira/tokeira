@@ -8,12 +8,12 @@ use turmoil_sim::{
     workload::{self, QueuePlacement},
 };
 
-use crate::{SEED, logs};
+use crate::{logs, seed};
 
 #[test]
 fn a_workflow_completes_when_its_tasks_start_across_nodes() {
     logs();
-    let mut run = topology::cluster(SEED).expect("the cluster builds");
+    let mut run = topology::cluster(seed()).expect("the cluster builds");
     run.worker(|trace| workload::one_activity_across_nodes(trace, QueuePlacement::Agreeing));
     let trace = run.drive([]).expect("the simulation runs to the end");
     assert!(
@@ -30,7 +30,7 @@ fn a_workflow_completes_when_its_tasks_start_across_nodes() {
 #[ignore = "fails until the edge and the runtime agree on an activity queue's home"]
 fn an_activity_poll_is_served_on_the_node_the_edge_sends_it_to() {
     logs();
-    let mut run = topology::cluster(SEED).expect("the cluster builds");
+    let mut run = topology::cluster(seed()).expect("the cluster builds");
     run.worker(|trace| workload::one_activity_across_nodes(trace, QueuePlacement::Disagreeing));
     let trace = run.drive([]).expect("the simulation runs to the end");
     assert!(

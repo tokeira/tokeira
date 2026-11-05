@@ -15,7 +15,7 @@ use turmoil_sim::{
     workload::{self, COMPLETING_THE_CHILD, STARTING_THE_CHILD},
 };
 
-use crate::{SEED, logs};
+use crate::{logs, seed};
 
 #[test]
 fn a_child_homed_on_the_other_node_starts_once_and_reports_back_once() {
@@ -75,7 +75,7 @@ fn link_down(
 
 fn child_across_homes(faults: impl IntoIterator<Item = Fault>) -> Trace {
     logs();
-    let mut run = topology::cluster(SEED).expect("the cluster builds");
+    let mut run = topology::cluster(seed()).expect("the cluster builds");
     run.worker(workload::child_across_homes);
     run.drive(faults).expect("the simulation runs to the end")
 }

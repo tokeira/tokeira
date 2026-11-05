@@ -13,14 +13,14 @@ use turmoil_sim::{
     workload::{self, CUT_NODE, HOME_CHOSEN, QueuePlacement},
 };
 
-use crate::{SEED, logs};
+use crate::{logs, seed};
 
 // The cluster forms by handing every bundle from a previous generation to
 // the two nodes, so each bundle changes owner while the workflow runs.
 #[test]
 fn bundles_keep_one_owner_per_epoch_while_the_cluster_forms() {
     logs();
-    let mut run = topology::cluster(SEED).expect("the cluster builds");
+    let mut run = topology::cluster(seed()).expect("the cluster builds");
     run.observe(oracle::one_owner_per_epoch);
     run.worker(|trace| workload::one_activity_across_nodes(trace, QueuePlacement::Agreeing));
     let trace = run.drive([]).expect("the simulation runs to the end");
@@ -40,7 +40,7 @@ fn bundles_keep_one_owner_per_epoch_while_the_cluster_forms() {
 /// applies `fault`, waits out a lease, then starts the workflow.
 fn a_lease_after(fault: Action) -> Trace {
     logs();
-    let mut run = topology::cluster(SEED).expect("the cluster builds");
+    let mut run = topology::cluster(seed()).expect("the cluster builds");
     run.observe(oracle::one_owner_per_epoch);
     run.worker(workload::work_a_lease_later);
     run.drive([Fault::when_seen(HOME_CHOSEN, fault)])

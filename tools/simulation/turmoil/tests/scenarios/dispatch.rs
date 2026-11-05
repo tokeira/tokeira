@@ -15,7 +15,7 @@ use turmoil_sim::{
     workload::{self, ACTIVITY_TIMEOUT, FIRST_ATTEMPT_RECEIVED},
 };
 
-use crate::{SEED, logs};
+use crate::{logs, seed};
 
 // The worker's completion of the first attempt is held on the network until
 // the attempt has timed out and been retried. The late completion must be
@@ -23,7 +23,7 @@ use crate::{SEED, logs};
 #[test]
 fn a_completion_held_past_its_timeout_is_refused_and_the_retry_completes() {
     logs();
-    let mut run = topology::single_node(SEED);
+    let mut run = topology::single_node(seed());
     run.worker(workload::late_completion);
     let faults = [
         Fault::when_seen(FIRST_ATTEMPT_RECEIVED, Action::Hold(WORKER, NODE)),

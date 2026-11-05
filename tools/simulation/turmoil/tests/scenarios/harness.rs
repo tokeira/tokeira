@@ -8,12 +8,12 @@ use turmoil_sim::{
     workload::{self, QueuePlacement, TIMER},
 };
 
-use crate::{SEED, logs};
+use crate::{logs, seed};
 
 #[test]
 fn a_one_activity_workflow_completes_on_one_node() {
     logs();
-    let mut run = topology::single_node(SEED);
+    let mut run = topology::single_node(seed());
     run.worker(workload::one_activity);
     let trace = run.drive([]).expect("the simulation runs to the end");
     assert!(
@@ -27,7 +27,7 @@ fn a_one_activity_workflow_completes_on_one_node() {
 #[test]
 fn a_timer_fires_in_simulated_time() {
     logs();
-    let mut run = topology::single_node(SEED);
+    let mut run = topology::single_node(seed());
     run.worker(workload::timer);
     let trace = run.drive([]).expect("the simulation runs to the end");
     assert!(
@@ -49,7 +49,7 @@ fn a_timer_fires_in_simulated_time() {
 fn the_same_seed_replays_the_same_trace() {
     logs();
     let run_once = || {
-        let mut run = topology::single_node(SEED);
+        let mut run = topology::single_node(seed());
         run.worker(workload::timer);
         run.drive([]).expect("the simulation runs to the end")
     };
@@ -79,7 +79,7 @@ fn the_same_seed_replays_the_same_lease_handovers() {
 /// One cluster run of the one-activity workload, with the lease observer if
 /// `observed`.
 fn cluster_run(observed: bool) -> Trace {
-    let mut run = topology::cluster(SEED).expect("the cluster builds");
+    let mut run = topology::cluster(seed()).expect("the cluster builds");
     if observed {
         run.observe(oracle::one_owner_per_epoch);
     }

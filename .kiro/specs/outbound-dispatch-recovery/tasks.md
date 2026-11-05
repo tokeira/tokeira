@@ -356,18 +356,29 @@ No separate specification PR is planned.
     and after the fix, and record their figures in the ledger.
   - _Requirements: 2.6, 2.7, 3.4, 3.8, 10.4, 10.5, 10.6, 10.7._
 
-- [x] 23. Bound discovery latency across partial scheduling rounds
-  - Resume partial rounds after their last visited stream; rotate after the first
-    stream only when the round visits every stream. Preserve admission limits,
-    tick duration, retry backoff and wake behavior.
-  - Implement **Property 23** with at least 100 generated cases over 1–512 streams
-    and 1–16 visits per round, checking ordered cycles, full-sweep rotation and
-    coverage within ⌈N/16⌉ full-budget rounds.
-    - Tag: `// Feature: outbound-dispatch-recovery, Property 23: Discovery reads every stream within a bounded number of rounds.`
-  - Run the paused-time driver with 32 active homes and 256 streams; commit one
-    operation after its home has been visited and require delivery within 17 ticks.
-    Run both negative controls with unconditional first-stream reset, preserve the
-    existing discovery/admission tests, and record the memory fan-out measurement.
+- [x] 23. Rotate each home's starting kind across discovery rounds
+  - Walk active homes in key order and each home's kinds from its offset, wrapping
+    within the home. Advance the offset only after a complete home visit; resume
+    partial visits across page or global admission limits. Drop inactive offsets,
+    start new homes at zero and continue after a departed home's key. Preserve
+    admission limits, tick duration, retry backoff, wakes and page reads.
+  - Implement **Property 23** with at least 100 generated cases over 1–64 homes,
+    2–8 kinds and 1–16 reads per round: key order, one offset advance per completed
+    home visit, at most N + K − 2 intervening reads and every kind first in K visits.
+    - Tag: `// Feature: outbound-dispatch-recovery, Property 23: Discovery rotates each home's starting kind.`
+  - Run the paused-time driver with 32 active homes and 256 streams; require a new
+    row within 17 ticks, from the N + K − 2 bound at 16 reads per round. With 32
+    homes and four kinds, require one second-kind row within four home visits
+    despite a first-kind backlog of 128 rows and immediate attempt completion.
+    Rotating only after a full sweep must fail the property and starvation tests;
+    resetting to the round's first stream must fail the property and 32-home test.
+    Preserve discovery/admission regressions and record the memory fan-out.
+  - Keep all four rules and five configurations in
+    [42_outbound_discovery.tla](../../../spec/tla/42_outbound_discovery.tla), with
+    flat protocol outcomes and explicit observer expressions. Check every
+    configuration with tla-rs 0.24.11 and TLC 1.7.4: both home configurations pass,
+    continue/full fail first-pick rotation, and reset fails bounded waiting.
+    Record both checkers' results.
   - Run the live fan-out at DSQL's default 32 shards, with every home acquired and
     on its own database, before and after the fix, and record its figures in the ledger.
   - _Requirements: 2.1, 2.3, 2.8, 10.4, 10.6._

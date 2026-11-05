@@ -249,15 +249,23 @@ they can tune throughput without changing semantic guarantees. Individual attemp
 have bounded timeouts and exponential backoff; exhausted local retries leave durable
 work discoverable. An unresolved record is reported without stalling unrelated work.
 
-The driver visits at most 16 streams per scheduling round. A round visiting every
-stream starts the next round one stream after its first, so the same kind cannot
-consume all per-home admission on every tick. A partial round, whether limited by
-pages or in-flight admission, resumes after its last visited stream. Across consecutive
-partial rounds, streams therefore form a cycle in key order without repeats before
-every stream is visited. For a stable set of N streams, rounds with the full 16-stream
-budget visit every stream within ⌈N/16⌉ rounds; admission can shorten a round without
-resetting its progress. These are scheduling visits, not a promise to read a page
-while a home's admission is exhausted.
+The driver visits at most 16 streams per scheduling round. It walks active homes
+in key order, continuing across rounds. Within each home it reads streams in key
+order from that home's offset and wraps within the home. Completing all K kinds
+advances the home's offset by one and moves to the next home. A round shortened by
+the page budget or global admission resumes the partial home visit next round.
+Inactive homes lose their offsets; newly active homes start at zero. If the current
+home leaves, discovery continues at the next active home in key order.
+
+For a stable set of N streams with K kinds per home, at most N + K − 2 other reads
+intervene between two reads of a stream: the home moves its first kind by one on
+each visit. With the full 16-stream budget this is about ⌈N/16⌉ + 1 rounds. Every
+stream is read once a cycle and every kind reads first once in every K visits of
+its home, taking that home's admission first. Nothing is reserved for a kind.
+These bounds count scheduling visits, including visits that skip a page because
+the home's admission is exhausted; they do not guarantee that every pending row
+is offered under every completion interleaving. The four scheduling rules and
+this limit are modelled in [42_outbound_discovery.tla](../../../spec/tla/42_outbound_discovery.tla).
 
 Each stream's discovery sweep captures a finite greatest key, walks keyset pages
 to that bound, then starts a new sweep at the head. New lower keys wait only for
@@ -775,14 +783,19 @@ sequence for child delivery.
 
 **Validates: Requirements 2.6, 2.7, 3.4, 3.8, 10.4, 10.5, 10.6, 10.7.**
 
-### Property 23: Discovery reads every stream within a bounded number of rounds
+### Property 23: Discovery rotates each home's starting kind
 
-For any stable ordered set of N streams and sequence of scheduling rounds visiting
-between one and 16 streams (capped at N), consecutive partial rounds SHALL traverse
-the set in key order without skipping a stream or repeating one before all others
-have been visited. A round visiting every stream SHALL start the next round one
-stream after its first. With the full 16-stream budget and available admission,
-every stream SHALL be read within ⌈N/16⌉ rounds, independently of notifications.
+For any stable set of N streams across homes with K kinds each, and scheduling
+rounds visiting between one and 16 streams (capped at N), discovery SHALL visit
+homes in key order across rounds. Each home visit SHALL read its kinds in key
+order from its offset, wrapping within the home; only a completed visit SHALL
+advance that offset by one. At most N + K − 2 other reads SHALL intervene between
+two reads of a stream. Each kind SHALL read first once in every K visits of its
+home. Page and global admission limits SHALL preserve a partial home visit.
+
+The [outbound discovery model](../../../spec/tla/42_outbound_discovery.tla) checks
+bounded waiting, rotating first picks and admission bounds, and retains
+`EventuallyOffered` as a limit: shared home admission reserves nothing for a kind.
 
 **Validates: Requirements 2.1, 2.3, 2.8, 10.4, 10.6.**
 
@@ -794,7 +807,7 @@ every stream SHALL be read within ⌈N/16⌉ rounds, independently of notificati
 | `tokeira-storage/src/outbound_tests.rs`, memory and DSQL repository suites | Properties 1, 2, 4, 12, 14, 15, 16, 19; shared semantic cases, injected conflicts/refusals, live fence and large-value cases |
 | `tokeira-kernel` child/reset/Nexus test modules and codec tests | Properties 5, 6, 8, 11, 13, 17; deterministic generated identities/times and old/new encoded fixtures |
 | `tokeira-runtime/src/outbound/tests.rs` | Properties 3, 5–11, 13, 14, 20; controlled executor, owner and transport faults |
-| `tokeira-runtime/src/outbound/driver_tests.rs` | Property 23: at least 100 generated cases over 1–512 streams and 1–16 visits per round, full-sweep rotation and ⌈N/16⌉ coverage; paused-time driver over 32 active homes/256 streams, with delivery within 17 ticks; both tests fail with unconditional first-stream reset |
+| `tokeira-runtime/src/outbound/driver_tests.rs` | Property 23: at least 100 generated cases over 1–64 homes, 2–8 kinds and 1–16 reads per round; key order, offset advancement, N + K − 2 wait bound and every kind first in K visits. Paused time: 32 homes/256 streams deliver within 17 ticks; 32 homes/128 streams deliver a second-kind row within four home visits despite 128 first-kind rows. Refresh preserves partial visits and drops departed offsets. Rotating only after a full sweep fails the property and starvation tests; resetting to the round's first stream fails the property and 32-home deadline test. |
 | `tokeira-edge` internal RPC and `tokeira-auth::peer` tests | Property 18; purpose separation, bounded metadata, absent no-peer route, local/remote parity |
 | Existing completion-callback and successor suites | Preservation regression evidence alongside focused new properties |
 

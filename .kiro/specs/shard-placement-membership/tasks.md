@@ -471,6 +471,16 @@ Key changes from the previous plan:
     - Test `--config` CLI arg is parsed correctly
     - _Requirements: 10.2.1, 10.2.2, 10.2.3_
 
+- [ ] 12. Phase 7 — Connection budgets follow the reservoir's capacity rules
+  - [ ] 12.1 Apply the whole directive and keep it through controller outages
+    - `ConnectionBudgetApplier::apply_budget` becomes async; the engine's DSQL applier hands `rate_per_second`, `capacity` and `max_reservoir_size` to `DsqlConnectionDirector::apply_connection_budget` (DSQL reservoir redesign task 16.14)
+    - On a stream drop or a failed reconnect, keep the last applied budget; the one-connection cap on an expired share goes; warn once when the share passes `valid_until`
+    - _Requirements: 9.1.5, 9.2.1, 9.2.2, 9.2.3, 9.2.4_
+  - [ ]* 12.2 Write property test for budget retention
+    - **Property 8: A connection budget share holds until the next directive**
+    - **Validates: Requirements 9.1.5, 9.2.1, 9.2.2, 9.2.4, 9.2.5**
+  - [ ] 12.3 Checkpoint — the §10.4 bar passes
+
 ## Notes
 
 - Tasks marked with `*` are test tasks — ALL tests are REQUIRED per project convention

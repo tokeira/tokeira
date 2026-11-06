@@ -445,7 +445,7 @@ The authoritative architecture documents are [035-placement-and-membership](../.
 
 ### Requirement 9.1: Controller-Coordinated Connection Budget with Expiry
 
-**User Story:** As a Tokeira developer, I want the controller to distribute DSQL connection budget shares to runtime nodes with expiry, so that multi-node deployments respect the cluster-wide connection rate limit (100/sec sustained) and connection limit (10,000 default), and runtimes degrade safely when directives expire.
+**User Story:** As a Tokeira developer, I want the controller to distribute DSQL connection budget shares to runtime nodes with expiry, so that multi-node deployments respect the cluster-wide connection rate limit (100/sec sustained) and connection limit (10,000 default), and a node whose share has gone stale keeps working within it.
 
 #### Acceptance Criteria
 
@@ -453,20 +453,20 @@ The authoritative architecture documents are [035-placement-and-membership](../.
 2. WHEN a Runtime_Node joins or leaves the active membership, THE Placement_Controller SHALL recompute and redistribute connection budget shares to all active nodes.
 3. THE Placement_Controller SHALL send connection budget shares to each Runtime_Node via a `ConnectionBudgetDirective` on the Membership_Stream.
 4. THE `ConnectionBudgetDirective` SHALL carry `rate_per_second: f64`, `capacity: u64`, `max_reservoir_size: u32`, and `valid_until: Timestamp` fields.
-5. WHEN the `valid_until` timestamp expires without a new directive, THE Runtime_Node SHALL degrade to a conservative default budget.
+5. WHEN the `valid_until` timestamp passes without a new directive, THE Runtime_Node SHALL keep applying its last share and SHALL log a warning that the share is stale.
 6. WHEN there are zero active nodes, THE Placement_Controller SHALL handle the edge case without division by zero.
 7. WHEN distributing remainder capacity, THE Placement_Controller SHALL distribute deterministically by sorted Incarnation_Id.
 
 ### Requirement 9.2: Runtime Connection Budget Application
 
-**User Story:** As a Tokeira developer, I want each runtime node to apply the controller-assigned connection budget to its local rate limiter and reservoir, so that the cluster-wide limits are respected across all nodes.
+**User Story:** As a Tokeira developer, I want each runtime node to apply the controller-assigned connection budget to its reservoir and its fallback rate limiter, so that the cluster-wide limits are respected across all nodes.
 
 #### Acceptance Criteria
 
-1. WHEN a Runtime_Node receives a `ConnectionBudgetDirective`, THE Runtime_Node SHALL NOT apply `rate_per_second` or `capacity` to a per-node limiter: on the distributed path the connection creation rate is enforced cluster-wide by the DynamoDB token bucket every node's refiller draws from, and a per-node share written to that shared row would replace the cluster rate with a fraction of it. The two fields are carried for a process-local governor in front of the shared bucket, which does not exist.
-2. WHEN a Runtime_Node receives a `ConnectionBudgetDirective`, THE Runtime_Node SHALL cap its reservoir `target_ready` to `min(configured_target_ready, max_reservoir_size)`, floored at one, through the connection director's `apply_connection_budget(max_reservoir_size)`, which calls `reconfigure_target(new_target: u32)` on the reservoir. A directive never raises the target above the operator's configuration.
-3. IF the ready reservoir exceeds the new cap, THE Runtime_Node SHALL proactively retire idle excess connections via `retire_excess(target: u32)` on the reservoir; connections checked out by in-flight work are not interrupted and the refiller simply declines to replace them.
-4. WHEN the Membership_Stream drops, THE Runtime_Node SHALL retain its last-known connection budget share until the `valid_until` expiry; WHEN a drop or a failed reconnect finds the last share expired, THE Runtime_Node SHALL cap the reservoir to one warm connection, the floor that keeps lease renewal and relinquishment possible, until the next directive.
+1. WHEN a Runtime_Node receives a `ConnectionBudgetDirective`, THE Runtime_Node SHALL hand `rate_per_second` to the reservoir as the rate of its fallback limiter, which admits connection creations while the DynamoDB token bucket cannot be reached (DSQL reservoir redesign Requirement 7.9), and SHALL NOT write it to the DynamoDB token bucket: the shared item enforces the cluster's rate for every node, and a per-node share written there would replace the cluster rate with a fraction of it.
+2. WHEN a Runtime_Node receives a `ConnectionBudgetDirective`, THE Runtime_Node SHALL cap its reservoir target at `min(configured_target_ready, max_reservoir_size, capacity)`, floored at five (one connection for each operation class), through the connection director's `apply_connection_budget`, which reconfigures the reservoir's target and recomputes the class budgets from it. A directive never raises the target above the operator's configuration.
+3. IF the reservoir's live connections exceed the new cap, THE Runtime_Node SHALL proactively retire idle excess connections; connections checked out by in-flight work are not interrupted, and the reservoir retires them as they are returned until its live connections are within the cap.
+4. WHEN the Membership_Stream drops, THE Runtime_Node SHALL retain its last-known connection budget share, past its `valid_until`, until the next directive. A controller outage therefore leaves every node at the share it was last given, which together sum to no more than the cluster budget they were drawn from, rather than collapsing every node's connections and refilling them all at once when the controller returns.
 5. WHEN a Runtime_Node starts without a controller connection, THE Runtime_Node SHALL run its reservoir at the operator-configured `target_ready` until a directive arrives.
 6. WHERE the Runtime_Node runs on the in-memory store, THE Runtime_Node SHALL accept and discard connection budget directives: there is no reservoir to budget.
 

@@ -14,6 +14,7 @@
 //! every read of an action, each in a transaction, joins the parts it reads there.
 
 use std::sync::Arc;
+use tokeira_observability::statement_accounting::in_operation;
 
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
@@ -466,23 +467,32 @@ impl DsqlWorkerComputeRepository {
     }
 }
 
+// Every method runs in a DEBUG span named `dsql.<store>.<method>`, the
+// operation the process's statement accounting charges its round trips to
+// (`tokeira_observability::statement_accounting`).
 #[async_trait]
 impl WorkerComputeRepository for DsqlWorkerComputeRepository {
     async fn list_controllers(
         &self,
         namespace_id: NamespaceId,
     ) -> Result<Vec<WorkerComputeControllerRecord>> {
-        let mut permit = self.director.acquire(DbClass::Read).await?;
-        let rows = sqlx::query(
-            "SELECT revision, lease_epoch, record_data
-             FROM worker_compute_controller
-             WHERE namespace_id = $1
-             ORDER BY deployment_name ASC, build_id ASC",
+        in_operation(
+            tracing::debug_span!("dsql.worker_compute.list_controllers"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Read).await?;
+                let rows = sqlx::query(
+                    "SELECT revision, lease_epoch, record_data
+                 FROM worker_compute_controller
+                 WHERE namespace_id = $1
+                 ORDER BY deployment_name ASC, build_id ASC",
+                )
+                .bind(namespace_id.0)
+                .fetch_all(permit.connection()?)
+                .await?;
+                rows.iter().map(Self::decode_controller_row).collect()
+            },
         )
-        .bind(namespace_id.0)
-        .fetch_all(permit.connection()?)
-        .await?;
-        rows.iter().map(Self::decode_controller_row).collect()
+        .await
     }
 
     async fn inactivate_controller(
@@ -490,80 +500,87 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
         key: &ControllerInstanceKey,
         now: OffsetDateTime,
     ) -> Result<Option<WorkerComputeControllerRecord>> {
-        for _ in 0..32 {
-            let mut permit = self.director.acquire(DbClass::Commit).await?;
-            let mut tx = permit.begin().await?;
-            let row = sqlx::query(
-                "SELECT revision, lease_epoch, record_data
-                 FROM worker_compute_controller
-                 WHERE namespace_id = $1 AND deployment_name = $2 AND build_id = $3",
-            )
-            .bind(key.namespace_id.0)
-            .bind(&key.deployment_name.0)
-            .bind(&key.build_id.0)
-            .fetch_optional(&mut *tx)
-            .await?;
-            let Some(mut record) = row.as_ref().map(Self::decode_controller_row).transpose()?
-            else {
-                tx.rollback().await?;
-                return Ok(None);
-            };
-            if record.lifecycle == WorkerComputeControllerLifecycle::Inactive {
-                tx.rollback().await?;
-                return Ok(Some(record));
-            }
-            let previous_revision = record.revision;
-            if let Some(slot) = record.slot {
-                sqlx::query(
-                    "DELETE FROM worker_compute_controller_slot
-                     WHERE namespace_id = $1 AND slot = $2
-                       AND deployment_name = $3 AND build_id = $4",
-                )
-                .bind(key.namespace_id.0)
-                .bind(i16::from(slot))
-                .bind(&key.deployment_name.0)
-                .bind(&key.build_id.0)
-                .execute(&mut *tx)
-                .await?;
-            }
-            record.lifecycle = WorkerComputeControllerLifecycle::Inactive;
-            record.slot = None;
-            record.owner = None;
-            record.lease_until = None;
-            record.next_metrics_poll_at = None;
-            record.revision = record.revision.saturating_add(1);
-            record.reconciled_at = now;
-            for group in record.groups.values_mut() {
-                group.health = WorkerComputeHealth::Inactive;
-            }
-            let data = codec::encode_worker_compute_controller(&record)?;
-            let update = sqlx::query(
-                "UPDATE worker_compute_controller
-                 SET revision = $4, active = FALSE, slot = NULL,
-                     next_metrics_poll_at = NULL, lease_owner = NULL,
-                     lease_until = NULL, record_data = $5, updated_at = $6
-                 WHERE namespace_id = $1 AND deployment_name = $2 AND build_id = $3
-                   AND revision = $7",
-            )
-            .bind(key.namespace_id.0)
-            .bind(&key.deployment_name.0)
-            .bind(&key.build_id.0)
-            .bind(Self::i64(record.revision, "controller revision")?)
-            .bind(data)
-            .bind(now)
-            .bind(Self::i64(
-                previous_revision,
-                "previous controller revision",
-            )?)
-            .execute(&mut *tx)
-            .await?;
-            if update.rows_affected() == 1 {
-                tx.commit().await?;
-                return Ok(Some(record));
-            }
-            tx.rollback().await?;
-        }
-        anyhow::bail!("worker-compute controller inactivation exhausted optimistic retries")
+        in_operation(
+            tracing::debug_span!("dsql.worker_compute.inactivate_controller"),
+            async move {
+                for _ in 0..32 {
+                    let mut permit = self.director.acquire(DbClass::Commit).await?;
+                    let mut tx = permit.begin().await?;
+                    let row = sqlx::query(
+                        "SELECT revision, lease_epoch, record_data
+                     FROM worker_compute_controller
+                     WHERE namespace_id = $1 AND deployment_name = $2 AND build_id = $3",
+                    )
+                    .bind(key.namespace_id.0)
+                    .bind(&key.deployment_name.0)
+                    .bind(&key.build_id.0)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    let Some(mut record) =
+                        row.as_ref().map(Self::decode_controller_row).transpose()?
+                    else {
+                        tx.rollback().await?;
+                        return Ok(None);
+                    };
+                    if record.lifecycle == WorkerComputeControllerLifecycle::Inactive {
+                        tx.rollback().await?;
+                        return Ok(Some(record));
+                    }
+                    let previous_revision = record.revision;
+                    if let Some(slot) = record.slot {
+                        sqlx::query(
+                            "DELETE FROM worker_compute_controller_slot
+                         WHERE namespace_id = $1 AND slot = $2
+                           AND deployment_name = $3 AND build_id = $4",
+                        )
+                        .bind(key.namespace_id.0)
+                        .bind(i16::from(slot))
+                        .bind(&key.deployment_name.0)
+                        .bind(&key.build_id.0)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    record.lifecycle = WorkerComputeControllerLifecycle::Inactive;
+                    record.slot = None;
+                    record.owner = None;
+                    record.lease_until = None;
+                    record.next_metrics_poll_at = None;
+                    record.revision = record.revision.saturating_add(1);
+                    record.reconciled_at = now;
+                    for group in record.groups.values_mut() {
+                        group.health = WorkerComputeHealth::Inactive;
+                    }
+                    let data = codec::encode_worker_compute_controller(&record)?;
+                    let update = sqlx::query(
+                        "UPDATE worker_compute_controller
+                     SET revision = $4, active = FALSE, slot = NULL,
+                         next_metrics_poll_at = NULL, lease_owner = NULL,
+                         lease_until = NULL, record_data = $5, updated_at = $6
+                     WHERE namespace_id = $1 AND deployment_name = $2 AND build_id = $3
+                       AND revision = $7",
+                    )
+                    .bind(key.namespace_id.0)
+                    .bind(&key.deployment_name.0)
+                    .bind(&key.build_id.0)
+                    .bind(Self::i64(record.revision, "controller revision")?)
+                    .bind(data)
+                    .bind(now)
+                    .bind(Self::i64(
+                        previous_revision,
+                        "previous controller revision",
+                    )?)
+                    .execute(&mut *tx)
+                    .await?;
+                    if update.rows_affected() == 1 {
+                        tx.commit().await?;
+                        return Ok(Some(record));
+                    }
+                    tx.rollback().await?;
+                }
+                anyhow::bail!("worker-compute controller inactivation exhausted optimistic retries")
+            },
+        )
+        .await
     }
 
     async fn admit_controller(
@@ -572,104 +589,112 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
         namespace_limit: usize,
         now: OffsetDateTime,
     ) -> Result<WorkerComputeControllerAdmission> {
-        let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.begin().await?;
-        let existing = sqlx::query(
-            "SELECT revision, lease_epoch, record_data
-             FROM worker_compute_controller
-             WHERE namespace_id = $1 AND deployment_name = $2 AND build_id = $3",
-        )
-        .bind(candidate.key.namespace_id.0)
-        .bind(&candidate.key.deployment_name.0)
-        .bind(&candidate.key.build_id.0)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some(existing) = existing
-            .as_ref()
-            .map(Self::decode_controller_row)
-            .transpose()?
-        {
-            if existing.lifecycle == WorkerComputeControllerLifecycle::Active {
-                tx.rollback().await?;
-                return Ok(WorkerComputeControllerAdmission::Existing(existing));
-            }
-            candidate.revision = existing.revision.saturating_add(1);
-            candidate.owner_epoch = existing.owner_epoch;
-        }
-
-        let limit = namespace_limit.min(WORKER_COMPUTE_NAMESPACE_SLOT_LIMIT);
-        let mut assigned = None;
-        for slot in 0..limit {
-            let slot = u8::try_from(slot).expect("namespace slot bound is at most 100");
-            let inserted = sqlx::query(
-                "INSERT INTO worker_compute_controller_slot
-                 (namespace_id, slot, deployment_name, build_id, updated_at)
-                 VALUES ($1, $2, $3, $4, $5)
-                 ON CONFLICT (namespace_id, slot) DO NOTHING",
-            )
-            .bind(candidate.key.namespace_id.0)
-            .bind(i16::from(slot))
-            .bind(&candidate.key.deployment_name.0)
-            .bind(&candidate.key.build_id.0)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-            if inserted.rows_affected() == 1 {
-                assigned = Some(slot);
-                break;
-            }
-        }
-
-        candidate.reconciled_at = now;
-        candidate.owner = None;
-        candidate.lease_until = None;
-        candidate.slot = assigned;
-        candidate.lifecycle = if assigned.is_some() {
-            WorkerComputeControllerLifecycle::Active
-        } else {
-            for group in candidate.groups.values_mut() {
-                if group.eligibility == tokeira_types::WorkerComputeGroupEligibility::Eligible {
-                    group.health = WorkerComputeHealth::CapacityLimited;
+        in_operation(
+            tracing::debug_span!("dsql.worker_compute.admit_controller"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Commit).await?;
+                let mut tx = permit.begin().await?;
+                let existing = sqlx::query(
+                    "SELECT revision, lease_epoch, record_data
+                 FROM worker_compute_controller
+                 WHERE namespace_id = $1 AND deployment_name = $2 AND build_id = $3",
+                )
+                .bind(candidate.key.namespace_id.0)
+                .bind(&candidate.key.deployment_name.0)
+                .bind(&candidate.key.build_id.0)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some(existing) = existing
+                    .as_ref()
+                    .map(Self::decode_controller_row)
+                    .transpose()?
+                {
+                    if existing.lifecycle == WorkerComputeControllerLifecycle::Active {
+                        tx.rollback().await?;
+                        return Ok(WorkerComputeControllerAdmission::Existing(existing));
+                    }
+                    candidate.revision = existing.revision.saturating_add(1);
+                    candidate.owner_epoch = existing.owner_epoch;
                 }
-            }
-            WorkerComputeControllerLifecycle::CapacityLimited
-        };
-        let record_data = codec::encode_worker_compute_controller(&candidate)?;
-        sqlx::query(
-            "INSERT INTO worker_compute_controller
-             (namespace_id, deployment_name, build_id, revision, active, slot,
-              next_metrics_poll_at, lease_owner, lease_epoch, lease_until,
-              record_data, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, NULL, $9, $10)
-             ON CONFLICT (namespace_id, deployment_name, build_id) DO UPDATE SET
-                 revision = EXCLUDED.revision,
-                 active = EXCLUDED.active,
-                 slot = EXCLUDED.slot,
-                 next_metrics_poll_at = EXCLUDED.next_metrics_poll_at,
-                 lease_owner = NULL,
-                 lease_epoch = EXCLUDED.lease_epoch,
-                 lease_until = NULL,
-                 record_data = EXCLUDED.record_data,
-                 updated_at = EXCLUDED.updated_at",
+
+                let limit = namespace_limit.min(WORKER_COMPUTE_NAMESPACE_SLOT_LIMIT);
+                let mut assigned = None;
+                for slot in 0..limit {
+                    let slot = u8::try_from(slot).expect("namespace slot bound is at most 100");
+                    let inserted = sqlx::query(
+                        "INSERT INTO worker_compute_controller_slot
+                     (namespace_id, slot, deployment_name, build_id, updated_at)
+                     VALUES ($1, $2, $3, $4, $5)
+                     ON CONFLICT (namespace_id, slot) DO NOTHING",
+                    )
+                    .bind(candidate.key.namespace_id.0)
+                    .bind(i16::from(slot))
+                    .bind(&candidate.key.deployment_name.0)
+                    .bind(&candidate.key.build_id.0)
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await?;
+                    if inserted.rows_affected() == 1 {
+                        assigned = Some(slot);
+                        break;
+                    }
+                }
+
+                candidate.reconciled_at = now;
+                candidate.owner = None;
+                candidate.lease_until = None;
+                candidate.slot = assigned;
+                candidate.lifecycle = if assigned.is_some() {
+                    WorkerComputeControllerLifecycle::Active
+                } else {
+                    for group in candidate.groups.values_mut() {
+                        if group.eligibility
+                            == tokeira_types::WorkerComputeGroupEligibility::Eligible
+                        {
+                            group.health = WorkerComputeHealth::CapacityLimited;
+                        }
+                    }
+                    WorkerComputeControllerLifecycle::CapacityLimited
+                };
+                let record_data = codec::encode_worker_compute_controller(&candidate)?;
+                sqlx::query(
+                    "INSERT INTO worker_compute_controller
+                 (namespace_id, deployment_name, build_id, revision, active, slot,
+                  next_metrics_poll_at, lease_owner, lease_epoch, lease_until,
+                  record_data, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, NULL, $9, $10)
+                 ON CONFLICT (namespace_id, deployment_name, build_id) DO UPDATE SET
+                     revision = EXCLUDED.revision,
+                     active = EXCLUDED.active,
+                     slot = EXCLUDED.slot,
+                     next_metrics_poll_at = EXCLUDED.next_metrics_poll_at,
+                     lease_owner = NULL,
+                     lease_epoch = EXCLUDED.lease_epoch,
+                     lease_until = NULL,
+                     record_data = EXCLUDED.record_data,
+                     updated_at = EXCLUDED.updated_at",
+                )
+                .bind(candidate.key.namespace_id.0)
+                .bind(&candidate.key.deployment_name.0)
+                .bind(&candidate.key.build_id.0)
+                .bind(Self::i64(candidate.revision, "controller revision")?)
+                .bind(assigned.is_some())
+                .bind(assigned.map(i16::from))
+                .bind(candidate.next_metrics_poll_at)
+                .bind(Self::i64(candidate.owner_epoch, "controller owner epoch")?)
+                .bind(record_data)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok(if assigned.is_some() {
+                    WorkerComputeControllerAdmission::Admitted(candidate)
+                } else {
+                    WorkerComputeControllerAdmission::CapacityLimited(candidate)
+                })
+            },
         )
-        .bind(candidate.key.namespace_id.0)
-        .bind(&candidate.key.deployment_name.0)
-        .bind(&candidate.key.build_id.0)
-        .bind(Self::i64(candidate.revision, "controller revision")?)
-        .bind(assigned.is_some())
-        .bind(assigned.map(i16::from))
-        .bind(candidate.next_metrics_poll_at)
-        .bind(Self::i64(candidate.owner_epoch, "controller owner epoch")?)
-        .bind(record_data)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(if assigned.is_some() {
-            WorkerComputeControllerAdmission::Admitted(candidate)
-        } else {
-            WorkerComputeControllerAdmission::CapacityLimited(candidate)
-        })
+        .await
     }
 
     async fn claim_controller(
@@ -679,73 +704,80 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
         now: OffsetDateTime,
         lease_until: OffsetDateTime,
     ) -> Result<Option<ClaimedWorkerComputeController>> {
-        if lease_until <= now {
-            return Ok(None);
-        }
-        let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.begin().await?;
-        let row = sqlx::query(
-            "SELECT revision, lease_epoch, record_data
-             FROM worker_compute_controller
-             WHERE namespace_id = $1 AND deployment_name = $2 AND build_id = $3
-               AND active = TRUE
-               AND (lease_until IS NULL OR lease_until <= $4 OR lease_owner = $5)",
-        )
-        .bind(key.namespace_id.0)
-        .bind(&key.deployment_name.0)
-        .bind(&key.build_id.0)
-        .bind(now)
-        .bind(owner.0)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(mut record) = row.as_ref().map(Self::decode_controller_row).transpose()? else {
-            tx.rollback().await?;
-            return Ok(None);
-        };
-        let previous_epoch = record.owner_epoch;
-        record.owner_epoch = record.owner_epoch.saturating_add(1);
-        record.owner = Some(owner);
-        record.lease_until = Some(lease_until);
-        let record_data = codec::encode_worker_compute_controller(&record)?;
-        let update = sqlx::query(
-            "UPDATE worker_compute_controller
-             SET lease_owner = $4, lease_epoch = $5, lease_until = $6,
-                 record_data = $7, updated_at = $8
-             WHERE namespace_id = $1 AND deployment_name = $2 AND build_id = $3
-               AND lease_epoch = $9
-               AND (lease_until IS NULL OR lease_until <= $8 OR lease_owner = $4)",
-        )
-        .bind(key.namespace_id.0)
-        .bind(&key.deployment_name.0)
-        .bind(&key.build_id.0)
-        .bind(owner.0)
-        .bind(Self::i64(record.owner_epoch, "controller owner epoch")?)
-        .bind(lease_until)
-        .bind(record_data)
-        .bind(now)
-        .bind(Self::i64(
-            previous_epoch,
-            "previous controller owner epoch",
-        )?)
-        .execute(&mut *tx)
-        .await?;
-        if update.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Ok(None);
-        }
-        match tx.commit().await {
-            Ok(()) => {
-                let claim = WorkerComputeControllerClaim {
-                    key: key.clone(),
-                    owner,
-                    owner_epoch: record.owner_epoch,
-                    lease_until,
+        in_operation(
+            tracing::debug_span!("dsql.worker_compute.claim_controller"),
+            async move {
+                if lease_until <= now {
+                    return Ok(None);
+                }
+                let mut permit = self.director.acquire(DbClass::Commit).await?;
+                let mut tx = permit.begin().await?;
+                let row = sqlx::query(
+                    "SELECT revision, lease_epoch, record_data
+                 FROM worker_compute_controller
+                 WHERE namespace_id = $1 AND deployment_name = $2 AND build_id = $3
+                   AND active = TRUE
+                   AND (lease_until IS NULL OR lease_until <= $4 OR lease_owner = $5)",
+                )
+                .bind(key.namespace_id.0)
+                .bind(&key.deployment_name.0)
+                .bind(&key.build_id.0)
+                .bind(now)
+                .bind(owner.0)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let Some(mut record) = row.as_ref().map(Self::decode_controller_row).transpose()?
+                else {
+                    tx.rollback().await?;
+                    return Ok(None);
                 };
-                Ok(Some(ClaimedWorkerComputeController { claim, record }))
-            }
-            Err(error) if DsqlRunRepository::is_serialization_failure(&error) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
+                let previous_epoch = record.owner_epoch;
+                record.owner_epoch = record.owner_epoch.saturating_add(1);
+                record.owner = Some(owner);
+                record.lease_until = Some(lease_until);
+                let record_data = codec::encode_worker_compute_controller(&record)?;
+                let update = sqlx::query(
+                    "UPDATE worker_compute_controller
+                 SET lease_owner = $4, lease_epoch = $5, lease_until = $6,
+                     record_data = $7, updated_at = $8
+                 WHERE namespace_id = $1 AND deployment_name = $2 AND build_id = $3
+                   AND lease_epoch = $9
+                   AND (lease_until IS NULL OR lease_until <= $8 OR lease_owner = $4)",
+                )
+                .bind(key.namespace_id.0)
+                .bind(&key.deployment_name.0)
+                .bind(&key.build_id.0)
+                .bind(owner.0)
+                .bind(Self::i64(record.owner_epoch, "controller owner epoch")?)
+                .bind(lease_until)
+                .bind(record_data)
+                .bind(now)
+                .bind(Self::i64(
+                    previous_epoch,
+                    "previous controller owner epoch",
+                )?)
+                .execute(&mut *tx)
+                .await?;
+                if update.rows_affected() != 1 {
+                    tx.rollback().await?;
+                    return Ok(None);
+                }
+                match tx.commit().await {
+                    Ok(()) => {
+                        let claim = WorkerComputeControllerClaim {
+                            key: key.clone(),
+                            owner,
+                            owner_epoch: record.owner_epoch,
+                            lease_until,
+                        };
+                        Ok(Some(ClaimedWorkerComputeController { claim, record }))
+                    }
+                    Err(error) if DsqlRunRepository::is_serialization_failure(&error) => Ok(None),
+                    Err(error) => Err(error.into()),
+                }
+            },
+        )
+        .await
     }
 
     async fn commit_decision(
@@ -755,120 +787,133 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
         next: WorkerComputeControllerRecord,
         action: Option<WorkerComputeProviderAction>,
     ) -> Result<WorkerComputeControllerCommitResult> {
-        if next.key != claim.key || next.revision != expected_revision.saturating_add(1) {
-            return Ok(WorkerComputeControllerCommitResult::Conflict);
-        }
-        if let Some(action) = action.as_ref()
-            && (action.controller_key != claim.key
-                || action.due_bucket >= WORKER_COMPUTE_ACTION_BUCKETS
-                || action.due_bucket != WorkerComputeProviderAction::due_bucket(action.action_id))
-        {
-            return Ok(WorkerComputeControllerCommitResult::Conflict);
-        }
-        let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.begin().await?;
-        if let Some(action) = action.as_ref()
-            && Self::insert_action(&mut tx, action).await? != 1
-        {
-            tx.rollback().await?;
-            return Ok(WorkerComputeControllerCommitResult::Conflict);
-        }
+        in_operation(
+            tracing::debug_span!("dsql.worker_compute.commit_decision"),
+            async move {
+                if next.key != claim.key || next.revision != expected_revision.saturating_add(1) {
+                    return Ok(WorkerComputeControllerCommitResult::Conflict);
+                }
+                if let Some(action) = action.as_ref()
+                    && (action.controller_key != claim.key
+                        || action.due_bucket >= WORKER_COMPUTE_ACTION_BUCKETS
+                        || action.due_bucket
+                            != WorkerComputeProviderAction::due_bucket(action.action_id))
+                {
+                    return Ok(WorkerComputeControllerCommitResult::Conflict);
+                }
+                let mut permit = self.director.acquire(DbClass::Commit).await?;
+                let mut tx = permit.begin().await?;
+                if let Some(action) = action.as_ref()
+                    && Self::insert_action(&mut tx, action).await? != 1
+                {
+                    tx.rollback().await?;
+                    return Ok(WorkerComputeControllerCommitResult::Conflict);
+                }
 
-        let record_data = codec::encode_worker_compute_controller(&next)?;
-        let update = sqlx::query(
-            "UPDATE worker_compute_controller
-             SET revision = $7, active = $8, slot = $9,
-                 next_metrics_poll_at = $10, lease_owner = $11,
-                 lease_epoch = $12, lease_until = $13, record_data = $14,
-                 updated_at = now()
-             WHERE namespace_id = $1 AND deployment_name = $2 AND build_id = $3
-               AND revision = $4 AND lease_owner = $5 AND lease_epoch = $6
-               AND lease_until > now()",
+                let record_data = codec::encode_worker_compute_controller(&next)?;
+                let update = sqlx::query(
+                    "UPDATE worker_compute_controller
+                 SET revision = $7, active = $8, slot = $9,
+                     next_metrics_poll_at = $10, lease_owner = $11,
+                     lease_epoch = $12, lease_until = $13, record_data = $14,
+                     updated_at = now()
+                 WHERE namespace_id = $1 AND deployment_name = $2 AND build_id = $3
+                   AND revision = $4 AND lease_owner = $5 AND lease_epoch = $6
+                   AND lease_until > now()",
+                )
+                .bind(claim.key.namespace_id.0)
+                .bind(&claim.key.deployment_name.0)
+                .bind(&claim.key.build_id.0)
+                .bind(Self::i64(
+                    expected_revision,
+                    "expected controller revision",
+                )?)
+                .bind(claim.owner.0)
+                .bind(Self::i64(claim.owner_epoch, "controller owner epoch")?)
+                .bind(Self::i64(next.revision, "controller revision")?)
+                .bind(next.lifecycle == WorkerComputeControllerLifecycle::Active)
+                .bind(next.slot.map(i16::from))
+                .bind(next.next_metrics_poll_at)
+                .bind(next.owner.map(|owner| owner.0))
+                .bind(Self::i64(next.owner_epoch, "next controller owner epoch")?)
+                .bind(next.lease_until)
+                .bind(record_data)
+                .execute(&mut *tx)
+                .await?;
+                if update.rows_affected() != 1 {
+                    tx.rollback().await?;
+                    return Ok(WorkerComputeControllerCommitResult::Fenced);
+                }
+                if next.lifecycle != WorkerComputeControllerLifecycle::Active {
+                    sqlx::query(
+                        "DELETE FROM worker_compute_controller_slot
+                     WHERE namespace_id = $1 AND deployment_name = $2 AND build_id = $3",
+                    )
+                    .bind(next.key.namespace_id.0)
+                    .bind(&next.key.deployment_name.0)
+                    .bind(&next.key.build_id.0)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                match tx.commit().await {
+                    Ok(()) => Ok(WorkerComputeControllerCommitResult::Applied),
+                    Err(error) if DsqlRunRepository::is_serialization_failure(&error) => {
+                        Ok(WorkerComputeControllerCommitResult::Conflict)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            },
         )
-        .bind(claim.key.namespace_id.0)
-        .bind(&claim.key.deployment_name.0)
-        .bind(&claim.key.build_id.0)
-        .bind(Self::i64(
-            expected_revision,
-            "expected controller revision",
-        )?)
-        .bind(claim.owner.0)
-        .bind(Self::i64(claim.owner_epoch, "controller owner epoch")?)
-        .bind(Self::i64(next.revision, "controller revision")?)
-        .bind(next.lifecycle == WorkerComputeControllerLifecycle::Active)
-        .bind(next.slot.map(i16::from))
-        .bind(next.next_metrics_poll_at)
-        .bind(next.owner.map(|owner| owner.0))
-        .bind(Self::i64(next.owner_epoch, "next controller owner epoch")?)
-        .bind(next.lease_until)
-        .bind(record_data)
-        .execute(&mut *tx)
-        .await?;
-        if update.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Ok(WorkerComputeControllerCommitResult::Fenced);
-        }
-        if next.lifecycle != WorkerComputeControllerLifecycle::Active {
-            sqlx::query(
-                "DELETE FROM worker_compute_controller_slot
-                 WHERE namespace_id = $1 AND deployment_name = $2 AND build_id = $3",
-            )
-            .bind(next.key.namespace_id.0)
-            .bind(&next.key.deployment_name.0)
-            .bind(&next.key.build_id.0)
-            .execute(&mut *tx)
-            .await?;
-        }
-        match tx.commit().await {
-            Ok(()) => Ok(WorkerComputeControllerCommitResult::Applied),
-            Err(error) if DsqlRunRepository::is_serialization_failure(&error) => {
-                Ok(WorkerComputeControllerCommitResult::Conflict)
-            }
-            Err(error) => Err(error.into()),
-        }
+        .await
     }
 
     async fn put_queue_sample(&self, sample: WorkerComputeQueueSample) -> Result<()> {
-        let mut permit = self.director.acquire(DbClass::Commit).await?;
-        sqlx::query(
-            "INSERT INTO worker_compute_queue_sample
-             (namespace_id, deployment_name, build_id, task_type, task_queue,
-              writer_id, writer_sequence, backlog_count, add_rate, dispatch_rate, sampled_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-             ON CONFLICT (namespace_id, deployment_name, build_id, task_type, task_queue)
-             DO UPDATE SET writer_id = EXCLUDED.writer_id,
-                 writer_sequence = EXCLUDED.writer_sequence,
-                 backlog_count = EXCLUDED.backlog_count,
-                 add_rate = EXCLUDED.add_rate,
-                 dispatch_rate = EXCLUDED.dispatch_rate,
-                 sampled_at = EXCLUDED.sampled_at
-             WHERE
-                 (worker_compute_queue_sample.writer_id = EXCLUDED.writer_id
-                  AND worker_compute_queue_sample.writer_sequence < EXCLUDED.writer_sequence)
-                 OR
-                 (worker_compute_queue_sample.writer_id <> EXCLUDED.writer_id
-                  AND worker_compute_queue_sample.sampled_at <= EXCLUDED.sampled_at)",
+        in_operation(
+            tracing::debug_span!("dsql.worker_compute.put_queue_sample"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Commit).await?;
+                sqlx::query(
+                    "INSERT INTO worker_compute_queue_sample
+                 (namespace_id, deployment_name, build_id, task_type, task_queue,
+                  writer_id, writer_sequence, backlog_count, add_rate, dispatch_rate, sampled_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                 ON CONFLICT (namespace_id, deployment_name, build_id, task_type, task_queue)
+                 DO UPDATE SET writer_id = EXCLUDED.writer_id,
+                     writer_sequence = EXCLUDED.writer_sequence,
+                     backlog_count = EXCLUDED.backlog_count,
+                     add_rate = EXCLUDED.add_rate,
+                     dispatch_rate = EXCLUDED.dispatch_rate,
+                     sampled_at = EXCLUDED.sampled_at
+                 WHERE
+                     (worker_compute_queue_sample.writer_id = EXCLUDED.writer_id
+                      AND worker_compute_queue_sample.writer_sequence < EXCLUDED.writer_sequence)
+                     OR
+                     (worker_compute_queue_sample.writer_id <> EXCLUDED.writer_id
+                      AND worker_compute_queue_sample.sampled_at <= EXCLUDED.sampled_at)",
+                )
+                .bind(sample.key.namespace_id.0)
+                .bind(&sample.key.deployment_name.0)
+                .bind(&sample.key.build_id.0)
+                .bind(Self::encode_task_type(sample.key.task_type))
+                .bind(&sample.key.task_queue.0)
+                .bind(sample.writer_id.0)
+                .bind(Self::i64(
+                    sample.writer_sequence,
+                    "queue sample writer sequence",
+                )?)
+                .bind(Self::i64(
+                    sample.backlog_count,
+                    "queue sample backlog count",
+                )?)
+                .bind(sample.add_rate)
+                .bind(sample.dispatch_rate)
+                .bind(sample.sampled_at)
+                .execute(permit.connection()?)
+                .await?;
+                Ok(())
+            },
         )
-        .bind(sample.key.namespace_id.0)
-        .bind(&sample.key.deployment_name.0)
-        .bind(&sample.key.build_id.0)
-        .bind(Self::encode_task_type(sample.key.task_type))
-        .bind(&sample.key.task_queue.0)
-        .bind(sample.writer_id.0)
-        .bind(Self::i64(
-            sample.writer_sequence,
-            "queue sample writer sequence",
-        )?)
-        .bind(Self::i64(
-            sample.backlog_count,
-            "queue sample backlog count",
-        )?)
-        .bind(sample.add_rate)
-        .bind(sample.dispatch_rate)
-        .bind(sample.sampled_at)
-        .execute(permit.connection()?)
-        .await?;
-        Ok(())
+        .await
     }
 
     async fn list_queue_samples(
@@ -876,46 +921,52 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
         key: &ControllerInstanceKey,
         not_before: OffsetDateTime,
     ) -> Result<Vec<WorkerComputeQueueSample>> {
-        let mut permit = self.director.acquire(DbClass::Read).await?;
-        let rows = sqlx::query(
-            "SELECT task_type, task_queue, writer_id, writer_sequence, backlog_count,
-                    add_rate, dispatch_rate, sampled_at
-             FROM worker_compute_queue_sample
-             WHERE namespace_id = $1 AND deployment_name = $2 AND build_id = $3
-               AND sampled_at >= $4
-             ORDER BY task_type ASC, task_queue ASC",
+        in_operation(
+            tracing::debug_span!("dsql.worker_compute.list_queue_samples"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Read).await?;
+                let rows = sqlx::query(
+                    "SELECT task_type, task_queue, writer_id, writer_sequence, backlog_count,
+                        add_rate, dispatch_rate, sampled_at
+                 FROM worker_compute_queue_sample
+                 WHERE namespace_id = $1 AND deployment_name = $2 AND build_id = $3
+                   AND sampled_at >= $4
+                 ORDER BY task_type ASC, task_queue ASC",
+                )
+                .bind(key.namespace_id.0)
+                .bind(&key.deployment_name.0)
+                .bind(&key.build_id.0)
+                .bind(not_before)
+                .fetch_all(permit.connection()?)
+                .await?;
+                rows.iter()
+                    .map(|row| {
+                        Ok(WorkerComputeQueueSample {
+                            key: WorkerComputeQueueKey {
+                                namespace_id: key.namespace_id,
+                                deployment_name: key.deployment_name.clone(),
+                                build_id: key.build_id.clone(),
+                                task_type: Self::decode_task_type(row.try_get("task_type")?)?,
+                                task_queue: TaskQueueName(row.try_get("task_queue")?),
+                            },
+                            writer_id: IncarnationId(row.try_get("writer_id")?),
+                            writer_sequence: Self::u64(
+                                row.try_get("writer_sequence")?,
+                                "queue sample writer sequence",
+                            )?,
+                            backlog_count: Self::u64(
+                                row.try_get("backlog_count")?,
+                                "queue sample backlog count",
+                            )?,
+                            add_rate: row.try_get("add_rate")?,
+                            dispatch_rate: row.try_get("dispatch_rate")?,
+                            sampled_at: row.try_get("sampled_at")?,
+                        })
+                    })
+                    .collect()
+            },
         )
-        .bind(key.namespace_id.0)
-        .bind(&key.deployment_name.0)
-        .bind(&key.build_id.0)
-        .bind(not_before)
-        .fetch_all(permit.connection()?)
-        .await?;
-        rows.iter()
-            .map(|row| {
-                Ok(WorkerComputeQueueSample {
-                    key: WorkerComputeQueueKey {
-                        namespace_id: key.namespace_id,
-                        deployment_name: key.deployment_name.clone(),
-                        build_id: key.build_id.clone(),
-                        task_type: Self::decode_task_type(row.try_get("task_type")?)?,
-                        task_queue: TaskQueueName(row.try_get("task_queue")?),
-                    },
-                    writer_id: IncarnationId(row.try_get("writer_id")?),
-                    writer_sequence: Self::u64(
-                        row.try_get("writer_sequence")?,
-                        "queue sample writer sequence",
-                    )?,
-                    backlog_count: Self::u64(
-                        row.try_get("backlog_count")?,
-                        "queue sample backlog count",
-                    )?,
-                    add_rate: row.try_get("add_rate")?,
-                    dispatch_rate: row.try_get("dispatch_rate")?,
-                    sampled_at: row.try_get("sampled_at")?,
-                })
-            })
-            .collect()
+        .await
     }
 
     async fn claim_due_actions(
@@ -926,87 +977,97 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
         claim_until: OffsetDateTime,
         limit: usize,
     ) -> Result<Vec<ClaimedWorkerComputeProviderAction>> {
-        let limit = limit.min(WORKER_COMPUTE_ACTION_CLAIM_LIMIT);
-        if claim_until <= now || limit == 0 {
-            return Ok(Vec::new());
-        }
-        let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.begin().await?;
-        let start_bucket = owner.0.as_bytes()[0] >> 2;
-        let mut claimed = Vec::with_capacity(limit.min(WORKER_COMPUTE_ACTION_BUCKETS as usize));
-
-        for offset in 0..WORKER_COMPUTE_ACTION_BUCKETS {
-            if claimed.len() == limit {
-                break;
-            }
-            let bucket = start_bucket.wrapping_add(offset) & (WORKER_COMPUTE_ACTION_BUCKETS - 1);
-            let remaining = i64::try_from(limit - claimed.len())
-                .map_err(|_| anyhow::anyhow!("action claim limit exceeds i64"))?;
-            let query = format!(
-                "SELECT {ACTION_COLUMNS}
-                 FROM worker_compute_action
-                 WHERE namespace_id = $1 AND due_bucket = $2
-                   AND next_attempt_at <= $3
-                   AND (status = $4 OR (status = $5 AND claim_until <= $3))
-                 ORDER BY next_attempt_at ASC, action_id ASC
-                 LIMIT $6"
-            );
-            // SQL safety: the only interpolation is the `ACTION_COLUMNS` constant;
-            // every request value is a bind parameter.
-            let rows = sqlx::query(AssertSqlSafe(query))
-                .bind(namespace_id.0)
-                .bind(i16::from(bucket))
-                .bind(now)
-                .bind(Self::encode_status(
-                    WorkerComputeProviderActionStatus::Pending,
-                ))
-                .bind(Self::encode_status(
-                    WorkerComputeProviderActionStatus::Claimed,
-                ))
-                .bind(remaining)
-                .fetch_all(&mut *tx)
-                .await?;
-            for row in rows {
-                let mut action = Self::read_action(&mut tx, &row).await?;
-                let previous_epoch = action.claim_epoch;
-                let claim = WorkerComputeActionClaim {
-                    action_id: action.action_id,
-                    owner,
-                    claim_epoch: previous_epoch.saturating_add(1),
-                    claim_until,
-                };
-                let update = sqlx::query(
-                    "UPDATE worker_compute_action
-                     SET status = $4, claim_owner = $5, claim_epoch = $6,
-                         claim_until = $7, updated_at = $8
-                     WHERE action_id = $1 AND status = $2 AND claim_epoch = $3",
-                )
-                .bind(action.action_id)
-                .bind(Self::encode_status(action.status))
-                .bind(Self::i64(previous_epoch, "previous action claim epoch")?)
-                .bind(Self::encode_status(
-                    WorkerComputeProviderActionStatus::Claimed,
-                ))
-                .bind(owner.0)
-                .bind(Self::i64(claim.claim_epoch, "action claim epoch")?)
-                .bind(claim_until)
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
-                if update.rows_affected() == 1 {
-                    action.status = WorkerComputeProviderActionStatus::Claimed;
-                    action.claim_epoch = claim.claim_epoch;
-                    action.claim = Some(claim.clone());
-                    action.updated_at = now;
-                    claimed.push(ClaimedWorkerComputeProviderAction { claim, action });
+        in_operation(
+            tracing::debug_span!("dsql.worker_compute.claim_due_actions"),
+            async move {
+                let limit = limit.min(WORKER_COMPUTE_ACTION_CLAIM_LIMIT);
+                if claim_until <= now || limit == 0 {
+                    return Ok(Vec::new());
                 }
-            }
-        }
-        match tx.commit().await {
-            Ok(()) => Ok(claimed),
-            Err(error) if DsqlRunRepository::is_serialization_failure(&error) => Ok(Vec::new()),
-            Err(error) => Err(error.into()),
-        }
+                let mut permit = self.director.acquire(DbClass::Commit).await?;
+                let mut tx = permit.begin().await?;
+                let start_bucket = owner.0.as_bytes()[0] >> 2;
+                let mut claimed =
+                    Vec::with_capacity(limit.min(WORKER_COMPUTE_ACTION_BUCKETS as usize));
+
+                for offset in 0..WORKER_COMPUTE_ACTION_BUCKETS {
+                    if claimed.len() == limit {
+                        break;
+                    }
+                    let bucket =
+                        start_bucket.wrapping_add(offset) & (WORKER_COMPUTE_ACTION_BUCKETS - 1);
+                    let remaining = i64::try_from(limit - claimed.len())
+                        .map_err(|_| anyhow::anyhow!("action claim limit exceeds i64"))?;
+                    let query = format!(
+                        "SELECT {ACTION_COLUMNS}
+                     FROM worker_compute_action
+                     WHERE namespace_id = $1 AND due_bucket = $2
+                       AND next_attempt_at <= $3
+                       AND (status = $4 OR (status = $5 AND claim_until <= $3))
+                     ORDER BY next_attempt_at ASC, action_id ASC
+                     LIMIT $6"
+                    );
+                    // SQL safety: the only interpolation is the `ACTION_COLUMNS` constant;
+                    // every request value is a bind parameter.
+                    let rows = sqlx::query(AssertSqlSafe(query))
+                        .bind(namespace_id.0)
+                        .bind(i16::from(bucket))
+                        .bind(now)
+                        .bind(Self::encode_status(
+                            WorkerComputeProviderActionStatus::Pending,
+                        ))
+                        .bind(Self::encode_status(
+                            WorkerComputeProviderActionStatus::Claimed,
+                        ))
+                        .bind(remaining)
+                        .fetch_all(&mut *tx)
+                        .await?;
+                    for row in rows {
+                        let mut action = Self::read_action(&mut tx, &row).await?;
+                        let previous_epoch = action.claim_epoch;
+                        let claim = WorkerComputeActionClaim {
+                            action_id: action.action_id,
+                            owner,
+                            claim_epoch: previous_epoch.saturating_add(1),
+                            claim_until,
+                        };
+                        let update = sqlx::query(
+                            "UPDATE worker_compute_action
+                         SET status = $4, claim_owner = $5, claim_epoch = $6,
+                             claim_until = $7, updated_at = $8
+                         WHERE action_id = $1 AND status = $2 AND claim_epoch = $3",
+                        )
+                        .bind(action.action_id)
+                        .bind(Self::encode_status(action.status))
+                        .bind(Self::i64(previous_epoch, "previous action claim epoch")?)
+                        .bind(Self::encode_status(
+                            WorkerComputeProviderActionStatus::Claimed,
+                        ))
+                        .bind(owner.0)
+                        .bind(Self::i64(claim.claim_epoch, "action claim epoch")?)
+                        .bind(claim_until)
+                        .bind(now)
+                        .execute(&mut *tx)
+                        .await?;
+                        if update.rows_affected() == 1 {
+                            action.status = WorkerComputeProviderActionStatus::Claimed;
+                            action.claim_epoch = claim.claim_epoch;
+                            action.claim = Some(claim.clone());
+                            action.updated_at = now;
+                            claimed.push(ClaimedWorkerComputeProviderAction { claim, action });
+                        }
+                    }
+                }
+                match tx.commit().await {
+                    Ok(()) => Ok(claimed),
+                    Err(error) if DsqlRunRepository::is_serialization_failure(&error) => {
+                        Ok(Vec::new())
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            },
+        )
+        .await
     }
 
     async fn begin_action_attempt(
@@ -1014,53 +1075,61 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
         claim: &WorkerComputeActionClaim,
         now: OffsetDateTime,
     ) -> Result<WorkerComputeActionAttemptStart> {
-        let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.begin().await?;
-        let query =
-            format!("SELECT {ACTION_COLUMNS} FROM worker_compute_action WHERE action_id = $1");
-        // SQL safety: the only interpolation is the `ACTION_COLUMNS` constant;
-        // every request value is a bind parameter.
-        let row = sqlx::query(AssertSqlSafe(query))
-            .bind(claim.action_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let action = match &row {
-            Some(row) => Some(Self::read_action(&mut tx, row).await?),
-            None => None,
-        };
-        let Some(mut action) = action else {
-            tx.rollback().await?;
-            return Ok(WorkerComputeActionAttemptStart::NotFound);
-        };
-        if action.claim.as_ref() != Some(claim)
-            || action.status != WorkerComputeProviderActionStatus::Claimed
-            || claim.claim_until <= now
-        {
-            tx.rollback().await?;
-            return Ok(WorkerComputeActionAttemptStart::StaleClaim);
-        }
-        let (_, fingerprint_current) = Self::current_action_fingerprint(&mut tx, &action).await?;
-        if !fingerprint_current {
-            action.status = WorkerComputeProviderActionStatus::Superseded;
-            action.superseded_at = Some(now);
-            action.claim = None;
-            action.updated_at = now;
-            if Self::update_action(&mut tx, &action, claim).await? != 1 {
-                tx.rollback().await?;
-                return Ok(WorkerComputeActionAttemptStart::StaleClaim);
-            }
-            tx.commit().await?;
-            return Ok(WorkerComputeActionAttemptStart::Superseded);
-        }
-        action.attempts = action.attempts.saturating_add(1);
-        action.attempt_started_at = Some(now);
-        action.updated_at = now;
-        if Self::update_action(&mut tx, &action, claim).await? != 1 {
-            tx.rollback().await?;
-            return Ok(WorkerComputeActionAttemptStart::StaleClaim);
-        }
-        tx.commit().await?;
-        Ok(WorkerComputeActionAttemptStart::Started(action))
+        in_operation(
+            tracing::debug_span!("dsql.worker_compute.begin_action_attempt"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Commit).await?;
+                let mut tx = permit.begin().await?;
+                let query = format!(
+                    "SELECT {ACTION_COLUMNS} FROM worker_compute_action WHERE action_id = $1"
+                );
+                // SQL safety: the only interpolation is the `ACTION_COLUMNS` constant;
+                // every request value is a bind parameter.
+                let row = sqlx::query(AssertSqlSafe(query))
+                    .bind(claim.action_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                let action = match &row {
+                    Some(row) => Some(Self::read_action(&mut tx, row).await?),
+                    None => None,
+                };
+                let Some(mut action) = action else {
+                    tx.rollback().await?;
+                    return Ok(WorkerComputeActionAttemptStart::NotFound);
+                };
+                if action.claim.as_ref() != Some(claim)
+                    || action.status != WorkerComputeProviderActionStatus::Claimed
+                    || claim.claim_until <= now
+                {
+                    tx.rollback().await?;
+                    return Ok(WorkerComputeActionAttemptStart::StaleClaim);
+                }
+                let (_, fingerprint_current) =
+                    Self::current_action_fingerprint(&mut tx, &action).await?;
+                if !fingerprint_current {
+                    action.status = WorkerComputeProviderActionStatus::Superseded;
+                    action.superseded_at = Some(now);
+                    action.claim = None;
+                    action.updated_at = now;
+                    if Self::update_action(&mut tx, &action, claim).await? != 1 {
+                        tx.rollback().await?;
+                        return Ok(WorkerComputeActionAttemptStart::StaleClaim);
+                    }
+                    tx.commit().await?;
+                    return Ok(WorkerComputeActionAttemptStart::Superseded);
+                }
+                action.attempts = action.attempts.saturating_add(1);
+                action.attempt_started_at = Some(now);
+                action.updated_at = now;
+                if Self::update_action(&mut tx, &action, claim).await? != 1 {
+                    tx.rollback().await?;
+                    return Ok(WorkerComputeActionAttemptStart::StaleClaim);
+                }
+                tx.commit().await?;
+                Ok(WorkerComputeActionAttemptStart::Started(action))
+            },
+        )
+        .await
     }
 
     async fn finalize_action(
@@ -1068,153 +1137,163 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
         claim: &WorkerComputeActionClaim,
         result: WorkerComputeActionFinalization,
     ) -> Result<WorkerComputeActionFinalizeResult> {
-        let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.begin().await?;
-        let query =
-            format!("SELECT {ACTION_COLUMNS} FROM worker_compute_action WHERE action_id = $1");
-        // SQL safety: the only interpolation is the `ACTION_COLUMNS` constant;
-        // every request value is a bind parameter.
-        let row = sqlx::query(AssertSqlSafe(query))
-            .bind(claim.action_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let action = match &row {
-            Some(row) => Some(Self::read_action(&mut tx, row).await?),
-            None => None,
-        };
-        let Some(mut action) = action else {
-            tx.rollback().await?;
-            return Ok(WorkerComputeActionFinalizeResult::NotFound);
-        };
-        let completed_at = match &result {
-            WorkerComputeActionFinalization::Delivered { completed_at }
-            | WorkerComputeActionFinalization::RetryableFailure { completed_at, .. }
-            | WorkerComputeActionFinalization::TerminalFailure { completed_at, .. } => {
-                *completed_at
-            }
-            WorkerComputeActionFinalization::Superseded { superseded_at } => *superseded_at,
-        };
-        if action.claim.as_ref() != Some(claim)
-            || action.status != WorkerComputeProviderActionStatus::Claimed
-            || claim.claim_until <= completed_at
-        {
-            tx.rollback().await?;
-            return Ok(WorkerComputeActionFinalizeResult::StaleClaim);
-        }
-        let (mut controller, fingerprint_current) =
-            Self::current_action_fingerprint(&mut tx, &action).await?;
-        let (status, category, next_attempt_at, superseded_at, completed_at) = match result {
-            WorkerComputeActionFinalization::Delivered { completed_at } => (
-                WorkerComputeProviderActionStatus::Delivered,
-                None,
-                action.next_attempt_at,
-                None,
-                completed_at,
-            ),
-            WorkerComputeActionFinalization::RetryableFailure {
-                category,
-                next_attempt_at,
-                completed_at,
-            } if fingerprint_current => (
-                WorkerComputeProviderActionStatus::Pending,
-                Some(category),
-                next_attempt_at,
-                None,
-                completed_at,
-            ),
-            WorkerComputeActionFinalization::RetryableFailure { completed_at, .. }
-            | WorkerComputeActionFinalization::TerminalFailure { completed_at, .. }
-                if !fingerprint_current =>
-            {
-                (
-                    WorkerComputeProviderActionStatus::Superseded,
-                    None,
-                    action.next_attempt_at,
-                    Some(completed_at),
-                    completed_at,
-                )
-            }
-            WorkerComputeActionFinalization::TerminalFailure {
-                category,
-                completed_at,
-            } => (
-                WorkerComputeProviderActionStatus::TerminalFailed,
-                Some(category),
-                action.next_attempt_at,
-                None,
-                completed_at,
-            ),
-            WorkerComputeActionFinalization::Superseded { superseded_at } => (
-                WorkerComputeProviderActionStatus::Superseded,
-                None,
-                action.next_attempt_at,
-                Some(superseded_at),
-                superseded_at,
-            ),
-            WorkerComputeActionFinalization::RetryableFailure { .. } => {
-                unreachable!("stale retryable failures were matched above")
-            }
-        };
-        action.status = status;
-        action.last_error_category = category;
-        action.next_attempt_at = next_attempt_at;
-        action.superseded_at = superseded_at;
-        action.claim = None;
-        action.updated_at = completed_at;
-        if Self::update_action(&mut tx, &action, claim).await? != 1 {
-            tx.rollback().await?;
-            return Ok(WorkerComputeActionFinalizeResult::StaleClaim);
-        }
-
-        if fingerprint_current
-            && let Some(controller) = controller.as_mut()
-            && let Some(group) = controller.groups.get_mut(&action.scaling_group)
-        {
-            group.last_action_id = Some(action.action_id);
-            group.last_failure_category = category;
-            group.health = match status {
-                WorkerComputeProviderActionStatus::Pending => WorkerComputeHealth::DeliveryRetrying,
-                WorkerComputeProviderActionStatus::TerminalFailed => {
-                    WorkerComputeHealth::DeliveryTerminalFailure
+        in_operation(
+            tracing::debug_span!("dsql.worker_compute.finalize_action"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Commit).await?;
+                let mut tx = permit.begin().await?;
+                let query = format!(
+                    "SELECT {ACTION_COLUMNS} FROM worker_compute_action WHERE action_id = $1"
+                );
+                // SQL safety: the only interpolation is the `ACTION_COLUMNS` constant;
+                // every request value is a bind parameter.
+                let row = sqlx::query(AssertSqlSafe(query))
+                    .bind(claim.action_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                let action = match &row {
+                    Some(row) => Some(Self::read_action(&mut tx, row).await?),
+                    None => None,
+                };
+                let Some(mut action) = action else {
+                    tx.rollback().await?;
+                    return Ok(WorkerComputeActionFinalizeResult::NotFound);
+                };
+                let completed_at = match &result {
+                    WorkerComputeActionFinalization::Delivered { completed_at }
+                    | WorkerComputeActionFinalization::RetryableFailure { completed_at, .. }
+                    | WorkerComputeActionFinalization::TerminalFailure { completed_at, .. } => {
+                        *completed_at
+                    }
+                    WorkerComputeActionFinalization::Superseded { superseded_at } => *superseded_at,
+                };
+                if action.claim.as_ref() != Some(claim)
+                    || action.status != WorkerComputeProviderActionStatus::Claimed
+                    || claim.claim_until <= completed_at
+                {
+                    tx.rollback().await?;
+                    return Ok(WorkerComputeActionFinalizeResult::StaleClaim);
                 }
-                _ => WorkerComputeHealth::Active,
-            };
-            if action.reason == WorkerComputeInvokeReason::ConfigurationActivation {
-                group.activation_status = Some(status);
-            }
-            let previous_revision = controller.revision;
-            controller.revision = controller.revision.saturating_add(1);
-            let record_data = codec::encode_worker_compute_controller(controller)?;
-            let update = sqlx::query(
-                "UPDATE worker_compute_controller
-                 SET revision = $4, record_data = $5, updated_at = $6
-                 WHERE namespace_id = $1 AND deployment_name = $2 AND build_id = $3
-                   AND revision = $7",
-            )
-            .bind(controller.key.namespace_id.0)
-            .bind(&controller.key.deployment_name.0)
-            .bind(&controller.key.build_id.0)
-            .bind(Self::i64(controller.revision, "controller revision")?)
-            .bind(record_data)
-            .bind(completed_at)
-            .bind(Self::i64(
-                previous_revision,
-                "previous controller revision",
-            )?)
-            .execute(&mut *tx)
-            .await?;
-            if update.rows_affected() != 1 {
-                tx.rollback().await?;
-                return Ok(WorkerComputeActionFinalizeResult::StaleClaim);
-            }
-        }
-        match tx.commit().await {
-            Ok(()) => Ok(WorkerComputeActionFinalizeResult::Applied { status }),
-            Err(error) if DsqlRunRepository::is_serialization_failure(&error) => {
-                Ok(WorkerComputeActionFinalizeResult::StaleClaim)
-            }
-            Err(error) => Err(error.into()),
-        }
+                let (mut controller, fingerprint_current) =
+                    Self::current_action_fingerprint(&mut tx, &action).await?;
+                let (status, category, next_attempt_at, superseded_at, completed_at) = match result
+                {
+                    WorkerComputeActionFinalization::Delivered { completed_at } => (
+                        WorkerComputeProviderActionStatus::Delivered,
+                        None,
+                        action.next_attempt_at,
+                        None,
+                        completed_at,
+                    ),
+                    WorkerComputeActionFinalization::RetryableFailure {
+                        category,
+                        next_attempt_at,
+                        completed_at,
+                    } if fingerprint_current => (
+                        WorkerComputeProviderActionStatus::Pending,
+                        Some(category),
+                        next_attempt_at,
+                        None,
+                        completed_at,
+                    ),
+                    WorkerComputeActionFinalization::RetryableFailure { completed_at, .. }
+                    | WorkerComputeActionFinalization::TerminalFailure { completed_at, .. }
+                        if !fingerprint_current =>
+                    {
+                        (
+                            WorkerComputeProviderActionStatus::Superseded,
+                            None,
+                            action.next_attempt_at,
+                            Some(completed_at),
+                            completed_at,
+                        )
+                    }
+                    WorkerComputeActionFinalization::TerminalFailure {
+                        category,
+                        completed_at,
+                    } => (
+                        WorkerComputeProviderActionStatus::TerminalFailed,
+                        Some(category),
+                        action.next_attempt_at,
+                        None,
+                        completed_at,
+                    ),
+                    WorkerComputeActionFinalization::Superseded { superseded_at } => (
+                        WorkerComputeProviderActionStatus::Superseded,
+                        None,
+                        action.next_attempt_at,
+                        Some(superseded_at),
+                        superseded_at,
+                    ),
+                    WorkerComputeActionFinalization::RetryableFailure { .. } => {
+                        unreachable!("stale retryable failures were matched above")
+                    }
+                };
+                action.status = status;
+                action.last_error_category = category;
+                action.next_attempt_at = next_attempt_at;
+                action.superseded_at = superseded_at;
+                action.claim = None;
+                action.updated_at = completed_at;
+                if Self::update_action(&mut tx, &action, claim).await? != 1 {
+                    tx.rollback().await?;
+                    return Ok(WorkerComputeActionFinalizeResult::StaleClaim);
+                }
+
+                if fingerprint_current
+                    && let Some(controller) = controller.as_mut()
+                    && let Some(group) = controller.groups.get_mut(&action.scaling_group)
+                {
+                    group.last_action_id = Some(action.action_id);
+                    group.last_failure_category = category;
+                    group.health = match status {
+                        WorkerComputeProviderActionStatus::Pending => {
+                            WorkerComputeHealth::DeliveryRetrying
+                        }
+                        WorkerComputeProviderActionStatus::TerminalFailed => {
+                            WorkerComputeHealth::DeliveryTerminalFailure
+                        }
+                        _ => WorkerComputeHealth::Active,
+                    };
+                    if action.reason == WorkerComputeInvokeReason::ConfigurationActivation {
+                        group.activation_status = Some(status);
+                    }
+                    let previous_revision = controller.revision;
+                    controller.revision = controller.revision.saturating_add(1);
+                    let record_data = codec::encode_worker_compute_controller(controller)?;
+                    let update = sqlx::query(
+                        "UPDATE worker_compute_controller
+                     SET revision = $4, record_data = $5, updated_at = $6
+                     WHERE namespace_id = $1 AND deployment_name = $2 AND build_id = $3
+                       AND revision = $7",
+                    )
+                    .bind(controller.key.namespace_id.0)
+                    .bind(&controller.key.deployment_name.0)
+                    .bind(&controller.key.build_id.0)
+                    .bind(Self::i64(controller.revision, "controller revision")?)
+                    .bind(record_data)
+                    .bind(completed_at)
+                    .bind(Self::i64(
+                        previous_revision,
+                        "previous controller revision",
+                    )?)
+                    .execute(&mut *tx)
+                    .await?;
+                    if update.rows_affected() != 1 {
+                        tx.rollback().await?;
+                        return Ok(WorkerComputeActionFinalizeResult::StaleClaim);
+                    }
+                }
+                match tx.commit().await {
+                    Ok(()) => Ok(WorkerComputeActionFinalizeResult::Applied { status }),
+                    Err(error) if DsqlRunRepository::is_serialization_failure(&error) => {
+                        Ok(WorkerComputeActionFinalizeResult::StaleClaim)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            },
+        )
+        .await
     }
 
     async fn list_health(
@@ -1222,8 +1301,14 @@ impl WorkerComputeRepository for DsqlWorkerComputeRepository {
         namespace_id: NamespaceId,
         filter: WorkerComputeHealthFilter,
     ) -> Result<Vec<WorkerComputeControllerHealthView>> {
-        let mut permit = self.director.acquire(DbClass::Read).await?;
-        Self::list_health_with_connection(permit.connection()?, namespace_id, filter).await
+        in_operation(
+            tracing::debug_span!("dsql.worker_compute.list_health"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Read).await?;
+                Self::list_health_with_connection(permit.connection()?, namespace_id, filter).await
+            },
+        )
+        .await
     }
 }
 

@@ -31,6 +31,8 @@ mod large_value_tests;
 pub mod migration;
 pub(crate) mod projection_image_parts;
 pub mod projection_log;
+#[cfg(any(test, feature = "dsql-integration"))]
+pub mod query_plan_for_tests;
 pub mod reservoir;
 pub mod run_repository;
 pub mod schema_compatibility;

@@ -6,6 +6,7 @@
 //! this single row.
 
 use std::sync::Arc;
+use tokeira_observability::statement_accounting::in_operation;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -72,24 +73,35 @@ impl DsqlWorkerDeploymentRepository {
     }
 }
 
+// Every method runs in a DEBUG span named `dsql.<store>.<method>`, the
+// operation the process's statement accounting charges its round trips to
+// (`tokeira_observability::statement_accounting`).
 #[async_trait]
 impl WorkerDeploymentRepository for DsqlWorkerDeploymentRepository {
     async fn load_deployment(&self, key: &DeploymentKey) -> Result<Option<StoredWorkerDeployment>> {
-        let mut permit = self.director.acquire(DbClass::Read).await?;
-        let row = sqlx::query(
-            "SELECT record_data
-             FROM worker_deployments
-             WHERE namespace_id = $1 AND deployment_name = $2",
-        )
-        .bind(key.namespace_id.0)
-        .bind(&key.deployment_name.0)
-        .fetch_optional(permit.connection()?)
-        .await?;
+        in_operation(
+            tracing::debug_span!("dsql.worker_deployment.load_deployment"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Read).await?;
+                let row = sqlx::query(
+                    "SELECT record_data
+                 FROM worker_deployments
+                 WHERE namespace_id = $1 AND deployment_name = $2",
+                )
+                .bind(key.namespace_id.0)
+                .bind(&key.deployment_name.0)
+                .fetch_optional(permit.connection()?)
+                .await?;
 
-        row.map(|row| {
-            codec::decode_worker_deployment(row.try_get::<Vec<u8>, _>("record_data")?.as_slice())
-        })
-        .transpose()
+                row.map(|row| {
+                    codec::decode_worker_deployment(
+                        row.try_get::<Vec<u8>, _>("record_data")?.as_slice(),
+                    )
+                })
+                .transpose()
+            },
+        )
+        .await
     }
 
     async fn put_deployment(
@@ -97,62 +109,133 @@ impl WorkerDeploymentRepository for DsqlWorkerDeploymentRepository {
         mut record: StoredWorkerDeployment,
         expected: Option<ConflictToken>,
     ) -> Result<DeploymentCasResult> {
-        let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.begin().await?;
-        let row = sqlx::query(
-            "SELECT conflict_token
-             FROM worker_deployments
-             WHERE namespace_id = $1 AND deployment_name = $2",
-        )
-        .bind(record.namespace_id.0)
-        .bind(&record.name.0)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let current_token = row
-            .map(|row| row.try_get::<Vec<u8>, _>("conflict_token"))
-            .transpose()?
-            .map(Self::token_from_bytes)
-            .transpose()?;
-
-        match (current_token, expected) {
-            (Some(_), None) => {
-                tx.rollback().await?;
-                Ok(DeploymentCasResult::AlreadyExists)
-            }
-            (None, Some(_)) => {
-                tx.rollback().await?;
-                Ok(DeploymentCasResult::NotFound)
-            }
-            (Some(current), Some(expected)) if current != expected => {
-                tx.rollback().await?;
-                Ok(DeploymentCasResult::Conflict)
-            }
-            _ => {
-                let token =
-                    Self::advance_token_generation(&mut tx, record.namespace_id, &record.name.0)
-                        .await?;
-                record.conflict_token = token;
-                let record_data = codec::encode_worker_deployment(&record)?;
-                let write = sqlx::query(
-                    "INSERT INTO worker_deployments
-                     (namespace_id, deployment_name, conflict_token, record_data, updated_at)
-                     VALUES ($1, $2, $3, $4, now())
-                     ON CONFLICT (namespace_id, deployment_name) DO UPDATE SET
-                         conflict_token = EXCLUDED.conflict_token,
-                         record_data = EXCLUDED.record_data,
-                         updated_at = EXCLUDED.updated_at",
+        in_operation(
+            tracing::debug_span!("dsql.worker_deployment.put_deployment"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Commit).await?;
+                let mut tx = permit.begin().await?;
+                let row = sqlx::query(
+                    "SELECT conflict_token
+                 FROM worker_deployments
+                 WHERE namespace_id = $1 AND deployment_name = $2",
                 )
                 .bind(record.namespace_id.0)
                 .bind(&record.name.0)
-                .bind(token.0.as_slice())
-                .bind(record_data)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+                let current_token = row
+                    .map(|row| row.try_get::<Vec<u8>, _>("conflict_token"))
+                    .transpose()?
+                    .map(Self::token_from_bytes)
+                    .transpose()?;
+
+                match (current_token, expected) {
+                    (Some(_), None) => {
+                        tx.rollback().await?;
+                        Ok(DeploymentCasResult::AlreadyExists)
+                    }
+                    (None, Some(_)) => {
+                        tx.rollback().await?;
+                        Ok(DeploymentCasResult::NotFound)
+                    }
+                    (Some(current), Some(expected)) if current != expected => {
+                        tx.rollback().await?;
+                        Ok(DeploymentCasResult::Conflict)
+                    }
+                    _ => {
+                        let token = Self::advance_token_generation(
+                            &mut tx,
+                            record.namespace_id,
+                            &record.name.0,
+                        )
+                        .await?;
+                        record.conflict_token = token;
+                        let record_data = codec::encode_worker_deployment(&record)?;
+                        let write = sqlx::query(
+                            "INSERT INTO worker_deployments
+                         (namespace_id, deployment_name, conflict_token, record_data, updated_at)
+                         VALUES ($1, $2, $3, $4, now())
+                         ON CONFLICT (namespace_id, deployment_name) DO UPDATE SET
+                             conflict_token = EXCLUDED.conflict_token,
+                             record_data = EXCLUDED.record_data,
+                             updated_at = EXCLUDED.updated_at",
+                        )
+                        .bind(record.namespace_id.0)
+                        .bind(&record.name.0)
+                        .bind(token.0.as_slice())
+                        .bind(record_data)
+                        .execute(&mut *tx)
+                        .await;
+                        // Aurora DSQL may reject a concurrent writer at write or commit with
+                        // SQLSTATE 40001. The registry's load -> validate -> CAS loop already
+                        // knows how to reload and retry `Conflict`, so normalize it here
+                        // (matching `run_repository::commit` and `leases`).
+                        if let Err(err) = write {
+                            if DsqlRunRepository::is_serialization_failure(&err) {
+                                tx.rollback().await?;
+                                return Ok(DeploymentCasResult::Conflict);
+                            }
+                            return Err(err.into());
+                        }
+                        match tx.commit().await {
+                            Ok(()) => Ok(DeploymentCasResult::Applied { token }),
+                            Err(err) if DsqlRunRepository::is_serialization_failure(&err) => {
+                                Ok(DeploymentCasResult::Conflict)
+                            }
+                            Err(err) => Err(err.into()),
+                        }
+                    }
+                }
+            },
+        )
+        .await
+    }
+
+    async fn delete_deployment(
+        &self,
+        key: &DeploymentKey,
+        expected: ConflictToken,
+    ) -> Result<DeploymentCasResult> {
+        in_operation(
+            tracing::debug_span!("dsql.worker_deployment.delete_deployment"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Commit).await?;
+                let mut tx = permit.begin().await?;
+                let row = sqlx::query(
+                    "SELECT conflict_token
+                 FROM worker_deployments
+                 WHERE namespace_id = $1 AND deployment_name = $2",
+                )
+                .bind(key.namespace_id.0)
+                .bind(&key.deployment_name.0)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+                let Some(row) = row else {
+                    tx.rollback().await?;
+                    return Ok(DeploymentCasResult::NotFound);
+                };
+                let current = Self::token_from_bytes(row.try_get::<Vec<u8>, _>("conflict_token")?)?;
+                if current != expected {
+                    tx.rollback().await?;
+                    return Ok(DeploymentCasResult::Conflict);
+                }
+
+                let token = Self::advance_token_generation(
+                    &mut tx,
+                    key.namespace_id,
+                    &key.deployment_name.0,
+                )
+                .await?;
+                let write = sqlx::query(
+                    "DELETE FROM worker_deployments
+                 WHERE namespace_id = $1 AND deployment_name = $2",
+                )
+                .bind(key.namespace_id.0)
+                .bind(&key.deployment_name.0)
                 .execute(&mut *tx)
                 .await;
-                // Aurora DSQL may reject a concurrent writer at write or commit with
-                // SQLSTATE 40001. The registry's load -> validate -> CAS loop already
-                // knows how to reload and retry `Conflict`, so normalize it here
-                // (matching `run_repository::commit` and `leases`).
                 if let Err(err) = write {
                     if DsqlRunRepository::is_serialization_failure(&err) {
                         tx.rollback().await?;
@@ -167,62 +250,9 @@ impl WorkerDeploymentRepository for DsqlWorkerDeploymentRepository {
                     }
                     Err(err) => Err(err.into()),
                 }
-            }
-        }
-    }
-
-    async fn delete_deployment(
-        &self,
-        key: &DeploymentKey,
-        expected: ConflictToken,
-    ) -> Result<DeploymentCasResult> {
-        let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.begin().await?;
-        let row = sqlx::query(
-            "SELECT conflict_token
-             FROM worker_deployments
-             WHERE namespace_id = $1 AND deployment_name = $2",
+            },
         )
-        .bind(key.namespace_id.0)
-        .bind(&key.deployment_name.0)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let Some(row) = row else {
-            tx.rollback().await?;
-            return Ok(DeploymentCasResult::NotFound);
-        };
-        let current = Self::token_from_bytes(row.try_get::<Vec<u8>, _>("conflict_token")?)?;
-        if current != expected {
-            tx.rollback().await?;
-            return Ok(DeploymentCasResult::Conflict);
-        }
-
-        let token =
-            Self::advance_token_generation(&mut tx, key.namespace_id, &key.deployment_name.0)
-                .await?;
-        let write = sqlx::query(
-            "DELETE FROM worker_deployments
-             WHERE namespace_id = $1 AND deployment_name = $2",
-        )
-        .bind(key.namespace_id.0)
-        .bind(&key.deployment_name.0)
-        .execute(&mut *tx)
-        .await;
-        if let Err(err) = write {
-            if DsqlRunRepository::is_serialization_failure(&err) {
-                tx.rollback().await?;
-                return Ok(DeploymentCasResult::Conflict);
-            }
-            return Err(err.into());
-        }
-        match tx.commit().await {
-            Ok(()) => Ok(DeploymentCasResult::Applied { token }),
-            Err(err) if DsqlRunRepository::is_serialization_failure(&err) => {
-                Ok(DeploymentCasResult::Conflict)
-            }
-            Err(err) => Err(err.into()),
-        }
+        .await
     }
 
     async fn list_deployments(
@@ -231,71 +261,83 @@ impl WorkerDeploymentRepository for DsqlWorkerDeploymentRepository {
         after: Option<&DeploymentName>,
         limit: usize,
     ) -> Result<Vec<StoredWorkerDeployment>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let mut permit = self.director.acquire(DbClass::Read).await?;
-        let limit = i64::try_from(limit).map_err(|_| {
-            anyhow::anyhow!("worker deployment list limit {limit} exceeds i64 range")
-        })?;
-        let rows = if let Some(after) = after {
-            sqlx::query(
-                "SELECT record_data
-                 FROM worker_deployments
-                 WHERE namespace_id = $1 AND deployment_name > $2
-                 ORDER BY deployment_name ASC
-                 LIMIT $3",
-            )
-            .bind(namespace_id.0)
-            .bind(&after.0)
-            .bind(limit)
-            .fetch_all(permit.connection()?)
-            .await?
-        } else {
-            sqlx::query(
-                "SELECT record_data
-                 FROM worker_deployments
-                 WHERE namespace_id = $1
-                 ORDER BY deployment_name ASC
-                 LIMIT $2",
-            )
-            .bind(namespace_id.0)
-            .bind(limit)
-            .fetch_all(permit.connection()?)
-            .await?
-        };
+        in_operation(
+            tracing::debug_span!("dsql.worker_deployment.list_deployments"),
+            async move {
+                if limit == 0 {
+                    return Ok(Vec::new());
+                }
+                let mut permit = self.director.acquire(DbClass::Read).await?;
+                let limit = i64::try_from(limit).map_err(|_| {
+                    anyhow::anyhow!("worker deployment list limit {limit} exceeds i64 range")
+                })?;
+                let rows = if let Some(after) = after {
+                    sqlx::query(
+                        "SELECT record_data
+                     FROM worker_deployments
+                     WHERE namespace_id = $1 AND deployment_name > $2
+                     ORDER BY deployment_name ASC
+                     LIMIT $3",
+                    )
+                    .bind(namespace_id.0)
+                    .bind(&after.0)
+                    .bind(limit)
+                    .fetch_all(permit.connection()?)
+                    .await?
+                } else {
+                    sqlx::query(
+                        "SELECT record_data
+                     FROM worker_deployments
+                     WHERE namespace_id = $1
+                     ORDER BY deployment_name ASC
+                     LIMIT $2",
+                    )
+                    .bind(namespace_id.0)
+                    .bind(limit)
+                    .fetch_all(permit.connection()?)
+                    .await?
+                };
 
-        rows.into_iter()
-            .map(|row| {
-                codec::decode_worker_deployment(
-                    row.try_get::<Vec<u8>, _>("record_data")?.as_slice(),
-                )
-            })
-            .collect()
+                rows.into_iter()
+                    .map(|row| {
+                        codec::decode_worker_deployment(
+                            row.try_get::<Vec<u8>, _>("record_data")?.as_slice(),
+                        )
+                    })
+                    .collect()
+            },
+        )
+        .await
     }
 
     async fn list_all_for_namespace(
         &self,
         namespace_id: NamespaceId,
     ) -> Result<Vec<StoredWorkerDeployment>> {
-        let mut permit = self.director.acquire(DbClass::Read).await?;
-        let rows = sqlx::query(
-            "SELECT record_data
-             FROM worker_deployments
-             WHERE namespace_id = $1
-             ORDER BY deployment_name ASC",
-        )
-        .bind(namespace_id.0)
-        .fetch_all(permit.connection()?)
-        .await?;
-
-        rows.into_iter()
-            .map(|row| {
-                codec::decode_worker_deployment(
-                    row.try_get::<Vec<u8>, _>("record_data")?.as_slice(),
+        in_operation(
+            tracing::debug_span!("dsql.worker_deployment.list_all_for_namespace"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Read).await?;
+                let rows = sqlx::query(
+                    "SELECT record_data
+                 FROM worker_deployments
+                 WHERE namespace_id = $1
+                 ORDER BY deployment_name ASC",
                 )
-            })
-            .collect()
+                .bind(namespace_id.0)
+                .fetch_all(permit.connection()?)
+                .await?;
+
+                rows.into_iter()
+                    .map(|row| {
+                        codec::decode_worker_deployment(
+                            row.try_get::<Vec<u8>, _>("record_data")?.as_slice(),
+                        )
+                    })
+                    .collect()
+            },
+        )
+        .await
     }
 }
 

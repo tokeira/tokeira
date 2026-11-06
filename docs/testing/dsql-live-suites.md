@@ -118,6 +118,28 @@ local file, then run that test with the URL gate and `dsql-integration` enabled.
 It writes only counts, or a `not bootstrapped` schema status on a fresh cluster.
 It neither creates tables nor takes a lease.
 
+Run the statement budget against a **separate freshly migrated disposable
+database**, selected through `TOKEIRA_DSQL_TEST_DATABASE_URL`: another suite's
+leftover runs would add their recovery work to its counts. It migrates the
+database, prepares eight homes and acquires all of them with fenced writes, as
+a controller-placed node does. Then it drives one workflow through its start,
+two activities (one heartbeat, one failure and its retry), a signal, a timer
+and its close. It asserts the round trips of every committed commit against
+the budget pinned in the test; an attempt that loses a race and rolls back is
+reported, not pinned, since whether one happens depends on timing. It checks
+the production round-trip metric (`tokeira_dsql_operation_round_trips`)
+against its own count of each committed attempt, and that each names its
+cause. It plans every distinct statement it saw with
+`EXPLAIN (GENERIC_PLAN, VERBOSE)`. Set `TOKEIRA_DSQL_STATEMENT_REPORT` to keep
+the counts, commit times, background statements and plans. Set
+`TOKEIRA_DSQL_STATEMENT_REPEAT` to run that many more lifecycles after the
+measured one and report their window, so the cluster's per-minute DPU metrics
+can be divided by lifecycle. It releases its homes before it ends.
+
+```bash
+cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --test dsql_statement_budget --test-threads 1
+```
+
 ## URL-gated storage and projection
 
 Set `TOKEIRA_DSQL_TEST_DATABASE_URL` to a connection URL for a disposable test database.
@@ -178,6 +200,7 @@ point them at a database holding application data.
 | Projection `dsql_store::large_value_tests` | 4 | Generated grow/shrink sequences leave exactly the current memo's parts, including tombstones and rejected older images; staged flips and standalone upserts replace parts; a list held between its row and parts reads returns one version while another apply replaces the memo; `dsql-integration`, URL gate only |
 | Storage visibility cases in `dsql::large_value_tests` | 3 (included above) | An image over 1 MiB commits and reads back; generated image deletions leave no parts; a split image seeds a legacy accumulator from its whole context; `dsql-integration`, URL gate only |
 | Engine `large_value_visibility::live` | 2 | Real starts carry a memo through the event, state, image and visibility row; generated sizes cover both sides of the part size and whole values have no count or parts; a memo exactly at the 2 MiB admission limit follows the same path; `dsql-integration`, URL gate only |
+| Runtime `dsql_statement_budget` | 1 | A measurement and a budget: the statements and round trips of every commit of one workflow's lifecycle on a fenced node, checked against the production round-trip metric, the reads around each, the node's background statements, and the generic plan of every distinct statement; runtime `dsql-integration`, URL gate only; run it on its own freshly migrated disposable database, as above |
 | Runtime `dsql_activity_inputs` | 3 | Activity inputs read from history: six pending activities with inputs of about 200 KB each, three activities scheduled in one batch, and a reset successor's activities delivered from its copied batches; runtime `dsql-integration`, URL gate only; run after storage schema bootstrap |
 | Runtime `workflow_dispatch_live_lost_publication_offered_by_next_pass`, `activity_dispatch_live_lost_publication_offered_by_next_pass` and `activity_dispatch_live_backlog_counts_rows_without_pollers` | 3 | A workflow task and an activity task whose post-commit publication fails reach a parked poll by the next discovery pass, within two discovery periods, without a restart; with no poller, DescribeTaskQueue counts due activity rows in their priority bands and leaves out a row due later; runtime `dsql-integration`, ignored, URL required; they prepare 4096 homes, so run them after storage schema bootstrap and before the eight-home placement fixtures |
 

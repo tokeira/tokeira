@@ -16,6 +16,18 @@
 //! - Retry transitions retain canonical eligibility; discovery reconstructs lost
 //!   offers. Start OCC retries retain their request UUID and original acquisition,
 //!   so neither retry nor lost replies can authorize a second start.
+//!
+//! Each worker-facing method runs in a span whose `tokeira.command_type` names
+//! its Temporal request, the cause the DSQL round-trip metric charges its reads
+//! and commits to (`tokeira_observability::statement_accounting`): these paths
+//! load runs, and starts, heartbeats and retries commit, outside the span of
+//! any lane command. A transition a method submits to the lane is charged to
+//! the lane's command instead. The spans are
+//! DEBUG so they add nothing to logs or exported traces at the default filter.
+//! Each method boxes its body before instrumenting it, as the start path does:
+//! the body holds whole run images across awaits, and `#[instrument]` would
+//! hold the body twice in the caller's future, which overflows the stack of an
+//! unoptimized build.
 use tokeira_kernel::deadline_after;
 
 use super::*;
@@ -520,6 +532,21 @@ where
         worker_identity: Option<WorkerIdentity>,
         request: RequestContext,
     ) -> Result<CommitResult> {
+        Box::pin(self.complete_activity_task_inner(token, result, worker_identity, request))
+            .instrument(tracing::debug_span!(
+                "activity_task.complete",
+                tokeira.command_type = "RespondActivityTaskCompleted"
+            ))
+            .await
+    }
+
+    async fn complete_activity_task_inner(
+        &self,
+        token: ActivityTaskToken,
+        result: Payloads,
+        worker_identity: Option<WorkerIdentity>,
+        request: RequestContext,
+    ) -> Result<CommitResult> {
         let activity_id = token.activity_id.clone();
         let (_, _, home) = self
             .validate_activity_token(&token)
@@ -569,6 +596,32 @@ where
     /// `RespondActivityTaskFailedById` passes `None`: v1.31.0's frontend drops
     /// them on that path (frontend/workflow_handler.go:1965-1969).
     pub async fn fail_activity_task(
+        &self,
+        token: ActivityTaskToken,
+        failure: Payload,
+        failure_error_type: Option<String>,
+        is_non_retryable: bool,
+        last_heartbeat_details: Option<Payloads>,
+        worker_identity: Option<WorkerIdentity>,
+        request: RequestContext,
+    ) -> Result<()> {
+        Box::pin(self.fail_activity_task_inner(
+            token,
+            failure,
+            failure_error_type,
+            is_non_retryable,
+            last_heartbeat_details,
+            worker_identity,
+            request,
+        ))
+        .instrument(tracing::debug_span!(
+            "activity_task.fail",
+            tokeira.command_type = "RespondActivityTaskFailed"
+        ))
+        .await
+    }
+
+    async fn fail_activity_task_inner(
         &self,
         token: ActivityTaskToken,
         failure: Payload,
@@ -687,6 +740,21 @@ where
         worker_identity: Option<WorkerIdentity>,
         request: RequestContext,
     ) -> Result<CommitResult> {
+        Box::pin(self.cancel_activity_task_inner(token, details, worker_identity, request))
+            .instrument(tracing::debug_span!(
+                "activity_task.cancel",
+                tokeira.command_type = "RespondActivityTaskCanceled"
+            ))
+            .await
+    }
+
+    async fn cancel_activity_task_inner(
+        &self,
+        token: ActivityTaskToken,
+        details: Option<Payloads>,
+        worker_identity: Option<WorkerIdentity>,
+        request: RequestContext,
+    ) -> Result<CommitResult> {
         let activity_id = token.activity_id.clone();
         let (_, _, home) = self.validate_activity_token(&token).await?;
         let result = self
@@ -722,6 +790,20 @@ where
     /// Volatile tracking remains responsible only for timeout and cooperative
     /// cancellation liveness.
     pub async fn record_activity_heartbeat(
+        &self,
+        token: ActivityTaskToken,
+        details: Option<Payloads>,
+        identity: Option<WorkerIdentity>,
+    ) -> Result<ActivityHeartbeatOutcome> {
+        Box::pin(self.record_activity_heartbeat_inner(token, details, identity))
+            .instrument(tracing::debug_span!(
+                "activity_task.heartbeat",
+                tokeira.command_type = "RecordActivityTaskHeartbeat"
+            ))
+            .await
+    }
+
+    async fn record_activity_heartbeat_inner(
         &self,
         token: ActivityTaskToken,
         details: Option<Payloads>,
@@ -940,6 +1022,26 @@ where
     /// shape to `Self::start_activity_task`'s; a stale broker offer for
     /// this activity dies at claim time against `started_event_id`.
     pub async fn force_start_activity_for_completion(
+        &self,
+        run_key: RunKey,
+        activity_id: &str,
+        identity: WorkerIdentity,
+        request: RequestContext,
+    ) -> Result<ActivityTaskToken> {
+        Box::pin(self.force_start_activity_for_completion_inner(
+            run_key,
+            activity_id,
+            identity,
+            request,
+        ))
+        .instrument(tracing::debug_span!(
+            "activity_task.force_start",
+            tokeira.command_type = "RespondActivityTaskCompleted"
+        ))
+        .await
+    }
+
+    async fn force_start_activity_for_completion_inner(
         &self,
         run_key: RunKey,
         activity_id: &str,
@@ -1248,6 +1350,7 @@ where
     ) -> Result<ActivityStartOutcome> {
         let span = tracing::info_span!(
             "activity_task.process",
+            tokeira.command_type = "RecordActivityTaskStarted",
             tokeira.run_key = %task.run_key.0,
             tokeira.workflow_id = tracing::field::Empty,
             tokeira.run_id = tracing::field::Empty,

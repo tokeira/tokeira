@@ -1,12 +1,13 @@
 #![cfg(feature = "dsql-integration")]
 
-//! Opt-in IAM and TLS round trip through the production DSQL connection factory.
+//! Opt-in IAM and TLS round trip through the production DSQL connection factory,
+//! and the `application_name` it gives the cluster.
 //!
 //! Both endpoint and region must be supplied explicitly. An unset gate returns
 //! without connecting; this test neither provisions a cluster nor changes schema.
 
 use anyhow::Result;
-use tokeira_storage::dsql::ConnectionFactory;
+use tokeira_storage::dsql::{APPLICATION_NAME_PREFIX, ConnectionFactory};
 
 #[tokio::test]
 async fn connector_iam_round_trips_query() -> Result<()> {
@@ -23,5 +24,13 @@ async fn connector_iam_round_trips_query() -> Result<()> {
         .fetch_one(&mut connection)
         .await?;
     assert_eq!(value, 1);
+    // The name the cluster attributes this connection's statements to.
+    let application_name: String = sqlx::query_scalar("SELECT current_setting('application_name')")
+        .fetch_one(&mut connection)
+        .await?;
+    assert!(
+        application_name.starts_with(&format!("{APPLICATION_NAME_PREFIX}:aurora-dsql-rust-sqlx/")),
+        "application_name {application_name}"
+    );
     Ok(())
 }

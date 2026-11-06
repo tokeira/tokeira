@@ -5,6 +5,7 @@
 //! run transitions and reconstructible runtime delivery caches.
 
 use std::sync::Arc;
+use tokeira_observability::statement_accounting::in_operation;
 
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
@@ -104,24 +105,33 @@ impl DsqlTaskQueueConfigRepository {
     }
 }
 
+// Every method runs in a DEBUG span named `dsql.<store>.<method>`, the
+// operation the process's statement accounting charges its round trips to
+// (`tokeira_observability::statement_accounting`).
 #[async_trait]
 impl TaskQueueConfigRepository for DsqlTaskQueueConfigRepository {
     async fn load_task_queue_config(
         &self,
         key: &StoredTaskQueueConfigKey,
     ) -> Result<Option<StoredTaskQueueConfig>> {
-        let mut permit = self.director.acquire(DbClass::Read).await?;
-        let row = sqlx::query(
-            "SELECT revision, record_data
-             FROM task_queue_config
-             WHERE namespace_id = $1 AND task_queue = $2 AND task_kind = $3",
+        in_operation(
+            tracing::debug_span!("dsql.task_queue_config.load_task_queue_config"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Read).await?;
+                let row = sqlx::query(
+                    "SELECT revision, record_data
+                 FROM task_queue_config
+                 WHERE namespace_id = $1 AND task_queue = $2 AND task_kind = $3",
+                )
+                .bind(key.namespace_id.0)
+                .bind(&key.task_queue.0)
+                .bind(Self::encode_kind(key.kind))
+                .fetch_optional(permit.connection()?)
+                .await?;
+                row.as_ref().map(Self::decode_row).transpose()
+            },
         )
-        .bind(key.namespace_id.0)
-        .bind(&key.task_queue.0)
-        .bind(Self::encode_kind(key.kind))
-        .fetch_optional(permit.connection()?)
-        .await?;
-        row.as_ref().map(Self::decode_row).transpose()
+        .await
     }
 
     async fn compare_and_swap_task_queue_config(
@@ -129,28 +139,40 @@ impl TaskQueueConfigRepository for DsqlTaskQueueConfigRepository {
         mut record: StoredTaskQueueConfig,
         expected_revision: Option<u64>,
     ) -> Result<TaskQueueConfigCasResult> {
-        let revision = expected_revision
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("task-queue configuration revision overflow"))?;
-        record.revision = revision;
-        if self.execute_cas(&record, expected_revision).await? == 1 {
-            Ok(TaskQueueConfigCasResult::Applied { revision })
-        } else {
-            Ok(TaskQueueConfigCasResult::Conflict)
-        }
+        in_operation(
+            tracing::debug_span!("dsql.task_queue_config.compare_and_swap_task_queue_config"),
+            async move {
+                let revision = expected_revision
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("task-queue configuration revision overflow"))?;
+                record.revision = revision;
+                if self.execute_cas(&record, expected_revision).await? == 1 {
+                    Ok(TaskQueueConfigCasResult::Applied { revision })
+                } else {
+                    Ok(TaskQueueConfigCasResult::Conflict)
+                }
+            },
+        )
+        .await
     }
 
     async fn list_all_task_queue_configs(&self) -> Result<Vec<StoredTaskQueueConfig>> {
-        let mut permit = self.director.acquire(DbClass::Read).await?;
-        let rows = sqlx::query(
-            "SELECT revision, record_data
-             FROM task_queue_config
-             ORDER BY namespace_id ASC, task_queue ASC, task_kind ASC",
+        in_operation(
+            tracing::debug_span!("dsql.task_queue_config.list_all_task_queue_configs"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Read).await?;
+                let rows = sqlx::query(
+                    "SELECT revision, record_data
+                 FROM task_queue_config
+                 ORDER BY namespace_id ASC, task_queue ASC, task_kind ASC",
+                )
+                .fetch_all(permit.connection()?)
+                .await?;
+                rows.iter().map(Self::decode_row).collect()
+            },
         )
-        .fetch_all(permit.connection()?)
-        .await?;
-        rows.iter().map(Self::decode_row).collect()
+        .await
     }
 }
 

@@ -322,6 +322,20 @@ Add comprehensive metrics instrumentation to the DSQL storage and projection lay
 - [x] 17. Final checkpoint — Ensure all tests pass
   - Ensure all tests pass (`cargo test --workspace`), ask the user if questions arise.
 
+
+- [x] 18. Count round trips per DSQL operation
+  - [x] 18.1 Add the statement-accounting layer and its two metrics to `tokeira-observability`; make the log filter per layer
+    - _Requirements: 45.1, 45.2, 45.3, 45.4, 45.5, 45.6_
+  - [x] 18.2 Run every DSQL trait method in a `dsql.*` span through `in_operation`
+    - _Requirements: 45.7_
+  - [x] 18.3 Name the cause on the runtime's activity paths
+    - _Requirements: 45.8_
+  - [x] 18.4 Write unit tests and the round-trip accounting property test (Property 7)
+    - **Property 7: Round-trip accounting**
+    - **Validates: Requirements 45.2, 45.3**
+  - [x] 18.5 Check the metric in the live statement-budget suite
+    - _Requirements: 45.9_
+
 ## Notes
 
 - Tasks marked with `*` are optional and can be skipped for faster MVP
@@ -346,7 +360,9 @@ Add comprehensive metrics instrumentation to the DSQL storage and projection lay
     { "id": 5, "tasks": ["10.2"] },
     { "id": 6, "tasks": ["14.1", "14.2", "14.3", "14.4", "14.5", "14.6", "14.7", "14.8", "14.9", "14.10"] },
     { "id": 7, "tasks": ["14.11"] },
-    { "id": 8, "tasks": ["16.1", "16.2", "16.3", "16.4", "16.5", "16.6", "16.7", "16.8"] }
+    { "id": 8, "tasks": ["16.1", "16.2", "16.3", "16.4", "16.5", "16.6", "16.7", "16.8"] },
+    { "id": 9, "tasks": ["18.1", "18.2", "18.3"] },
+    { "id": 10, "tasks": ["18.4", "18.5"] }
   ]
 }
 ```

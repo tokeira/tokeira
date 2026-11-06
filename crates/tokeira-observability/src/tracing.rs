@@ -23,11 +23,12 @@ use opentelemetry_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, reload, util::SubscriberInitExt};
+use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, reload, util::SubscriberInitExt};
 
 use crate::{
     LogFormat, ObservabilityError, OtlpProtocol, ProcessObservabilityConfig,
     logging::{CorrelationFormat, LogResourceFields},
+    statement_accounting::statement_accounting_layer,
 };
 
 pub type ReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
@@ -153,6 +154,11 @@ pub fn mark_error_biased_sample(reason: ErrorBiasedSamplingReason) {
 ///
 /// The returned handle reloads only the `EnvFilter`; formatter shape and OTLP
 /// export configuration remain fixed for the process lifetime.
+///
+/// The `EnvFilter` filters the log and trace-export layers only, not the whole
+/// subscriber: the [statement accounting](crate::statement_accounting) layer
+/// beside them reads sqlx's DEBUG statement events whatever the log filter is,
+/// and its own filter admits nothing else.
 pub fn install_tracing_subscriber(
     config: &ProcessObservabilityConfig,
 ) -> Result<ReloadHandle, ObservabilityError> {
@@ -160,34 +166,35 @@ pub fn install_tracing_subscriber(
 
     let filter =
         EnvFilter::try_new(config.log_filter.clone()).unwrap_or_else(|_| EnvFilter::new("info"));
-    let (filter_layer, handle) = reload::Layer::new(filter);
+    let (filter, handle) = reload::Layer::new(filter);
     let otel_layer = install_otlp_tracer(config)?
         .map(|tracer| tracing_opentelemetry::layer().with_tracer(tracer));
 
+    // The OTel layer goes first so the log formatter sees the span context it
+    // records. `Layer::and_then` by path: `Option::and_then` would shadow it.
     match config.log_format {
-        LogFormat::Text => tracing_subscriber::registry()
-            .with(filter_layer)
-            .with(otel_layer)
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .event_format(CorrelationFormat::text(tracing_subscriber::fmt::format())),
-            )
-            .try_init()
-            .map_err(|error| ObservabilityError::TracingInstall(error.to_string()))?,
-        LogFormat::Json => tracing_subscriber::registry()
-            .with(filter_layer)
-            .with(otel_layer)
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .fmt_fields(tracing_subscriber::fmt::format::JsonFields::new())
-                    .event_format(
-                        CorrelationFormat::json(tracing_subscriber::fmt::format().json())
-                            .with_resource(LogResourceFields::from_config(config)),
-                    ),
-            )
-            .try_init()
-            .map_err(|error| ObservabilityError::TracingInstall(error.to_string()))?,
+        LogFormat::Text => {
+            let log = tracing_subscriber::fmt::layer()
+                .event_format(CorrelationFormat::text(tracing_subscriber::fmt::format()));
+            tracing_subscriber::registry()
+                .with(Layer::and_then(otel_layer, log).with_filter(filter))
+                .with(statement_accounting_layer())
+                .try_init()
+        }
+        LogFormat::Json => {
+            let log = tracing_subscriber::fmt::layer()
+                .fmt_fields(tracing_subscriber::fmt::format::JsonFields::new())
+                .event_format(
+                    CorrelationFormat::json(tracing_subscriber::fmt::format().json())
+                        .with_resource(LogResourceFields::from_config(config)),
+                );
+            tracing_subscriber::registry()
+                .with(Layer::and_then(otel_layer, log).with_filter(filter))
+                .with(statement_accounting_layer())
+                .try_init()
+        }
     }
+    .map_err(|error| ObservabilityError::TracingInstall(error.to_string()))?;
 
     // Subscriber registration races other threads' one-time lock-free
     // callsite registrations inside tracing-core: a callsite whose
@@ -311,6 +318,58 @@ mod tests {
                     && fields.get("message").map(String::as_str) == Some("connector bridge probe")
             }),
             "connector target and message must survive the log bridge: {events:?}"
+        );
+    }
+
+    #[test]
+    fn the_log_filter_leaves_statement_events_to_the_accounting_layer() {
+        // nextest isolates this global installation in its own process.
+        let handle = install_tracing_subscriber(&ProcessObservabilityConfig {
+            service_name: crate::ServiceName::Tokeirad,
+            cluster_name: "test-cluster".to_owned(),
+            deployment_name: "test-deployment".to_owned(),
+            node_id: None,
+            task_id: None,
+            metrics_enabled: false,
+            metrics_addr: "127.0.0.1:0".parse().unwrap(),
+            log_format: LogFormat::Json,
+            log_filter: "info".to_owned(),
+            otlp_metrics: crate::OtlpMetricsConfig::default(),
+            tracing: crate::TraceExportConfig::default(),
+            shutdown_flush_timeout: std::time::Duration::from_secs(1),
+            redacted_config: None,
+        })
+        .unwrap();
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            assert!(tracing::enabled!(target: "sqlx::query", tracing::Level::DEBUG));
+            assert!(!tracing::enabled!(target: "tokeira_storage", tracing::Level::DEBUG));
+            let operation = tracing::info_span!("dsql.load_run");
+            let _operation = operation.enter();
+            tracing::event!(
+                target: "sqlx::query",
+                tracing::Level::DEBUG,
+                summary = "SELECT 1",
+                db.statement = ""
+            );
+        });
+
+        let samples = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, ..)| key.key().name() == crate::DSQL_OPERATION_ROUND_TRIPS)
+            .count();
+        assert_eq!(samples, 1, "the info filter must not hide statements");
+
+        handle
+            .modify(|filter| *filter = EnvFilter::new("debug"))
+            .unwrap();
+        assert!(
+            tracing::enabled!(target: "tokeira_storage", tracing::Level::DEBUG),
+            "the reload handle still governs the log layers"
         );
     }
 

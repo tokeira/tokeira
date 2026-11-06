@@ -1,8 +1,12 @@
 //! Process-level metrics recorder setup.
 //!
 //! Domain crates define and emit their own metrics. This module installs the
-//! global Prometheus recorder and emits only process metadata that is common to
-//! every Tokeira binary.
+//! global Prometheus recorder and emits only what is common to every Tokeira
+//! binary: process metadata, and the round trips counted by the
+//! [statement accounting](crate::statement_accounting) layer the process
+//! subscriber carries. That count lives here rather than in storage because it
+//! is taken from the subscriber, which this crate assembles; storage only names
+//! its spans.
 
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -20,6 +24,11 @@ pub const BUILD_INFO: &str = "tokeira_build_info";
 pub const PROCESS_START_TIME_SECONDS: &str = "tokeira_process_metadata_start_time_seconds";
 /// Embedded lifecycle attempts, classified only by bounded operational dimensions.
 pub const EMBEDDED_LIFECYCLE_OPERATIONS_TOTAL: &str = "tokeira_embedded_lifecycle_operations_total";
+/// Round trips one DSQL operation made to the database, one sample per
+/// transaction it ended (see [`crate::statement_accounting`]).
+pub const DSQL_OPERATION_ROUND_TRIPS: &str = "tokeira_dsql_operation_round_trips";
+/// Statements sent outside every DSQL operation span.
+pub const DSQL_UNATTRIBUTED_STATEMENTS_TOTAL: &str = "tokeira_dsql_unattributed_statements_total";
 
 const SERVICE_LABEL: LabelDescriptor = LabelDescriptor {
     name: "service",
@@ -75,6 +84,32 @@ const RUSTC_VERSION_LABEL: LabelDescriptor = LabelDescriptor {
     allowed_values: &[],
     max_cardinality_hint: Some(32),
     description: "compiler version for the running build",
+};
+
+const DSQL_OPERATION_LABEL: LabelDescriptor = LabelDescriptor {
+    name: "operation",
+    cardinality: LabelCardinality::BoundedEnum,
+    allowed_values: &[],
+    max_cardinality_hint: Some(128),
+    description: "DSQL operation: the outermost `dsql.*` span's name without the prefix; span \
+                  names are fixed at compile time",
+};
+
+const COMMAND_TYPE_LABEL: LabelDescriptor = LabelDescriptor {
+    name: "command_type",
+    cardinality: LabelCardinality::BoundedEnum,
+    allowed_values: &[],
+    max_cardinality_hint: Some(64),
+    description: "what caused the operation: the nearest enclosing span's `tokeira.command_type`, \
+                  a compile-time name, or `none`",
+};
+
+const DSQL_TRANSACTION_LABEL: LabelDescriptor = LabelDescriptor {
+    name: "transaction",
+    cardinality: LabelCardinality::BoundedEnum,
+    allowed_values: &["committed", "rolled_back", "none"],
+    max_cardinality_hint: Some(3),
+    description: "how the sample's transaction ended; `none` for statements after the last",
 };
 
 const STORAGE_MODE_LABEL: LabelDescriptor = LabelDescriptor {
@@ -207,6 +242,27 @@ pub static PROCESS_METRIC_MANIFEST: MetricManifest = MetricManifest {
             unit: MetricUnit::Seconds,
             description: "Unix timestamp at which the Tokeira process started.",
             labels: &[SERVICE_LABEL, CLUSTER_LABEL, DEPLOYMENT_LABEL],
+        },
+        MetricDescriptor {
+            name: DSQL_OPERATION_ROUND_TRIPS,
+            metric_type: MetricType::Histogram,
+            unit: MetricUnit::Count,
+            description: "Round trips a DSQL operation made: the statements it sent plus the \
+                          BEGIN of each transaction, one sample per transaction it ended and one \
+                          for any statements after its last.",
+            labels: &[
+                DSQL_OPERATION_LABEL,
+                COMMAND_TYPE_LABEL,
+                DSQL_TRANSACTION_LABEL,
+            ],
+        },
+        MetricDescriptor {
+            name: DSQL_UNATTRIBUTED_STATEMENTS_TOTAL,
+            metric_type: MetricType::Counter,
+            unit: MetricUnit::Count,
+            description: "Statements sent outside every DSQL operation span, so missing from \
+                          the round-trip histogram.",
+            labels: &[],
         },
     ],
 };

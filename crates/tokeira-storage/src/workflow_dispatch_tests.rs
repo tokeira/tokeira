@@ -1379,7 +1379,10 @@ pub(crate) fn run_completion_inline_cases(
         .run(
             &(any::<bool>(), any::<bool>(), 0u8..5, 0u8..3, any::<bool>()),
             |(return_new, sticky, reason, stamp, scoped_out)| {
-                runtime.block_on(async {
+                // The case retains run images and backend commit futures across
+                // awaits. Heap-pin it before block_on so the larger DSQL future
+                // is not embedded in the test thread's executor stack frames.
+                runtime.block_on(Box::pin(async {
                     let key = RunKey::new();
                     let mut initial = fresh_transition(key);
                     initial.next_state.status = ExecutionStatus::Running;
@@ -1604,7 +1607,7 @@ pub(crate) fn run_completion_inline_cases(
                         committed.pending_workflow_task
                     );
                     Ok(())
-                })
+                }))
             },
         )
         .unwrap();

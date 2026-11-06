@@ -821,7 +821,8 @@ pub trait MembershipShardLifecycle {
 /// implements it over the `DsqlConnectionDirector` every repository shares;
 /// the in-memory stack supplies a no-op (Req 9.2.6).
 pub trait ConnectionBudgetApplier {
-    fn apply_budget(&self, rate_per_second: f64, capacity: u64, max_reservoir_size: u32) -> Result<()>;
+    /// Async because applying a budget recomputes the director's class budgets.
+    async fn apply_budget(&self, rate_per_second: f64, capacity: u64, max_reservoir_size: u32) -> Result<()>;
     /// Warm connections available right now, reported as heartbeat headroom.
     fn available_connections(&self) -> u32;
 }
@@ -844,15 +845,16 @@ impl MembershipClient {
         // 3. DesiredPlacementDirective: shard_lifecycle.acquire_shard / relinquish_shard per bundle
         // 4. ConnectionBudgetDirective: record valid_until, then
         //    budget_applier.apply_budget(rate_per_second, capacity, max_reservoir_size).
-        //    The DSQL applier caps the reservoir through
-        //    DsqlConnectionDirector::apply_connection_budget(max_reservoir_size):
-        //    min with the configured target, floor one, retire idle excess.
-        //    rate_per_second and capacity are not applied (Req 9.2.1).
+        //    The DSQL applier hands all three to
+        //    DsqlConnectionDirector::apply_connection_budget: the target becomes
+        //    min(configured, max_reservoir_size, capacity), floored at five; idle
+        //    excess is retired and the class budgets are recomputed (Req 9.2.2);
+        //    rate_per_second becomes the fallback limiter's rate (Req 9.2.1).
         // 5. DrainDirective: drain.begin(); relinquish every owned bundle through
         //    shard_lifecycle in sorted order; record drain progress from a fresh
         //    load snapshot (Req 8.2)
-        // 6. On stream drop: if the last budget has expired, apply_budget(1.0, 1, 1)
-        //    caps the reservoir to one warm connection (Req 9.2.4); back off; reconnect
+        // 6. On stream drop: keep the last applied budget, even past valid_until
+        //    (Req 9.2.4); warn once when it goes stale (Req 9.1.5); back off; reconnect
     }
 
     /// One heartbeat: a live load snapshot plus drain re-evaluation (Req 8.2.10).
@@ -1129,9 +1131,9 @@ With active-active controllers, connection budget allocation uses a CAS-protecte
 
 - Any controller can attempt to allocate budgets.
 - CAS ensures only one allocation succeeds per cycle.
-- The `valid_until` field on directives ensures runtimes degrade to conservative defaults if no controller is available.
+- The `valid_until` field on directives marks when a share goes stale. A runtime keeps a stale share until the next directive (Req 9.2.4), so a controller outage leaves every node at its last share rather than collapsing the fleet's connections.
 
-**Bounded overshoot:** During the window between a node joining/leaving and the next budget reallocation, the sum of retained shares may not equal the cluster budget. The `valid_until` expiry bounds this window.
+**Bounded overshoot:** During the window between a node joining/leaving and the next budget reallocation, the sum of retained shares may not equal the cluster budget. Shares retained through an outage sum to no more than the budget they were drawn from; nodes that start during it run at their configured target (Req 9.2.5) and add to that sum. DSQL refuses connections past its limit with SQLSTATE `53300`, and the reservoir backs off from the refusal while its existing connections keep serving, so an overshoot costs refused connects, never a node.
 
 **Known limitation:** This is not work-conserving. If one node is idle and another is bursting, the idle node's unused share is not redistributed.
 
@@ -1547,6 +1549,12 @@ The controller binary exposes the following Prometheus metrics on the metrics en
 
 **Validates: Requirements 5.1.3, 5.1.4, 6.3.1, 6.3.2**
 
+### Property 8: A connection budget share holds until the next directive
+
+*For any* configured target of at least five and any sequence of `ConnectionBudgetDirective`s, stream drops, failed reconnects and passing `valid_until` times, the reservoir target the runtime applies SHALL be `max(5, min(configured_target_ready, max_reservoir_size, capacity))` of the latest directive received, or the configured target before the first; the fallback rate SHALL be that directive's `rate_per_second`; and no stream drop, failed reconnect or expiry SHALL change either.
+
+**Validates: Requirements 9.1.5, 9.2.1, 9.2.2, 9.2.4, 9.2.5**
+
 ## Error Handling
 
 ### Active-Active Controller Coordination Failures
@@ -1576,8 +1584,8 @@ The controller binary exposes the following Prometheus metrics on the metrics en
 
 ### Connection Budget Expiry
 
-- When a stream drop or a failed reconnect finds the last `ConnectionBudgetDirective` expired (past `valid_until`), the runtime caps its reservoir to one warm connection until the next directive.
-- This prevents a disconnected runtime from consuming more than its fair share indefinitely while leaving it able to renew and relinquish its own leases.
+- When the last `ConnectionBudgetDirective` passes its `valid_until` without a new one, the runtime keeps applying it and logs once that the share is stale.
+- A disconnected runtime therefore never takes more than the share it was last given, and a controller outage never cuts every node's connections at once, which would leave the fleet without capacity and then refill every node together against the cluster's connection rate when the controller returned.
 
 ## Testing Strategy
 
@@ -1592,6 +1600,7 @@ The controller binary exposes the following Prometheus metrics on the metrics en
 | Property 5: Bundle ownership consistency | `tokeira-controller/src/placement.rs` | Generate random BundleLease sets (at most one owner per bundle). Compute snapshot, verify 1:1 mapping with epoch. |
 | Property 6: Queue partition distribution | `tokeira-types/src/routing.rs` | Generate 10,000 random keys with deterministic seed, compute partitions, chi-squared test for uniformity. |
 | Property 7: Execution-home consistency | `tokeira-types/src/routing.rs` | Generate random (namespace_id, workflow_id) pairs, verify execution_home_bundle produces same result for same input. |
+| Property 8: Budget share holds | `tokeira-runtime/src/membership.rs` | Generate configured targets and interleavings of directives, drops, failed reconnects and clock advances past `valid_until` against a recording applier; verify the applied target and rate after every step. |
 
 ### Unit Tests
 
@@ -1602,7 +1611,7 @@ The controller binary exposes the following Prometheus metrics on the metrics en
 - **NotShardOwner retry:** Verify hint-based routing. Verify controller refresh fallback. Verify DSQL fallback. Verify max retries.
 - **Two-phase drain:** Verify the served `MarkNodeDraining` delivers the `DrainDirective` and `DescribeNodeDrain` follows the heartbeat. Verify a reopened stream of a draining node receives the drain again. Verify SAFE_TO_TERMINATE is held until the in-flight counters clear. Verify epoch-checked CAS relinquish and that work routed after relinquish is refused.
 - **Bundle relinquish:** Verify epoch validation. Verify epoch advancement on success.
-- **Connection budget:** Verify zero-node handling. Verify remainder distribution by sorted IncarnationId. Verify a directive caps the reservoir target, never raises it above configuration, and floors at one.
+- **Connection budget:** Verify zero-node handling. Verify remainder distribution by sorted IncarnationId. Verify a directive caps the reservoir target at its capacity share, never raises it above configuration, and floors at five.
 
 ### Integration Tests
 

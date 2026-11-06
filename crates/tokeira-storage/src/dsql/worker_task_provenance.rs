@@ -4,8 +4,8 @@
 //! can only gate an edge response; they can never start, complete, or dispatch
 //! work without the runtime's existing token fence or correlation.
 
+use crate::dsql::in_operation;
 use std::sync::Arc;
-use tokeira_observability::statement_accounting::in_operation;
 
 use async_trait::async_trait;
 use sqlx::Row;
@@ -19,7 +19,7 @@ use crate::{
     WorkerTaskProvenanceStore,
 };
 
-use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, key_codec};
+use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, key_codec, operation};
 
 /// DSQL-backed Worker task-provenance repository.
 #[derive(Debug)]
@@ -225,7 +225,12 @@ impl WorkerTaskProvenanceStore for DsqlWorkerTaskProvenanceStore {
     }
 }
 
-fn unavailable(error: impl std::fmt::Display) -> WorkerTaskProvenanceError {
+fn unavailable(error: impl Into<anyhow::Error>) -> WorkerTaskProvenanceError {
+    let error = error.into();
+    // The typed error keeps only the message, so a failure that broke the
+    // connection is reported to the enclosing operation here, while the cause
+    // is still at hand.
+    operation::note_failure(&error);
     WorkerTaskProvenanceError::Unavailable {
         message: error.to_string(),
     }

@@ -25,15 +25,16 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{ConnectionDirector, DbClass, metrics};
+use crate::{ConnectionDirector, DbClass, PersistenceCapacityExhausted, metrics};
 
 use super::{
-    DsqlPoolConfig, Reservoir, ReservoirEntry, ReturnedConnection,
+    DsqlPoolConfig, Reservoir, ReservoirEntry, ReservoirError, ReturnedConnection,
     config::ReservoirConfig,
     connection_coordinator::EmbeddedConnectionCoordinator,
     control_lease::{OwnershipAdmissionGate, OwnershipAdmissionPermit, OwnershipAdmissionState},
     embedded_reservoir,
     embedded_reservoir::EmbeddedReservoir,
+    operation::{BrokenFlag, note_checkout},
 };
 
 const LEAK_SUSPECT_AFTER: StdDuration = StdDuration::from_secs(30);
@@ -594,7 +595,16 @@ impl DsqlConnectionDirector {
         {
             bail!("DSQL connection admission is closed");
         }
-        let entry = reservoir.checkout()?;
+        // An empty reservoir after class admission is backpressure (Req 12.2):
+        // the class permit drops with this frame. The typed context lets the
+        // edge answer as v1.31.0 does when persistence capacity is spent, and
+        // the reservoir error stays underneath for callers that retry on it.
+        let entry = reservoir.checkout().map_err(|error| match error {
+            ReservoirError::Empty => {
+                anyhow::Error::new(error).context(PersistenceCapacityExhausted)
+            }
+            ReservoirError::Closed => anyhow::Error::new(error),
+        })?;
         // From this point until `DsqlPermit::drop`, the connection is out of
         // the ready reservoir but still owns exactly one slot reservation.
         let in_flight = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
@@ -788,8 +798,14 @@ pub struct DsqlPermit {
     created_at: std::time::Instant,
     /// Maximum lifetime assigned when the connection was created.
     max_lifetime: std::time::Duration,
-    /// Semaphore permit enforcing operation-class admission.
-    _class_guard: OwnedSemaphorePermit,
+    /// Set by a failed operation that left this connection unusable; shared
+    /// with whichever reservoir holds the connection next.
+    broken: BrokenFlag,
+    /// Semaphore permit enforcing operation-class admission. On the
+    /// distributed path it travels back with the connection and is released
+    /// by the return processor, once the connection is checkable-out again;
+    /// see the `reservoir` module.
+    class_guard: Option<OwnedSemaphorePermit>,
     /// Mode-specific return and slot-accounting path. The distributed variant
     /// retains the original DynamoDB slot manager; embedded uses only local state.
     reservoir_return: PermitReturn,
@@ -837,12 +853,14 @@ impl DsqlPermit {
         leak_checkout: CheckoutLeak,
         ownership_guard: Option<OwnershipAdmissionPermit>,
     ) -> Self {
+        note_checkout(&entry.broken);
         Self {
             class,
             connection: Some(entry.connection),
             created_at: entry.created_at,
             max_lifetime: entry.max_lifetime,
-            _class_guard: class_guard,
+            broken: entry.broken,
+            class_guard: Some(class_guard),
             reservoir_return: PermitReturn::Distributed {
                 sender: reservoir_return,
                 slot_manager,
@@ -870,12 +888,14 @@ impl DsqlPermit {
         leak_checkout: CheckoutLeak,
         ownership_guard: Option<OwnershipAdmissionPermit>,
     ) -> Self {
+        note_checkout(&entry.broken);
         Self {
             class,
             connection: Some(entry.connection),
             created_at: entry.created_at,
             max_lifetime: entry.max_lifetime,
-            _class_guard: class_guard,
+            broken: entry.broken,
+            class_guard: Some(class_guard),
             reservoir_return: PermitReturn::Embedded {
                 sender: reservoir_return,
                 coordinator,
@@ -971,8 +991,10 @@ impl Drop for DsqlPermit {
                                 connection,
                                 created_at: self.created_at,
                                 max_lifetime: self.max_lifetime,
+                                broken: self.broken.clone(),
                             },
                             marked_bad: self.marked_bad,
+                            class_permit: self.class_guard.take(),
                         })
                         .is_err(),
                     PermitReturn::Embedded { sender, .. } => sender
@@ -981,6 +1003,7 @@ impl Drop for DsqlPermit {
                                 connection,
                                 created_at: self.created_at,
                                 max_lifetime: self.max_lifetime,
+                                broken: self.broken.clone(),
                             },
                             marked_bad: self.marked_bad,
                         })
@@ -1438,7 +1461,8 @@ mod tests {
             connection: None,
             created_at: std::time::Instant::now(),
             max_lifetime: std::time::Duration::from_secs(60),
-            _class_guard: class_guard,
+            broken: BrokenFlag::default(),
+            class_guard: Some(class_guard),
             reservoir_return: PermitReturn::Distributed {
                 sender: return_tx,
                 slot_manager: crate::dsql::SlotBlockManager::local_for_tests(1),

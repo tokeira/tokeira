@@ -39,8 +39,8 @@
 //! (SQLSTATE 40001) covers a concurrent writer that slips between the check and the
 //! commit — normalized to the same `Conflict` so the runtime reloads and re-runs.
 
+use crate::dsql::in_operation;
 use std::{collections::BTreeMap, sync::Arc};
-use tokeira_observability::statement_accounting::in_operation;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;

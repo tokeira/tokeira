@@ -6,7 +6,7 @@
 //! ops become visibility rows.
 
 use std::{collections::BTreeSet, sync::Arc, time::Instant};
-use tokeira_observability::statement_accounting::in_operation;
+use tokeira_storage::dsql::in_operation;
 
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;

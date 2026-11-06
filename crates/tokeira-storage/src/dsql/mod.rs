@@ -29,6 +29,7 @@ pub(crate) mod key_codec;
 #[cfg(all(test, feature = "dsql-integration"))]
 mod large_value_tests;
 pub mod migration;
+pub mod operation;
 pub(crate) mod projection_image_parts;
 pub mod projection_log;
 #[cfg(any(test, feature = "dsql-integration"))]
@@ -55,6 +56,7 @@ pub use control_lease::*;
 pub use distributed_bucket::*;
 pub use embedded_reservoir::WarmupDeadline;
 pub use migration::*;
+pub use operation::{OperationOutcome, in_operation};
 pub use projection_log::*;
 pub use reservoir::*;
 pub use run_repository::*;

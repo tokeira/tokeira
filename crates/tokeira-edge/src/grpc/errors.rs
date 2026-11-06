@@ -2,7 +2,8 @@ use prost::Message as _;
 use tokeira_proto::{
     conversions::ProtoConversionError,
     public::temporal::api::{
-        enums::v1::ResourceExhaustedCause, errordetails::v1::PermissionDeniedFailure,
+        enums::v1::{ResourceExhaustedCause, ResourceExhaustedScope},
+        errordetails::v1::PermissionDeniedFailure,
     },
 };
 use tonic::{
@@ -20,10 +21,17 @@ impl From<EdgeError> for Status {
             EdgeError::NotFound(message) => Status::not_found(message),
             EdgeError::AlreadyExists(message) => Status::already_exists(message),
             EdgeError::ResourceExhausted(message) => Status::resource_exhausted(message),
-            EdgeError::ConcurrentLimitExceeded(message) => {
-                resource_exhausted_status(ResourceExhaustedCause::ConcurrentLimit, message)
-            }
+            EdgeError::ConcurrentLimitExceeded(message) => resource_exhausted_status(
+                ResourceExhaustedCause::ConcurrentLimit,
+                ResourceExhaustedScope::Namespace,
+                message,
+            ),
             EdgeError::WorkflowClosing => workflow_closing_status(),
+            error @ EdgeError::PersistenceLimitExceeded => resource_exhausted_status(
+                ResourceExhaustedCause::PersistenceLimit,
+                ResourceExhaustedScope::System,
+                error.to_string(),
+            ),
             EdgeError::ConsistentQueryBufferExceeded => busy_workflow_resource_exhausted_status(
                 "consistent query buffer is full, this may be caused by too many queries and \
                  workflow not able to process query fast enough"
@@ -255,23 +263,28 @@ fn workflow_closing_status() -> Status {
 /// v1.31.0's `ErrWorkflowClosing` and `ErrConsistentQueryBufferExceeded`
 /// (consts/const.go:62-77 @ v1.31.0).
 fn busy_workflow_resource_exhausted_status(message: String) -> Status {
-    resource_exhausted_status(ResourceExhaustedCause::BusyWorkflow, message)
+    resource_exhausted_status(
+        ResourceExhaustedCause::BusyWorkflow,
+        ResourceExhaustedScope::Namespace,
+        message,
+    )
 }
 
 /// Build a RESOURCE_EXHAUSTED status carrying a `ResourceExhaustedFailure`
-/// detail with `cause` and scope NAMESPACE, every scope Tokeira answers. The Go
-/// SDK reconstructs `serviceerror.ResourceExhausted` — including the Cause and
-/// Scope the corpus asserts — from the `google.rpc.Status` detail in the
-/// trailer.
-fn resource_exhausted_status(cause: ResourceExhaustedCause, message: String) -> Status {
+/// detail with `cause` and `scope`. The Go SDK reconstructs
+/// `serviceerror.ResourceExhausted` — including the Cause and Scope the corpus
+/// asserts — from the `google.rpc.Status` detail in the trailer.
+fn resource_exhausted_status(
+    cause: ResourceExhaustedCause,
+    scope: ResourceExhaustedScope,
+    message: String,
+) -> Status {
     use prost::Message as _;
-    use tokeira_proto::public::temporal::api::{
-        enums::v1::ResourceExhaustedScope, errordetails::v1::ResourceExhaustedFailure,
-    };
+    use tokeira_proto::public::temporal::api::errordetails::v1::ResourceExhaustedFailure;
 
     let failure = ResourceExhaustedFailure {
         cause: cause as i32,
-        scope: ResourceExhaustedScope::Namespace as i32,
+        scope: scope as i32,
     };
     let detail = ProtoAny {
         type_url: "type.googleapis.com/temporal.api.errordetails.v1.ResourceExhaustedFailure"
@@ -707,6 +720,27 @@ mod tests {
             ResourceExhaustedCause::ConcurrentLimit as i32
         );
         assert_eq!(failure.scope, ResourceExhaustedScope::Namespace as i32);
+    }
+
+    #[test]
+    fn persistence_limit_status_matches_v1_31_0s_system_limit() {
+        use tokeira_proto::public::temporal::api::{
+            enums::v1::ResourceExhaustedScope, errordetails::v1::ResourceExhaustedFailure,
+        };
+
+        // `ErrPersistenceSystemLimitExceeded`
+        // (`common/persistence/persistence_rate_limited_clients.go:23-28 @ v1.31.0`).
+        let status: Status = EdgeError::PersistenceLimitExceeded.into();
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(status.message(), "System Persistence Max QPS Reached.");
+        let rpc_status = RpcStatus::decode(status.details()).expect("decode google.rpc.Status");
+        let failure = ResourceExhaustedFailure::decode(rpc_status.details[0].value.as_slice())
+            .expect("decode detail");
+        assert_eq!(
+            failure.cause,
+            ResourceExhaustedCause::PersistenceLimit as i32
+        );
+        assert_eq!(failure.scope, ResourceExhaustedScope::System as i32);
     }
 
     #[test]

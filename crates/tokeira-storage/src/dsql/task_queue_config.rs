@@ -4,8 +4,8 @@
 //! and task kind. The data is low-volume control-plane state, independent from
 //! run transitions and reconstructible runtime delivery caches.
 
+use crate::dsql::in_operation;
 use std::sync::Arc;
-use tokeira_observability::statement_accounting::in_operation;
 
 use anyhow::{Result, ensure};
 use async_trait::async_trait;

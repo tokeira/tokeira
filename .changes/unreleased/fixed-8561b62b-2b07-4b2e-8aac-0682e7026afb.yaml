@@ -1,0 +1,5 @@
+kind: fixed
+body: When no DSQL connection is free, requests now fail with `RESOURCE_EXHAUSTED`, which SDKs retry with backoff, instead of `INTERNAL`.
+time: 2026-11-06T11:27:25.000000+00:00
+custom:
+    Slice: 8561b62b-2b07-4b2e-8aac-0682e7026afb

@@ -11,7 +11,11 @@ The design goal is simple: commits should either get an already-safe connection 
 
 ## Reservoir Ownership
 
-The storage crate owns a `Reservoir` per `DsqlStore`. The reservoir owns raw `PgConnection` values created through `aurora_dsql_sqlx_connector::connection::connect_with`. The connector handles IAM token creation internally during connection establishment; Tokeira does not maintain an IAM token cache and does not instrument token refresh directly.
+The storage crate owns a `Reservoir` per `DsqlStore`. The reservoir owns raw `PgConnection` values created through `aurora_dsql_sqlx_connector::connection::connect_with`. The connector mints an IAM token for each connection as it connects; Tokeira never caches tokens and does not instrument token refresh directly.
+
+The AWS credentials that sign the tokens are a different matter. `ConnectionFactory` resolves them once through the default credentials chain and reuses them until five minutes before they expire. Left to itself, the connector would build a new credentials chain for every connection, and its signer bypasses the SDK's credential cache, so a refill of fifty connections would fetch credentials fifty times from the ECS credentials endpoint or STS.
+
+Every connect is bounded by a 30-second timeout. Neither sqlx nor the connector bounds one, and a peer that accepts TCP and never answers would otherwise hold a creation slot forever.
 
 Connection flow:
 
@@ -31,13 +35,17 @@ flowchart LR
 
 The reservoir has three background tasks:
 
-- `Refiller`: reserves capacity, waits for a distributed rate token, creates a raw connection, and places it in the ready channel.
+- `Refiller`: reserves capacity, waits for a distributed rate token, creates a raw connection, and places it in the ready channel. Up to eight creations run at once, so refilling fifty connections after a mass retirement takes a handful of connect latencies rather than fifty. Creations still running count against the target, so the refiller never overshoots it. Consecutive failures back off exponentially, from 250 ms doubling to 10 seconds with jitter, so nodes refused together retry apart; the first success ends the backoff at once.
 - `Expiry scanner`: scans at most half of the target ready channel per pass and retires connections inside the guard window.
-- `Return processor`: accepts returned permits and validates only lifetime plus the bad flag. It performs no network ping.
+- `Return processor`: accepts returned permits and validates only lifetime plus the bad and broken flags. It performs no network ping and never waits for room: the ready channel holds twice the target, which is more than the refiller and every admitted caller can fill together.
 
 ## Admission Path
 
 Every storage operation first acquires a class permit from `ClassBudgets`, then performs a non-blocking reservoir checkout. If the class semaphore is saturated, the operation queues at the class boundary. If the reservoir is empty after admission, the class permit is dropped and `ReservoirError::Empty` is returned immediately.
+
+A class permit travels with its connection. When an operation finishes, its permit goes to the return processor along with the connection and returns to the class only once the connection is back in the ready channel or retired. If the permit came back first, the next caller of that class could be admitted while the connection it needs is still in the return queue, and find the reservoir empty although the class budgets were respected.
+
+An empty reservoir reaches the client as `RESOURCE_EXHAUSTED`, with cause `RESOURCE_EXHAUSTED_CAUSE_PERSISTENCE_LIMIT` and scope `RESOURCE_EXHAUSTED_SCOPE_SYSTEM`: the director marks the error `PersistenceCapacityExhausted`, and the frontend answers it the way Temporal answers a persistence rate limit (`common/persistence/persistence_rate_limited_clients.go` @ v1.31.0). SDKs retry it with backoff.
 
 Default classes match the runtime `DbClass` enum:
 
@@ -48,6 +56,12 @@ Default classes match the runtime `DbClass` enum:
 - `maintenance`
 
 The default allocation is derived from the target ready count and preserves at least one permit per class. Commit gets the largest share because the transition log is the authoritative write path.
+
+## Broken Connections
+
+A connection whose transport failed, or whose session the server ended with a FATAL error, must not reach another caller, but nothing on the connection says so afterwards: sqlx has no synchronous health check, and the return path does no network I/O. So every storage operation runs inside `in_operation`, which records each connection the operation checks out. When the operation fails with an IO, TLS or protocol error, or a FATAL error response, every recorded connection is flagged broken. The return processor, checkout and the expiry scanner each retire a flagged connection when they meet it, and the refiller replaces it.
+
+The flag is set once the operation has failed, after its permit has returned the connection, so a caller that checks the connection out in that short window fails on it the same way and flags it again. An operation that held more than one connection retires them all; such failures are rare, and a spare reconnect costs less than handing the next caller a dead connection.
 
 ## Distributed Rate Bucket
 
@@ -74,10 +88,12 @@ The invariant is strict: every path that drops a created connection releases exa
 
 Slot release happens when:
 
+- a connection creation fails or times out,
 - refiller fails to place a created connection in the ready channel,
 - expiry scanner retires a ready connection,
 - expiry scanner cannot requeue a scanned connection,
-- return processor discards a bad or guard-window connection,
+- return processor discards a bad, broken or guard-window connection,
+- checkout or the expiry scanner retires a broken connection,
 - return processor cannot place a returned connection back in the ready channel,
 - `DsqlPermit::drop` discards a connection that exceeded its lifetime,
 - `DsqlPermit::drop` cannot send the connection to the return processor.
@@ -111,6 +127,9 @@ The reservoir uses conservative internal constants:
 - scan interval: 1 second
 - scan budget: 25 entries per pass
 - warmup timeout: 30 seconds
+- connect timeout: 30 seconds
+- refill backoff: 250 ms, doubling per consecutive failure to 10 seconds
+- ready channel capacity: twice the target ready count
 
 The safety invariant is:
 

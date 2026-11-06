@@ -258,6 +258,21 @@ Implementation follows the natural dependency order: foundational components fir
 - [x] 14. Final checkpoint — Full compilation, all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
+- [x] 15. Keep the reservoir serving through failures and bursts
+  - [x] 15.1 Bound every connect with `CONNECT_TIMEOUT`, in the reservoir and the embedded reservoirs; resolve the AWS credentials once per factory and reuse them until shortly before they expire
+    - _Requirements: 1.2, 1.4, 10.1, 10.2_
+  - [x] 15.2 Run up to `INFLIGHT_LIMIT` creations at once, counting running creations against the target; back off exponentially on consecutive failures and resume at once on the first success
+    - _Requirements: 4.2, 4.3, 4.4, 4.5, 4.8, 12.4, 12.5_
+  - [x] 15.3 Keep the caller's class permit until its connection is back in the ready channel or retired; size the ready channel at twice the target so a return never waits
+    - _Requirements: 2.1, 6.4, 9.4, 12.1, 12.2_
+  - [x] 15.4 Retire every connection an operation broke, through the broken flag `in_operation` sets, at return, checkout and scan
+    - _Requirements: 6.5, 16.3_
+  - [x] 15.5 Report an empty reservoir as `PersistenceCapacityExhausted`, which the frontend answers with `RESOURCE_EXHAUSTED`
+    - _Requirements: 3.4, 12.2_
+  - [x] 15.6 Write scenario tests on paused time and a live burst and connection storm
+    - _Requirements: 3.2, 4.4, 4.5, 4.8, 12.2, 12.4, 12.5, 16.3_
+    - DONE: the seven scenario tests pass forty runs in a row, and the class-permit test fails when the permit is released at drop instead. On a throwaway cluster, 64 workers ran 3,200 operations through a reservoir of 10 and never found it empty. Eight reservoirs each refilled 49 connections five times over: 2,360 connections, 101 refused for the cluster's connection rate, every refill complete and no slot lost. A refill of 49 took a median of 2.1 seconds with eight connects in flight, against 15.0 seconds one at a time.
+
 ## Notes
 
 - Tasks marked with `*` are optional and can be skipped for faster MVP
@@ -283,7 +298,9 @@ Implementation follows the natural dependency order: foundational components fir
     { "id": 6, "tasks": ["7.2", "7.3"] },
     { "id": 7, "tasks": ["7.4", "7.5"] },
     { "id": 8, "tasks": ["9.1", "9.2", "9.3"] },
-    { "id": 9, "tasks": ["11.1", "12.1", "13.1"] }
+    { "id": 9, "tasks": ["11.1", "12.1", "13.1"] },
+    { "id": 10, "tasks": ["15.1", "15.2", "15.3", "15.4", "15.5"] },
+    { "id": 11, "tasks": ["15.6"] }
   ]
 }
 ```

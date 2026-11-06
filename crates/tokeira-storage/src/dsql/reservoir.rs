@@ -4,29 +4,52 @@
 //! first obtain an operation-class permit, then checkout either returns a warm
 //! connection immediately or reports `Empty` so the caller can shed/backpressure
 //! work. Background tasks refill, scan, and process returns independently.
+//!
+//! Four invariants keep checkout from reporting `Empty` while the class
+//! budgets still admit work, without wasting connections:
+//!
+//! - A returned connection's class permit travels with it and is released
+//!   only once the return processor has put the connection back in the ready
+//!   queue (or retired it). Releasing the permit first would let the next
+//!   caller of that class find the queue empty while the connection it needs
+//!   is still on its way back.
+//! - The ready queue has room for twice the target, which is every connection
+//!   the node can hold: the refiller adds connections only while the ready
+//!   ones plus those being made stay below the target, and the class budgets
+//!   cap checked-out connections at the target. So a return never waits for
+//!   room, and never retires a healthy connection that a later checkout would
+//!   have to replace.
+//! - The refiller makes up to the in-flight limit of connections at once, so a
+//!   mass retirement refills in a fraction of the serial time.
+//! - A failing refill backs off exponentially, shared across every attempt, so
+//!   a cluster refusing connections is not hammered while it recovers.
 
 use std::{
     error::Error as StdError,
     fmt,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
     },
     time::{Duration as StdDuration, Instant},
 };
 
 use anyhow::Result;
+use async_channel::TrySendError;
 use rand::Rng;
 use sqlx::PgConnection;
 use tokeira_observability::OutcomeLabel;
 use tokio::{
-    sync::{Semaphore, mpsc},
-    task::JoinHandle,
+    sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc},
+    task::{JoinHandle, JoinSet},
 };
 
 use crate::metrics;
 
-use super::{DistributedTokenBucket, PhysicalConnectionFactory, ReservoirConfig, SlotBlockManager};
+use super::{
+    DistributedTokenBucket, PhysicalConnectionFactory, ReservoirConfig, SlotBlockManager,
+    connection_factory::create_within_timeout, operation::BrokenFlag,
+};
 
 /// Default warm connection target for one node.
 // Pinned here for reservoir startup wiring and tested as part of the DSQL token-safety contract.
@@ -51,8 +74,18 @@ pub(crate) const GUARD_WINDOW: StdDuration = StdDuration::from_secs(45);
 pub(crate) const INFLIGHT_LIMIT: usize = 8;
 pub(crate) const SCAN_INTERVAL: StdDuration = StdDuration::from_secs(1);
 pub(crate) const WARMUP_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+/// How often warmup looks at the ready queue. Polling with a sleep, not a
+/// yield, keeps warmup from spinning a runtime worker until the queue fills.
+const WARMUP_POLL_INTERVAL: StdDuration = StdDuration::from_millis(10);
 pub(crate) const REFILLER_IDLE_INTERVAL: StdDuration = StdDuration::from_millis(100);
+/// Delay before the next refill attempt after the first failure in a row.
 pub(crate) const REFILLER_ERROR_BACKOFF: StdDuration = StdDuration::from_millis(250);
+/// Longest delay between refill attempts while they keep failing.
+///
+/// The delay doubles with each failure in a row, so a cluster that refuses
+/// connections (too many, or too fast) sees this node's attempts thin out to
+/// one every ten seconds; the first success restores full speed.
+pub(crate) const REFILLER_MAX_BACKOFF: StdDuration = StdDuration::from_secs(10);
 
 #[derive(Debug)]
 pub struct ReservoirEntry {
@@ -62,6 +95,8 @@ pub struct ReservoirEntry {
     pub(crate) created_at: Instant,
     /// Per-connection lifetime after jitter was assigned at creation.
     pub(crate) max_lifetime: StdDuration,
+    /// Set by a failed operation that left this connection unusable.
+    pub(crate) broken: BrokenFlag,
 }
 
 impl ReservoirEntry {
@@ -77,6 +112,9 @@ pub struct ReturnedConnection {
     /// Caller-set health flag. The return processor does not ping; bad-flagged
     /// connections are retired immediately.
     pub(crate) marked_bad: bool,
+    /// The returning caller's class permit, released once the connection is
+    /// back in the ready queue or retired.
+    pub(crate) class_permit: Option<OwnedSemaphorePermit>,
 }
 
 #[derive(Debug)]
@@ -122,7 +160,7 @@ impl Reservoir {
         slot_manager: Arc<SlotBlockManager>,
     ) -> Result<Self> {
         config.validate()?;
-        let (ready_tx, ready) = async_channel::bounded(config.target_ready);
+        let (ready_tx, ready) = async_channel::bounded(ready_capacity(config.target_ready));
         let (return_tx, return_rx) = mpsc::unbounded_channel();
         let inflight = Arc::new(Semaphore::new(config.inflight_limit));
         let target_ready = Arc::new(AtomicUsize::new(config.target_ready));
@@ -165,12 +203,12 @@ impl Reservoir {
     }
 
     pub async fn warmup(&self) -> Result<()> {
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         while self.ready.len() < self.config.target_ready {
             if started.elapsed() > WARMUP_TIMEOUT {
                 anyhow::bail!("timed out warming DSQL connection reservoir");
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(WARMUP_POLL_INTERVAL).await;
         }
         metrics::record_dsql_pool_connections_total(self.ready.len());
         metrics::set_dsql_reservoir_ready_connections(self.ready.len());
@@ -181,17 +219,24 @@ impl Reservoir {
         // Non-blocking by design. Queueing is handled by class budgets before
         // checkout; an empty reservoir is immediate backpressure, not another
         // hidden wait queue.
-        match self.ready.try_recv() {
-            Ok(entry) => {
-                metrics::record_dsql_pool_connections_total(self.ready.len());
-                metrics::set_dsql_reservoir_ready_connections(self.ready.len());
-                Ok(entry)
+        loop {
+            match self.ready.try_recv() {
+                // An operation that failed on this connection flagged it after
+                // returning it; it never reaches another caller.
+                Ok(entry) if entry.broken.is_set() => {
+                    record_retirement(&self.slot_manager, "broken", entry.created_at.elapsed());
+                }
+                Ok(entry) => {
+                    metrics::record_dsql_pool_connections_total(self.ready.len());
+                    metrics::set_dsql_reservoir_ready_connections(self.ready.len());
+                    return Ok(entry);
+                }
+                Err(async_channel::TryRecvError::Empty) => {
+                    metrics::record_dsql_pool_empty_reservoir();
+                    return Err(ReservoirError::Empty);
+                }
+                Err(async_channel::TryRecvError::Closed) => return Err(ReservoirError::Closed),
             }
-            Err(async_channel::TryRecvError::Empty) => {
-                metrics::record_dsql_pool_empty_reservoir();
-                Err(ReservoirError::Empty)
-            }
-            Err(async_channel::TryRecvError::Closed) => Err(ReservoirError::Closed),
         }
     }
 
@@ -261,7 +306,7 @@ impl Reservoir {
     /// ready channel open is spawned on it.
     #[cfg(any(test, feature = "dsql-integration"))]
     pub fn idle_for_tests(config: ReservoirConfig) -> Self {
-        let (ready_tx, ready) = async_channel::bounded(config.target_ready);
+        let (ready_tx, ready) = async_channel::bounded(ready_capacity(config.target_ready));
         let (return_tx, _return_rx) = mpsc::unbounded_channel();
         let idle = |sender: async_channel::Sender<ReservoirEntry>| {
             tokio::spawn(async move {
@@ -300,6 +345,20 @@ impl Drop for Reservoir {
     }
 }
 
+/// Keep the ready queue at its target with up to `inflight` creations at once.
+///
+/// One task decides, in the order Req 4.3 fixes: an in-flight permit, a slot,
+/// a cluster rate token. Each admitted creation then runs as its own task in a
+/// `JoinSet` this task owns, so aborting the refiller at shutdown cancels every
+/// creation it started, and each cancelled creation's [`SlotCharge`] gives its
+/// slot back. Ready connections plus creations in flight never exceed the
+/// target, so parallel creation cannot overfill the queue.
+///
+/// Failures anywhere in a refill (no slot, no rate token, a refused or timed-out
+/// connect) count toward one shared streak, and every new attempt waits
+/// [`refill_backoff`] of that streak first. The first created connection ends
+/// the streak and cuts short a wait already under way, so a cluster that
+/// recovers is refilled at once rather than after the longest delay.
 fn spawn_refiller(
     config: ReservoirConfig,
     factory: Arc<dyn PhysicalConnectionFactory>,
@@ -310,81 +369,174 @@ fn spawn_refiller(
     target_ready: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut creating = JoinSet::new();
+        let failures = Arc::new(AtomicU32::new(0));
+        let recovered = Arc::new(Notify::new());
         loop {
-            while ready_tx.len() >= target_ready.load(Ordering::Acquire) {
-                tokio::time::sleep(REFILLER_IDLE_INTERVAL).await;
+            let streak = failures.load(Ordering::Acquire);
+            if streak > 0 {
+                let mut success = std::pin::pin!(recovered.notified());
+                success.as_mut().enable();
+                // Registered before the second look, so a success between
+                // the two cannot be missed.
+                if failures.load(Ordering::Acquire) > 0 {
+                    tokio::select! {
+                        () = tokio::time::sleep(refill_backoff(streak)) => {}
+                        () = success => {}
+                    }
+                }
             }
-            let Ok(_inflight_guard) = inflight.clone().acquire_owned().await else {
+            let Ok(inflight_permit) = inflight.clone().acquire_owned().await else {
                 return;
             };
-            let Ok(_slot) = slot_manager.acquire_slot().await else {
-                metrics::record_dsql_reservoir_refill_error("slot_unavailable");
-                tokio::time::sleep(StdDuration::from_secs(1)).await;
+            // A creation that finished has already put its connection in the
+            // ready queue (or failed), so reaping before counting keeps
+            // `ready + creating` exact.
+            while creating.try_join_next().is_some() {}
+            if ready_tx.len() + creating.len() >= target_ready.load(Ordering::Acquire) {
+                drop(inflight_permit);
+                tokio::time::sleep(REFILLER_IDLE_INTERVAL).await;
                 continue;
-            };
+            }
             let refill_started = Instant::now();
+            if slot_manager.acquire_slot().await.is_err() {
+                metrics::record_dsql_reservoir_refill_error("slot_unavailable");
+                failures.fetch_add(1, Ordering::AcqRel);
+                continue;
+            }
+            let slot = SlotCharge::new(Arc::clone(&slot_manager));
             if let Err(error) = distributed_bucket.wait().await {
                 // A slot is reserved before the global rate token so local
                 // refillers cannot collectively overshoot capacity while
-                // waiting for token-bucket admission.
-                slot_manager.release_slot();
+                // waiting for token-bucket admission. Dropping the charge
+                // releases it.
+                drop(slot);
                 metrics::record_dsql_reservoir_refill_error("rate_limiter");
                 metrics::record_dsql_reservoir_refill_duration(
                     OutcomeLabel::Failure,
                     refill_started.elapsed(),
                 );
                 tracing::warn!(error = %error, "failed to acquire DSQL distributed rate token");
-                tokio::time::sleep(REFILLER_ERROR_BACKOFF).await;
+                failures.fetch_add(1, Ordering::AcqRel);
                 continue;
             }
-            let create_started = Instant::now();
-            match factory.create_connection().await {
-                Ok(connection) => {
-                    metrics::record_dsql_reservoir_connection_create_duration(
-                        create_started.elapsed(),
-                    );
-                    metrics::record_dsql_pool_connection_created();
-                    let entry = ReservoirEntry {
-                        connection,
-                        created_at: Instant::now(),
-                        max_lifetime: assign_lifetime(&config),
-                    };
-                    if ready_tx.send(entry).await.is_err() {
-                        // Channel closure means shutdown won the race after the
-                        // physical connection was created. Dropping the
-                        // connection must also release its reserved slot.
-                        slot_manager.release_slot();
-                        metrics::record_dsql_reservoir_refill_error("ready_channel_closed");
-                        metrics::record_dsql_reservoir_refill_duration(
-                            OutcomeLabel::Failure,
-                            refill_started.elapsed(),
-                        );
-                        return;
-                    }
-                    metrics::record_dsql_pool_connections_total(ready_tx.len());
-                    metrics::set_dsql_reservoir_ready_connections(ready_tx.len());
-                    metrics::record_dsql_reservoir_refill_duration(
-                        OutcomeLabel::Success,
-                        refill_started.elapsed(),
-                    );
-                }
-                Err(error) => {
-                    slot_manager.release_slot();
-                    metrics::record_dsql_reservoir_connection_create_duration(
-                        create_started.elapsed(),
-                    );
-                    metrics::record_dsql_reservoir_refill_error("factory");
-                    metrics::record_dsql_reservoir_refill_duration(
-                        OutcomeLabel::Failure,
-                        refill_started.elapsed(),
-                    );
-                    metrics::record_dsql_connection_error(error.kind());
-                    tracing::warn!(error = %error, "failed to create DSQL connection");
-                    tokio::time::sleep(REFILLER_ERROR_BACKOFF).await;
-                }
-            }
+            creating.spawn(create_into_ready(
+                assign_lifetime(&config),
+                Arc::clone(&factory),
+                ready_tx.clone(),
+                slot,
+                inflight_permit,
+                Arc::clone(&failures),
+                Arc::clone(&recovered),
+                refill_started,
+            ));
         }
     })
+}
+
+/// Make one connection and hand it to the ready queue.
+///
+/// Holds `_inflight_permit` for the whole attempt, so at most the in-flight
+/// limit of connects run at once.
+async fn create_into_ready(
+    max_lifetime: StdDuration,
+    factory: Arc<dyn PhysicalConnectionFactory>,
+    ready_tx: async_channel::Sender<ReservoirEntry>,
+    slot: SlotCharge,
+    _inflight_permit: OwnedSemaphorePermit,
+    failures: Arc<AtomicU32>,
+    recovered: Arc<Notify>,
+    refill_started: Instant,
+) {
+    let create_started = Instant::now();
+    let connection = match create_within_timeout(factory.as_ref()).await {
+        Ok(connection) => connection,
+        Err(error) => {
+            // The slot charge drops with this frame and releases the slot.
+            failures.fetch_add(1, Ordering::AcqRel);
+            metrics::record_dsql_reservoir_connection_create_duration(create_started.elapsed());
+            metrics::record_dsql_reservoir_refill_error("factory");
+            metrics::record_dsql_reservoir_refill_duration(
+                OutcomeLabel::Failure,
+                refill_started.elapsed(),
+            );
+            metrics::record_dsql_connection_error(error.kind());
+            tracing::warn!(error = %error, "failed to create DSQL connection");
+            return;
+        }
+    };
+    failures.store(0, Ordering::Release);
+    recovered.notify_waiters();
+    metrics::record_dsql_reservoir_connection_create_duration(create_started.elapsed());
+    metrics::record_dsql_pool_connection_created();
+    let entry = ReservoirEntry {
+        connection,
+        created_at: Instant::now(),
+        max_lifetime,
+        broken: BrokenFlag::default(),
+    };
+    // The queue always has room (see `ready_capacity`); a full queue would
+    // only make this creation wait, still counted, so the refiller starts
+    // nothing new meanwhile.
+    if ready_tx.send(entry).await.is_err() {
+        // Channel closure means shutdown won the race after the physical
+        // connection was created. The slot charge drops with the connection
+        // and releases its slot (Req 4.8).
+        metrics::record_dsql_reservoir_refill_error("ready_channel_closed");
+        metrics::record_dsql_reservoir_refill_duration(
+            OutcomeLabel::Failure,
+            refill_started.elapsed(),
+        );
+        return;
+    }
+    slot.transfer_to_connection();
+    metrics::record_dsql_pool_connections_total(ready_tx.len());
+    metrics::set_dsql_reservoir_ready_connections(ready_tx.len());
+    metrics::record_dsql_reservoir_refill_duration(OutcomeLabel::Success, refill_started.elapsed());
+}
+
+/// A slot reserved for a connection that does not exist yet.
+///
+/// Dropping the charge releases the slot, so a refill that fails, times out,
+/// or is cancelled at shutdown gives its slot back exactly once (Req 4.4, 4.8).
+/// A connection placed in the ready queue takes the slot over.
+#[derive(Debug)]
+struct SlotCharge {
+    slot_manager: Option<Arc<SlotBlockManager>>,
+}
+
+impl SlotCharge {
+    fn new(slot_manager: Arc<SlotBlockManager>) -> Self {
+        Self {
+            slot_manager: Some(slot_manager),
+        }
+    }
+
+    fn transfer_to_connection(mut self) {
+        self.slot_manager.take();
+    }
+}
+
+impl Drop for SlotCharge {
+    fn drop(&mut self) {
+        if let Some(slot_manager) = self.slot_manager.take() {
+            slot_manager.release_slot();
+        }
+    }
+}
+
+/// The delay before a refill attempt after `failures` failures in a row:
+/// [`REFILLER_ERROR_BACKOFF`] doubled per failure, capped at
+/// [`REFILLER_MAX_BACKOFF`], with equal jitter (half fixed, half random) so
+/// nodes refused together do not retry together.
+pub(crate) fn refill_backoff(failures: u32) -> StdDuration {
+    let doublings = failures.saturating_sub(1).min(16);
+    let ceiling = REFILLER_ERROR_BACKOFF
+        .saturating_mul(1 << doublings)
+        .min(REFILLER_MAX_BACKOFF);
+    let half = ceiling / 2;
+    let jitter_millis = u64::try_from(half.as_millis()).unwrap_or(u64::MAX);
+    half + StdDuration::from_millis(rand::thread_rng().gen_range(0..=jitter_millis))
 }
 
 fn spawn_scanner(
@@ -406,7 +558,9 @@ fn spawn_scanner(
                 match ready_rx.try_recv() {
                     Ok(entry) => {
                         scanned += 1;
-                        if entry.should_retire(guard_window) {
+                        if entry.broken.is_set() {
+                            record_retirement(&slot_manager, "broken", entry.created_at.elapsed());
+                        } else if entry.should_retire(guard_window) {
                             record_retirement(
                                 &slot_manager,
                                 "guard_window",
@@ -440,35 +594,81 @@ fn spawn_return_processor(
     tokio::spawn(async move {
         let guard_window = duration_or_default(config.guard_window, GUARD_WINDOW);
         while let Some(returned) = return_rx.recv().await {
+            let ReturnedConnection {
+                entry,
+                marked_bad,
+                class_permit,
+            } = returned;
             let validate_started = Instant::now();
-            let entry = returned.entry;
-            if returned.marked_bad {
-                metrics::record_dsql_reservoir_connection_validate_duration(
-                    validate_started.elapsed(),
-                );
-                record_retirement(&slot_manager, "bad_flag", entry.created_at.elapsed());
-                continue;
-            }
-            if entry.should_retire(guard_window) {
-                metrics::record_dsql_reservoir_connection_validate_duration(
-                    validate_started.elapsed(),
-                );
-                record_retirement(&slot_manager, "guard_window", entry.created_at.elapsed());
-                continue;
-            }
+            let retirement = return_retirement_reason(
+                marked_bad,
+                entry.broken.is_set(),
+                entry.should_retire(guard_window),
+            );
             metrics::record_dsql_reservoir_connection_validate_duration(validate_started.elapsed());
+            if let Some(reason) = retirement {
+                record_retirement(&slot_manager, reason, entry.created_at.elapsed());
+                continue;
+            }
             metrics::record_dsql_pool_connection_returned();
-            if ready_tx.send(entry).await.is_err() {
-                // The return processor is the last owner when the ready channel
-                // is closed. Retire the connection instead of leaking capacity.
-                slot_manager.release_slot();
-                metrics::record_dsql_pool_connection_retired("return_channel_closed");
-                return;
+            match ready_tx.try_send(entry) {
+                Ok(()) => {}
+                // Unreachable while the class budgets sum to at most the
+                // target (see `ready_capacity`). If a reconfigured budget ever
+                // admits more, the connection retires (Req 6.7) rather than
+                // the processor waiting for room: a wait would hold up every
+                // return queued behind it, each holding its caller's class
+                // permit.
+                Err(TrySendError::Full(entry)) => {
+                    record_retirement(
+                        &slot_manager,
+                        "ready_channel_full",
+                        entry.created_at.elapsed(),
+                    );
+                }
+                Err(TrySendError::Closed(_entry)) => {
+                    // The return processor is the last owner when the ready
+                    // channel is closed. Retire the connection instead of
+                    // leaking capacity.
+                    slot_manager.release_slot();
+                    metrics::record_dsql_pool_connection_retired("return_channel_closed");
+                    return;
+                }
             }
             metrics::record_dsql_pool_connections_total(ready_tx.len());
             metrics::set_dsql_reservoir_ready_connections(ready_tx.len());
+            // Only now may the next caller of this class take the permit: the
+            // connection it will check out is already in the ready queue.
+            drop(class_permit);
         }
     })
+}
+
+/// Why a returned connection retires instead of going back to the ready
+/// queue, if it does. Validation reads only flags and the lifetime, never the
+/// network (Req 6.3).
+fn return_retirement_reason(
+    marked_bad: bool,
+    broken: bool,
+    inside_guard_window: bool,
+) -> Option<&'static str> {
+    if marked_bad {
+        Some("bad_flag")
+    } else if broken {
+        Some("broken")
+    } else if inside_guard_window {
+        Some("guard_window")
+    } else {
+        None
+    }
+}
+
+/// The ready queue's capacity for a reservoir of `target_ready`: every
+/// connection the node can hold. Ready connections plus creations stay below
+/// the target when a creation starts, and the class budgets, which sum to the
+/// target, cap the connections checked out, so returns can always be queued.
+pub(crate) fn ready_capacity(target_ready: usize) -> usize {
+    target_ready.saturating_mul(2)
 }
 
 fn record_retirement(slot_manager: &SlotBlockManager, reason: &'static str, age: StdDuration) {
@@ -504,6 +704,9 @@ pub(crate) fn scan_budget(target_ready: usize) -> usize {
 fn duration_or_default(value: time::Duration, fallback: StdDuration) -> StdDuration {
     value.try_into().unwrap_or(fallback)
 }
+
+#[cfg(test)]
+mod scenario_tests;
 
 #[cfg(test)]
 mod tests {
@@ -559,6 +762,33 @@ mod tests {
             prop_assert!(budget <= target_ready.max(2) / 2);
             prop_assert!(budget >= 1);
         }
+    }
+
+    #[test]
+    fn refill_backoff_doubles_from_the_initial_delay_up_to_the_cap() {
+        for failures in 1..=64 {
+            let ceiling = REFILLER_ERROR_BACKOFF
+                .saturating_mul(1 << (failures - 1).min(16))
+                .min(REFILLER_MAX_BACKOFF);
+            for _ in 0..32 {
+                let delay = refill_backoff(failures);
+                assert!(delay >= ceiling / 2, "{failures}: {delay:?}");
+                assert!(delay <= ceiling, "{failures}: {delay:?}");
+            }
+        }
+        assert!(refill_backoff(1) <= REFILLER_ERROR_BACKOFF);
+        assert!(refill_backoff(u32::MAX) >= REFILLER_MAX_BACKOFF / 2);
+    }
+
+    #[test]
+    fn returns_retire_on_the_bad_flag_a_break_or_the_guard_window() {
+        assert_eq!(return_retirement_reason(false, false, false), None);
+        assert_eq!(return_retirement_reason(true, true, true), Some("bad_flag"));
+        assert_eq!(return_retirement_reason(false, true, true), Some("broken"));
+        assert_eq!(
+            return_retirement_reason(false, false, true),
+            Some("guard_window")
+        );
     }
 
     #[test]

@@ -29,6 +29,7 @@ use crate::metrics;
 use super::{
     PhysicalConnectionFactory, ReservoirConfig,
     connection_coordinator::EmbeddedConnectionCoordinator,
+    connection_factory::create_within_timeout, operation::BrokenFlag,
 };
 
 /// Base age before a connection becomes eligible for retirement.
@@ -67,6 +68,8 @@ pub(crate) struct ReservoirEntry {
     pub(crate) created_at: Instant,
     /// Per-connection lifetime after jitter was assigned at creation.
     pub(crate) max_lifetime: StdDuration,
+    /// Set by a failed operation that left this connection unusable.
+    pub(crate) broken: BrokenFlag,
 }
 
 impl ReservoirEntry {
@@ -225,13 +228,24 @@ impl EmbeddedReservoir {
 
     /// Wait for a warm connection, returning promptly when shutdown closes admission.
     pub(crate) async fn checkout_wait(&self) -> Result<ReservoirEntry, ReservoirError> {
-        match self.ready.recv().await {
-            Ok(entry) => {
-                metrics::record_dsql_pool_connections_total(self.ready.len());
-                metrics::set_dsql_reservoir_ready_connections(self.ready.len());
-                Ok(entry)
+        loop {
+            match self.ready.recv().await {
+                // An operation that failed on this connection flagged it after
+                // returning it; it never reaches another caller.
+                Ok(entry) if entry.broken.is_set() => {
+                    record_retirement(
+                        self.coordinator.as_ref(),
+                        "broken",
+                        entry.created_at.elapsed(),
+                    );
+                }
+                Ok(entry) => {
+                    metrics::record_dsql_pool_connections_total(self.ready.len());
+                    metrics::set_dsql_reservoir_ready_connections(self.ready.len());
+                    return Ok(entry);
+                }
+                Err(_) => return Err(ReservoirError::Closed),
             }
-            Err(_) => Err(ReservoirError::Closed),
         }
     }
 
@@ -398,7 +412,7 @@ fn spawn_refillers(
                 continue;
             }
             let create_started = Instant::now();
-            match factory.create_connection().await {
+            match create_within_timeout(factory.as_ref()).await {
                 Ok(connection) => {
                     metrics::record_dsql_reservoir_connection_create_duration(
                         create_started.elapsed(),
@@ -408,6 +422,7 @@ fn spawn_refillers(
                         connection,
                         created_at: Instant::now(),
                         max_lifetime: assign_lifetime(&config),
+                        broken: BrokenFlag::default(),
                     };
                     if ready_tx.send(entry).await.is_err() {
                         // Channel closure means shutdown won the race after the
@@ -468,7 +483,13 @@ fn spawn_scanner(
                 match ready_rx.try_recv() {
                     Ok(entry) => {
                         scanned += 1;
-                        if entry.should_retire(guard_window) {
+                        if entry.broken.is_set() {
+                            record_retirement(
+                                coordinator.as_ref(),
+                                "broken",
+                                entry.created_at.elapsed(),
+                            );
+                        } else if entry.should_retire(guard_window) {
                             record_retirement(
                                 coordinator.as_ref(),
                                 "guard_window",
@@ -504,9 +525,11 @@ fn spawn_return_processor(
         while let Some(returned) = return_rx.recv().await {
             let validate_started = Instant::now();
             let entry = returned.entry;
-            if let Some(reason) =
-                return_retirement_reason(returned.marked_bad, entry.should_retire(guard_window))
-            {
+            if let Some(reason) = return_retirement_reason(
+                returned.marked_bad,
+                entry.broken.is_set(),
+                entry.should_retire(guard_window),
+            ) {
                 metrics::record_dsql_reservoir_connection_validate_duration(
                     validate_started.elapsed(),
                 );
@@ -528,9 +551,15 @@ fn spawn_return_processor(
     })
 }
 
-fn return_retirement_reason(marked_bad: bool, inside_guard_window: bool) -> Option<&'static str> {
+fn return_retirement_reason(
+    marked_bad: bool,
+    broken: bool,
+    inside_guard_window: bool,
+) -> Option<&'static str> {
     if marked_bad {
         Some("bad_flag")
+    } else if broken {
+        Some("broken")
     } else if inside_guard_window {
         Some("guard_window")
     } else {
@@ -736,10 +765,17 @@ mod tests {
 
     #[test]
     fn bad_returns_are_unconditionally_retired() {
-        assert_eq!(return_retirement_reason(true, false), Some("bad_flag"));
-        assert_eq!(return_retirement_reason(true, true), Some("bad_flag"));
-        assert_eq!(return_retirement_reason(false, true), Some("guard_window"));
-        assert_eq!(return_retirement_reason(false, false), None);
+        assert_eq!(
+            return_retirement_reason(true, false, false),
+            Some("bad_flag")
+        );
+        assert_eq!(return_retirement_reason(true, true, true), Some("bad_flag"));
+        assert_eq!(return_retirement_reason(false, true, true), Some("broken"));
+        assert_eq!(
+            return_retirement_reason(false, false, true),
+            Some("guard_window")
+        );
+        assert_eq!(return_retirement_reason(false, false, false), None);
     }
 
     #[tokio::test]

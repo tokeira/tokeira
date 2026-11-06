@@ -569,6 +569,7 @@ fn expected_code(err: &EdgeError) -> Code {
         EdgeError::ResourceExhausted(_) => Code::ResourceExhausted,
         EdgeError::ConcurrentLimitExceeded(_) => Code::ResourceExhausted,
         EdgeError::WorkflowClosing => Code::ResourceExhausted,
+        EdgeError::PersistenceLimitExceeded => Code::ResourceExhausted,
         EdgeError::ConsistentQueryBufferExceeded => Code::ResourceExhausted,
         EdgeError::WorkflowNotReady(_) => Code::FailedPrecondition,
         EdgeError::QueryFailed { .. } => Code::InvalidArgument,

@@ -1,0 +1,5 @@
+kind: changed
+body: DSQL refills now open up to eight connections at once, give up on a connection attempt after 30 seconds, and back off exponentially while connects fail.
+time: 2026-11-06T11:27:25.000000+00:00
+custom:
+    Slice: a8075718-d457-4e3d-8995-2be7c31fd238

@@ -1,0 +1,5 @@
+kind: changed
+body: DSQL connections now share AWS credentials until shortly before they expire, instead of fetching credentials for each connection.
+time: 2026-11-06T11:27:25.000000+00:00
+custom:
+    Slice: 96f69cc7-1720-42ce-be18-1226895e99c0

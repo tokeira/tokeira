@@ -13,8 +13,8 @@
 //! transaction that inserts the action, and a request never changes after it, so
 //! every read of an action, each in a transaction, joins the parts it reads there.
 
+use crate::dsql::in_operation;
 use std::sync::Arc;
-use tokeira_observability::statement_accounting::in_operation;
 
 use anyhow::{Result, ensure};
 use async_trait::async_trait;

@@ -123,7 +123,7 @@ code comments (AGENTS §8, §9). Verify with `cargo clippy -p tokeira-kernel -p 
   - Integrate the parked normal-poll heartbeat race and lost-response recovery
     fixtures from the completion spec. Run focused kernel/runtime/edge/storage
     tests and root §10.4 with the combined change.
-  - [ ] Orchestrator runs the entire `TestWorkflowTaskTestSuite`, including both
+  - [x] Orchestrator runs the entire `TestWorkflowTaskTestSuite`, including both
     heartbeat tests, with the override; remove the historical fork skip only as
     part of that verification, never edit corpus bodies or claim a skipped pass.
   - _Requirements: C.1.1–C.1.12; Properties C1, C2_

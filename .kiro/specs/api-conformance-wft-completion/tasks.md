@@ -60,7 +60,7 @@ Complete `RespondWorkflowTaskCompleted` field handling and return-new-workflow-t
   - Run `cargo test -p tokeira-runtime`.
   - Run `cargo test -p tokeira-kernel`.
 
-- [ ] 6. Start completion-returned tasks atomically
+- [x] 6. Start completion-returned tasks atomically
   - [x] 6.1 Before production edits, park worker B on the normal queue while worker A
     completes with return-new enabled. Synchronize the old publisher/claim gap and
     assert only A receives the new task, including a force-new local-activity
@@ -85,7 +85,7 @@ Complete `RespondWorkflowTaskCompleted` field handling and return-new-workflow-t
     `// Feature: api-conformance-wft-completion, Property 3`.
     Assert one start per logical incarnation and zero rows/offers for inline work
     across memory/DSQL derivation; use committed-state and publication-call oracles.
-  - [ ] 6.6 Integrate transient-wft task C.2's heartbeat-limit reproduction/controls;
+  - [x] 6.6 Integrate transient-wft task C.2's heartbeat-limit reproduction/controls;
     orchestrator runs `TestWorkflowTaskTestSuite` including both heartbeat tests,
     `TestEagerWorkflowTestSuite` and `TestStickyTqTestSuite`. Run root §10.4 for the
     combined change. The timeout successor follows Requirement 3 but is not returned;

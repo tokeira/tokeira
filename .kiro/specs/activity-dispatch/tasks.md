@@ -287,7 +287,7 @@ may retire a recovery mechanism before its replacement is verified.
     No migration.
   - _Requirements: 2.1, 2.10_
 
-- [ ] 15. Replace post-commit eager claims with completion-inline starts
+- [x] 15. Replace post-commit eager claims with completion-inline starts
   - Depends on task 14 and the completion/heartbeat amendments in
     [api-conformance-wft-completion](../api-conformance-wft-completion/tasks.md),
     [edge-eager-dispatch](../edge-eager-dispatch/tasks.md) and
@@ -321,7 +321,7 @@ may retire a recovery mechanism before its replacement is verified.
     commit/repair fixtures, including OCC failure and staged-publication refusal.
     Count committed starts, not only materialized Started events (retry-policy
     starts can be transient). Verify no publisher call for inline incarnations.
-  - [ ] 15.6 Integrate the waiting normal-queue WFT/heartbeat reproducer, heartbeat
+  - [x] 15.6 Integrate the waiting normal-queue WFT/heartbeat reproducer, heartbeat
     limit reproducer and their negative controls from the sibling tasks. Have the
     orchestrator run `TestWorkflowTaskTestSuite` (both heartbeat tests),
     `TestEagerWorkflowTestSuite`, `TestStickyTqTestSuite`, and the corpus eager
@@ -333,6 +333,9 @@ may retire a recovery mechanism before its replacement is verified.
     before changing evidence/skip claims. Run the full root §10.4 bar and the
     configuration-ledger/render checks. The edge now depends directly on the
     `semver` crate already in the lockfile for v1.31.0's TypeScript version test.
+    Result: `TestDispatchActivityEager` passes with eager execution on.
+    `TestEagerActivity` stays in the skip registry: its setup calls the internal
+    matching service, outside the public surface.
   - _Requirements: 4.4, 6.2, 6.5, 6.6, 8.3–8.7, 9.1–9.13_
 
 ## Task Dependency Graph

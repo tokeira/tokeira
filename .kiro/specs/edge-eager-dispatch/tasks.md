@@ -210,7 +210,7 @@ Tasks 1-5 record the original eager workflow/activity implementation. Tier 3.18 
     incremental WFT history, query barriers, update attachments and scoped provenance.
   - _Requirements: 6.1–6.6, 7.3–7.4, 8.1–8.2, 10.1–10.5, 11.1–11.3, 12.1–12.4_
 
-- [ ] 13. Verify the corrected completion paths
+- [x] 13. Verify the corrected completion paths
   - Required PBTs: revised Properties 8, 9, 10, 11 and 12, at least 100 cases per
     property with the existing feature tags. Keep broker-primitive coverage distinct
     from completion correctness. Run activity-dispatch task 15's eligibility, lost

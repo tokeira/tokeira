@@ -1217,9 +1217,17 @@ where
                                 paused: false,
                             }),
                         );
-                        // The owner's eligibility index evaluates delayed rules and
-                        // offers locally at the deadline; discovery is the backstop.
-                        if *dispatch_at <= self.clock.now()
+                        // Use one cutoff for both paths: due work is published
+                        // here, while deferred work is offered by eligibility.
+                        // Tracking is installed before either can expose a token.
+                        let recorded_at = self.clock.now();
+                        self.activity_tracking.eligibility.record(
+                            task.clone(),
+                            execution_home,
+                            *dispatch_at,
+                            recorded_at,
+                        );
+                        if *dispatch_at <= recorded_at
                             && let Err(error) = async {
                                 #[cfg(test)]
                                 self.fail_publication(tokeira_types::TaskKind::Activity)?;

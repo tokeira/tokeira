@@ -227,13 +227,27 @@ The companion inline workflow-task contract is in
 
 Retry eligibility shares the activity timeout scanner's earliest-deadline wake,
 including earlier-insert notifications and immediate continuation of unattempted
-capped work, so backoff expiry is evaluated at its due time. Eligible attempts
-are then routed from the already loaded run and deployment registry and offered
-through `publish_activity_task`, after checking dispatch time against the deps'
-clock. A local waiting poll receives that offer without waiting for discovery;
-a remote queue home still finds it on its next discovery pass, as for a first
-attempt. Discovery remains the backstop and broker duplicate suppression handles
-racing offers (`service/history/workflow/task_generator.go:567-577 @ v1.31.0`).
+capped work, so backoff expiry is evaluated at its due time. Each eligibility entry
+retains whether its dispatch time was strictly after registration time. Only those
+deferred entries offer locally after passing owner rules and the deps' clock check.
+The publisher uses the same registration time to offer already-due work, including
+first attempts. Unrelated refreshes preserve the decision for the same incarnation
+and due time; an already-due entry still evaluates rules but leaves delivery to the
+publisher or discovery. This separates schedule-time transfer from retry-time
+delivery (`service/history/workflow/task_generator.go:550-577 @ v1.31.0`).
+
+Timeout tracking is installed before eligibility registration. Retry and option
+updates reset the attempt's anchors before exposing its eligibility wake, so a local
+poll's committed start cannot be erased by a later reset. Publication registers
+each attempt only after tracking it; the lane registers any remaining obligations
+after publication, installing missing tracking even if publication failed. Recovery
+and publication rebuilds likewise restore timeout tracking first.
+
+Eligible deferred attempts are routed from the already loaded run and deployment
+registry through `publish_activity_task`. A local waiting poll receives that offer
+without waiting for discovery; a remote queue home still finds it on its next
+discovery pass, as for a first attempt. Discovery remains the backstop and broker
+duplicate suppression handles racing offers.
 
 Split `prepare_activity_dispatch_publish` into read-only candidate inspection and
 execution-owner rule application. Discovery does not suppress an otherwise valid

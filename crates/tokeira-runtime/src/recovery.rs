@@ -130,6 +130,7 @@ where
         nexus_timeout_tracking,
         completion_callback_tracking,
         &repair,
+        retry_deps.clock.as_ref(),
     )
     .await?;
     assert!(owner.write().unwrap().activate_acquisition(&acquisition));
@@ -257,6 +258,7 @@ pub(crate) async fn sweep_shard_inner<R>(
     nexus_timeout_tracking: &NexusTimeoutTrackingState,
     completion_callback_tracking: &CompletionCallbackTrackingState,
     repair: &RepairAcquisition,
+    clock: &dyn tokeira_clock::Clock,
 ) -> Result<SweepResult>
 where
     R: RunRepository + ?Sized,
@@ -277,7 +279,6 @@ where
         repair.validate()?;
         for state in &page.states {
             repair.repair(repo, state.run_key).await?;
-            activity_tracking.eligibility.refresh(state, shard_id);
             let entries = recovery_entries(state);
             if let Some(task) = entries.dispatchable_workflow_task {
                 // Recovery republishes the same derived envelope as the hot
@@ -362,6 +363,7 @@ where
                 });
                 result.activity_tracking_entries_reconstructed += 1;
             }
+            activity_tracking.refresh_eligibility(state, shard_id, clock.now());
             for entry in entries.nexus_timeouts {
                 nexus_timeout_tracking.insert(NexusTimeoutEntry {
                     timeouts: state

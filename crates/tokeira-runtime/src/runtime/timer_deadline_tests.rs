@@ -6,7 +6,7 @@ use super::*;
 use crate::test_clock::TestClock;
 use tokeira_storage::InMemoryStore;
 
-async fn fixture() -> (Arc<InMemoryStore>, TokeiraRuntime<InMemoryStore>) {
+pub(super) async fn fixture() -> (Arc<InMemoryStore>, TokeiraRuntime<InMemoryStore>) {
     let clock: Arc<dyn Clock> = Arc::new(TestClock::new());
     let store = Arc::new(InMemoryStore::default().with_clock(clock.clone()));
     let runtime = fixture_on(store.clone(), clock).await;
@@ -39,7 +39,10 @@ async fn fixture_on<R: RunRepository + 'static>(
     runtime
 }
 
-fn start<R: RunRepository + 'static>(runtime: &TokeiraRuntime<R>, delayed: bool) -> StartRequest {
+pub(super) fn start<R: RunRepository + 'static>(
+    runtime: &TokeiraRuntime<R>,
+    delayed: bool,
+) -> StartRequest {
     let mut request = tests::sample_start_request(None, None);
     request.run_key = RunKey::derive(request.namespace_id, &request.workflow_id, request.run_id);
     request.now = runtime.clock.now();

@@ -15,7 +15,9 @@
 //! `ShardId` so a handoff evicts exactly the activities this node no longer owns.
 //!
 //! Cached timeouts select deadline wakes; each selected entry is still reloaded
-//! before a decision. A periodic full pass reconciles stale caches. Retry
+//! before a decision. A periodic full pass reconciles stale caches, including
+//! starts missed before schedule tracking; it restores the durable start and
+//! heartbeat without replacing a newer tracked start or heartbeat. Retry
 //! eligibility shares the wake, and bounded passes retain unattempted due work.
 
 use tokeira_kernel::deadline_after;
@@ -134,6 +136,21 @@ pub struct ActivityTrackingEntry {
     pub cancel_requested: bool,
 }
 
+impl ActivityTrackingEntry {
+    fn refresh_from_activity(&mut self, activity: &ActivityState) {
+        self.timeouts = Some(ActivityTimeouts::from(activity));
+        // An offer can reach a worker before the owner records its schedule.
+        // Repair that missed start from authority, preserving any newer volatile
+        // heartbeat. Never replace an already recorded start with a stale read.
+        // Durable anchors drive Temporal timers too (service/history/workflow/
+        // timer_sequence.go:298-355 @ v1.31.0).
+        if self.started_at.is_none() && activity.started_at.is_some() {
+            self.started_at = activity.started_at;
+            self.last_heartbeat_at = self.last_heartbeat_at.max(activity.last_heartbeat_at);
+        }
+    }
+}
+
 /// Shared in-memory tracking state for open activities.
 ///
 /// Cloning shares the underlying map; lanes, the scanner, and shard recovery all
@@ -240,6 +257,45 @@ impl ActivityTrackingState {
                 entry.last_heartbeat_at = None;
                 entry
             });
+    }
+
+    /// Install missing timeout tracking before making an eligibility obligation
+    /// visible. Existing anchors belong to their scoped start/retry callbacks.
+    pub(crate) fn refresh_eligibility(
+        &self,
+        state: &tokeira_kernel::WorkflowState,
+        home: ShardId,
+        recorded_at: OffsetDateTime,
+    ) {
+        if state.status == tokeira_types::ExecutionStatus::Running {
+            for activity in state.activities.values().filter(|activity| {
+                activity.started_at.is_none()
+                    && activity.started_event_id.is_none()
+                    && activity.pause_info.is_none()
+                    && activity.current_attempt_scheduled_at.is_some()
+            }) {
+                self.inner.upsert_if(
+                    (state.run_key, activity.activity_id.clone()),
+                    home,
+                    |previous| {
+                        previous.is_none().then(|| ActivityTrackingEntry {
+                            timeouts: Some(ActivityTimeouts::from(activity)),
+                            run_key: state.run_key,
+                            shard_id: home,
+                            activity_id: activity.activity_id.clone(),
+                            original_scheduled_at: activity.scheduled_at,
+                            last_dispatched_at: activity
+                                .current_attempt_scheduled_at
+                                .unwrap_or(activity.scheduled_at),
+                            started_at: None,
+                            last_heartbeat_at: activity.last_heartbeat_at,
+                            cancel_requested: activity.cancel_requested,
+                        })
+                    },
+                );
+            }
+        }
+        self.eligibility.refresh(state, home, recorded_at);
     }
 
     /// Refresh cached options without rearming unchanged, already attempted work.
@@ -529,7 +585,7 @@ pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
         if !tracking.inner.active(&tracked) {
             continue;
         }
-        let entry = tracked.value.clone();
+        let mut entry = tracked.value.clone();
         if submitted >= config.max_timeouts_per_scan {
             break;
         }
@@ -582,12 +638,15 @@ pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
             continue;
         };
 
+        // Full passes also reload entries whose missing start left them without
+        // a heartbeat/start-to-close deadline. Repair before evaluating this pass.
+        entry.refresh_from_activity(&activity);
         tracking.inner.refresh_scanned(
             &(entry.run_key, entry.activity_id.clone()),
             &tracked,
             now,
             |entry| {
-                entry.timeouts = Some(ActivityTimeouts::from(&activity));
+                entry.refresh_from_activity(&activity);
             },
         );
 

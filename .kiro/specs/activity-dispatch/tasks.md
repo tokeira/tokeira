@@ -464,3 +464,14 @@ active for the live campaign. No implementation commit or PR exists yet.
     run the real timer/eligibility loops with a retry preceding a user timer.
   - Dependency: task 16.
   - _Requirements: 6.10._
+
+- [x] 18. Order attempt tracking before deferred eligibility offers
+  - Retain the future-at-registration decision per incarnation and due time;
+    publish already-due attempts only through commit publication or discovery.
+  - Install timeout tracking before eligibility in publication, retry, option
+    updates, lane commits and acquisition/publication rebuilds.
+  - Reproduce first-attempt republication after an injected publication loss and
+    a short retry whose local start races its tracking reset. Verify heartbeat
+    expiry at its deadline and discovery repair with the activity scanner running.
+  - Dependency: task 17; runtime-activity-timeouts task 10 backs up early discovery.
+  - _Requirements: 6.10._

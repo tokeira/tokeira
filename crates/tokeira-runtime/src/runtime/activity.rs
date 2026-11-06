@@ -2187,7 +2187,6 @@ where
         {
             CommitResult::Applied { new_state } => {
                 let tracking = deps.tracking.for_acquisition(acquisition);
-                tracking.eligibility.refresh(&new_state, bundle);
                 if paused {
                     tracking.remove(run_key, activity_id);
                     return Ok(());
@@ -2201,6 +2200,11 @@ where
                         .get(activity_id)
                         .map(crate::activity_timeout::ActivityTimeouts::from),
                 );
+                // Eligibility can wake a local poll immediately. Reset this
+                // attempt's anchors first, so its start cannot be cleared later.
+                tracking.refresh_eligibility(&new_state, bundle, deps.clock.now());
+                #[cfg(test)]
+                tracking.eligibility.pause_after_refresh().await;
                 // The committed canonical row is discoverable independently of
                 // this callback; eligibility tracking applies later owner rules.
                 return Ok(());
@@ -2253,7 +2257,7 @@ pub(crate) fn activity_dispatch_task(
     }
 }
 
-/// Execution-owner eligibility outcome; eligible due attempts are offered locally.
+/// Execution-owner eligibility outcome; only deferred attempts are offered locally.
 #[derive(Debug)]
 pub(crate) enum ActivityDispatchPreparation {
     /// The due attempt passed owner rule evaluation.
@@ -2301,7 +2305,7 @@ pub(crate) fn activity_backoff_interval_seconds(
     Ok(Some((scheduled_at - completed_at).whole_seconds()))
 }
 
-/// Evaluate the captured execution-owner timer and offer eligible work locally.
+/// Evaluate the captured execution-owner timer and offer deferred work locally.
 /// A pause uses the captured fence and publishes nothing. Queue homes on another
 /// node still discover the durable attempt on their next pass, as for first starts.
 pub(crate) async fn evaluate_activity_eligibility<R: RunRepository + 'static>(
@@ -2392,6 +2396,9 @@ async fn prepare_activity_dispatch<R: RunRepository + 'static>(
         else {
             if dispatch_at > deps.clock.now() {
                 return Ok(Preparation::NotYetDispatchable);
+            }
+            if !deps.tracking.eligibility.offers_locally(task) {
+                return Ok(Preparation::Eligible);
             }
             let registry = deps
                 .worker_deployment_registry
@@ -3551,7 +3558,7 @@ mod tests {
                 if !matches_rule {
                     assert_eq!(after, retried);
                     repo.create_workflow_rule(state.namespace_id, pause_rule("after-evaluation", "Attempts >= 2"), 10).await.unwrap();
-                    deps.tracking.eligibility.refresh(&after, ShardId(0));
+                    deps.tracking.refresh_eligibility(&after, ShardId(0), deps.clock.now());
                     crate::activity_eligibility::scan_activity_eligibility_once(&deps, ShardId(0), due).await;
                     assert_eq!(repo.load_run(token.run_key).await.unwrap(), LoadedRun::Existing(after));
                     runtime.recover_self_assigned_shard(ShardId(0), ShardEpoch::ZERO).await.unwrap();
@@ -3593,7 +3600,7 @@ mod tests {
                 repo.commit_transition(state.run_key, Transition { expected_seq, next_state: state.clone(), history_events: SmallVec::new(),
                     event_principals: SmallVec::new(), request_dedupe_ops: SmallVec::new(), activity_ops: SmallVec::new(), timer_ops: SmallVec::new(),
                     dispatch_ops: SmallVec::new(), events_numbered_at_close: 0, workflow_task_heartbeat_timed_out: false, growth_limits: None }, WriteFence::Unfenced).await.unwrap();
-                runtime.activity_tracking.eligibility.refresh(&state, ShardId(0));
+                runtime.activity_tracking.refresh_eligibility(&state, ShardId(0), runtime.clock.now());
                 repo.create_workflow_rule(state.namespace_id, pause_rule("bounded", "Attempts >= 2"), 10).await.unwrap();
                 let deps = runtime.activity_retry_deps();
                 crate::activity_eligibility::scan_activity_eligibility_once(&deps, ShardId(0), due).await;

@@ -195,3 +195,13 @@ All code lives in `tokeira-runtime`, in a new `activity_timeout.rs` module (foll
     Cover each due-time rule, overflow, notifications, counted cache refreshes,
     ordering/caps, failures and Property 17 with at least 100 generated cases.
   - _Requirements: 7.1, 7.3, 7.6–7.8._
+
+- [x] 10. Repair starts missed before owner tracking
+  - On authoritative reload, fill a missing cached start and durable heartbeat
+    under the configuration refresh's revision guard; preserve newer volatile
+    heartbeats and already recorded starts.
+  - Reproduce both an absent entry at start and a late schedule record overwriting
+    a recorded start. Require the durable heartbeat to extend the deadline and a
+    full pass to fire the expired heartbeat within one reconciliation interval.
+  - Dependency: task 9.
+  - _Requirements: 3.1, 7.3._

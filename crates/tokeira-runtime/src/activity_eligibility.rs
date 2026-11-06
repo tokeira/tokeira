@@ -1,7 +1,8 @@
 //! Execution-owner retry/rule timers reconstructed from authoritative activities.
 //!
 //! This index never scans dispatch rows. Its evaluator offers eligible attempts
-//! locally and consumes only its captured revision. A small completed descriptor
+//! locally only when their dispatch was deferred at registration, and consumes
+//! only its captured revision. A small completed descriptor
 //! remains until the incarnation changes, preventing unrelated transitions from
 //! rearming an already evaluated timer; acquisition rebuilds every obligation.
 
@@ -32,12 +33,24 @@ struct Eligibility {
     home: ShardId,
     due: OffsetDateTime,
     evaluated: bool,
+    // Retain the registration decision across unrelated commits and later scans.
+    // Already-due attempts belong to commit publication (or discovery repair).
+    offer_locally: bool,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ActivityEligibility {
     entries: AcquisitionEntries<(RunKey, String), Eligibility>,
     cursors: Arc<Mutex<HashMap<(ShardId, u64), Position>>>,
+    #[cfg(test)]
+    refresh_pause: Arc<Mutex<Option<RefreshPause>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct RefreshPause {
+    installed: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl Default for ActivityEligibility {
@@ -53,8 +66,35 @@ impl ActivityEligibility {
                 (!entry.evaluated).then_some(entry.due)
             }),
             cursors: Arc::default(),
+            #[cfg(test)]
+            refresh_pause: Arc::default(),
         }
     }
+    #[cfg(test)]
+    pub(crate) fn pause_next_refresh(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (installed, entered) = tokio::sync::oneshot::channel();
+        let (resume, released) = tokio::sync::oneshot::channel();
+        *self.refresh_pause.lock().unwrap() = Some(RefreshPause {
+            installed,
+            resume: released,
+        });
+        (entered, resume)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_after_refresh(&self) {
+        let pause = self.refresh_pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            let _ = pause.installed.send(());
+            let _ = pause.resume.await;
+        }
+    }
+
     pub(crate) fn begin_full_pass(&self) {
         self.entries.begin_full_pass(false);
     }
@@ -84,7 +124,12 @@ impl ActivityEligibility {
         }
     }
 
-    pub(crate) fn refresh(&self, state: &WorkflowState, home: ShardId) {
+    pub(crate) fn refresh(
+        &self,
+        state: &WorkflowState,
+        home: ShardId,
+        recorded_at: OffsetDateTime,
+    ) {
         self.entries.retain(|(run, id), _| {
             *run != state.run_key
                 || (state.status == ExecutionStatus::Running
@@ -110,6 +155,7 @@ impl ActivityEligibility {
                     activity_dispatch_task(state.run_key, state, activity),
                     home,
                     due,
+                    recorded_at,
                 );
             }
         }
@@ -120,6 +166,7 @@ impl ActivityEligibility {
         task: DispatchableActivityTask,
         home: ShardId,
         due: OffsetDateTime,
+        recorded_at: OffsetDateTime,
     ) {
         self.entries
             .upsert_if((task.run_key, task.activity_id.clone()), home, |previous| {
@@ -142,9 +189,18 @@ impl ActivityEligibility {
                         home,
                         due,
                         evaluated: false,
+                        offer_locally: due > recorded_at,
                     })
                 }
             });
+    }
+
+    pub(crate) fn offers_locally(&self, task: &DispatchableActivityTask) -> bool {
+        self.entries
+            .get(&(task.run_key, task.activity_id.clone()))
+            .is_some_and(|entry| {
+                incarnation(&entry.task) == incarnation(task) && entry.offer_locally
+            })
     }
 
     pub(crate) fn remove(&self, run: RunKey, activity: &str) {
@@ -287,9 +343,12 @@ mod tests {
                 ..Default::default()
             }),
         );
-        tracking
-            .eligibility
-            .record(task(0, 2), ShardId(0), now + time::Duration::seconds(2));
+        tracking.eligibility.record(
+            task(0, 2),
+            ShardId(0),
+            now + time::Duration::seconds(2),
+            now,
+        );
         let notified = tracking.wake.notify.notified();
         tokio::pin!(notified);
         assert!(
@@ -302,9 +361,12 @@ mod tests {
             tracking.scan_delay(now, maximum),
             std::time::Duration::from_secs(2)
         );
-        tracking
-            .eligibility
-            .record(task(1, 2), ShardId(0), now + time::Duration::seconds(20));
+        tracking.eligibility.record(
+            task(1, 2),
+            ShardId(0),
+            now + time::Duration::seconds(20),
+            now,
+        );
         let notified = tracking.wake.notify.notified();
         tokio::pin!(notified);
         assert!(
@@ -333,15 +395,15 @@ mod tests {
             let tracking = ActivityEligibility::default();
             tracking.set_owner(owner.clone());
             let old = tracking.for_acquisition(first);
-            old.record(task(stamp, attempt), ShardId(0), OffsetDateTime::UNIX_EPOCH);
+            old.record(task(stamp, attempt), ShardId(0), OffsetDateTime::UNIX_EPOCH, OffsetDateTime::UNIX_EPOCH);
             let submitted = tracking.entries.snapshot(None).pop().unwrap();
             if takeover {
                 owner.write().unwrap().record_acquired(ShardId(0), ShardEpoch(1));
                 owner.write().unwrap().mark_active(ShardId(0));
             }
             let replacement = owner.read().unwrap().acquisition(ShardId(0)).unwrap();
-            tracking.for_acquisition(replacement).record(task(stamp + 1, 1), ShardId(0), OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1));
-            old.record(task(stamp, attempt), ShardId(0), OffsetDateTime::UNIX_EPOCH);
+            tracking.for_acquisition(replacement).record(task(stamp + 1, 1), ShardId(0), OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1), OffsetDateTime::UNIX_EPOCH);
+            old.record(task(stamp, attempt), ShardId(0), OffsetDateTime::UNIX_EPOCH, OffsetDateTime::UNIX_EPOCH);
             tracking.entries.for_entry(&submitted).update(&(task(stamp, attempt).run_key, "activity".into()), |entry| entry.evaluated = true);
             if takeover {
                 old.remove_run(task(stamp, attempt).run_key);

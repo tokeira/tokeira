@@ -3,7 +3,8 @@
 //! Ownership is locked before entries so replacement cannot interleave validation
 //! with installation. Every authoritative tracking mutation advances a revision: an awaited scan may
 //! retire only the exact value it submitted, even when its logical key is reused.
-//! Scanner-only cache refreshes preserve that revision and never replace anchors.
+//! Scanner-only cache refreshes preserve that revision. They may repair missing
+//! anchors from authority, but cannot overwrite a concurrently updated entry.
 
 use std::{
     collections::HashMap,

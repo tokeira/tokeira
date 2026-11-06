@@ -785,6 +785,7 @@ async fn deadline_passes_select_due_entries_among_many_future_entries() {
             activity_dispatch_task(first.run_key, &state, activity),
             ShardId(0),
             due,
+            now,
         );
     }
     runtime.activity_tracking.set_timeouts(
@@ -1814,6 +1815,7 @@ async fn recovered_callback_is_due_immediately(publication_rebuild: bool) {
                 max_retries: 3,
                 fence: attempt.fence,
             },
+            runtime.clock.as_ref(),
         )
         .await
         .unwrap();

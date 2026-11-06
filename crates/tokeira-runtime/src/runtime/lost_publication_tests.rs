@@ -60,16 +60,6 @@ pub(super) async fn lost_publication<R: RunRepository + 'static>(
     request: StartRequest,
     kind: TaskKind,
 ) -> Result<()> {
-    // Isolate discovery's repair of a lost publication. Eligibility now has its
-    // own local-offer path, which would legitimately heal the loss first.
-    runtime.activity_timeout_scanner_cancel.cancel();
-    while runtime
-        .activity_timeout_scanner_handle
-        .as_ref()
-        .is_some_and(|handle| !handle.is_finished())
-    {
-        tokio::task::yield_now().await;
-    }
     let run_key = request.run_key;
     let mut queue = QueueKey {
         namespace_id: request.namespace_id,

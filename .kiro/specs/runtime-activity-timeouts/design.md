@@ -208,6 +208,16 @@ check across both index snapshots prevents an insert racing planning from being
 lost. A stale-early cache costs one reload and refresh; a stale-late cache is repaired
 by the full pass. These caches never authorize a timeout (Requirement 7.3).
 
+An early offer can commit a start before schedule tracking exists, or before a
+late schedule record clears its anchors. Every reload repairs a missing cached
+start from the authoritative activity's start time and durable last heartbeat,
+retaining any newer volatile heartbeat. The cache update uses the same captured
+revision and acquisition guard as configuration refresh, and never replaces an
+already recorded start. The full pass discovers a missing start even when the
+cache has no heartbeat or start-to-close deadline, so an expired heartbeat fires
+by that pass. Durable start/heartbeat anchors also drive Temporal's timers
+(`service/history/workflow/timer_sequence.go:298-355 @ v1.31.0`).
+
 Authority: `service/history/workflow/timer_sequence.go:108-154` and
 `service/history/queues/queue_scheduled.go:159-224,269 @ v1.31.0`.
 

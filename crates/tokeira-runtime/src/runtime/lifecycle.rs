@@ -1262,12 +1262,6 @@ where
                 if activity.started_at.is_some() || activity.pause_info.is_some() {
                     continue;
                 }
-                self.activity_tracking.record_retry_with_timeouts(
-                    run_key,
-                    &activity_id,
-                    dispatch_at,
-                    Some(crate::activity_timeout::ActivityTimeouts::from(activity)),
-                );
                 let task = DispatchableActivityTask {
                     run_key,
                     queue: QueueKey {

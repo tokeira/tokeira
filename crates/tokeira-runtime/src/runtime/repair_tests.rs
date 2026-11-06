@@ -1855,6 +1855,7 @@ pub(super) async fn final_gate_case<R: RunRepository + 'static>(
         &NexusTimeoutTrackingState::default(),
         &CompletionCallbackTrackingState::default(),
         &repair,
+        tokeira_clock::system_clock().as_ref(),
     )
     .await
     .unwrap();

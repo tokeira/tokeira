@@ -889,7 +889,23 @@ where
                 };
                 if let CommitResult::Applied { new_state } = &commit_result {
                     let shard_id = shard_id.expect("applied transition has an execution home");
-                    activity_tracking.eligibility.refresh(new_state, shard_id);
+                    // An option update can expose a deferred attempt to eligibility.
+                    // Its old retry anchors must be reset before that wake escapes.
+                    if let Command::UpdateActivityOptions(request) = &committed_command {
+                        for (id, at) in &request.reschedule_at {
+                            if let Some(activity) = new_state.activities.get(id)
+                                && activity.started_at.is_none()
+                                && activity.pause_info.is_none()
+                            {
+                                activity_tracking.record_retry_with_timeouts(
+                                    new_state.run_key,
+                                    id,
+                                    *at,
+                                    Some(crate::activity_timeout::ActivityTimeouts::from(activity)),
+                                );
+                            }
+                        }
+                    }
                     // Option updates, pause and reset may move a deadline without
                     // starting an attempt. Unchanged caches do not rearm failed work.
                     activity_tracking.refresh_timeouts(new_state);
@@ -1046,6 +1062,9 @@ where
                 {
                     if let CommitResult::Applied { new_state } = &commit_result {
                         let shard_id = shard_id.expect("applied transition has an execution home");
+                        // Publication has installed schedule tracking. Only now
+                        // expose any remaining deferred obligations to the scanner.
+                        activity_tracking.refresh_eligibility(new_state, shard_id, clock.now());
                         if let Command::NexusOperationResolved(request) = &committed_command
                             && matches!(
                                 request.resolution,
@@ -1091,7 +1110,6 @@ where
                                     history,
                                 } = *committed;
                                 let home = shard_id.expect("paired close has an execution home");
-                                activity_tracking.eligibility.refresh(&state, home);
                                 track_committed_run(
                                     &state,
                                     &history,
@@ -1104,6 +1122,7 @@ where
                                 {
                                     tracing::warn!(?error, run_key = ?state.run_key, "failed to publish successor dispatch");
                                 }
+                                activity_tracking.refresh_eligibility(&state, home, clock.now());
                             }
                         }
                     }

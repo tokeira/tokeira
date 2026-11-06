@@ -95,6 +95,8 @@ mod activity_deadline_tests;
 #[cfg(test)]
 mod activity_retirement_tests;
 #[cfg(test)]
+mod activity_tracking_order_tests;
+#[cfg(test)]
 mod buffered_force_close_tests;
 mod commit;
 #[cfg(test)]

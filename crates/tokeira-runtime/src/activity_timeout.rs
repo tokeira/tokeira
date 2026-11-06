@@ -16,8 +16,9 @@
 //!
 //! Cached timeouts select deadline wakes; each selected entry is still reloaded
 //! before a decision. A periodic full pass reconciles stale caches, including
-//! starts missed before schedule tracking; it restores the durable start and
-//! heartbeat without replacing a newer tracked start or heartbeat. Retry
+//! starts missed before schedule tracking and anchors superseded by a retry.
+//! Reloaded attempt anchors authorize decisions; cache repairs are revision guarded
+//! and preserve heartbeats at or after the reloaded start. Retry
 //! eligibility shares the wake, and bounded passes retain unattempted due work.
 
 use tokeira_kernel::deadline_after;
@@ -137,17 +138,27 @@ pub struct ActivityTrackingEntry {
 }
 
 impl ActivityTrackingEntry {
+    fn heartbeat_for_activity(&self, activity: &ActivityState) -> Option<OffsetDateTime> {
+        let started_at = activity.started_at?;
+        // Retry state can retain the preceding attempt's durable heartbeat.
+        // Only heartbeats from this start onward extend this attempt's budget
+        // (service/history/workflow/timer_sequence.go:323-355 @ v1.31.0).
+        self.last_heartbeat_at
+            .max(activity.last_heartbeat_at)
+            .filter(|heartbeat| *heartbeat >= started_at)
+    }
+
     fn refresh_from_activity(&mut self, activity: &ActivityState) {
         self.timeouts = Some(ActivityTimeouts::from(activity));
-        // An offer can reach a worker before the owner records its schedule.
-        // Repair that missed start from authority, preserving any newer volatile
-        // heartbeat. Never replace an already recorded start with a stale read.
-        // Durable anchors drive Temporal timers too (service/history/workflow/
-        // timer_sequence.go:298-355 @ v1.31.0).
-        if self.started_at.is_none() && activity.started_at.is_some() {
-            self.started_at = activity.started_at;
-            self.last_heartbeat_at = self.last_heartbeat_at.max(activity.last_heartbeat_at);
-        }
+        // An early offer can lose a start, and a heartbeat racing a retry can
+        // stale its scoped reset. Reconcile both from authority under the scan's
+        // revision guard, so this reload cannot overwrite a concurrent update.
+        self.last_heartbeat_at = self.heartbeat_for_activity(activity);
+        self.started_at = activity.started_at;
+        self.original_scheduled_at = activity.scheduled_at;
+        self.last_dispatched_at = activity
+            .current_attempt_scheduled_at
+            .unwrap_or(activity.scheduled_at);
     }
 }
 
@@ -483,8 +494,9 @@ impl Default for ActivityTimeoutScannerConfig {
     }
 }
 
-/// Decide which activity deadline, if any, `entry` has breached at `now`, given
-/// the live `activity` state for the configured timeouts.
+/// Decide which deadline the reloaded activity has breached at `now`.
+/// Its schedule and start anchors are authoritative; the cache can only extend a
+/// heartbeat deadline with a heartbeat at or after the reloaded start.
 ///
 /// Precedence is deliberate and matches the activity lifecycle:
 /// schedule-to-close bounds the whole activity and so is checked first; then, if
@@ -503,12 +515,15 @@ pub fn evaluate_activity_timeout(
 ) -> Option<TimeoutViolation> {
     if let Some(timeout) = activity.schedule_to_close_timeout
         && !timeout.is_zero()
-        && now > deadline_after(entry.original_scheduled_at, timeout)
+        && now > deadline_after(activity.scheduled_at, timeout)
     {
         return Some(TimeoutViolation::ScheduleToClose);
     }
 
-    if let Some(started_at) = entry.started_at {
+    // Timers are derived from the current attempt, not the cached incarnation
+    // (service/history/timer_queue_active_task_executor.go:204-258,292-295;
+    // service/history/workflow/timer_sequence.go:229-257,291-355 @ v1.31.0).
+    if let Some(started_at) = activity.started_at {
         if let Some(timeout) = activity.heartbeat_timeout
             && !timeout.is_zero()
         {
@@ -516,9 +531,7 @@ pub fn evaluate_activity_timeout(
             // (`getActivityHeartbeatTimeout`, timer_sequence.go:341-351 @
             // v1.31.0): a time restored from durable state may predate the
             // current attempt, whose clock then runs from its start.
-            let heartbeat_at = entry
-                .last_heartbeat_at
-                .map_or(started_at, |at| at.max(started_at));
+            let heartbeat_at = entry.heartbeat_for_activity(activity).unwrap_or(started_at);
             if now > deadline_after(heartbeat_at, timeout) {
                 return Some(TimeoutViolation::Heartbeat);
             }
@@ -532,7 +545,13 @@ pub fn evaluate_activity_timeout(
         }
     } else if let Some(timeout) = activity.schedule_to_start_timeout
         && !timeout.is_zero()
-        && now > deadline_after(entry.last_dispatched_at, timeout)
+        && now
+            > deadline_after(
+                activity
+                    .current_attempt_scheduled_at
+                    .unwrap_or(activity.scheduled_at),
+                timeout,
+            )
     {
         return Some(TimeoutViolation::ScheduleToStart);
     }
@@ -1125,6 +1144,7 @@ mod tests {
             };
             let mut activity = sample_activity();
             activity.heartbeat_timeout = Some(Duration::seconds(timeout_secs));
+            activity.started_at = Some(started_at);
             let anchor = last_heartbeat_at.map_or(started_at, |at| at.max(started_at));
             prop_assert_eq!(
                 evaluate_activity_timeout(&entry, &activity, now) == Some(TimeoutViolation::Heartbeat),
@@ -1148,6 +1168,8 @@ mod tests {
             cancel_requested: false,
         };
         let mut activity = sample_activity();
+        activity.scheduled_at = entry.original_scheduled_at;
+        activity.started_at = entry.started_at;
         activity.schedule_to_close_timeout = Some(Duration::seconds(1));
         activity.start_to_close_timeout = Some(Duration::seconds(1));
         activity.heartbeat_timeout = Some(Duration::seconds(1));

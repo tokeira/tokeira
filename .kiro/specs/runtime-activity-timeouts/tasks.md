@@ -205,3 +205,16 @@ All code lives in `tokeira-runtime`, in a new `activity_timeout.rs` module (foll
     full pass to fire the expired heartbeat within one reconciliation interval.
   - Dependency: task 9.
   - _Requirements: 3.1, 7.3._
+
+- [x] 11. Follow the reloaded attempt after a skipped retry reset
+  - Evaluate startedness, start time and current dispatch time from reloaded state;
+    retain only heartbeats at or after that attempt's start when extending it.
+  - Reconcile superseded cache anchors under the existing revision guard, keeping
+    the retry's scoped reset and the full-pass repair of missed starts.
+  - Reproduce a heartbeat during the scanner's retry commit: heartbeat and
+    start-to-close must neither spend an unstarted retry nor terminally resolve it.
+    Verify schedule-to-start at the new attempt's boundary and cache repair.
+  - Check direct evaluation with stale anchors and preservation of a concurrent
+    heartbeat by the revision guard; retain the local-offer regressions.
+  - Dependency: task 10.
+  - _Requirements: 3.3, 4.1, 4.2, 5.2, 7.3._

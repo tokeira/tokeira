@@ -39,7 +39,9 @@ fn due_time_matches_each_strict_timeout_and_later_heartbeat() {
             let mut tracked = entry(now);
             if kind >= 2 {
                 tracked.started_at = Some(now);
+                activity.started_at = Some(now);
             }
+            activity.current_attempt_scheduled_at = Some(now);
             tracked.last_heartbeat_at = Some(now + Duration::seconds(heartbeat_offset));
             tracked.timeouts = Some(ActivityTimeouts::from(&activity));
             let due = activity_timeout_due_at(&tracked).unwrap();
@@ -202,4 +204,112 @@ proptest! {
         }
         prop_assert_eq!(tracking.scan_delay(now, std::time::Duration::from_millis(interval_ms)), expected);
     }
+}
+
+#[test]
+fn evaluation_uses_reloaded_attempt_anchors() {
+    let base = OffsetDateTime::UNIX_EPOCH;
+    for started in [false, true] {
+        for cached_start in [None, Some(base)] {
+            let mut cached = entry(base);
+            cached.started_at = cached_start;
+            cached.last_heartbeat_at = Some(base + Duration::seconds(5));
+            let mut activity = sample_activity();
+            activity.current_attempt_scheduled_at = Some(base + Duration::seconds(40));
+            activity.started_at = started.then_some(base + Duration::seconds(50));
+            activity.schedule_to_start_timeout = Some(Duration::seconds(20));
+            activity.start_to_close_timeout = Some(Duration::seconds(20));
+            activity.heartbeat_timeout = Some(Duration::seconds(10));
+            let now = base + Duration::seconds(55);
+            assert_eq!(
+                evaluate_activity_timeout(&cached, &activity, now),
+                None,
+                "cached anchors must not authorize a timeout for the reloaded attempt"
+            );
+            assert_eq!(
+                evaluate_activity_timeout(&cached, &activity, base + Duration::seconds(60)),
+                None
+            );
+            assert_eq!(
+                evaluate_activity_timeout(
+                    &cached,
+                    &activity,
+                    base + Duration::seconds(60) + Duration::nanoseconds(1)
+                ),
+                Some(if started {
+                    TimeoutViolation::Heartbeat
+                } else {
+                    TimeoutViolation::ScheduleToStart
+                })
+            );
+            if started {
+                cached.last_heartbeat_at = Some(base + Duration::seconds(58));
+                activity.last_heartbeat_at = Some(base + Duration::seconds(59));
+                assert_eq!(
+                    evaluate_activity_timeout(&cached, &activity, base + Duration::seconds(69)),
+                    None
+                );
+                cached.last_heartbeat_at = Some(base + Duration::seconds(60));
+                assert_eq!(
+                    evaluate_activity_timeout(&cached, &activity, base + Duration::seconds(70)),
+                    None
+                );
+                assert_eq!(
+                    evaluate_activity_timeout(
+                        &cached,
+                        &activity,
+                        base + Duration::seconds(70) + Duration::nanoseconds(1)
+                    ),
+                    Some(TimeoutViolation::Heartbeat)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn reload_replaces_superseded_attempt_cache() {
+    let base = OffsetDateTime::UNIX_EPOCH;
+    let mut cached = entry(base);
+    cached.started_at = Some(base);
+    cached.last_heartbeat_at = Some(base + Duration::seconds(10));
+    let mut activity = sample_activity();
+    activity.current_attempt_scheduled_at = Some(base + Duration::seconds(20));
+    activity.last_heartbeat_at = cached.last_heartbeat_at;
+    activity.schedule_to_start_timeout = Some(Duration::seconds(5));
+    cached.refresh_from_activity(&activity);
+    assert_eq!(cached.started_at, None);
+    assert_eq!(cached.last_heartbeat_at, None);
+    assert_eq!(
+        Some(cached.last_dispatched_at),
+        activity.current_attempt_scheduled_at
+    );
+    assert_eq!(
+        activity_timeout_due_at(&cached),
+        Some(base + Duration::seconds(25) + Duration::nanoseconds(1))
+    );
+    activity.started_at = Some(base + Duration::seconds(21));
+    activity.heartbeat_timeout = Some(Duration::seconds(1));
+    activity.last_heartbeat_at = Some(base + Duration::seconds(22));
+    cached.refresh_from_activity(&activity);
+    assert_eq!(cached.started_at, activity.started_at);
+    assert_eq!(cached.last_heartbeat_at, activity.last_heartbeat_at);
+    cached.last_heartbeat_at = Some(base + Duration::seconds(23));
+    cached.refresh_from_activity(&activity);
+    assert_eq!(cached.last_heartbeat_at, Some(base + Duration::seconds(23)));
+
+    let tracking = ActivityTrackingState::default();
+    let key = (cached.run_key, cached.activity_id.clone());
+    tracking.insert(cached.clone());
+    let captured = tracking.inner.snapshot(None).pop().unwrap();
+    tracking.record_heartbeat(key.0, &key.1, base + Duration::seconds(24));
+    tracking
+        .inner
+        .refresh_scanned(&key, &captured, base, |entry| {
+            entry.refresh_from_activity(&activity)
+        });
+    assert_eq!(
+        tracking.inner.get(&key).unwrap().last_heartbeat_at,
+        Some(base + Duration::seconds(24))
+    );
 }

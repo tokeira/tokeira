@@ -54,9 +54,16 @@ flowchart TD
 
 ### Key design decisions
 
-**Runtime-local tracking state, not kernel state.** The kernel's `ActivityState` stores timeout *configuration* (durations), but not the timestamps needed for timeout *detection* (`original_scheduled_at`, `last_dispatched_at`, `started_at`, `last_heartbeat_at`). Adding these to `ActivityState` would mean every heartbeat requires a storage commit, which defeats the purpose of lightweight heartbeats. Instead, the runtime maintains an in-memory `ActivityTrackingState` that is populated from lifecycle events. This state is ephemeral — if the runtime restarts, tracking state is lost and in-flight activities lose their timeout baselines. Reconstruction after restart is deferred to Feature 11 (Sweeper and Recovery).
+**Runtime-local tracking is a cache of durable attempt state.** The kernel's
+`ActivityState` carries the authoritative schedule, start and durable heartbeat
+anchors as well as timeout configuration. Runtime tracking adds volatile heartbeat
+updates and deadline planning; recovery rebuilds it from durable state. Reloaded
+anchors decide whether a timeout applies even if a scoped tracking callback lost a
+race.
 
-**Heartbeat is a pure runtime operation.** `record_activity_heartbeat` validates the token (reusing `validate_activity_token` from Feature 2), updates `last_heartbeat_at` in the tracking state, reads `cancel_requested`, and returns. No kernel command, no history event, no storage write. This keeps heartbeat latency minimal and avoids amplifying write pressure on storage.
+**Heartbeat bookkeeping is runtime-owned.** `record_activity_heartbeat` validates
+the token, records progress durably and updates the volatile heartbeat timestamp.
+It submits no kernel command and creates no history event.
 
 **Cached configuration selects wakes; storage authorizes decisions.** Tracking caches all four timeout durations and the pause flag beside the anchors. Each due entry reloads its `ActivityState` before evaluation and refreshes that cache, including when no timeout fires. A full pass every interval repairs a cache later than the real deadline; `UpdateActivityOptions` and other lane commits also refresh tracked configuration.
 
@@ -212,8 +219,8 @@ An early offer can commit a start before schedule tracking exists, or before a
 late schedule record clears its anchors. Every reload repairs a missing cached
 start from the authoritative activity's start time and durable last heartbeat,
 retaining any newer volatile heartbeat. The cache update uses the same captured
-revision and acquisition guard as configuration refresh, and never replaces an
-already recorded start. The full pass discovers a missing start even when the
+revision and acquisition guard as configuration refresh, so a concurrent start
+or heartbeat cannot be overwritten by the reload. The full pass discovers a missing start even when the
 cache has no heartbeat or start-to-close deadline, so an expired heartbeat fires
 by that pass. Durable start/heartbeat anchors also drive Temporal's timers
 (`service/history/workflow/timer_sequence.go:298-355 @ v1.31.0`).
@@ -222,6 +229,24 @@ Authority: `service/history/workflow/timer_sequence.go:108-154` and
 `service/history/queues/queue_scheduled.go:159-224,269 @ v1.31.0`.
 
 ### Timeout evaluation (pure function)
+
+A retry's scoped tracking reset can lose its captured revision to a heartbeat while
+the retry commits. The resulting cache may still contain the previous attempt's
+start, heartbeat and dispatch time. Evaluation therefore reads startedness and the
+start time from the reloaded activity, and uses its current attempt's scheduled
+time for schedule-to-start (the original schedule if the current time is absent).
+Schedule-to-close uses the reloaded original schedule. Only a heartbeat at or after
+that start can extend a started attempt's deadline; the later durable or cached
+heartbeat wins. An unstarted attempt has no heartbeat or start-to-close deadline.
+
+The same reload reconciles the cache's schedule, start and heartbeat anchors under
+the existing revision guard. It clears the start and heartbeat for an unstarted
+retry, restores its dispatch time, and retains newer heartbeats for a started
+attempt. The scoped post-commit reset stays: a delayed retry reply must not clear a
+newer start. Thus the cache chooses wakes while the reloaded attempt decides which
+timeouts apply. Temporal builds timers from mutable state under the workflow lock
+and skips earlier attempts (`service/history/timer_queue_active_task_executor.go:204-258,292-295`;
+`service/history/workflow/timer_sequence.go:229-257,291-355 @ v1.31.0`).
 
 ```rust
 pub enum TimeoutViolation {
@@ -313,13 +338,13 @@ ActivityTrackingEntry:
 evaluate_activity_timeout(entry, activity_state, now):
   // Schedule-to-close takes precedence (uses original scheduling time)
   if activity_state.schedule_to_close_timeout is Some(d):
-    if now - entry.original_scheduled_at > d:
+    if now - activity_state.scheduled_at > d:
       return Some(ScheduleToClose)
 
-  if entry.started_at is Some(started):
+  if activity_state.started_at is Some(started):
     // Heartbeat timeout (only for started activities)
     if activity_state.heartbeat_timeout is Some(d):
-      let baseline = entry.last_heartbeat_at.unwrap_or(started)
+      let baseline = max(started, activity_state.last_heartbeat_at, entry.last_heartbeat_at)
       if now - baseline > d:
         return Some(Heartbeat)
 
@@ -328,9 +353,10 @@ evaluate_activity_timeout(entry, activity_state, now):
       if now - started > d:
         return Some(StartToClose)
   else:
-    // Schedule-to-start timeout (uses last dispatch time)
+    // Schedule-to-start timeout (uses this attempt's authoritative schedule)
     if activity_state.schedule_to_start_timeout is Some(d):
-      if now - entry.last_dispatched_at > d:
+      let scheduled = activity_state.current_attempt_scheduled_at.unwrap_or(activity_state.scheduled_at)
+      if now - scheduled > d:
         return Some(ScheduleToStart)
 
   return None
@@ -393,19 +419,19 @@ TokeiraRuntime::shutdown (or Drop):
 
 ### Property 7: Heartbeat timeout fires for started activities with expired heartbeat
 
-*For any* `ActivityTrackingEntry` with `started_at = Some(t)` and *for any* `ActivityState` with `heartbeat_timeout = Some(d)`, if `now - max(last_heartbeat_at, started_at) > d`, then `evaluate_activity_timeout` shall return `Some(Heartbeat)` — unless `schedule_to_close_timeout` also fires, in which case `ScheduleToClose` takes precedence. If `last_heartbeat_at` is `None`, the baseline shall be `started_at`. If `started_at` is `None`, the function shall never return `Heartbeat`.
+*For any* cached entry and reloaded `ActivityState` with `started_at = Some(t)` and `heartbeat_timeout = Some(d)`, if `now - max(t, durable_last_heartbeat_at, cached_last_heartbeat_at) > d`, then `evaluate_activity_timeout` shall return `Some(Heartbeat)` — unless `schedule_to_close_timeout` also fires, in which case `ScheduleToClose` takes precedence. If `last_heartbeat_at` is `None`, the baseline shall be `started_at`. If `started_at` is `None`, the function shall never return `Heartbeat`.
 
 **Validates: Requirements 3.1, 3.2, 3.3**
 
 ### Property 8: Schedule-to-start timeout fires only for unstarted activities
 
-*For any* `ActivityTrackingEntry` with `started_at = None` and *for any* `ActivityState` with `schedule_to_start_timeout = Some(d)`, if `now - scheduled_at > d`, then `evaluate_activity_timeout` shall return `Some(ScheduleToStart)` — unless `schedule_to_close_timeout` also fires, in which case `ScheduleToClose` takes precedence. If `started_at` is `Some(_)`, the function shall never return `ScheduleToStart`.
+*For any* cached entry and reloaded `ActivityState` with `started_at = None` and `schedule_to_start_timeout = Some(d)`, if `now - current_attempt_scheduled_at.unwrap_or(scheduled_at) > d`, then `evaluate_activity_timeout` shall return `Some(ScheduleToStart)` — unless `schedule_to_close_timeout` also fires, in which case `ScheduleToClose` takes precedence. If `started_at` is `Some(_)`, the function shall never return `ScheduleToStart`.
 
 **Validates: Requirements 4.1, 4.2**
 
 ### Property 9: Start-to-close timeout fires only for started activities
 
-*For any* `ActivityTrackingEntry` with `started_at = Some(t)` and *for any* `ActivityState` with `start_to_close_timeout = Some(d)`, if `now - t > d`, then `evaluate_activity_timeout` shall return `Some(StartToClose)` — unless `schedule_to_close_timeout` or `heartbeat_timeout` also fires with higher precedence. If `started_at` is `None`, the function shall never return `StartToClose`.
+*For any* cached entry and reloaded `ActivityState` with `started_at = Some(t)` and `start_to_close_timeout = Some(d)`, if `now - t > d`, then `evaluate_activity_timeout` shall return `Some(StartToClose)` — unless `schedule_to_close_timeout` or `heartbeat_timeout` also fires with higher precedence. If `started_at` is `None`, the function shall never return `StartToClose`.
 
 **Validates: Requirements 5.1, 5.2**
 

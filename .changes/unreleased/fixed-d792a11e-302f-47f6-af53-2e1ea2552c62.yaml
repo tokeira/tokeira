@@ -1,0 +1,5 @@
+kind: fixed
+body: An activity retried while its previous attempt was still heartbeating no longer times out before its new attempt starts.
+time: 2026-11-06T10:01:30.971614+00:00
+custom:
+    Slice: d792a11e-302f-47f6-af53-2e1ea2552c62

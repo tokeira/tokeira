@@ -394,18 +394,13 @@ async fn eager_reply_loss_reload_and_both_timeouts_retry_normally() {
             })
         );
         let deps = reloaded.activity_retry_deps();
-        deps.tracking
-            .insert(crate::activity_timeout::ActivityTrackingEntry {
-                timeouts: None,
-                started_at: Some(OffsetDateTime::now_utc() - Duration::minutes(2)),
-                ..entry
-            });
-        crate::activity_timeout::scan_activity_timeouts_once(
+        crate::activity_timeout::scan_activity_timeouts_at(
             &deps,
             None,
             &reloaded.lanes,
             reloaded.lanes.len(),
             &ActivityTimeoutScannerConfig::default(),
+            now,
         )
         .await;
         let retried = reloaded

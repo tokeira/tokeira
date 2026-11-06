@@ -13,7 +13,7 @@ pub(super) async fn fixture() -> (Arc<InMemoryStore>, TokeiraRuntime<InMemorySto
     (store, runtime)
 }
 
-async fn fixture_on<R: RunRepository + 'static>(
+pub(super) async fn fixture_on<R: RunRepository + 'static>(
     store: Arc<R>,
     clock: Arc<dyn Clock>,
 ) -> TokeiraRuntime<R> {

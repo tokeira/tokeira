@@ -89,6 +89,8 @@ use crate::{
 
 pub(crate) mod activity;
 #[cfg(test)]
+mod activity_attempt_timeout_tests;
+#[cfg(test)]
 mod activity_backlog_tests;
 #[cfg(test)]
 mod activity_deadline_tests;

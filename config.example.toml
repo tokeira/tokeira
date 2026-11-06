@@ -17,7 +17,7 @@
 # @field emergency.freeze_projection | emergency | default=false | Emergency-only restriction that freezes projection advancement.
 # @field infrastructure.cluster_name | infrastructure | default="tokeira-local" | Stable cluster label used in operator output and telemetry.
 # @field infrastructure.dsql.admin_role_arn | infrastructure | default=<unset> | Provisioning identity for DSQL administrative operations.
-# @field infrastructure.dsql.conn_lease_table | infrastructure | default=<unset> | Provisioned DynamoDB table for distributed connection-slot leases.
+# @field infrastructure.dsql.conn_lease_table | infrastructure | default=<unset> | No longer used; still accepted so existing configurations load, ignored with a warning at startup.
 # @field infrastructure.dsql.endpoint | infrastructure | default=<unset> | Required when storage is dsql; normally written by the provisioner.
 # @field infrastructure.dsql.migration_policy | infrastructure | default=<unset> | Distributed DSQL startup schema policy: unset or validate_only checks the schema; automatic is refused.
 # @field infrastructure.dsql.rate_limiter_table | infrastructure | default=<unset> | Provisioned DynamoDB table for distributed rate limiting.

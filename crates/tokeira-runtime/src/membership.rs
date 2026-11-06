@@ -17,10 +17,13 @@
 //!   or relinquishing a bundle is delegated to one runtime lifecycle unit: local
 //!   [`ShardOwner`] state is only made active after the lease store confirms the
 //!   acquire and durable recovery completes.
-//! - **Disconnects must not silently keep a stale connection budget.** A budget
-//!   directive carries an expiry; on reconnect, if the last budget has expired the
-//!   client resets to a safe minimal budget rather than continuing to honour a
-//!   directive the controller may no longer endorse.
+//! - **A connection budget share holds until the next directive.** A budget
+//!   directive carries an expiry, but a stream drop, a failed reconnect or an
+//!   expiry changes nothing: the node keeps its last share and warns once when
+//!   the share passes `valid_until`. Shares kept through a controller outage
+//!   sum to no more than the budget they came from, whereas collapsing every
+//!   node to one connection would take the fleet's capacity with the
+//!   controller.
 //! - **Reconnect backs off exponentially** between `reconnect_base_delay` and
 //!   `reconnect_max_delay` so a flapping controller does not amplify into a
 //!   reconnect storm.
@@ -138,6 +141,9 @@ pub struct MembershipClient {
 #[derive(Clone, Debug)]
 struct BudgetExpiry {
     seconds: i64,
+    /// Set once the share has been reported stale, so a long outage warns
+    /// once per share rather than on every reconnect attempt.
+    stale_reported: bool,
 }
 
 impl Clone for MembershipClient {
@@ -193,9 +199,9 @@ impl MembershipClient {
     /// Run the membership stream until `shutdown` fires, reconnecting with
     /// exponential backoff on transient stream failures.
     ///
-    /// On reconnect, if the previously applied connection budget has expired the
-    /// client resets to a minimal safe budget — it must not keep honouring a
-    /// budget the controller can no longer confirm while the stream is down.
+    /// A stream drop or a failed reconnect keeps the last applied connection
+    /// budget, even past its `valid_until`, and warns once when it goes stale
+    /// (see [`report_stale_budget`](Self::report_stale_budget)).
     pub async fn run(self, shutdown: CancellationToken) -> Result<()> {
         let mut backoff = self.config.reconnect_base_delay;
         loop {
@@ -206,9 +212,7 @@ impl MembershipClient {
                 Ok(()) => return Ok(()),
                 Err(error) => {
                     tracing::warn!(%error, "membership stream disconnected; reconnecting");
-                    if self.last_budget_expired() {
-                        self.budget_applier.apply_budget(1.0, 1, 1)?;
-                    }
+                    self.report_stale_budget();
                 }
             }
             tokio::select! {
@@ -506,15 +510,18 @@ impl MembershipClient {
                 )
                 .await
             }
-            Some(Directive::ConnectionBudget(budget)) => self.apply_connection_budget(
-                budget.rate_per_second,
-                budget.capacity,
-                budget.max_reservoir_size,
-                budget
-                    .valid_until
-                    .is_set()
-                    .then_some(budget.valid_until.seconds),
-            ),
+            Some(Directive::ConnectionBudget(budget)) => {
+                self.apply_connection_budget(
+                    budget.rate_per_second,
+                    budget.capacity,
+                    budget.max_reservoir_size,
+                    budget
+                        .valid_until
+                        .is_set()
+                        .then_some(budget.valid_until.seconds),
+                )
+                .await
+            }
             Some(Directive::Drain(_)) => self.apply_drain().await,
             Some(Directive::RoutingUpdate(_)) | None => Ok(()),
         }
@@ -531,8 +538,8 @@ impl MembershipClient {
                 )
                 .await
             }
-            Some(controller_directive::Directive::ConnectionBudget(budget)) => self
-                .apply_connection_budget(
+            Some(controller_directive::Directive::ConnectionBudget(budget)) => {
+                self.apply_connection_budget(
                     budget.rate_per_second,
                     budget.capacity,
                     budget.max_reservoir_size,
@@ -540,7 +547,9 @@ impl MembershipClient {
                         .valid_until
                         .is_set()
                         .then_some(budget.valid_until.seconds),
-                ),
+                )
+                .await
+            }
             Some(controller_directive::Directive::Drain(_)) => self.apply_drain().await,
             Some(controller_directive::Directive::RoutingUpdate(_)) | None => Ok(()),
         }
@@ -562,7 +571,7 @@ impl MembershipClient {
         Ok(())
     }
 
-    fn apply_connection_budget(
+    async fn apply_connection_budget(
         &self,
         rate_per_second: f64,
         capacity: u64,
@@ -573,9 +582,44 @@ impl MembershipClient {
             .last_budget_valid_until
             .lock()
             .expect("last_budget_valid_until lock poisoned") =
-            valid_until_seconds.map(|seconds| BudgetExpiry { seconds });
+            valid_until_seconds.map(|seconds| BudgetExpiry {
+                seconds,
+                stale_reported: false,
+            });
         self.budget_applier
             .apply_budget(rate_per_second, capacity, max_reservoir_size)
+            .await
+    }
+
+    /// Warn, once per directive, that the last connection budget share has
+    /// passed its `valid_until` without a new directive. Returns whether it
+    /// warned.
+    ///
+    /// The share is kept, not replaced. The controller divided the cluster's
+    /// connections among the nodes it budgeted, so shares kept through its
+    /// outage sum to no more than that budget; capping each node at one
+    /// connection instead would leave the fleet unable to serve until the
+    /// controller returns. Nodes that start during the outage run at their
+    /// configured target and can push the fleet past the budget, and DSQL
+    /// refuses the excess.
+    pub fn report_stale_budget(&self) -> bool {
+        let mut guard = self
+            .last_budget_valid_until
+            .lock()
+            .expect("last_budget_valid_until lock poisoned");
+        let Some(expiry) = guard.as_mut() else {
+            return false;
+        };
+        if expiry.stale_reported || !budget_valid_until_expired(Some(expiry.seconds)) {
+            return false;
+        }
+        expiry.stale_reported = true;
+        tracing::warn!(
+            valid_until = expiry.seconds,
+            "the connection budget share passed its valid_until without a new directive from \
+             the placement controller; keeping it until the next directive"
+        );
+        true
     }
 
     /// Enact a controller-initiated drain (Req 8.2): stop admitting new
@@ -633,10 +677,14 @@ impl MembershipClient {
 /// Implemented by whatever component owns the connection reservoir/rate limiter.
 /// Keeping it a trait lets `membership` apply budgets without depending on the
 /// connection-management internals, and lets tests record applied budgets.
+#[async_trait]
 pub trait ConnectionBudgetApplier: Send + Sync + std::fmt::Debug {
-    /// Apply a controller-issued budget: sustained `rate_per_second`, burst
-    /// `capacity`, and the maximum reservoir size to maintain.
-    fn apply_budget(
+    /// Apply a controller-issued budget: this node's share of the cluster's
+    /// connection rate (`rate_per_second`) and of its connections
+    /// (`capacity`), and an absolute ceiling on its reservoir
+    /// (`max_reservoir_size`). Async because applying one recomputes the
+    /// connection director's class budgets.
+    async fn apply_budget(
         &self,
         rate_per_second: f64,
         capacity: u64,
@@ -682,8 +730,9 @@ mod tests {
         available: AtomicUsize,
     }
 
+    #[async_trait]
     impl ConnectionBudgetApplier for RecordingBudgetApplier {
-        fn apply_budget(
+        async fn apply_budget(
             &self,
             rate_per_second: f64,
             capacity: u64,
@@ -1068,5 +1117,191 @@ mod tests {
             buffa::EnumValue::Known(pb::NodeDrainState::NODE_DRAIN_STATE_SAFE_TO_TERMINATE)
         );
         assert_eq!(client.drain.state(), RuntimeDrainState::SafeToTerminate);
+    }
+
+    #[tokio::test]
+    async fn a_stale_budget_share_is_reported_once_and_a_new_directive_rearms_it() {
+        let store = Arc::new(InMemoryStore::default());
+        let budget = Arc::new(RecordingBudgetApplier::default());
+        let client = client(store, Arc::clone(&budget));
+        assert!(!client.report_stale_budget(), "no directive yet");
+
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        client
+            .handle_directive(budget_directive(10.0, 20, 30, Some(now - 1)))
+            .await
+            .unwrap();
+        assert!(client.report_stale_budget());
+        assert!(!client.report_stale_budget(), "warned once");
+
+        client
+            .handle_directive(budget_directive(10.0, 20, 30, Some(now + 600)))
+            .await
+            .unwrap();
+        assert!(!client.report_stale_budget(), "the new share is current");
+        client
+            .handle_directive(budget_directive(10.0, 20, 30, Some(now - 1)))
+            .await
+            .unwrap();
+        assert!(client.report_stale_budget());
+        assert_eq!(budget.calls.lock().expect("calls lock poisoned").len(), 3);
+    }
+
+    fn budget_directive(
+        rate_per_second: f64,
+        capacity: u64,
+        max_reservoir_size: u32,
+        valid_until: Option<i64>,
+    ) -> pb::ControllerDirective {
+        pb::ControllerDirective {
+            directive: Some(controller_directive::Directive::ConnectionBudget(
+                pb::ConnectionBudgetDirective {
+                    rate_per_second,
+                    capacity,
+                    max_reservoir_size,
+                    valid_until: valid_until
+                        .map(|seconds| buffa_types::google::protobuf::Timestamp {
+                            seconds,
+                            nanos: 0,
+                            ..Default::default()
+                        })
+                        .into(),
+                    ..Default::default()
+                }
+                .into(),
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// The reservoir side of a budget, as the DSQL director applies it: the
+    /// target is `max(5, min(configured, max_reservoir_size, capacity))` and
+    /// the rate share becomes the fallback rate.
+    #[derive(Debug)]
+    struct ReservoirModel {
+        configured: u64,
+        applied: Mutex<(u64, Option<f64>)>,
+    }
+
+    #[async_trait]
+    impl ConnectionBudgetApplier for ReservoirModel {
+        async fn apply_budget(
+            &self,
+            rate_per_second: f64,
+            capacity: u64,
+            max_reservoir_size: u32,
+        ) -> Result<()> {
+            let target = self
+                .configured
+                .min(u64::from(max_reservoir_size))
+                .min(capacity)
+                .max(5);
+            *self.applied.lock().expect("applied lock poisoned") = (target, Some(rate_per_second));
+            Ok(())
+        }
+
+        fn available_connections(&self) -> u32 {
+            0
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum BudgetEvent {
+        Directive {
+            rate_per_second: f64,
+            capacity: u64,
+            max_reservoir_size: u32,
+            /// Seconds from now; negative is a share already past its expiry.
+            valid_for: Option<i64>,
+        },
+        /// A stream drop or a failed reconnect.
+        StreamLost,
+    }
+
+    fn budget_event() -> impl proptest::strategy::Strategy<Value = BudgetEvent> {
+        use proptest::prelude::*;
+        prop_oneof![
+            (
+                0.5f64..200.0,
+                0u64..400,
+                0u32..10_000,
+                proptest::option::of(-3_600i64..3_600)
+            )
+                .prop_map(
+                    |(rate_per_second, capacity, max_reservoir_size, valid_for)| {
+                        BudgetEvent::Directive {
+                            rate_per_second,
+                            capacity,
+                            max_reservoir_size,
+                            valid_for,
+                        }
+                    }
+                ),
+            Just(BudgetEvent::StreamLost),
+        ]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(100))]
+
+        // Feature: shard-placement-membership, Property 8: A connection budget share holds until the next directive
+        #[test]
+        fn a_budget_share_holds_until_the_next_directive(
+            configured in 5u64..200,
+            events in proptest::collection::vec(budget_event(), 1..40),
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let model = Arc::new(ReservoirModel {
+                configured,
+                applied: Mutex::new((configured, None)),
+            });
+            let config = config();
+            let shard_owner = Arc::new(RwLock::new(ShardOwner::new(4)));
+            let client = MembershipClient::new(
+                config.clone(),
+                Arc::new(TestShardLifecycle {
+                    store: Arc::new(InMemoryStore::default()),
+                    shard_owner: Arc::clone(&shard_owner),
+                    owner_identity: config.owner_identity(),
+                    node_endpoint: config.node_endpoint.as_authority(),
+                    inflight_transitions: AtomicUsize::new(0),
+                    pending_wft_replies: AtomicUsize::new(0),
+                }),
+                shard_owner,
+                Arc::new(RuntimeDrain::default()),
+                Arc::clone(&model) as Arc<dyn ConnectionBudgetApplier>,
+            );
+            let mut expected = (configured, None);
+            for event in events {
+                match event {
+                    BudgetEvent::Directive {
+                        rate_per_second,
+                        capacity,
+                        max_reservoir_size,
+                        valid_for,
+                    } => {
+                        let now = OffsetDateTime::now_utc().unix_timestamp();
+                        runtime
+                            .block_on(client.handle_directive(budget_directive(
+                                rate_per_second,
+                                capacity,
+                                max_reservoir_size,
+                                valid_for.map(|seconds| now + seconds),
+                            )))
+                            .unwrap();
+                        let target = configured
+                            .min(u64::from(max_reservoir_size))
+                            .min(capacity)
+                            .max(5);
+                        expected = (target, Some(rate_per_second));
+                    }
+                    BudgetEvent::StreamLost => {
+                        client.report_stale_budget();
+                    }
+                }
+                let applied = *model.applied.lock().expect("applied lock poisoned");
+                proptest::prop_assert_eq!(applied, expected);
+            }
+        }
     }
 }

@@ -112,17 +112,6 @@ def runtime_policies(project):
             "property": "table_arn",
             "resource_suffixes": [""],
         },
-        {
-            "name": "dsql-connection-lease",
-            "actions": [
-                "dynamodb:GetItem",
-                "dynamodb:PutItem",
-                "dynamodb:UpdateItem",
-            ],
-            "dependency": "dynamodb-" + project + "-dsql-conn-lease",
-            "property": "table_arn",
-            "resource_suffixes": [""],
-        },
     ]
 
 

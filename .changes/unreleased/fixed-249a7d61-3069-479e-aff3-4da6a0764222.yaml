@@ -1,0 +1,5 @@
+kind: fixed
+body: A node now holds no more DSQL connections than its target while all of them are in use, rather than opening more as they are checked out.
+time: 2026-11-06T18:55:44.293244+00:00
+custom:
+    Slice: 249a7d61-3069-479e-aff3-4da6a0764222

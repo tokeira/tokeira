@@ -628,7 +628,6 @@ fn the_shipped_set_evaluates_with_managed_defaults() {
         keys,
         [
             "infrastructure.dsql.admin_role_arn",
-            "infrastructure.dsql.conn_lease_table",
             "infrastructure.dsql.endpoint",
             "infrastructure.dsql.rate_limiter_table",
             "infrastructure.dsql.region",
@@ -659,7 +658,6 @@ fn assert_dsql_identities(output: &EvaluatedDefinition<DecodedKind>) {
         [
             "admin_role",
             "cluster",
-            "conn_lease",
             "connection_endpoint",
             "management_endpoint",
             "rate_limiter",
@@ -835,7 +833,6 @@ fn selecting_preexisting_dsql_keeps_identities_and_canonical_writeback() {
             keys,
             [
                 "infrastructure.dsql.admin_role_arn",
-                "infrastructure.dsql.conn_lease_table",
                 "infrastructure.dsql.endpoint",
                 "infrastructure.dsql.rate_limiter_table",
                 "infrastructure.dsql.region",

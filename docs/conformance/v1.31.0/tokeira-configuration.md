@@ -405,7 +405,7 @@ All accepted production leaves are listed below. Fields are startup-static; chan
 | `emergency.freeze_projection` | emergency | `false` | no | yes | — | Emergency-only restriction that freezes projection advancement. |
 | `infrastructure.cluster_name` | infrastructure | `"tokeira-local"` | no | yes | — | Stable cluster label used in operator output and telemetry. |
 | `infrastructure.dsql.admin_role_arn` | infrastructure | `<unset>` | no | yes | — | Provisioning identity for DSQL administrative operations. |
-| `infrastructure.dsql.conn_lease_table` | infrastructure | `<unset>` | no | yes | — | Provisioned DynamoDB table for distributed connection-slot leases. |
+| `infrastructure.dsql.conn_lease_table` | infrastructure | `<unset>` | no | yes | — | No longer used; still accepted so existing configurations load, ignored with a warning at startup. |
 | `infrastructure.dsql.endpoint` | infrastructure | `<unset>` | yes | yes | — | Required when storage is dsql; normally written by the provisioner. |
 | `infrastructure.dsql.migration_policy` | infrastructure | `<unset>` | no | yes | — | Distributed DSQL startup schema policy: unset or validate_only checks the schema; automatic is refused. |
 | `infrastructure.dsql.rate_limiter_table` | infrastructure | `<unset>` | no | yes | — | Provisioned DynamoDB table for distributed rate limiting. |

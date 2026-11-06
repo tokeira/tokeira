@@ -518,8 +518,9 @@ mod tests {
     #[derive(Debug)]
     struct NoopBudgetApplier;
 
+    #[async_trait::async_trait]
     impl ConnectionBudgetApplier for NoopBudgetApplier {
-        fn apply_budget(
+        async fn apply_budget(
             &self,
             _rate_per_second: f64,
             _capacity: u64,

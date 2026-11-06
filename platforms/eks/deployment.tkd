@@ -276,15 +276,6 @@ fn deployment(cfg: Eks, cx: Context) -> Deployment {
             ttl: Some("ttl_epoch".into()),
         },
     );
-    let conn_lease = dsql_module.resource(
-        "conn-lease",
-        DynamoDbTable {
-            table: format!("{}-dsql-conn-lease", cx.project_name),
-            region: cfg.aws.region.clone(),
-            hash_key: "pk".into(),
-            ttl: Some("ttl_epoch".into()),
-        },
-    );
     d.writeback("infrastructure.storage", "dsql");
     d.writeback(
         "infrastructure.dsql.endpoint",
@@ -294,10 +285,6 @@ fn deployment(cfg: Eks, cx: Context) -> Deployment {
     d.writeback(
         "infrastructure.dsql.rate_limiter_table",
         rate_limiter.output("table_name"),
-    );
-    d.writeback(
-        "infrastructure.dsql.conn_lease_table",
-        conn_lease.output("table_name"),
     );
 
     // The control plane waits for its storage/network foundation; the
@@ -354,7 +341,7 @@ fn deployment(cfg: Eks, cx: Context) -> Deployment {
         cx.project_name.clone(),
         "tokeirad".into(),
         helpers::runtime_policies(cx.project_name.clone()),
-        vec![dsql_cluster, rate_limiter, conn_lease],
+        vec![dsql_cluster, rate_limiter],
     );
     let controller_identity = helpers::pod_role(
         services_module,
@@ -364,7 +351,7 @@ fn deployment(cfg: Eks, cx: Context) -> Deployment {
         cx.project_name.clone(),
         "tokeira-controller".into(),
         helpers::runtime_policies(cx.project_name.clone()),
-        vec![dsql_cluster, rate_limiter, conn_lease],
+        vec![dsql_cluster, rate_limiter],
     );
     let autoscaler_identity = helpers::pod_role(
         services_module,
@@ -374,7 +361,7 @@ fn deployment(cfg: Eks, cx: Context) -> Deployment {
         cx.project_name.clone(),
         "tokeira-autoscaler".into(),
         helpers::runtime_policies(cx.project_name.clone()),
-        vec![dsql_cluster, rate_limiter, conn_lease],
+        vec![dsql_cluster, rate_limiter],
     );
     let mimir_identity = helpers::pod_role(
         services_module,

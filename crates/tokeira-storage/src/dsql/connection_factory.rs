@@ -218,6 +218,10 @@ pub enum ConnectionFactoryError {
     /// The database rejected the connection handshake.
     #[error("DSQL database handshake failed: {0}")]
     Database(String),
+    /// The cluster refused the connection: its connection rate is exceeded
+    /// (SQLSTATE `53400`) or it is at its connection limit (`53300`).
+    #[error("DSQL refused the connection: {0}")]
+    Refused(String),
     /// The attempt did not finish within the connect timeout.
     #[error("DSQL connection attempt did not finish within {0:?}")]
     Timeout(Duration),
@@ -228,7 +232,18 @@ impl ConnectionFactoryError {
     /// messages. Flattening everything into `sqlx::Error` would hide whether
     /// the failure came from local configuration, IAM token generation, TCP/TLS,
     /// or the database handshake.
+    ///
+    /// A refusal is recognised by its SQLSTATE before the error's type is
+    /// looked at: the connector reports a refusal during the startup handshake
+    /// as a connection error, with the server's error response inside it
+    /// (aurora-dsql-sqlx-connector 0.2.2, `src/connection.rs`).
     pub fn from_dsql_error(error: DsqlError) -> Self {
+        // The SQLSTATE leads the message, so an operator (and a log query)
+        // can tell a rate refusal from a full cluster without parsing the
+        // connector's wording.
+        if let Some(code) = refusal_sqlstate(&error) {
+            return Self::Refused(format!("SQLSTATE {code}: {error}"));
+        }
         match error {
             DsqlError::ConfigError(error) => Self::Config(error.to_string()),
             DsqlError::TokenError(error) => Self::Token(error.to_string()),
@@ -249,9 +264,38 @@ impl ConnectionFactoryError {
             Self::Token(_) => "token",
             Self::Connection(_) => "connection",
             Self::Database(_) => "database",
+            Self::Refused(_) => "refused",
             Self::Timeout(_) => "timeout",
         }
     }
+}
+
+/// SQLSTATE DSQL answers a connect with past its connection rate.
+pub const SQLSTATE_CONNECTION_RATE_EXCEEDED: &str = "53400";
+/// SQLSTATE DSQL answers a connect with at its connection limit.
+pub const SQLSTATE_TOO_MANY_CONNECTIONS: &str = "53300";
+
+/// The refusal SQLSTATE carried by `error` or any error in its source chain.
+///
+/// Only a database error response carries a SQLSTATE, and only these two
+/// codes mean the cluster refused the connection for its limits. The code is
+/// read from the response, never from a message, so no message text can turn
+/// another failure into a refusal.
+fn refusal_sqlstate(error: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+    let mut cause = Some(error);
+    while let Some(current) = cause {
+        if let Some(sqlx::Error::Database(database)) = current.downcast_ref::<sqlx::Error>() {
+            match database.code().as_deref() {
+                Some(SQLSTATE_CONNECTION_RATE_EXCEEDED) => {
+                    return Some(SQLSTATE_CONNECTION_RATE_EXCEEDED);
+                }
+                Some(SQLSTATE_TOO_MANY_CONNECTIONS) => return Some(SQLSTATE_TOO_MANY_CONNECTIONS),
+                _ => {}
+            }
+        }
+        cause = current.source();
+    }
+    None
 }
 
 #[async_trait]
@@ -304,6 +348,80 @@ mod tests {
         APPLICATION_NAME_PREFIX, CREDENTIALS_REFRESH_MARGIN, ConnectionFactory,
         ConnectionFactoryError, usable_until_refresh,
     };
+
+    /// A server error response, as sqlx reports one, with a chosen SQLSTATE.
+    #[derive(Debug)]
+    struct ServerError {
+        code: String,
+        message: String,
+    }
+
+    impl std::fmt::Display for ServerError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for ServerError {}
+
+    impl sqlx::error::DatabaseError for ServerError {
+        fn message(&self) -> &str {
+            &self.message
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(std::borrow::Cow::Borrowed(self.code.as_str()))
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn server_error(code: &str, message: &str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(ServerError {
+            code: code.to_owned(),
+            message: message.to_owned(),
+        }))
+    }
+
+    /// An error whose source is `inner`, as a wrapper layer reports it.
+    #[derive(Debug)]
+    struct Wrapped(sqlx::Error);
+
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("wrapped")
+        }
+    }
+
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    /// Every way the connector can carry a server error response.
+    fn wrappings(code: &str, message: &str) -> [DsqlError; 4] {
+        [
+            DsqlError::ConnectionError(server_error(code, message)),
+            DsqlError::DatabaseError(server_error(code, message)),
+            DsqlError::ConfigError(Box::new(Wrapped(server_error(code, message)))),
+            DsqlError::TokenError(Box::new(Wrapped(server_error(code, message)))),
+        ]
+    }
 
     // The prefix travels as a query value, where `+` decodes to a space and `&`
     // ends it, and PostgreSQL truncates `application_name` past 63 bytes.
@@ -395,6 +513,14 @@ mod tests {
             ConnectionFactoryError::Timeout(Duration::from_secs(1)).kind(),
             "timeout"
         );
+        assert_eq!(
+            ConnectionFactoryError::from_dsql_error(DsqlError::ConnectionError(server_error(
+                "53400",
+                "rate exceeded"
+            )))
+            .kind(),
+            "refused"
+        );
     }
 
     proptest! {
@@ -409,6 +535,28 @@ mod tests {
             ];
             let categories = errors.map(|error| ConnectionFactoryError::from_dsql_error(error).kind());
             prop_assert_eq!(categories, ["config", "token", "connection", "database"]);
+        }
+
+        // Feature: dsql-reservoir-redesign, Property 14: Refused Connects Are Classified by SQLSTATE
+        #[test]
+        fn refused_connects_are_classified_by_sqlstate(
+            code in prop_oneof![
+                Just("53400".to_owned()),
+                Just("53300".to_owned()),
+                "[0-9A-Z]{5}",
+            ],
+            message in any::<String>(),
+        ) {
+            let refused = code == "53400" || code == "53300";
+            let expected = ["connection", "database", "config", "token"];
+            for (error, otherwise) in wrappings(&code, &message).into_iter().zip(expected) {
+                let classified = ConnectionFactoryError::from_dsql_error(error);
+                prop_assert_eq!(classified.kind(), if refused { "refused" } else { otherwise });
+                if refused {
+                    let expected = format!("DSQL refused the connection: SQLSTATE {code}");
+                    prop_assert!(classified.to_string().starts_with(&expected));
+                }
+            }
         }
     }
 }

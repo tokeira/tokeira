@@ -347,6 +347,33 @@ connection, and checks `SELECT 1`. It does not provision a cluster or change sch
 it does not use either URL gate above. It proves the connector path that the URL-gated
 suites bypass.
 
+## Reservoir load
+
+`dsql_reservoir_live` drives reservoirs through the production `ConnectionFactory` with the
+same two variables: a burst of operations through a small reservoir, a connection storm from
+eight reservoirs refilling past the cluster's connection burst, and 24 reservoirs of 50
+starting together through one shared rate limiter table. The shared start also needs
+`TOKEIRA_DSQL_TEST_RATE_LIMITER_TABLE`, a DynamoDB table in the same Region with a string
+partition key named `pk`, and returns early without it. Use a throwaway cluster and table:
+the storm bypasses the shared rate limiter, and each test spends the cluster's connection
+burst, so run them one at a time. Each prints what it measured. The cluster's burst takes
+ten seconds to refill, so a shared start that follows the storm sooner reports connects
+refused for the rate: the shared table does not know what the storm spent.
+
+```bash
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live \
+  --test-threads 1 --no-capture --test dsql_reservoir_live
+```
+
+The arrival-time bucket's DynamoDB tests run against the same table when
+`TOKEIRA_DSQL_TEST_RATE_LIMITER_TABLE` and `TOKEIRA_DSQL_TEST_REGION` are set, or against
+DynamoDB Local when `TOKEIRA_DYNAMODB_LOCAL_ENDPOINT` names one, and return early otherwise:
+
+```bash
+cargo nextest run -p tokeira-storage --features dsql --locked \
+  -E 'test(/distributed_bucket::tests::dynamodb::/)'
+```
+
 ## Schema-bootstrap recovery
 
 The ignored `dsql_schema_bootstrap` test requires both
@@ -413,13 +440,13 @@ cargo nextest run -p tokeira-storage --features dsql-integration --locked --prof
 
 The three ignored `distributed_schema_live_tests` in `tokeira-engine` start a
 listener-backed distributed node, as `tokeirad` with `infrastructure.storage = "dsql"`
-starts, against an existing cluster and the two DynamoDB tables that coordinate its
-connections. Set `TOKEIRA_DSQL_DISTRIBUTED_ENDPOINT`, `TOKEIRA_DSQL_DISTRIBUTED_REGION`,
-`TOKEIRA_DSQL_DISTRIBUTED_RATE_LIMITER_TABLE` and `TOKEIRA_DSQL_DISTRIBUTED_CONN_LEASE_TABLE`;
-each test fails when one is unset. Run these tests serially (`--test-threads 1`). Use a
-separate fixture from placement suites that deliberately use a different home count.
-Each table needs only a string partition key named `pk`. The standard AWS credential chain must supply an identity authorized for the
-connector's `admin` connection and for both tables.
+starts, against an existing cluster and the DynamoDB rate limiter table its nodes share.
+Set `TOKEIRA_DSQL_DISTRIBUTED_ENDPOINT`, `TOKEIRA_DSQL_DISTRIBUTED_REGION` and
+`TOKEIRA_DSQL_DISTRIBUTED_RATE_LIMITER_TABLE`; each test fails when one is unset. Run these
+tests serially (`--test-threads 1`). Use a separate fixture from placement suites that
+deliberately use a different home count. The table needs only a string partition key named
+`pk`. The standard AWS credential chain must supply an identity authorized for the
+connector's `admin` connection and for the table.
 
 ```bash
 cargo nextest run -p tokeira-engine --features dsql-integration --lib --locked --profile dsql-live \
@@ -431,15 +458,14 @@ the release reads, so the tests run in any order and again on the same cluster. 
 run on a new cluster applies the whole corpus.
 - One test forgets the target's ledger row, and one records a version past the maximum
   readable one. Each start must be refused, and must leave as it found them the ledger,
-  the compatibility record, the shard leases, the connection-slot blocks and both
-  listener addresses. Each test then restores the ledger.
+  the compatibility record, the shard leases and both listener addresses. Each test then restores the ledger.
 - The third starts a node on the target schema and calls `GetSystemInfo`.
 
 ## Single-node claim
 
 The ignored `single_node_claim_live_tests` test in `tokeira-engine` starts listener-backed
-distributed nodes without a controller on one cluster, with the environment and the two
-tables of the distributed schema check's tests. Run it after those tests, so that a new
+distributed nodes without a controller on one cluster, with the environment and the
+table of the distributed schema check's tests. Run it after those tests, so that a new
 cluster's first migration doesn't count against its time limit.
 
 ```bash
@@ -449,8 +475,8 @@ cargo nextest run -p tokeira-engine --features dsql-integration --lib --locked -
 
 The test removes the `tokeirad-owner` claim, then:
 - starts node A, then node B beside it. B tries for 80 s and refuses, naming A's claim. It
-  leaves both its listener addresses free, the ledger, the shard leases and A's claim as
-  they were, and none of its connection-slot blocks owned;
+  leaves both its listener addresses free, and the ledger, the shard leases and A's claim as
+  they were;
 - stops A cleanly, which releases the claim, and starts B at once;
 - starts A again and crashes it without a release. B serves only once A's hold has
   expired and 5 minutes more have passed on the database's clock;

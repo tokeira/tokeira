@@ -1,0 +1,5 @@
+kind: changed
+body: DSQL connections now live 50 to 54 minutes instead of 10 to 12, so a fleet spends far less of the cluster's connection rate replacing them.
+time: 2026-11-06T18:55:41.293244+00:00
+custom:
+    Slice: 42e7408d-35fe-4523-8421-ea6c0c49b092

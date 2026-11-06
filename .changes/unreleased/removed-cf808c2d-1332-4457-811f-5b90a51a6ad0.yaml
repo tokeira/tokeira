@@ -1,0 +1,5 @@
+kind: removed
+body: Nodes no longer lease DSQL connection slots, and platforms no longer provision that table; `infrastructure.dsql.conn_lease_table` still loads and is ignored with a warning.
+time: 2026-11-06T18:55:43.293244+00:00
+custom:
+    Slice: cf808c2d-1332-4457-811f-5b90a51a6ad0

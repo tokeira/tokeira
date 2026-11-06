@@ -31,11 +31,11 @@
 
   <!-- reservoir -->
   <rect x="964" y="184" width="880" height="180" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".18" stroke-width="1.4"/>
-  <text x="988" y="216" class="boxtitle">Reservoir — four background keepers</text>
-  <text x="988" y="244" class="small"><tspan font-weight="600" fill="#1B1714">Refiller</tspan> creates connections — a slot first, then a creation token, never the reverse.</text>
+  <text x="988" y="216" class="boxtitle">Reservoir — three keepers and a live count</text>
+  <text x="988" y="244" class="small"><tspan font-weight="600" fill="#1B1714">Refiller</tspan> creates connections — a place in the live count first, then a creation admission.</text>
   <text x="988" y="266" class="small"><tspan font-weight="600" fill="#1B1714">Scanner</tspan> retires by lifetime and guard window, in bounded batches that cannot drain the pool.</text>
   <text x="988" y="288" class="small"><tspan font-weight="600" fill="#1B1714">Return processor</tspan> honors the caller's marked_bad flag and the guard window — it does not ping.</text>
-  <text x="988" y="310" class="small"><tspan font-weight="600" fill="#1B1714">Leak detector</tspan> flags checkouts held past 30s, scanning every 5s.</text>
+  <text x="988" y="310" class="small"><tspan font-weight="600" fill="#1B1714">Live count</tspan> caps ready, checked-out and creating connections at the target.</text>
   <text x="988" y="340" class="chip">⏱ reservoir_utilization_ratio · pool_connections_total</text>
 
   <!-- fork -->
@@ -50,23 +50,23 @@
   <rect x="56" y="580" width="880" height="560" rx="12" fill="#FBF9F5" stroke="#1B1714" stroke-opacity=".16" stroke-width="1.4"/>
 
   <rect x="88" y="612" width="816" height="128" rx="10" fill="#F7F0DC" stroke="#E3D394" stroke-width="1.3"/>
-  <text x="112" y="644" class="boxtitle">Slot blocks — DynamoDB</text>
-  <text x="112" y="672" class="small">Capacity claimed in blocks of 50 under 60s leases, renewed every 20s. The fleet's</text>
-  <text x="112" y="692" class="small">total footprint stays under the account envelope because every slot is leased.</text>
-  <text x="112" y="720" class="chip">⏱ slot_blocks_owned</text>
+  <text x="112" y="644" class="boxtitle">Fleet capacity — controller budgets</text>
+  <text x="112" y="672" class="small">The placement controller divides the cluster's 10,000 connections among its nodes;</text>
+  <text x="112" y="692" class="small">each node holds at most its share, and keeps it through a controller outage.</text>
+  <text x="112" y="720" class="chip">⏱ reservoir_live_connections</text>
 
   <rect x="88" y="768" width="816" height="128" rx="10" fill="#F7F0DC" stroke="#E3D394" stroke-width="1.3"/>
-  <text x="112" y="800" class="boxtitle">Creation token bucket — DynamoDB</text>
-  <text x="112" y="828" class="small">One shared row, conditionally written: cluster-wide connection-creation rate</text>
-  <text x="112" y="848" class="small">(default 100/s, burst 1000). Every node's refiller drinks from the same bucket.</text>
-  <text x="112" y="876" class="chip">⏱ rate_limiter_tokens_remaining</text>
+  <text x="112" y="800" class="boxtitle">Creation rate limiter — DynamoDB</text>
+  <text x="112" y="828" class="small">One arrival time per cluster, conditionally updated: connection-creation rate</text>
+  <text x="112" y="848" class="small">(100/s, burst 1000). Every node's refiller is admitted against the same item.</text>
+  <text x="112" y="876" class="chip">⏱ pool_rate_limiter_tokens · pool_rate_limiter_fallback</text>
 
   <rect x="88" y="924" width="816" height="96" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".16"/>
-  <text x="112" y="956" class="boxtitle" font-size="15">Mandatory, not optional</text>
-  <text x="112" y="982" class="small">Distributed mode refuses to run without its DynamoDB coordination — there is no local fallback.</text>
+  <text x="112" y="956" class="boxtitle" font-size="15">Mandatory, with a fallback</text>
+  <text x="112" y="982" class="small">A node does not start without its table; if DynamoDB stops answering, it admits at its share locally.</text>
 
   <rect x="88" y="1048" width="816" height="64" rx="10" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".45"/>
-  <text x="112" y="1074" class="small"><tspan font-weight="600" fill="#9A4A2C">Why:</tspan> many nodes, one Aurora DSQL account envelope — the budget must live somewhere every node can see.</text>
+  <text x="112" y="1074" class="small"><tspan font-weight="600" fill="#9A4A2C">Why:</tspan> many nodes, one Aurora DSQL cluster — its creation rate must live somewhere every node can see.</text>
 
   <!-- EMBEDDED half -->
   <text x="964" y="560" class="section">EMBEDDED — ONE OWNER, NO DYNAMODB</text>
@@ -86,7 +86,7 @@
 
   <rect x="996" y="924" width="816" height="96" rx="10" fill="#FFFFFF" stroke="#1B1714" stroke-opacity=".16"/>
   <text x="1020" y="956" class="boxtitle" font-size="15">The embedded reservoir</text>
-  <text x="1020" y="982" class="small">Deadline-aware warmup and shutdown wrap the same four keepers — no idle machinery, no cloud.</text>
+  <text x="1020" y="982" class="small">Deadline-aware warmup and shutdown wrap the same keepers — no idle machinery, no cloud.</text>
 
   <rect x="996" y="1048" width="816" height="64" rx="10" fill="#F6EDE5" stroke="#B85C38" stroke-opacity=".45"/>
   <text x="1020" y="1074" class="small"><tspan font-weight="600" fill="#9A4A2C">Why:</tspan> one process owns the cluster — the budget can be an atomic, and exclusion belongs to the database itself.</text>

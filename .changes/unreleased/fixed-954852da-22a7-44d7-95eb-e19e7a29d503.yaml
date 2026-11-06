@@ -1,0 +1,5 @@
+kind: fixed
+body: A node now starts serving with the DSQL connections it holds after its 30-second warmup, rather than failing to start.
+time: 2026-11-06T18:55:46.293244+00:00
+custom:
+    Slice: 954852da-22a7-44d7-95eb-e19e7a29d503

@@ -26,6 +26,7 @@ pub const DSQL_POOL_CONNECTIONS_RETURNED_TOTAL: &str =
     "tokeira_dsql_pool_connections_returned_total";
 pub const DSQL_POOL_RATE_LIMITER_TOKENS: &str = "tokeira_dsql_pool_rate_limiter_tokens";
 pub const DSQL_POOL_RATE_LIMITER_RATE: &str = "tokeira_dsql_pool_rate_limiter_rate";
+pub const DSQL_POOL_RATE_LIMITER_FALLBACK: &str = "tokeira_dsql_pool_rate_limiter_fallback";
 pub const DSQL_POOL_CLASS_BUDGET_TOTAL: &str = "tokeira_dsql_pool_class_budget_total";
 pub const DSQL_POOL_CLASS_IN_USE: &str = "tokeira_dsql_pool_class_in_use";
 pub const DSQL_POOL_CLASS_WAITERS: &str = "tokeira_dsql_pool_class_waiters";
@@ -40,6 +41,7 @@ pub const DSQL_OPERATION_TOTAL: &str = "tokeira_storage_dsql_operation_total";
 pub const DSQL_RESERVOIR_READY_CONNECTIONS: &str = "tokeira_dsql_reservoir_ready_connections";
 pub const DSQL_RESERVOIR_IN_FLIGHT: &str = "tokeira_dsql_reservoir_in_flight";
 pub const DSQL_RESERVOIR_TARGET_CONNECTIONS: &str = "tokeira_dsql_reservoir_target_connections";
+pub const DSQL_RESERVOIR_LIVE_CONNECTIONS: &str = "tokeira_dsql_reservoir_live_connections";
 pub const DSQL_RESERVOIR_REFILL_ERRORS_TOTAL: &str = "tokeira_dsql_reservoir_refill_errors_total";
 pub const DSQL_RESERVOIR_REFILL_DURATION_SECONDS: &str =
     "tokeira_dsql_reservoir_refill_duration_seconds";
@@ -66,8 +68,6 @@ pub const DSQL_SHARD_CONFLICT_TOTAL: &str = "tokeira_storage_dsql_shard_conflict
 pub const DSQL_SHARD_DURATION_SECONDS: &str = "tokeira_storage_dsql_shard_duration_seconds";
 pub const DSQL_CONNECTION_ERROR_TOTAL: &str = "tokeira_dsql_connection_error_total";
 pub const DSQL_ERROR_CODE_TOTAL: &str = "tokeira_dsql_error_code_total";
-pub const DSQL_SLOT_BLOCKS_OWNED: &str = "tokeira_dsql_slot_blocks_owned";
-pub const DSQL_SLOT_BLOCK_LOST_TOTAL: &str = "tokeira_dsql_slot_block_lost_total";
 pub const DSQL_CONNECTION_LEAK_DETECTED_TOTAL: &str = "tokeira_dsql_connection_leak_detected_total";
 pub const DSQL_CONNECTION_LEAK_SUSPECTS: &str = "tokeira_dsql_connection_leak_suspects";
 pub const DSQL_CONNECTION_CHECKOUT_OVERDUE_SECONDS: &str =
@@ -100,6 +100,7 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (DSQL_POOL_CONNECTIONS_RETURNED_TOTAL, MetricType::Counter),
     (DSQL_POOL_RATE_LIMITER_TOKENS, MetricType::Gauge),
     (DSQL_POOL_RATE_LIMITER_RATE, MetricType::Gauge),
+    (DSQL_POOL_RATE_LIMITER_FALLBACK, MetricType::Gauge),
     (DSQL_POOL_CLASS_BUDGET_TOTAL, MetricType::Gauge),
     (DSQL_POOL_CLASS_IN_USE, MetricType::Gauge),
     (DSQL_POOL_CLASS_WAITERS, MetricType::Gauge),
@@ -122,6 +123,7 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (DSQL_RESERVOIR_READY_CONNECTIONS, MetricType::Gauge),
     (DSQL_RESERVOIR_IN_FLIGHT, MetricType::Gauge),
     (DSQL_RESERVOIR_TARGET_CONNECTIONS, MetricType::Gauge),
+    (DSQL_RESERVOIR_LIVE_CONNECTIONS, MetricType::Gauge),
     (DSQL_RESERVOIR_REFILL_ERRORS_TOTAL, MetricType::Counter),
     (
         DSQL_RESERVOIR_REFILL_DURATION_SECONDS,
@@ -160,8 +162,6 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (DSQL_SHARD_DURATION_SECONDS, MetricType::DurationHistogram),
     (DSQL_CONNECTION_ERROR_TOTAL, MetricType::Counter),
     (DSQL_ERROR_CODE_TOTAL, MetricType::Counter),
-    (DSQL_SLOT_BLOCKS_OWNED, MetricType::Gauge),
-    (DSQL_SLOT_BLOCK_LOST_TOTAL, MetricType::Counter),
     (DSQL_CONNECTION_LEAK_DETECTED_TOTAL, MetricType::Counter),
     (DSQL_CONNECTION_LEAK_SUSPECTS, MetricType::Gauge),
     (
@@ -242,6 +242,12 @@ pub fn record_dsql_pool_rate_limiter(tokens: f64, rate: f64) {
     gauge!(DSQL_POOL_RATE_LIMITER_RATE).set(rate);
 }
 
+/// One while connection creations are admitted by the process-local fallback
+/// limiter because DynamoDB failed, zero once DynamoDB answers again.
+pub fn set_dsql_pool_rate_limiter_fallback(active: bool) {
+    gauge!(DSQL_POOL_RATE_LIMITER_FALLBACK).set(if active { 1.0 } else { 0.0 });
+}
+
 pub fn record_dsql_pool_class_budget(
     class: DbClassLabel,
     total: usize,
@@ -309,6 +315,11 @@ pub fn set_dsql_reservoir_ready_connections(count: usize) {
 
 pub fn set_dsql_reservoir_target_connections(count: usize) {
     gauge!(DSQL_RESERVOIR_TARGET_CONNECTIONS).set(count as f64);
+}
+
+/// Connections the reservoir holds: ready, checked out and being created.
+pub fn set_dsql_reservoir_live_connections(count: usize) {
+    gauge!(DSQL_RESERVOIR_LIVE_CONNECTIONS).set(count as f64);
 }
 
 pub fn record_dsql_reservoir_refill_error(reason: &'static str) {
@@ -406,14 +417,6 @@ pub fn record_dsql_connection_error(error_kind: &'static str) {
 
 pub fn record_dsql_error_code(sqlstate: &str) {
     counter!(DSQL_ERROR_CODE_TOTAL, "sqlstate" => sqlstate.to_owned()).increment(1);
-}
-
-pub fn set_dsql_slot_blocks_owned(count: usize) {
-    gauge!(DSQL_SLOT_BLOCKS_OWNED).set(count as f64);
-}
-
-pub fn record_dsql_slot_block_lost() {
-    counter!(DSQL_SLOT_BLOCK_LOST_TOTAL).increment(1);
 }
 
 pub fn record_dsql_connection_leak_detected(class: DbClassLabel, call_site: &'static str) {
@@ -627,8 +630,8 @@ mod tests {
             record_dsql_shard_duration(4, std::time::Duration::from_millis(16));
             record_dsql_connection_error("timeout");
             record_dsql_error_code("40001");
-            set_dsql_slot_blocks_owned(1);
-            record_dsql_slot_block_lost();
+            set_dsql_reservoir_live_connections(5);
+            set_dsql_pool_rate_limiter_fallback(true);
             record_dsql_connection_leak_detected(DbClassLabel::Commit, "commit_transition");
             resolve_dsql_connection_leak_suspect(
                 DbClassLabel::Commit,
@@ -668,8 +671,8 @@ mod tests {
         assert!(snapshot.contains_key(DSQL_SHARD_DURATION_SECONDS));
         assert!(snapshot.contains_key(DSQL_CONNECTION_ERROR_TOTAL));
         assert!(snapshot.contains_key(DSQL_ERROR_CODE_TOTAL));
-        assert!(snapshot.contains_key(DSQL_SLOT_BLOCKS_OWNED));
-        assert!(snapshot.contains_key(DSQL_SLOT_BLOCK_LOST_TOTAL));
+        assert!(snapshot.contains_key(DSQL_RESERVOIR_LIVE_CONNECTIONS));
+        assert!(snapshot.contains_key(DSQL_POOL_RATE_LIMITER_FALLBACK));
         assert!(snapshot.contains_key(DSQL_CONNECTION_LEAK_DETECTED_TOTAL));
         assert!(snapshot.contains_key(DSQL_CONNECTION_LEAK_SUSPECTS));
         assert!(snapshot.contains_key(DSQL_CONNECTION_CHECKOUT_OVERDUE_SECONDS));

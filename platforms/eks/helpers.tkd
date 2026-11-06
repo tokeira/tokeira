@@ -120,17 +120,6 @@ pub fn runtime_policies(project: String) -> Vec<DependentInlinePolicy> {
             property: "table_arn".into(),
             resource_suffixes: vec!["".into()],
         },
-        DependentInlinePolicy {
-            name: "dsql-connection-lease".into(),
-            actions: vec![
-                "dynamodb:GetItem".into(),
-                "dynamodb:PutItem".into(),
-                "dynamodb:UpdateItem".into(),
-            ],
-            dependency: format!("dynamodb-{}-dsql-conn-lease", project),
-            property: "table_arn".into(),
-            resource_suffixes: vec!["".into()],
-        },
     ]
 }
 

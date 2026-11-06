@@ -215,8 +215,9 @@ pub struct DsqlInfraConfig {
     /// Written back by `tkr infra apply --module dsql`.
     #[serde(default)]
     pub rate_limiter_table: Option<String>,
-    /// DynamoDB table name for distributed connection slot leasing.
-    /// Written back by `tkr infra apply --module dsql`.
+    /// No longer used: the DynamoDB table of the connection slot lease DSQL
+    /// nodes used to take. Still accepted so existing configurations load;
+    /// the server ignores the value and warns once at startup that it is set.
     #[serde(default)]
     pub conn_lease_table: Option<String>,
     /// Schema policy for listener-backed distributed DSQL startup. Absent or

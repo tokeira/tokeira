@@ -1,0 +1,5 @@
+kind: changed
+body: Nodes now share DSQL's connection rate through one DynamoDB item, and keep creating connections at their budget share while DynamoDB is unreachable.
+time: 2026-11-06T18:55:42.293244+00:00
+custom:
+    Slice: 9cf10e63-bafe-4b34-8495-44a8030b7f9f

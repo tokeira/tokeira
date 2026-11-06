@@ -30,7 +30,7 @@ graph TD
     end
 
     subgraph "Reservoir Core"
-        READY[Ready Channel<br/>async_channel bounded PhysicalConn<br/>capacity = 50]
+        READY[Ready Channel<br/>async_channel bounded PhysicalConn<br/>capacity = 2 x target_ready]
         RETURN_CH[Return Channel<br/>mpsc unbounded ReturnedConn]
     end
 
@@ -46,7 +46,7 @@ graph TD
     end
 
     subgraph "Connection Factory"
-        IAM[IAM Token Provider<br/>fresh token per connection]
+        IAM[IAM Token Provider<br/>fresh token per connection<br/>shared AWS credentials]
         FACTORY[ConnectionFactory<br/>DsqlConnectOptions + connector connect_with]
     end
 
@@ -78,6 +78,9 @@ graph TD
 6. **DynamoDB coordination is mandatory for DSQL.** No local-only fallback. Unreachable DynamoDB = startup failure.
 7. **No ping on return.** Lifetime check and bad-flag check only.
 8. **Every reserved slot is released exactly once.** Any path that drops a physical connection created after `acquire_slot()` must call `release_slot()` before the connection leaves the reservoir lifecycle.
+9. **A class permit travels with its connection.** A caller's class permit goes back to its class only after the return processor has put the connection back in the ready channel or retired it. Otherwise the next caller of that class could be admitted while the connection it needs is still on its way back, and find the reservoir empty although no more callers hold connections than the budgets allow.
+10. **A returned connection always fits in the ready channel.** The channel holds `2 × target_ready`: the refiller fills to `target_ready` ready connections, and the class budgets admit at most `target_ready` callers, each returning one connection. A return therefore never waits for room, and no healthy connection is retired for lack of it.
+11. **A connection an operation broke is retired, not reused.** Each storage operation runs inside `in_operation`, which records every connection the operation checks out. When the operation fails with an IO, TLS or protocol error, or the server ends the session with a FATAL error, every recorded connection is flagged broken, and the return processor, checkout and the expiry scanner each retire a flagged connection when they meet it. The flag is set after the operation's permit dropped, so a caller that checks the connection out in that window fails on it the same way and flags it again.
 
 
 ## Components and Interfaces
@@ -91,6 +94,7 @@ pub struct PhysicalConn {
     pub(crate) connection: PgConnection,  // raw, NOT PoolConnection<Postgres>
     pub(crate) created_at: Instant,
     pub(crate) lifetime: Duration,        // BASE_LIFETIME ± LIFETIME_JITTER
+    pub(crate) broken: BrokenFlag,        // set by a failed operation; shared by every holder
 }
 
 impl PhysicalConn {
@@ -106,7 +110,10 @@ pub struct ReturnedConn {
     pub(crate) connection: PgConnection,
     pub(crate) created_at: Instant,
     pub(crate) lifetime: Duration,
+    pub(crate) broken: BrokenFlag,
     pub(crate) marked_bad: bool,
+    // The caller's class permit, released by the return processor (invariant 9).
+    pub(crate) class_permit: Option<OwnedSemaphorePermit>,
 }
 ```
 
@@ -114,50 +121,52 @@ pub struct ReturnedConn {
 
 **Location:** `crates/tokeira-storage/src/dsql/connection_factory.rs` (new file)
 
-Creates raw `PgConnection` instances via IAM-authenticated TCP/TLS. Each call generates a fresh IAM token — no caching.
+Creates raw `PgConnection` instances via IAM-authenticated TCP/TLS. Each call signs a fresh IAM token for that connection alone; tokens are never cached.
+
+The AWS credentials that sign the tokens are shared by every connect. The factory builds the default credentials chain once and keeps the credentials it returns until five minutes before they expire, then fetches new ones; one connect fetches while concurrent connects wait for its result. The connector would otherwise build a new credentials chain for each connection, and its token signer asks the provider directly rather than through the SDK's credential cache, so every connect would fetch credentials from the ECS credentials endpoint or STS at up to the cluster's connection rate.
 
 ```rust
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const CREDENTIALS_REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
+
 pub struct ConnectionFactory {
-    endpoint: String,
+    pg_options: PgConnectOptions,         // endpoint, admin, postgres, port 5432, verify-full
     region: String,
+    credentials: Arc<CredentialCache>,    // shared by every clone
 }
 
 impl ConnectionFactory {
     pub async fn create_connection(&self) -> Result<PgConnection, ConnectionFactoryError> {
-        let conn_str = format!("postgres://admin@{}:5432/postgres?region={}", self.endpoint, self.region);
-        let options = DsqlConnectOptions::from_connection_string(&conn_str)
-            .map_err(|e| ConnectionFactoryError::Iam(e.into()))?;
+        let credentials = self.credentials.current(&self.region).await?;
+        // A static provider over the fetched credentials: the connector signs
+        // with them as they are.
+        let options = self.connect_options(Some(credentials))?;
         aurora_dsql_sqlx_connector::connection::connect_with(&options)
             .await
             .map_err(ConnectionFactoryError::from_dsql_error)
     }
 }
 
+/// Every reservoir connects through this bound, whichever factory it holds.
+pub(crate) async fn create_within_timeout(
+    factory: &dyn PhysicalConnectionFactory,
+) -> Result<PgConnection, ConnectionFactoryError> {
+    tokio::time::timeout(CONNECT_TIMEOUT, factory.create_connection())
+        .await
+        .unwrap_or(Err(ConnectionFactoryError::Timeout(CONNECT_TIMEOUT)))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectionFactoryError {
-    #[error("IAM token generation failed: {0}")] Iam(anyhow::Error),
-    #[error("TLS handshake failed: {0}")] Tls(anyhow::Error),
-    #[error("connection timed out: {0}")] Timeout(anyhow::Error),
-    #[error("connection refused: {0}")] Refused(anyhow::Error),
-    #[error("connection failed: {0}")] Other(anyhow::Error),
-}
-
-impl ConnectionFactoryError {
-    pub fn category(&self) -> &'static str {
-        match self { Self::Iam(_) => "iam", Self::Tls(_) => "tls",
-                     Self::Timeout(_) => "timeout", Self::Refused(_) => "refused",
-                     Self::Other(_) => "other" }
-    }
-
-    pub fn from_dsql_error(error: aurora_dsql_sqlx_connector::DsqlError) -> Self {
-        match error {
-            aurora_dsql_sqlx_connector::DsqlError::TokenError(err) => Self::Iam(err.into()),
-            aurora_dsql_sqlx_connector::DsqlError::ConnectionError(err) => classify_sqlx_connection_error(err),
-            other => Self::Other(other.into()),
-        }
-    }
+    #[error("DSQL connection configuration failed: {0}")] Config(String),
+    #[error("DSQL IAM token generation failed: {0}")] Token(String),
+    #[error("DSQL TCP/TLS connection failed: {0}")] Connection(String),
+    #[error("DSQL database handshake failed: {0}")] Database(String),
+    #[error("DSQL connection attempt did not finish within {0:?}")] Timeout(Duration),
 }
 ```
+
+Neither sqlx nor the connector bounds a connect, so a peer that accepts TCP and never answers would hold an attempt, its in-flight permit and its slot forever. `CONNECT_TIMEOUT` ends the attempt; the attempt then fails like any other and gives its slot back.
 
 ### 2.5 DSQL Coordination Config
 
@@ -235,7 +244,10 @@ it, and build the `DsqlConnectionDirector`.
 | `SCAN_BUDGET` | `TARGET_READY / 2` | Max ready entries examined per scan |
 | `WARMUP_TIMEOUT` | 30 sec | Max time to wait for initial fill |
 | `REFILLER_IDLE_INTERVAL` | 100ms | Check interval when full |
-| `REFILLER_ERROR_BACKOFF` | 250ms | Initial backoff on failure |
+| `REFILLER_ERROR_BACKOFF` | 250ms | Backoff after the first failure; doubles per consecutive failure |
+| `REFILLER_MAX_BACKOFF` | 10 sec | Backoff ceiling; a recovering cluster is retried at least this often |
+| `CONNECT_TIMEOUT` | 30 sec | Bound on one connect: a credentials refresh plus a TLS handshake to a loaded cluster |
+| `READY_CAPACITY` | `2 × TARGET_READY` | Ready channel capacity (invariant 10) |
 | `DISTRIBUTED_RATE` | 100/sec | DSQL cluster-wide sustained rate |
 | `DISTRIBUTED_BURST` | 1000 | DSQL cluster-wide burst capacity |
 | `SLOT_BLOCK_SIZE` | 100 | Connections per block |
@@ -258,9 +270,13 @@ impl Reservoir {
 
     /// Non-blocking checkout. Returns immediately or ErrReservoirEmpty.
     pub fn checkout(&self) -> Result<PhysicalConn, ReservoirError> {
-        match self.ready_rx.try_recv() {
-            Ok(conn) => { metrics::record_dsql_pool_connections_total(self.ready_rx.len()); Ok(conn) }
-            Err(_) => { metrics::record_dsql_pool_empty_reservoir(); Err(ReservoirError::Empty) }
+        loop {
+            match self.ready_rx.try_recv() {
+                // Flagged after it was returned (invariant 11): retire, look again.
+                Ok(conn) if conn.broken.is_set() => record_retirement("broken", conn.created_at.elapsed()),
+                Ok(conn) => { metrics::record_dsql_pool_connections_total(self.ready_rx.len()); return Ok(conn) }
+                Err(_) => { metrics::record_dsql_pool_empty_reservoir(); return Err(ReservoirError::Empty) }
+            }
         }
     }
 
@@ -272,37 +288,43 @@ impl Reservoir {
 
 ### 4. Refiller Loop
 
+One task admits connection creations and runs each in its own child task, so up to `INFLIGHT_LIMIT` connects proceed at once. A refill after a mass retirement takes about `target_ready / INFLIGHT_LIMIT` connect latencies rather than `target_ready`. The refiller counts creations still running against the target, so it never starts more than the target needs.
+
+Consecutive failures share one streak: the refiller waits `refill_backoff(streak)` before admitting the next creation, and the first success resets the streak and cuts a running wait short, so a recovered cluster is refilled at once rather than after the longest backoff.
+
 ```rust
 // Pseudocode — exact implementation mechanics
+let mut creating = JoinSet::new();   // child creations; aborted with the refiller
 loop {
-    if ready_tx.len() >= TARGET_READY { sleep(100ms); continue; }
-    if !slot_manager.has_budget() { sleep(100ms); continue; }
-    let _permit = inflight_sem.acquire().await;  // max 8 concurrent
-    match slot_manager.acquire_slot() {
-        Ok(()) => {}
-        Err(_) => { sleep(100ms); continue; }
+    if failures > 0 {
+        select! { sleep(refill_backoff(failures)), recovered.notified() }
     }
+    let inflight_permit = inflight_sem.acquire_owned().await;  // max 8 concurrent
+    reap_finished(&mut creating);
+    if ready_tx.len() + creating.len() >= target_ready() { drop(inflight_permit); sleep(100ms); continue; }
+    if slot_manager.acquire_slot().await.is_err() { failures += 1; continue; }
+    let slot = SlotCharge::new(slot_manager);         // releases the slot on drop
     if let Err(e) = distributed_bucket.wait().await {  // DynamoDB round-trip
-        slot_manager.release_slot();
-        log_warn(e);
-        sleep(250ms);
-        continue;
+        drop(slot); log_warn(e); failures += 1; continue;
     }
-    match factory.create_connection().await {
-        Ok(conn) => {
-            let lifetime = assign_jittered_lifetime(); // [8min, 12min]
-            if let Err(err) = ready_tx.send(PhysicalConn { connection: conn, created_at: now(), lifetime }).await {
-                slot_manager.release_slot();
-                drop(err.into_inner());
+    creating.spawn(async move {
+        let _inflight_permit = inflight_permit;        // held for the whole attempt
+        match create_within_timeout(factory).await {   // CONNECT_TIMEOUT
+            Ok(conn) => {
+                failures = 0; recovered.notify_waiters();
+                let entry = PhysicalConn { connection: conn, created_at: now(),
+                                           lifetime: assign_jittered_lifetime(), broken: BrokenFlag::default() };
+                if ready_tx.send(entry).await.is_ok() { slot.transfer_to_connection(); }
+                // else: shutdown closed the channel; dropping `slot` releases it.
             }
+            Err(e) => { failures += 1; log_warn(e); }  // dropping `slot` releases it
         }
-        Err(e) => {
-            slot_manager.release_slot();
-            log_warn(e);
-            sleep(250ms);
-        }
-    }
+    });
 }
+
+/// REFILLER_ERROR_BACKOFF × 2^(failures - 1), capped at REFILLER_MAX_BACKOFF, with
+/// equal jitter (half fixed, half random) so nodes refused together retry apart.
+fn refill_backoff(failures: u32) -> Duration;
 
 fn assign_jittered_lifetime() -> Duration {
     let offset = rand::gen_range(0..=(LIFETIME_JITTER.as_secs() * 2));
@@ -320,6 +342,11 @@ loop {
     sleep(SCAN_INTERVAL); // 1 second
     for _ in 0..SCAN_BUDGET {  // bounded: max 25 entries per pass
         match ready_rx.try_recv() {
+            Ok(conn) if conn.broken.is_set() => {
+                metrics::record_retirement("broken", conn.created_at.elapsed());
+                slot_manager.release_slot();
+                drop(conn);
+            }
             Ok(conn) if conn.within_guard_window(GUARD_WINDOW) => {
                 metrics::record_retirement("guard_window", conn.created_at.elapsed());
                 slot_manager.release_slot();
@@ -341,27 +368,28 @@ loop {
 
 The return processor receives the same `Arc<SlotBlockManager>` and releases a
 slot whenever it discards a returned connection instead of putting it back into
-the ready channel.
+the ready channel. It releases the caller's class permit last (invariant 9).
 
 ```rust
 while let Some(returned) = return_rx.recv().await {
-    if returned.marked_bad {
-        metrics::record_retirement("unhealthy", returned.created_at.elapsed());
+    let reason = if returned.marked_bad { Some("bad_flag") }
+                 else if returned.broken.is_set() { Some("broken") }
+                 else if returned.within_guard_window(GUARD_WINDOW) { Some("guard_window") }
+                 else { None };
+    if let Some(reason) = reason {
+        metrics::record_retirement(reason, returned.created_at.elapsed());
         slot_manager.release_slot();
-        continue; // discard
+        continue; // discard; dropping `returned` releases its class permit
     }
-    let conn = PhysicalConn { connection: returned.connection, created_at: returned.created_at,
-                              lifetime: returned.lifetime };
-    if conn.within_guard_window(GUARD_WINDOW) {
-        metrics::record_retirement("guard_window", conn.created_at.elapsed());
-        slot_manager.release_slot();
-        continue; // discard
+    // Put back — NO PING, no network I/O, and never wait: the channel has room
+    // for every return (invariant 10).
+    match ready_tx.try_send(returned.conn()) {
+        Ok(()) => {}
+        Err(Full(conn)) => { metrics::record_retirement("ready_channel_full", conn.created_at.elapsed());
+                             slot_manager.release_slot(); }
+        Err(Closed(_)) => { slot_manager.release_slot(); return; }
     }
-    // Put back — NO PING, no network I/O.
-    if let Err(err) = ready_tx.send(conn).await {
-        slot_manager.release_slot();
-        drop(err.into_inner());
-    }
+    drop(returned.class_permit);
 }
 ```
 
@@ -736,7 +764,7 @@ impl ConnectionDirector for DsqlConnectionDirector {
             Ok(conn) => { /* build permit with Arc<SlotBlockManager> clone */ }
             Err(ReservoirError::Empty) => {
                 drop(class_guard);  // release permit on backpressure
-                Err(anyhow!("reservoir empty: backpressure"))
+                Err(anyhow::Error::new(ReservoirError::Empty).context(PersistenceCapacityExhausted))
             }
         }
     }
@@ -766,7 +794,8 @@ pub struct DsqlPermit {
     created_at: Instant,
     lifetime: Duration,
     marked_bad: bool,
-    _class_guard: OwnedSemaphorePermit,
+    broken: BrokenFlag,                      // registered with the enclosing operation at checkout
+    class_guard: Option<OwnedSemaphorePermit>, // handed to the return processor on drop
     reservoir_return: mpsc::UnboundedSender<ReturnedConn>,
     slot_manager: Arc<SlotBlockManager>,
     director_in_flight: Arc<AtomicUsize>,
@@ -789,7 +818,8 @@ impl Drop for DsqlPermit {
             }
             if let Err(err) = self.reservoir_return.send(ReturnedConn {
                 connection: conn, created_at: self.created_at,
-                lifetime: self.lifetime, marked_bad: self.marked_bad,
+                lifetime: self.lifetime, broken: self.broken.clone(), marked_bad: self.marked_bad,
+                class_permit: self.class_guard.take(),
             }) {
                 self.slot_manager.release_slot();
                 drop(err.0);
@@ -988,13 +1018,13 @@ All metrics emitted unconditionally via the `metrics` crate. No configuration op
 
 | Error Category | Cause | Refiller Behavior | Caller Impact |
 |---------------|-------|-------------------|---------------|
-| `iam` | IAM token generation failure | Backoff 250ms, retry | None |
-| `tls` | TLS handshake failure | Backoff 250ms, retry | None |
-| `timeout` | TCP connect timeout | Backoff 250ms, retry | None |
-| `refused` | DSQL endpoint refusing connections | Backoff 250ms, retry | None |
-| `other` | Unknown connection error | Backoff 250ms, retry | None |
+| `config` | The connector rejected the connection options | Back off, retry | None |
+| `token` | No credentials, or IAM token generation failed | Back off, retry | None |
+| `connection` | TCP or TLS failure, DNS failure, or the cluster refusing the connection (for example, its connection rate exceeded) | Back off, retry | None |
+| `database` | The database rejected the handshake | Back off, retry | None |
+| `timeout` | The attempt did not finish within `CONNECT_TIMEOUT` | Back off, retry | None |
 
-The refiller never propagates errors to checkout callers. It logs, backs off, and retries indefinitely.
+Every failure lengthens the shared failure streak: the refiller waits `refill_backoff(streak)` (250ms doubling to 10 sec, with equal jitter) before its next attempt, and the first success resets the streak. The refiller never propagates errors to checkout callers. It logs, backs off, and retries indefinitely.
 
 ### DynamoDB Coordination Failures
 
@@ -1012,7 +1042,7 @@ The refiller never propagates errors to checkout callers. It logs, backs off, an
 
 | Scenario | Behavior |
 |----------|----------|
-| Ready channel empty | Return `Err(ReservoirError::Empty)` immediately |
+| Ready channel empty | Return `Err(ReservoirError::Empty)` immediately; the director adds `PersistenceCapacityExhausted`, which the frontend answers with `RESOURCE_EXHAUSTED` (cause `RESOURCE_EXHAUSTED_CAUSE_PERSISTENCE_LIMIT`, scope `RESOURCE_EXHAUSTED_SCOPE_SYSTEM`), as Temporal does when its persistence rate limit is reached (`common/persistence/persistence_rate_limited_clients.go` @ v1.31.0) |
 | Class budget exhausted | Block at semaphore until permit available |
 | Reservoir dropped | Return `Err` (channel closed) |
 
@@ -1022,6 +1052,8 @@ The refiller never propagates errors to checkout callers. It logs, backs off, an
 |----------|----------|
 | Within guard window | Discard, emit metric |
 | Marked bad | Discard, emit metric |
+| Flagged broken by its operation | Discard, emit metric |
+| Ready channel full (unreachable while class budgets sum to `target_ready`) | Discard, emit metric |
 | Healthy, outside guard window | Put back (no ping) |
 
 ### Graceful Shutdown
@@ -1065,6 +1097,19 @@ Each correctness property maps to a property-based test with minimum 100 iterati
 - Startup fails without DynamoDB coordination tables
 - Scanner retires expired connections, preserves healthy ones
 - Return processor discards bad/expired, keeps healthy
+- Connect timeout, credentials refresh margin, and the backoff's doubling and ceiling
+- A failed operation flags every connection it checked out, and only when the failure broke a connection
+
+### Scenario Tests (paused time)
+
+Real connections to a local server that answers only the startup handshake, opened before time is paused, are handed out by a scripted factory that connects, refuses or hangs with a virtual connect latency:
+
+- After a mass retirement the reservoir refills in about `target_ready / INFLIGHT_LIMIT` connect latencies, never past its target, with no more than `INFLIGHT_LIMIT` connects at once
+- A class permit comes back only with its connection: the next caller of the class is never refused for an empty reservoir while the connection is on its way back
+- A burst within the class budgets never finds the reservoir empty and makes no more than `2 × target_ready` connections
+- A hung connect times out and gives its slot back
+- Refused connects back off within the expected attempt rate and the reservoir refills promptly on the first success
+- A connection an operation broke is retired and replaced, including one flagged after its return
 
 ### Integration Tests (require DynamoDB Local)
 
@@ -1073,3 +1118,8 @@ Each correctness property maps to a property-based test with minimum 100 iterati
 - Slot block TTL expiry: block reclaimable after crash
 - Full lifecycle: warmup → checkout → use → return → expiry → refill
 - Graceful shutdown releases slot blocks
+
+### Live Tests (opt-in, throwaway cluster)
+
+- A burst through a small reservoir never finds it empty
+- A connection storm from several reservoirs past the cluster's connection burst: every refill completes, refused connects back off, and no slot is lost

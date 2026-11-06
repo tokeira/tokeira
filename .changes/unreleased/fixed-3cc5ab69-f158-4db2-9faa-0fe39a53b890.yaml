@@ -1,0 +1,5 @@
+kind: fixed
+body: A DSQL connection broken by a network, TLS or protocol failure is now discarded instead of being handed to a later request.
+time: 2026-11-06T11:27:25.000000+00:00
+custom:
+    Slice: 3cc5ab69-f158-4db2-9faa-0fe39a53b890

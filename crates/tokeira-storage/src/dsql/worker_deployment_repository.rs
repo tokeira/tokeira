@@ -5,8 +5,8 @@
 //! token. Secondary projections can be derived later; correctness is fenced on
 //! this single row.
 
+use crate::dsql::in_operation;
 use std::sync::Arc;
-use tokeira_observability::statement_accounting::in_operation;
 
 use anyhow::Result;
 use async_trait::async_trait;

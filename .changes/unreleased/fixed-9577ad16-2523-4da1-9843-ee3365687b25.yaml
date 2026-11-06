@@ -1,0 +1,5 @@
+kind: fixed
+body: Under load, requests no longer fail for want of a DSQL connection while an earlier request's connection is still on its way back to the reservoir.
+time: 2026-11-06T11:27:25.000000+00:00
+custom:
+    Slice: 9577ad16-2523-4da1-9843-ee3365687b25

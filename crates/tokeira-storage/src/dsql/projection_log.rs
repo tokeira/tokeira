@@ -12,14 +12,14 @@ use async_trait::async_trait;
 use sqlx::{PgConnection, Postgres, QueryBuilder};
 use time::OffsetDateTime;
 use tokeira_types::{RunKey, TransitionSeq};
-use tracing::instrument;
 use uuid::Uuid;
 
 use crate::{
     DbClass, ProjectionContext, ProjectionImageKey, ProjectionLog, ProjectionPage,
     ProjectionRecord,
     dsql::{
-        DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert, projection_image_parts,
+        DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert, in_operation,
+        projection_image_parts,
     },
     metrics,
 };
@@ -71,18 +71,47 @@ impl DsqlProjectionLog {
     }
 }
 
-// Every method runs in a span named `dsql.<store>.<method>`, the operation
-// the process's statement accounting charges its round trips to
-// (`tokeira_observability::statement_accounting`); a span added only for that
-// is DEBUG, out of logs and traces at the default filter.
+// Every method runs as an operation named `dsql.<store>.<method>`: statement
+// accounting charges its round trips to it
+// (`tokeira_observability::statement_accounting`), and a failure that breaks a
+// connection retires the connection (`dsql::operation`).
 #[async_trait]
 impl ProjectionLog for DsqlProjectionLog {
-    #[instrument(
-        name = "dsql.projection_log.read_page",
-        skip_all,
-        fields(partition_id, fanout, limit)
-    )]
     async fn read_page(
+        &self,
+        partition_id: u32,
+        fanout: u16,
+        after: Option<ProjectionImageKey>,
+        limit: usize,
+    ) -> Result<ProjectionPage> {
+        in_operation(
+            tracing::info_span!("dsql.projection_log.read_page", partition_id, fanout, limit),
+            self.read_page_in_operation(partition_id, fanout, after, limit),
+        )
+        .await
+    }
+
+    async fn delete_images(
+        &self,
+        partition_id: u32,
+        fanout: u16,
+        keys: &[ProjectionImageKey],
+    ) -> Result<u64> {
+        in_operation(
+            tracing::info_span!(
+                "dsql.projection_log.delete_images",
+                partition_id,
+                fanout,
+                keys = keys.len()
+            ),
+            self.delete_images_in_operation(partition_id, fanout, keys),
+        )
+        .await
+    }
+}
+
+impl DsqlProjectionLog {
+    async fn read_page_in_operation(
         &self,
         partition_id: u32,
         fanout: u16,
@@ -137,8 +166,7 @@ impl ProjectionLog for DsqlProjectionLog {
         })
     }
 
-    #[instrument(name = "dsql.projection_log.delete_images", skip_all, fields(partition_id, fanout, keys = keys.len()))]
-    async fn delete_images(
+    async fn delete_images_in_operation(
         &self,
         partition_id: u32,
         fanout: u16,

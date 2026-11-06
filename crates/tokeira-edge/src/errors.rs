@@ -53,6 +53,15 @@ pub enum EdgeError {
     #[error("workflow operation can not be applied because workflow is closing")]
     WorkflowClosing,
 
+    /// Storage had no free database connection for the request, which did not
+    /// run. v1.31.0's `ErrPersistenceSystemLimitExceeded`: RESOURCE_EXHAUSTED
+    /// with cause PERSISTENCE_LIMIT, scope SYSTEM and this exact message
+    /// (`common/persistence/persistence_rate_limited_clients.go:23-28
+    /// @ v1.31.0`). Its frontend masks only INTERNAL and UNKNOWN errors, so
+    /// clients see this status and retry it with backoff.
+    #[error("System Persistence Max QPS Reached.")]
+    PersistenceLimitExceeded,
+
     /// v1.31.0's `consts.ErrConsistentQueryBufferExceeded`: a query overflowed
     /// the run's consistent-query buffer (capacity 1). RESOURCE_EXHAUSTED with
     /// cause BUSY_WORKFLOW, scope NAMESPACE, and this exact message — the
@@ -216,6 +225,7 @@ impl EdgeError {
             EdgeError::ResourceExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::ConcurrentLimitExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::WorkflowClosing => StatusCode::TOO_MANY_REQUESTS,
+            EdgeError::PersistenceLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::ConsistentQueryBufferExceeded => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::WorkflowNotReady(_) => StatusCode::PRECONDITION_FAILED,
             EdgeError::QueryFailed { .. } => StatusCode::BAD_REQUEST,
@@ -263,6 +273,7 @@ impl EdgeError {
             EdgeError::ResourceExhausted(_) => "resource_exhausted",
             EdgeError::ConcurrentLimitExceeded(_) => "concurrent_limit_exceeded",
             EdgeError::WorkflowClosing => "workflow_closing",
+            EdgeError::PersistenceLimitExceeded => "persistence_limit_exceeded",
             EdgeError::ConsistentQueryBufferExceeded => "consistent_query_buffer_exceeded",
             EdgeError::WorkflowNotReady(_) => "workflow_not_ready",
             EdgeError::QueryFailed { .. } => "query_failed",
@@ -297,6 +308,9 @@ impl EdgeError {
 
 impl From<anyhow::Error> for EdgeError {
     fn from(value: anyhow::Error) -> Self {
+        if value.is::<tokeira_storage::PersistenceCapacityExhausted>() {
+            return Self::PersistenceLimitExceeded;
+        }
         if let Some(error) = value.downcast_ref::<tokeira_runtime::ActivityDemandCapacity>() {
             return Self::ResourceExhausted(error.to_string());
         }
@@ -617,6 +631,19 @@ mod tests {
             message,
             "exceeded workflow execution limit for signal events"
         );
+    }
+
+    #[test]
+    fn spent_connection_capacity_answers_the_persistence_limit() {
+        // The reservoir attaches the typed context over its own error; any
+        // further context an operation adds must not hide it.
+        let error = anyhow::anyhow!("DSQL reservoir is empty")
+            .context(tokeira_storage::PersistenceCapacityExhausted)
+            .context("loading the run");
+        assert!(matches!(
+            EdgeError::from(error),
+            EdgeError::PersistenceLimitExceeded
+        ));
     }
 
     #[test]

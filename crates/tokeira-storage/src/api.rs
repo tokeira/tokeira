@@ -301,6 +301,19 @@ pub struct LeaseFenceLost {
     pub found: Option<(String, ShardEpoch)>,
 }
 
+/// Every database connection this node holds was in use when the operation
+/// asked for one, so the operation did not run and changed nothing. The caller
+/// may retry after a backoff.
+///
+/// Temporal v1.31.0 answers spent persistence capacity with RESOURCE_EXHAUSTED,
+/// cause PERSISTENCE_LIMIT, scope SYSTEM
+/// (`common/persistence/persistence_rate_limited_clients.go @ v1.31.0`), and its
+/// frontend passes that status through to the client; the edge maps this error
+/// to the same status.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("no database connection is free for this operation; retry after a backoff")]
+pub struct PersistenceCapacityExhausted;
+
 /// What a run's bulk-write record says is happening to the run's rows.
 ///
 /// A record names a run whose rows are written or removed across several

@@ -6,8 +6,8 @@
 //! tables combine into workflow semantics; callers continue to use the storage
 //! trait in terms of runs, history, leases, dispatch, and sweep entries.
 
+use crate::dsql::in_operation;
 use std::{sync::Arc, time::Instant};
-use tokeira_observability::statement_accounting::in_operation;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;

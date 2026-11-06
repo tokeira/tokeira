@@ -571,6 +571,7 @@ async fn workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs(
     workflow.insert(stale);
     assert_eq!(runtime.workflow_timeout_tracking.snapshot(), before);
     activity.insert(ActivityTrackingEntry {
+        timeouts: None,
         run_key,
         shard_id: execution_home,
         activity_id: "old".into(),
@@ -581,6 +582,7 @@ async fn workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs(
         cancel_requested: false,
     });
     nexus.insert(NexusTimeoutEntry {
+        timeouts: None,
         run_key,
         shard_id: execution_home,
         operation_id: "old".into(),
@@ -588,6 +590,7 @@ async fn workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs(
         scheduled_at: OffsetDateTime::now_utc(),
     });
     callbacks.insert(CompletionCallbackTrackingEntry {
+        timing: None,
         run_key,
         shard_id: execution_home,
         callback_index: 0,
@@ -988,6 +991,9 @@ async fn child_release_fixture_complete(
             worker_deployment_name: None,
             sticky: None,
             commands,
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
+            heartbeat: Default::default(),
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),

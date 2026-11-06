@@ -298,6 +298,7 @@ impl StoredTransition {
             timer_ops: self.timers.into(),
             dispatch_ops: self.dispatches.into(),
             events_numbered_at_close: self.numbered_at_close,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: self
                 .growth_limits
                 .map(|v| tokeira_kernel::limits::RunGrowthLimits {

@@ -2,16 +2,16 @@
 
 ## Overview
 
-This design adds a background timer scanner to `tokeira-runtime`, completing Feature 4 of the runtime roadmap. The scanner periodically discovers timers whose deadlines have passed and injects `Command::TimerDue` commands into the owning run's lane mailbox.
+This design adds a background timer scanner to `tokeira-runtime`, completing Feature 4 of the runtime roadmap. The scanner looks ahead for durable deadlines, wakes when they arrive and injects `Command::TimerDue` commands into the owning run's lane mailbox.
 
-The feature is structurally parallel to the Activity Timeout Scanner from Feature 3. Both are background `tokio::spawn` tasks that periodically scan and inject commands through the lane. The key difference is the data source:
+The feature is structurally parallel to the Activity Timeout Scanner from Feature 3. Both are background `tokio::spawn` tasks with deadline wakes and periodic reconciliation that inject commands through the lane. The key difference is the data source:
 
 - **Activity Timeout Scanner** reads from runtime-local `ActivityTrackingState` (in-memory timestamps populated by lifecycle hooks).
 - **Timer Scanner** reads from the storage layer's `list_due_timers(now, limit)` API, which queries the durable timer bucket managed authoritatively by the kernel via `TimerOp::Upsert` and `TimerOp::Delete`.
 
 Timer scanning is non-authoritative. The scanner is a delivery mechanism, not a state authority. The authoritative state transition happens when the kernel processes the `TimerDue` command — it emits a `TimerFired` history event, removes the timer from the open set via `TimerOp::Delete`, and schedules a workflow task. If the scanner fires a stale or duplicate `TimerDue` (timer already canceled or fired, run already closed, run absent), the kernel rejects it harmlessly via `Reject::UnknownTimer`, `Reject::RunClosed`, or `Reject::MissingRun`.
 
-Because the scanner reads from durable storage rather than runtime-local state, it requires no lifecycle hooks or in-memory tracking structures. This makes it simpler than the activity timeout scanner.
+Timer obligations remain in storage. Volatile shard cursors and deadline notifications reduce delivery latency; a full pass every interval repairs missed notifications.
 
 ## Architecture
 
@@ -37,19 +37,35 @@ flowchart TD
 
 ### Key design decisions
 
-**Storage-backed scanning, no runtime-local state.** Unlike the activity timeout scanner, the timer scanner does not need an in-memory tracking structure. Timer obligations are managed authoritatively by the kernel in the durable timer bucket (via `TimerOp::Upsert` on `StartTimer` and `TimerOp::Delete` on `TimerFired` or `CancelTimer`). The scanner simply queries `list_due_timers(now, limit)` each cycle. This eliminates lifecycle hooks, reduces memory footprint, and means the scanner works correctly after runtime restart without any rebuild step.
+**Storage-backed look-ahead.** Each active shard lists through `clock.now() + scan_interval`,
+using checked deadline arithmetic. Due entries are submitted in listing order. The first future
+entry sets that shard's next wake. The shared `DeadlineWake` combines these deadlines with
+commit and acquisition notifications without losing an insertion during planning.
+
+Successful lane commits announce their earliest `TimerOp::Upsert`, including delayed starts
+and atomic successor transitions. Reset publication writes the full timer projection
+reconstructed from its copied prefix. Reset and prepared successor runs announce their timers
+only after preparation completes and listings can see them; recovery reconciliation does
+likewise. Acquisition activation invalidates only its shard. These are volatile hints, never
+an alternative to the stored obligation.
+
+A deadline wake lists only shards whose cursor or notification is due. A full due page
+continues immediately after its last entry. A new timer rewinds that shard's cursor so an
+insertion behind it is not lost. Failed identities remain suppressed through these rewinds
+until the next full pass. Every interval, all active shards restart from the beginning.
+`command_for_due_timer` and stale-row cleanup remain unchanged.
 
 **Scanner submits through the lane, not directly to the kernel.** The scanner uses the same `self.submit(run_key, Command::TimerDue(...))` path as all other runtime commands. This preserves the lane's single-writer serialization for each run and ensures the kernel's fenced transition logic handles conflicts correctly.
 
 **Non-authoritative delivery.** The scanner is a best-effort delivery mechanism. If it submits a `TimerDue` for a timer that has already been canceled or fired, the kernel rejects it with `Reject::UnknownTimer`. If the run is closed or absent, the kernel rejects with `Reject::RunClosed` or `Reject::MissingRun`. All rejections are harmless no-ops. This means duplicate firings from multiple scanner instances (e.g., during rolling deploys before shard-scoped scanning) are safe.
 
-**Bounded batches per scan cycle.** The scanner processes at most `max_timers_per_scan` timers per cycle, passed directly as the `limit` parameter to `list_due_timers`. This bounds the work per cycle and prevents the scanner from starving other lane work. Remaining due timers are picked up in the next cycle.
+**Bounded batches per scan cycle.** The scanner processes at most `max_timers_per_scan` timers per cycle, passed directly as the `limit` parameter to `list_due_timers`. This bounds the work per cycle and prevents the scanner from starving other lane work. A full due page continues immediately using its last entry as the cursor.
 
 **Configurable scan interval.** The default scan interval of 200ms provides sub-second timer resolution. Operators can tune this for their workload — lower for tighter timer precision, higher to reduce storage read pressure.
 
 **Graceful lifecycle management.** The scanner is spawned during `TokeiraRuntime::new` and cancelled via a `CancellationToken` on shutdown, mirroring the activity timeout scanner pattern.
 
-**Shard-scoped scanning deferred.** The current implementation scans all timers regardless of shard assignment. This is safe because timer scanning is non-authoritative. Shard-scoped scanning (where only timers for owned shards are scanned) is deferred to Feature 11 (Sweeper and Recovery).
+**Shard-scoped scanning.** Only active acquisitions are scanned, with acquisition identity rechecked before each submission.
 
 ## Components and Interfaces
 
@@ -60,7 +76,7 @@ Configuration for the timer scanner background task:
 ```rust
 /// Configuration for the background timer scanner.
 pub struct TimerScannerConfig {
-    /// How often the scanner runs. Default: 200ms.
+    /// Maximum interval between full passes. Default: 200ms.
     pub scan_interval: tokio::time::Duration,
     /// Maximum number of DueTimer entries processed per scan cycle.
     /// Passed as the `limit` parameter to `list_due_timers`.
@@ -79,66 +95,12 @@ impl Default for TimerScannerConfig {
 
 ### Timer scanner loop (async function)
 
-The scanner is implemented as an async function spawned via `tokio::spawn`:
-
-```rust
-async fn run_timer_scanner<R>(
-    repo: Arc<R>,
-    lanes: Vec<LaneHandle>,
-    lane_count: usize,
-    config: TimerScannerConfig,
-    cancel: CancellationToken,
-) where
-    R: RunRepository + 'static,
-{
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(config.scan_interval) => {}
-        }
-
-        let now = OffsetDateTime::now_utc();
-        let due_timers = match repo.list_due_timers(now, config.max_timers_per_scan).await {
-            Ok(timers) => timers,
-            Err(error) => {
-                tracing::warn!(?error, "timer scanner: list_due_timers failed, skipping cycle");
-                continue;
-            }
-        };
-
-        for due in due_timers {
-            let lane = pick_lane(&lanes, lane_count, due.run_key);
-            let command = Command::TimerDue(TimerDueRequest {
-                timer_id: due.timer_id,
-                fired_at: now,
-            });
-            match lane.submit(due.run_key, command).await {
-                Ok(_) => {}
-                Err(error) => {
-                    let msg = error.to_string();
-                    if msg.contains("kernel rejected") {
-                        // Kernel rejections (UnknownTimer, RunClosed,
-                        // MissingRun) are harmless for timer scanning.
-                        tracing::debug!(
-                            ?error,
-                            run_key = ?due.run_key,
-                            "timer scanner: kernel rejection (harmless)"
-                        );
-                    } else {
-                        // Lane-level failures (channel closed, OCC
-                        // exhaustion) indicate real delivery problems.
-                        tracing::warn!(
-                            ?error,
-                            run_key = ?due.run_key,
-                            "timer scanner: lane submit failed"
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-```
+`run_timer_scanner` supplies the lane submit closure to `run_timer_scanner_with_submit`.
+Both planning and `fired_at` use the node clock. Tokio supplies only the cancellable sleep.
+The default 200 ms interval bounds reconciliation; it does not round timer deadlines.
+Authority: `service/history/workflow/timer_sequence.go:69-106`,
+`service/history/workflow/task_generator.go:372-402`, and
+`service/history/queues/queue_scheduled.go:159-275 @ v1.31.0`.
 
 ### Updated TokeiraRuntime
 
@@ -263,16 +225,15 @@ fn pick_lane(lanes: &[LaneHandle], lane_count: usize, run_key: RunKey) -> &LaneH
 
 ```
 TimerScanner loop:
-  1. Sleep for scan_interval (or exit on cancellation)
-  2. now = OffsetDateTime::now_utc()
-  3. due_timers = repo.list_due_timers(now, max_timers_per_scan)
-     - On error: log warn, continue to next cycle
-  4. For each DueTimer { run_key, timer_id }:
-     a. lane = pick_lane(run_key)
-     b. command = Command::TimerDue(TimerDueRequest { timer_id, fired_at: now })
-     c. lane.submit(run_key, command)
-        - On Ok: timer delivered (kernel will fire or reject)
-        - On Err: log debug, continue to next entry
+  1. Merge committed-timer and acquisition notifications into affected shard cursors.
+  2. Plan the earliest shard deadline or full-pass deadline against clock.now().
+  3. Wait on cancellation, an earlier-deadline notification, or the planned sleep.
+  4. List only due active shards through clock.now() + scan_interval.
+     - A full pass restarts every shard cursor and clears failed identities.
+  5. Submit due rows in fire-time order through command_for_due_timer.
+     - A full due page continues immediately after its last row.
+     - Remember the first future row's deadline for the next wake.
+     - Retain failed identities until the full pass, even if a commit rewinds a cursor.
 ```
 
 
@@ -325,13 +286,13 @@ If `repo.list_due_timers(now, limit)` returns an error (transient network error,
 
 ### Lane submission errors
 
-If `lane.submit(run_key, command)` returns an `Err` that is not a kernel rejection (e.g., channel closed, OCC exhaustion), the scanner logs at `warn` level and continues to the next `DueTimer` entry. These are real delivery-path failures that operators should be aware of. The timer remains in the durable timer bucket and will be re-discovered in the next scan cycle.
+If `lane.submit(run_key, command)` returns an `Err` that is not a kernel rejection (e.g., channel closed, OCC exhaustion), the scanner logs at `warn` level and continues to the next `DueTimer` entry. These are real delivery-path failures that operators should be aware of. The timer remains in the durable timer bucket and will be re-discovered in the next full pass; intervening deadline wakes skip that failed identity.
 
 ### Kernel rejections
 
 The lane's `submit` path translates kernel `Reject` variants into `Err`. For timer scanning, the relevant rejections are:
 
-- `Reject::UnknownTimer(timer_id)` — the timer was already fired or canceled. Harmless.
+- `Reject::UnknownTimer(timer_id)` — the timer was already fired or canceled, or its current fire time is later than the command observation after both are floored to milliseconds. This precision accepts due microsecond rows for nanosecond state. Harmless; a replacement timer row stays pending.
 - `Reject::RunClosed(status)` — the run reached a terminal state. Harmless.
 - `Reject::MissingRun` — the run does not exist in storage. Harmless.
 
@@ -340,6 +301,16 @@ All three are logged at `debug` level (not warn) and the scanner continues. Thes
 ### Race between timer cancellation and scanner
 
 If a `CancelTimer` workflow command is processed between the scanner's `list_due_timers` call and the `submit` call for that timer, the kernel will reject the `TimerDue` with `Reject::UnknownTimer` because the `CancelTimer` transition already removed the timer from the open set and emitted `TimerOp::Delete`. This is the intended non-authoritative behavior.
+
+If the workflow starts a replacement under the same id before submission, the kernel also
+checks its current `fire_at` against the command's `fired_at`, flooring both to milliseconds,
+including before 1970. DSQL rows keep microseconds while state keeps nanoseconds; since the
+scanner only submits rows at or before `fired_at`, this precision accepts current timers despite
+that storage truncation. A replacement in a later millisecond is rejected with
+`Reject::UnknownTimer`; the runtime keeps its row for its own deadline. No timer identity
+fields or start-delay behavior change (Requirement 2.5;
+`service/history/timer_queue_active_task_executor.go:163-175`,
+`service/history/queues/queue_scheduled.go:286-301` and `common/constants.go:46 @ v1.31.0`).
 
 ### Race between duplicate scanner instances
 

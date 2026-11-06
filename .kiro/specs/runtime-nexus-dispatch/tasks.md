@@ -200,3 +200,7 @@ Wire the runtime's `DispatchPublisher` to handle `DispatchOp::ScheduleNexusOpera
 - The implementation language is Rust, matching the existing codebase and design document
 - Checkpoints are placed after each major phase (kernel changes, runtime types, publisher wiring, lane integration, scanner)
 - Property tests use the `proptest` crate consistent with existing test infrastructure
+
+- [x] 12. Fire tracked deadlines without periodic-tick delay
+  - Cache operation timing and wire deadline wakes, due-only reloads, full reconciliation, ordering and cap continuation. Verify a one-hour loop, cache reload counts, timeout history ordering and Property 11 with at least 100 cases.
+  - _Requirements: 7.3, 7.7_

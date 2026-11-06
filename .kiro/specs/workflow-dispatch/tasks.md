@@ -444,6 +444,18 @@ Single-owner reconciliation and backlog retirement do not depend on those tasks.
     Record actual outcomes under Task 15's evidence rules; keep lifecycle times private.
   - _Requirements: 8.4, 8.5, 8.6, 10.8, 12.5, 12.8, 12.9_
 
+- [x] 19. Wake the workflow-task scanner at tracked deadlines
+  - Bound sleeps by the earliest active deadline and wake for an earlier inserted
+    deadline without losing inserts during scanning. Preserve retry intervals for
+    overdue entries, acquisition checks, per-shard limits and revision retirement.
+  - Reproduce both a pretracked deadline and an earlier deadline inserted while
+    asleep with a one-hour interval and submission channels before the fix.
+  - Test both deadline kinds, zero timeouts, inactive/overdue entries, overflow,
+    later-entry suppression and inserts during scanning. Extend Property 7 with
+    at least 100 independently modeled delay cases.
+  - Depends on task 8.
+  - _Requirements: 7.9_
+
 ## Task Dependency Graph
 
 The graph covers top-level tasks. Within each task, sub-tasks execute in listed
@@ -473,7 +485,8 @@ unrelated lease work in this feature.
     "15": ["14"],
     "16": ["12", "13", "14", "15"],
     "17": ["9", "lease-fence"],
-    "18": ["15", "17"]
+    "18": ["15", "17"],
+    "19": ["8"]
   }
 }
 ```
@@ -534,3 +547,7 @@ unrelated lease work in this feature.
 - Each implementation PR starts with a code/tests commit and a spec-alignment
   commit recording completed tasks and actual evidence. Review fixes follow as
   additional commits. Run the full completion bar for each implementation PR.
+
+- [x] 20. Fire tracked deadlines without periodic-tick delay
+  - Order due tasks by deadline and stable identity; immediately continue unattempted capped work without spinning on failed submissions. Preserve earlier loop and acquisition tests.
+  - _Requirements: 7.10_

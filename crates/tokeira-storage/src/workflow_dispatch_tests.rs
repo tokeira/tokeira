@@ -1362,3 +1362,312 @@ pub(crate) fn run_disposal_cases(
         )
         .unwrap();
 }
+
+// Feature: api-conformance-wft-completion, Property 3
+// A completion-owned successor has one committed start and no delivery intent,
+// including after repair; a refused inline start remains normally dispatchable.
+pub(crate) fn run_completion_inline_cases(
+    backend: &impl Backend,
+    runtime: &tokio::runtime::Runtime,
+) {
+    let mut runner = TestRunner::new(ProptestConfig {
+        cases: 100,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    });
+    runner
+        .run(
+            &(any::<bool>(), any::<bool>(), 0u8..5, 0u8..3, any::<bool>()),
+            |(return_new, sticky, reason, stamp, scoped_out)| {
+                // The case retains run images and backend commit futures across
+                // awaits. Heap-pin it before block_on so the larger DSQL future
+                // is not embedded in the test thread's executor stack frames.
+                runtime.block_on(Box::pin(async {
+                    let key = RunKey::new();
+                    let mut initial = fresh_transition(key);
+                    initial.next_state.status = ExecutionStatus::Running;
+                    initial.next_state.next_workflow_task_seq = LogicalTaskSeq(
+                        initial
+                            .next_state
+                            .pending_workflow_task
+                            .as_ref()
+                            .unwrap()
+                            .logical_seq
+                            .0
+                            + 1,
+                    );
+                    initial.next_state.build_id = (stamp != 0).then(|| BuildId("assigned".into()));
+                    initial.next_state.workflow_id.0 = key.0.to_string();
+                    initial.next_state.namespace_id = tokeira_types::NamespaceId::new();
+                    let mut state = applied(commit(backend, initial).await.unwrap());
+                    let start = BasicKernel
+                        .apply(
+                            LoadedRun::Existing(state.clone()),
+                            Command::WorkflowTaskStarted(
+                                tokeira_kernel::StartWorkflowTaskRequest {
+                                    logical_seq: state
+                                        .pending_workflow_task
+                                        .as_ref()
+                                        .unwrap()
+                                        .logical_seq,
+                                    worker_identity: WorkerIdentity("a".into()),
+                                    request_id: "first".into(),
+                                    history_size_bytes: 0,
+                                    advice_policy:
+                                        tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
+                                    deployment_transition: None,
+                                    deployment_transition_revision_number: None,
+                                    polled_task_queue: state.task_queue.clone(),
+                                    now: OffsetDateTime::UNIX_EPOCH,
+                                    target_version_changed_enabled: false,
+                                    target_deployment_version: None,
+                                },
+                            ),
+                        )
+                        .unwrap();
+                    state = applied(commit(backend, start).await.unwrap());
+                    if reason == 1 {
+                        let update = BasicKernel
+                            .apply(
+                                LoadedRun::Existing(state.clone()),
+                                Command::Update(tokeira_kernel::UpdateRequest {
+                                    update_id: "mid-task".into(),
+                                    update_name: "handler".into(),
+                                    input: Default::default(),
+                                    request: tokeira_types::RequestContext::unattributed(
+                                        OffsetDateTime::UNIX_EPOCH,
+                                    ),
+                                    now: OffsetDateTime::UNIX_EPOCH,
+                                    limits: Default::default(),
+                                    request_bytes: 0,
+                                    in_flight_request_bytes: 0,
+                                    readmit: false,
+                                }),
+                            )
+                            .unwrap();
+                        state = applied(commit(backend, update).await.unwrap());
+                    }
+                    if reason == 2 {
+                        let signal = BasicKernel
+                            .apply(
+                                LoadedRun::Existing(state.clone()),
+                                Command::Signal(tokeira_kernel::SignalRequest {
+                                    signal_name: "buffered".into(),
+                                    input: Default::default(),
+                                    header: None,
+                                    links: Vec::new(),
+                                    request: tokeira_types::RequestContext::unattributed(
+                                        OffsetDateTime::UNIX_EPOCH,
+                                    ),
+                                    now: OffsetDateTime::UNIX_EPOCH,
+                                }),
+                            )
+                            .unwrap();
+                        state = applied(commit(backend, signal).await.unwrap());
+                    }
+                    if reason == 3 {
+                        let transition = BasicKernel
+                            .apply(
+                                LoadedRun::Existing(state.clone()),
+                                Command::StartDeploymentTransition(
+                                    tokeira_kernel::StartDeploymentTransitionRequest {
+                                        target: tokeira_kernel::WorkerDeploymentVersionRef {
+                                            deployment_name: "workers".into(),
+                                            build_id: "next".into(),
+                                        },
+                                        revision_number: 1,
+                                        now: OffsetDateTime::UNIX_EPOCH,
+                                    },
+                                ),
+                            )
+                            .unwrap();
+                        state = applied(commit(backend, transition).await.unwrap());
+                    }
+                    let pending = state.pending_workflow_task.as_ref().unwrap();
+                    let request = tokeira_kernel::WorkflowTaskCompletedRequest {
+                        token: tokeira_types::WorkflowTaskToken {
+                            run_key: key,
+                            logical_seq: pending.logical_seq,
+                            started_event_id: pending.started_event_id.unwrap(),
+                            attempt: pending.attempt,
+                            shard_epoch: tokeira_types::ShardEpoch::ZERO,
+                        },
+                        identity: WorkerIdentity("a".into()),
+                        client_discards_speculative_with_events: false,
+                        sdk_metadata: None,
+                        metering_metadata: None,
+                        worker_version: Some(tokeira_kernel::WorkflowTaskWorkerVersion {
+                            binary_checksum: String::new(),
+                            stamp: Some(tokeira_kernel::WorkerVersionStamp {
+                                build_id: if stamp == 1 { "assigned" } else { "different" }.into(),
+                                use_versioning: true,
+                            }),
+                        }),
+                        versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+                        deployment_version: None,
+                        worker_deployment_name: None,
+                        sticky: sticky.then(|| tokeira_kernel::StickySpec {
+                            queue: TaskQueueName("sticky".into()),
+                            schedule_to_start_timeout: Duration::seconds(5),
+                        }),
+                        commands: Vec::new(),
+                        command_sizes: Vec::new(),
+                        heartbeat: Default::default(),
+                        force_new_workflow_task: reason == 0,
+                        eager_activities: Default::default(),
+                        inline_workflow_task: return_new.then(|| {
+                            tokeira_kernel::CompletionWorkflowTaskStart {
+                                scope: scoped_out.then(|| {
+                                    tokeira_kernel::CompletionWorkflowTaskScope {
+                                        namespace_id: state.namespace_id,
+                                        normal_task_queues: vec![TaskQueueName("forbidden".into())],
+                                        deployment: DeploymentId("workers".into()),
+                                        build_id: BuildId("assigned".into()),
+                                    }
+                                }),
+                                history_size_bytes: 123,
+                                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
+                            }
+                        }),
+                        limits: Default::default(),
+                        delivered_update_ids: Vec::new(),
+                        request: tokeira_types::RequestContext::unattributed(
+                            OffsetDateTime::UNIX_EPOCH,
+                        ),
+                        now: OffsetDateTime::UNIX_EPOCH,
+                    };
+                    let completed = BasicKernel
+                        .apply(
+                            LoadedRun::Existing(state.clone()),
+                            Command::WorkflowTaskCompleted(request),
+                        )
+                        .unwrap();
+                    prop_assert_eq!(&completed.next_state.build_id, &state.build_id);
+                    let should_start = reason != 4
+                        && return_new
+                        && !scoped_out
+                        && reason != 3
+                        && (reason == 1 || stamp != 2);
+                    let pending = completed.next_state.pending_workflow_task.as_ref();
+                    prop_assert_eq!(
+                        pending.is_some_and(|task| task.started_event_id.is_some()),
+                        should_start
+                    );
+                    prop_assert_eq!(
+                        completed.next_state.transition_seq.0,
+                        state.transition_seq.0 + 1
+                    );
+                    let enqueue_count = completed
+                        .dispatch_ops
+                        .iter()
+                        .filter(|op| {
+                            matches!(op, tokeira_kernel::DispatchOp::EnqueueWorkflowTask { .. })
+                        })
+                        .count();
+                    prop_assert_eq!(enqueue_count, usize::from(reason != 4 && !should_start));
+                    let starts = completed
+                        .history_events
+                        .iter()
+                        .filter(|event| {
+                            matches!(
+                                event.kind,
+                                tokeira_kernel::HistoryEventKind::WorkflowTaskStarted { .. }
+                            )
+                        })
+                        .count();
+                    prop_assert_eq!(starts, usize::from(should_start && reason != 1));
+                    let committed = applied(commit(backend, completed.clone()).await.unwrap());
+                    prop_assert!(
+                        !matches!(
+                            commit(backend, completed).await.unwrap(),
+                            CommitResult::Applied { .. }
+                        ),
+                        "duplicate start must not commit"
+                    );
+                    prop_assert_eq!(
+                        backend.row(key).await.unwrap().is_some(),
+                        reason != 4 && !should_start
+                    );
+                    backend
+                        .repo()
+                        .reconcile_workflow_dispatch_run(ShardId(0), key, WriteFence::Unfenced)
+                        .await
+                        .unwrap();
+                    prop_assert_eq!(
+                        backend.row(key).await.unwrap().is_some(),
+                        reason != 4 && !should_start
+                    );
+                    let LoadedRun::Existing(reloaded) = backend.repo().load_run(key).await.unwrap()
+                    else {
+                        panic!("run");
+                    };
+                    prop_assert_eq!(reloaded.transition_seq, committed.transition_seq);
+                    prop_assert_eq!(
+                        reloaded.pending_workflow_task,
+                        committed.pending_workflow_task
+                    );
+                    Ok(())
+                }))
+            },
+        )
+        .unwrap();
+}
+
+/// Both backends preserve optional heartbeat origins without changing dispatch derivation.
+pub(crate) async fn heartbeat_original_schedule_roundtrip(backend: &impl Backend) {
+    for original in [
+        None,
+        Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()),
+    ] {
+        let key = RunKey::new();
+        let mut initial = fresh_transition(key);
+        initial.next_state.workflow_id.0 = key.0.to_string();
+        initial
+            .next_state
+            .pending_workflow_task
+            .as_mut()
+            .unwrap()
+            .original_scheduled_at = original;
+        let state = applied(commit(backend, initial).await.unwrap());
+        let LoadedRun::Existing(loaded) = backend.repo().load_run(key).await.unwrap() else {
+            panic!("run");
+        };
+        assert_eq!(
+            loaded
+                .pending_workflow_task
+                .as_ref()
+                .unwrap()
+                .original_scheduled_at,
+            original
+        );
+        assert_eq!(loaded.pending_workflow_task, state.pending_workflow_task);
+        let mut started = state.clone();
+        let expected_seq = state.transition_seq;
+        started.transition_seq = expected_seq.next();
+        let pending = started.pending_workflow_task.as_mut().unwrap();
+        pending.started_event_id = Some(state.last_event_id + 1);
+        pending.started_at = Some(pending.scheduled_at);
+        let transition = Transition {
+            expected_seq,
+            next_state: started,
+            history_events: Default::default(),
+            event_principals: Default::default(),
+            request_dedupe_ops: Default::default(),
+            activity_ops: Default::default(),
+            timer_ops: Default::default(),
+            dispatch_ops: Default::default(),
+            events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
+            growth_limits: None,
+        };
+        applied(commit(backend, transition).await.unwrap());
+        let LoadedRun::Existing(loaded) = backend.repo().load_run(key).await.unwrap() else {
+            panic!("run");
+        };
+        assert_eq!(
+            loaded.pending_workflow_task.unwrap().original_scheduled_at,
+            original
+        );
+        assert!(backend.row(key).await.unwrap().is_none());
+    }
+}

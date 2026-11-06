@@ -455,6 +455,14 @@ pub const CONFIG_FIELD_CATALOG: &[ConfigFieldDocumentation] = &[
         "Maximum admitted signal payload size."
     ),
     field!(
+        "policy.compatibility.enable_activity_eager_execution",
+        ConfiguredParity,
+        "false",
+        false,
+        Some("workflow-task-lifecycle"),
+        "Enable eager activity execution for every namespace; off by default."
+    ),
+    field!(
         "policy.compatibility.enable_standalone_activities",
         ConfiguredParity,
         "false",
@@ -926,6 +934,7 @@ max_workflow_timeout_seconds = 315360000
 max_signal_payload_bytes = 4194304
 
 [policy.compatibility]
+enable_activity_eager_execution = false
 enable_standalone_activities = false
 enable_standalone_activity_callbacks = false
 

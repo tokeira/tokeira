@@ -69,9 +69,23 @@ pub struct WorkflowTimeoutEntry {
 ///
 /// Cloning shares the underlying map (it is `Arc`-backed), so the scanner, the
 /// lanes that insert/remove entries, and shard recovery all observe one set.
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Debug)]
 pub struct WorkflowTimeoutTrackingState {
+    pub(crate) wake: crate::deadline_wake::DeadlineWake,
     pub(crate) inner: crate::acquisition_tracking::AcquisitionEntries<RunKey, WorkflowTimeoutEntry>,
+}
+
+impl Default for WorkflowTimeoutTrackingState {
+    fn default() -> Self {
+        let wake = crate::deadline_wake::DeadlineWake::default();
+        Self {
+            inner: crate::acquisition_tracking::AcquisitionEntries::with_deadlines(
+                wake.clone(),
+                workflow_timeout_due_at,
+            ),
+            wake,
+        }
+    }
 }
 
 impl WorkflowTimeoutTrackingState {
@@ -81,6 +95,7 @@ impl WorkflowTimeoutTrackingState {
     pub(crate) fn for_acquisition(&self, acquisition: crate::shard::ShardAcquisition) -> Self {
         Self {
             inner: self.inner.for_acquisition(acquisition),
+            ..self.clone()
         }
     }
     /// Install only for the current acquisition; recovery may install before activation.
@@ -198,7 +213,11 @@ pub(crate) async fn scan_workflow_timeouts_once<F, Fut>(
     F: FnMut(WorkflowTimeoutEntry, WorkflowTimeoutViolation, OffsetDateTime) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let entries = tracking.inner.snapshot(shard_id);
+    let mut entries = tracking.inner.select_active(shard_id, |entry| {
+        entry.deadline_pending
+            && workflow_timeout_due_at(&entry.value).is_some_and(|due| due <= now)
+    });
+    entries.sort_by_key(|entry| (workflow_timeout_due_at(&entry.value), entry.value.run_key));
     let mut submitted = 0usize;
 
     for tracked in entries {
@@ -213,6 +232,9 @@ pub(crate) async fn scan_workflow_timeouts_once<F, Fut>(
             continue;
         };
 
+        if !tracking.inner.mark_attempted(&entry.run_key, &tracked) {
+            continue;
+        }
         match submit_timeout(entry.clone(), violation, now).await {
             Ok(()) => tracking.inner.remove_submitted(&entry.run_key, &tracked),
             Err(error) => {
@@ -251,40 +273,38 @@ fn workflow_timeout_scan_delay(
     now: OffsetDateTime,
     maximum: tokio::time::Duration,
 ) -> tokio::time::Duration {
-    tracking
-        .inner
-        .snapshot(None)
-        .iter()
-        .filter(|tracked| tracking.inner.active(tracked))
-        .flat_map(|tracked| {
-            let entry = &tracked.value;
-            [
-                entry.workflow_execution_timeout.map(|timeout| {
-                    deadline_after(
-                        entry.first_run_started_at.unwrap_or(entry.started_at),
-                        timeout,
-                    )
-                }),
-                entry.workflow_run_timeout.map(|timeout| {
-                    deadline_after(
-                        deadline_after(
-                            entry.started_at,
-                            entry.workflow_start_delay.unwrap_or(Duration::ZERO),
-                        ),
-                        timeout,
-                    )
-                }),
-            ]
-            .into_iter()
-            .flatten()
-        })
-        // The existing evaluator uses a strict comparison for nonzero timeouts.
-        .map(|deadline| deadline_after(deadline, Duration::NANOSECOND) - now)
-        // An already overdue entry may have failed its storage read. Preserve
-        // the normal retry interval instead of spinning on that failed entry.
-        .filter(|remaining| *remaining > Duration::ZERO)
-        .filter_map(|remaining| tokio::time::Duration::try_from(remaining).ok())
-        .fold(maximum, std::cmp::min)
+    let revision = tracking.wake.begin_plan();
+    let delay = tracking.inner.deadline_delay(now, maximum);
+    tracking.wake.plan(now, revision, delay)
+}
+
+// Strict nonzero comparisons must not fire at a saturated date's last instant.
+// The zero case is inclusive, just as evaluate_workflow_timeout is.
+fn workflow_timeout_due_at(entry: &WorkflowTimeoutEntry) -> Option<OffsetDateTime> {
+    [
+        (
+            entry.workflow_execution_timeout,
+            entry.first_run_started_at.unwrap_or(entry.started_at),
+        ),
+        (
+            entry.workflow_run_timeout,
+            deadline_after(
+                entry.started_at,
+                entry.workflow_start_delay.unwrap_or(Duration::ZERO),
+            ),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(timeout, anchor)| {
+        let timeout = timeout?;
+        let deadline = deadline_after(anchor, timeout);
+        if timeout.is_zero() {
+            Some(deadline)
+        } else {
+            deadline.checked_add(Duration::NANOSECOND)
+        }
+    })
+    .min()
 }
 
 /// Background loop: evaluate timeouts at approaching tracked deadlines, with
@@ -305,11 +325,19 @@ pub(crate) async fn run_workflow_timeout_scanner<R: tokeira_storage::RunReposito
     cancel: CancellationToken,
     clock: Arc<dyn Clock>,
 ) {
+    let mut full = crate::deadline_wake::FullPass::new(config.scan_interval, clock.now());
     loop {
-        let delay = workflow_timeout_scan_delay(&tracking, clock.now(), config.scan_interval);
+        let now = clock.now();
+        let delay = workflow_timeout_scan_delay(&tracking, now, full.remaining(now));
         tokio::select! {
             _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(delay) => {}
+            _ = tokio::time::sleep(delay) => {},
+            _ = tracking.wake.notify.notified() => {}
+        }
+        let now = clock.now();
+        tracking.wake.start_scan(now);
+        if full.start(now) {
+            tracking.inner.begin_full_pass(false);
         }
 
         let active_shards: Vec<_> = shard_owner
@@ -523,6 +551,10 @@ mod successor_scan_tests {
             interval
         );
         tracking.insert(entry(now - Duration::seconds(10)));
+        let tracked = tracking.inner.snapshot(None).pop().unwrap();
+        tracking
+            .inner
+            .mark_attempted(&tracked.value.run_key, &tracked);
         assert_eq!(
             workflow_timeout_scan_delay(&tracking, now, interval),
             interval
@@ -534,6 +566,81 @@ mod successor_scan_tests {
         assert_eq!(
             workflow_timeout_scan_delay(&tracking, now, interval),
             tokio::time::Duration::from_millis(250) + tokio::time::Duration::from_nanos(1)
+        );
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use std::{future::Future, task::Poll};
+
+    fn entry(now: OffsetDateTime, seconds: i64) -> WorkflowTimeoutEntry {
+        WorkflowTimeoutEntry {
+            run_key: RunKey::new(),
+            shard_id: ShardId(0),
+            workflow_execution_timeout: None,
+            workflow_run_timeout: Some(Duration::seconds(seconds)),
+            started_at: now,
+            workflow_start_delay: None,
+            first_run_started_at: None,
+            has_retry_policy: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_notification_only_moves_earlier() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        for earlier in [false, true] {
+            let tracking = WorkflowTimeoutTrackingState::default();
+            workflow_timeout_scan_delay(&tracking, now, std::time::Duration::from_secs(10));
+            tracking.insert(entry(now, if earlier { 2 } else { 20 }));
+            let notified = tracking.wake.notify.notified();
+            tokio::pin!(notified);
+            let ready =
+                std::future::poll_fn(|cx| Poll::Ready(notified.as_mut().poll(cx).is_ready())).await;
+            assert_eq!(ready, earlier);
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_deadline_order_cap_and_failed_attempt_spacing() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let tracking = WorkflowTimeoutTrackingState::default();
+        let early = entry(now, 1);
+        let late = entry(now, 2);
+        tracking.insert(late.clone());
+        tracking.insert(early.clone());
+        let now = now + Duration::seconds(5);
+        let config = WorkflowTimeoutScannerConfig {
+            max_timeouts_per_scan: 1,
+            ..Default::default()
+        };
+        let mut seen = vec![];
+        scan_workflow_timeouts_once(&tracking, None, &config, now, |entry, _, _| {
+            seen.push(entry.run_key);
+            async { anyhow::bail!("injected submission failure") }
+        })
+        .await;
+        assert_eq!(seen, [early.run_key]);
+        assert_eq!(
+            workflow_timeout_scan_delay(&tracking, now, config.scan_interval),
+            std::time::Duration::ZERO
+        );
+        scan_workflow_timeouts_once(&tracking, None, &config, now, |entry, _, _| {
+            seen.push(entry.run_key);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(seen, [early.run_key, late.run_key]);
+        assert_eq!(
+            workflow_timeout_scan_delay(&tracking, now, config.scan_interval),
+            config.scan_interval
+        );
+        tracking.inner.begin_full_pass(false);
+        assert_eq!(
+            workflow_timeout_scan_delay(&tracking, now, config.scan_interval),
+            std::time::Duration::ZERO
         );
     }
 }

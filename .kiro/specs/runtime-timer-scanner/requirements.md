@@ -33,11 +33,12 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 
 #### Acceptance Criteria
 
-1. THE Runtime SHALL run a background task (Timer_Scanner) that periodically calls `list_due_timers(now, limit)` on the RunRepository to discover timers whose `fire_at` has passed.
-2. WHEN `list_due_timers` returns one or more DueTimer entries, THE Timer_Scanner SHALL submit a `Command::TimerDue(TimerDueRequest { timer_id, fired_at })` for each entry to the owning run's lane via the same `submit` path used by other runtime commands.
+1. THE Runtime SHALL run a background Timer_Scanner that lists timers through one scan interval ahead, submits those already due in fire-time order, and wakes for the earliest future timer. Deadline wakes SHALL list only affected active shards; a full pass SHALL list every active shard each interval.
+2. WHEN the listing returns one or more DueTimer entries whose fire time has arrived, THE Timer_Scanner SHALL submit a `Command::TimerDue(TimerDueRequest { timer_id, fired_at })` for each entry to the owning run's lane via the same `submit` path used by other runtime commands.
 3. THE Timer_Scanner SHALL use a configurable scan interval with a default suitable for sub-second timer resolution (e.g. 200ms).
 4. THE Timer_Scanner SHALL use a configurable batch limit to bound the number of timers processed per scan cycle.
 5. THE Timer_Scanner SHALL set the `fired_at` field in each `TimerDueRequest` to the wall-clock time at which the scan cycle observed the timer as due.
+6. WHEN a durable timer's fire time arrives, THE Timer_Scanner SHALL submit it at that time, not at a later periodic scan. Committed visible timers and activated acquisitions SHALL wake the affected shard; full due pages SHALL continue immediately, while failed submissions wait for the next full pass. Fire times, look-ahead bounds and observations SHALL use the node clock. Authority: `service/history/workflow/timer_sequence.go:69-106`, `service/history/workflow/task_generator.go:372-402`, `service/history/queues/queue_scheduled.go:159-275 @ v1.31.0`.
 
 ---
 
@@ -51,6 +52,7 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 2. WHEN a `TimerDue` command is delivered for a timer that has already been canceled or fired, THE Kernel SHALL reject it with `Reject::UnknownTimer`, and THE Runtime SHALL treat that rejection as a harmless no-op.
 3. WHEN a `TimerDue` command is delivered for a run that is already closed, THE Kernel SHALL reject it with `Reject::RunClosed`, and THE Runtime SHALL treat that rejection as a harmless no-op.
 4. WHEN a `TimerDue` command is delivered for a run that does not exist, THE Kernel SHALL reject it with `Reject::MissingRun`, and THE Runtime SHALL treat that rejection as a harmless no-op.
+5. WHEN a `TimerDue` command names a timer whose fire time, floored to the millisecond, is after its `fired_at` floored to the millisecond, THE Kernel SHALL reject it with `Reject::UnknownTimer`, and THE Runtime SHALL treat that rejection as a harmless no-op. Flooring SHALL also apply before 1970. Authority: `service/history/timer_queue_active_task_executor.go:163-175`, `service/history/queues/queue_scheduled.go:286-301` and `common/constants.go:46 @ v1.31.0`.
 
 ---
 

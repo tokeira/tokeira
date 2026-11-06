@@ -29,13 +29,16 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
             .activity_tracking
             .for_acquisition(attempt.acquisition.clone());
         activity.remove_all_for_run(state.run_key);
-        activity.eligibility.refresh(state, home);
         for entry in entries.activities {
             let cancel_requested = state
                 .activities
                 .get(&entry.activity_id)
                 .is_some_and(|activity| activity.cancel_requested);
             activity.insert(crate::ActivityTrackingEntry {
+                timeouts: state
+                    .activities
+                    .get(&entry.activity_id)
+                    .map(crate::activity_timeout::ActivityTimeouts::from),
                 run_key: state.run_key,
                 shard_id: home,
                 activity_id: entry.activity_id,
@@ -48,12 +51,17 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
                 cancel_requested,
             });
         }
+        activity.refresh_eligibility(state, home, self.clock.now());
         let nexus = self
             .nexus_timeout_tracking
             .for_acquisition(attempt.acquisition.clone());
         nexus.remove_all_for_run(state.run_key);
         for entry in entries.nexus_timeouts {
             nexus.insert(crate::NexusTimeoutEntry {
+                timeouts: state
+                    .pending_nexus_operations
+                    .get(&entry.operation_id)
+                    .map(crate::nexus::NexusTimeouts::from),
                 run_key: state.run_key,
                 shard_id: home,
                 operation_id: entry.operation_id,
@@ -67,6 +75,13 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
         callbacks.remove_all_for_run(state.run_key);
         for entry in entries.completion_callbacks {
             callbacks.insert(crate::CompletionCallbackTrackingEntry {
+                timing: state
+                    .completion_callbacks
+                    .get(entry.callback_index)
+                    // Recovery may have lost the Scheduled invocation. Unknown
+                    // timing requests an immediate authoritative reload.
+                    .filter(|callback| callback.state != tokeira_kernel::CallbackState::Scheduled)
+                    .map(crate::nexus::CompletionCallbackTiming::from),
                 run_key: state.run_key,
                 shard_id: home,
                 callback_index: entry.callback_index,
@@ -256,6 +271,7 @@ fn metadata_transition(mut state: WorkflowState) -> Transition {
         timer_ops: Default::default(),
         dispatch_ops: Default::default(),
         events_numbered_at_close: 0,
+        workflow_task_heartbeat_timed_out: false,
         growth_limits: Some(crate::run_growth::run_growth_limits()),
     }
 }

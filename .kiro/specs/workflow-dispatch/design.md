@@ -779,6 +779,23 @@ partial sweeps, and the managed lease-loss watcher retains the acquisition's cle
 guard after activation. These local lifecycle checks complement the
 transaction-local competing-owner fence; neither substitutes for the other.
 
+The scanner sleeps until the earliest active tracked deadline or the scan interval,
+whichever is sooner. Schedule-to-start is due at its deadline, start-to-close one
+nanosecond after it, and a zero timeout at its anchor; deadline arithmetic saturates.
+Overdue entries present when the scan began keep the interval for retry, and
+entries from inactive acquisitions do not shorten the sleep. Inserting an earlier
+deadline wakes the scanner; a later deadline leaves its planned wake alone.
+Planning the wake and installing entries share the tracking lock. During a scan,
+the planned wake is the time the scanner woke, so future inserts do not notify.
+The scanner also captures the tracking revision at scan start: planning wakes at
+once for an active overdue entry with a newer revision or unattempted work left
+by the cap, while attempted overdue entries keep the retry interval so failed
+submissions cannot spin. Passes select only due active entries and order them by
+deadline then run key (Requirement 7.10). Future entries
+are seen by the next plan without a notification. Per-shard scans,
+submission caps, revision checks and speculative timers remain unchanged
+(`service/history/queues/queue_scheduled.go:159-224,269 @ v1.31.0`; Requirement 7.9).
+
 Each installed timeout also has a monotonically increasing local revision. After
 awaiting submission, success and stale rejection retire only the submitted
 revision. A concurrent start replaces schedule-to-start with start-to-close while
@@ -984,8 +1001,11 @@ reconstruction preserves its absolute pending deadline before serving. Overdue
 deadlines are immediately eligible after serving; valid timeouts create normal
 discoverable replacement work, while stale timeouts do not change a newer or
 started task. Sticky scans are absent and fallback reads do not mutate affinity.
+For any tracked task set and clock position, the next sleep is no longer than the
+scan interval or any active future due time. Earlier inserts advance the wake;
+entries inserted during scanning remain visible before the next sleep.
 
-**Validates: Requirements 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 12.2**
+**Validates: Requirements 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9, 12.2**
 
 ### Property 8: Complete bounded repair
 

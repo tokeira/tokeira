@@ -1262,8 +1262,6 @@ where
                 if activity.started_at.is_some() || activity.pause_info.is_some() {
                     continue;
                 }
-                self.activity_tracking
-                    .record_retry(run_key, &activity_id, dispatch_at);
                 let task = DispatchableActivityTask {
                     run_key,
                     queue: QueueKey {

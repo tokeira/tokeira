@@ -891,16 +891,18 @@ fn default_endpoint_list_max_page_size() -> usize {
     1000
 }
 
-/// Operator overrides that intentionally diverge from the pinned Temporal
-/// behavioural baseline (`TEMPORAL_SERVER_COMPAT`).
+/// Configured Temporal behavior and explicitly enabled preview features.
 ///
-/// Each flag, when set, turns on a feature that sits *ahead* of the baseline
-/// behavioural claim. They default off so an unconfigured server matches the
-/// baseline exactly; enabling one is a declared deviation that the compatibility
-/// report surfaces rather than hides.
+/// Defaults match the pinned baseline. Each setting documents whether enabling
+/// it selects supported v1.31.0 behavior or a feature beyond that baseline.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompatibilityConfig {
+    /// Enable completion-owned eager activity starts for every namespace.
+    /// Matches `system.enableActivityEagerExecution` (default false) in
+    /// `common/dynamicconfig/constants.go:193-197 @ v1.31.0`.
+    #[serde(default)]
+    pub enable_activity_eager_execution: bool,
     /// Enable standalone (CHASM) activities — the public `*ActivityExecution`
     /// RPCs. Off by default: the baseline (`v1.31.0`) gates them off and answers
     /// `UNIMPLEMENTED` (`chasm/lib/activity/frontend.go @ v1.31.0`). When `true`,
@@ -1722,6 +1724,17 @@ mod tests {
     use std::{path::PathBuf, sync::Mutex};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn eager_activity_policy_defaults_off_and_round_trips() {
+        let default = TokeiraConfig::default();
+        assert!(!default.policy.compatibility.enable_activity_eager_execution);
+        let mut enabled = default;
+        enabled.policy.compatibility.enable_activity_eager_execution = true;
+        let parsed: TokeiraConfig = toml::from_str(&enabled.to_toml().unwrap()).unwrap();
+        assert!(parsed.policy.compatibility.enable_activity_eager_execution);
+        assert_eq!(enabled, parsed);
+    }
 
     #[test]
     fn outbound_storage_cli_requires_review_digest_and_stopped_writer_confirmation() {

@@ -1,0 +1,5 @@
+kind: fixed
+body: With in-memory storage, timers started before a reset point that are still pending now fire in the reset's new run.
+time: 2026-11-06T01:16:42.800138+00:00
+custom:
+    Slice: b0b0ee4a-77c1-49c2-b9ee-b9520662fa12

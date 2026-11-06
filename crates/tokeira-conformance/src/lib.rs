@@ -132,6 +132,16 @@ pub struct KeySpec {
 /// `Wired` set always equals the set of keys a real accessor reads — which is
 /// exactly the honesty boundary the spec requires.
 pub static KEY_CLASSIFICATION: &[KeySpec] = &[
+    KeySpec {
+        key: "history.workflowTaskHeartbeatTimeout",
+        value_type: ValueType::Duration,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "system.enableActivityEagerExecution",
+        value_type: ValueType::Bool,
+        disposition: Disposition::Wired,
+    },
     // The HTTP gateway consults the global Host allow-list before body decode
     // on every annotated request (`allowedHostsMiddleware`,
     // service/frontend/http_api_server.go @ v1.31.0).
@@ -833,6 +843,31 @@ mod tests {
         for key in AUTH_BOOL_KEYS {
             assert_eq!(overrides.get_bool(key), None);
         }
+    }
+
+    #[test]
+    fn workflow_task_heartbeat_override_is_duration_and_scope_reset_drops_it() {
+        let registry = ConformanceOverrides::default();
+        let key = "history.workflowTaskHeartbeatTimeout";
+        let timeout = Duration::from_secs(5);
+        assert!(registry.set(key, OverrideValue::Duration(timeout)).is_ok());
+        assert_eq!(registry.get_duration(key), Some(timeout));
+        registry.reset();
+        assert_eq!(registry.get_duration(key), None);
+        assert!(registry.set(key, OverrideValue::Bool(true)).is_err());
+    }
+
+    #[test]
+    fn eager_activity_override_is_boolean_and_scope_reset_drops_it() {
+        let registry = ConformanceOverrides::default();
+        let key = "system.enableActivityEagerExecution";
+        assert!(registry.set(key, OverrideValue::Bool(true)).is_ok());
+        assert_eq!(registry.get_bool(key), Some(true));
+        let before = registry.scope_generation();
+        registry.reset();
+        assert!(registry.scope_generation() > before);
+        assert_eq!(registry.get_bool(key), None);
+        assert!(registry.set(key, OverrideValue::Int(1)).is_err());
     }
 
     /// Keys are matched case-insensitively. The fork bridge delivers

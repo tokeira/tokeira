@@ -432,6 +432,32 @@ pub fn workflow_task_completed_request(
 ) -> Result<WorkflowTaskCompletedRequest> {
     let (token, _) = crate::task_token::decode::<WorkflowTaskToken>(&req.task_token)?;
     let caller_identity = (!req.identity.is_empty()).then(|| req.identity.clone());
+    let scope = context
+        .claims
+        .as_ref()
+        .and_then(|claims| claims.worker_scope.as_ref())
+        .map(|scope| {
+            anyhow::ensure!(
+                context
+                    .namespace
+                    .as_ref()
+                    .is_some_and(|namespace| namespace.name == scope.namespace()),
+                "completion scope namespace was not admitted"
+            );
+            Ok(tokeira_kernel::CompletionWorkflowTaskScope {
+                namespace_id: crate::workflow_service::resolved_namespace_id(
+                    context,
+                    &req.namespace,
+                )?,
+                normal_task_queues: scope
+                    .task_queues()
+                    .map(|queue| TaskQueueName(queue.to_owned()))
+                    .collect(),
+                deployment: DeploymentId(scope.deployment_name().to_owned()),
+                build_id: BuildId(scope.build_id().to_owned()),
+            })
+        })
+        .transpose()?;
     Ok(WorkflowTaskCompletedRequest {
         token,
         identity: WorkerIdentity(req.identity),
@@ -444,6 +470,21 @@ pub fn workflow_task_completed_request(
         sticky: req.sticky,
         commands: req.commands,
         client_discards_speculative_with_events: req.client_discards_speculative_with_events,
+        eager_activities: tokeira_kernel::CompletionActivityStarts {
+            scope: scope.clone(),
+            ..Default::default()
+        },
+        inline_workflow_task: req.return_new_workflow_task.then_some(
+            tokeira_kernel::CompletionWorkflowTaskStart {
+                scope,
+                history_size_bytes: 0,
+                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
+            },
+        ),
+        heartbeat: tokeira_kernel::WorkflowTaskHeartbeat {
+            wire_empty: req.wire_completion_empty,
+            ..Default::default()
+        },
         force_new_workflow_task: req.force_create_new_workflow_task,
         limits: Default::default(),
         // Filled by the runtime from its update registry before the commit
@@ -1008,6 +1049,7 @@ mod tests {
             commands: Vec::new(),
             command_sizes: Vec::new(),
             return_new_workflow_task: false,
+            wire_completion_empty: false,
             force_create_new_workflow_task: false,
             query_results: std::collections::HashMap::new(),
             messages: Vec::new(),

@@ -63,7 +63,7 @@ The requirements use this mapping explicitly so the model is unambiguous:
 - **Sticky_Promotion**: Moving a sticky task to the general tier when its sticky TTL expires before the preferred worker polls, making it general-deliverable to any poller.
 - **Sweeper**: The recovery mechanism that, after broker restart or shard failover, reconstructs delivery candidates (pending WFTs, dispatchable activity attempts, expired sticky claims) from authoritative per-run state and republishes them (doc 040 "Sweeper contract").
 - **Query_Task**: A read-only task delivered without deduplication and without backlog participation, preferring a matching sticky worker (`crates/tokeira-runtime/src/broker.rs` `publish_query_task` / `poll_query_task`).
-- **Direct_Claim**: Pulling a specific run's task out of the general tier by RunKey for eager/direct dispatch rather than the normal poll path (`try_claim_workflow_task`); never claims from the sticky tier.
+- **Direct_Claim**: Pulling a specific run's task out of the general tier by RunKey for broker-only direct delivery rather than the normal poll path (`try_claim_workflow_task`); never claims from the sticky tier.
 - **Queue_Partition**: One partition of a logically-named task queue. Each partition has its own waiters and ready tiers; backlog on one partition while pollers wait on another is the doc-040 sync-match-collapse condition.
 - **Sync_Match_Rate**: The fraction of published tasks that found a waiting poller at publish time (the broker emits `record_sync_match` / `record_non_sync_match`); a primary doc-040 health indicator.
 - **Poll_Success_Rate**: The fraction of resolved polls that received work rather than timing out; a doc-040 health indicator.
@@ -304,9 +304,9 @@ This deliverable re-models the real Tokeira delivery broker as a pure determinis
 3. THE Broker_Model SHALL NOT allocate a durable resource for any query poll, consistent with the long-poll resource-isolation guarantee (Requirement 15).
 4. THE Broker_Model SHALL record named signal counts for query deliveries and query poll timeouts.
 
-### Requirement 19: Eager / Direct Claim Path
+### Requirement 19: Broker Direct Claim Path
 
-**User Story:** As a simulator author, I want the eager direct-claim path modelled, so that pulling a task out of the general tier for direct dispatch is exercised without double-starting or stranding it.
+**User Story:** As a simulator author, I want the broker direct-claim primitive modelled, so that pulling a task out of the general tier for direct dispatch is exercised without double-starting or stranding it.
 
 #### Acceptance Criteria
 
@@ -315,6 +315,12 @@ This deliverable re-models the real Tokeira delivery broker as a pure determinis
 3. IF a directly-claimed task is not subsequently started, THEN THE Broker_Model SHALL make it deliverable again rather than losing it.
 4. THE Broker_Model SHALL ensure a directly-claimed task cannot also be delivered through the normal poll path, so the direct claim never produces a double-start (cross-checked by invariant `S2`).
 5. THE Broker_Model SHALL record a named signal count for direct claims.
+
+Completion-inline activity and workflow tasks are outside this Direct_Claim model:
+they start in the completion and produce no offer. The completion specs own their
+one-start/no-row/no-offer properties; simulator direct-claim results are not evidence
+for those paths. Tier_A_Inline continues to mean an ordinary reserved-poller match,
+not `RespondWorkflowTaskCompleted` inline delivery.
 
 ### Requirement 20: Partitioned-Queue Modelling and Sync-Match Collapse
 

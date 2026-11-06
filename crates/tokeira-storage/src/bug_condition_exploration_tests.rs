@@ -58,6 +58,7 @@ mod tests {
             external_payload_size_bytes: 0,
             next_workflow_task_seq: LogicalTaskSeq(1),
             pending_workflow_task: Some(PendingWorkflowTask {
+                original_scheduled_at: None,
                 advice: Default::default(),
                 task_type: tokeira_kernel::WorkflowTaskType::Normal,
                 schedule_to_start_deadline: None,
@@ -137,6 +138,7 @@ mod tests {
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         }
     }
@@ -234,6 +236,7 @@ mod tests {
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         };
 
@@ -338,6 +341,7 @@ mod tests {
                     timer_ops: Default::default(),
                     dispatch_ops: Default::default(),
                     events_numbered_at_close: 0,
+                    workflow_task_heartbeat_timed_out: false,
                     growth_limits: None,
                 };
 

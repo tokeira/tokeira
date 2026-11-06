@@ -4,8 +4,8 @@
 //! served from local authoritative state. These sit at the runtime boundary: the
 //! edge translates them into the appropriate public status codes. They are kept
 //! distinct from kernel rejections (which describe *semantic* refusals) — these
-//! describe *placement* and *resolution* failures: the local node is not the
-//! owner, or authoritative state needed to answer is absent.
+//! include *placement* and *resolution* failures (ownership or missing state),
+//! and the committed heartbeat-timeout outcome whose public response is an error.
 
 use std::sync::RwLock;
 
@@ -14,6 +14,13 @@ use tokeira_storage::LeaseFenceLost;
 use tokeira_types::{BundleId, IncarnationId, RunKey, ShardEpoch};
 
 use crate::shard::ShardOwner;
+
+/// A heartbeat-only completion committed its timeout and successor. This is an
+/// error response after durable success, never a pre-commit rejection
+/// (respondworkflowtaskcompleted/api.go:731-737 @ v1.31.0).
+#[derive(Clone, Debug, Error)]
+#[error("workflow task heartbeat timeout")]
+pub struct WorkflowTaskHeartbeatTimedOut;
 
 /// Atomic reset publication lost its captured base/current snapshot. No partial
 /// reset was exposed; retrying must load the current execution again.

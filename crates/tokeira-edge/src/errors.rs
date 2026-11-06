@@ -344,6 +344,19 @@ impl From<anyhow::Error> for EdgeError {
         {
             return Self::ServiceUnavailable(error.to_string());
         }
+        if let Some(timeout) =
+            value.downcast_ref::<tokeira_runtime::WorkflowTaskHeartbeatTimedOut>()
+        {
+            return Self::NotFound(timeout.to_string());
+        }
+        if let Some(tokeira_runtime::KernelRejected(
+            tokeira_kernel::Reject::ForcedWorkflowTaskWhilePaused,
+        )) = value.downcast_ref::<tokeira_runtime::KernelRejected>()
+        {
+            return Self::FailedPrecondition(
+                "Workflow is paused and force create new workflow task is not allowed.".into(),
+            );
+        }
         // A failed activity-token revalidation surfaces as v1.31.0's
         // `ErrActivityTaskNotFound`: code NotFound with this exact message,
         // asserted verbatim by clients (`service/history/consts/const.go:44-45

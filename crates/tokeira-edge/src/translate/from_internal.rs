@@ -136,7 +136,7 @@ fn poll_history(
             happened_at: started.scheduled_time,
             kind: tokeira_kernel::HistoryEventKind::WorkflowTaskScheduled {
                 logical_seq: started.token.logical_seq,
-                task_queue: started.task_queue.clone(),
+                task_queue: started.scheduled_task_queue.clone(),
                 workflow_task_timeout: started.workflow_task_timeout,
                 attempt: started.token.attempt,
             },
@@ -370,6 +370,7 @@ mod tests {
     fn started_task(previous_started_event_id: i64, is_sticky_match: bool) -> StartedWorkflowTask {
         let run_key = RunKey::new();
         StartedWorkflowTask {
+            scheduled_task_queue: TaskQueueName("queue".to_string()),
             advice: Default::default(),
             token: WorkflowTaskToken {
                 run_key,

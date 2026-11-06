@@ -1,0 +1,5 @@
+kind: changed
+body: Eager activity execution is now off by default. Set policy.compatibility.enable_activity_eager_execution to true to turn it on.
+time: 2026-11-05T16:13:36.241672+00:00
+custom:
+    Slice: 898aa880-69f6-4ee5-8045-a958e3f007e7

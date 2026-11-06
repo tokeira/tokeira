@@ -90,11 +90,12 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 
 #### Acceptance Criteria
 
-1. THE Runtime SHALL run a background task (Workflow_Timeout_Scanner) that periodically iterates over all entries in the Workflow_Timeout_Tracking_State and checks each run against its configured timeouts.
+1. THE Runtime SHALL run a background task (Workflow_Timeout_Scanner) that wakes at the earliest active tracked deadline and selects due entries in deadline order, without reloading runs. A capped pass SHALL immediately continue unattempted due work; failed submissions SHALL wait for the scan interval.
 2. THE Workflow_Timeout_Scanner SHALL use a configurable scan interval with a sensible default (e.g. 1 second).
 3. WHEN the Workflow_Timeout_Scanner detects a timeout violation, THE Workflow_Timeout_Scanner SHALL submit the `WorkflowExecutionTimedOut` command to the owning run's lane using the same `submit` path used by other runtime commands.
 4. THE Workflow_Timeout_Scanner SHALL process timeout violations in bounded batches per scan cycle to avoid starving other lane work.
 5. THE Workflow_Timeout_Scanner SHALL capture the current wall-clock time once at the start of each scan cycle and use that single timestamp for all timeout comparisons within the cycle.
+6. WHEN a run is tracked with a deadline before the scanner's planned wake, THE scanner SHALL wake for it (`service/history/queues/queue_scheduled.go:159-224,269 @ v1.31.0`).
 
 ---
 

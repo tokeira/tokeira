@@ -35,7 +35,7 @@ proptest! {
             repo.state.lock().await.loaded = LoadedRun::Existing(state.clone());
             owner.write().unwrap().invalidate_published_states();
             drop(exclusive);
-            let (result, _, _) = pending.await.unwrap();
+            let (result, ..) = pending.await.unwrap();
             let CommitResult::Applied { new_state } = result else { panic!("no-op applies"); };
             prop_assert_eq!(new_state.transition_seq, state.transition_seq);
             prop_assert_eq!(repo.snapshot().await.1, 0);

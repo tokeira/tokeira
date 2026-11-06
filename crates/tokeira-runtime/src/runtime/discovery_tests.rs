@@ -75,7 +75,7 @@ proptest! {
             for _ in 0..duplicates { first.broker.publish_workflow_task(task.clone(), None).await; }
             if started {
                 // Drop the response just as a caller whose transport lost it would.
-                assert!(first.try_claim_workflow_task(queue.clone(), None, task.run_key, WorkerIdentity("lost-reply".into())).await.unwrap().is_some());
+                assert!(claim_workflow_task(&first, queue.clone(), None, task.run_key, WorkerIdentity("lost-reply".into())).await.unwrap().is_some());
                 let entries = first.wft_timeout_tracking.snapshot();
                 let entry = entries.iter().find(|entry| entry.run_key == task.run_key).unwrap();
                 assert_eq!(entry.shard_id, expected_home);
@@ -88,7 +88,7 @@ proptest! {
             let second = runtime(store.clone(), home((home_id + 1) % 8));
             if started {
                 second.broker.publish_workflow_task(task.clone(), None).await;
-                assert!(second.try_claim_workflow_task(queue.clone(), None, task.run_key, WorkerIdentity("retry".into())).await.unwrap().is_none());
+                assert!(claim_workflow_task(&second, queue.clone(), None, task.run_key, WorkerIdentity("retry".into())).await.unwrap().is_none());
             } else {
                 let result = second.poll_workflow_activation(queue.clone(), None, WorkerIdentity("recovered".into()), tokio::time::Duration::from_secs(30)).await.unwrap();
                 assert!(matches!(result, Some(WorkflowActivation::WorkflowTask(_))));
@@ -126,7 +126,7 @@ async fn sticky_poll_without_normal_name_never_registers_periodic_discovery() {
     stop(&runtime).await;
 }
 
-pub(super) async fn stop(runtime: &TokeiraRuntime<InMemoryStore>) {
+pub(super) async fn stop<R: RunRepository + 'static>(runtime: &TokeiraRuntime<R>) {
     runtime.runtime_shutdown.begin_shutdown();
     runtime
         .runtime_shutdown
@@ -239,13 +239,15 @@ async fn overlapping_queue_homes_can_commit_only_one_start() {
         .publish_workflow_task(task.clone(), None)
         .await;
     let (a, b) = tokio::join!(
-        first.try_claim_workflow_task(
+        claim_workflow_task(
+            &first,
             queue.clone(),
             None,
             task.run_key,
             WorkerIdentity("first".into())
         ),
-        second.try_claim_workflow_task(
+        claim_workflow_task(
+            &second,
             queue.clone(),
             None,
             task.run_key,
@@ -529,4 +531,29 @@ async fn unavailable_owner_keeps_polling_until_the_original_deadline() {
         assert_eq!(store.snapshot().await.unwrap(), before);
         stop(&node).await;
     }
+}
+
+async fn claim_workflow_task<R: RunRepository + 'static>(
+    runtime: &TokeiraRuntime<R>,
+    queue: QueueKey,
+    normal_queue: Option<QueueKey>,
+    run_key: RunKey,
+    identity: WorkerIdentity,
+) -> anyhow::Result<Option<super::StartedWorkflowTask>> {
+    let Some(offered) = runtime
+        .broker
+        .try_claim_workflow_task_for_worker_with_normal(
+            &queue,
+            normal_queue.as_ref(),
+            run_key,
+            Some(&identity),
+        )
+        .await
+    else {
+        return Ok(None);
+    };
+    Ok(runtime
+        .start_polled_workflow_task(offered.0, offered.1, identity)
+        .await
+        .ok())
 }

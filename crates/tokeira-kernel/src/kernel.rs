@@ -1347,7 +1347,7 @@ impl BasicKernel {
                 .state
                 .pending_workflow_task
                 .as_ref()
-                .expect("retained task exists");
+                .expect("pending task exists");
             let sticky = builder.state.sticky.as_ref().filter(|affinity| {
                 !affinity.sticky_queue.0.is_empty() && pending.schedule_to_start_deadline.is_some()
             });
@@ -1893,154 +1893,8 @@ impl BasicKernel {
         req: StartWorkflowTaskRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
-        if state.status != ExecutionStatus::Running {
-            return Err(Reject::WorkflowPaused);
-        }
-        let pending = state
-            .pending_workflow_task
-            .clone()
-            .ok_or(Reject::NoPendingWorkflowTask)?;
-
-        if pending.logical_seq != req.logical_seq {
-            return Err(Reject::WorkflowTaskSeqMismatch {
-                expected: pending.logical_seq.0,
-                got: req.logical_seq.0,
-            });
-        }
-        if pending.started_event_id.is_some() {
-            return Err(Reject::WorkflowTaskAlreadyStarted {
-                logical_seq: pending.logical_seq.0,
-            });
-        }
-
         let mut builder = TransitionBuilder::new(state, req.now, None);
-        let target_version_changed_enabled = req.target_version_changed_enabled;
-        let target_deployment_version = req.target_deployment_version.clone();
-        let target_worker_deployment_version_changed =
-            builder.state.apply_target_version_observation(
-                target_version_changed_enabled,
-                target_deployment_version.clone(),
-            );
-        let attempt = pending.attempt.max(1);
-        // The count operand is the id the next event would receive at this
-        // moment (`GetNextEventID()`, workflow_task_state_machine.go:1452 @
-        // v1.31.0): the started id for a persisted start and the virtual
-        // scheduled id for a suppressed one. It is fixed before anything is
-        // emitted so the conversion branch below matches v1.31.0, which decides
-        // before adding its events. In-flight updates are the admitted set plus
-        // the accepted set; acceptance moves an id from one to the other, so
-        // the sum never double-counts.
-        let in_flight_updates =
-            builder.state.admitted_updates.len() + builder.state.pending_updates.len();
-        let advice = crate::advice::continue_as_new_advice(
-            req.history_size_bytes,
-            builder.state.last_event_id + 1,
-            in_flight_updates,
-            builder.state.completed_update_count,
-            req.advice_policy,
-        );
-        // Transient (attempt>1) and SPECULATIVE starts persist no
-        // WorkflowTaskStarted event: the started id is virtual
-        // (scheduled_event_id + 1) and last_event_id is unchanged — v1.31.0
-        // suppresses the pair for both modes with one predicate
-        // (`!IsTransientWorkflowTask() && Type != SPECULATIVE`,
-        // workflow_task_state_machine.go:556-558 @ v1.31.0; spec
-        // speculative-wft, one predicate / three modes per Invariant I.2).
-        // Conversion (rule ii): if new events landed after the virtual
-        // scheduling — the virtual scheduled id no longer equals
-        // last_event_id + 1 — convert back to a NORMAL attempt-1 task with
-        // real Scheduled + Started, since the frozen virtual suffix is now
-        // invalid (workflow_task_state_machine.go:559-576 @ v1.31.0; the same
-        // branch also flips a speculative task's `Type` to NORMAL).
-        let suppressed = attempt > 1 || pending.task_type == WorkflowTaskType::Speculative;
-        let new_events_since_schedule =
-            suppressed && pending.scheduled_event_id != builder.state.last_event_id + 1;
-        let (scheduled_event_id, started_event_id) = if suppressed && !new_events_since_schedule {
-            (pending.scheduled_event_id, pending.scheduled_event_id + 1)
-        } else if new_events_since_schedule {
-            builder.state.workflow_task_attempt = 1;
-            let scheduled = builder.emit(HistoryEventKind::WorkflowTaskScheduled {
-                logical_seq: pending.logical_seq,
-                task_queue: builder.state.task_queue.clone(),
-                workflow_task_timeout: builder.state.workflow_task_timeout,
-                attempt: 1,
-            });
-            let started = builder.emit(HistoryEventKind::WorkflowTaskStarted {
-                logical_seq: pending.logical_seq,
-                scheduled_event_id: scheduled,
-                attempt: 1,
-                identity: req.worker_identity.clone(),
-                request_id: req.request_id,
-                history_size_bytes: advice.history_size_bytes,
-                suggest_continue_as_new: advice.suggest_continue_as_new,
-                suggest_continue_as_new_reasons: advice.suggest_continue_as_new_reasons.clone(),
-                target_worker_deployment_version_changed,
-                target_version_changed_enabled,
-                target_deployment_version: target_deployment_version.clone(),
-            });
-            (scheduled, started)
-        } else {
-            let started = builder.emit(HistoryEventKind::WorkflowTaskStarted {
-                logical_seq: pending.logical_seq,
-                scheduled_event_id: pending.scheduled_event_id,
-                attempt,
-                identity: req.worker_identity.clone(),
-                request_id: req.request_id,
-                history_size_bytes: advice.history_size_bytes,
-                suggest_continue_as_new: advice.suggest_continue_as_new,
-                suggest_continue_as_new_reasons: advice.suggest_continue_as_new_reasons.clone(),
-                target_worker_deployment_version_changed,
-                target_version_changed_enabled,
-                target_deployment_version: target_deployment_version.clone(),
-            });
-            (pending.scheduled_event_id, started)
-        };
-
-        let current = builder
-            .state
-            .pending_workflow_task
-            .as_mut()
-            .expect("validated pending workflow task must still exist");
-        current.scheduled_event_id = scheduled_event_id;
-        current.started_event_id = Some(started_event_id);
-        current.started_at = Some(req.now);
-        current.attempt = builder.state.workflow_task_attempt;
-        current.target_worker_deployment_version_changed = target_worker_deployment_version_changed;
-        current.target_version_changed_enabled = target_version_changed_enabled;
-        current.target_deployment_version = target_deployment_version;
-        // Recorded so a suppressed start's later materialization or synthesis
-        // carries exactly this decision (Requirement 2.6).
-        current.advice = advice;
-        if new_events_since_schedule {
-            // The conversion branch persisted real Scheduled/Started — the
-            // task is normal from here on (`workflowTask.Type = NORMAL`,
-            // workflow_task_state_machine.go:564-566 @ v1.31.0).
-            current.task_type = WorkflowTaskType::Normal;
-        }
-
-        // Sticky metadata survives an unavailable-worker fallback and clears
-        // only when the derived task actually starts outside the sticky queue
-        // (`recordworkflowtaskstarted/api.go:115-149 @ v1.31.0`).
-        if builder.state.sticky.as_ref().is_some_and(|sticky| {
-            !sticky.sticky_queue.0.is_empty() && sticky.sticky_queue != req.polled_task_queue
-        }) {
-            builder.state.sticky = None;
-        }
-
-        if let Some(target) = req.deployment_transition {
-            builder
-                .state
-                .start_version_transition(
-                    target,
-                    req.deployment_transition_revision_number
-                        .unwrap_or_default(),
-                )
-                .map_err(|error| match error {
-                    crate::state::VersionTransitionError::PinnedWorkflowCannotTransition => {
-                        Reject::PinnedWorkflowCannotTransition
-                    }
-                })?;
-        }
+        builder.start_workflow_task(req)?;
 
         builder.finish()
     }
@@ -2109,6 +1963,8 @@ impl BasicKernel {
         retry_continuation: Option<RetryContinuation>,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
+        let inline_identity = req.identity.clone();
+        let inline_worker_version = req.worker_version.clone();
         let pending = state
             .pending_workflow_task
             .clone()
@@ -2127,6 +1983,47 @@ impl BasicKernel {
         }
         if pending.attempt != req.token.attempt || started_event_id != req.token.started_event_id {
             return Err(Reject::WorkflowTaskTokenMismatch);
+        }
+
+        // Refuse after token validation, without mutating paused state
+        // (respondworkflowtaskcompleted/api.go:209-214 @ v1.31.0).
+        if state.status == ExecutionStatus::Paused && req.force_new_workflow_task {
+            return Err(Reject::ForcedWorkflowTaskWhilePaused);
+        }
+        // Only the original wire request decides progress: translation can drop
+        // messages. Equality is still inside the heartbeat window
+        // (respondworkflowtaskcompleted/api.go:288-299 @ v1.31.0).
+        let heartbeat = req.force_new_workflow_task && req.heartbeat.wire_empty;
+        let expired = heartbeat
+            && pending.original_scheduled_at.is_some_and(|original| {
+                original > OffsetDateTime::UNIX_EPOCH
+                    && original
+                        .checked_add(req.heartbeat.timeout)
+                        .is_some_and(|deadline| req.now > deadline)
+            });
+        if expired {
+            let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
+            builder.timeout_started_workflow_task(&pending, started_event_id, false);
+            // Timeout clears old affinity; completion then applies the request's
+            // attributes (respondworkflowtaskcompleted/api.go:298-342 @ v1.31.0).
+            builder.state.sticky = req
+                .sticky
+                .as_ref()
+                .filter(|sticky| !sticky.queue.0.is_empty())
+                .map(|sticky| StickyAffinity {
+                    worker_identity: inline_identity.clone(),
+                    sticky_queue: sticky.queue.clone(),
+                    schedule_to_start_timeout: sticky.schedule_to_start_timeout,
+                });
+            builder.schedule_workflow_task();
+            builder.start_completion_workflow_task(
+                req.inline_workflow_task.as_ref(),
+                &inline_identity,
+                inline_worker_version.as_ref(),
+            )?;
+            let mut transition = builder.finish()?;
+            transition.workflow_task_heartbeat_timed_out = true;
+            return Ok(transition);
         }
 
         // K3 (spec speculative-wft): a SPECULATIVE completion that is not a
@@ -2228,9 +2125,34 @@ impl BasicKernel {
                 // update its event delivers needs none: it reaches the worker
                 // in history (`needToSend`, `update/update.go:404-437 @
                 // v1.31.0`).
-                if builder.state.has_admitted_update_to_send() {
-                    builder.schedule_speculative_workflow_task();
+                builder.state.sticky = req
+                    .sticky
+                    .as_ref()
+                    .filter(|sticky| !sticky.queue.0.is_empty())
+                    .map(|sticky| StickyAffinity {
+                        worker_identity: inline_identity.clone(),
+                        sticky_queue: sticky.queue.clone(),
+                        schedule_to_start_timeout: sticky.schedule_to_start_timeout,
+                    });
+                if builder
+                    .state
+                    .versioning_info
+                    .as_ref()
+                    .is_some_and(|info| info.version_transition.is_some())
+                {
+                    builder.schedule_workflow_task();
+                } else if builder.state.has_admitted_update_to_send() {
+                    if req.inline_workflow_task.is_some() {
+                        builder.schedule_speculative_workflow_task();
+                    } else {
+                        builder.schedule_workflow_task();
+                    }
                 }
+                builder.start_completion_workflow_task(
+                    req.inline_workflow_task.as_ref(),
+                    &inline_identity,
+                    inline_worker_version.as_ref(),
+                )?;
                 return builder.finish();
             }
         }
@@ -2263,7 +2185,7 @@ impl BasicKernel {
                     pending.scheduled_at,
                     HistoryEventKind::WorkflowTaskScheduled {
                         logical_seq: pending.logical_seq,
-                        task_queue: builder.state.task_queue.clone(),
+                        task_queue: builder.state.current_workflow_task_queue().clone(),
                         workflow_task_timeout: builder.state.workflow_task_timeout,
                         attempt: pending.attempt,
                     },
@@ -2346,15 +2268,16 @@ impl BasicKernel {
             req.deployment_version,
             req.worker_deployment_name,
         );
-        // Sticky raise S1: the completion's sticky attributes carry the
-        // sticky QUEUE and the per-dispatch schedule-to-start timeout; a
-        // completion without them clears the affinity (`ClearStickyTaskQueue`
-        // on nil StickyAttributes @ v1.31.0).
+
+        // Materialize the task with the queue current before this completion;
+        // only then apply the request's sticky attributes for its commands and
+        // successor (service/history/api/respondworkflowtaskcompleted/api.go:316-342;
+        // service/history/workflow/workflow_task_state_machine.go:766-772 @ v1.31.0).
         builder.state.sticky = req
             .sticky
             .filter(|spec| !spec.queue.0.is_empty())
             .map(|spec| StickyAffinity {
-                worker_identity: req.identity,
+                worker_identity: inline_identity.clone(),
                 sticky_queue: spec.queue,
                 schedule_to_start_timeout: spec.schedule_to_start_timeout,
             });
@@ -2362,6 +2285,7 @@ impl BasicKernel {
         let limits = req.limits;
         let command_sizes = req.command_sizes;
         builder.resurrection = UpdateSlots::at_completion(&builder.state);
+        let mut eager = Vec::new();
         let mut closed = false;
         for (index, command) in req.commands.into_iter().enumerate() {
             if closed {
@@ -2373,6 +2297,33 @@ impl BasicKernel {
             // between the command handler (collects `wtFailedCause`) and the
             // API layer (`failWorkflowTask` + error return,
             // respondworkflowtaskcompleted/api.go:455-485,739-742).
+            if let WorkflowCommand::ScheduleActivity {
+                activity_id,
+                request_eager_execution,
+                use_workflow_build_id,
+                ..
+            } = command.semantic_command()
+            {
+                // Completed has already recorded the worker stamp. Deployment
+                // versioning alone does not disable eager starts
+                // (workflow_task_completed_handler.go:489-502 @ v1.31.0).
+                let old_versioned = builder.state.effective_behavior()
+                    == crate::state::VersioningBehavior::Unspecified
+                    && builder
+                        .state
+                        .versioning_info
+                        .as_ref()
+                        .and_then(|info| info.most_recent_worker_version_stamp.as_ref())
+                        .is_some_and(|stamp| stamp.use_versioning);
+                let assigned = builder.state.assigned_build_id().is_some();
+                if *request_eager_execution
+                    && req.eager_activities.enabled
+                    && (!(old_versioned || assigned) || *use_workflow_build_id)
+                    && let Some(request_id) = req.eager_activities.request_ids.get(activity_id)
+                {
+                    eager.push((activity_id.clone(), *request_id));
+                }
+            }
             closed = apply_workflow_command(
                 &mut builder,
                 command,
@@ -2381,6 +2332,15 @@ impl BasicKernel {
                 cron_continuation.as_ref(),
                 retry_continuation.as_ref(),
                 &limits,
+            )?;
+        }
+
+        for (activity_id, request_id) in eager {
+            builder.start_completion_activity(
+                &activity_id,
+                request_id,
+                &inline_identity,
+                req.eager_activities.scope.as_ref(),
             )?;
         }
 
@@ -2415,7 +2375,12 @@ impl BasicKernel {
 
         // Schedule a new WFT when the worker explicitly requests one
         // (heartbeat / local-activity keep-alive).
-        if req.force_new_workflow_task
+        if (req.force_new_workflow_task
+            || builder
+                .state
+                .versioning_info
+                .as_ref()
+                .is_some_and(|info| info.version_transition.is_some()))
             && builder.state.is_open()
             && builder.state.pending_workflow_task.is_none()
         {
@@ -2449,8 +2414,20 @@ impl BasicKernel {
             && builder.state.pending_workflow_task.is_none()
             && builder.state.has_admitted_update_to_send()
         {
-            builder.schedule_speculative_workflow_task();
+            if req.inline_workflow_task.is_some() {
+                builder.schedule_speculative_workflow_task();
+            } else {
+                builder.schedule_workflow_task();
+            }
         }
+        if heartbeat && let Some(next) = &mut builder.state.pending_workflow_task {
+            next.original_scheduled_at = pending.original_scheduled_at;
+        }
+        builder.start_completion_workflow_task(
+            req.inline_workflow_task.as_ref(),
+            &inline_identity,
+            inline_worker_version.as_ref(),
+        )?;
 
         // M.1: a speculative task that reached the materialize path (rather than
         // the rejection-only drop at the top) committed into history — count a
@@ -2487,55 +2464,8 @@ impl BasicKernel {
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         let prior = PriorRun::of(&state);
-        let activity = state
-            .activities
-            .get(&req.activity_id)
-            .cloned()
-            .ok_or_else(|| Reject::UnknownActivity(req.activity_id.clone()))?;
-
-        let mut builder = TransitionBuilder::new(state, req.now, req.principal);
-        let started_event_id =
-            if req.mode == ActivityStartMode::Poll && activity.retry_policy.is_some() {
-                // A retry-policy start is transient: the start is recorded on
-                // the activity but consumes no history event until the
-                // activity resolves (`AddActivityTaskStartedEvent`,
-                // mutable_state_impl.go:4082-4152 @ v1.31.0), so a retryable
-                // failure leaves neither Started nor Failed for that attempt.
-                TRANSIENT_ACTIVITY_STARTED_EVENT_ID
-            } else {
-                // Buffers to `BUFFERED_EVENT_ID` while a WFT is started; the
-                // resolution then carries that sentinel as its
-                // `started_event_id` and the flush wires the real id in
-                // (TestBufferedEventsOutOfOrder).
-                builder.append_external(HistoryEventKind::ActivityTaskStarted {
-                    activity_id: req.activity_id.clone(),
-                    scheduled_event_id: activity.schedule_event_id,
-                    attempt: activity.attempt,
-                    identity: req.identity.clone(),
-                    request_id: req.request_id.map_or_else(
-                        || format!("activity-start-{}-{}", req.activity_id, activity.attempt),
-                        |id| id.to_string(),
-                    ),
-                    last_failure: activity.last_failure.clone(),
-                })
-            };
-
-        let started = builder
-            .state
-            .activities
-            .get_mut(&req.activity_id)
-            .expect("activity was read from this state above");
-        // The stamp bump fences any other outstanding offer for this attempt
-        // (`ObsoleteMatchingTask`, recordactivitytaskstarted/api.go @ v1.31.0).
-        started.stamp += 1;
-        started.started_event_id = Some(started_event_id);
-        started.started_at = Some(req.now);
-        // `ai.StartedIdentity` — Describe's primary `LastWorkerIdentity`
-        // source (workflow/activity.go:159 @ v1.31.0). Stored verbatim, even
-        // when empty.
-        started.started_identity = Some(req.identity);
-        let snapshot = started.clone();
-        builder.activity_ops.push(ActivityOp::Upsert(snapshot));
+        let mut builder = TransitionBuilder::new(state, req.now, req.principal.clone());
+        builder.start_activity(req)?;
 
         let transition = builder.finish_without_buffered_limits();
         check_transition(&prior, &transition)?;
@@ -3536,9 +3466,8 @@ impl BasicKernel {
         builder.finish()
     }
 
-    /// Record a WFT failure. The pending WFT stays alive (with
-    /// `started_event_id` cleared) so it can be retried — unlike
-    /// completion, failure does not consume the logical task slot.
+    /// Record a WFT failure and prepare its retry. A paused run keeps only
+    /// the retry attempt; unpause schedules the replacement task.
     fn apply_workflow_task_failed(
         &self,
         loaded: LoadedRun,
@@ -3994,7 +3923,19 @@ impl BasicKernel {
         // resets the attempt to 1 and, with the affinity cleared above, the
         // retry lands on the NORMAL queue as a real scheduled task
         // (workflow_task_state_machine.go:1011-1018 @ v1.31.0; raise S4).
-        if (flushed > 0 || is_reset || sticky_was_set) && !paused {
+        if paused {
+            // Closing a failed task flushes its buffer even while paused, but
+            // only scheduling with buffered events resets the attempt. There is
+            // no replacement task until unpause (service/history/workflow/
+            // workflow_task_state_machine.go:329-335,1003-1028 and
+            // service/history/workflow/util.go:52-69 @ v1.31.0).
+            builder.state.workflow_task_attempt = if sticky_was_set || is_reset {
+                1
+            } else {
+                builder.state.workflow_task_attempt + 1
+            };
+            builder.state.pending_workflow_task = None;
+        } else if flushed > 0 || is_reset || sticky_was_set {
             // Events buffered during the WFT invalidate any continuously-failing
             // (transient) suffix: v1.31.0 resets the next task to a NORMAL,
             // attempt-1 task with a REAL WorkflowTaskScheduled — the flushed events
@@ -4007,7 +3948,7 @@ impl BasicKernel {
             builder.state.pending_workflow_task = None;
             builder.schedule_workflow_task();
         } else {
-            // No new events (or paused): preserve transient event suppression
+            // No new events: preserve transient event suppression
             // and virtual IDs, but fence delayed offers from the failed attempt.
             // The new internal generation does not change Temporal's attempts
             // (service/history/workflow/workflow_task_state_machine.go @ v1.31.0).
@@ -4025,18 +3966,15 @@ impl BasicKernel {
                 .expect("validated pending workflow task must still exist");
             current.started_event_id = None;
             current.started_at = None;
+            // A failed attempt starts a fresh scheduling/heartbeat window even
+            // when its Scheduled event is suppressed
+            // (workflow_task_state_machine.go:357-391 @ v1.31.0).
+            current.scheduled_at = req.now;
+            current.original_scheduled_at = Some(req.now);
             // A retained transient retry is a fresh schedule for advice
             // purposes: the next start recomputes it (Requirement 2.7;
             // workflow_task_state_machine.go:98-99, 158-159 @ v1.31.0).
             current.advice = RecordedAdvice::default();
-            // Paused-with-sticky corner (the only way sticky_was_set reaches
-            // this branch): keep the retained task in the TRANSIENT
-            // (attempt>1, virtual-id) shape the resume/start path expects —
-            // an attempt-1 task with a virtual scheduled id would emit a
-            // Started event referencing a never-persisted Scheduled event.
-            // The v1.31.0 attempt-1 reset only accompanies the fresh
-            // reschedule above; the sticky clear and the skipped count
-            // already happened either way.
             builder.state.workflow_task_attempt += 1;
             current.attempt = builder.state.workflow_task_attempt;
             // The retry is transient: its Scheduled event is never persisted, so
@@ -4047,22 +3985,20 @@ impl BasicKernel {
             // (`scheduledEventID = m.ms.GetNextEventID()`,
             // workflow_task_state_machine.go:376-379 @ v1.31.0; Req B.1/B.3).
             current.scheduled_event_id = virtual_scheduled_event_id;
-            if !paused {
-                builder.dispatch_ops.push(DispatchOp::EnqueueWorkflowTask {
-                    speculative: false,
-                    queue: QueueKey {
-                        namespace_id: builder.state.namespace_id,
-                        task_queue: builder.state.task_queue.clone(),
-                        task_kind: tokeira_types::TaskKind::Workflow,
-                        deployment: builder.state.deployment.clone(),
-                        build_id: builder.state.build_id.clone(),
-                    },
-                    logical_seq,
-                    sticky_preferred,
-                    normal_task_queue: Some(builder.state.task_queue.clone()),
-                    priority: builder.state.priority.clone(),
-                });
-            }
+            builder.dispatch_ops.push(DispatchOp::EnqueueWorkflowTask {
+                speculative: false,
+                queue: QueueKey {
+                    namespace_id: builder.state.namespace_id,
+                    task_queue: builder.state.task_queue.clone(),
+                    task_kind: tokeira_types::TaskKind::Workflow,
+                    deployment: builder.state.deployment.clone(),
+                    build_id: builder.state.build_id.clone(),
+                },
+                logical_seq,
+                sticky_preferred,
+                normal_task_queue: Some(builder.state.task_queue.clone()),
+                priority: builder.state.priority.clone(),
+            });
         }
         builder.finish()
     }
@@ -4149,20 +4085,8 @@ impl BasicKernel {
             builder.state.sticky = None;
             builder.state.workflow_task_attempt = 1;
             let _ = builder.flush_buffered();
-            if builder.state.status == ExecutionStatus::Paused {
-                let current = builder
-                    .state
-                    .pending_workflow_task
-                    .as_mut()
-                    .expect("validated pending workflow task must still exist");
-                current.attempt = 1;
-                // Disarm the fired deadline so a paused-retained task cannot
-                // time out again before resume re-dispatches it.
-                current.schedule_to_start_deadline = None;
-            } else {
-                builder.state.pending_workflow_task = None;
-                builder.schedule_workflow_task();
-            }
+            builder.state.pending_workflow_task = None;
+            builder.schedule_workflow_task();
             // M.1: a speculative schedule-to-start timeout counts one timer-task
             // request (no start-to-close counter) with the operation tag.
             if pending.task_type == WorkflowTaskType::Speculative {
@@ -4193,156 +4117,7 @@ impl BasicKernel {
         }
 
         let mut builder = TransitionBuilder::new(state, req.now, None);
-        // Same sticky rule as the failure path (raise S4): a start-to-close
-        // timeout while the run's REAL sticky queue is set clears the
-        // affinity and retries fresh at attempt 1 without counting —
-        // v1.31.0's `failWorkflowTask` applies its sticky override to
-        // timeout-driven calls identically
-        // (workflow_task_state_machine.go:1010-1027 @ v1.31.0).
-        let sticky_was_set = builder
-            .state
-            .sticky
-            .as_ref()
-            .is_some_and(|sticky| !sticky.sticky_queue.0.is_empty());
-        // A started SPECULATIVE task persists Scheduled + Started LATE, at
-        // its real schedule/start times, immediately before the timed-out
-        // event — v1.31.0's `AddWorkflowTaskTimedOutEvent` creates "the
-        // corresponding WorkflowTaskScheduled and WorkflowTaskStarted events
-        // for speculative WT" first (workflow_task_state_machine.go:934-960
-        // @ v1.31.0; spec speculative-wft K4, Req 5.1). Corpus shape:
-        // 5 WorkflowTaskScheduled, 6 WorkflowTaskStarted,
-        // 7 WorkflowTaskTimedOut, then the attempt-2 retry stays virtual
-        // (`TestSpeculativeWorkflowTask_StartToCloseTimeout`).
-        let (scheduled_event_id, started_event_id) =
-            if pending.task_type == WorkflowTaskType::Speculative {
-                let scheduled = builder.emit_at(
-                    pending.scheduled_at,
-                    HistoryEventKind::WorkflowTaskScheduled {
-                        logical_seq: pending.logical_seq,
-                        task_queue: builder.state.task_queue.clone(),
-                        workflow_task_timeout: builder.state.workflow_task_timeout,
-                        attempt: pending.attempt,
-                    },
-                );
-                let started = builder.emit_at(
-                    pending.started_at.unwrap_or(req.now),
-                    HistoryEventKind::WorkflowTaskStarted {
-                        logical_seq: pending.logical_seq,
-                        scheduled_event_id: scheduled,
-                        attempt: pending.attempt,
-                        identity: WorkerIdentity(String::new()),
-                        request_id: format!("transient-materialize-{}", pending.logical_seq.0),
-                        // Materialization copies the Advice decided at the
-                        // attempt's start; it never recomputes it against the
-                        // thresholds in force now (stored task info,
-                        // workflow_task_state_machine.go:790-794, 881-885, 954-958
-                        // @ v1.31.0).
-                        history_size_bytes: pending.advice.history_size_bytes,
-                        suggest_continue_as_new: pending.advice.suggest_continue_as_new,
-                        suggest_continue_as_new_reasons: pending
-                            .advice
-                            .suggest_continue_as_new_reasons
-                            .clone(),
-                        target_worker_deployment_version_changed: pending
-                            .target_worker_deployment_version_changed,
-                        target_version_changed_enabled: pending.target_version_changed_enabled,
-                        target_deployment_version: pending.target_deployment_version.clone(),
-                    },
-                );
-                // The events are durable now; the (about-to-be-replaced or
-                // paused-retained) task is no longer speculative.
-                let current = builder
-                    .state
-                    .pending_workflow_task
-                    .as_mut()
-                    .expect("validated pending workflow task must still exist");
-                current.task_type = WorkflowTaskType::Normal;
-                current.scheduled_event_id = scheduled;
-                current.started_event_id = Some(started);
-                (scheduled, started)
-            } else {
-                (pending.scheduled_event_id, started_event_id)
-            };
-        // Only the attempt-1 timeout persists a WorkflowTaskTimedOut event; a
-        // transient (attempt>1) timeout writes nothing
-        // (workflow_task_state_machine.go:965-967 @ v1.31.0; Req B.3).
-        if pending.attempt == 1 {
-            builder.emit(HistoryEventKind::WorkflowTaskTimedOut {
-                logical_seq: pending.logical_seq,
-                scheduled_event_id,
-                started_event_id,
-                timeout_type: req.timeout_type,
-            });
-            // The persisted (non-transient) timeout records the problem
-            // identity; v1.31.0 stores only the start-to-close type and only
-            // when the event is emitted (`workflow_task_state_machine.go:
-            // 966-979 @ v1.31.0`), so a transient retry's timeout keeps
-            // reporting the earlier attempt-1 cause.
-            builder.state.last_workflow_task_problem =
-                Some(WorkflowTaskProblem::TimedOutStartToClose);
-        }
-        // A non-sticky start-to-close timeout advances the
-        // consecutive-problem accumulator exactly like a non-sticky explicit
-        // failure — both funnel into v1.31.0's `failWorkflowTask(true)`
-        // (`ApplyWorkflowTaskTimedOutEvent`,
-        // workflow_task_state_machine.go:263-268, 1017-1027 @ v1.31.0). The
-        // sticky case counts nothing (the affinity is dropped below either
-        // way).
-        if !sticky_was_set {
-            builder.state.workflow_task_attempts_since_last_success = builder
-                .state
-                .workflow_task_attempts_since_last_success
-                .saturating_add(1);
-        }
-        // WFT timeout is a close: buffered events flush after the timed-out
-        // event and before the retry's fresh WorkflowTaskScheduled
-        // (`AddWorkflowTaskScheduledEventAsHeartbeat` flushes first,
-        // workflow_task_state_machine.go @ v1.31.0). As at WFT-failed close, a
-        // non-empty flush converts the retry back to a NORMAL attempt-1 task
-        // (rule (i), workflow_task_state_machine.go:329-338; Req B.4). A
-        // sticky-dispatched timeout also resets to attempt 1 — v1.31.0's
-        // sticky override forces `incrementAttempt = false` for timeouts too —
-        // but only when the fresh reschedule actually runs: a PAUSED retention
-        // must keep the transient shape (see the WFT-failed paused corner).
-        let flushed = builder.flush_buffered();
-        let paused = builder.state.status == ExecutionStatus::Paused;
-        if flushed > 0 || (sticky_was_set && !paused) {
-            builder.state.workflow_task_attempt = 1;
-        } else {
-            builder.state.workflow_task_attempt += 1;
-        }
-        builder.state.sticky = None;
-        if paused {
-            // Paused workflows retain the pending task (cleared of started
-            // state) so it can be re-dispatched when the workflow resumes.
-            let current = builder
-                .state
-                .pending_workflow_task
-                .as_mut()
-                .expect("validated pending workflow task must still exist");
-            current.started_event_id = None;
-            current.started_at = None;
-            current.attempt = builder.state.workflow_task_attempt;
-            // Cleared like any other schedule so the resumed start recomputes
-            // the advice (Requirement 2.7).
-            current.advice = RecordedAdvice::default();
-        } else {
-            // Active workflows get a fresh WorkflowTaskScheduled event so the
-            // SDK state machine sees the correct Scheduled→Started sequence.
-            builder.state.pending_workflow_task = None;
-            builder.schedule_workflow_task();
-        }
-        // M.1: a speculative start-to-close timeout counts a timer-task request
-        // AND the start-to-close timeout, both with the operation tag
-        // (`TestSpeculativeWorkflowTask_StartToCloseTimeout`).
-        if pending.task_type == WorkflowTaskType::Speculative {
-            builder
-                .dispatch_ops
-                .push(DispatchOp::RecordSpeculativeTimeout {
-                    namespace_id: builder.state.namespace_id,
-                    start_to_close: true,
-                });
-        }
+        builder.timeout_started_workflow_task(&pending, started_event_id, true);
         builder.finish()
     }
 
@@ -4359,6 +4134,20 @@ impl BasicKernel {
             .get(&req.timer_id)
             .cloned()
             .ok_or_else(|| Reject::UnknownTimer(req.timer_id.clone()))?;
+        // A listing can outlive cancellation and replacement under the same id.
+        // Compare floored milliseconds like IsTimeExpired in
+        // service/history/queues/queue_scheduled.go:286-301, with the precision in
+        // common/constants.go:46, used by the user timer executor in
+        // service/history/timer_queue_active_task_executor.go:163-175 @ v1.31.0.
+        // DSQL rows keep microseconds while state keeps nanoseconds; since the
+        // scanner submits only rows at or before fired_at, this comparison accepts
+        // current timers despite storage truncation. Euclidean division floors
+        // timestamps before 1970 too, rather than rounding them toward zero.
+        if timer.fire_at.unix_timestamp_nanos().div_euclid(1_000_000)
+            > req.fired_at.unix_timestamp_nanos().div_euclid(1_000_000)
+        {
+            return Err(Reject::UnknownTimer(req.timer_id));
+        }
 
         let mut builder = TransitionBuilder::new(state, req.fired_at, None);
         let fired = HistoryEventKind::TimerFired {
@@ -4586,6 +4375,7 @@ impl BasicKernel {
             } => {
                 state.timers.remove(WORKFLOW_START_DELAY_TIMER_ID);
                 state.pending_workflow_task = Some(PendingWorkflowTask {
+                    original_scheduled_at: Some(event.happened_at),
                     task_type: WorkflowTaskType::Normal,
                     schedule_to_start_deadline: None,
                     target_worker_deployment_version_changed: false,
@@ -4625,6 +4415,10 @@ impl BasicKernel {
                     "stored WFT target-change result must match its replay operands"
                 );
                 state.pending_workflow_task = Some(PendingWorkflowTask {
+                    original_scheduled_at: state
+                        .pending_workflow_task
+                        .as_ref()
+                        .and_then(|pending| pending.original_scheduled_at),
                     task_type: WorkflowTaskType::Normal,
                     schedule_to_start_deadline: None,
                     target_worker_deployment_version_changed:
@@ -4715,6 +4509,10 @@ impl BasicKernel {
                         .map(|pending| pending.attempt)
                         .unwrap_or(0);
                     state.pending_workflow_task = Some(PendingWorkflowTask {
+                        // No Scheduled event exists for this reconstructed transient retry.
+                        // ApplyTransientWorkflowTaskScheduled leaves its origin absent
+                        // (workflow_task_state_machine.go:141-163 @ v1.31.0).
+                        original_scheduled_at: None,
                         advice: Default::default(),
                         task_type: WorkflowTaskType::Normal,
                         schedule_to_start_deadline: None,
@@ -4762,6 +4560,10 @@ impl BasicKernel {
                     .map(|pending| pending.attempt)
                     .unwrap_or(0);
                 state.pending_workflow_task = Some(PendingWorkflowTask {
+                    // No Scheduled event exists for this reconstructed transient retry.
+                    // ApplyTransientWorkflowTaskScheduled leaves its origin absent
+                    // (workflow_task_state_machine.go:141-163 @ v1.31.0).
+                    original_scheduled_at: None,
                     advice: Default::default(),
                     task_type: WorkflowTaskType::Normal,
                     schedule_to_start_deadline: None,
@@ -5769,6 +5571,7 @@ fn apply_workflow_command(
             input,
             header,
             request_eager_execution: _,
+            use_workflow_build_id: _,
             retry_policy,
             deployment,
             build_id,
@@ -5871,36 +5674,40 @@ fn apply_workflow_command(
             builder
                 .activity_ops
                 .push(ActivityOp::Upsert(activity.clone()));
-            builder.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
-                queue: QueueKey {
-                    namespace_id: builder.state.namespace_id,
-                    task_queue,
-                    task_kind: tokeira_types::TaskKind::Activity,
-                    deployment: activity.deployment.clone(),
-                    build_id: activity.build_id.clone(),
-                },
-                activity_id,
-                schedule_event_id,
-                attempt: 1,
-                dispatch_revision: builder
-                    .state
-                    .versioning_info
-                    .as_ref()
-                    .map(|info| info.revision_number)
-                    .unwrap_or_default(),
-                // A freshly scheduled activity is at stamp 0; a later pause or
-                // options update bumps it and fences this initial dispatch.
-                stamp: 0,
-                // The hint carries the same schedule clock as authority.
-                // An epoch sentinel would make timeout reconstruction treat a
-                // freshly scheduled activity as already overdue.
-                dispatch_at: builder.now,
-                schedule_to_close_timeout,
-                schedule_to_start_timeout,
-                start_to_close_timeout,
-                heartbeat_timeout,
-                priority: effective_priority,
-            });
+            // Paused runs suppress generation; unpause re-enqueues pending work
+            // (workflow_task_completed_handler.go:504-509 @ v1.31.0).
+            if builder.state.status != ExecutionStatus::Paused {
+                builder.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
+                    queue: QueueKey {
+                        namespace_id: builder.state.namespace_id,
+                        task_queue,
+                        task_kind: tokeira_types::TaskKind::Activity,
+                        deployment: activity.deployment.clone(),
+                        build_id: activity.build_id.clone(),
+                    },
+                    activity_id,
+                    schedule_event_id,
+                    attempt: 1,
+                    dispatch_revision: builder
+                        .state
+                        .versioning_info
+                        .as_ref()
+                        .map(|info| info.revision_number)
+                        .unwrap_or_default(),
+                    // A freshly scheduled activity is at stamp 0; a later pause or
+                    // options update bumps it and fences this initial dispatch.
+                    stamp: 0,
+                    // The hint carries the same schedule clock as authority.
+                    // An epoch sentinel would make timeout reconstruction treat a
+                    // freshly scheduled activity as already overdue.
+                    dispatch_at: builder.now,
+                    schedule_to_close_timeout,
+                    schedule_to_start_timeout,
+                    start_to_close_timeout,
+                    heartbeat_timeout,
+                    priority: effective_priority,
+                });
+            }
             Ok(false)
         }
         WorkflowCommand::StartTimer { timer_id, fire_at } => {
@@ -7901,8 +7708,8 @@ impl TransitionBuilder {
     /// carry (`run-growth-limits` criterion 2.7), while a workflow task is
     /// started, force-fail that
     /// task with `FORCE_CLOSE_COMMAND`, flush the buffered batch, and schedule a
-    /// fresh normal task to redeliver it. The workflow SURVIVES and every
-    /// buffered event is preserved — distinct from a size-limit terminate
+    /// task at the failure's attempt (transient above 1). The workflow SURVIVES
+    /// and every buffered event is preserved — distinct from a size-limit terminate
     /// (`TestMaxBufferedEventsLimit` / `TestRateLimitBufferedEvents`: exactly
     /// one `WorkflowTaskFailed(FORCE_CLOSE_COMMAND)`, all 101 signals delivered).
     /// Returns true if it fired. [`Self::finish`] calls it at the end of every
@@ -7974,11 +7781,16 @@ impl TransitionBuilder {
                 .workflow_task_attempts_since_last_success
                 .saturating_add(1);
         }
-        // Flush after the WFT-failed event, then schedule a fresh normal
-        // attempt-1 task to redeliver the buffered batch (failWorkflowTask then
-        // ScheduleWorkflowTask, mutable_state_impl.go:8220-8223).
+        // The failure flushes before scheduling, so scheduling sees no buffer
+        // that could reset the attempt. This also preserves the failure attempt
+        // while paused, until unpause schedules the retry (service/history/workflow/
+        // util.go:26-69 and workflow_task_state_machine.go:332-337,1003-1028 @ v1.31.0).
         self.flush_buffered();
-        self.state.workflow_task_attempt = 1;
+        self.state.workflow_task_attempt = if sticky_was_set {
+            1
+        } else {
+            self.state.workflow_task_attempt + 1
+        };
         self.state.pending_workflow_task = None;
         self.schedule_workflow_task();
         true
@@ -8048,7 +7860,7 @@ impl TransitionBuilder {
             pending.scheduled_at,
             HistoryEventKind::WorkflowTaskScheduled {
                 logical_seq: pending.logical_seq,
-                task_queue: self.state.task_queue.clone(),
+                task_queue: self.state.current_workflow_task_queue().clone(),
                 workflow_task_timeout: self.state.workflow_task_timeout,
                 attempt: pending.attempt,
             },
@@ -8380,6 +8192,7 @@ impl TransitionBuilder {
                 })
             };
         self.state.pending_workflow_task = Some(PendingWorkflowTask {
+            original_scheduled_at: Some(self.now),
             task_type,
             logical_seq,
             scheduled_event_id,
@@ -8413,6 +8226,557 @@ impl TransitionBuilder {
             speculative: task_type == WorkflowTaskType::Speculative,
             priority: self.state.priority.clone(),
         });
+    }
+
+    /// Shared start semantics keep virtual history, advice and sticky handling
+    /// identical for polled tasks and completion-owned starts.
+    fn start_workflow_task(&mut self, req: StartWorkflowTaskRequest) -> Result<(), Reject> {
+        if self.state.status != ExecutionStatus::Running {
+            return Err(Reject::WorkflowPaused);
+        }
+        let pending = self
+            .state
+            .pending_workflow_task
+            .clone()
+            .ok_or(Reject::NoPendingWorkflowTask)?;
+
+        if pending.logical_seq != req.logical_seq {
+            return Err(Reject::WorkflowTaskSeqMismatch {
+                expected: pending.logical_seq.0,
+                got: req.logical_seq.0,
+            });
+        }
+        if pending.started_event_id.is_some() {
+            return Err(Reject::WorkflowTaskAlreadyStarted {
+                logical_seq: pending.logical_seq.0,
+            });
+        }
+
+        let target_version_changed_enabled = req.target_version_changed_enabled;
+        let target_deployment_version = req.target_deployment_version.clone();
+        let target_worker_deployment_version_changed = self.state.apply_target_version_observation(
+            target_version_changed_enabled,
+            target_deployment_version.clone(),
+        );
+        let attempt = pending.attempt.max(1);
+        // The count operand is the id the next event would receive at this
+        // moment (`GetNextEventID()`, workflow_task_state_machine.go:1452 @
+        // v1.31.0): the started id for a persisted start and the virtual
+        // scheduled id for a suppressed one. It is fixed before anything is
+        // emitted so the conversion branch below matches v1.31.0, which decides
+        // before adding its events. In-flight updates are the admitted set plus
+        // the accepted set; acceptance moves an id from one to the other, so
+        // the sum never double-counts.
+        let in_flight_updates =
+            self.state.admitted_updates.len() + self.state.pending_updates.len();
+        let advice = crate::advice::continue_as_new_advice(
+            req.history_size_bytes,
+            self.state.last_event_id + 1,
+            in_flight_updates,
+            self.state.completed_update_count,
+            req.advice_policy,
+        );
+        // Transient (attempt>1) and SPECULATIVE starts persist no
+        // WorkflowTaskStarted event: the started id is virtual
+        // (scheduled_event_id + 1) and last_event_id is unchanged — v1.31.0
+        // suppresses the pair for both modes with one predicate
+        // (`!IsTransientWorkflowTask() && Type != SPECULATIVE`,
+        // workflow_task_state_machine.go:556-558 @ v1.31.0; spec
+        // speculative-wft, one predicate / three modes per Invariant I.2).
+        // Conversion (rule ii): if new events landed after the virtual
+        // scheduling — the virtual scheduled id no longer equals
+        // last_event_id + 1 — convert back to a NORMAL attempt-1 task with
+        // real Scheduled + Started, since the frozen virtual suffix is now
+        // invalid (workflow_task_state_machine.go:559-576 @ v1.31.0; the same
+        // branch also flips a speculative task's `Type` to NORMAL).
+        let suppressed = attempt > 1 || pending.task_type == WorkflowTaskType::Speculative;
+        let new_events_since_schedule =
+            suppressed && pending.scheduled_event_id != self.state.last_event_id + 1;
+        let (scheduled_event_id, started_event_id) = if suppressed && !new_events_since_schedule {
+            (pending.scheduled_event_id, pending.scheduled_event_id + 1)
+        } else if new_events_since_schedule {
+            self.state.workflow_task_attempt = 1;
+            let scheduled = self.emit(HistoryEventKind::WorkflowTaskScheduled {
+                logical_seq: pending.logical_seq,
+                task_queue: self.state.task_queue.clone(),
+                workflow_task_timeout: self.state.workflow_task_timeout,
+                attempt: 1,
+            });
+            let started = self.emit(HistoryEventKind::WorkflowTaskStarted {
+                logical_seq: pending.logical_seq,
+                scheduled_event_id: scheduled,
+                attempt: 1,
+                identity: req.worker_identity.clone(),
+                request_id: req.request_id,
+                history_size_bytes: advice.history_size_bytes,
+                suggest_continue_as_new: advice.suggest_continue_as_new,
+                suggest_continue_as_new_reasons: advice.suggest_continue_as_new_reasons.clone(),
+                target_worker_deployment_version_changed,
+                target_version_changed_enabled,
+                target_deployment_version: target_deployment_version.clone(),
+            });
+            (scheduled, started)
+        } else {
+            let started = self.emit(HistoryEventKind::WorkflowTaskStarted {
+                logical_seq: pending.logical_seq,
+                scheduled_event_id: pending.scheduled_event_id,
+                attempt,
+                identity: req.worker_identity.clone(),
+                request_id: req.request_id,
+                history_size_bytes: advice.history_size_bytes,
+                suggest_continue_as_new: advice.suggest_continue_as_new,
+                suggest_continue_as_new_reasons: advice.suggest_continue_as_new_reasons.clone(),
+                target_worker_deployment_version_changed,
+                target_version_changed_enabled,
+                target_deployment_version: target_deployment_version.clone(),
+            });
+            (pending.scheduled_event_id, started)
+        };
+
+        let current = self
+            .state
+            .pending_workflow_task
+            .as_mut()
+            .expect("validated pending workflow task must still exist");
+        current.scheduled_event_id = scheduled_event_id;
+        current.started_event_id = Some(started_event_id);
+        current.started_at = Some(req.now);
+        current.attempt = self.state.workflow_task_attempt;
+        current.target_worker_deployment_version_changed = target_worker_deployment_version_changed;
+        current.target_version_changed_enabled = target_version_changed_enabled;
+        current.target_deployment_version = target_deployment_version;
+        // Recorded so a suppressed start's later materialization or synthesis
+        // carries exactly this decision (Requirement 2.6).
+        current.advice = advice;
+        if new_events_since_schedule {
+            // The conversion branch persisted real Scheduled/Started — the
+            // task is normal from here on (`workflowTask.Type = NORMAL`,
+            // workflow_task_state_machine.go:564-566 @ v1.31.0).
+            current.task_type = WorkflowTaskType::Normal;
+        }
+
+        // Sticky metadata survives an unavailable-worker fallback and clears
+        // only when the derived task actually starts outside the sticky queue
+        // (`recordworkflowtaskstarted/api.go:115-149 @ v1.31.0`).
+        if self.state.sticky.as_ref().is_some_and(|sticky| {
+            !sticky.sticky_queue.0.is_empty() && sticky.sticky_queue != req.polled_task_queue
+        }) {
+            self.state.sticky = None;
+        }
+
+        if let Some(target) = req.deployment_transition {
+            self.state
+                .start_version_transition(
+                    target,
+                    req.deployment_transition_revision_number
+                        .unwrap_or_default(),
+                )
+                .map_err(|error| match error {
+                    crate::state::VersionTransitionError::PinnedWorkflowCannotTransition => {
+                        Reject::PinnedWorkflowCannotTransition
+                    }
+                })?;
+        }
+
+        Ok(())
+    }
+
+    // Completion heartbeat expiry and the ordinary timer share materialization,
+    // attempt/sticky handling and buffered-event ordering. Completion applies its
+    // new sticky attributes before selecting the successor queue.
+    fn timeout_started_workflow_task(
+        &mut self,
+        pending: &PendingWorkflowTask,
+        started_event_id: i64,
+        schedule_successor: bool,
+    ) {
+        // Same sticky rule as the failure path (raise S4): a start-to-close
+        // timeout while the run's REAL sticky queue is set clears the
+        // affinity and retries fresh at attempt 1 without counting —
+        // v1.31.0's `failWorkflowTask` applies its sticky override to
+        // timeout-driven calls identically
+        // (workflow_task_state_machine.go:1010-1027 @ v1.31.0).
+        let sticky_was_set = self
+            .state
+            .sticky
+            .as_ref()
+            .is_some_and(|sticky| !sticky.sticky_queue.0.is_empty());
+        // A started SPECULATIVE task persists Scheduled + Started LATE, at
+        // its real schedule/start times, immediately before the timed-out
+        // event — v1.31.0's `AddWorkflowTaskTimedOutEvent` creates "the
+        // corresponding WorkflowTaskScheduled and WorkflowTaskStarted events
+        // for speculative WT" first (workflow_task_state_machine.go:934-960
+        // @ v1.31.0; spec speculative-wft K4, Req 5.1). Corpus shape:
+        // 5 WorkflowTaskScheduled, 6 WorkflowTaskStarted,
+        // 7 WorkflowTaskTimedOut, then the attempt-2 retry stays virtual
+        // (`TestSpeculativeWorkflowTask_StartToCloseTimeout`).
+        let (scheduled_event_id, started_event_id) =
+            if pending.task_type == WorkflowTaskType::Speculative {
+                let scheduled = self.emit_at(
+                    pending.scheduled_at,
+                    HistoryEventKind::WorkflowTaskScheduled {
+                        logical_seq: pending.logical_seq,
+                        task_queue: self.state.current_workflow_task_queue().clone(),
+                        workflow_task_timeout: self.state.workflow_task_timeout,
+                        attempt: pending.attempt,
+                    },
+                );
+                let started = self.emit_at(
+                    pending.started_at.unwrap_or(self.now),
+                    HistoryEventKind::WorkflowTaskStarted {
+                        logical_seq: pending.logical_seq,
+                        scheduled_event_id: scheduled,
+                        attempt: pending.attempt,
+                        identity: WorkerIdentity(String::new()),
+                        request_id: format!("transient-materialize-{}", pending.logical_seq.0),
+                        // Materialization copies the Advice decided at the
+                        // attempt's start; it never recomputes it against the
+                        // thresholds in force now (stored task info,
+                        // workflow_task_state_machine.go:790-794, 881-885, 954-958
+                        // @ v1.31.0).
+                        history_size_bytes: pending.advice.history_size_bytes,
+                        suggest_continue_as_new: pending.advice.suggest_continue_as_new,
+                        suggest_continue_as_new_reasons: pending
+                            .advice
+                            .suggest_continue_as_new_reasons
+                            .clone(),
+                        target_worker_deployment_version_changed: pending
+                            .target_worker_deployment_version_changed,
+                        target_version_changed_enabled: pending.target_version_changed_enabled,
+                        target_deployment_version: pending.target_deployment_version.clone(),
+                    },
+                );
+                let current = self
+                    .state
+                    .pending_workflow_task
+                    .as_mut()
+                    .expect("validated pending workflow task must still exist");
+                current.task_type = WorkflowTaskType::Normal;
+                current.scheduled_event_id = scheduled;
+                current.started_event_id = Some(started);
+                (scheduled, started)
+            } else {
+                (pending.scheduled_event_id, started_event_id)
+            };
+        // Only the attempt-1 timeout persists a WorkflowTaskTimedOut event; a
+        // transient (attempt>1) timeout writes nothing
+        // (workflow_task_state_machine.go:965-967 @ v1.31.0; Req B.3).
+        if pending.attempt == 1 {
+            self.emit(HistoryEventKind::WorkflowTaskTimedOut {
+                logical_seq: pending.logical_seq,
+                scheduled_event_id,
+                started_event_id,
+                timeout_type: WorkflowTaskTimeoutType::StartToClose,
+            });
+            // The persisted (non-transient) timeout records the problem
+            // identity; v1.31.0 stores only the start-to-close type and only
+            // when the event is emitted (`workflow_task_state_machine.go:
+            // 966-979 @ v1.31.0`), so a transient retry's timeout keeps
+            // reporting the earlier attempt-1 cause.
+            self.state.last_workflow_task_problem = Some(WorkflowTaskProblem::TimedOutStartToClose);
+        }
+        // A non-sticky start-to-close timeout advances the
+        // consecutive-problem accumulator exactly like a non-sticky explicit
+        // failure — both funnel into v1.31.0's `failWorkflowTask(true)`
+        // (`ApplyWorkflowTaskTimedOutEvent`,
+        // workflow_task_state_machine.go:263-268, 1017-1027 @ v1.31.0). The
+        // sticky case counts nothing (the affinity is dropped below either
+        // way).
+        if !sticky_was_set {
+            self.state.workflow_task_attempts_since_last_success = self
+                .state
+                .workflow_task_attempts_since_last_success
+                .saturating_add(1);
+        }
+        // Flushing at close is not scheduling: while paused it preserves the
+        // incremented attempt. Sticky still resets to 1, even without a retry
+        // schedule (service/history/workflow/workflow_task_state_machine.go:
+        // 329-335,1003-1028 @ v1.31.0).
+        let flushed = self.flush_buffered();
+        let paused = self.state.status == ExecutionStatus::Paused;
+        if sticky_was_set || (flushed > 0 && !paused) {
+            self.state.workflow_task_attempt = 1;
+        } else {
+            self.state.workflow_task_attempt += 1;
+        }
+        self.state.sticky = None;
+        self.state.pending_workflow_task = None;
+        if schedule_successor {
+            self.schedule_workflow_task();
+        }
+        // M.1: a speculative start-to-close timeout counts a timer-task request
+        // AND the start-to-close timeout, both with the operation tag
+        // (`TestSpeculativeWorkflowTask_StartToCloseTimeout`).
+        if pending.task_type == WorkflowTaskType::Speculative {
+            self.dispatch_ops
+                .push(DispatchOp::RecordSpeculativeTimeout {
+                    namespace_id: self.state.namespace_id,
+                    start_to_close: true,
+                });
+        }
+    }
+
+    /// Shared mutation for ordinary polls and completion-owned starts. Retry
+    /// starts stay transient on both paths (AddActivityTaskStartedEvent,
+    /// service/history/workflow/mutable_state_impl.go @ v1.31.0).
+    fn start_activity(&mut self, req: ActivityStartRequest) -> Result<(), Reject> {
+        let activity = self
+            .state
+            .activities
+            .get(&req.activity_id)
+            .cloned()
+            .ok_or_else(|| Reject::UnknownActivity(req.activity_id.clone()))?;
+
+        let started_event_id =
+            if req.mode == ActivityStartMode::Poll && activity.retry_policy.is_some() {
+                // A retry-policy start is transient: the start is recorded on
+                // the activity but consumes no history event until the
+                // activity resolves (`AddActivityTaskStartedEvent`,
+                // mutable_state_impl.go:4082-4152 @ v1.31.0), so a retryable
+                // failure leaves neither Started nor Failed for that attempt.
+                TRANSIENT_ACTIVITY_STARTED_EVENT_ID
+            } else {
+                // Buffers to `BUFFERED_EVENT_ID` while a WFT is started; the
+                // resolution then carries that sentinel as its
+                // `started_event_id` and the flush wires the real id in
+                // (TestBufferedEventsOutOfOrder).
+                self.append_external(HistoryEventKind::ActivityTaskStarted {
+                    activity_id: req.activity_id.clone(),
+                    scheduled_event_id: activity.schedule_event_id,
+                    attempt: activity.attempt,
+                    identity: req.identity.clone(),
+                    request_id: req.request_id.map_or_else(
+                        || format!("activity-start-{}-{}", req.activity_id, activity.attempt),
+                        |id| id.to_string(),
+                    ),
+                    last_failure: activity.last_failure.clone(),
+                })
+            };
+
+        let started = self
+            .state
+            .activities
+            .get_mut(&req.activity_id)
+            .expect("activity was read from this state above");
+        // The stamp bump fences any other outstanding offer for this attempt
+        // (`ObsoleteMatchingTask`, recordactivitytaskstarted/api.go @ v1.31.0).
+        started.stamp += 1;
+        started.started_event_id = Some(started_event_id);
+        started.started_at = Some(req.now);
+        // `ai.StartedIdentity` — Describe's primary `LastWorkerIdentity`
+        // source (workflow/activity.go:159 @ v1.31.0). Stored verbatim, even
+        // when empty.
+        started.started_identity = Some(req.identity);
+        let snapshot = started.clone();
+        self.activity_ops.push(ActivityOp::Upsert(snapshot));
+
+        Ok(())
+    }
+
+    fn start_completion_activity(
+        &mut self,
+        activity_id: &str,
+        request_id: tokeira_types::Uuid,
+        identity: &WorkerIdentity,
+        scope: Option<&crate::command::CompletionWorkflowTaskScope>,
+    ) -> Result<(), Reject> {
+        if !self.state.is_open() || self.state.status == ExecutionStatus::Paused {
+            return Ok(());
+        }
+        let Some(activity) = self.state.activities.get(activity_id) else {
+            return Ok(());
+        };
+        let schedule_event_id = activity.schedule_event_id;
+        let Some((index, mut queue, dispatch_revision)) = self
+            .dispatch_ops
+            .iter()
+            .enumerate()
+            .find_map(|(index, op)| match op {
+                DispatchOp::EnqueueActivityTask {
+                    activity_id: id,
+                    schedule_event_id: scheduled,
+                    queue,
+                    dispatch_revision,
+                    ..
+                } if id == activity_id && *scheduled == schedule_event_id => {
+                    Some((index, queue.clone(), *dispatch_revision))
+                }
+                _ => None,
+            })
+        else {
+            return Ok(());
+        };
+        if let Some(version) = self.state.effective_deployment() {
+            queue.deployment = Some(tokeira_types::DeploymentId(version.deployment_name.clone()));
+            queue.build_id = Some(tokeira_types::BuildId(version.build_id.clone()));
+        }
+        if scope.is_some_and(|scope| {
+            scope.namespace_id != queue.namespace_id
+                || !scope.normal_task_queues.contains(&queue.task_queue)
+                || queue.deployment.as_ref() != Some(&scope.deployment)
+                || queue.build_id.as_ref() != Some(&scope.build_id)
+        }) {
+            return Ok(());
+        }
+        // No runtime start gate is involved: workflow rules only match ordinary
+        // starts and retries (workflow_task_completed_handler.go:533-565 @ v1.31.0).
+        self.start_activity(ActivityStartRequest {
+            activity_id: activity_id.to_owned(),
+            request_id: Some(request_id),
+            identity: identity.clone(),
+            principal: None,
+            mode: ActivityStartMode::Poll,
+            now: self.now,
+        })?;
+        self.state.activity_start_receipts.insert(
+            activity_id.to_owned(),
+            crate::state::ActivityStartReceipt {
+                request_id,
+                schedule_event_id,
+                attempt: 1,
+                offered_stamp: 0,
+                worker_identity: identity.clone(),
+                selected_queue: queue,
+                dispatch_revision,
+            },
+        );
+        // Removing the exact incarnation's effect prevents both durable dispatch
+        // and publication. The receipt reports the start in the committed image.
+        self.dispatch_ops.remove(index);
+        Ok(())
+    }
+
+    /// Decide inline admission only after commands have selected the actual
+    /// successor and its queue. This runs again against fresh state on OCC retry.
+    fn start_completion_workflow_task(
+        &mut self,
+        inline: Option<&crate::command::CompletionWorkflowTaskStart>,
+        identity: &WorkerIdentity,
+        worker_version: Option<&crate::command::WorkflowTaskWorkerVersion>,
+    ) -> Result<(), Reject> {
+        let Some(pending) = self.state.pending_workflow_task.as_ref() else {
+            return Ok(());
+        };
+        let Some(inline) = inline else {
+            return Ok(());
+        };
+        if pending.started_event_id.is_some() {
+            return Ok(());
+        }
+        let logical_seq = pending.logical_seq;
+        // The stamp gate is only for Normal successors. An old stamp without
+        // an assigned build is deliberately not a start operand; recording it
+        // on Completed must not assign a build
+        // (service/history/api/respondworkflowtaskcompleted/api.go:547-568,708-713 @ v1.31.0).
+        if pending.task_type == WorkflowTaskType::Normal {
+            let stamp = worker_version.and_then(|version| version.stamp.as_ref());
+            if self
+                .state
+                .versioning_info
+                .as_ref()
+                .is_some_and(|info| info.version_transition.is_some())
+                || stamp.is_some_and(|stamp| {
+                    stamp.use_versioning
+                        && self
+                            .state
+                            .assigned_build_id()
+                            .is_some_and(|assigned| assigned.0 != stamp.build_id)
+                })
+            {
+                return Ok(());
+            }
+        }
+        let Some(mut queue) = self.dispatch_ops.iter().find_map(|op| match op {
+            DispatchOp::EnqueueWorkflowTask {
+                queue,
+                logical_seq: seq,
+                ..
+            } if *seq == logical_seq => Some(queue.clone()),
+            _ => None,
+        }) else {
+            // Every current completion scheduling path calls
+            // schedule_workflow_task_typed, which emits the matching enqueue.
+            // Without that selected queue, leave the successor unstarted.
+            return Ok(());
+        };
+        // Completion may have changed effective deployment. Ordinary dispatch
+        // resolves it later, but inline scope and provenance use this final target.
+        if let Some(version) = self.state.effective_deployment() {
+            queue.deployment = Some(tokeira_types::DeploymentId(version.deployment_name.clone()));
+            queue.build_id = Some(tokeira_types::BuildId(version.build_id.clone()));
+        }
+        if let Some(scope) = &inline.scope {
+            // Authorize the selected sticky queue through its authoritative
+            // normal alias, never a request's guessed normal queue. Both the
+            // alias and version are from this transition's selected dispatch.
+            let normal_queue = if self
+                .state
+                .sticky
+                .as_ref()
+                .is_some_and(|sticky| sticky.sticky_queue == queue.task_queue)
+            {
+                &self.state.task_queue
+            } else {
+                &queue.task_queue
+            };
+            if scope.namespace_id != queue.namespace_id
+                || !scope.normal_task_queues.contains(normal_queue)
+                || queue.deployment.as_ref() != Some(&scope.deployment)
+                || queue.build_id.as_ref() != Some(&scope.build_id)
+            {
+                // A speculative candidate needs ordinary task generation when
+                // scope prevents bypass, just like ReturnNewWorkflowTask=false.
+                if pending.task_type == WorkflowTaskType::Speculative {
+                    let scheduled = self.emit(HistoryEventKind::WorkflowTaskScheduled {
+                        logical_seq,
+                        task_queue: queue.task_queue.clone(),
+                        workflow_task_timeout: self.state.workflow_task_timeout,
+                        attempt: 1,
+                    });
+                    let current = self
+                        .state
+                        .pending_workflow_task
+                        .as_mut()
+                        .expect("successor exists");
+                    current.task_type = WorkflowTaskType::Normal;
+                    current.scheduled_event_id = scheduled;
+                    if queue.task_queue == self.state.task_queue {
+                        current.schedule_to_start_deadline = None;
+                    }
+                    for op in &mut self.dispatch_ops {
+                        if let DispatchOp::EnqueueWorkflowTask {
+                            logical_seq: seq,
+                            speculative,
+                            ..
+                        } = op
+                            && *seq == logical_seq
+                        {
+                            *speculative = false;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        }
+        self.start_workflow_task(StartWorkflowTaskRequest {
+            logical_seq,
+            worker_identity: identity.clone(),
+            request_id: "request-from-RespondWorkflowTaskCompleted".into(),
+            history_size_bytes: inline.history_size_bytes,
+            advice_policy: inline.advice_policy,
+            deployment_transition: None,
+            deployment_transition_revision_number: None,
+            polled_task_queue: queue.task_queue,
+            now: self.now,
+            target_version_changed_enabled: false,
+            target_deployment_version: None,
+        })?;
+        // Publication consumes explicit ops, so final-state row derivation alone
+        // cannot prevent the poll race. Remove the only offer-producing effect
+        // before this transition can commit
+        // (service/history/api/respondworkflowtaskcompleted/api.go:533-604 @ v1.31.0).
+        self.dispatch_ops.retain(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { logical_seq: seq, .. } if *seq == logical_seq));
+        Ok(())
     }
 
     /// Start the just-scheduled WFT in the same transition for runtime-owned
@@ -8636,6 +9000,7 @@ impl TransitionBuilder {
             timer_ops: self.timer_ops,
             dispatch_ops: self.dispatch_ops,
             events_numbered_at_close: u32::try_from(events_numbered_at_close).unwrap_or(u32::MAX),
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         }
     }
@@ -8663,6 +9028,7 @@ impl TransitionBuilder {
             timer_ops: self.timer_ops,
             dispatch_ops: self.dispatch_ops,
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         }
     }
@@ -8996,6 +9362,9 @@ pub enum Reject {
     /// it is.
     #[error("workflow is paused")]
     WorkflowPaused,
+    /// A paused workflow cannot force a new task from completion.
+    #[error("Workflow is paused and force create new workflow task is not allowed.")]
+    ForcedWorkflowTaskWhilePaused,
     /// An update request reached a running workflow whose workflow task keeps
     /// failing: its attempt is [`crate::limits::FAIL_UPDATE_WORKFLOW_TASK_ATTEMPT`]
     /// or more. v1.31.0 answers `WorkflowNotReady` at once

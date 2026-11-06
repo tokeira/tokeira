@@ -22,7 +22,7 @@ all activity *semantics* pure (chasm-activity) and the runtime piece a clock+loo
 
 ```
 ChasmTimerSweeper (tokeira-runtime, background)        ActivityBridge (tokeira-edge)
-  interval tick (+ engine Notify)  ── due (key,deadline) ──> evaluate_timeouts(key, now)
+  deadline wake (+ full-pass backstop)  ── due (key,deadline) ──> evaluate_timeouts(key, now)
   release due delayed dispatches                              │  load ActivityState
                                                               │  derive due timer(s)
                                                               ▼
@@ -51,8 +51,15 @@ dispatch queue are re-derivable from node state.
   - fail path: compute `is_retryable` from the worker `Failure`, then `retry_decision` →
     `Rescheduled{failure, interval}` or `Failed`.
 - **`tokeira-runtime::chasm::ChasmTimerSweeper`**
-  - `tokio::time::interval` (default ~200ms) + optional engine `Notify`; reads armed due entries;
-    calls `evaluate_timeouts`; releases due delayed dispatches; injectable clock.
+  - Sleeps to the earliest armed deadline, bounded by the 200 ms full-pass interval.
+    Every `arm_timer` notifies the shared `DeadlineWake` for an earlier deadline,
+    including commits, re-arms and rebuilds. Planning walks the map under its lock;
+    selection copies only due, unattempted executions, sorted by deadline and key.
+    A failed evaluation remains armed but is suppressed until the full pass.
+    Logical timestamps come from the engine's clock and convert without overflow;
+    Tokio supplies the wait. The evaluator and its re-arming semantics stay intact.
+    Authority: `chasm/lib/activity/activity_tasks.go:100-152` and
+    `service/history/queues/queue_scheduled.go:159-275 @ v1.31.0`.
 - **`apps/tokeirad`** — `spawn_chasm_timer_sweeper(engine, bridge, clock, cancel)` next to
   `spawn_visibility_repair`, gated on standalone activities.
 

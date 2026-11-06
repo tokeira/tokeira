@@ -438,7 +438,7 @@ impl VisibilityApi for ScriptedVisibility {
 
 fn outcome() -> WorkflowMutationOutcome {
     WorkflowMutationOutcome {
-        scheduled_activity_event_ids: Default::default(),
+        completion: None,
         transition_seq: 1,
         last_event_id: 1,
         was_duplicate: false,

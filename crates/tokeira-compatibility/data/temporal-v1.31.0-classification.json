@@ -4722,12 +4722,17 @@
       "temporal_key": "history.workflowTaskHeartbeatTimeout",
       "temporal_default": "time.Minute * 30",
       "temporal_scope": "Namespace",
-      "classification": "auto-tuned-mechanical-setting",
-      "tokeira_treatment": "No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern.",
+      "classification": "pinned-behavioral-constant",
+      "tokeira_treatment": "Fixed 30-minute workflow-task heartbeat limit in production, with no TOML field. The conformance harness may override the duration per test; completion resolves it once before submission.",
       "owner": "crates/tokeira-runtime",
-      "conformance_override": "none",
+      "conformance_override": "wired",
       "evidence": [
-        "common/dynamicconfig/constants.go:2427",
+        "common/dynamicconfig/constants.go:2427-2431",
+        "service/history/api/respondworkflowtaskcompleted/api.go:281-342,573-604,731-737 @ v1.31.0",
+        "crates/tokeira-runtime/src/conformance.rs",
+        "crates/tokeira-runtime/src/runtime/workflow_task.rs",
+        "crates/tokeira-kernel/src/command.rs",
+        ".kiro/specs/transient-wft/requirements.md",
         ".kiro/specs/configuration-policy/requirements.md"
       ]
     },
@@ -6648,13 +6653,15 @@
       "temporal_key": "system.enableActivityEagerExecution",
       "temporal_default": "false",
       "temporal_scope": "Namespace",
-      "classification": "pinned-behavioral-constant",
-      "tokeira_treatment": "No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog.",
+      "classification": "deployment-policy",
+      "tokeira_treatment": "Startup-static policy.compatibility.enable_activity_eager_execution, false by default, applies to every namespace. A per-test bool override takes precedence. Eligible activities start in the completion transition without a count cap.",
       "owner": ".kiro/specs/configuration-policy",
-      "conformance_override": "none",
+      "conformance_override": "wired",
       "evidence": [
         "common/dynamicconfig/constants.go:193",
-        ".kiro/specs/configuration-policy/requirements.md"
+        "crates/tokeira-config/src/lib.rs",
+        "crates/tokeira-runtime/src/runtime/workflow_task.rs",
+        ".kiro/specs/activity-dispatch/requirements.md"
       ]
     },
     {

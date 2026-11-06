@@ -268,6 +268,47 @@ Relevant static groups from `common/config/config.go @ v1.31.0` are represented 
 second collection using the same disposition vocabulary. They are rendered separately
 from dynamic settings because their topology and ownership differ.
 
+### Completion-inline start policy amendment
+
+Both completion-inline treatments are implemented in the checked ledger and
+generated documentation:
+
+| Temporal key | Implementation status | Treatment |
+|---|---|---|
+| `system.enableActivityEagerExecution` | Implemented | `deployment-policy`, override `wired`: typed `policy.compatibility.enable_activity_eager_execution`, default false, startup-static and applying to every namespace; per-test bool override wins. |
+| `history.workflowTaskHeartbeatTimeout` | Implemented | `pinned-behavioral-constant`, override `wired`: fixed 30 minutes in production, no deployment field; per-test duration override only. |
+
+Preserve the upstream `Namespace` scope and defaults in the source inventory:
+`common/dynamicconfig/constants.go:193-197,2427-2431 @ v1.31.0`. Tokeira's deployment
+scope differs intentionally because it has no per-namespace configuration. Eager
+execution is supported when enabled, with no count cap; the heartbeat limit is
+behavioral, not auto-tuned. Ownership and evidence must cite the implementing
+runtime/config paths plus [activity-dispatch](../activity-dispatch/requirements.md)
+and [transient-wft](../transient-wft/requirements.md).
+
+Implementation edits `crates/tokeira-compatibility/data/temporal-v1.31.0-classification.json`
+directly, not the extracted `temporal-v1.31.0-settings.json`. Add typed `Wired`
+entries to `tokeira-conformance::KEY_CLASSIFICATION` only together with working
+bool/duration consult sites and scope reset tests. Add the deployment field to
+`CompatibilityConfig` and `CONFIG_FIELD_CATALOG`, thread the effective bool through
+server/runtime assembly (`crates/tokeira-engine/src/lib.rs`), and update applicable feature metadata.
+Update the compatibility-config documentation to distinguish configured v1.31.0
+support from features beyond the baseline; enabling eager activities is supported
+configured behavior, not a newer-proto feature. Resolve policy
+outside the pure kernel and pass explicit values as completion inputs. Production
+builds must not acquire a dependency on the conformance registry.
+
+The current implementation is checked by
+`crates/tokeira-compatibility/src/configuration.rs::verify_configuration_ledger`
+and its `checked_conformance_keys` test adapter. After code and ledger changes run
+`cargo nextest run -p tokeira-compatibility -p tokeira-conformance -p tokeira-config --locked`,
+then `cargo run -p compatibility-docs --locked -- write` and
+`cargo run -p compatibility-docs --locked -- check`. The renderer
+(`tools/compatibility-docs/src/main.rs`) owns `temporal-configuration.md`,
+`tokeira-configuration.md` and `config.example.toml`; never hand-edit those outputs.
+Both classification rows and generated artifacts describe their implemented consult
+sites. The heartbeat limit has no production configuration field.
+
 ### 3. Enriched Feature Catalog
 
 Files:
@@ -752,7 +793,7 @@ typed deployment value, durable public API value, emergency restriction, and
 conformance-only overlay, resolution SHALL equal the specified precedence model;
 production resolution SHALL ignore the conformance source entirely.
 
-**Validates: Requirements 1.1–1.8, 3.1–3.10, 7.1–7.9**
+**Validates: Requirements 1.1–1.8, 3.1–3.10, 7.1–7.9, 13.1–13.2, 13.4**
 
 ### Property 2: Configuration defaulting and round-trip preservation
 
@@ -778,7 +819,7 @@ duplication, missing evidence, missing owner, or conformance-disposition change,
 verifier SHALL accept exactly the unchanged complete ledger and reject every invalid
 mutation without producing a verified projection.
 
-**Validates: Requirements 2.2–2.12, 7.7–7.8, 12.3**
+**Validates: Requirements 2.2–2.12, 7.7–7.8, 12.3, 13.3–13.4**
 
 ### Property 5: Feature-catalog surface ownership
 
@@ -804,7 +845,7 @@ available default-disabled feature SHALL have an exact production enablement act
 field catalog, rendering SHALL produce byte-identical sorted documentation whose
 feature availability/default/enablement cells equal the source catalog.
 
-**Validates: Requirements 2.9–2.11, 10.6–10.10, 11.5–11.13, 11.22**
+**Validates: Requirements 2.9–2.11, 10.6–10.10, 11.5–11.13, 11.22, 13.4**
 
 ### Property 8: Task-queue patch state machine
 

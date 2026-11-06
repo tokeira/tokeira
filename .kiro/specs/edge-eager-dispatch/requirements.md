@@ -7,9 +7,9 @@ This spec implements Eager Dispatch — an optimization where the server returns
 Eager dispatch has two independent paths:
 
 1. **Eager workflow task on `StartWorkflowExecution`**: When the caller sets `request_eager_execution=true`, eager workflow start is enabled, and the first workflow task has no backoff, the runtime commits the first workflow task as started in the run-creation transition and returns it inline in `StartWorkflowExecutionResponse.eager_workflow_task`. Temporal v1.31.0 does not require a server-observed active poller; the caller is the intended worker.
-2. **Eager activity tasks on `RespondWorkflowTaskCompleted`**: When the completing worker sets `return_new_workflow_task=true` and the workflow task completion schedules activities, eligible activity tasks are claimed from the `InMemoryActivityBroker` and returned inline in `RespondWorkflowTaskCompletedResponse.activity_tasks`. The activity commands must carry `request_eager_execution=true` to be eligible.
+2. **Eager activity tasks on `RespondWorkflowTaskCompleted`**: When eager activity execution is enabled, eligible requested activities are started in the completion transition and returned in `RespondWorkflowTaskCompletedResponse.activity_tasks`. This does not depend on `return_new_workflow_task` or a parked activity poll.
 
-The workflow-start path does not put correctness weight on the broker: the kernel's existing reserved-start path authors `WorkflowExecutionStarted`, `WorkflowTaskScheduled`, and `WorkflowTaskStarted` in one transition. The activity path retains its targeted broker claim. If an eager response fails to reach the client, the existing workflow-task or activity timeout mechanism recovers the already-authoritative pending work.
+The workflow-start path does not put correctness weight on the broker: the kernel's existing reserved-start path authors `WorkflowExecutionStarted`, `WorkflowTaskScheduled`, and `WorkflowTaskStarted` in one transition. The activity path likewise bypasses dispatch rows and offers when it starts work inline. If an eager response fails to reach the client, the existing workflow-task or activity timeout mechanism recovers the already-authoritative pending work.
 
 The edge layer already has a partial eager pattern: `respond_workflow_task_completed` builds an inline query-only WFT via `build_eager_query_workflow_task` when `return_new_workflow_task=true` and buffered queries exist. This spec extends that pattern to cover the two proto-defined eager dispatch paths.
 
@@ -42,7 +42,7 @@ The implementation is organized into three phases:
 - `service/history/api/create_workflow_util.go @ v1.31.0` schedules and starts the accepted first WFT while creating the run. Tokeira matches that observable result through its existing `reserved_poller_identity` start branch, without requiring a live `PollerRegistry` entry.
 - Current Tokeira code incorrectly gates eager start on `PollerRegistry::has_active_poller`, claims after publication, omits the durable history flag, and always omits the eager task on request-id dedup. Tier 3.18's six leaves therefore fail at the missing eager task.
 
-The pinned v1.31.0 eager-enable default is a constant `true`, not a new operator knob. Feature-mode testing may inject the disabled value into the pure admission decision, but the default server path remains enabled.
+The pinned v1.31.0 eager **workflow-start** default is a constant `true`, not a new operator knob. Feature-mode testing may inject the disabled value into the pure admission decision, but the default server path remains enabled.
 
 ## Requirements
 
@@ -111,31 +111,38 @@ The pinned v1.31.0 eager-enable default is a constant `true`, not a new operator
 
 #### Acceptance Criteria
 
-1. WHEN a `RespondWorkflowTaskCompletedRequest` contains `ScheduleActivityTask` commands with `request_eager_execution=true`, THE Edge_Layer SHALL mark those commands as eager-eligible.
+1. WHEN a `RespondWorkflowTaskCompletedRequest` contains `ScheduleActivityTask` commands with `request_eager_execution=true`, THE Edge_Layer SHALL preserve them as eager candidates, subject to the SDK exclusion and runtime/kernel eligibility checks.
 2. WHEN a `ScheduleActivityTask` command has `request_eager_execution=false` or unset, THE Edge_Layer SHALL NOT mark it as eager-eligible.
-3. THE Edge_Layer SHALL thread the `request_eager_execution` flag through the internal command representation so that the eager dispatch logic can identify eligible activities after the workflow task is committed.
+3. THE Edge_Layer SHALL thread `request_eager_execution` and `use_workflow_build_id` into completion inputs before the transition.
+4. WHEN the SDK headers identify Python `0.1a1`, `0.1a2`, `0.1b1`, or `0.1b2`, or parseable TypeScript below `1.4.4`, THE Edge_Layer SHALL clear activity eager requests; invalid TypeScript semver SHALL remain unexcluded by this check (`service/frontend/overrides.go:23-56 @ v1.31.0`).
 
-### Requirement 6: Eager Activity Task Claim and Return
+### Requirement 6: Eager Activity Start and Return in Completion
 
-**User Story:** As an SDK user, I want `RespondWorkflowTaskCompletedResponse` to include activity tasks inline when my workflow task schedules eager-eligible activities, so that my worker can begin executing activities immediately without separate poll round-trips.
-
-#### Acceptance Criteria
-
-1. WHEN a workflow task completion commits successfully and the response contains eager-eligible activity commands, THE Edge_Layer SHALL attempt to claim the corresponding activity tasks from the InMemoryActivityBroker using Atomic_Claim operations.
-2. WHEN an Atomic_Claim succeeds for an activity task, THE Edge_Layer SHALL build a complete `PollActivityTaskQueueResponse` from the claimed task and include it in the `activity_tasks` list of `RespondWorkflowTaskCompletedResponse`.
-3. WHEN an Atomic_Claim fails for an activity task (task not yet published, already taken, or queue empty), THE Edge_Layer SHALL omit that activity from the `activity_tasks` list (the task will be delivered via normal polling).
-4. EACH Eager_Activity_Task SHALL use the same task token encoding as a normally polled activity task.
-5. EACH Eager_Activity_Task SHALL include all fields required by a complete `PollActivityTaskQueueResponse`: `task_token`, `activity_id`, `activity_type`, `input`, `workflow_execution`, `scheduled_time`, `started_time`, `current_attempt_scheduled_time`, `heartbeat_timeout`, `schedule_to_close_timeout`, `start_to_close_timeout`, and workflow metadata.
-
-### Requirement 7: Eager Activity Task Limit
-
-**User Story:** As a Tokeira operator, I want a configurable maximum number of eager activity tasks per response, so that a single workflow task completion does not monopolize the worker's activity slots.
+**User Story:** As an SDK worker, I want my completion to start its inline activities, so that another poll cannot take them first.
 
 #### Acceptance Criteria
 
-1. THE Edge_Layer SHALL enforce a maximum number of eager activity tasks returned per `RespondWorkflowTaskCompletedResponse`.
-2. WHEN the number of eager-eligible activity commands exceeds the maximum, THE Edge_Layer SHALL claim at most the configured maximum number of activity tasks and leave the remainder for normal polling.
-3. THE maximum SHALL default to a reasonable value (e.g., 3) and be configurable via the edge layer's configuration.
+1. WHEN the setting is enabled and a command requests eagerness, THE completion SHALL apply the versioning, pause and surviving-command eligibility in [activity-dispatch Requirement 9](../activity-dispatch/requirements.md#requirement-9-start-eager-activities-inside-completion).
+2. WHEN all commands succeed, THE kernel SHALL start eligible surviving activities in the completion's transition with fresh runtime-supplied request IDs, the completing identity and the workflow's assigned build ID.
+3. WHEN the run closes or an activity is cancelled in the same completion, THE completion SHALL NOT start or return that activity.
+4. EACH Eager_Activity_Task SHALL use the normal activity task-token encoding and exact scheduled input/header, schedule/start times, attempt, timeouts, workflow metadata and priority from committed state.
+5. THE eager first-start path SHALL bypass workflow-rule evaluation; ordinary starts and retries SHALL retain it.
+6. WHEN the completion commits, THE runtime SHALL return its started activity results directly to the edge without a second start commit.
+
+Authority: `service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:487-622 @ v1.31.0`.
+
+### Requirement 7: Default-Off Policy Without an Activity Count Cap
+
+**User Story:** As an operator, I want explicit eager activity enablement matching the stock default, so that production policy is intentional.
+
+#### Acceptance Criteria
+
+1. THE typed deployment setting SHALL default to false and apply to every namespace; the existing functional harness override SHALL take precedence per test.
+2. WHEN the setting is false, THE response SHALL contain no activity tasks and otherwise dispatchable activities SHALL remain available to polls.
+3. THE server SHALL impose no maximum number of eager activities per response; existing payload/command admission SHALL remain in effect.
+4. THE activity path SHALL NOT require `return_new_workflow_task` or an active poller.
+
+Authority: `common/dynamicconfig/constants.go:193-197` and the unbounded response mutations in `service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:524-622 @ v1.31.0`.
 
 ### Requirement 8: RespondWorkflowTaskCompletedResponse Proto Translation
 
@@ -162,17 +169,17 @@ The pinned v1.31.0 eager-enable default is a constant `true`, not a new operator
 4. THE `try_claim_workflow_task` method SHALL remove the task from the deduplication set (`enqueued`) so that the task is not delivered again via normal polling.
 5. THE `try_claim_workflow_task` method SHALL NOT wake any waiting pollers (the task is being claimed, not published).
 
-### Requirement 10: InMemoryActivityBroker Targeted Claim for Activity Tasks
+### Requirement 10: No Dispatch for Inline Activity Starts
 
-**User Story:** As a Tokeira developer, I want the InMemoryActivityBroker to support a targeted claim operation that removes a specific activity task (identified by run_key and activity_id) from the ready queue without blocking, so that the eager dispatch path claims the just-scheduled activity and not an unrelated activity.
+**User Story:** As a worker, I want eagerly started work absent from poll delivery, so that the response owns its start.
 
 #### Acceptance Criteria
 
-1. THE InMemoryActivityBroker SHALL expose a `try_claim_activity_task` method that accepts a `QueueKey`, a `RunKey`, and an `activity_id: &str`, and attempts to remove the activity task matching that `(RunKey, activity_id)` from the ready queue.
-2. WHEN a task matching the specified `(RunKey, activity_id)` is available in the ready queue for the specified `QueueKey`, THE `try_claim_activity_task` method SHALL remove and return the task atomically (within a single lock acquisition).
-3. WHEN no task matching the specified `(RunKey, activity_id)` is available in the ready queue, THE `try_claim_activity_task` method SHALL return `None` without blocking.
-4. THE `try_claim_activity_task` method SHALL remove the task from the deduplication set (`enqueued`) so that the task is not delivered again via normal polling.
-5. THE `try_claim_activity_task` method SHALL NOT wake any waiting pollers.
+1. WHEN a completion starts an activity inline, THE kernel SHALL emit no activity enqueue operation for that incarnation.
+2. WHEN that transition commits, THE repository SHALL write no activity dispatch row for the inline incarnation.
+3. THE publisher, discovery and acquisition repair SHALL publish no offer for an inline-started activity.
+4. THE completion path SHALL NOT call `try_claim_activity_task` or depend on activity-broker visibility.
+5. WHEN an optional inline origin is outside the worker's authorized scope, THE completion SHALL leave that work unstarted for ordinary authorized dispatch.
 
 ### Requirement 11: Re-Enqueue Safety via Existing Timeout Mechanisms
 
@@ -181,8 +188,8 @@ The pinned v1.31.0 eager-enable default is a constant `true`, not a new operator
 #### Acceptance Criteria
 
 1. WHEN an Eager_Workflow_Task is committed as started and returned to the client, THE Runtime SHALL rely on the existing WFT start-to-close timeout mechanism to detect non-completion and reschedule the workflow task.
-2. WHEN an Eager_Activity_Task is claimed and returned to the client, THE Runtime SHALL rely on the existing activity timeout mechanisms (schedule-to-start, start-to-close, schedule-to-close) to detect non-completion and reschedule the activity task.
-3. THE eager dispatch path SHALL NOT introduce any new timeout or re-enqueue mechanism — the existing scanner-based recovery is sufficient because eagerly claimed tasks are indistinguishable from normally polled tasks once claimed.
+2. IF an Eager_Activity_Task response is lost, THEN THE activity SHALL remain started until its applicable start-to-close, heartbeat or schedule-to-close timeout resolves it; retry policy SHALL determine retry versus terminal timeout.
+3. THE eager dispatch path SHALL NOT immediately reoffer work on response loss or apply schedule-to-start timeout to work already started.
 
 ### Requirement 12: Authoritative Commit and Publish Ordering
 
@@ -191,9 +198,9 @@ The pinned v1.31.0 eager-enable default is a constant `true`, not a new operator
 #### Acceptance Criteria
 
 1. WHEN eager workflow start is accepted, THE Runtime SHALL commit the run and started first WFT before constructing `StartWorkflowExecutionResponse`.
-2. WHEN the Edge_Layer attempts eager activity task claims after `complete_workflow_task`, THE claims SHALL occur after the runtime's `complete_workflow_task` has committed the transition and the dispatch publisher has published the activity tasks to the InMemoryActivityBroker.
-3. IF the activity dispatch publisher has not yet published an eager-eligible activity at claim time, THEN THE Atomic_Claim SHALL return `None`.
-4. WHEN an eager activity claim returns `None`, THE Runtime SHALL leave the authoritative pending activity eligible for normal polling.
+2. WHEN a completion starts activities inline, THE runtime SHALL commit their started state in the completion before exposing any task token.
+3. IF the completion commit fails, THEN THE edge SHALL expose no inline tasks.
+4. WHEN optional task provenance cannot be registered after commit, THE edge SHALL withhold that task and let its started timeout recover it; THE runtime SHALL NOT undo or republish its start.
 
 ### Requirement 13: Request-ID Retry Fidelity
 

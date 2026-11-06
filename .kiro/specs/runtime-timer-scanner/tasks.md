@@ -153,3 +153,21 @@ Add a background timer scanner to `tokeira-runtime` that periodically discovers 
 
 - [x] Verify Property 7 with the required property and regression tests: `stored_start_delay_deadlines_are_total`, `command_durations_preserve_failure_cause_and_message`.
   _Requirements: 7._
+
+- [x] 9. Deliver durable timers and start delays at their deadlines
+  - Add look-ahead, shard-specific commit/acquisition wakes, immediate capped-page
+    continuation and failure deferral until the full pass.
+  - Verify sleeping-scanner delivery, preparation visibility, acquisition, cursor
+    rewinds, failure isolation and counted per-shard listings with the node clock.
+  - _Requirements: 1.1, 1.6, 5, 6._
+
+- [x] 10. Reject stale timer commands using millisecond deadline precision
+  - Verify an earlier observation in the same millisecond fires a timer with
+    sub-millisecond digits, including at its microsecond-truncated time and before
+    1970. Reject an observation in the preceding millisecond without a transition;
+    preserve firing at and after the exact deadline.
+  - Verify a scanner command built from a microsecond-truncated row fires the
+    nanosecond-state timer exactly once. Keep the captured-listing race test:
+    cancellation and replacement under the same id leave state, history and the
+    later replacement row unchanged on rejection, then fire at its own time.
+  - _Requirements: 2.5._

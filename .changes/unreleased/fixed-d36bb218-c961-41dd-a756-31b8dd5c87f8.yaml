@@ -1,0 +1,5 @@
+kind: fixed
+body: After a workflow task fails or times out while its workflow is paused, unpausing now schedules a new task with the correct attempt and history.
+time: 2026-11-05T19:12:44.663752+00:00
+custom:
+    Slice: d36bb218-c961-41dd-a756-31b8dd5c87f8

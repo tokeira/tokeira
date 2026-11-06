@@ -1,0 +1,5 @@
+kind: fixed
+body: The new workflow task that RespondWorkflowTaskCompleted returns is now started by the completion itself, so another worker's waiting poll can no longer take it first.
+time: 2026-11-05T14:55:28.667772+00:00
+custom:
+    Slice: 45e7d9b5-9285-451f-9fb1-da8cf1b8470f

@@ -287,3 +287,10 @@ mod query_plans;
 
 #[path = "activity_race_tests.rs"]
 mod races;
+
+#[test]
+fn eager_completion_live_has_no_dispatch_rows() -> Result<()> {
+    let (runtime, fixture) = fixture()?;
+    contracts::eager_completion_cases(&fixture, &runtime);
+    runtime.block_on(fixture.store.shutdown())
+}

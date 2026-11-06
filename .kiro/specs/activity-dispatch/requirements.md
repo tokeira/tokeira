@@ -67,7 +67,8 @@ other remaining item 4.7 work are not prerequisites for correctness here. Genera
 run-scoped RPC forwarding, speculative workflow tasks, standalone CHASM activities,
 new public RPC support, timeout architecture redesign, and changes to other
 derived-operation or intent families are out of scope. Existing eager workflow
-activity delivery must continue to work. This specification does not amend the
+activity delivery is corrected below to start inside the completion transition.
+This specification does not amend the
 workflow-task start retry contract.
 
 ## Evidence From Current Code
@@ -127,6 +128,8 @@ behavioral evidence, not permission to copy their implementation.
 | `service/history/timer_queue_active_task_executor.go`, `executeActivityRetryTimerTask` | Recheck stamp, pause, attempt, started state and running execution; evaluate current workflow rules before adding a retry to matching. |
 | `service/history/api/recordactivitytaskstarted/api.go`, `Invoke` | Missing/closed/stale activity is not started; same request ID can recover an existing start; a different request receives already-started; enforce workflow rules, stamp and deployment transition rules before start. |
 | Same file, `getDeploymentVersionAndRevisionNumberForWorkflowID` and `processActivityWorkflowRules` | Activity start consults workflow-task routing for deployment transitions; independent activity routing must not spuriously transition pinned workflows; first-attempt rule evaluation occurs at start. |
+| `service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:487-622 @ v1.31.0` | Eager eligibility bypasses task generation; post-command start skips closed runs and cancelled activities, uses a fresh request ID, completing identity and assigned workflow build ID, and performs no workflow-rule evaluation or per-response count limiting. |
+| `common/dynamicconfig/constants.go:193-197`; `service/frontend/overrides.go:23-56 @ v1.31.0` | Eager activity execution defaults off; buggy Python and old TypeScript clients have eager flags cleared. |
 | `service/matching/matching_engine.go`, `PollActivityTaskQueue` and `recordActivityTaskStarted` | Matching asks history to record start using a generated request ID and the poller's metadata; stale/already-started candidates are consumed internally rather than returned as worker tasks. |
 
 Vendored wire shape is
@@ -272,7 +275,7 @@ lives, so that independent queue and execution placement is functional.
 
 1. WHEN a queue-home poll selects an activity owned elsewhere, THE runtime SHALL
    obtain the start result from the current execution owner over the internal path.
-2. WHEN the owner processes a start, THE runtime SHALL revalidate authoritative run,
+2. WHEN the owner processes an ordinary polled start, THE runtime SHALL revalidate authoritative run,
    activity, incarnation, pause, eligibility, routing and workflow-rule state.
 3. WHEN a start commits, THE repository SHALL atomically apply its state/history,
    dispatch-row removal and existing derived effects under the execution-home
@@ -338,14 +341,15 @@ semantics, so that reconciliation does not change workflow results.
 1. WHEN retry backoff has not elapsed, THE delivery path SHALL NOT start that
    attempt through either ordinary or eager delivery.
 2. WHEN a rule is created after publication, THE execution owner SHALL enforce the
-   existing retry-publication and start-time rule contracts before a worker starts.
+   retry-eligibility and ordinary-start rule contracts; eager first starts SHALL
+   follow Requirement 9.9 instead.
 3. WHEN pause, unpause, reset, cancellation, options or retry races with an old
    offer, THE owner SHALL use current state and preserve the existing stamp and
    timeout semantics of the corresponding activity lifecycle transition.
 4. WHEN deployment routing changes, THE delivery path SHALL preserve pinned,
    independently versioned, auto-upgrade and dispatch-revision start rules verified
    in `recordactivitytaskstarted/api.go @ v1.31.0`.
-5. WHEN an ordinary poll or eager claim succeeds, THE response SHALL preserve every
+5. WHEN an ordinary poll or in-completion eager start succeeds, THE response SHALL preserve every
    existing started-activity field and the exact scheduled input/header values.
 6. WHEN activity start is transient or buffered by a running workflow task, THE
    implementation SHALL preserve its existing history materialization contract.
@@ -354,6 +358,14 @@ semantics, so that reconciliation does not change workflow results.
    destructive legacy backlog drain.
 8. WHEN activity timeout processing is due, THE retirement of reconciliation and
    backlog loops SHALL leave timeout scanning and deadline reconstruction intact.
+
+9. WHEN a retry's backoff ends, THE execution owner SHALL evaluate the retry's
+   eligibility at that time rather than at a later periodic scan
+   (`service/history/workflow/task_generator.go:567-577 @ v1.31.0`).
+10. WHEN a retry's backoff ends and the attempt is eligible, THE execution owner
+    SHALL offer it to a local queue home at that time. A pause rule SHALL publish
+    nothing. Remote queue homes and missed local offers SHALL retain discovery as
+    the backstop (`service/history/workflow/task_generator.go:567-577 @ v1.31.0`).
 
 ### Requirement 7: Cut over and retire duplicate delivery mechanisms
 
@@ -407,6 +419,58 @@ delivery, so that memory-only tests cannot conceal a DSQL or ownership gap.
    actually executed live checks, failures/skips and temporary-resource cleanup.
 9. THE PR SHALL pass the repository's complete enforced-command bar and contain an
    unreleased change record before it is presented for exact-head merge approval.
+
+### Requirement 9: Start eager activities inside completion
+
+**User Story:** As a completing worker, I want eligible activities reserved by my
+completion, so that another poll cannot take work returned in its response.
+
+#### Acceptance Criteria
+
+1. THE typed deployment policy SHALL default eager activity execution to false and
+   apply one configured value to every namespace.
+2. WHERE the functional conformance harness supplies
+   `system.enableActivityEagerExecution`, THE runtime SHALL use that per-test
+   override ahead of the deployment value through the existing override bridge.
+3. WHEN eager execution is disabled, THE completion SHALL ignore eager requests,
+   return no activity tasks and leave otherwise dispatchable activities for polls.
+4. WHEN the caller is Python `0.1a1`, `0.1a2`, `0.1b1`, or `0.1b2`, or a parseable
+   TypeScript version below `1.4.4`, THE edge SHALL clear activity eager requests;
+   unparseable TypeScript versions SHALL NOT be excluded by this version test.
+5. WHEN a command requests eager execution and the effective setting is enabled,
+   THE kernel SHALL select it only if the workflow is not versioned under the
+   v1.31.0 predicate or `UseWorkflowBuildId` is true. That predicate is an old
+   `use_versioning` stamp with unspecified effective versioning behavior, or a
+   nonempty assigned build ID (`workflow_task_completed_handler.go:487-502`).
+6. WHEN the workflow is paused, THE completion SHALL neither start an activity
+   eagerly nor generate its dispatch row or offer.
+7. WHEN all commands have succeeded and the run remains open, THE completion SHALL
+   start each selected activity still present after cancellation handling in the
+   completion's own fenced transition, using a runtime-supplied fresh request ID, the completing
+   worker identity and the workflow's assigned build ID.
+8. WHEN an activity is started eagerly, THE transition SHALL emit no enqueue
+   operation, the repository SHALL write no activity dispatch row, and the runtime
+   SHALL publish no offer for that incarnation, including on repair or restart.
+9. WHEN an activity first starts eagerly, THE runtime SHALL NOT evaluate workflow
+   rules; ordinary starts and retry eligibility SHALL continue evaluating them.
+10. THE server SHALL impose no per-response eager-activity count cap and SHALL NOT
+    condition activity eagerness on `return_new_workflow_task` or parked poll demand.
+11. WHEN the completion commits, THE response SHALL carry all activities it started
+    inline with exact scheduled payloads and committed start metadata, subject to
+    existing authorization and response admission contracts.
+12. IF an inline response is lost, THEN the activity SHALL remain started until its
+    applicable start-to-close, heartbeat or schedule-to-close timeout resolves it;
+    no immediate reoffer or schedule-to-start recovery SHALL be introduced.
+13. WHEN a completion fails or closes the run, or a selected activity was cancelled
+    in that completion, THE response SHALL carry no start for that activity.
+
+These decisions replace the post-commit claim contract. Behavior authority is
+`service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:487-622`,
+`service/frontend/overrides.go:23-56`, and
+`common/dynamicconfig/constants.go:193-197 @ v1.31.0`. Scoped task authorization is
+checked before choosing an inline start; an unauthorized optional return remains
+ordinary work, as specified by
+[scoped-worker-authorization](../scoped-worker-authorization/requirements.md).
 
 ## Review Status
 

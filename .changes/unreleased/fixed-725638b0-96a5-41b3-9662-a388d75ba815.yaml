@@ -1,0 +1,5 @@
+kind: fixed
+body: When a workflow task is failed because too many events were buffered, its retry now takes the next attempt number, unless the task was on a sticky queue.
+time: 2026-11-05T20:25:29.533404+00:00
+custom:
+    Slice: 725638b0-96a5-41b3-9662-a388d75ba815

@@ -544,18 +544,18 @@ The table below maps every gap identified in `reference/proto-field-audit.md` to
 
 #### Acceptance Criteria
 
-1. WHEN a `RespondWorkflowTaskCompletedRequest` includes `return_new_workflow_task=true` and the completing worker is also polling for activities on compatible task queues, THE Edge_Layer SHALL include eligible activity tasks in the `RespondWorkflowTaskCompletedResponse.activity_tasks` field.
+1. WHEN eager activity execution is enabled and a command requests it, THE completion SHALL start and return eligible surviving activities under [edge-eager-dispatch](../edge-eager-dispatch/requirements.md), independently of `return_new_workflow_task` or poll demand.
 2. EACH eagerly returned activity task SHALL be a fully populated `PollActivityTaskQueueResponse` containing the activity's input, task token, timeouts, and all fields required for the SDK to begin executing the activity.
 3. WHEN activity tasks are eagerly returned, THE Edge_Layer SHALL NOT also publish those tasks to the activity broker for normal poll dispatch.
-4. THE Edge_Layer SHALL limit the number of eagerly returned activity tasks to a configurable maximum per response.
-5. WHEN no eligible activity tasks exist or the worker is not polling for activities, THE Edge_Layer SHALL return an empty `activity_tasks` list.
+4. THE server SHALL impose no eager-activity count cap; the typed deployment enable setting SHALL default off.
+5. WHEN no eligible activity tasks exist or eager execution is disabled, THE Edge_Layer SHALL return an empty `activity_tasks` list.
 
-### Requirement 9.3: Eager dispatch coordination with broker
+### Requirement 9.3: Eager dispatch owned by its transition
 
-**User Story:** As a Tokeira developer, I want eager dispatch to coordinate with the broker, so that tasks are not double-dispatched and broker state remains consistent.
+**User Story:** As a Tokeira developer, I want inline work started by its originating transition, so that waiting polls cannot take it.
 
 #### Acceptance Criteria
 
-1. WHEN a task is eagerly dispatched, THE Edge_Layer SHALL atomically claim the task from the broker before including it in the response, preventing concurrent poll from also returning the same task.
-2. IF the eager dispatch response fails to reach the client (e.g., connection drop), THE runtime SHALL detect the unacknowledged task and re-enqueue it for normal poll dispatch.
+1. WHEN a task is returned inline, THE runtime SHALL obtain its start from the originating transition without a broker claim, dispatch row or offer; completion-returned WFTs follow [api-conformance-wft-completion](../api-conformance-wft-completion/requirements.md).
+2. IF an inline response fails to reach the client, THEN THE task SHALL remain started until its applicable timeout; normal retry policy SHALL determine recovery.
 3. THE eager dispatch path SHALL use the same task token encoding and validation as normal poll dispatch, so that completions and failures are handled identically regardless of dispatch path.

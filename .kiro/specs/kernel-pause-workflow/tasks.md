@@ -181,6 +181,20 @@ workflow code observe accumulated events.
 - [x] 6. Final checkpoint
   - Ensure all tests pass, ask the user if questions arise.
 
+- [x] 7. Clear failed and timed-out workflow tasks during a pause
+  - Remove paused task retention from failure and both timeout paths; preserve
+    attempts and attempts-since-success without resetting on a buffered flush.
+    Audit server-failed completions and buffered-event overflow failures.
+  - Keep pending-task timeout behavior and unstarted-task re-dispatch; remove the
+    retained-placeholder timestamp adjustment at unpause.
+  - Reproduce all six paused failure/timeout histories before the fix through
+    persistence, poll and start, including transient materialization on completion.
+  - Cover older pending tasks, completion during pause, two pause cycles and the
+    heartbeat window; extend generated traces for Properties 4 and 5.
+  - Run focused tests and the requested formatting, lint, test and documentation
+    checks. Depends on task 6 and transient-wft Item C.
+  - _Requirements: 7.7, 7.8; transient-wft C.1.4; Properties 4, 5_
+
 ## Notes
 
 - All property and unit tests in this plan are required because they validate externally visible Temporal compatibility semantics.
@@ -200,7 +214,8 @@ workflow code observe accumulated events.
     { "id": 2, "tasks": ["1.8", "1.9", "1.10", "1.11", "1.12"] },
     { "id": 3, "tasks": ["2", "3.1", "3.2", "4.1", "4.2", "4.3", "5.1", "5.2"] },
     { "id": 4, "tasks": ["3.3", "3.4", "3.5", "3.6", "3.7", "3.8", "4.4", "5.3"] },
-    { "id": 5, "tasks": ["3.9", "6"] }
+    { "id": 5, "tasks": ["3.9", "6"] },
+    { "id": 6, "tasks": ["7"] }
   ]
 }
 ```

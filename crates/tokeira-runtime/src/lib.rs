@@ -32,6 +32,7 @@ pub mod chasm;
 mod child_start;
 #[cfg(feature = "conformance")]
 pub mod conformance;
+mod deadline_wake;
 pub mod deployment_registry;
 mod discovery;
 pub mod dispatch_rate_limit;
@@ -71,6 +72,8 @@ mod signal_limits;
 pub mod speculative_timer;
 pub mod task_ordering;
 pub mod task_queue_config;
+#[cfg(test)]
+mod test_clock;
 pub mod timeout;
 pub mod update;
 pub mod wft_timeout;

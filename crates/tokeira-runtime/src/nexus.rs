@@ -2124,16 +2124,99 @@ impl NexusCompletionClient for NoopNexusCompletionClient {
     }
 }
 
+/// Cached authoritative operation timing; absence on an entry requests an immediate reload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NexusTimeouts {
+    /// Whole-operation deadline duration, including invocation backoff.
+    pub schedule_to_close: Option<Duration>,
+    /// Deadline duration while waiting for the operation to start.
+    pub schedule_to_start: Option<Duration>,
+    /// Duration allowed after asynchronous start.
+    pub start_to_close: Option<Duration>,
+    /// Whether schedule-to-start no longer applies.
+    pub started: bool,
+    /// Authoritative anchor of start-to-close.
+    pub started_at: Option<OffsetDateTime>,
+}
+
+impl From<&PendingNexusOperation> for NexusTimeouts {
+    fn from(op: &PendingNexusOperation) -> Self {
+        Self {
+            schedule_to_close: op.schedule_to_close_timeout,
+            schedule_to_start: op.schedule_to_start_timeout,
+            start_to_close: op.start_to_close_timeout,
+            started: op.started,
+            started_at: op.started_at,
+        }
+    }
+}
+
+pub(crate) fn nexus_timeout_due_at(entry: &NexusTimeoutEntry) -> Option<OffsetDateTime> {
+    let Some(cache) = entry.timeouts else {
+        return Some(time::PrimitiveDateTime::MIN.assume_utc());
+    };
+    // Nexus timers are inclusive, unlike activity timeouts. Zero disables a timer
+    // (components/nexusoperations/statemachine.go:144-167 @ v1.31.0).
+    let due = |anchor, timeout: Option<Duration>| {
+        timeout
+            .filter(|t| !t.is_zero())
+            .map(|t| deadline_after(anchor, t))
+    };
+    [
+        due(entry.scheduled_at, cache.schedule_to_close),
+        (!cache.started)
+            .then(|| due(entry.scheduled_at, cache.schedule_to_start))
+            .flatten(),
+        cache
+            .started_at
+            .and_then(|anchor| due(anchor, cache.start_to_close)),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
+/// Cached callback lifecycle; authoritative state is reloaded before delivery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionCallbackTiming {
+    /// Committed lifecycle controls whether a retry is eligible.
+    pub state: tokeira_kernel::CallbackState,
+    /// Backoff deadline; Scheduled callbacks need no explicit timestamp.
+    pub next_attempt_at: Option<OffsetDateTime>,
+}
+impl From<&tokeira_kernel::CompletionCallback> for CompletionCallbackTiming {
+    fn from(callback: &tokeira_kernel::CompletionCallback) -> Self {
+        Self {
+            state: callback.state.clone(),
+            next_attempt_at: callback.next_attempt_at,
+        }
+    }
+}
+pub(crate) fn callback_due_at(entry: &CompletionCallbackTrackingEntry) -> Option<OffsetDateTime> {
+    // Known Scheduled entries already have a first delivery in flight. Recovery
+    // leaves their timing unknown to regenerate a potentially lost invocation;
+    // otherwise the full pass is the backstop for a lost first delivery.
+    match entry.timing.as_ref() {
+        None => Some(time::PrimitiveDateTime::MIN.assume_utc()),
+        Some(timing) => match timing.state {
+            tokeira_kernel::CallbackState::BackingOff => timing.next_attempt_at,
+            _ => None,
+        },
+    }
+}
+
 /// Volatile index of which open Nexus operations to watch for timeouts.
 ///
 /// This is a derived index, not authority: it lists *which* `(run, operation)`
-/// pairs the scanner must check. The timeout deadlines, `started`/`started_at`
-/// anchors, and current liveness are read from the durable `PendingNexusOperation`
-/// at scan time (history is authority, AGENTS §3). On shard takeover the index is
+/// pairs the scanner must check. Cached deadlines select due-only reloads; every
+/// interval also refreshes all entries. The durable `PendingNexusOperation`
+/// remains the authority at scan time (history is authority, AGENTS §3). On shard takeover the index is
 /// rebuilt from durable state by `crate::recovery::sweep_shard`; losing it only
 /// delays firing until the rebuild, never changes the outcome.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NexusTimeoutEntry {
+    /// Derived deadline cache, refreshed from committed operation state.
+    pub timeouts: Option<NexusTimeouts>,
     pub run_key: RunKey,
     pub shard_id: ShardId,
     pub operation_id: String,
@@ -2141,10 +2224,24 @@ pub struct NexusTimeoutEntry {
     pub scheduled_at: OffsetDateTime,
 }
 
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Debug)]
 pub struct NexusTimeoutTrackingState {
+    pub(crate) wake: crate::deadline_wake::DeadlineWake,
     pub(crate) inner:
         crate::acquisition_tracking::AcquisitionEntries<(RunKey, String), NexusTimeoutEntry>,
+}
+
+impl Default for NexusTimeoutTrackingState {
+    fn default() -> Self {
+        let wake = crate::deadline_wake::DeadlineWake::default();
+        Self {
+            inner: crate::acquisition_tracking::AcquisitionEntries::with_deadlines(
+                wake.clone(),
+                nexus_timeout_due_at,
+            ),
+            wake,
+        }
+    }
 }
 
 impl NexusTimeoutTrackingState {
@@ -2154,6 +2251,7 @@ impl NexusTimeoutTrackingState {
     pub(crate) fn for_acquisition(&self, acquisition: crate::shard::ShardAcquisition) -> Self {
         Self {
             inner: self.inner.for_acquisition(acquisition),
+            ..self.clone()
         }
     }
     /// Install only for the current acquisition; recovery may install before activation.
@@ -2198,20 +2296,23 @@ impl NexusTimeoutTrackingState {
 /// scanner must re-fire.
 ///
 /// Like [`NexusTimeoutTrackingState`] this is a derived index, not authority: it lists
-/// *which* `(run, callback_index)` pairs are backing off. The `next_attempt_at`
-/// deadline and current `CallbackState` are read from the durable `CompletionCallback`
-/// at scan time (history is authority, AGENTS §3). On shard takeover the index is
+/// *which* `(run, callback_index)` pairs need delivery. Cached lifecycle and deadline
+/// select due-only reloads, with a full refresh every interval. Durable callbacks
+/// remain authoritative at scan time (history is authority, AGENTS §3). On shard takeover the index is
 /// rebuilt from durable state by `crate::recovery::sweep_shard`; losing it only
 /// delays a retry until the rebuild, never changes the outcome.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletionCallbackTrackingEntry {
+    /// Derived lifecycle cache; unknown entries are reloaded immediately.
+    pub timing: Option<CompletionCallbackTiming>,
     pub run_key: RunKey,
     pub shard_id: ShardId,
     pub callback_index: usize,
 }
 
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Debug)]
 pub struct CompletionCallbackTrackingState {
+    pub(crate) wake: crate::deadline_wake::DeadlineWake,
     pub(crate) inner: crate::acquisition_tracking::AcquisitionEntries<
         (RunKey, usize),
         CompletionCallbackTrackingEntry,
@@ -2234,6 +2335,21 @@ impl Drop for CallbackAttemptPermit {
             .lock()
             .expect("callback admission lock poisoned")
             .remove(&self.key);
+    }
+}
+
+impl Default for CompletionCallbackTrackingState {
+    fn default() -> Self {
+        let wake = crate::deadline_wake::DeadlineWake::default();
+        Self {
+            inner: crate::acquisition_tracking::AcquisitionEntries::with_deadlines(
+                wake.clone(),
+                callback_due_at,
+            ),
+            wake,
+            in_flight: Default::default(),
+            shutdown: Default::default(),
+        }
     }
 }
 
@@ -2468,7 +2584,7 @@ pub fn nexus_completion_backoff(
 /// operation has not started; start-to-close is anchored at the started time and
 /// only once started. A zero/unset timeout means "no deadline" (v1.31.0 only
 /// emits the task when `AsDuration() != 0`), which is the opposite of the
-/// activity scanner's zero-means-immediate convention — Nexus has no schedule
+/// workflow-task scanner's zero-means-immediate convention — Nexus has no schedule
 /// command default, so an unset timeout must not fire. When more than one
 /// deadline has passed, the earliest-anchored applicable one is reported; since
 /// the conformance suite sets exactly one timeout per operation, precedence only
@@ -2520,12 +2636,14 @@ pub fn evaluate_nexus_timeout(
 /// Evaluate the watched Nexus operations once and resolve any that have timed
 /// out, capped at `max_timeouts_per_scan`.
 ///
-/// Each entry's run is reloaded from `repo` because the live `PendingNexusOperation`
+/// Only due or full-pass refresh entries are selected, in deadline order. Failed
+/// attempts wait for reconciliation; capped unattempted work continues immediately.
+/// Each selected run is reloaded from `repo` because the live `PendingNexusOperation`
 /// is the authority for the current timeouts, the started anchor, and whether the
 /// operation still exists (mirrors the activity scanner). An entry whose run is
 /// absent, or whose operation is no longer pending, is dropped (it resolved by
 /// another path); a load error is transient and leaves the entry for the next scan.
-pub(crate) async fn scan_nexus_timeouts_once<R>(
+pub(crate) async fn scan_nexus_timeouts_at<R>(
     repo: &R,
     tracking: &NexusTimeoutTrackingState,
     shard_id: Option<ShardId>,
@@ -2536,7 +2654,18 @@ pub(crate) async fn scan_nexus_timeouts_once<R>(
 ) where
     R: RunRepository + 'static,
 {
-    let entries = tracking.inner.snapshot(shard_id);
+    let mut entries = tracking.inner.select_active(shard_id, |entry| {
+        entry.refresh_pending
+            || (entry.deadline_pending
+                && nexus_timeout_due_at(&entry.value).is_some_and(|due| due <= now))
+    });
+    entries.sort_by_key(|entry| {
+        (
+            nexus_timeout_due_at(&entry.value),
+            entry.value.run_key,
+            entry.value.operation_id.clone(),
+        )
+    });
     let mut submitted = 0usize;
 
     for tracked in entries {
@@ -2548,6 +2677,10 @@ pub(crate) async fn scan_nexus_timeouts_once<R>(
             break;
         }
 
+        let key = (entry.run_key, entry.operation_id.clone());
+        if !tracking.inner.mark_attempted(&key, &tracked) {
+            continue;
+        }
         let state = match repo.load_run(entry.run_key).await {
             Ok(LoadedRun::Existing(state)) => state,
             Ok(LoadedRun::Absent) => {
@@ -2577,6 +2710,12 @@ pub(crate) async fn scan_nexus_timeouts_once<R>(
             continue;
         };
 
+        tracking
+            .inner
+            .refresh_scanned(&key, &tracked, now, |entry| {
+                entry.timeouts = Some(NexusTimeouts::from(operation));
+                entry.scheduled_at = operation.scheduled_at;
+            });
         let Some(timeout_type) = evaluate_nexus_timeout(operation, now) else {
             continue;
         };
@@ -2644,10 +2783,21 @@ pub(crate) async fn run_nexus_timeout_scanner<R>(
 ) where
     R: RunRepository + 'static,
 {
+    let mut full = crate::deadline_wake::FullPass::new(config.scan_interval, clock.now());
     loop {
+        let now = clock.now();
+        let revision = tracking.wake.begin_plan();
+        let delay = tracking.inner.deadline_delay(now, full.remaining(now));
+        let delay = tracking.wake.plan(now, revision, delay);
         tokio::select! {
             _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(config.scan_interval) => {}
+            _ = tokio::time::sleep(delay) => {},
+            _ = tracking.wake.notify.notified() => {}
+        }
+        let now = clock.now();
+        tracking.wake.start_scan(now);
+        if full.start(now) {
+            tracking.inner.begin_full_pass(true);
         }
 
         let active_shards: Vec<_> = shard_owner
@@ -2657,7 +2807,7 @@ pub(crate) async fn run_nexus_timeout_scanner<R>(
             .collect();
         for shard_id in active_shards {
             runtime_metrics::record_scanner_tick("nexus_timeout", shard_id.0);
-            scan_nexus_timeouts_once(
+            scan_nexus_timeouts_at(
                 repo.as_ref(),
                 &tracking,
                 Some(shard_id),
@@ -2670,6 +2820,10 @@ pub(crate) async fn run_nexus_timeout_scanner<R>(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "nexus_deadline_tests.rs"]
+mod deadline_tests;
 
 #[cfg(test)]
 mod tests {

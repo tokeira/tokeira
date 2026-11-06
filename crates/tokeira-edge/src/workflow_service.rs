@@ -66,7 +66,7 @@ use tokeira_storage::{
     worker_task_token_digest,
 };
 use tokeira_types::{
-    ActivityTaskToken, ArchetypeId, BuildId, DeploymentId, ExecutionRef, ExecutionStatus, Headers,
+    ActivityTaskToken, ArchetypeId, BuildId, DeploymentId, ExecutionRef, ExecutionStatus,
     HeartbeatStore, Payload, Payloads, QueueKey, RequestContext, RequestId, RunId, RunKey,
     TaskKind, TaskQueueName, WorkerIdentity, WorkerInstanceKey, WorkflowId,
 };
@@ -169,17 +169,28 @@ pub struct BatchDispatchContext {
     pub edge_context: EdgeContext,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WorkflowMutationOutcome {
-    /// Newly scheduled activity IDs mapped to their committed event identities.
-    /// Only a successful completion fills this; duplicate replies cannot reuse
-    /// command payloads against an activity scheduled by another completion.
-    pub scheduled_activity_event_ids: BTreeMap<String, i64>,
+    /// Completion-specific results from the exact committed image.
+    pub completion: Option<Box<WorkflowCompletionDetails>>,
     pub transition_seq: u64,
     pub last_event_id: i64,
     pub was_duplicate: bool,
     pub execution_status: ExecutionStatus,
     pub new_run_id: Option<RunId>,
+}
+
+/// Response data bound to the completion commit, never to a later run reload.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkflowCompletionDetails {
+    /// Successor already started by the completion, if inline admission succeeded.
+    pub workflow_task: Option<StartedWorkflowTask>,
+    /// Activities started in the completion commit, in command order.
+    pub activity_tasks: Vec<StartedActivityTask>,
+    /// Open committed image with no pending WFT, for buffered-query release.
+    pub quiescent_state: Option<tokeira_kernel::WorkflowState>,
+    /// Last completed started ID when a speculative task was discarded.
+    pub reset_history_event_id: i64,
 }
 
 /// Worker-deployment mutation response with the post-commit conflict token.
@@ -680,17 +691,6 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         false
     }
 
-    async fn try_claim_workflow_task(
-        &self,
-        queue: tokeira_types::QueueKey,
-        normal_queue: Option<tokeira_types::QueueKey>,
-        run_key: RunKey,
-        worker_identity: tokeira_types::WorkerIdentity,
-    ) -> Result<Option<StartedWorkflowTask>> {
-        let _ = (queue, normal_queue, run_key, worker_identity);
-        Ok(None)
-    }
-
     async fn complete_workflow_task(
         &self,
         req: WorkflowTaskCompletedRequest,
@@ -810,31 +810,6 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         _task_classes: &[tokeira_types::WorkerTaskClass],
     ) -> bool {
         false
-    }
-
-    /// Eagerly claim and start an activity task. `input` and `header` are those
-    /// of the ScheduleActivity command that scheduled it, which the start answers
-    /// with instead of reading the activity's scheduled event.
-    async fn try_claim_activity_task(
-        &self,
-        queue: tokeira_types::QueueKey,
-        run_key: RunKey,
-        activity_id: String,
-        schedule_event_id: i64,
-        worker_identity: tokeira_types::WorkerIdentity,
-        input: Payloads,
-        header: Option<Headers>,
-    ) -> Result<Option<StartedActivityTask>> {
-        let _ = (
-            queue,
-            run_key,
-            activity_id,
-            schedule_event_id,
-            worker_identity,
-            input,
-            header,
-        );
-        Ok(None)
     }
 
     async fn complete_activity_task(
@@ -1365,7 +1340,6 @@ pub struct WorkflowService {
     worker_task_provenance: Arc<dyn WorkerTaskProvenanceStore>,
     batch_store: Arc<BatchOperationStore>,
     workflow_rules: WorkflowRuleStore,
-    eager_dispatch_config: EagerDispatchConfig,
     task_queue_rate_limiter: TaskQueueRateLimiter,
 }
 
@@ -1472,19 +1446,6 @@ fn validate_nexus_completed_response_failure_details(
 impl std::fmt::Debug for WorkflowService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkflowService").finish_non_exhaustive()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EagerDispatchConfig {
-    pub max_eager_activity_tasks_per_response: usize,
-}
-
-impl Default for EagerDispatchConfig {
-    fn default() -> Self {
-        Self {
-            max_eager_activity_tasks_per_response: 3,
-        }
     }
 }
 
@@ -1917,17 +1878,8 @@ impl WorkflowService {
             worker_task_provenance: Arc::new(tokeira_storage::InMemoryStore::default()),
             batch_store,
             workflow_rules,
-            eager_dispatch_config: EagerDispatchConfig::default(),
             task_queue_rate_limiter: TaskQueueRateLimiter::default(),
         }
-    }
-
-    pub fn with_eager_dispatch_config(
-        mut self,
-        eager_dispatch_config: EagerDispatchConfig,
-    ) -> Self {
-        self.eager_dispatch_config = eager_dispatch_config;
-        self
     }
 
     /// Attach the edge-owned waiters used by caller-facing Nexus HTTP dispatch.
@@ -4613,7 +4565,8 @@ impl WorkflowService {
                         let mut response = from_internal::start_response(
                             &internal,
                             WorkflowMutationOutcome {
-                                scheduled_activity_event_ids: BTreeMap::new(),
+                                completion: None,
+
                                 transition_seq: mutation_metadata.transition_seq.0,
                                 last_event_id: mutation_metadata.last_event_id,
                                 was_duplicate: false,
@@ -5345,12 +5298,16 @@ impl WorkflowService {
                     });
                 }
 
-                let eager_activity_specs = collect_eager_activity_specs(
-                    &req.commands,
-                    self.eager_dispatch_config
-                        .max_eager_activity_tasks_per_response,
-                );
-                let eager_activity_namespace = if eager_activity_specs.is_empty() {
+                let requests_eager_activity = req.commands.iter().any(|command| {
+                    matches!(
+                        command.semantic_command(),
+                        tokeira_kernel::WorkflowCommand::ScheduleActivity {
+                            request_eager_execution: true,
+                            ..
+                        }
+                    )
+                });
+                let eager_activity_namespace = if !requests_eager_activity {
                     None
                 } else if let Some(namespace) = context.namespace.as_ref() {
                     Some(namespace.name.clone())
@@ -5373,15 +5330,11 @@ impl WorkflowService {
                             .name,
                     )
                 };
-                let completion_identity = req.identity.clone();
-                let saved_task_token = req.task_token.clone();
-                let wants_eager_return = req.return_new_workflow_task;
 
                 let internal = to_internal::workflow_task_completed_request(req, &context, self.clock().now())
                     .map_err(EdgeError::from)?;
                 let run_key = internal.token.run_key;
-                let speculative_token_started_event_id = internal.token.started_event_id;
-                let outcome = self
+                let mut outcome = self
                     .runtime
                     .complete_workflow_task(internal)
                     .await
@@ -5394,204 +5347,98 @@ impl WorkflowService {
                 self.notify_history_run_key(run_key, outcome.last_event_id)
                     .await;
 
-                let scheduled_activity_event_ids = outcome.scheduled_activity_event_ids.clone();
+                let details = outcome.completion.take();
                 let mut resp = from_internal::completed_response(outcome);
-                // Speculative DROP (spec speculative-wft E2): the completion
-                // committed but persisted nothing for this task — its virtual
-                // started id sits beyond the run's last event. The SDK rewinds
-                // to the last completed WFT's started event
-                // (respondworkflowtaskcompleted/api.go:770 @ v1.31.0).
-                if resp.last_event_id < speculative_token_started_event_id
-                    && let tokeira_kernel::LoadedRun::Existing(state) =
-                        self.repo.load_run(run_key).await.map_err(EdgeError::from)?
-                {
-                    resp.reset_history_event_id = state.previous_started_event_id;
+                if let Some(details) = &details {
+                    resp.reset_history_event_id = details.reset_history_event_id;
                 }
 
-                if let Some(workflow_namespace) = eager_activity_namespace.as_deref() {
-                    for eager in eager_activity_specs {
-                        let Some(&schedule_event_id) = scheduled_activity_event_ids.get(&eager.activity_id) else {
+                if let (Some(workflow_namespace), Some(details)) =
+                    (eager_activity_namespace.as_deref(), details.as_ref())
+                {
+                    let preflight =
+                        crate::grpc::activity_dispatch::ActivityResponsePreflight::new(
+                            context.clone(),
+                            workflow_namespace.to_owned(),
+                            namespace_id,
+                        );
+                    for started in &details.activity_tasks {
+                        // A reply failure cannot undo a committed start. Withhold
+                        // only this task and let its authoritative deadlines recover it.
+                        let Ok(task) = from_internal::poll_activity_response(
+                            started.clone(),
+                            namespace_id,
+                            workflow_namespace,
+                        ) else {
                             continue;
                         };
-                        let queue = tokeira_types::QueueKey {
-                            namespace_id,
-                            task_queue: eager.task_queue,
-                            task_kind: TaskKind::Activity,
-                            deployment: eager.deployment,
-                            build_id: eager.build_id,
-                        };
-                        let prospective_origin = tokeira_types::WorkerTaskOrigin::from_queue_key(
-                            &queue,
-                            queue.task_queue.clone(),
-                            tokeira_types::WorkerTaskClass::Activity,
-                        );
-                        if !scoped_worker_allows_task_origin(
-                            &context,
-                            Action::PollActivityTaskQueue,
-                            &prospective_origin,
-                        ) {
+                        if tokeira_runtime::ActivityStartResponsePreflight::validate(
+                            preflight.as_ref(),
+                            started,
+                        )
+                        .is_err()
+                        {
                             continue;
                         }
-                        if let Some(started) = tokeira_runtime::scope_activity_start_response(
-                            crate::grpc::activity_dispatch::ActivityResponsePreflight::new(context.clone(), workflow_namespace.to_owned(), namespace_id),
-                            self.runtime.try_claim_activity_task(
-                                queue,
-                                run_key,
-                                eager.activity_id,
-                                schedule_event_id,
-                                WorkerIdentity(completion_identity.clone()),
-                                eager.input,
-                                eager.header,
-                            )).await
-                            .map_err(EdgeError::from)?
+                        let Ok(deadline) = activity_task_deadline(started) else {
+                            continue;
+                        };
+                        if self
+                            .register_optional_scoped_task_provenance(
+                                &context,
+                                Action::PollActivityTaskQueue,
+                                &task.task_token,
+                                &started.origin,
+                                deadline,
+                            )
+                            .await
                         {
-                            let task = from_internal::poll_activity_response(
-                                started.clone(),
-                                namespace_id,
-                                workflow_namespace,
-                            )?;
-                            if self
-                                .register_optional_scoped_task_provenance(
-                                    &context,
-                                    Action::PollActivityTaskQueue,
-                                    &task.task_token,
-                                    &started.origin,
-                                    activity_task_deadline(&started)?,
-                                )
-                                .await
-                            {
-                                resp.activity_tasks.push(task);
-                            }
+                            resp.activity_tasks.push(task);
                         }
                     }
                 }
 
-                if resp.execution_status.is_open()
-                    && (wants_eager_return || self.buffered_queries.has_buffered(run_key))
-                {
-                    let (token, _) = crate::task_token::decode::<
-                        tokeira_types::WorkflowTaskToken,
-                    >(&saved_task_token)
-                    .map_err(EdgeError::from)?;
-                    let loaded = self
-                        .repo
-                        .load_run(token.run_key)
+                if let Some(details) = details {
+                    if let Some(started) = details.workflow_task {
+                        let mut workflow_task = from_internal::poll_response(
+                            started.clone(),
+                            self.repo.as_ref(),
+                            namespace_id,
+                        )
                         .await
                         .map_err(EdgeError::from)?;
-                    if let tokeira_kernel::LoadedRun::Existing(state) = loaded {
-                        if wants_eager_return && state.pending_workflow_task.is_some() {
-                            // The kernel authors the sticky destination, but
-                            // the disposable publisher may immediately fall
-                            // back to normal when no sticky long poll exists.
-                            // Eager return itself is the eligible worker path,
-                            // so claim through both aliases just as a sticky
-                            // poll does (`service/history/api/
-                            // respondworkflowtaskcompleted/api.go:745-766 @ v1.31.0`).
-                            let sticky_dispatched =
-                                state.pending_workflow_task.as_ref().is_some_and(|pending| {
-                                    pending.schedule_to_start_deadline.is_some()
-                                });
-                            let task_queue = state
-                                .sticky
-                                .as_ref()
-                                .filter(|sticky| {
-                                    sticky_dispatched && !sticky.sticky_queue.0.is_empty()
-                                })
-                                .map(|sticky| sticky.sticky_queue.clone())
-                                .unwrap_or_else(|| state.task_queue.clone());
-                            let queue = tokeira_types::QueueKey {
-                                namespace_id: state.namespace_id,
-                                task_queue,
-                                task_kind: TaskKind::Workflow,
-                                deployment: state.deployment.clone(),
-                                build_id: state.build_id.clone(),
-                            };
-                            let normal_queue = (queue.task_queue != state.task_queue).then(|| {
-                                tokeira_types::QueueKey {
-                                    task_queue: state.task_queue.clone(),
-                                    ..queue.clone()
-                                }
-                            });
-                            let prospective_origin =
-                                tokeira_types::WorkerTaskOrigin::from_queue_key(
-                                    &queue,
-                                    state.task_queue.clone(),
-                                    tokeira_types::WorkerTaskClass::Workflow,
-                                );
-                            if !scoped_worker_allows_task_origin(
+                        // Completion update processing precedes decoration. Inline
+                        // tasks carry incremental history even without a sticky poll
+                        // (respondworkflowtaskcompleted/api.go:747-764 @ v1.31.0).
+                        self.decorate_workflow_task_response(&started, &mut workflow_task)
+                            .await?;
+                        let deadline_message =
+                            "Workflow Task deadline exceeds the supported time range.";
+                        let expires_at = started
+                            .started_time
+                            .checked_add(started.workflow_task_timeout)
+                            .ok_or_else(|| EdgeError::Internal(deadline_message.to_owned()))?;
+                        if self
+                            .register_optional_scoped_task_provenance(
                                 &context,
                                 Action::PollWorkflowTaskQueue,
-                                &prospective_origin,
-                            ) {
-                                return Ok(resp);
-                            }
-                            if let Some(mut started) = self
-                                .runtime
-                                .try_claim_workflow_task(
-                                    queue,
-                                    normal_queue,
-                                    run_key,
-                                    WorkerIdentity(completion_identity.clone()),
-                                )
-                                .await
-                                .map_err(EdgeError::from)?
-                            {
-                                // A new WFT returned inline from RespondWorkflowTaskCompleted is
-                                // delivered to the same worker and carries incremental history from
-                                // the previous started event — v1.31.0 treats it as sticky
-                                // (respondworkflowtaskcompleted/api.go:759-760), so the SDK receives
-                                // only the events after PreviousStartedEventId rather than the full
-                                // history.
-                                started.is_sticky_match = true;
-                                let mut workflow_task = from_internal::poll_response(
-                                    started.clone(),
-                                    self.repo.as_ref(),
-                                    state.namespace_id,
-                                )
-                                .await
-                                .map_err(EdgeError::from)?;
-                                self.decorate_workflow_task_response(&started, &mut workflow_task)
-                                    .await?;
-                                let expires_at = started
-                                    .started_time
-                                    .checked_add(started.workflow_task_timeout)
-                                    .ok_or_else(|| {
-                                        EdgeError::Internal(
-                                            "Workflow Task deadline exceeds the supported time range."
-                                                .to_owned(),
-                                        )
-                                    })?;
-                                if self
-                                    .register_optional_scoped_task_provenance(
-                                        &context,
-                                        Action::PollWorkflowTaskQueue,
-                                        &workflow_task.task_token,
-                                        &started.origin,
-                                        expires_at,
-                                    )
-                                    .await
-                                {
-                                    resp.workflow_task = Some(workflow_task);
-                                }
-                            }
-                        } else if state.pending_workflow_task.is_none() {
-                            // The completing WFT created no follow-up task:
-                            // remaining buffered queries are UNBLOCKED and
-                            // dispatch directly through the broker as
-                            // standalone query tasks — v1.31.0 does the same
-                            // regardless of ReturnNewWorkflowTask
-                            // (QueryCompletionTypeUnblocked,
-                            // respondworkflowtaskcompleted/api.go:1010-1029 +
-                            // queryworkflow/api.go:242-260). The old inline
-                            // "eager query WFT" (empty history, no legacy
-                            // query field) was a shape v1.31.0 never emits
-                            // and crashed SDK workers without a cache entry.
-                            self.dispatch_queries_direct(
-                                state.run_key,
-                                &state,
-                                state.last_event_id,
+                                &workflow_task.task_token,
+                                &started.origin,
+                                expires_at,
                             )
-                            .await;
+                            .await
+                        {
+                            resp.workflow_task = Some(workflow_task);
+                        }
+                        // A withheld reply remains started. Only its timeout may
+                        // make it pollable again; never republish on evidence failure.
+                    } else if let Some(state) = details.quiescent_state {
+                        // QueryCompletionTypeUnblocked applies only when no new
+                        // task exists, including an inline task whose reply was lost
+                        // (respondworkflowtaskcompleted/api.go:731,1010-1029 @ v1.31.0).
+                        if self.buffered_queries.has_buffered(run_key) {
+                            self.dispatch_queries_direct(run_key, &state, state.last_event_id)
+                                .await;
                         }
                     }
                 }
@@ -9828,49 +9675,6 @@ fn is_internal_nexus_task_queue(task_queue: &str) -> bool {
     task_queue.starts_with("/temporal-sys/")
 }
 
-/// What an eager start needs from a ScheduleActivity command that asks for one:
-/// where the activity's task waits, and the input and header the command records
-/// in the activity's ActivityTaskScheduled event, which the start answers with.
-#[derive(Clone, Debug, PartialEq)]
-struct EagerActivity {
-    activity_id: String,
-    task_queue: TaskQueueName,
-    deployment: Option<DeploymentId>,
-    build_id: Option<BuildId>,
-    input: Payloads,
-    header: Option<Headers>,
-}
-
-fn collect_eager_activity_specs(
-    commands: &[tokeira_kernel::WorkflowCommand],
-    limit: usize,
-) -> Vec<EagerActivity> {
-    commands
-        .iter()
-        .filter_map(|command| match command {
-            tokeira_kernel::WorkflowCommand::ScheduleActivity {
-                activity_id,
-                task_queue,
-                deployment,
-                build_id,
-                input,
-                header,
-                request_eager_execution: true,
-                ..
-            } => Some(EagerActivity {
-                activity_id: activity_id.clone(),
-                task_queue: task_queue.clone(),
-                deployment: deployment.clone(),
-                build_id: build_id.clone(),
-                input: input.clone(),
-                header: header.clone(),
-            }),
-            _ => None,
-        })
-        .take(limit)
-        .collect()
-}
-
 fn cross_namespace_authorization_targets(
     source_namespace: &str,
     commands: &[tokeira_kernel::WorkflowCommand],
@@ -10057,13 +9861,13 @@ mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
     use super::{
-        EagerActivity, EmptyVisibilityApi, ExecutionResolver, WorkflowService,
+        EmptyVisibilityApi, ExecutionResolver, WorkflowService,
         activity_offer_requires_rule_evaluation, apply_matrix_capability_field,
-        build_update_activity_options_command, collect_eager_activity_specs,
-        cross_namespace_authorization_targets, resolve_build_id_reset_point,
-        scoped_worker_allows_completion_targets, scoped_worker_allows_task_origin,
-        system_capabilities_with_matrix_overlay, worker_identity_from_request,
-        worker_rate_limit_when_api_unset, workflow_rule_crud_admitted,
+        build_update_activity_options_command, cross_namespace_authorization_targets,
+        resolve_build_id_reset_point, scoped_worker_allows_completion_targets,
+        scoped_worker_allows_task_origin, system_capabilities_with_matrix_overlay,
+        worker_identity_from_request, worker_rate_limit_when_api_unset,
+        workflow_rule_crud_admitted,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -10301,11 +10105,6 @@ mod tests {
         );
     }
 
-    fn arb_small_string() -> impl Strategy<Value = String> {
-        prop::collection::vec(prop::char::range('a', 'z'), 1..8)
-            .prop_map(|chars| chars.into_iter().collect())
-    }
-
     #[test]
     fn namespace_state_update_matches_v1_31_0_rules() {
         use super::validate_namespace_state_update;
@@ -10475,33 +10274,6 @@ mod tests {
         }
     }
 
-    fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
-        prop_oneof![
-            (arb_small_string(), arb_small_string(), any::<bool>(),).prop_map(
-                |(activity_id, task_queue, request_eager_execution)| {
-                    WorkflowCommand::ScheduleActivity {
-                        activity_id,
-                        activity_type: "activity-type".into(),
-                        task_queue: TaskQueueName(task_queue),
-                        input: Payloads::default(),
-                        header: None,
-                        request_eager_execution,
-                        retry_policy: None,
-                        deployment: None,
-                        build_id: None,
-                        schedule_to_close_timeout: None,
-                        schedule_to_start_timeout: None,
-                        start_to_close_timeout: None,
-                        heartbeat_timeout: None,
-                        priority: None,
-                    }
-                }
-            ),
-            arb_small_string().prop_map(|timer_id| WorkflowCommand::CancelTimer { timer_id }),
-            Just(WorkflowCommand::CancelWorkflow { details: None }),
-        ]
-    }
-
     fn baseline_capabilities() -> SystemCapabilities {
         SystemCapabilities {
             signal_and_query_header: true,
@@ -10564,6 +10336,79 @@ mod tests {
     }
 
     struct UnavailableProvenanceStore;
+
+    struct RefuseNewProvenanceStore(Arc<dyn WorkerTaskProvenanceStore>);
+
+    #[async_trait]
+    impl WorkerTaskProvenanceStore for RefuseNewProvenanceStore {
+        async fn put(
+            &self,
+            _record: WorkerTaskProvenance,
+        ) -> Result<ProvenancePut, WorkerTaskProvenanceError> {
+            Err(WorkerTaskProvenanceError::Unavailable {
+                message: "fixture unavailable".into(),
+            })
+        }
+
+        async fn get(
+            &self,
+            token_digest: [u8; 32],
+        ) -> Result<Option<WorkerTaskProvenance>, WorkerTaskProvenanceError> {
+            self.0.get(token_digest).await
+        }
+
+        async fn delete(&self, token_digest: [u8; 32]) -> Result<(), WorkerTaskProvenanceError> {
+            self.0.delete(token_digest).await
+        }
+
+        async fn delete_expired(
+            &self,
+            now: OffsetDateTime,
+            limit: usize,
+        ) -> Result<usize, WorkerTaskProvenanceError> {
+            self.0.delete_expired(now, limit).await
+        }
+    }
+
+    struct RefuseFirstProvenanceStore(
+        Arc<dyn WorkerTaskProvenanceStore>,
+        std::sync::atomic::AtomicBool,
+    );
+
+    #[async_trait]
+    impl WorkerTaskProvenanceStore for RefuseFirstProvenanceStore {
+        async fn put(
+            &self,
+            record: WorkerTaskProvenance,
+        ) -> Result<ProvenancePut, WorkerTaskProvenanceError> {
+            if self.1.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                Err(WorkerTaskProvenanceError::Unavailable {
+                    message: "fixture unavailable".into(),
+                })
+            } else {
+                self.0.put(record).await
+            }
+        }
+
+        async fn get(
+            &self,
+            token_digest: [u8; 32],
+        ) -> Result<Option<WorkerTaskProvenance>, WorkerTaskProvenanceError> {
+            self.0.get(token_digest).await
+        }
+
+        async fn delete(&self, token_digest: [u8; 32]) -> Result<(), WorkerTaskProvenanceError> {
+            self.0.delete(token_digest).await
+        }
+
+        async fn delete_expired(
+            &self,
+            now: OffsetDateTime,
+            limit: usize,
+        ) -> Result<usize, WorkerTaskProvenanceError> {
+            self.0.delete_expired(now, limit).await
+        }
+    }
 
     #[async_trait]
     impl WorkerTaskProvenanceStore for UnavailableProvenanceStore {
@@ -10849,6 +10694,7 @@ mod tests {
             resource_id: String::new(),
             worker_instance_key: "worker-instance-a".to_owned(),
             worker_control_task_queue: "worker-control-a".to_owned(),
+            wire_completion_empty: commands.is_empty(),
             commands,
             command_sizes: Vec::new(),
             return_new_workflow_task: false,
@@ -10856,6 +10702,938 @@ mod tests {
             query_results: std::collections::HashMap::new(),
             messages: Vec::new(),
         }
+    }
+
+    fn enable_eager_override() -> Result<()> {
+        tokeira_runtime::conformance::install(tokeira_runtime::conformance::OverrideReads {
+            read_bool: |key| tokeira_conformance::overrides().get_bool(key),
+            read_i64: |_| None,
+            read_f64: |_| None,
+            read_duration: |_| None,
+            read_scope_generation: || tokeira_conformance::overrides().scope_generation(),
+        });
+        tokeira_conformance::overrides().set(
+            "system.enableActivityEagerExecution",
+            tokeira_conformance::OverrideValue::Bool(true),
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_paused_completion_is_refused_without_commit() -> Result<()> {
+        let (service, runtime, namespace_id, _, _) = update_test_service().await?;
+        let first = runtime
+            .poll_workflow_task(
+                tokeira_types::QueueKey {
+                    namespace_id,
+                    task_queue: TaskQueueName("queue-a".into()),
+                    task_kind: TaskKind::Workflow,
+                    deployment: None,
+                    build_id: None,
+                },
+                WorkerIdentity("worker-a".into()),
+                std::time::Duration::from_secs(1),
+            )
+            .await?
+            .unwrap();
+        runtime
+            .submit(
+                first.run_key,
+                tokeira_kernel::Command::PauseWorkflow(tokeira_kernel::PauseWorkflowRequest {
+                    identity: "operator".into(),
+                    reason: "pause".into(),
+                    request: RequestContext::unattributed(first.started_time),
+                    now: first.started_time,
+                }),
+            )
+            .await?;
+        let before = service.repo.load_run(first.run_key).await?;
+        let history = service.repo.read_history_to_end(first.run_key, 0).await?;
+        let mut request = scoped_workflow_completion(
+            crate::task_token::encode(first.token, namespace_id)?,
+            Vec::new(),
+        );
+        request.namespace = "default".into();
+        request.force_create_new_workflow_task = true;
+        let status = tonic::Status::from(
+            service
+                .respond_workflow_task_completed(&HeaderMap::new(), request)
+                .await
+                .expect_err("paused"),
+        );
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            status.message(),
+            "Workflow is paused and force create new workflow task is not allowed."
+        );
+        assert_eq!(service.repo.load_run(first.run_key).await?, before);
+        assert_eq!(
+            service.repo.read_history_to_end(first.run_key, 0).await?,
+            history
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_timeout_keeps_queries_buffered_and_updates_unsent() -> Result<()> {
+        let (mut service, runtime, namespace_id, workflow_id, run_id) =
+            update_test_service().await?;
+        let first = runtime
+            .poll_workflow_task(
+                tokeira_types::QueueKey {
+                    namespace_id,
+                    task_queue: TaskQueueName("queue-a".into()),
+                    task_kind: TaskKind::Workflow,
+                    deployment: None,
+                    build_id: None,
+                },
+                WorkerIdentity("worker-a".into()),
+                std::time::Duration::from_secs(1),
+            )
+            .await?
+            .unwrap();
+        runtime
+            .update_workflow(
+                ExecutionRef {
+                    namespace_id,
+                    workflow_id,
+                    run_id: Some(run_id),
+                },
+                "not-sent".into(),
+                "handler".into(),
+                Payloads::default(),
+                RequestContext {
+                    request_id: RequestId("admit-not-sent".into()),
+                    ..RequestContext::unattributed(first.scheduled_time)
+                },
+                Duration::seconds(1),
+                UpdateWaitPolicy::Admitted,
+                0,
+            )
+            .await?;
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        service
+            .buffered_queries
+            .buffer(
+                first.run_key,
+                tokeira_runtime::BufferedQuery {
+                    query_id: "waiting".into(),
+                    query_type: "read".into(),
+                    query_args: Payloads::default(),
+                    required_barrier: 0,
+                    enqueued_at: std::time::Instant::now(),
+                    deadline: first.scheduled_time + Duration::hours(1),
+                    response_tx: tx,
+                },
+            )
+            .expect("buffer");
+        let mut adapter = RuntimeAdapter::new(runtime.clone());
+        adapter.completion_now = Some(first.scheduled_time + Duration::minutes(31));
+        service.runtime = Arc::new(adapter);
+        let mut request = scoped_workflow_completion(
+            crate::task_token::encode(first.token, namespace_id)?,
+            Vec::new(),
+        );
+        request.namespace = "default".into();
+        request.return_new_workflow_task = true;
+        request.force_create_new_workflow_task = true;
+        let error = service
+            .respond_workflow_task_completed(&HeaderMap::new(), request)
+            .await
+            .expect_err("heartbeat timeout");
+        assert_eq!(
+            tonic::Status::from(error).message(),
+            "workflow task heartbeat timeout"
+        );
+        assert!(service.buffered_queries.has_buffered(first.run_key));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            runtime
+                .pending_update_transports(first.run_key, false)
+                .iter()
+                .map(|update| update.update_id.as_str())
+                .collect::<Vec<_>>(),
+            ["not-sent"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_limit_with_request_sticky() -> Result<()> {
+        heartbeat_limit_chain(true).await
+    }
+
+    #[tokio::test]
+    async fn heartbeat_limit_without_request_sticky() -> Result<()> {
+        heartbeat_limit_chain(false).await
+    }
+
+    async fn heartbeat_limit_chain(request_sticky: bool) -> Result<()> {
+        let (mut service, runtime, namespace_id, _, _) = update_test_service().await?;
+        let queue = tokeira_types::QueueKey {
+            namespace_id,
+            task_queue: TaskQueueName("queue-a".into()),
+            task_kind: TaskKind::Workflow,
+            deployment: None,
+            build_id: None,
+        };
+        let first = runtime
+            .poll_workflow_task(
+                queue.clone(),
+                WorkerIdentity("worker-a".into()),
+                std::time::Duration::from_secs(1),
+            )
+            .await?
+            .unwrap();
+        let original = first.scheduled_time;
+        let mut token = crate::task_token::encode(first.token.clone(), namespace_id)?;
+        for step in 1..=226 {
+            let now = original + Duration::seconds(step * 8);
+            let mut adapter = RuntimeAdapter::new(runtime.clone());
+            adapter.completion_now = Some(now);
+            service.runtime = Arc::new(adapter);
+            let mut req = scoped_workflow_completion(token.clone(), Vec::new());
+            req.namespace = "default".into();
+            req.return_new_workflow_task = true;
+            req.force_create_new_workflow_task = true;
+            if step < 226 || request_sticky {
+                req.sticky = Some(tokeira_kernel::StickySpec {
+                    queue: TaskQueueName("heartbeat-cache".into()),
+                    schedule_to_start_timeout: Duration::seconds(5),
+                });
+            }
+            let before = service.repo.read_history_to_end(first.run_key, 0).await?;
+            let response = service
+                .respond_workflow_task_completed(&HeaderMap::new(), req)
+                .await;
+            if step < 226 {
+                token = response?
+                    .workflow_task
+                    .expect("heartbeat successor")
+                    .task_token;
+                continue;
+            }
+            let error = response.expect_err("heartbeat-only chain past 30 minutes must time out");
+            let status = tonic::Status::from(error);
+            assert_eq!(status.code(), tonic::Code::NotFound);
+            assert_eq!(status.message(), "workflow task heartbeat timeout");
+            let tokeira_kernel::LoadedRun::Existing(state) =
+                service.repo.load_run(first.run_key).await?
+            else {
+                panic!("run")
+            };
+            let pending = state.pending_workflow_task.as_ref().unwrap();
+            assert_eq!(state.sticky.is_some(), request_sticky);
+            let history = service.repo.read_history_to_end(first.run_key, 0).await?;
+            let tail = &history[before.len()..];
+            assert_eq!(tail.len(), 3);
+            assert!(matches!(
+                tail[0].kind,
+                tokeira_kernel::HistoryEventKind::WorkflowTaskTimedOut { .. }
+            ));
+            assert!(matches!(
+                tail[1].kind,
+                tokeira_kernel::HistoryEventKind::WorkflowTaskScheduled { .. }
+            ));
+            assert!(matches!(
+                tail[2].kind,
+                tokeira_kernel::HistoryEventKind::WorkflowTaskStarted { .. }
+            ));
+            runtime
+                .submit(
+                    first.run_key,
+                    tokeira_kernel::Command::WorkflowTaskTimedOut(
+                        tokeira_kernel::WorkflowTaskTimedOutRequest {
+                            logical_seq: pending.logical_seq,
+                            started_event_id: pending.started_event_id.unwrap(),
+                            timeout_type: tokeira_kernel::WorkflowTaskTimeoutType::StartToClose,
+                            now: now + state.workflow_task_timeout + Duration::nanoseconds(1),
+                        },
+                    ),
+                )
+                .await?;
+            let history = service.repo.read_history_to_end(first.run_key, 0).await?;
+            assert!(matches!(
+                history[before.len() + 3].kind,
+                tokeira_kernel::HistoryEventKind::WorkflowTaskTimedOut { .. }
+            ));
+            let next = runtime
+                .poll_workflow_task(
+                    queue.clone(),
+                    WorkerIdentity("worker-b".into()),
+                    std::time::Duration::from_secs(1),
+                )
+                .await?
+                .expect("normal-queue retry");
+            assert_eq!(next.token.attempt, if request_sticky { 1 } else { 2 });
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completion_eager_activity_excludes_waiting_poll() -> Result<()> {
+        enable_eager_override()?;
+        let (mut service, runtime, namespace_id, _, _) = update_test_service().await?;
+        let mut queue = tokeira_types::QueueKey {
+            namespace_id,
+            task_queue: TaskQueueName("queue-a".into()),
+            task_kind: TaskKind::Workflow,
+            deployment: None,
+            build_id: None,
+        };
+        let first = runtime
+            .poll_workflow_task(
+                queue.clone(),
+                WorkerIdentity("worker-a".into()),
+                std::time::Duration::from_secs(1),
+            )
+            .await?
+            .expect("first task");
+        let tokeira_kernel::LoadedRun::Existing(before) =
+            service.repo.load_run(first.run_key).await?
+        else {
+            panic!("run")
+        };
+        queue.task_kind = TaskKind::Activity;
+        let committed = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut adapter = RuntimeAdapter::new(runtime.clone());
+        adapter.completion_barrier = Some((committed.clone(), release.clone()));
+        service.runtime = Arc::new(adapter);
+        let poll_runtime = runtime.clone();
+        let poll_queue = queue.clone();
+        let poll = tokio::spawn(async move {
+            poll_runtime
+                .poll_activity_task(
+                    poll_queue,
+                    WorkerIdentity("worker-b".into()),
+                    std::time::Duration::from_secs(60),
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !runtime
+                .activity_broker()
+                .queues_with_waiters()
+                .await
+                .contains(&queue)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let commands = [true, false]
+            .into_iter()
+            .map(|eager| WorkflowCommand::ScheduleActivity {
+                activity_id: if eager { "eager" } else { "ordinary" }.into(),
+                activity_type: "activity-type".into(),
+                task_queue: queue.task_queue.clone(),
+                input: Payloads::default(),
+                header: None,
+                request_eager_execution: eager,
+                use_workflow_build_id: false,
+                retry_policy: None,
+                deployment: None,
+                build_id: None,
+                schedule_to_close_timeout: Some(Duration::minutes(5)),
+                schedule_to_start_timeout: None,
+                start_to_close_timeout: Some(Duration::minutes(1)),
+                heartbeat_timeout: None,
+                priority: None,
+            })
+            .collect();
+        let mut request = scoped_workflow_completion(
+            crate::task_token::encode(first.token.clone(), namespace_id)?,
+            commands,
+        );
+        request.namespace = "default".into();
+        let repo = service.repo.clone();
+        let completing = tokio::spawn(async move {
+            service
+                .respond_workflow_task_completed(&HeaderMap::new(), request)
+                .await
+        });
+        committed.notified().await;
+        let polled = tokio::time::timeout(std::time::Duration::from_secs(5), poll)
+            .await???
+            .expect("ordinary control reaches poll");
+        release.notify_one();
+        let response = completing.await??;
+        assert_eq!(
+            response.activity_tasks.len(),
+            1,
+            "completion lost eager activity to poll: {}",
+            polled.activity_id
+        );
+        assert_eq!(polled.activity_id, "ordinary");
+        let tokeira_kernel::LoadedRun::Existing(after) = repo.load_run(first.run_key).await? else {
+            panic!("run")
+        };
+        assert_eq!(
+            after.transition_seq.0,
+            before.transition_seq.0 + 2,
+            "one completion commit and one ordinary start"
+        );
+        assert_eq!(
+            after.activities["eager"].started_identity,
+            Some(WorkerIdentity("worker-a".into()))
+        );
+        assert_eq!(after.activities["eager"].stamp, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completion_inline_ordinary_excludes_waiting_normal_poll() -> Result<()> {
+        completion_inline_race(false, true).await
+    }
+
+    #[tokio::test]
+    async fn completion_inline_heartbeat_excludes_waiting_normal_poll() -> Result<()> {
+        completion_inline_race(true, true).await
+    }
+
+    #[tokio::test]
+    async fn completion_without_inline_delivers_to_waiting_normal_poll() -> Result<()> {
+        completion_inline_race(true, false).await
+    }
+
+    async fn completion_inline_race(heartbeat: bool, return_new: bool) -> Result<()> {
+        let (mut service, runtime, namespace_id, workflow_id, run_id) =
+            update_test_service().await?;
+        let queue = tokeira_types::QueueKey {
+            namespace_id,
+            task_queue: TaskQueueName("queue-a".into()),
+            task_kind: TaskKind::Workflow,
+            deployment: None,
+            build_id: None,
+        };
+        let first = runtime
+            .poll_workflow_task(
+                queue.clone(),
+                WorkerIdentity("worker-a".into()),
+                std::time::Duration::from_secs(1),
+            )
+            .await?
+            .expect("first task");
+        if !heartbeat {
+            runtime
+                .signal_workflow(
+                    ExecutionRef {
+                        namespace_id,
+                        workflow_id,
+                        run_id: Some(run_id),
+                    },
+                    tokeira_kernel::SignalRequest {
+                        signal_name: "during-task".into(),
+                        input: Payloads::default(),
+                        header: None,
+                        links: Vec::new(),
+                        request: RequestContext::unattributed(OffsetDateTime::now_utc()),
+                        now: OffsetDateTime::now_utc(),
+                    },
+                )
+                .await?;
+        }
+        let tokeira_kernel::LoadedRun::Existing(before) =
+            service.repo.load_run(first.run_key).await?
+        else {
+            panic!("run");
+        };
+        let committed = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut adapter = RuntimeAdapter::new(runtime.clone());
+        adapter.completion_barrier = Some((committed.clone(), release.clone()));
+        service.runtime = Arc::new(adapter);
+        let poll_runtime = runtime.clone();
+        let poll_queue = queue.clone();
+        let poll = tokio::spawn(async move {
+            poll_runtime
+                .poll_workflow_task(
+                    poll_queue,
+                    WorkerIdentity("worker-b".into()),
+                    std::time::Duration::from_secs(60),
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !runtime
+                .broker()
+                .queues_with_waiters()
+                .await
+                .contains(&queue)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let mut request = scoped_workflow_completion(
+            crate::task_token::encode(first.token.clone(), namespace_id)?,
+            Vec::new(),
+        );
+        request.namespace = "default".into();
+        request.return_new_workflow_task = return_new;
+        request.force_create_new_workflow_task = heartbeat;
+        request.sticky = Some(tokeira_kernel::StickySpec {
+            queue: TaskQueueName("sticky-a".into()),
+            schedule_to_start_timeout: Duration::seconds(5),
+        });
+        let repo = service.repo.clone();
+        let completing = tokio::spawn(async move {
+            service
+                .respond_workflow_task_completed(&HeaderMap::new(), request)
+                .await
+        });
+        committed.notified().await;
+        let tokeira_kernel::LoadedRun::Existing(after) = repo.load_run(first.run_key).await? else {
+            panic!("run");
+        };
+        let atomic_start = after.transition_seq.0 == before.transition_seq.0 + 1
+            && after
+                .pending_workflow_task
+                .as_ref()
+                .is_some_and(|pending| pending.started_event_id.is_some());
+        let competing_task = if atomic_start {
+            assert!(!poll.is_finished(), "B received completion-owned work");
+            poll.abort();
+            None
+        } else {
+            tokio::time::timeout(std::time::Duration::from_secs(5), poll)
+                .await???
+                .map(|task| task.token)
+        };
+        release.notify_one();
+        let response = completing.await??;
+        assert_eq!(
+            response.workflow_task.is_some(),
+            return_new,
+            "A must receive its inline task; B received {competing_task:?}"
+        );
+        assert_eq!(competing_task.is_none(), return_new);
+        if return_new {
+            assert!(atomic_start, "completion must be the only start commit");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completion_inline_decorates_new_updates_without_releasing_buffered_queries()
+    -> Result<()> {
+        let (mut service, runtime, namespace_id, workflow_id, run_id) =
+            update_test_service().await?;
+        let queue = tokeira_types::QueueKey {
+            namespace_id,
+            task_queue: TaskQueueName("queue-a".into()),
+            task_kind: TaskKind::Workflow,
+            deployment: None,
+            build_id: None,
+        };
+        let first = runtime
+            .poll_workflow_task(
+                queue,
+                WorkerIdentity("worker-a".into()),
+                std::time::Duration::from_secs(1),
+            )
+            .await?
+            .expect("first");
+        let execution = ExecutionRef {
+            namespace_id,
+            workflow_id,
+            run_id: Some(run_id),
+        };
+        runtime
+            .update_workflow(
+                execution.clone(),
+                "already-sent".into(),
+                "handler".into(),
+                Payloads::default(),
+                RequestContext {
+                    request_id: RequestId("admit-already-sent".into()),
+                    ..RequestContext::unattributed(OffsetDateTime::now_utc())
+                },
+                Duration::seconds(1),
+                UpdateWaitPolicy::Admitted,
+                0,
+            )
+            .await?;
+        assert_eq!(
+            runtime
+                .pending_update_transports(first.run_key, false)
+                .len(),
+            1
+        );
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        service
+            .buffered_queries
+            .buffer(
+                first.run_key,
+                tokeira_runtime::BufferedQuery {
+                    query_id: "waiting".into(),
+                    query_type: "read".into(),
+                    query_args: Payloads::default(),
+                    required_barrier: i64::MAX,
+                    enqueued_at: std::time::Instant::now(),
+                    deadline: OffsetDateTime::now_utc() + Duration::minutes(1),
+                    response_tx: tx,
+                },
+            )
+            .expect("buffer");
+        let mut request = scoped_workflow_completion(
+            crate::task_token::encode(first.token.clone(), namespace_id)?,
+            Vec::new(),
+        );
+        request.namespace = "default".into();
+        request.return_new_workflow_task = true;
+        request.force_create_new_workflow_task = true;
+        let committed = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut adapter = RuntimeAdapter::new(runtime.clone());
+        adapter.completion_barrier = Some((committed.clone(), release.clone()));
+        service.runtime = Arc::new(adapter);
+        let service = Arc::new(service);
+        let completing = service.clone();
+        let handle = tokio::spawn(async move {
+            completing
+                .respond_workflow_task_completed(&HeaderMap::new(), request)
+                .await
+        });
+        committed.notified().await;
+        runtime
+            .update_workflow(
+                execution,
+                "new-admission".into(),
+                "handler".into(),
+                Payloads::default(),
+                RequestContext {
+                    request_id: RequestId("admit-new-admission".into()),
+                    ..RequestContext::unattributed(OffsetDateTime::now_utc())
+                },
+                Duration::seconds(1),
+                UpdateWaitPolicy::Admitted,
+                0,
+            )
+            .await?;
+        release.notify_one();
+        let response = handle.await??;
+        let inline = response.workflow_task.expect("inline");
+        assert_eq!(
+            inline
+                .messages
+                .iter()
+                .map(|message| message.protocol_instance_id.as_str())
+                .collect::<Vec<_>>(),
+            ["new-admission"]
+        );
+        assert!(inline.queries.is_empty());
+        assert!(service.buffered_queries.has_buffered(first.run_key));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(
+            inline
+                .payload
+                .history
+                .iter()
+                .all(|event| event.event_id > first.token.started_event_id)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completion_inline_speculative_history_and_reset_pointer() -> Result<()> {
+        let (service, runtime, namespace_id, workflow_id, run_id) = update_test_service().await?;
+        let queue = tokeira_types::QueueKey {
+            namespace_id,
+            task_queue: TaskQueueName("queue-a".into()),
+            task_kind: TaskKind::Workflow,
+            deployment: None,
+            build_id: None,
+        };
+        let first = runtime
+            .poll_workflow_task(
+                queue,
+                WorkerIdentity("worker-a".into()),
+                std::time::Duration::from_secs(1),
+            )
+            .await?
+            .expect("first");
+        let execution = ExecutionRef {
+            namespace_id,
+            workflow_id,
+            run_id: Some(run_id),
+        };
+        runtime
+            .update_workflow(
+                execution,
+                "update".into(),
+                "handler".into(),
+                Payloads::default(),
+                RequestContext::unattributed(OffsetDateTime::now_utc()),
+                Duration::seconds(1),
+                UpdateWaitPolicy::Admitted,
+                0,
+            )
+            .await?;
+        let mut request = scoped_workflow_completion(
+            crate::task_token::encode(first.token.clone(), namespace_id)?,
+            Vec::new(),
+        );
+        request.namespace = "default".into();
+        request.return_new_workflow_task = true;
+        request.sticky = Some(tokeira_kernel::StickySpec {
+            queue: TaskQueueName("inline-cache".into()),
+            schedule_to_start_timeout: Duration::seconds(5),
+        });
+        let response = service
+            .respond_workflow_task_completed(&HeaderMap::new(), request)
+            .await?;
+        let inline = response.workflow_task.expect("speculative");
+        assert_eq!(inline.started_event_id, response.last_event_id + 2);
+        let scheduled = inline
+            .payload
+            .history
+            .iter()
+            .find(|event| event.event_id == inline.started_event_id - 1)
+            .expect("virtual schedule");
+        let tokeira_kernel::HistoryEventKind::WorkflowTaskScheduled { task_queue, .. } =
+            &scheduled.kind
+        else {
+            panic!("schedule");
+        };
+        assert_eq!(task_queue.0, "inline-cache");
+        assert_eq!(
+            inline
+                .payload
+                .history
+                .last()
+                .expect("virtual start")
+                .event_id,
+            inline.started_event_id
+        );
+        let mut reject = scoped_workflow_completion(
+            inline.task_token,
+            vec![WorkflowCommand::ProtocolMessage {
+                message_id: "reject".into(),
+                body: tokeira_kernel::UpdateProtocolBody::Rejected {
+                    update_id: "update".into(),
+                    failure: Payload::new(Vec::new()),
+                },
+            }],
+        );
+        reject.namespace = "default".into();
+        reject.return_new_workflow_task = true;
+        let dropped = service
+            .respond_workflow_task_completed(&HeaderMap::new(), reject)
+            .await?;
+        assert_eq!(dropped.reset_history_event_id, first.token.started_event_id);
+        assert_eq!(dropped.last_event_id, response.last_event_id);
+        assert!(dropped.workflow_task.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completion_eager_bypasses_matching_pause_rule() -> Result<()> {
+        enable_eager_override()?;
+        let (service, runtime, namespace_id, _, _) = update_test_service().await?;
+        runtime
+            .repo()
+            .create_workflow_rule(
+                namespace_id,
+                tokeira_types::WorkflowRuleRecord {
+                    id: "pause".into(),
+                    create_time: OffsetDateTime::now_utc(),
+                    created_by_identity: "test".into(),
+                    description: String::new(),
+                    trigger: tokeira_types::WorkflowRuleTrigger::ActivityStart {
+                        predicate: "ActivityType = 'work'".into(),
+                    },
+                    visibility_query: String::new(),
+                    actions: vec![tokeira_types::WorkflowRuleAction::ActivityPause],
+                    expiration_time: None,
+                },
+                10,
+            )
+            .await?;
+        let queue = tokeira_types::QueueKey {
+            namespace_id,
+            task_queue: TaskQueueName("queue-a".into()),
+            task_kind: TaskKind::Workflow,
+            deployment: None,
+            build_id: None,
+        };
+        let first = runtime
+            .poll_workflow_task(
+                queue.clone(),
+                WorkerIdentity("worker-a".into()),
+                std::time::Duration::from_secs(1),
+            )
+            .await?
+            .expect("first");
+        let command = WorkflowCommand::ScheduleActivity {
+            activity_id: "a".into(),
+            activity_type: "work".into(),
+            task_queue: queue.task_queue,
+            input: Payloads::default(),
+            header: None,
+            request_eager_execution: true,
+            use_workflow_build_id: false,
+            retry_policy: None,
+            deployment: None,
+            build_id: None,
+            schedule_to_close_timeout: None,
+            schedule_to_start_timeout: None,
+            start_to_close_timeout: Some(Duration::minutes(1)),
+            heartbeat_timeout: None,
+            priority: None,
+        };
+        let mut req = scoped_workflow_completion(
+            crate::task_token::encode(first.token.clone(), namespace_id)?,
+            vec![command],
+        );
+        req.namespace = "default".into();
+        let response = service
+            .respond_workflow_task_completed(&HeaderMap::new(), req)
+            .await?;
+        assert_eq!(
+            response.activity_tasks.len(),
+            1,
+            "an eager first start bypasses the pause rule"
+        );
+        let tokeira_kernel::LoadedRun::Existing(state) =
+            runtime.repo().load_run(first.run_key).await?
+        else {
+            panic!("run")
+        };
+        assert!(state.activities["a"].pause_info.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completion_eager_provenance_failure_withholds_only_one_started_activity() -> Result<()>
+    {
+        enable_eager_override()?;
+        let (mut service, runtime, _, _, _) = update_test_service().await?;
+        configure_scoped_test_auth(&mut service);
+        let (run_key, _, queue) =
+            start_scoped_test_workflow(&runtime, "eager-provenance", Duration::seconds(10)).await?;
+        let first = runtime
+            .poll_workflow_task(
+                queue.clone(),
+                WorkerIdentity("worker-a".into()),
+                std::time::Duration::from_secs(1),
+            )
+            .await?
+            .expect("first");
+        let token = crate::task_token::encode(first.token.clone(), queue.namespace_id)?;
+        service
+            .register_scoped_task_provenance(
+                &scoped_edge_context(payments_worker_scope()),
+                Action::PollWorkflowTaskQueue,
+                &token,
+                &first.origin,
+                first.started_time + first.workflow_task_timeout,
+            )
+            .await?;
+        service.worker_task_provenance = Arc::new(RefuseFirstProvenanceStore(
+            service.worker_task_provenance.clone(),
+            std::sync::atomic::AtomicBool::new(true),
+        ));
+        let commands = ["withheld", "delivered"]
+            .into_iter()
+            .map(|id| WorkflowCommand::ScheduleActivity {
+                activity_id: id.into(),
+                activity_type: "work".into(),
+                task_queue: queue.task_queue.clone(),
+                input: Payloads::default(),
+                header: None,
+                request_eager_execution: true,
+                use_workflow_build_id: true,
+                retry_policy: None,
+                deployment: queue.deployment.clone(),
+                build_id: queue.build_id.clone(),
+                schedule_to_close_timeout: None,
+                schedule_to_start_timeout: None,
+                start_to_close_timeout: Some(Duration::minutes(1)),
+                heartbeat_timeout: None,
+                priority: None,
+            })
+            .collect();
+        let response = service
+            .respond_workflow_task_completed(
+                &HeaderMap::new(),
+                scoped_workflow_completion(token, commands),
+            )
+            .await?;
+        assert_eq!(response.activity_tasks.len(), 1);
+        assert_eq!(response.activity_tasks[0].activity_id, "delivered");
+        let tokeira_kernel::LoadedRun::Existing(state) = runtime.repo().load_run(run_key).await?
+        else {
+            panic!("run")
+        };
+        assert!(state.activities.values().all(|a| a.started_at.is_some()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completion_inline_provenance_failure_withholds_started_task() -> Result<()> {
+        let (mut service, runtime, _, _, _) = update_test_service().await?;
+        configure_scoped_test_auth(&mut service);
+        let (run_key, _, queue) =
+            start_scoped_test_workflow(&runtime, "withheld-inline-token", Duration::seconds(10))
+                .await?;
+        let first = runtime
+            .poll_workflow_task(
+                queue.clone(),
+                WorkerIdentity("worker-a".into()),
+                std::time::Duration::from_secs(1),
+            )
+            .await?
+            .expect("first task");
+        let token = crate::task_token::encode(first.token.clone(), queue.namespace_id)?;
+        service
+            .register_scoped_task_provenance(
+                &scoped_edge_context(payments_worker_scope()),
+                Action::PollWorkflowTaskQueue,
+                &token,
+                &first.origin,
+                first.started_time + first.workflow_task_timeout,
+            )
+            .await?;
+        service.worker_task_provenance = Arc::new(RefuseNewProvenanceStore(
+            service.worker_task_provenance.clone(),
+        ));
+        let mut request = scoped_workflow_completion(token, Vec::new());
+        request.return_new_workflow_task = true;
+        request.force_create_new_workflow_task = true;
+        request.versioning_behavior = tokeira_kernel::VersioningBehavior::AutoUpgrade;
+        request.deployment_version = Some(tokeira_kernel::WorkerDeploymentVersionRef {
+            deployment_name: "payments".into(),
+            build_id: "build-a".into(),
+        });
+        let response = service
+            .respond_workflow_task_completed(&HeaderMap::new(), request)
+            .await?;
+        assert!(response.workflow_task.is_none());
+        let tokeira_kernel::LoadedRun::Existing(state) = runtime.repo().load_run(run_key).await?
+        else {
+            panic!("run");
+        };
+        let pending = state
+            .pending_workflow_task
+            .expect("withheld task stays pending");
+        assert_ne!(pending.logical_seq, first.token.logical_seq);
+        assert!(pending.started_event_id.is_some());
+        assert!(
+            runtime
+                .broker()
+                .try_claim_workflow_task(&queue, run_key)
+                .await
+                .is_none()
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -10983,6 +11761,7 @@ mod tests {
                     input: Payloads(vec![payload(b"input")]),
                     header: None,
                     request_eager_execution: false,
+                    use_workflow_build_id: false,
                     retry_policy: Some(tokeira_types::RetryPolicy {
                         initial_interval: Duration::seconds(1),
                         backoff_coefficient: 2.0,
@@ -10998,6 +11777,9 @@ mod tests {
                     heartbeat_timeout: Some(Duration::seconds(20)),
                     priority: None,
                 }],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
+                heartbeat: Default::default(),
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -11124,6 +11906,7 @@ mod tests {
                         input: Payloads(vec![payload(b"input")]),
                         header: None,
                         request_eager_execution: false,
+                        use_workflow_build_id: false,
                         retry_policy: None,
                         deployment: None,
                         build_id: None,
@@ -11137,6 +11920,9 @@ mod tests {
                         result: Payloads(vec![payload(b"done")]),
                     },
                 ],
+                eager_activities: Default::default(),
+                inline_workflow_task: None,
+                heartbeat: Default::default(),
                 force_new_workflow_task: false,
                 limits: Default::default(),
                 delivered_update_ids: Vec::new(),
@@ -11319,6 +12105,7 @@ mod tests {
             input: Payloads::default(),
             header: None,
             request_eager_execution: true,
+            use_workflow_build_id: false,
             retry_policy: None,
             deployment: activity_queue.deployment.clone(),
             build_id: activity_queue.build_id.clone(),
@@ -12007,43 +12794,6 @@ mod tests {
             _request_body_is_valid in any::<bool>(),
         ) {
             prop_assert_eq!(workflow_rule_crud_admitted(enabled), enabled);
-        }
-
-        #[test]
-        fn property_collect_eager_activity_specs_respects_limit(
-            commands in prop::collection::vec(arb_workflow_command(), 0..20),
-            limit in 0usize..8usize,
-        ) {
-            let eager_commands: Vec<_> = commands
-                .iter()
-                .filter_map(|command| match command {
-                    WorkflowCommand::ScheduleActivity {
-                        activity_id,
-                        task_queue,
-                        deployment,
-                        build_id,
-                        input,
-                        header,
-                        request_eager_execution: true,
-                        ..
-                    } => Some(EagerActivity {
-                        activity_id: activity_id.clone(),
-                        task_queue: task_queue.clone(),
-                        deployment: deployment.clone(),
-                        build_id: build_id.clone(),
-                        input: input.clone(),
-                        header: header.clone(),
-                    }),
-                    _ => None,
-                })
-                .collect();
-
-            let specs = collect_eager_activity_specs(&commands, limit);
-            prop_assert!(specs.len() <= limit);
-            prop_assert_eq!(
-                specs,
-                eager_commands.into_iter().take(limit).collect::<Vec<_>>()
-            );
         }
 
         #[test]

@@ -92,6 +92,13 @@ The `WorkflowTaskFailed` event variant already carries `base_run_id/new_run_id/f
 fork_event_version` (kernel.rs:1340-1343) — no new event fields, but `fork_event_version` must be
 populated (CM2) and the event must now be authored on the successor, not the base.
 
+The successor transition's timer operations name every timer still pending in its rebuilt
+state, including timers from the copied prefix, so each has a durable row and fires at its
+preserved time. DSQL's preparation stages a row for every timer in the new run's state; the
+in-memory store writes rows from the transition's timer operations, so it needs them all
+(Requirement 2.6; `service/history/ndc/state_rebuilder.go:141` and
+`service/history/workflow/task_refresher.go:433-464 @ v1.31.0`).
+
 ## CM4 — Closed-run reset (M) — Slice 1
 
 - Remove the `expect_open` gate from the reset path (kernel.rs:1302). Reset must load a **closed**

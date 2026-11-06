@@ -233,6 +233,16 @@ impl<R: RunRepository + 'static> TokeiraRuntime<R> {
             .prepare_reset_child_releases(&mut successor.next_state)
             .await?;
         successor.expected_seq = TransitionSeq::ZERO;
+        // The suffix did not schedule timers copied from the history prefix.
+        // This is a new run: publish its complete timer projection, not only the
+        // suffix's mutations, so the post-publication wake can discover them.
+        successor.timer_ops = successor
+            .next_state
+            .timers
+            .values()
+            .cloned()
+            .map(tokeira_kernel::TimerOp::Upsert)
+            .collect();
         let preparation = RunPreparation {
             request_key,
             expected_current: current_key,
@@ -356,6 +366,11 @@ impl<R: RunRepository + 'static> TokeiraRuntime<R> {
                 drop(exclusive);
                 repo.complete_run_preparation(token.clone(), attempt.fence)
                     .await?;
+                owner
+                    .read()
+                    .expect("shard owner lock poisoned")
+                    .timer_wake
+                    .published(token.home, &state);
                 publisher.publish(state.run_key, token.home, &[]).await?;
                 Ok(reset_result(&state))
             })
@@ -423,6 +438,7 @@ fn reset_participant(
             timer_ops: SmallVec::new(),
             dispatch_ops: SmallVec::new(),
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         })
     }

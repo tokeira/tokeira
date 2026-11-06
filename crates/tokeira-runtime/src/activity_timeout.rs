@@ -9,17 +9,19 @@
 //! authoritative for which activities are open and what their timeouts are.
 //! This map is the scan-time cache, rebuilt from durable history by
 //! `crate::recovery::sweep_shard` on shard takeover — losing it costs a
-//! rebuild, never correctness. Heartbeat timestamps are intentionally *not*
-//! durable: they are reset to `None` on rebuild and on retry, so after a failover
-//! the heartbeat clock restarts from the activity's start rather than firing
-//! spuriously. Entries are keyed by `(RunKey, activity_id)` and tagged with their
+//! rebuild, never correctness. Recovery restores schedule/start anchors and the
+//! last durable heartbeat; retries clear the per-attempt start and heartbeat.
+//! Entries are keyed by `(RunKey, activity_id)` and tagged with their
 //! `ShardId` so a handoff evicts exactly the activities this node no longer owns.
 //!
-//! Unlike the workflow and WFT scanners, this scanner reloads each run from the
-//! repository before firing, because the live `ActivityState` (current timeouts,
-//! attempt, whether the activity still exists) is the authority for the decision;
-//! the tracking entry only supplies the timing anchors the durable state does not
-//! retain.
+//! Cached timeouts select deadline wakes; each selected entry is still reloaded
+//! before a decision. A periodic full pass reconciles stale caches, including
+//! starts missed before schedule tracking and anchors superseded by a retry.
+//! Reloaded attempt anchors select observations; each commit rechecks its captured
+//! attempt and deadline against the state it writes, including after OCC conflicts.
+//! Cache repairs are revision guarded and preserve heartbeats at or after the
+//! reloaded start. Retry
+//! eligibility shares the wake, and bounded passes retain unattempted due work.
 
 use tokeira_kernel::deadline_after;
 
@@ -27,9 +29,9 @@ use std::sync::{Arc, RwLock};
 
 use crate::shard::ShardOwner;
 
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    ActivityResolution, ActivityResolvedRequest, ActivityState, Command, LoadedRun, RetryState,
+    ActivityResolution, ActivityResolvedRequest, ActivityState, LoadedRun, RetryState,
 };
 use tokeira_observability::OutcomeLabel;
 use tokeira_proto::{
@@ -51,13 +53,75 @@ use crate::{
     scanner::pick_lane_for_run_key,
 };
 
+/// Derived timeout configuration; reloads remain authoritative before firing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ActivityTimeouts {
+    /// Whole activity budget, anchored at its first schedule across retries.
+    pub schedule_to_close: Option<Duration>,
+    /// Unstarted attempt budget, anchored at its latest dispatch.
+    pub schedule_to_start: Option<Duration>,
+    /// Started attempt budget.
+    pub start_to_close: Option<Duration>,
+    /// Liveness budget from the later of start and the latest heartbeat.
+    pub heartbeat: Option<Duration>,
+    /// Paused activities have no active timeout deadline.
+    pub paused: bool,
+}
+
+impl From<&ActivityState> for ActivityTimeouts {
+    fn from(activity: &ActivityState) -> Self {
+        Self {
+            schedule_to_close: activity.schedule_to_close_timeout,
+            schedule_to_start: activity.schedule_to_start_timeout,
+            start_to_close: activity.start_to_close_timeout,
+            heartbeat: activity.heartbeat_timeout,
+            paused: activity.pause_info.is_some(),
+        }
+    }
+}
+
+/// Earliest strict deadline, matching evaluation rather than choosing a violation.
+/// Unknown configuration requires one reload; a saturated deadline cannot expire.
+fn activity_timeout_due_at(entry: &ActivityTrackingEntry) -> Option<OffsetDateTime> {
+    let Some(timeouts) = entry.timeouts else {
+        return Some(time::PrimitiveDateTime::MIN.assume_utc());
+    };
+    if timeouts.paused {
+        return None;
+    }
+    let due = |anchor, timeout: Option<Duration>| {
+        timeout
+            .filter(|timeout| !timeout.is_zero())
+            .and_then(|timeout| {
+                deadline_after(anchor, timeout).checked_add(Duration::nanoseconds(1))
+            })
+    };
+    let close = due(entry.original_scheduled_at, timeouts.schedule_to_close);
+    let attempt = if let Some(started) = entry.started_at {
+        [
+            due(started, timeouts.start_to_close),
+            due(
+                entry.last_heartbeat_at.unwrap_or(started).max(started),
+                timeouts.heartbeat,
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    } else {
+        due(entry.last_dispatched_at, timeouts.schedule_to_start)
+    };
+    close.into_iter().chain(attempt).min()
+}
+
 /// One open activity being watched for timeouts.
 ///
-/// Holds the timing anchors the scanner needs but durable state does not retain.
-/// `started_at` and `last_heartbeat_at` are `None` until the activity starts /
-/// first heartbeats; both are deliberately volatile (see module docs).
+/// Caches anchors and options from committed state. `started_at` and
+/// `last_heartbeat_at` are `None` until the attempt starts / first heartbeats.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActivityTrackingEntry {
+    /// Cached configuration; absence schedules an immediate authoritative reload.
+    pub timeouts: Option<ActivityTimeouts>,
     pub run_key: RunKey,
     /// Owning shard, so a handoff can evict this node's entries selectively.
     pub shard_id: ShardId,
@@ -75,16 +139,56 @@ pub struct ActivityTrackingEntry {
     pub cancel_requested: bool,
 }
 
+impl ActivityTrackingEntry {
+    fn heartbeat_for_activity(&self, activity: &ActivityState) -> Option<OffsetDateTime> {
+        let started_at = activity.started_at?;
+        // Retry state can retain the preceding attempt's durable heartbeat.
+        // Only heartbeats from this start onward extend this attempt's budget
+        // (service/history/workflow/timer_sequence.go:323-355 @ v1.31.0).
+        self.last_heartbeat_at
+            .max(activity.last_heartbeat_at)
+            .filter(|heartbeat| *heartbeat >= started_at)
+    }
+
+    fn refresh_from_activity(&mut self, activity: &ActivityState) {
+        self.timeouts = Some(ActivityTimeouts::from(activity));
+        // An early offer can lose a start, and a heartbeat racing a retry can
+        // stale its scoped reset. Reconcile both from authority under the scan's
+        // revision guard, so this reload cannot overwrite a concurrent update.
+        self.last_heartbeat_at = self.heartbeat_for_activity(activity);
+        self.started_at = activity.started_at;
+        self.original_scheduled_at = activity.scheduled_at;
+        self.last_dispatched_at = activity
+            .current_attempt_scheduled_at
+            .unwrap_or(activity.scheduled_at);
+    }
+}
+
 /// Shared in-memory tracking state for open activities.
 ///
 /// Cloning shares the underlying map; lanes, the scanner, and shard recovery all
 /// see one set. Keyed by `(RunKey, activity_id)` since a run may have many
 /// activities open at once.
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Debug)]
 pub struct ActivityTrackingState {
+    pub(crate) wake: crate::deadline_wake::DeadlineWake,
     pub(crate) eligibility: crate::activity_eligibility::ActivityEligibility,
     pub(crate) inner:
         crate::acquisition_tracking::AcquisitionEntries<(RunKey, String), ActivityTrackingEntry>,
+}
+
+impl Default for ActivityTrackingState {
+    fn default() -> Self {
+        let wake = crate::deadline_wake::DeadlineWake::default();
+        Self {
+            eligibility: crate::activity_eligibility::ActivityEligibility::with_wake(wake.clone()),
+            inner: crate::acquisition_tracking::AcquisitionEntries::with_deadlines(
+                wake.clone(),
+                activity_timeout_due_at,
+            ),
+            wake,
+        }
+    }
 }
 
 impl ActivityTrackingState {
@@ -96,6 +200,7 @@ impl ActivityTrackingState {
         Self {
             eligibility: self.eligibility.for_acquisition(acquisition.clone()),
             inner: self.inner.for_acquisition(acquisition),
+            ..self.clone()
         }
     }
 
@@ -103,6 +208,7 @@ impl ActivityTrackingState {
         Self {
             eligibility: self.eligibility.for_activity(run, activity),
             inner: self.inner.for_key(&(run, activity.into())),
+            ..self.clone()
         }
     }
 
@@ -133,10 +239,22 @@ impl ActivityTrackingState {
         activity_id: impl Into<String>,
         now: OffsetDateTime,
     ) {
+        self.record_scheduled_with_timeouts(run_key, shard_id, activity_id, now, None);
+    }
+
+    pub(crate) fn record_scheduled_with_timeouts(
+        &self,
+        run_key: RunKey,
+        shard_id: ShardId,
+        activity_id: impl Into<String>,
+        now: OffsetDateTime,
+        timeouts: Option<ActivityTimeouts>,
+    ) {
         let activity_id = activity_id.into();
         self.inner
             .upsert((run_key, activity_id.clone()), shard_id, |previous| {
                 let mut entry = previous.unwrap_or(ActivityTrackingEntry {
+                    timeouts: None,
                     run_key,
                     shard_id,
                     activity_id,
@@ -146,6 +264,7 @@ impl ActivityTrackingState {
                     last_heartbeat_at: None,
                     cancel_requested: false,
                 });
+                entry.timeouts = timeouts.or(entry.timeouts);
                 entry.last_dispatched_at = now;
                 entry.started_at = None;
                 entry.last_heartbeat_at = None;
@@ -153,13 +272,101 @@ impl ActivityTrackingState {
             });
     }
 
+    /// Install missing timeout tracking before making an eligibility obligation
+    /// visible. Existing anchors belong to their scoped start/retry callbacks.
+    pub(crate) fn refresh_eligibility(
+        &self,
+        state: &tokeira_kernel::WorkflowState,
+        home: ShardId,
+        recorded_at: OffsetDateTime,
+    ) {
+        if state.status == tokeira_types::ExecutionStatus::Running {
+            for activity in state.activities.values().filter(|activity| {
+                activity.started_at.is_none()
+                    && activity.started_event_id.is_none()
+                    && activity.pause_info.is_none()
+                    && activity.current_attempt_scheduled_at.is_some()
+            }) {
+                self.inner.upsert_if(
+                    (state.run_key, activity.activity_id.clone()),
+                    home,
+                    |previous| {
+                        previous.is_none().then(|| ActivityTrackingEntry {
+                            timeouts: Some(ActivityTimeouts::from(activity)),
+                            run_key: state.run_key,
+                            shard_id: home,
+                            activity_id: activity.activity_id.clone(),
+                            original_scheduled_at: activity.scheduled_at,
+                            last_dispatched_at: activity
+                                .current_attempt_scheduled_at
+                                .unwrap_or(activity.scheduled_at),
+                            started_at: None,
+                            last_heartbeat_at: activity.last_heartbeat_at,
+                            cancel_requested: activity.cancel_requested,
+                        })
+                    },
+                );
+            }
+        }
+        self.eligibility.refresh(state, home, recorded_at);
+    }
+
+    /// Refresh cached options without rearming unchanged, already attempted work.
+    pub(crate) fn refresh_timeouts(&self, state: &tokeira_kernel::WorkflowState) {
+        for (activity_id, activity) in &state.activities {
+            let key = (state.run_key, activity_id.clone());
+            let Some(tracked) = self.inner.tracked(&key) else {
+                continue;
+            };
+            let timeouts = Some(ActivityTimeouts::from(activity));
+            if tracked.value.timeouts != timeouts {
+                self.inner
+                    .for_entry(&tracked)
+                    .update(&key, |entry| entry.timeouts = timeouts);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_timeouts(&self, run: RunKey, id: &str, timeouts: ActivityTimeouts) {
+        self.inner
+            .update(&(run, id.into()), |entry| entry.timeouts = Some(timeouts));
+    }
+
+    fn begin_full_pass(&self) {
+        self.inner.begin_full_pass(true);
+        self.eligibility.begin_full_pass();
+    }
+
+    pub(crate) fn scan_delay(
+        &self,
+        now: OffsetDateTime,
+        maximum: std::time::Duration,
+    ) -> std::time::Duration {
+        let revision = self.wake.begin_plan();
+        let delay = self.inner.deadline_delay(now, maximum);
+        let delay = self.eligibility.deadline_delay(now, delay);
+        self.wake.plan(now, revision, delay)
+    }
+
     /// Record a redispatch on retry: advance the schedule-to-start anchor and
     /// clear the per-attempt start/heartbeat clocks, while leaving
     /// `original_scheduled_at` (the schedule-to-close anchor) untouched so the
     /// overall deadline still spans all attempts.
     pub fn record_retry(&self, run_key: RunKey, activity_id: &str, now: OffsetDateTime) {
+        self.record_retry_with_timeouts(run_key, activity_id, now, None);
+    }
+
+    pub(crate) fn record_retry_with_timeouts(
+        &self,
+        run_key: RunKey,
+        activity_id: &str,
+        now: OffsetDateTime,
+        timeouts: Option<ActivityTimeouts>,
+    ) {
         self.inner
             .update(&(run_key, activity_id.to_string()), |entry| {
+                entry.timeouts = timeouts.or(entry.timeouts);
                 entry.last_dispatched_at = now;
                 entry.started_at = None;
                 entry.last_heartbeat_at = None;
@@ -170,9 +377,20 @@ impl ActivityTrackingState {
     /// heartbeat clocks. Heartbeat is reset to `None` so the first interval is
     /// measured from start.
     pub fn record_started(&self, run_key: RunKey, activity_id: &str, now: OffsetDateTime) {
+        self.record_started_with_timeouts(run_key, activity_id, now, None);
+    }
+
+    pub(crate) fn record_started_with_timeouts(
+        &self,
+        run_key: RunKey,
+        activity_id: &str,
+        now: OffsetDateTime,
+        timeouts: Option<ActivityTimeouts>,
+    ) {
         self.eligibility.remove(run_key, activity_id);
         self.inner
             .update(&(run_key, activity_id.to_string()), |entry| {
+                entry.timeouts = timeouts.or(entry.timeouts);
                 entry.started_at = Some(now);
                 entry.last_heartbeat_at = None;
             });
@@ -262,7 +480,7 @@ pub enum TimeoutViolation {
 /// Tuning for the activity timeout scanner loop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActivityTimeoutScannerConfig {
-    /// Delay between scans of the tracking set.
+    /// Maximum delay between full reconciliations; earlier deadlines wake sooner.
     pub scan_interval: tokio::time::Duration,
     /// Upper bound on timeouts submitted per scan, bounding the work one tick can
     /// do when many activities expire together.
@@ -278,8 +496,9 @@ impl Default for ActivityTimeoutScannerConfig {
     }
 }
 
-/// Decide which activity deadline, if any, `entry` has breached at `now`, given
-/// the live `activity` state for the configured timeouts.
+/// Decide which deadline the reloaded activity has breached at `now`.
+/// Its schedule and start anchors are authoritative; the cache can only extend a
+/// heartbeat deadline with a heartbeat at or after the reloaded start.
 ///
 /// Precedence is deliberate and matches the activity lifecycle:
 /// schedule-to-close bounds the whole activity and so is checked first; then, if
@@ -296,14 +515,25 @@ pub fn evaluate_activity_timeout(
     activity: &ActivityState,
     now: OffsetDateTime,
 ) -> Option<TimeoutViolation> {
+    evaluate_activity_timeout_with_heartbeat(activity, entry.heartbeat_for_activity(activity), now)
+}
+
+fn evaluate_activity_timeout_with_heartbeat(
+    activity: &ActivityState,
+    heartbeat_at: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> Option<TimeoutViolation> {
     if let Some(timeout) = activity.schedule_to_close_timeout
         && !timeout.is_zero()
-        && now > deadline_after(entry.original_scheduled_at, timeout)
+        && now > deadline_after(activity.scheduled_at, timeout)
     {
         return Some(TimeoutViolation::ScheduleToClose);
     }
 
-    if let Some(started_at) = entry.started_at {
+    // Timers are derived from the current attempt, not the cached incarnation
+    // (service/history/timer_queue_active_task_executor.go:204-258,292-295;
+    // service/history/workflow/timer_sequence.go:229-257,291-355 @ v1.31.0).
+    if let Some(started_at) = activity.started_at {
         if let Some(timeout) = activity.heartbeat_timeout
             && !timeout.is_zero()
         {
@@ -311,9 +541,7 @@ pub fn evaluate_activity_timeout(
             // (`getActivityHeartbeatTimeout`, timer_sequence.go:341-351 @
             // v1.31.0): a time restored from durable state may predate the
             // current attempt, whose clock then runs from its start.
-            let heartbeat_at = entry
-                .last_heartbeat_at
-                .map_or(started_at, |at| at.max(started_at));
+            let heartbeat_at = heartbeat_at.unwrap_or(started_at).max(started_at);
             if now > deadline_after(heartbeat_at, timeout) {
                 return Some(TimeoutViolation::Heartbeat);
             }
@@ -327,7 +555,13 @@ pub fn evaluate_activity_timeout(
         }
     } else if let Some(timeout) = activity.schedule_to_start_timeout
         && !timeout.is_zero()
-        && now > deadline_after(entry.last_dispatched_at, timeout)
+        && now
+            > deadline_after(
+                activity
+                    .current_attempt_scheduled_at
+                    .unwrap_or(activity.scheduled_at),
+                timeout,
+            )
     {
         return Some(TimeoutViolation::ScheduleToStart);
     }
@@ -335,41 +569,140 @@ pub fn evaluate_activity_timeout(
     None
 }
 
-/// Evaluate the tracked activities once, retrying attempts whose fired timeout
-/// is retryable and resolving the rest as timed out, capped at
-/// `max_timeouts_per_scan`.
-///
-/// Each entry's run is reloaded from `deps.repo` because the live
-/// `ActivityState` is the authority for the current timeouts and for whether
-/// the activity still exists; the tracking entry only supplies the timing
-/// anchors. An entry whose run is absent or closed, or whose activity is no
-/// longer present in the loaded state, is dropped (it resolved by another
-/// path, or can no longer time out); a load error is transient and leaves the
-/// entry for the next scan.
-pub(crate) async fn scan_activity_timeouts_once<R>(
+/// Volatile evidence carried with a scanner mutation, never serialized with commands.
+/// Both commit loops recheck it on every OCC attempt against their transition base.
+#[derive(Clone, Debug)]
+pub(crate) struct ActivityTimeoutCheck {
+    activity_id: String,
+    schedule_event_id: i64,
+    attempt: u32,
+    violation: TimeoutViolation,
+    observed_sequence: tokeira_types::TransitionSeq,
+    observed_at: OffsetDateTime,
+}
+
+/// A moved deadline needs a reload; a resolved activity needs conditional removal.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ActivityTimeoutRejection {
+    /// The activity remains open, but this attempt or deadline no longer applies.
+    #[error("activity timeout observation is stale")]
+    Stale,
+    /// The activity or its open run no longer exists.
+    #[error("activity timeout target has resolved")]
+    Resolved,
+}
+
+impl ActivityTimeoutCheck {
+    fn new(
+        activity: &ActivityState,
+        violation: TimeoutViolation,
+        observed_sequence: tokeira_types::TransitionSeq,
+        observed_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            activity_id: activity.activity_id.clone(),
+            schedule_event_id: activity.schedule_event_id,
+            attempt: activity.attempt,
+            violation,
+            observed_sequence,
+            observed_at,
+        }
+    }
+
+    /// A lane cache predating the scanner's read cannot reject that observation.
+    pub(crate) fn predates_observation(&self, loaded: &LoadedRun) -> bool {
+        !matches!(loaded, LoadedRun::Existing(state)
+            if state.transition_seq >= self.observed_sequence)
+    }
+
+    /// Use durable anchors at the captured time; the caller must fence any write
+    /// against this image and repeat validation if it reloads after a conflict.
+    pub(crate) fn validate(&self, loaded: &LoadedRun) -> Result<(), ActivityTimeoutRejection> {
+        let LoadedRun::Existing(state) = loaded else {
+            return Err(ActivityTimeoutRejection::Resolved);
+        };
+        let Some(activity) = state
+            .activities
+            .get(&self.activity_id)
+            .filter(|_| state.is_open())
+        else {
+            return Err(ActivityTimeoutRejection::Resolved);
+        };
+        // The write's expected sequence fences this exact state. Repeating the
+        // check after an OCC conflict provides the workflow-lock guarantee of
+        // service/history/timer_queue_active_task_executor.go:204-258,292-295
+        // @ v1.31.0, without trusting a scanner's earlier read or volatile cache.
+        if activity.attempt != self.attempt
+            || activity.schedule_event_id != self.schedule_event_id
+            || activity.pause_info.is_some()
+            || evaluate_activity_timeout_with_heartbeat(
+                activity,
+                activity.last_heartbeat_at,
+                self.observed_at,
+            ) != Some(self.violation)
+        {
+            return Err(ActivityTimeoutRejection::Stale);
+        }
+        Ok(())
+    }
+}
+
+/// Reconcile all entries, reloading authoritative state before retry or resolution.
+#[cfg(test)]
+pub(crate) async fn scan_activity_timeouts_once<R: RunRepository + 'static>(
     deps: &ActivityRetryDeps<R>,
     shard_id: Option<ShardId>,
     lanes: &[LaneHandle],
     lane_count: usize,
     config: &ActivityTimeoutScannerConfig,
-) where
-    R: RunRepository + 'static,
-{
+) {
+    deps.tracking.inner.begin_full_pass(true);
+    scan_activity_timeouts_at(deps, shard_id, lanes, lane_count, config, deps.clock.now()).await;
+}
+
+/// Reload due entries in stable deadline order. Full-pass obligations also refresh
+/// future caches. Mark attempts before I/O so failed loads/submissions wait for the
+/// next interval; a capped pass leaves unattempted entries immediately runnable.
+pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
+    deps: &ActivityRetryDeps<R>,
+    shard_id: Option<ShardId>,
+    lanes: &[LaneHandle],
+    lane_count: usize,
+    config: &ActivityTimeoutScannerConfig,
+    now: OffsetDateTime,
+) {
     let tracking = &deps.tracking;
-    let now = deps.clock.now();
     let mut submitted = 0usize;
 
-    let entries = tracking.inner.snapshot(shard_id);
+    let mut entries = tracking.inner.select_active(shard_id, |entry| {
+        entry.refresh_pending
+            || (entry.deadline_pending
+                && activity_timeout_due_at(&entry.value).is_some_and(|due| due <= now))
+    });
+    entries.sort_by_key(|entry| {
+        (
+            activity_timeout_due_at(&entry.value)
+                .unwrap_or(time::PrimitiveDateTime::MAX.assume_utc()),
+            entry.value.run_key,
+            entry.value.activity_id.clone(),
+        )
+    });
 
     for tracked in entries {
         if !tracking.inner.active(&tracked) {
             continue;
         }
-        let entry = tracked.value.clone();
+        let mut entry = tracked.value.clone();
         if submitted >= config.max_timeouts_per_scan {
             break;
         }
 
+        if !tracking
+            .inner
+            .mark_attempted(&(entry.run_key, entry.activity_id.clone()), &tracked)
+        {
+            continue;
+        }
         let state = match deps.repo.load_run(entry.run_key).await {
             Ok(LoadedRun::Existing(state)) => state,
             Ok(LoadedRun::Absent) => {
@@ -411,6 +744,18 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
                 .remove_submitted(&(entry.run_key, entry.activity_id.clone()), &tracked);
             continue;
         };
+
+        // Full passes also reload entries whose missing start left them without
+        // a heartbeat/start-to-close deadline. Repair before evaluating this pass.
+        entry.refresh_from_activity(&activity);
+        tracking.inner.refresh_scanned(
+            &(entry.run_key, entry.activity_id.clone()),
+            &tracked,
+            now,
+            |entry| {
+                entry.refresh_from_activity(&activity);
+            },
+        );
 
         // Temporal suspends all four activity timers while an activity is paused:
         // `LoadAndSortActivityTimers` skips paused activities
@@ -489,6 +834,12 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
                             activity_id: &entry.activity_id,
                             expected_attempt: activity.attempt,
                             expected_schedule_event_id: activity.schedule_event_id,
+                            timeout: Some(ActivityTimeoutCheck::new(
+                                &activity,
+                                violation,
+                                state.transition_seq,
+                                now,
+                            )),
                         },
                         next_attempt,
                         backoff,
@@ -506,9 +857,23 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
                             runtime_metrics::record_activity_task_retry(OutcomeLabel::Success);
                         }
                         Err(error) => {
-                            // Lost a race with a concurrent resolution or hit a
-                            // transient commit error: leave the entry; the next
-                            // scan re-evaluates against reloaded state.
+                            match error.downcast_ref::<ActivityTimeoutRejection>() {
+                                Some(ActivityTimeoutRejection::Stale) => {
+                                    tracking.inner.request_refresh(
+                                        &(entry.run_key, entry.activity_id.clone()),
+                                        &tracked,
+                                    )
+                                }
+                                Some(ActivityTimeoutRejection::Resolved) => {
+                                    tracking.inner.remove_submitted(
+                                        &(entry.run_key, entry.activity_id.clone()),
+                                        &tracked,
+                                    )
+                                }
+                                None => {}
+                            }
+                            // Stale observations request a reload; other commit
+                            // failures retain the full pass as their backstop.
                             runtime_metrics::record_activity_task_retry(OutcomeLabel::Failure);
                             tracing::warn!(
                                 ?error,
@@ -571,9 +936,9 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
         };
         let lane = pick_lane_for_run_key(lanes, lane_count, entry.run_key).clone();
         let result = lane
-            .submit(
+            .submit_activity_timeout(
                 entry.run_key,
-                Command::ActivityResolved(ActivityResolvedRequest {
+                ActivityResolvedRequest {
                     activity_id: entry.activity_id.clone(),
                     resolution: ActivityResolution::TimedOut {
                         timeout_type,
@@ -587,7 +952,8 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
                     worker_identity: None,
                     request: tokeira_types::RequestContext::unattributed(now),
                     now,
-                }),
+                },
+                ActivityTimeoutCheck::new(&activity, violation, state.transition_seq, now),
             )
             .await
             .map(|_| ());
@@ -600,19 +966,25 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
                     .remove_submitted(&(entry.run_key, entry.activity_id.clone()), &tracked);
             }
             Err(error) => {
-                let message = error.to_string();
-                // Kernel rejection means the activity already resolved or advanced
-                // past the state this timeout was computed against, so the entry is
-                // stale: drop it instead of retrying. Other errors are transient,
-                // so the entry is kept for the next scan.
-                if message.contains("kernel rejected") {
-                    runtime_metrics::record_activity_task_timed_out(OutcomeLabel::Rejected);
-                    tracing::debug!(
-                        ?error,
-                        run_key = ?entry.run_key,
-                        activity_id = entry.activity_id,
-                        "activity timeout scanner timeout rejected by kernel"
+                // A stale observation is still live work. Request a reload,
+                // including when a concurrent heartbeat advanced its revision.
+                let rejection = error.downcast_ref::<ActivityTimeoutRejection>();
+                let resolved = matches!(rejection, Some(ActivityTimeoutRejection::Resolved))
+                    || matches!(
+                        error.downcast_ref::<crate::KernelRejected>(),
+                        Some(crate::KernelRejected(
+                            tokeira_kernel::Reject::UnknownActivity(_)
+                                | tokeira_kernel::Reject::MissingRun
+                                | tokeira_kernel::Reject::RunClosed(_)
+                        ))
                     );
+                if matches!(rejection, Some(ActivityTimeoutRejection::Stale)) {
+                    runtime_metrics::record_activity_task_timed_out(OutcomeLabel::Rejected);
+                    tracking
+                        .inner
+                        .request_refresh(&(entry.run_key, entry.activity_id.clone()), &tracked);
+                } else if resolved {
+                    runtime_metrics::record_activity_task_timed_out(OutcomeLabel::Rejected);
                     tracking
                         .inner
                         .remove_submitted(&(entry.run_key, entry.activity_id.clone()), &tracked);
@@ -710,8 +1082,8 @@ fn terminal_timeout_failure(
     })
 }
 
-/// Background loop: every `scan_interval`, retry or resolve timed-out
-/// activities for each shard this node currently owns.
+/// Wake at the earliest timeout or retry deadline, with a full reconciliation
+/// every `scan_interval` as a backstop for stale caches.
 ///
 /// The active-shard set is re-read each tick so ownership changes (handoff, fresh
 /// sweep) are picked up without restarting the task. Each firing routes by
@@ -726,12 +1098,31 @@ pub(crate) async fn run_activity_timeout_scanner<R>(
 ) where
     R: RunRepository + 'static,
 {
+    let mut next_full = deadline_after(
+        deps.clock.now(),
+        Duration::try_from(config.scan_interval).unwrap_or(Duration::MAX),
+    );
     loop {
+        let now = deps.clock.now();
+        let maximum = std::time::Duration::try_from(next_full - now).unwrap_or_default();
+        let delay = deps
+            .tracking
+            .scan_delay(now, maximum.min(config.scan_interval));
         tokio::select! {
             _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(config.scan_interval) => {}
+            _ = tokio::time::sleep(delay) => {},
+            _ = deps.tracking.wake.notify.notified() => {}
         }
 
+        let woke = deps.clock.now();
+        deps.tracking.wake.start_scan(woke);
+        if woke >= next_full {
+            deps.tracking.begin_full_pass();
+            next_full = deadline_after(
+                woke,
+                Duration::try_from(config.scan_interval).unwrap_or(Duration::MAX),
+            );
+        }
         let active_shards: Vec<_> = deps
             .shard_owner
             .read()
@@ -740,7 +1131,15 @@ pub(crate) async fn run_activity_timeout_scanner<R>(
             .collect();
         for shard_id in active_shards {
             runtime_metrics::record_scanner_tick("activity_timeout", shard_id.0);
-            scan_activity_timeouts_once(&deps, Some(shard_id), &lanes, lane_count, &config).await;
+            scan_activity_timeouts_at(
+                &deps,
+                Some(shard_id),
+                &lanes,
+                lane_count,
+                &config,
+                deps.clock.now(),
+            )
+            .await;
             crate::activity_eligibility::scan_activity_eligibility_once(
                 &deps,
                 shard_id,
@@ -759,7 +1158,7 @@ mod tests {
     use tokeira_kernel::ActivityState;
     use tokeira_types::TaskQueueName;
 
-    fn sample_activity() -> ActivityState {
+    pub(super) fn sample_activity() -> ActivityState {
         ActivityState {
             last_attempt_complete_time: None,
             cancel_requested: false,
@@ -821,6 +1220,7 @@ mod tests {
         fn no_timeout_without_configuration(offset_secs in 0i64..1000i64) {
             let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(offset_secs);
             let entry = ActivityTrackingEntry {
+                timeouts: None,
                 run_key: RunKey::new(),
                 shard_id: ShardId(0),
                 activity_id: "a".into(),
@@ -847,6 +1247,7 @@ mod tests {
             let last_heartbeat_at = heartbeat_offset.map(|offset| base + Duration::seconds(offset));
             let now = base + Duration::seconds(now_offset);
             let entry = ActivityTrackingEntry {
+                timeouts: None,
                 run_key: RunKey::new(),
                 shard_id: ShardId(0),
                 activity_id: "a".into(),
@@ -858,6 +1259,7 @@ mod tests {
             };
             let mut activity = sample_activity();
             activity.heartbeat_timeout = Some(Duration::seconds(timeout_secs));
+            activity.started_at = Some(started_at);
             let anchor = last_heartbeat_at.map_or(started_at, |at| at.max(started_at));
             prop_assert_eq!(
                 evaluate_activity_timeout(&entry, &activity, now) == Some(TimeoutViolation::Heartbeat),
@@ -870,6 +1272,7 @@ mod tests {
     fn schedule_to_close_takes_precedence() {
         let now = OffsetDateTime::now_utc();
         let entry = ActivityTrackingEntry {
+            timeouts: None,
             run_key: RunKey::new(),
             shard_id: ShardId(0),
             activity_id: "a".into(),
@@ -880,6 +1283,8 @@ mod tests {
             cancel_requested: false,
         };
         let mut activity = sample_activity();
+        activity.scheduled_at = entry.original_scheduled_at;
+        activity.started_at = entry.started_at;
         activity.schedule_to_close_timeout = Some(Duration::seconds(1));
         activity.start_to_close_timeout = Some(Duration::seconds(1));
         activity.heartbeat_timeout = Some(Duration::seconds(1));
@@ -889,3 +1294,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "activity_timeout_deadline_tests.rs"]
+mod deadline_tests;

@@ -130,6 +130,7 @@ where
         nexus_timeout_tracking,
         completion_callback_tracking,
         &repair,
+        retry_deps.clock.as_ref(),
     )
     .await?;
     assert!(owner.write().unwrap().activate_acquisition(&acquisition));
@@ -257,6 +258,7 @@ pub(crate) async fn sweep_shard_inner<R>(
     nexus_timeout_tracking: &NexusTimeoutTrackingState,
     completion_callback_tracking: &CompletionCallbackTrackingState,
     repair: &RepairAcquisition,
+    clock: &dyn tokeira_clock::Clock,
 ) -> Result<SweepResult>
 where
     R: RunRepository + ?Sized,
@@ -277,7 +279,6 @@ where
         repair.validate()?;
         for state in &page.states {
             repair.repair(repo, state.run_key).await?;
-            activity_tracking.eligibility.refresh(state, shard_id);
             let entries = recovery_entries(state);
             if let Some(task) = entries.dispatchable_workflow_task {
                 // Recovery republishes the same derived envelope as the hot
@@ -345,6 +346,10 @@ where
                 // original schedule, which stays the schedule-to-close anchor
                 // spanning the whole retry chain (retry.go:108-110 @ v1.31.0).
                 activity_tracking.insert(ActivityTrackingEntry {
+                    timeouts: state
+                        .activities
+                        .get(&entry.activity_id)
+                        .map(crate::activity_timeout::ActivityTimeouts::from),
                     run_key: entry.run_key,
                     shard_id,
                     activity_id: entry.activity_id,
@@ -358,8 +363,13 @@ where
                 });
                 result.activity_tracking_entries_reconstructed += 1;
             }
+            activity_tracking.refresh_eligibility(state, shard_id, clock.now());
             for entry in entries.nexus_timeouts {
                 nexus_timeout_tracking.insert(NexusTimeoutEntry {
+                    timeouts: state
+                        .pending_nexus_operations
+                        .get(&entry.operation_id)
+                        .map(crate::nexus::NexusTimeouts::from),
                     run_key: entry.run_key,
                     shard_id,
                     operation_id: entry.operation_id,
@@ -370,6 +380,15 @@ where
             }
             for entry in entries.completion_callbacks {
                 completion_callback_tracking.insert(CompletionCallbackTrackingEntry {
+                    timing: state
+                        .completion_callbacks
+                        .get(entry.callback_index)
+                        // Recovery may have lost the Scheduled invocation. Unknown
+                        // timing requests an immediate authoritative reload.
+                        .filter(|callback| {
+                            callback.state != tokeira_kernel::CallbackState::Scheduled
+                        })
+                        .map(crate::nexus::CompletionCallbackTiming::from),
                     run_key: entry.run_key,
                     shard_id,
                     callback_index: entry.callback_index,
@@ -732,6 +751,7 @@ mod tests {
             external_payload_size_bytes: 0,
             next_workflow_task_seq: LogicalTaskSeq(1),
             pending_workflow_task: Some(PendingWorkflowTask {
+                original_scheduled_at: None,
                 advice: Default::default(),
                 task_type: tokeira_kernel::WorkflowTaskType::Normal,
                 schedule_to_start_deadline: None,
@@ -811,6 +831,7 @@ mod tests {
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         }
     }
@@ -918,6 +939,7 @@ mod tests {
         let mut transition = start_transition(run_key);
         transition.next_state.workflow_task_timeout = Duration::seconds(15);
         transition.next_state.pending_workflow_task = Some(PendingWorkflowTask {
+            original_scheduled_at: None,
             advice: Default::default(),
             task_type: tokeira_kernel::WorkflowTaskType::Normal,
             schedule_to_start_deadline: None,

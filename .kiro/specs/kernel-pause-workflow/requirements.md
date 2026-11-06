@@ -97,3 +97,20 @@ Complete the pause/unpause workflow feature across the Tokeira stack. The kernel
 4. THE only intentional exemption SHALL be successful `apply_unpause_workflow`, which changes status back to `ExecutionStatus::Running` before scheduling the WFT that lets workflow code observe accumulated changes.
 5. WHILE the Kernel WorkflowState has `status == ExecutionStatus::Paused`, THE Runtime SHALL continue to dispatch already-scheduled activity tasks, honor timer expirations, and process child workflow lifecycle events through the standard paths.
 6. WHILE paused, WHEN a `QueryWorkflow` request is received, THE Runtime SHALL return a query rejection carrying `ExecutionStatus::Paused`, and THE Edge SHALL translate it to a `QueryRejected` response with status `WORKFLOW_EXECUTION_STATUS_PAUSED` (proto enum value 8).
+7. WHILE paused, WHEN a workflow task fails or times out, THE Kernel SHALL record the failure or timeout as for a running workflow and leave no pending workflow task. THE attempt and attempts-since-success count SHALL follow the running rules, except that flushed buffered events SHALL NOT reset the attempt.
+8. WHEN `UnpauseWorkflow` finds no pending workflow task, THE task it schedules SHALL take the run's attempt: attempt 1 SHALL write `WorkflowTaskScheduled`, and a higher attempt SHALL be transient. An unstarted task scheduled before the pause SHALL be re-dispatched with its scheduled event, schedule time, and original scheduled time unchanged.
+
+Authority: `service/history/workflow/workflow_task_state_machine.go:259-268,322-335,1003-1028`,
+`service/history/workflow/util.go:52-69`,
+`service/history/api/update_workflow_util.go:80-89`,
+`service/history/api/unpauseworkflow/api.go:64-76`, and
+`service/history/workflow/mutable_state_impl.go:7800 @ v1.31.0`.
+
+Deliberate difference: v1.31.0 increments the pending task's stamp at pause
+(`service/history/workflow/mutable_state_impl.go:3057-3061 @ v1.31.0`), staling
+its timers and dispatch (`service/history/timer_queue_active_task_executor.go:395-398`
+and `service/history/api/recordworkflowtaskstarted/api.go:76-79 @ v1.31.0`).
+Unpause leaves that pending task unchanged, so it neither times out nor runs again.
+Tokeira keeps its timeouts and re-dispatches an unstarted task at unpause. A timeout
+that fires while paused follows the same failure bookkeeping as a worker-reported
+failure during a pause; it leaves no pending task until unpause.

@@ -27,7 +27,7 @@ Temporal API v1.62.11 supplies wire shape only. No Temporal implementation is co
 | [Lease fencing](../bundle-lease-fence/bugfix.md) | Transaction-local lease validation plus local serving/write barriers. |
 | [Activity inputs](../activity-inputs-from-history/bugfix.md) | Input/header remain in scheduled history; ordinary start reads that exact event, eager fresh-schedule start can reuse its committed values. |
 | [Activity heartbeat time](../activity-heartbeat-time/requirements.md) | State extensions, precise durable heartbeat restoration and frozen positional layout. |
-| [Workflow rules](../workflow-rules/requirements.md) | Rule evaluation at retry eligibility and immediately before start, including eager start. |
+| [Workflow rules](../workflow-rules/requirements.md) | Rule evaluation at retry eligibility and ordinary start; eager first starts bypass evaluation. |
 | [Storage contracts](../storage-contract-tests/design.md) | Shared backend cases, live DSQL receipts, isolated read baselines and cancellation-safe transactions. |
 
 No proactive remote activity offer RPC, general completion/heartbeat forwarding,
@@ -188,16 +188,66 @@ only an offer; it does not delete an activity row or record a durable acknowledg
 While capacity is unavailable, durable work stays discoverable. Continuous churn
 cannot restart a live pass at its head.
 
-Eager activity delivery remains an execution-owner operation with its original
-worker authorization. Replace dependence on finding a local broker copy with a
-direct owner-start attempt for the just-committed schedule. The ordinary and eager
-paths use the same incarnation validation, rules, receipt and fenced commit. Only
-this fresh-schedule path can pass already committed input/header to avoid the
-history read. A normal queue-home start carries no input/header supplied by a peer.
-If an ordinary poll wins the OCC race, eager returns no task; neither path invents
-a second start. Eager traffic uses its existing response/capacity bounds.
+Eager activities start inside the workflow-task completion's transition. This
+replaces the post-commit `try_claim_activity_task` path, not just its broker lookup.
+Resolve the typed, deployment-wide enable setting (default false), the per-test
+conformance override, old-SDK exclusion and scoped worker admission before entering
+the pure transition. Preserve `UseWorkflowBuildId` from the proto; the current
+translator drops it. In the kernel, select requested activities using the exact
+versioning predicate in
+`service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:487-508 @ v1.31.0`:
+old versioning is a `use_versioning` stamp with unspecified effective versioning
+behavior; a nonempty assigned build ID also requires `UseWorkflowBuildId`. A paused
+workflow produces neither eager starts nor activity tasks.
+
+After processing all commands, start only selected activities still present in an
+open run. Supply fresh request IDs from the runtime, the completion identity and
+the workflow's assigned build ID. Reuse the pure activity-start mutation and receipt
+representation within the completion builder; do not invoke a second transition or
+the ordinary-start rule evaluator. Preserve retry-policy transient starts and their
+later request-ID/identity/time materialization. Build the response from these start
+results and the exact scheduling command payloads after commit, without another
+history input read (`workflow_task_completed_handler.go:533-622 @ v1.31.0`).
+
+No enqueue operation may survive for an inline-started incarnation. Canonical
+row derivation sees the final started state and writes no dispatch row; publication,
+discovery and acquisition repair cannot offer it. This matters even when a poll
+was waiting before completion. There is no eager count cap; existing command,
+payload and response-size admission still apply. Disabling eagerness leaves every
+otherwise eligible activity on normal dispatch. A lost response leaves the activity
+started until its own applicable timeout, then the normal retry/terminal outcome.
+Retry eligibility and ordinary starts still evaluate workflow rules.
+
+Configuration ownership and the deferred ledger update are recorded in
+[configuration-policy](../configuration-policy/design.md#completion-inline-start-policy-amendment).
+The companion inline workflow-task contract is in
+[api-conformance-wft-completion](../api-conformance-wft-completion/design.md#return-new-wft-safety).
 
 ### Retry eligibility and workflow rules
+
+Retry eligibility shares the activity timeout scanner's earliest-deadline wake,
+including earlier-insert notifications and immediate continuation of unattempted
+capped work, so backoff expiry is evaluated at its due time. Each eligibility entry
+retains whether its dispatch time was strictly after registration time. Only those
+deferred entries offer locally after passing owner rules and the deps' clock check.
+The publisher uses the same registration time to offer already-due work, including
+first attempts. Unrelated refreshes preserve the decision for the same incarnation
+and due time; an already-due entry still evaluates rules but leaves delivery to the
+publisher or discovery. This separates schedule-time transfer from retry-time
+delivery (`service/history/workflow/task_generator.go:550-577 @ v1.31.0`).
+
+Timeout tracking is installed before eligibility registration. Retry and option
+updates reset the attempt's anchors before exposing its eligibility wake, so a local
+poll's committed start cannot be erased by a later reset. Publication registers
+each attempt only after tracking it; the lane registers any remaining obligations
+after publication, installing missing tracking even if publication failed. Recovery
+and publication rebuilds likewise restore timeout tracking first.
+
+Eligible deferred attempts are routed from the already loaded run and deployment
+registry through `publish_activity_task`. A local waiting poll receives that offer
+without waiting for discovery; a remote queue home still finds it on its next
+discovery pass, as for a first attempt. Discovery remains the backstop and broker
+duplicate suppression handles racing offers.
 
 Split `prepare_activity_dispatch_publish` into read-only candidate inspection and
 execution-owner rule application. Discovery does not suppress an otherwise valid
@@ -379,8 +429,9 @@ binaries reject TKW4 instead of dropping required receipts. Preserve all existin
 extension sections and large-state preparation paths.
 
 Set the receipt in the same transition as start. Add an optional caller-supplied
-request ID to the pure `ActivityStartRequest`; runtime supplies it for ordinary and
-eager matching, while the existing by-ID synthetic-start path retains its behavior.
+request ID to the pure `ActivityStartRequest`; runtime supplies it for ordinary
+matching and supplies eager IDs as completion operands. The existing by-ID
+synthetic-start path retains its behavior.
 Use that ID in materialized and buffered `ActivityTaskStarted` history, and retain it
 for later materialization of transient starts. The kernel generates no UUID and
 performs no I/O. Reset forks do not inherit a live delivery receipt from their source;
@@ -405,9 +456,8 @@ merely because the current control stamp changes.
    decisions from `transition_for_polled_activity_task`; do not replace the targeted
    revision rules with a blanket equality-to-latest-registry check. A required pause
    or deployment transition uses an owner-fenced transition and returns no activity.
-5. Compute the pure start and receipt with one owner-chosen timestamp for that OCC
-   attempt. Read the exact scheduled input/header once, or accept the validated fresh
-   eager-schedule values. Construct and size-check the prospective response before
+5. Compute the pure ordinary start and receipt with one owner-chosen timestamp for
+   that OCC attempt. Read the exact scheduled input/header once. Construct and size-check the prospective response before
    committing; no user payload is accepted from the internal start request.
 6. Commit through the current execution-home serving admission, captured fence and
    expected sequence. On conflict, reread authority and repeat the decision; preserve
@@ -697,11 +747,13 @@ generation work.
 
 ### Property 7: One authoritative start
 
-*For any* competing ordinary/eager/remote polls and stale incarnations, at most one
-start commits for a schedule/attempt/stamp, under the actual execution-home fence;
-no successful response precedes its atomic commit.
+*For any* ordinary/remote poll trace, completion-inline selection and stale
+incarnations, at most one start commits for a schedule/attempt/stamp under the
+execution-home fence. An eager first start belongs to the completion commit alone,
+has no dispatch row or offer, and cannot be taken by a waiting poll; no successful
+response precedes its commit.
 
-**Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.5, 8.4**
+**Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.5, 8.4, 9.7, 9.8**
 
 ### Property 8: Same-request recovery without resurrection
 
@@ -723,11 +775,12 @@ the admitted namespace, offer and origin.
 
 ### Property 10: Rules at retry eligibility and start
 
-*For any* generated schedule/rule-change/owner-restart trace, no start occurs before
-eligibility or through an effective pause rule; owner retry-eligibility evaluation
-also occurs without poll demand. Discovery performs no authoritative mutation.
+*For any* generated schedule/rule-change/owner-restart trace, no ordinary start
+occurs before eligibility or through an effective pause rule; owner retry-eligibility
+evaluation also occurs without poll demand. Eager first starts do not evaluate
+rules. Discovery performs no authoritative mutation.
 
-**Validates: Requirements 2.9, 6.1, 6.2, 6.3, 6.8, 8.5**
+**Validates: Requirements 2.9, 6.1, 6.2, 6.3, 6.8, 8.5, 9.9**
 
 ### Property 11: Routing and lifecycle preservation
 
@@ -740,11 +793,13 @@ New versioned demand can find previously unversioned work.
 
 ### Property 12: Response and eager preservation
 
-*For any* generated scheduled payloads and start metadata, local, eager and real
-remote transport preserve the applicable fresh/replay response fields, byte values,
-namespace identity and transient/buffered history semantics.
+*For any* generated payloads, SDK version, policy, versioning, pause and command
+outcomes, ordinary local/remote starts and eager completion results preserve their
+applicable response fields and transient/buffered history semantics. Eager results
+contain exactly the eligible, authorized surviving starts without a count cap;
+disabled execution returns none. Lost responses do not unstart their tasks.
 
-**Validates: Requirements 4.6, 4.10, 6.5, 6.6, 8.5**
+**Validates: Requirements 4.6, 4.10, 6.5, 6.6, 8.5, 9.1–9.13**
 
 ### Property 13: Complete bounded repair
 
@@ -810,9 +865,9 @@ its start commits.
 |---|---|
 | Storage `activity_dispatch_tests.rs`, memory adapter, DSQL adapter | Properties 1–3, 13–14, 17 against the same oracle; real transaction conflicts and conditional replacement. |
 | Runtime discovery/offer tests | Properties 4–6, 19; tiny budgets plus >64-row retained/incompatible prefixes and fair interleaving with workflow demand. |
-| Runtime activity/start/eligibility tests | Properties 7–8, 10–12, 15, 18; controlled clocks, channels and acquisition pause points. |
+| Runtime activity/start/eligibility tests | Properties 7–8, 10–12, 15, 18; controlled clocks, channels and acquisition pause points. Park a poll before eager completion and assert the completion is the only start commit, with no row or offer; disabled eagerness is the ordinary-dispatch control. |
 | Storage codec and kernel lifecycle/reset tests | Property 16, frozen legacy bytes, TKW3 outbound preparation, TKW4 rejection by old decoder, transient history request IDs. |
-| Edge activity-dispatch and auth peer tests | Properties 9 and 12 over real bounded protobuf transport and distinct owner runtimes, including malformed/oversize framing and purpose isolation. |
+| Edge activity-dispatch and auth peer tests | Properties 9 and 12 over real bounded protobuf transport and distinct owner runtimes, including malformed/oversize framing, purpose isolation, old-SDK exclusion, no count cap and lost inline responses. |
 
 The initial retained-full-first-page test must fail on the baseline with a recorded
 counterexample before the new discovery replaces that path; keep its model as the

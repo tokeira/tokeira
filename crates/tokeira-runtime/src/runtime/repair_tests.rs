@@ -7,7 +7,7 @@ use super::*;
 use async_trait::async_trait;
 use std::{
     collections::BTreeMap,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use tokeira_kernel::*;
 use tokeira_storage::*;
@@ -29,8 +29,9 @@ impl std::io::Write for PlacementLogCapture {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Point {
+pub(super) enum Point {
     Load,
+    Loaded,
     Candidates,
     Repair,
     Home,
@@ -50,14 +51,36 @@ struct Pause {
     resume: oneshot::Receiver<()>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OutboundRead {
+    Operation {
+        home: ShardId,
+        kind: OperationKind,
+        after: Option<OperationKey>,
+        fresh_bound: bool,
+        limit: usize,
+    },
+    Intent,
+    Publication,
+}
+
 #[derive(Debug, Default)]
-struct Repo {
-    inner: InMemoryStore,
-    fail: Mutex<Option<Point>>,
+pub(crate) struct Repo {
+    pub(crate) refuse_pair: AtomicBool,
+    pub(crate) lose_publication_reply: AtomicBool,
+    pub(super) inner: InMemoryStore,
+    pub(crate) outbound_reads: Mutex<Vec<OutboundRead>>,
+    pub(crate) timer_reads: Mutex<Vec<ShardId>>,
+    pub(crate) timer_fixture: Mutex<Option<BTreeMap<ShardId, Vec<DueTimer>>>>,
+    pub(crate) outbound_read: tokio::sync::Notify,
+    pub(super) history_reads: AtomicUsize,
+    pub(super) fail: Mutex<Option<Point>>,
     conflicts: AtomicUsize,
     repair_attempts: AtomicUsize,
     repair_fences: Mutex<Vec<WriteFence>>,
-    loads: AtomicUsize,
+    pub(super) loads: AtomicUsize,
+    pub(super) commit_conflicts: AtomicUsize,
+    stats_loads: AtomicUsize,
     legacy_delivery_calls: AtomicUsize,
     discovery_gate: Mutex<Option<Arc<discovery_scheduler_tests::Gate>>>,
     preparation_retries: AtomicUsize,
@@ -67,6 +90,13 @@ struct Repo {
 }
 
 impl Repo {
+    pub(crate) fn with_inner(inner: InMemoryStore) -> Self {
+        Self {
+            inner,
+            ..Self::default()
+        }
+    }
+
     async fn discovery_query(
         &self,
         kind: TaskKind,
@@ -79,7 +109,7 @@ impl Repo {
         }
     }
 
-    fn pause(&self, point: Point) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    pub(super) fn pause(&self, point: Point) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (entered, observed) = oneshot::channel();
         let (resume, waiting) = oneshot::channel();
         *self.pause.lock().unwrap() = Some(Pause {
@@ -529,6 +559,11 @@ impl RunRepository for Repo {
         limit: usize,
     ) -> anyhow::Result<tokeira_storage::OutboundPage<uuid::Uuid, tokeira_storage::PreparationToken>>
     {
+        self.outbound_reads
+            .lock()
+            .unwrap()
+            .push(OutboundRead::Publication);
+        self.outbound_read.notify_one();
         self.inner
             .read_published_preparations(home, bound, after, limit)
             .await
@@ -574,7 +609,11 @@ impl RunRepository for Repo {
         token: tokeira_storage::PreparationToken,
         fence: tokeira_storage::WriteFence,
     ) -> anyhow::Result<tokeira_storage::PublicationResult> {
-        self.inner.publish_prepared_run(token, fence).await
+        let result = self.inner.publish_prepared_run(token, fence).await?;
+        if self.lose_publication_reply.swap(false, Ordering::SeqCst) {
+            anyhow::bail!("lost publication reply");
+        }
+        Ok(result)
     }
 
     async fn abandon_prepared_run(
@@ -595,6 +634,17 @@ impl RunRepository for Repo {
     ) -> anyhow::Result<
         tokeira_storage::OutboundPage<tokeira_kernel::OperationKey, tokeira_storage::OperationRow>,
     > {
+        self.outbound_reads
+            .lock()
+            .unwrap()
+            .push(OutboundRead::Operation {
+                home,
+                kind,
+                after,
+                fresh_bound: matches!(bound, ScanBound::Capture),
+                limit,
+            });
+        self.outbound_read.notify_one();
         self.inner
             .read_operation_page(home, kind, bound, after, limit)
             .await
@@ -611,6 +661,11 @@ impl RunRepository for Repo {
             tokeira_storage::IntentDescriptor,
         >,
     > {
+        self.outbound_reads
+            .lock()
+            .unwrap()
+            .push(OutboundRead::Intent);
+        self.outbound_read.notify_one();
         self.inner.read_intent_page(home, bound, after, limit).await
     }
     async fn load_intent(
@@ -669,6 +724,9 @@ impl RunRepository for Repo {
         successor: Transition,
         fence: WriteFence,
     ) -> Result<tokeira_storage::PairCommitResult> {
+        if self.refuse_pair.load(Ordering::SeqCst) {
+            return Ok(tokeira_storage::PairCommitResult::SizeRefused);
+        }
         self.inner
             .commit_transition_pair(run_key, closing, successor_run_key, successor, fence)
             .await
@@ -741,10 +799,13 @@ impl RunRepository for Repo {
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
         self.loads.fetch_add(1, Ordering::SeqCst);
         self.hit(Point::Load).await?;
-        self.inner.load_run(run_key).await
+        let result = self.inner.load_run(run_key).await?;
+        self.hit(Point::Loaded).await?;
+        Ok(result)
     }
 
     async fn load_run_with_stats(&self, run_key: RunKey) -> Result<(LoadedRun, RunHistoryStats)> {
+        self.stats_loads.fetch_add(1, Ordering::SeqCst);
         self.inner.load_run_with_stats(run_key).await
     }
 
@@ -754,6 +815,7 @@ impl RunRepository for Repo {
         after_event_id: i64,
         limit: usize,
     ) -> Result<Vec<HistoryEvent>> {
+        self.history_reads.fetch_add(1, Ordering::SeqCst);
         self.inner
             .read_history(run_key, after_event_id, limit)
             .await
@@ -851,6 +913,9 @@ impl RunRepository for Repo {
             .inner
             .commit_transition_for_bundle(run_key, execution_home_bundle, transition, fence)
             .await?;
+        if matches!(result, CommitResult::Conflict { .. }) {
+            self.commit_conflicts.fetch_add(1, Ordering::SeqCst);
+        }
         self.hit(Point::Committed).await?;
         Ok(result)
     }
@@ -1127,6 +1192,20 @@ impl RunRepository for Repo {
         after: Option<&DueTimer>,
         limit: usize,
     ) -> Result<Vec<DueTimer>> {
+        self.timer_reads.lock().unwrap().push(shard_id);
+        if let Some(fixture) = self.timer_fixture.lock().unwrap().as_ref() {
+            let mut rows = fixture.get(&shard_id).cloned().unwrap_or_default();
+            rows.sort_by_key(|row| (row.fire_at, row.run_key, row.timer_id.clone()));
+            rows.retain(|row| {
+                row.fire_at <= now
+                    && after.is_none_or(|after| {
+                        (row.fire_at, row.run_key, &row.timer_id)
+                            > (after.fire_at, after.run_key, &after.timer_id)
+                    })
+            });
+            rows.truncate(limit);
+            return Ok(rows);
+        }
         self.inner
             .list_due_timers_for_shard(shard_id, now, after, limit)
             .await
@@ -1523,6 +1602,9 @@ async fn execution_home_admission_delivery_and_completion_check_current_and_stal
             sticky: None,
             commands: vec![],
             command_sizes: vec![],
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
+            heartbeat: Default::default(),
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: vec![],
@@ -1780,6 +1862,7 @@ pub(super) async fn final_gate_case<R: RunRepository + 'static>(
         &NexusTimeoutTrackingState::default(),
         &CompletionCallbackTrackingState::default(),
         &repair,
+        tokeira_clock::system_clock().as_ref(),
     )
     .await
     .unwrap();
@@ -1948,4 +2031,145 @@ async fn workflow_dispatch_fenced_repair_empty_home_gate_controls() {
             .await;
         }
     }
+}
+
+#[tokio::test]
+async fn completion_inline_scope_is_rechecked_after_occ_changes_target() {
+    let repo = Arc::new(Repo::default());
+    let runtime = Arc::new(
+        Arc::try_unwrap(runtime(repo.clone()))
+            .ok()
+            .unwrap()
+            .with_activity_eager_execution(true),
+    );
+    runtime
+        .recover_self_assigned_shard(ShardId(0), ShardEpoch::ZERO)
+        .await
+        .unwrap();
+    let mut start = super::tests::sample_start_request(None, None);
+    start.deployment = Some(DeploymentId("workers".into()));
+    start.build_id = Some(tokeira_types::BuildId("allowed".into()));
+    let queue = QueueKey {
+        namespace_id: start.namespace_id,
+        task_queue: start.task_queue.clone(),
+        task_kind: TaskKind::Workflow,
+        deployment: start.deployment.clone(),
+        build_id: start.build_id.clone(),
+    };
+    runtime.start_workflow(start).await.unwrap();
+    let first = runtime
+        .poll_workflow_task(
+            queue.clone(),
+            WorkerIdentity("a".into()),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let mut completion = super::completion_inline_tests::completion(&first, true);
+    completion.force_new_workflow_task = true;
+    completion.versioning_behavior = VersioningBehavior::AutoUpgrade;
+    completion.deployment_version = Some(WorkerDeploymentVersionRef {
+        deployment_name: "workers".into(),
+        build_id: "allowed".into(),
+    });
+    completion.sticky = Some(StickySpec {
+        queue: TaskQueueName("a-cache".into()),
+        schedule_to_start_timeout: Duration::seconds(5),
+    });
+    completion.inline_workflow_task.as_mut().unwrap().scope = Some(CompletionWorkflowTaskScope {
+        namespace_id: queue.namespace_id,
+        normal_task_queues: vec![queue.task_queue],
+        deployment: DeploymentId("workers".into()),
+        build_id: tokeira_types::BuildId("allowed".into()),
+    });
+    completion.eager_activities.scope = completion
+        .inline_workflow_task
+        .as_ref()
+        .unwrap()
+        .scope
+        .clone();
+    let mut activity = super::completion_eager_tests::schedule("scoped-eager", false);
+    if let tokeira_kernel::WorkflowCommand::ScheduleActivity {
+        task_queue,
+        use_workflow_build_id,
+        ..
+    } = &mut activity
+    {
+        *task_queue = completion
+            .eager_activities
+            .scope
+            .as_ref()
+            .unwrap()
+            .normal_task_queues[0]
+            .clone();
+        *use_workflow_build_id = true;
+    }
+    completion.commands.push(activity);
+    let stats_before = repo.stats_loads.load(Ordering::SeqCst);
+    let (entered, resume) = repo.pause(Point::Commit);
+    let completing = runtime.clone();
+    let handle = tokio::spawn(async move {
+        completing
+            .complete_workflow_task_with_result(completion)
+            .await
+    });
+    entered.await.unwrap();
+    let LoadedRun::Existing(state) = repo.inner.load_run(first.run_key).await.unwrap() else {
+        panic!("run");
+    };
+    let changed = BasicKernel
+        .apply(
+            LoadedRun::Existing(state),
+            Command::UpdateExecutionOptions(UpdateExecutionOptionsRequest {
+                versioning_override: VersioningOverrideChange::Set(VersioningOverride::Pinned {
+                    version: WorkerDeploymentVersionRef {
+                        deployment_name: "workers".into(),
+                        build_id: "outside-scope".into(),
+                    },
+                }),
+                completion_callbacks: FieldChange::Unchanged,
+                attached_completion_callbacks: Vec::new(),
+                attached_links: Vec::new(),
+                attached_request_id: None,
+                request: RequestContext::unattributed(OffsetDateTime::now_utc()),
+                now: OffsetDateTime::now_utc(),
+                priority: FieldChange::Unchanged,
+                completion_callback_limit: None,
+            }),
+        )
+        .unwrap();
+    assert!(matches!(
+        repo.inner
+            .commit_transition(first.run_key, changed, WriteFence::Unfenced)
+            .await
+            .unwrap(),
+        CommitResult::Applied { .. }
+    ));
+    resume.send(()).unwrap();
+    let outcome = handle.await.unwrap().unwrap();
+    assert!(outcome.activity_tasks.is_empty());
+    assert_eq!(repo.stats_loads.load(Ordering::SeqCst), stats_before + 1);
+    assert!(
+        outcome.workflow_task.is_none(),
+        "stale permitted target must not authorize the retried transition"
+    );
+    let CommitResult::Applied { new_state } = outcome.commit else {
+        panic!("commit");
+    };
+    assert!(new_state.activities["scoped-eager"].started_at.is_none());
+    assert_eq!(
+        new_state.effective_deployment().unwrap().build_id,
+        "outside-scope"
+    );
+    assert!(
+        new_state
+            .pending_workflow_task
+            .as_ref()
+            .unwrap()
+            .started_event_id
+            .is_none()
+    );
+    assert_eq!(new_state.sticky.unwrap().sticky_queue.0, "a-cache");
+    stop(&runtime).await;
 }

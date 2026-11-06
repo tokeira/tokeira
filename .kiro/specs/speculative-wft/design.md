@@ -241,9 +241,14 @@ embedding crates; the engine release that carries it is a minor version bump.
 
 ### Runtime (`crates/tokeira-runtime`)
 
-- **Direct dispatch:** the speculative dispatch op bypasses durable backlog — publish straight to
-  the broker; sticky-first with normal-queue fallback on sticky-unavailable; failures logged only.
-  Zero-message dispatch is suppressed (Req 1.5).
+- **Direct dispatch:** independently scheduled speculative work bypasses durable backlog and
+  publishes to the broker, sticky-first with normal fallback; zero-message dispatch is suppressed.
+  A speculative follow-up returned from completion instead follows
+  [api-conformance-wft-completion](../api-conformance-wft-completion/design.md#return-new-wft-safety):
+  its pending state is started in that transition, no offer/row is created, and the response
+  exposes virtual history only after commit. This preserves the existing durable pending-state
+  mapping below; Temporal creates/starts this follow-up after persistence
+  (`service/history/api/respondworkflowtaskcompleted/api.go:702-725 @ v1.31.0`).
 - **In-memory timers:** 5s normal-queue schedule-to-start (pinned const), sticky schedule-to-start,
   and start-to-close for the started speculative task — tracked beside the existing WFT timeout
   tracking, **invalidated when the tracked task changes** (stale-guard analogue of

@@ -3490,16 +3490,7 @@ fn spawn_chasm_timer_sweeper(
     let sweeper = tokeira_runtime::chasm::ChasmTimerSweeper::new(engine)
         .with_evaluator(archetype_id, evaluator);
     let _sweeper = tasks.spawn(async move {
-        let mut interval = tokio::time::interval(CHASM_TIMER_SWEEP_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = interval.tick() => {
-                    sweeper.sweep_once().await;
-                }
-            }
-        }
+        sweeper.run(CHASM_TIMER_SWEEP_INTERVAL, cancel).await;
     });
 }
 
@@ -3755,6 +3746,12 @@ where
     .with_queue_placement(
         effective_config.infrastructure.placement.partition_count,
         effective_config.infrastructure.placement.bundle_count,
+    )
+    .with_activity_eager_execution(
+        effective_config
+            .policy
+            .compatibility
+            .enable_activity_eager_execution,
     )
     .with_worker_deployment_repository(worker_deployment_repository)
     .with_task_queue_config_store(task_queue_config_store.clone())
@@ -5349,6 +5346,7 @@ where
                         .collect(),
                     pending_workflow_task: state.pending_workflow_task.as_ref().map(|task| {
                         tokeira_edge::translate::PendingWorkflowTaskDescription {
+                            original_scheduled_at: task.original_scheduled_at,
                             is_started: task.started_event_id.is_some(),
                             scheduled_at: task.scheduled_at,
                             started_at: task.started_at,

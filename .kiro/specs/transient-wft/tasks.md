@@ -17,8 +17,8 @@ verification; existing completion marks below retain their historical meaning.
 Requirements: [requirements.md](./requirements.md). Design: [design.md](./design.md).
 
 > **Requirement 0 accepted (2026-07-03, owner)** — adopt the transient-WFT model, amending the Feature-2
-> per-attempt-event design. Items A and B may proceed. Item C (heartbeat timeout) is **out of scope**
-> (OverrideDynamicConfig skip). The Tier-1.2 leaves stay classified skips until each phase flips them:
+> per-attempt-event design. Items A and B may proceed. Item C was excluded then;
+> the new decision and unchecked C.2 below supersede that exclusion. The Tier-1.2 leaves stay classified skips until each phase flips them:
 > Phase A flips 1 leaf, Phase B flips 3.
 
 All kernel edits stay pure (AGENTS §2). Ground-truth every behaviour to v1.31.0 and cite the source in
@@ -90,12 +90,43 @@ code comments (AGENTS §8, §9). Verify with `cargo clippy -p tokeira-kernel -p 
   removed; leaves GREEN out-of-process. `TestWorkflowTaskTestSuite` = 8 pass / 0 fail / 1 skip
   (the permanent heartbeat OverrideDynamicConfig skip).
 
-## Phase C — Heartbeat timeout (out of scope; skip only) ✅ done
+## Phase C — Heartbeat timeout (new implementation decision)
 
-- [x] C.1 `TestWorkflowTaskTestSuite/TestWorkflowTaskHeartbeatingWithEmptyResult` reclassified in the
+- [x] C.1 Historical skip decision, superseded by C.2: `TestWorkflowTaskTestSuite/TestWorkflowTaskHeartbeatingWithEmptyResult` reclassified in the
   fork registry (`tests/testcore/tokeira_conformance_skip.go`) from "DEFERRED GAP" to a **permanent
   `OverrideDynamicConfig` out-of-scope skip** (30m default not operationally wrong; same class as
   `MaxCallbacksPerWorkflow`; owner decision 2026-07-03). No config knob, no `original_scheduled_at`.
+
+- [x] C.2 Implement the fixed heartbeat limit with compatible state
+  - Depends on B.6/B.8 and the completion-inline result work in
+    [api-conformance-wft-completion tasks 6.2–6.4](../api-conformance-wft-completion/tasks.md).
+    Match Item C's exact successor oracle: reapply request sticky attributes,
+    schedule a fresh Normal task, and apply completion Requirement 3's inline gate
+    without returning the task or marking updates sent. Keep queries buffered and
+    test its subsequent sticky start-to-close timeout and normal-queue retry.
+  - First add a heartbeat-only completion beyond 30 minutes and require a committed
+    timeout, no Completed event and exact NotFound. Keep each individual task within
+    start-to-close while advancing a heartbeat chain beyond 30 minutes. Prove
+    failure on `main` before production edits. Use a supplied clock; disabling the limit must make the
+    negative-control test fail, while below/equal threshold completes successfully.
+  - Add the original-schedule optional extension and frozen old-byte fixtures;
+    carry it through heartbeat chains and reset after progress/timeout. Verify
+    missing/nonpositive legacy time, force=false, nonempty commands, message-only
+    progress and restart. Account explicitly for history-only rebuild, which must
+    not invent an origin unavailable in legacy history.
+  - Wire the duration override into runtime operands; production stays 30 minutes
+    with no TOML field. Emit a committed-timeout outcome, preserve transient and
+    speculative materialization, and map the error only after successful commit.
+  - Required PBTs C1/C2, at least 100 cases each, tagged
+    `// Feature: transient-wft, Property C1` and `Property C2`: independent predicate,
+    carry/reset/legacy oracle, OCC failures and timeout-state/token agreement.
+  - Integrate the parked normal-poll heartbeat race and lost-response recovery
+    fixtures from the completion spec. Run focused kernel/runtime/edge/storage
+    tests and root §10.4 with the combined change.
+  - [x] Orchestrator runs the entire `TestWorkflowTaskTestSuite`, including both
+    heartbeat tests, with the override; remove the historical fork skip only as
+    part of that verification, never edit corpus bodies or claim a skipped pass.
+  - _Requirements: C.1.1–C.1.12; Properties C1, C2_
 
 ## Phase D — Docs
 
@@ -115,7 +146,8 @@ code comments (AGENTS §8, §9). Verify with `cargo clippy -p tokeira-kernel -p 
     { "id": 4, "tasks": ["B.7"] },
     { "id": 5, "tasks": ["B.8", "B.9"] },
     { "id": 6, "tasks": ["B.10"] },
-    { "id": 7, "tasks": ["C.1", "D.1"] }
+    { "id": 7, "tasks": ["C.1", "D.1"] },
+    { "id": 8, "tasks": ["C.2"] }
   ]
 }
 ```

@@ -335,3 +335,12 @@ proptest! {
         })?;
     }
 }
+
+#[test]
+fn eager_completion_has_no_dispatch_rows() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    crate::activity_dispatch_tests::eager_completion_cases(&InMemoryStore::default(), &runtime);
+}

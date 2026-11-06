@@ -150,6 +150,11 @@ impl<R: RunRepository + 'static> Executor for Recovery<R> {
                 // A durable publication descriptor remains if the reply is lost or
                 // this bookkeeping fails; retirement of the intent cannot lose it.
                 repo.complete_run_preparation(token, attempt.fence).await?;
+                owner
+                    .read()
+                    .expect("shard owner lock poisoned")
+                    .timer_wake
+                    .published(intent.source_home, &state);
                 publisher
                     .publish(state.run_key, intent.source_home, &dispatch)
                     .await
@@ -172,14 +177,15 @@ impl<R: RunRepository + 'static> Recovery<R> {
             .write()
             .expect("shard owner lock poisoned")
             .invalidate_published_states();
-        if let LoadedRun::Existing(state) = loaded {
+        let home = token.home;
+        if let LoadedRun::Existing(state) = &loaded {
             let workflow = self
                 .workflow_timeouts
                 .for_acquisition(attempt.acquisition.clone());
             let wft = self
                 .wft_timeouts
                 .for_acquisition(attempt.acquisition.clone());
-            if let Some(entry) = tokeira_storage::recovery_entries(&state).workflow_timeout {
+            if let Some(entry) = tokeira_storage::recovery_entries(state).workflow_timeout {
                 workflow.insert(crate::timeout::WorkflowTimeoutEntry {
                     run_key: entry.run_key,
                     shard_id: token.home,
@@ -191,14 +197,21 @@ impl<R: RunRepository + 'static> Recovery<R> {
                     has_retry_policy: entry.has_retry_policy,
                 });
             }
-            crate::lane::track_committed_run(&state, &[], token.home, &workflow, &wft);
-            self.publisher.track_published_outbound(&state, &attempt);
+            crate::lane::track_committed_run(state, &[], token.home, &workflow, &wft);
+            self.publisher.track_published_outbound(state, &attempt);
         }
         drop(exclusive);
         attempt.validate(&self.owner)?;
         self.repo
             .complete_run_preparation(token, attempt.fence)
             .await?;
+        if let LoadedRun::Existing(state) = &loaded {
+            self.owner
+                .read()
+                .expect("shard owner lock poisoned")
+                .timer_wake
+                .published(home, state);
+        }
         Ok(())
     }
 }

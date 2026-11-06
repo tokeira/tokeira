@@ -76,6 +76,7 @@ impl OwnedShard {
 /// in the `Active` state accept new commands.
 #[derive(Debug)]
 pub struct ShardOwner {
+    pub(crate) timer_wake: crate::scanner::TimerWake,
     shards: HashMap<ShardId, OwnedShard>,
     shard_count: u32,
     next_generation: u64,
@@ -165,6 +166,7 @@ impl ShardOwner {
     pub fn new(shard_count: u32) -> Self {
         assert!(shard_count > 0, "shard_count must be > 0");
         Self {
+            timer_wake: crate::scanner::TimerWake::default(),
             shards: HashMap::new(),
             shard_count,
             next_generation: 0,
@@ -260,6 +262,8 @@ impl ShardOwner {
     pub fn mark_active(&mut self, shard_id: ShardId) {
         if let Some(owned) = self.shards.get_mut(&shard_id) {
             owned.state = ShardState::Active;
+            self.timer_wake
+                .changed(shard_id, time::PrimitiveDateTime::MIN.assume_utc());
         }
     }
 
@@ -637,6 +641,7 @@ mod tests {
                     has_retry_policy: false,
                 });
                 ats.insert(ActivityTrackingEntry {
+                    timeouts: None,
                     run_key: rk,
                     shard_id: shard_a,
                     activity_id: format!("a-{i}"),
@@ -647,6 +652,7 @@ mod tests {
                     cancel_requested: false,
                 });
                 nts.insert(NexusTimeoutEntry {
+                    timeouts: None,
                     run_key: rk,
                     shard_id: shard_a,
                     operation_id: format!("n-{i}"),
@@ -669,6 +675,7 @@ mod tests {
                     has_retry_policy: false,
                 });
                 ats.insert(ActivityTrackingEntry {
+                    timeouts: None,
                     run_key: rk,
                     shard_id: shard_b,
                     activity_id: format!("b-{i}"),
@@ -679,6 +686,7 @@ mod tests {
                     cancel_requested: false,
                 });
                 nts.insert(NexusTimeoutEntry {
+                    timeouts: None,
                     run_key: rk,
                     shard_id: shard_b,
                     operation_id: format!("nb-{i}"),
@@ -771,6 +779,7 @@ mod tests {
                     has_retry_policy: false,
                 });
                 ats.insert(ActivityTrackingEntry {
+                    timeouts: None,
                     run_key: rk,
                     shard_id: shard_a,
                     activity_id: format!("a-{i}"),
@@ -781,6 +790,7 @@ mod tests {
                     cancel_requested: false,
                 });
                 nts.insert(NexusTimeoutEntry {
+                    timeouts: None,
                     run_key: rk,
                     shard_id: shard_a,
                     operation_id: format!("n-{i}"),
@@ -803,6 +813,7 @@ mod tests {
                     has_retry_policy: false,
                 });
                 ats.insert(ActivityTrackingEntry {
+                    timeouts: None,
                     run_key: rk,
                     shard_id: shard_b,
                     activity_id: format!("b-{i}"),
@@ -813,6 +824,7 @@ mod tests {
                     cancel_requested: false,
                 });
                 nts.insert(NexusTimeoutEntry {
+                    timeouts: None,
                     run_key: rk,
                     shard_id: shard_b,
                     operation_id: format!("nb-{i}"),

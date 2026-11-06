@@ -106,3 +106,10 @@ Waves (each wave's tasks may proceed once prior waves complete):
 
 - [x] Verify Property 5 with the required property and regression tests: `stored_activity_deadlines_are_total`.
   _Requirements: 10._
+
+- [x] 8. Wake standalone activity timers at their deadlines
+  - Share deadline notifications across commit, re-arm and rebuild; select only due
+    executions in deadline order and defer failed evaluations until the full pass.
+  - Verify existing and newly armed deadlines with a one-hour interval, close
+    deadlines, failure isolation, bounded planning and due-only selection.
+  - _Requirements: 1.3, 9.2._

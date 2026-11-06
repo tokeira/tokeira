@@ -1,7 +1,7 @@
 //! Activity-task lifecycle methods of [`TokeiraRuntime`].
 //!
 //! This `impl` continuation owns the worker-facing activity-task surface:
-//! long-poll / eager-claim delivery, the atomic poll→Started transition, and
+//! ordinary local and forwarded delivery, the atomic poll→Started transition, and
 //! the completion / failure / cancel / heartbeat resolutions that feed an
 //! activity outcome back into its owning run. Every mutating path applies a
 //! kernel command on the run's owned shard via
@@ -44,21 +44,17 @@ use tokeira_observability::OutcomeLabel;
 use tokeira_types::{TaskKind, WorkerTaskClass, WorkerTaskOrigin};
 use tracing::Instrument as _;
 
-/// An activity's input and header, which live only in its ActivityTaskScheduled
-/// event (`activity-inputs-from-history`).
-type ScheduledInput = (Payloads, Option<Headers>);
-
 #[derive(Clone, Debug)]
-struct ActivitySchedule {
-    input: Payloads,
-    header: Option<Headers>,
-    scheduled_time: OffsetDateTime,
-    schedule_to_close_timeout: Option<Duration>,
-    start_to_close_timeout: Option<Duration>,
-    heartbeat_timeout: Option<Duration>,
+pub(super) struct ActivitySchedule {
+    pub(super) input: Payloads,
+    pub(super) header: Option<Headers>,
+    pub(super) scheduled_time: OffsetDateTime,
+    pub(super) schedule_to_close_timeout: Option<Duration>,
+    pub(super) start_to_close_timeout: Option<Duration>,
+    pub(super) heartbeat_timeout: Option<Duration>,
 }
 
-fn activity_start_response(
+pub(super) fn activity_start_response(
     state: &WorkflowState,
     activity: &tokeira_kernel::ActivityState,
     task: &DispatchableActivityTask,
@@ -401,7 +397,6 @@ where
             offer.request_id,
             offer.entered_at,
             &worker_identity,
-            None,
         )
         .await
     }
@@ -418,7 +413,6 @@ where
             request.request_id,
             tokio::time::Instant::now(),
             &request.worker,
-            None,
         )
         .await
     }
@@ -479,48 +473,6 @@ where
             now,
             rule_id: Some(rule_id),
         })))
-    }
-
-    /// Start a just-committed schedule directly on its execution owner.
-    ///
-    /// `schedule_event_id`, `input` and `header` must come from the same successful
-    /// workflow-task completion. The event identity prevents an old completion
-    /// callback from supplying payloads to a replacement using the same activity ID.
-    /// An ordinary poll may win first; the common fenced start then returns no task.
-    #[allow(clippy::too_many_arguments)] // The completion carries one exact schedule and its payload.
-    pub async fn try_claim_activity_task(
-        &self,
-        queue: QueueKey,
-        run_key: RunKey,
-        activity_id: String,
-        schedule_event_id: i64,
-        worker_identity: WorkerIdentity,
-        input: Payloads,
-        header: Option<Headers>,
-    ) -> Result<Option<StartedActivityTask>> {
-        self.ready().await?;
-        let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
-            return Ok(None);
-        };
-        let Some(activity) = state.activities.get(&activity_id) else {
-            return Ok(None);
-        };
-        if activity.schedule_event_id != schedule_event_id
-            || activity.attempt != 1
-            || activity.stamp != 0
-        {
-            return Ok(None);
-        }
-        let mut task = activity_dispatch_task(run_key, &state, activity);
-        task.queue = queue;
-        self.start_activity_task(
-            &task,
-            Uuid::new_v4(),
-            tokio::time::Instant::now(),
-            &worker_identity,
-            Some((input, header)),
-        )
-        .await
     }
 
     /// Record a successful activity completion and
@@ -888,6 +840,7 @@ where
                 timer_ops: SmallVec::new(),
                 dispatch_ops: SmallVec::new(),
                 events_numbered_at_close: 0,
+                workflow_task_heartbeat_timed_out: false,
                 growth_limits: Some(crate::run_growth::run_growth_limits()),
             };
 
@@ -1125,10 +1078,17 @@ where
             )
             .await?
             {
-                CommitResult::Applied { .. } => {
+                CommitResult::Applied { new_state } => {
                     runtime_metrics::record_activity_task_started(OutcomeLabel::Success);
-                    self.activity_tracking
-                        .record_started(run_key, activity_id, self.clock.now());
+                    self.activity_tracking.record_started_with_timeouts(
+                        run_key,
+                        activity_id,
+                        self.clock.now(),
+                        new_state
+                            .activities
+                            .get(activity_id)
+                            .map(crate::activity_timeout::ActivityTimeouts::from),
+                    );
                     return Ok(token);
                 }
                 CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
@@ -1322,23 +1282,20 @@ where
     /// returns a retryable owner error. The same request can retry, and canonical
     /// discovery recovers the work if that poll ends.
     ///
-    /// The task's input and header are `scheduled` when the caller has them, as
-    /// an eager start does; otherwise the start reads them from the activity's
-    /// ActivityTaskScheduled event.
+    /// The input and header come from the immutable ActivityTaskScheduled event.
     async fn start_activity_task(
         &self,
         task: &DispatchableActivityTask,
         request_id: Uuid,
         entered_at: tokio::time::Instant,
         worker_identity: &WorkerIdentity,
-        scheduled: Option<ScheduledInput>,
     ) -> Result<Option<StartedActivityTask>> {
-        self.start_activity_task_traced(task, request_id, entered_at, worker_identity, scheduled)
+        self.start_activity_task_traced(task, request_id, entered_at, worker_identity)
             .await
             .map(ActivityStartOutcome::into_task)
     }
 
-    // Local eager claims and forwarded owner starts share the same span boundary:
+    // Local polls and forwarded owner starts share the same span boundary:
     // changing placement must not remove host-owned activity processing telemetry.
     async fn start_activity_task_traced(
         &self,
@@ -1346,7 +1303,6 @@ where
         request_id: Uuid,
         entered_at: tokio::time::Instant,
         worker_identity: &WorkerIdentity,
-        scheduled: Option<ScheduledInput>,
     ) -> Result<ActivityStartOutcome> {
         let span = tracing::info_span!(
             "activity_task.process",
@@ -1360,17 +1316,12 @@ where
             tokeira.attempt = i64::from(task.attempt),
         );
         // Owner processing retains whole run images across awaits. Keeping its
-        // future on the heap prevents eager/poll/forwarding wrappers from
+        // future on the heap prevents poll/forwarding wrappers from
         // multiplying that state on the caller's stack in unoptimized builds.
-        let result = Box::pin(self.start_activity_task_inner(
-            task,
-            request_id,
-            entered_at,
-            worker_identity,
-            scheduled,
-        ))
-        .instrument(span.clone())
-        .await;
+        let result =
+            Box::pin(self.start_activity_task_inner(task, request_id, entered_at, worker_identity))
+                .instrument(span.clone())
+                .await;
         if let Ok(
             ActivityStartOutcome::Started(started) | ActivityStartOutcome::Replayed(started),
         ) = &result
@@ -1388,7 +1339,6 @@ where
         request_id: Uuid,
         entered_at: tokio::time::Instant,
         worker_identity: &WorkerIdentity,
-        eager: Option<ScheduledInput>,
     ) -> Result<ActivityStartOutcome> {
         ActivityTaskStartRequest {
             offered: task.clone(),
@@ -1533,9 +1483,9 @@ where
                 return Ok(ActivityStartOutcome::Stale);
             }
 
-            // All delivery shapes converge here: ordinary long-poll and eager claim both call
-            // `start_activity_task`. Reading durable rules immediately before Started avoids the
-            // frontend gate/poll-admission race and mirrors
+            // Ordinary local and forwarded polls evaluate rules immediately
+            // before Started. Completion-owned eager starts bypass this gate.
+            // Reading durable rules here avoids the frontend admission race and mirrors
             // `recordactivitytaskstarted/api.go:332-372 @ v1.31.0`. The
             // backoff interval is derived from durable state so a
             // `BackoffInterval` rule created after publication but before
@@ -1679,21 +1629,7 @@ where
             // event never changes, so a retry after a conflict keeps what the
             // first pass read.
             if scheduled.is_none() {
-                scheduled = Some(if let Some((input, header)) = eager.as_ref() {
-                    if current.attempt != 1 {
-                        return Ok(ActivityStartOutcome::Stale);
-                    }
-                    ActivitySchedule {
-                        input: input.clone(),
-                        header: header.clone(),
-                        scheduled_time: current.scheduled_at,
-                        schedule_to_close_timeout: current.schedule_to_close_timeout,
-                        start_to_close_timeout: current.start_to_close_timeout,
-                        heartbeat_timeout: current.heartbeat_timeout,
-                    }
-                } else {
-                    self.read_scheduled_input(task).await?
-                });
+                scheduled = Some(self.read_scheduled_input(task).await?);
             }
 
             let started = activity_start_response(
@@ -1744,7 +1680,14 @@ where
                         .record_latency(&task.queue, entered_at.elapsed());
                     // Callback authority stays with the acquisition that committed;
                     // a replacement owner must reconstruct its own timeout tracking.
-                    start_tracking.record_started(task.run_key, &next_activity.activity_id, now);
+                    start_tracking.record_started_with_timeouts(
+                        task.run_key,
+                        &next_activity.activity_id,
+                        now,
+                        Some(crate::activity_timeout::ActivityTimeouts::from(
+                            &next_activity,
+                        )),
+                    );
                     return Ok(ActivityStartOutcome::Started(started));
                 }
                 CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
@@ -1895,6 +1838,7 @@ where
                 activity_id: &token.activity_id,
                 expected_attempt: token.attempt,
                 expected_schedule_event_id: token.schedule_event_id,
+                timeout: None,
             },
             next_attempt,
             backoff,
@@ -2016,12 +1960,14 @@ pub(crate) struct ActivityRetryTarget<'a> {
     pub activity_id: &'a str,
     pub expected_attempt: u32,
     pub expected_schedule_event_id: i64,
+    /// Scanner observations must still hold at each commit; workers leave this absent.
+    pub timeout: Option<crate::activity_timeout::ActivityTimeoutCheck>,
 }
 
 /// Commit an activity's next attempt and durable eligibility time.
 ///
 /// Canonical storage maintenance retains the future attempt's row; owner
-/// eligibility tracking evaluates rules at the deadline and queue-home discovery
+/// eligibility tracking evaluates rules and offers locally at the deadline; discovery
 /// reconstructs offers. The timeout scanner uses the same transition when a
 /// fired attempt timeout is retryable (`RetryActivity` →
 /// `UpdateActivityInfoForRetries`, mutable_state_impl.go + activity.go:63-97
@@ -2053,7 +1999,11 @@ where
     });
     let mut attempts = 0u32;
     loop {
-        let LoadedRun::Existing(state) = deps.repo.load_run(run_key).await? else {
+        let loaded = deps.repo.load_run(run_key).await?;
+        if let Some(check) = &target.timeout {
+            check.validate(&loaded)?;
+        }
+        let LoadedRun::Existing(state) = loaded else {
             return Err(anyhow!("run not found for activity retry"));
         };
         // A closed run never schedules another attempt, whoever asks.
@@ -2191,6 +2141,7 @@ where
             timer_ops: SmallVec::new(),
             dispatch_ops,
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: Some(crate::run_growth::run_growth_limits()),
         };
 
@@ -2243,12 +2194,24 @@ where
         {
             CommitResult::Applied { new_state } => {
                 let tracking = deps.tracking.for_acquisition(acquisition);
-                tracking.eligibility.refresh(&new_state, bundle);
                 if paused {
                     tracking.remove(run_key, activity_id);
                     return Ok(());
                 }
-                tracking.record_retry(run_key, activity_id, dispatch_at);
+                tracking.record_retry_with_timeouts(
+                    run_key,
+                    activity_id,
+                    dispatch_at,
+                    new_state
+                        .activities
+                        .get(activity_id)
+                        .map(crate::activity_timeout::ActivityTimeouts::from),
+                );
+                // Eligibility can wake a local poll immediately. Reset this
+                // attempt's anchors first, so its start cannot be cleared later.
+                tracking.refresh_eligibility(&new_state, bundle, deps.clock.now());
+                #[cfg(test)]
+                tracking.eligibility.pause_after_refresh().await;
                 // The committed canonical row is discoverable independently of
                 // this callback; eligibility tracking applies later owner rules.
                 return Ok(());
@@ -2301,7 +2264,7 @@ pub(crate) fn activity_dispatch_task(
     }
 }
 
-/// Execution-owner eligibility outcome; none of these outcomes publishes work.
+/// Execution-owner eligibility outcome; only deferred attempts are offered locally.
 #[derive(Debug)]
 pub(crate) enum ActivityDispatchPreparation {
     /// The due attempt passed owner rule evaluation.
@@ -2349,8 +2312,9 @@ pub(crate) fn activity_backoff_interval_seconds(
     Ok(Some((scheduled_at - completed_at).whole_seconds()))
 }
 
-/// Evaluate the captured execution-owner timer without resolving a queue or
-/// publishing an offer. A non-match is read-only; a pause uses the captured fence.
+/// Evaluate the captured execution-owner timer and offer deferred work locally.
+/// A pause uses the captured fence and publishes nothing. Queue homes on another
+/// node still discover the durable attempt on their next pass, as for first starts.
 pub(crate) async fn evaluate_activity_eligibility<R: RunRepository + 'static>(
     deps: &ActivityRetryDeps<R>,
     task: &DispatchableActivityTask,
@@ -2437,6 +2401,34 @@ async fn prepare_activity_dispatch<R: RunRepository + 'static>(
         let Some(rule) =
             matching_pause_rule(&state, &current, &rules, now, backoff_interval_seconds)
         else {
+            if dispatch_at > deps.clock.now() {
+                return Ok(Preparation::NotYetDispatchable);
+            }
+            if !deps.tracking.eligibility.offers_locally(task) {
+                return Ok(Preparation::Eligible);
+            }
+            let registry = deps
+                .worker_deployment_registry
+                .read()
+                .expect("worker deployment registry lock poisoned")
+                .clone();
+            let mut offer = activity_dispatch_task(task.run_key, &state, &current);
+            (offer.queue, offer.dispatch_revision) =
+                super::workflow_task::route_activity_task_queue(
+                    registry.as_ref(),
+                    &state,
+                    offer.queue,
+                    offer.dispatch_revision,
+                )
+                .await?;
+            captured.validate(&deps.shard_owner)?;
+            // The retry timer supplies matching at its due time
+            // (service/history/workflow/task_generator.go:567-577 @ v1.31.0).
+            // Discovery remains the durable backstop; broker deduplication
+            // tolerates either path arriving first.
+            deps.broker
+                .publish_activity_task(offer, Some(&deps.delivery_metrics))
+                .await?;
             return Ok(Preparation::Eligible);
         };
 
@@ -2459,6 +2451,7 @@ async fn prepare_activity_dispatch<R: RunRepository + 'static>(
             timer_ops: SmallVec::new(),
             dispatch_ops: SmallVec::new(),
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: Some(crate::run_growth::run_growth_limits()),
         };
         captured.validate(&deps.shard_owner)?;
@@ -2858,6 +2851,7 @@ mod tests {
             timer_ops: SmallVec::new(),
             dispatch_ops: SmallVec::new(),
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         };
         repo.commit_transition(run_key, transition, WriteFence::Unfenced)
@@ -3008,6 +3002,7 @@ mod tests {
                 priority: None,
             }],
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         };
         repo.commit_transition(run_key, transition, WriteFence::Unfenced)
@@ -3170,7 +3165,6 @@ mod tests {
                 Uuid::new_v4(),
                 tokio::time::Instant::now(),
                 &WorkerIdentity("activity-worker".to_string()),
-                None,
             )
             .await
             .expect("activity poll should be evaluated");
@@ -3322,66 +3316,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_and_eager_starts_apply_the_same_rule_before_started() {
-        for eager in [false, true] {
-            let repo = Arc::new(InMemoryStore::default());
-            let runtime = TokeiraRuntime::new(
-                repo.clone(),
-                1,
-                LaneConfig::default(),
-                TimerScannerConfig::default(),
-                WorkflowTimeoutScannerConfig::default(),
-            );
-            let (state, queue, task) = seed_scheduled_activity(&runtime, &repo).await;
-            assert_eq!(
-                repo.create_workflow_rule(
-                    state.namespace_id,
-                    pause_rule("pause", "ActivityType = 'activity-type'"),
-                    10,
-                )
-                .await
-                .expect("store rule"),
-                WorkflowRuleCreateResult::Created,
-            );
+    async fn ordinary_starts_apply_rules_before_started() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+        );
+        let (state, queue, task) = seed_scheduled_activity(&runtime, &repo).await;
+        assert_eq!(
+            repo.create_workflow_rule(
+                state.namespace_id,
+                pause_rule("pause", "ActivityType = 'activity-type'"),
+                10,
+            )
+            .await
+            .expect("store rule"),
+            WorkflowRuleCreateResult::Created,
+        );
 
-            let started = if eager {
-                runtime
-                    .try_claim_activity_task(
-                        queue,
-                        task.run_key,
-                        task.activity_id.clone(),
-                        task.schedule_event_id,
-                        WorkerIdentity("worker".to_string()),
-                        Payloads::default(),
-                        None,
-                    )
-                    .await
-                    .expect("eager claim")
-            } else {
-                runtime
-                    .poll_activity_task(
-                        queue,
-                        WorkerIdentity("worker".to_string()),
-                        tokio::time::Duration::from_millis(100),
-                    )
-                    .await
-                    .expect("ordinary poll")
-            };
-            assert!(started.is_none());
-            let LoadedRun::Existing(after) = repo.load_run(task.run_key).await.unwrap() else {
-                panic!("seeded run should exist");
-            };
-            let pause = after.activities[&task.activity_id]
-                .pause_info
-                .as_ref()
-                .expect("rule must pause before Started");
-            assert_eq!(pause.rule_id.as_deref(), Some("pause"));
-            assert!(
-                after.activities[&task.activity_id]
-                    .started_event_id
-                    .is_none()
-            );
-        }
+        let started = runtime
+            .poll_activity_task(
+                queue,
+                WorkerIdentity("worker".into()),
+                tokio::time::Duration::from_millis(100),
+            )
+            .await
+            .expect("ordinary poll");
+        assert!(started.is_none());
+        let LoadedRun::Existing(after) = repo.load_run(task.run_key).await.unwrap() else {
+            panic!("seeded run should exist");
+        };
+        let pause = after.activities[&task.activity_id]
+            .pause_info
+            .as_ref()
+            .expect("rule must pause before Started");
+        assert_eq!(pause.rule_id.as_deref(), Some("pause"));
+        assert!(
+            after.activities[&task.activity_id]
+                .started_event_id
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3574,7 +3551,7 @@ mod tests {
                 let (state, token, queue) = seed_started_activity(&runtime, &repo, None).await;
                 let deps = runtime.activity_retry_deps();
                 commit_activity_retry(&deps, ActivityRetryTarget { run_key: token.run_key, activity_id: &token.activity_id,
-                    expected_attempt: token.attempt, expected_schedule_event_id: token.schedule_event_id },
+                    expected_attempt: token.attempt, expected_schedule_event_id: token.schedule_event_id, timeout: None },
                     2, Duration::seconds(backoff_seconds), None, None).await.unwrap();
                 let LoadedRun::Existing(retried) = repo.load_run(token.run_key).await.unwrap() else { panic!("retry exists"); };
                 let due = retried.activities[&token.activity_id].current_attempt_scheduled_at.unwrap();
@@ -3588,7 +3565,7 @@ mod tests {
                 if !matches_rule {
                     assert_eq!(after, retried);
                     repo.create_workflow_rule(state.namespace_id, pause_rule("after-evaluation", "Attempts >= 2"), 10).await.unwrap();
-                    deps.tracking.eligibility.refresh(&after, ShardId(0));
+                    deps.tracking.refresh_eligibility(&after, ShardId(0), deps.clock.now());
                     crate::activity_eligibility::scan_activity_eligibility_once(&deps, ShardId(0), due).await;
                     assert_eq!(repo.load_run(token.run_key).await.unwrap(), LoadedRun::Existing(after));
                     runtime.recover_self_assigned_shard(ShardId(0), ShardEpoch::ZERO).await.unwrap();
@@ -3629,8 +3606,8 @@ mod tests {
                 }
                 repo.commit_transition(state.run_key, Transition { expected_seq, next_state: state.clone(), history_events: SmallVec::new(),
                     event_principals: SmallVec::new(), request_dedupe_ops: SmallVec::new(), activity_ops: SmallVec::new(), timer_ops: SmallVec::new(),
-                    dispatch_ops: SmallVec::new(), events_numbered_at_close: 0, growth_limits: None }, WriteFence::Unfenced).await.unwrap();
-                runtime.activity_tracking.eligibility.refresh(&state, ShardId(0));
+                    dispatch_ops: SmallVec::new(), events_numbered_at_close: 0, workflow_task_heartbeat_timed_out: false, growth_limits: None }, WriteFence::Unfenced).await.unwrap();
+                runtime.activity_tracking.refresh_eligibility(&state, ShardId(0), runtime.clock.now());
                 repo.create_workflow_rule(state.namespace_id, pause_rule("bounded", "Attempts >= 2"), 10).await.unwrap();
                 let deps = runtime.activity_retry_deps();
                 crate::activity_eligibility::scan_activity_eligibility_once(&deps, ShardId(0), due).await;
@@ -3666,6 +3643,7 @@ mod tests {
                 activity_id: &token.activity_id,
                 expected_attempt: token.attempt,
                 expected_schedule_event_id: token.schedule_event_id,
+                timeout: None,
             },
             2,
             backoff,
@@ -3743,6 +3721,7 @@ mod tests {
             timer_ops: SmallVec::new(),
             dispatch_ops: SmallVec::new(),
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         };
         repo.commit_transition(run_key, transition, WriteFence::Unfenced)
@@ -3833,6 +3812,7 @@ mod tests {
         let long_ago = OffsetDateTime::now_utc() - Duration::hours(1);
         let deps = runtime.activity_retry_deps();
         deps.tracking.insert(ActivityTrackingEntry {
+            timeouts: None,
             run_key: token.run_key,
             shard_id: ShardId(0),
             activity_id: token.activity_id.clone(),
@@ -4015,6 +3995,7 @@ mod tests {
                             activity_id: &token.activity_id,
                             expected_attempt: token.attempt,
                             expected_schedule_event_id: token.schedule_event_id,
+                            timeout: None,
                         },
                         2,
                         Duration::minutes(1),
@@ -4043,7 +4024,6 @@ mod tests {
                                 Uuid::new_v4(),
                                 tokio::time::Instant::now(),
                                 &WorkerIdentity("poller".into()),
-                                None,
                             )
                             .await
                             .unwrap()
@@ -4273,6 +4253,7 @@ mod tests {
             timer_ops: SmallVec::new(),
             dispatch_ops: SmallVec::new(),
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         };
         repo.commit_transition(token.run_key, transition, WriteFence::Unfenced)
@@ -4304,6 +4285,7 @@ mod tests {
         let activity = &state.activities[&token.activity_id];
         let deps = runtime.activity_retry_deps();
         deps.tracking.insert(ActivityTrackingEntry {
+            timeouts: None,
             run_key: token.run_key,
             shard_id: ShardId(0),
             activity_id: token.activity_id.clone(),
@@ -4761,6 +4743,7 @@ mod tests {
                 timer_ops: SmallVec::new(),
                 dispatch_ops,
                 events_numbered_at_close: 0,
+                workflow_task_heartbeat_timed_out: false,
                 growth_limits: None,
             },
             WriteFence::Unfenced,
@@ -4932,6 +4915,7 @@ mod tests {
                 priority: None,
             }],
             events_numbered_at_close: 0,
+            workflow_task_heartbeat_timed_out: false,
             growth_limits: None,
         };
         repo.commit_transition(zombie_run, zombie_transition, WriteFence::Unfenced)
@@ -5219,6 +5203,7 @@ mod tests {
                             timer_ops: SmallVec::new(),
                             dispatch_ops: SmallVec::new(),
                             events_numbered_at_close: 0,
+                            workflow_task_heartbeat_timed_out: false,
                             growth_limits: None,
                         },
                         WriteFence::Unfenced,
@@ -5233,7 +5218,6 @@ mod tests {
                     Uuid::new_v4(),
                     tokio::time::Instant::now(),
                     &WorkerIdentity("poller".into()),
-                    None,
                 )
                 .await;
             assert!(
@@ -5241,35 +5225,6 @@ mod tests {
                 "refusal {refusal} answered {started:?}"
             );
         }
-    }
-
-    /// An eager start answers with the input and header of the command that
-    /// scheduled the activity, and reads nothing (criterion 2.2).
-    #[tokio::test]
-    async fn an_eager_start_answers_from_its_command() {
-        let repo = Arc::new(InMemoryStore::default());
-        let runtime = inputs_runtime(repo.clone());
-        let (_state, queue, task) =
-            seed_scheduled_activity_lacking_its_event(&runtime, &repo).await;
-        let input = payloads(b"from-the-command");
-        let header = Some(Headers(BTreeMap::from([(
-            "trace".to_string(),
-            payload(b"command"),
-        )])));
-        let started = runtime
-            .try_claim_activity_task(
-                queue,
-                task.run_key,
-                task.activity_id.clone(),
-                task.schedule_event_id,
-                WorkerIdentity("worker".into()),
-                input.clone(),
-                header.clone(),
-            )
-            .await
-            .expect("an eager start reads no event")
-            .expect("claims the task");
-        assert_eq!((started.input, started.header), (input, header));
     }
 
     proptest! {
@@ -5395,6 +5350,7 @@ mod tests {
                     timer_ops: SmallVec::new(),
                     dispatch_ops: SmallVec::new(),
                     events_numbered_at_close: 0,
+                    workflow_task_heartbeat_timed_out: false,
                     growth_limits: None,
                 },
                 WriteFence::Unfenced,

@@ -29,7 +29,7 @@ events force the task back to a normal, attempt-1 task). Tokeira's current model
 pending task. Adopting the transient model **reverses** that documented decision and changes observable
 history for every WFT-retry path.
 
-This is a two-feature spec (the third raised item is deliberately out of scope — see below):
+Items A and B retain their transient-task contract; the completion-inline amendment adds Item C:
 
 - **Item A — buffered-flush-resets-retry** (kernel, small): when a WFT-failed close flushes buffered
   events, the next task is reset to a *normal* attempt-1 task with a real `WorkflowTaskScheduled`.
@@ -67,7 +67,7 @@ explicit approval**.
 
 > **ACCEPTED (2026-07-03, owner).** The transient-WFT model is adopted; the Feature-2 per-attempt-event
 > design note is amended by this spec. Items A and B may proceed. The heartbeat-timeout leaf (raised item
-> C) is **out of scope** (see below). The Tier-1.2 leaves stay classified skips until each phase flips
+> C) was originally out of scope; the Item C decision below supersedes that exclusion. The Tier-1.2 leaves stay classified skips until each phase flips
 > them.
 
 ## Glossary
@@ -245,15 +245,75 @@ client sees a coherent history.
 
 ---
 
-## Item C — WFT Heartbeat Timeout (OUT OF SCOPE)
+## Item C — WFT Heartbeat Timeout
 
-**Decision (2026-07-03, owner): out of scope; classify-skip.** `TestWorkflowTaskHeartbeatingWithEmptyResult`
-depends on `OverrideDynamicConfig(WorkflowTaskHeartbeatTimeout = 5s)` against the default 30m
-(`respondworkflowtaskcompleted/api.go:298`, `dynamicconfig constants.go:2427`). Per the conformance
-config-as-constant convention, the 30m default is not operationally wrong for tokeira, so the heartbeat
-timeout does not earn a new deployment knob merely to pass a test; the leaf is registered as an
-**OverrideDynamicConfig out-of-scope skip** (same class as `MaxCallbacksPerWorkflow`), not implemented.
-No `original_scheduled_at` field, no heartbeat-timeout config knob is added by this spec.
+**New owner decision:** implement the fixed 30-minute limit. Only the functional
+harness may override `history.workflowTaskHeartbeatTimeout`, through the existing
+conformance bridge. This supersedes the earlier classify-skip decision; it does
+not add a production timeout knob or claim the corpus leaf has passed.
+
+### Requirement C.1: Bound heartbeat-only progress
+
+**User Story:** As an operator, I want a stalled local-activity heartbeat chain
+bounded, so that it cannot retain a worker indefinitely without progress.
+
+#### Acceptance Criteria
+
+1. WHEN a completion has `ForceCreateNewWorkflowTask=true` and its original wire
+   commands and messages are both empty, THE kernel SHALL test the heartbeat limit
+   before authoring `WorkflowTaskCompleted`.
+2. WHEN the pending task has a positive original scheduled timestamp and `now` is
+   strictly later than that timestamp plus 30 minutes, THE completion SHALL take
+   the start-to-close WFT timeout path instead of writing `WorkflowTaskCompleted`,
+   including existing transient/speculative event-materialization rules.
+3. WHEN the timeout transition commits, THE edge SHALL return `NOT_FOUND` with
+   `workflow task heartbeat timeout`; failed persistence SHALL NOT be reported as
+   a committed heartbeat timeout.
+4. WHEN heartbeat-only completion remains within the limit, THE next heartbeat
+   task SHALL inherit the original scheduled timestamp unchanged. A task scheduled
+   after progress or a timeout SHALL use its fresh schedule time. WHEN a failure
+   or timeout occurs during a pause, THE task subsequently scheduled by unpause
+   SHALL take the unpause time as both its schedule and original time; a task
+   scheduled before the pause SHALL keep both times.
+5. WHEN loading a task written without an original scheduled timestamp, THE decoder
+   SHALL use absence; THE heartbeat check SHALL never time out that task or its
+   no-progress heartbeat chain by inventing a timestamp.
+6. THE production heartbeat limit SHALL remain a fixed 30 minutes; WHERE the
+   functional harness supplies a duration override, THE runtime SHALL resolve it
+   into a pure completion operand through the existing override mechanism.
+7. WHEN evaluating the timeout, THE kernel SHALL use supplied time and policy
+   values only, without clock/config I/O; a message that translates to no workflow
+   command SHALL still count as a nonempty wire message for criterion C.1.1.
+8. WHEN the heartbeat timeout is recorded, THE kernel SHALL clear sticky affinity;
+   subsequent completion handling SHALL apply the request's sticky attributes,
+   restoring the sticky queue when those attributes specify one.
+9. WHEN the heartbeat timeout schedules a successor, THE successor SHALL be a fresh
+   Normal task, not a heartbeat schedule, with its own schedule time as its original
+   scheduled time.
+10. WHEN completion Requirement 3 permits inline start, THE timeout completion SHALL
+    start the successor for the completing identity but SHALL NOT return it or mark
+    updates as sent to it; THE worker SHALL receive `NOT_FOUND` with `workflow task
+    heartbeat timeout`, and buffered queries SHALL stay buffered while that new task
+    exists.
+11. WHEN that unreturned successor reaches start-to-close timeout, THE existing WFT
+    timeout rules SHALL apply; on a sticky queue THE timeout SHALL clear sticky
+    affinity and schedule the next task on the normal queue at the same attempt.
+12. WHEN DescribeWorkflowExecution reports a pending workflow task, THE response
+    SHALL include its original scheduled time, or `0001-01-01T00:00:00Z` when the
+    task has none (`service/history/api/describeworkflow/api.go:222-226 @ v1.31.0`).
+
+Authority: `service/history/api/respondworkflowtaskcompleted/api.go:281-342,573-604,731-737`,
+`service/history/workflow/workflow_task_state_machine.go:307-313,934-984,1010-1015`,
+`service/history/workflow/util.go:52-69`,
+`service/history/api/unpauseworkflow/api.go:64-76`, and
+`common/dynamicconfig/constants.go:2427-2431 @ v1.31.0`.
+
+The successor follows [completion Requirement 3](../api-conformance-wft-completion/requirements.md#requirement-3-return-new-workflow-task-semantics)
+but is not returned. The oracle is `TestWorkflowTaskHeartbeatingWithEmptyResult`
+(`tests/workflow_task_test.go:29-182 @ v1.31.0`): events 19–22 and 37–40 each record
+heartbeat TimedOut, successor Scheduled/Started, then successor TimedOut before a
+normal-queue poll receives the next task. This is exact v1.31.0 behavior, including
+the reapplied sticky queue and the unreturned started successor.
 
 ---
 
@@ -325,7 +385,7 @@ No `original_scheduled_at` field, no heartbeat-timeout config knob is added by t
 
 ## Out of Scope / Dependencies
 
-- **Item C (heartbeat timeout)** — out of scope (above): OverrideDynamicConfig-dependent skip.
+- **Item C (heartbeat timeout)** — now included; depends on the completion-inline contract and harness duration override. The old skip remains historical evidence until the orchestrator verifies the implementation.
 - **Speculative WFTs** — a separate mode (`WORKFLOW_TASK_TYPE_SPECULATIVE`) sharing the virtual-id
   machinery; not required by the Tier-1.2 leaves and not built here.
 - **Sequencing (A before B):** Item A *adds* a real Scheduled event on the flush path; Item B *suppresses*

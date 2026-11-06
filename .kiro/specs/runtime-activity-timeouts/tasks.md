@@ -183,3 +183,52 @@ All code lives in `tokeira-runtime`, in a new `activity_timeout.rs` module (foll
 
 - [x] Verify Property 16 with the required property and regression tests: `stored_retry_backoff_is_total`, `command_durations_preserve_failure_cause_and_message`.
   _Requirements: 9._
+
+- [x] 9. Wake activity timeout scanning at deadlines
+  - Cache timeout configuration and pause state at scheduling, start, committed
+    updates and recovery; retain it across re-anchoring.
+  - Share wake planning with workflow-task deadlines and retry eligibility; reload
+    due entries in stable deadline order and reconcile all entries each interval.
+  - Continue capped passes immediately for unattempted work; defer failed attempts
+    to the full pass without losing concurrent inserts or acquisition fencing.
+  - Reproduce both deadline loops and the buffered-event history before the fix.
+    Cover each due-time rule, overflow, notifications, counted cache refreshes,
+    ordering/caps, failures and Property 17 with at least 100 generated cases.
+  - _Requirements: 7.1, 7.3, 7.6–7.8._
+
+- [x] 10. Repair starts missed before owner tracking
+  - On authoritative reload, fill a missing cached start and durable heartbeat
+    under the configuration refresh's revision guard; preserve newer volatile
+    heartbeats and already recorded starts.
+  - Reproduce both an absent entry at start and a late schedule record overwriting
+    a recorded start. Require the durable heartbeat to extend the deadline and a
+    full pass to fire the expired heartbeat within one reconciliation interval.
+  - Dependency: task 9.
+  - _Requirements: 3.1, 7.3._
+
+- [x] 11. Follow the reloaded attempt after a skipped retry reset
+  - Evaluate startedness, start time and current dispatch time from reloaded state;
+    retain only heartbeats at or after that attempt's start when extending it.
+  - Reconcile superseded cache anchors under the existing revision guard, keeping
+    the retry's scoped reset and the full-pass repair of missed starts.
+  - Reproduce a heartbeat during the scanner's retry commit: heartbeat and
+    start-to-close must neither spend an unstarted retry nor terminally resolve it.
+    Verify schedule-to-start at the new attempt's boundary and cache repair.
+  - Check direct evaluation with stale anchors and preservation of a concurrent
+    heartbeat by the revision guard; retain the local-offer regressions.
+  - Dependency: task 10.
+  - _Requirements: 3.3, 4.1, 4.2, 5.2, 7.3._
+
+- [x] 12. Revalidate timeout observations at terminal and retry commits
+  - Carry attempt, schedule event, timeout type and scanner time as volatile
+    operands; share evaluation rules and recheck every OCC transition base.
+  - Keep stale observations tracked for an authoritative reload, and remove only
+    the captured entry when the activity has resolved.
+  - Reproduce starts, heartbeats and worker retries after the scanner's reload and
+    through lane conflict retries. Assert no timeout or spent attempt, retained
+    tracking, and successful timeout at the later deadline. Cover the scanner's
+    retry commit racing a heartbeat with and without an OCC conflict.
+  - Retain skipped-reset coverage with a delayed heartbeat tracking callback after
+    the retry commits; the old pre-commit heartbeat now invalidates the timeout.
+  - Dependency: task 11.
+  - _Requirements: 7.5, 7.9._

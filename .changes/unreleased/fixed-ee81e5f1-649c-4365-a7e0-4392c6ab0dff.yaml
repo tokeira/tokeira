@@ -1,0 +1,5 @@
+kind: fixed
+body: An activity that a worker started before the server had recorded the attempt now still times out on its heartbeat and start-to-close deadlines.
+time: 2026-11-06T02:42:55.610289+00:00
+custom:
+    Slice: ee81e5f1-649c-4365-a7e0-4392c6ab0dff

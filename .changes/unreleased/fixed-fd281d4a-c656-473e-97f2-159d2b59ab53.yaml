@@ -1,0 +1,5 @@
+kind: fixed
+body: Activity timeouts now fire at their deadline rather than up to a second late.
+time: 2026-11-05T22:07:59.856315+00:00
+custom:
+    Slice: fd281d4a-c656-473e-97f2-159d2b59ab53

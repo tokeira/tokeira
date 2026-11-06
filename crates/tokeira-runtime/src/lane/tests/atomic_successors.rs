@@ -164,7 +164,7 @@ proptest! {
             let repo = MockRepo::new(LoadedRun::Existing(state.clone()), vec![CommitBehavior::Applied]);
             repo.state.lock().await.pair_behaviors = std::iter::repeat_n(PairBehavior::Conflict, conflicts).chain([match outcome { 0 => PairBehavior::Applied, 1 => PairBehavior::SizeRefused, 2 => PairBehavior::Duplicate, _ => PairBehavior::Error }]).collect();
             let mut effect = None;
-            let result = handle_message_with_successor(&kernel, &repo, &test_shard_owner(), &UpdateRegistry::new(), state.run_key, sample_command("close"), plan.as_ref(), None, None, &mut effect, 5, &mut LaneCache::new(&LaneConfig::default()), &mut None, &SystemClock).await;
+            let result = handle_message_with_successor(&kernel, &repo, &test_shard_owner(), &UpdateRegistry::new(), state.run_key, sample_command("close"), plan.as_ref(), None, None, None, &mut effect, 5, &mut LaneCache::new(&LaneConfig::default()), &mut None, &SystemClock).await;
             let recorded = repo.state.lock().await;
             prop_assert_eq!(recorded.pairs.len(), conflicts + 1);
             let first = &recorded.pairs[0].1;
@@ -174,13 +174,13 @@ proptest! {
             if kind != 0 { prop_assert_eq!(inputs.header, header); }
             match outcome {
                 0 => {
-                    prop_assert!(matches!(result, Ok((CommitResult::Applied { .. }, _, _))), "applied close");
+                    prop_assert!(matches!(result, Ok((CommitResult::Applied { .. }, ..))), "applied close");
                     let Some(SuccessorEffect::Committed(actual)) = effect else { panic!("pair effects") };
                     prop_assert_eq!(actual.state, first.next_state.clone());
                     prop_assert_eq!(recorded.commit_calls, 0);
                 }
                 1 => {
-                    prop_assert!(matches!(result, Ok((CommitResult::Applied { .. }, _, _))), "applied close");
+                    prop_assert!(matches!(result, Ok((CommitResult::Applied { .. }, ..))), "applied close");
                     prop_assert!(effect.is_none());
                     let start = recorded.fallbacks.first().expect("persisted fallback start").clone();
                     let fallback = tokeira_kernel::BasicKernel.apply(LoadedRun::Absent, Command::Start(start)).unwrap();
@@ -191,7 +191,7 @@ proptest! {
                     prop_assert_eq!(recorded.commit_calls, 1);
                 }
                 _ => {
-                    prop_assert!(if outcome == 2 { matches!(result, Ok((CommitResult::Duplicate, _, _))) } else { result.is_err() }, "duplicate or rejected pair");
+                    prop_assert!(if outcome == 2 { matches!(result, Ok((CommitResult::Duplicate, ..))) } else { result.is_err() }, "duplicate or rejected pair");
                     prop_assert!(effect.is_none());
                     prop_assert_eq!(&recorded.loaded, &LoadedRun::Existing(state));
                     prop_assert_eq!(recorded.commit_calls, 0);
@@ -247,7 +247,7 @@ proptest! {
             let repo = MockRepo::new(LoadedRun::Existing(state.clone()), vec![CommitBehavior::Applied]);
             let kernel = RejectSuccessor { kind };
             let plan = plan(&state, kind, Payloads::default(), None, state.started_at);
-            let result = Box::pin(handle_message_with_successor(&kernel, &repo, &test_shard_owner(), &UpdateRegistry::new(), run_key, sample_command("close"), plan.as_ref(), None, None, &mut None, 5, &mut LaneCache::new(&LaneConfig::default()), &mut None, &SystemClock)).await;
+            let result = Box::pin(handle_message_with_successor(&kernel, &repo, &test_shard_owner(), &UpdateRegistry::new(), run_key, sample_command("close"), plan.as_ref(), None, None, None, &mut None, 5, &mut LaneCache::new(&LaneConfig::default()), &mut None, &SystemClock)).await;
             prop_assert!(result.is_err(), "a rejected successor must fail the close command");
             let (_, commits, loaded) = repo.snapshot().await;
             prop_assert_eq!(commits, 0);

@@ -198,6 +198,7 @@ impl StoreExecutionResolver {
                         .collect(),
                     pending_workflow_task: state.pending_workflow_task.as_ref().map(|task| {
                         tokeira_edge::translate::PendingWorkflowTaskDescription {
+                            original_scheduled_at: task.original_scheduled_at,
                             is_started: task.started_event_id.is_some(),
                             scheduled_at: task.scheduled_at,
                             started_at: task.started_at,

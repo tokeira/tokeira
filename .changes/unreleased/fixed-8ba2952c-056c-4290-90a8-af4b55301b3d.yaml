@@ -1,0 +1,5 @@
+kind: fixed
+body: Workflow task timeouts now fire at their deadline rather than up to a second late.
+time: 2026-11-05T20:30:18.932937+00:00
+custom:
+    Slice: 8ba2952c-056c-4290-90a8-af4b55301b3d

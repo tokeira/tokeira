@@ -44,13 +44,15 @@ This spec covers these limits on a run's growth. The limits on what a request or
 
 2.10 The limits SHALL be v1.31.0's default values: history size 50 MiB (warn 10 MiB), history count 51,200 (warn 10,240), state size 8 MiB (warn 1 MiB), history batch 4 MiB, 100 buffered events, 2 MiB of buffered events, and a 4 KiB stored activity failure. They SHALL be fixed: Tokeira offers no setting to change them. Above a warn limit the system SHALL only log.
 
+2.11 WHEN the force-close for buffered events fails a started task THEN the next task's attempt SHALL follow the failure rules: a sticky task's retry SHALL be attempt 1 on the normal queue with a `WorkflowTaskScheduled` event; otherwise the attempt SHALL add 1, and a retry above attempt 1 SHALL be transient. The flush before scheduling SHALL NOT reset the attempt (`service/history/workflow/mutable_state_impl.go:1048-1053,2250-2252,8202-8231`; `service/history/workflow/util.go:26-69`; `service/history/workflow/workflow_task_state_machine.go:327-337,1003-1028 @ v1.31.0`).
+
 ### Unchanged Behavior (Regression Prevention)
 
 3.1 WHEN a run stays within every limit THEN the system SHALL CONTINUE TO handle its writes as today
 
 3.2 The continue-as-new advice SHALL CONTINUE TO use its own thresholds (4 MiB, 4,096 events) as [continue-as-new-advice](../continue-as-new-advice/requirements.md) requires
 
-3.3 The force-close for buffered events SHALL CONTINUE TO record what it records today: WorkflowTaskFailed with `ForceCloseCommand`, the flushed events and a new workflow task
+3.3 The force-close for buffered events SHALL CONTINUE TO record WorkflowTaskFailed with `ForceCloseCommand` when the failed task is not transient, and the flushed events; the new workflow task SHALL follow criterion 2.11
 
 3.4 A reset SHALL CONTINUE TO write its successor's copied history without these limits' checks, in the batches of [bounded-bulk-writes](../bounded-bulk-writes/design.md)
 

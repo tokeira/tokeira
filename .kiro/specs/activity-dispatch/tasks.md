@@ -287,6 +287,57 @@ may retire a recovery mechanism before its replacement is verified.
     No migration.
   - _Requirements: 2.1, 2.10_
 
+- [x] 15. Replace post-commit eager claims with completion-inline starts
+  - Depends on task 14 and the completion/heartbeat amendments in
+    [api-conformance-wft-completion](../api-conformance-wft-completion/tasks.md),
+    [edge-eager-dispatch](../edge-eager-dispatch/tasks.md) and
+    [transient-wft](../transient-wft/tasks.md). Ship their code and specs together.
+  - [x] 15.1 Add a reproducer before changing production code: enable eager execution,
+    park an activity poll, hold completion at controlled publication/commit hooks,
+    and let the waiting poll run before the old eager claim. Require the completion
+    to own the only start commit and the poll to receive no eager incarnation.
+    Record its expected failure on `main` at the race assertion (the baseline
+    already enables eagerness unconditionally, so an unknown override is not a
+    valid reproduction). An ordinary non-eager activity must still
+    reach the poll. Retain a negative control that reinstates publish-then-start and
+    makes the reproducer fail. Use channels/Notify, never sleeps.
+  - [x] 15.2 Add typed default-off deployment policy, harness override and faithful
+    SDK/build-ID operands; preflight scope and response admission. Start eligible
+    surviving activities in the completion builder after commands, without rules,
+    dispatch operations, rows, offers or a second commit. Preserve request receipts,
+    transient started-event materialization and timeout tracking.
+  - [x] 15.3 Required PBT — revised Properties 7, 10 and 12, at least 100 cases each.
+    Generate incarnations, competing polls, retries, failures, restarts and lost
+    responses. Assert one start per incarnation, no inline dispatch rows/offers,
+    ordinary/retry rule application and eager rule bypass. Use an independent
+    eligibility/response oracle, tagged `// Feature: activity-dispatch, Property N`.
+  - [x] 15.4 Verify default-off dispatch and no response tasks; all four excluded
+    Python versions, TypeScript below/at 1.4.4 and invalid semver; old/new versioning
+    with/without `UseWorkflowBuildId`; paused workflows; same-completion cancel and
+    close; more than three eager activities; `return_new_workflow_task=false`.
+    Dropped replies remain started until their applicable deadlines; retries then
+    re-enter ordinary discovery and rule evaluation.
+  - [x] 15.5 Run the same final-state/row oracle through memory and opt-in DSQL
+    commit/repair fixtures, including OCC failure and staged-publication refusal.
+    Count committed starts, not only materialized Started events (retry-policy
+    starts can be transient). Verify no publisher call for inline incarnations.
+  - [x] 15.6 Integrate the waiting normal-queue WFT/heartbeat reproducer, heartbeat
+    limit reproducer and their negative controls from the sibling tasks. Have the
+    orchestrator run `TestWorkflowTaskTestSuite` (both heartbeat tests),
+    `TestEagerWorkflowTestSuite`, `TestStickyTqTestSuite`, and the corpus eager
+    activity tests with `system.enableActivityEagerExecution=true`, including
+    `VersioningIntegSuite.TestDispatchActivityEager`
+    (`tests/versioning_test.go:2413 @ v1.31.0`) and
+    `Versioning3Suite.TestEagerActivity`
+    (`tests/versioning_3_test.go:1608 @ v1.31.0`). Record results
+    before changing evidence/skip claims. Run the full root §10.4 bar and the
+    configuration-ledger/render checks. The edge now depends directly on the
+    `semver` crate already in the lockfile for v1.31.0's TypeScript version test.
+    Result: `TestDispatchActivityEager` passes with eager execution on.
+    `TestEagerActivity` stays in the skip registry: its setup calls the internal
+    matching service, outside the public surface.
+  - _Requirements: 4.4, 6.2, 6.5, 6.6, 8.3–8.7, 9.1–9.13_
+
 ## Task Dependency Graph
 
 ```json
@@ -304,11 +355,16 @@ may retire a recovery mechanism before its replacement is verified.
   "11": ["2", "3", "5", "6", "7", "8", "9", "10"],
   "12": ["10", "11"],
   "13": ["12"],
-  "14": ["13"]
+  "14": ["13"],
+  "15": ["14"]
 }
 ```
 
 ## Notes
+
+- Task 15 supersedes task 8.2's separate eager start, its response cap and task
+  8.3's ordinary/eager race model. Earlier checked tasks remain historical evidence;
+  task 15's checkboxes track the completion-inline correction and its verification.
 
 - Implementation and verification are complete. The
   [verification receipt](../../../docs/testing/activity-dispatch-verification.md)
@@ -395,3 +451,30 @@ historical link correction in the older workflow-dispatch requirements passes
 the full repository offline Markdown check with zero errors. Deletion of the
 original disposable devbox and database is verified; their replacements remain
 active for the live campaign. No implementation commit or PR exists yet.
+
+- [x] 16. Evaluate retry eligibility at its deadline
+  - Share the activity timeout wake and preserve acquisition-scoped cursors,
+    stable deadline order, the eligibility quantum and retry/rule decisions.
+  - Reproduce eligibility waking with a one-hour interval before the fix; test
+    earlier/later notifications, shared planning and bounded continuation.
+  - Dependency: runtime-activity-timeouts task 9.
+  - _Requirements: 6.9._
+
+- [x] 17. Offer eligible retries at the end of backoff
+  - Reuse the loaded authority and deployment routing to offer locally, retaining
+    rule suppression, broker deduplication and discovery for remote queue homes.
+  - Reproduce a waiting poll with discovery absent, verify pause suppression, and
+    run the real timer/eligibility loops with a retry preceding a user timer.
+  - Dependency: task 16.
+  - _Requirements: 6.10._
+
+- [x] 18. Order attempt tracking before deferred eligibility offers
+  - Retain the future-at-registration decision per incarnation and due time;
+    publish already-due attempts only through commit publication or discovery.
+  - Install timeout tracking before eligibility in publication, retry, option
+    updates, lane commits and acquisition/publication rebuilds.
+  - Reproduce first-attempt republication after an injected publication loss and
+    a short retry whose local start races its tracking reset. Verify heartbeat
+    expiry at its deadline and discovery repair with the activity scanner running.
+  - Dependency: task 17; runtime-activity-timeouts task 10 backs up early discovery.
+  - _Requirements: 6.10._

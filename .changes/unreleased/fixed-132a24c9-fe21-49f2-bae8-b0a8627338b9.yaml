@@ -1,0 +1,5 @@
+kind: fixed
+body: Eager activities that RespondWorkflowTaskCompleted returns are now started by the completion itself, so another worker's waiting poll can no longer take them first.
+time: 2026-11-05T16:13:36.242489+00:00
+custom:
+    Slice: 132a24c9-fe21-49f2-bae8-b0a8627338b9

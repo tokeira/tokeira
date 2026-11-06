@@ -1,6 +1,6 @@
 //! Conformance-only dynamic-override read seam.
 //!
-//! Production runtime code pins its tuned limits to release defaults. The
+//! Production runtime code uses release defaults and typed deployment policy. The
 //! functional-conformance harness needs the same sites to honour live per-test
 //! overrides delivered out of process (spec
 //! `.kiro/specs/conformance-config-override/`). The registry that stores those
@@ -94,4 +94,19 @@ pub(crate) fn install_registry_reads() {
         read_duration: |key| tokeira_conformance::overrides().get_duration(key),
         read_scope_generation: || tokeira_conformance::overrides().scope_generation(),
     });
+}
+
+/// Resolve configured eager execution once at completion admission.
+pub(crate) fn activity_eager_execution(default: bool) -> bool {
+    reads()
+        .get_bool("system.enableActivityEagerExecution")
+        .unwrap_or(default)
+}
+
+/// Resolve the test-only heartbeat override once before completion submission.
+pub(crate) fn workflow_task_heartbeat_timeout() -> time::Duration {
+    reads()
+        .get_duration("history.workflowTaskHeartbeatTimeout")
+        .map(|timeout| time::Duration::try_from(timeout).unwrap_or(time::Duration::MAX))
+        .unwrap_or(tokeira_kernel::WORKFLOW_TASK_HEARTBEAT_TIMEOUT)
 }

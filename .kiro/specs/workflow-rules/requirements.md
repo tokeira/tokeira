@@ -167,7 +167,7 @@ policy applies before work starts and across retries.
 
 #### Acceptance Criteria
 
-1. WHEN an activity becomes eligible to start, THE runtime SHALL evaluate every unexpired namespace
+1. WHEN an activity becomes eligible for an ordinary first start, THE runtime SHALL evaluate every unexpired namespace
    rule against the workflow visibility query and then the activity predicate.
 2. WHEN retry processing considers another attempt, THE runtime SHALL evaluate the same rule set
    before dispatching that retry.
@@ -186,8 +186,12 @@ policy applies before work starts and across retries.
    pause it as though a retry were pending.
 10. WHEN a retry timer becomes eligible, THE runtime SHALL evaluate rules before enqueueing the
     retry task.
-11. WHEN an activity is started through eager dispatch, THE runtime SHALL apply the same rule
-    evaluation and pause-before-start behavior as ordinary dispatch.
+11. WHEN an activity first starts eagerly inside a workflow-task completion, THE runtime SHALL
+    NOT evaluate workflow rules; ordinary first starts and retry processing SHALL retain their
+    rule checks. This supersedes eager/ordinary path equivalence:
+    `service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:533-565`,
+    `service/history/api/recordactivitytaskstarted/api.go:353-377`, and
+    `service/history/timer_queue_active_task_executor.go:955 @ v1.31.0`.
 
 ### Requirement 5: Rule Deletion and Existing Pauses
 

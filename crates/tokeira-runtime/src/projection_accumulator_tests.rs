@@ -47,6 +47,7 @@ pub(crate) async fn commit_state(
                 timer_ops: Default::default(),
                 dispatch_ops: Default::default(),
                 events_numbered_at_close: 0,
+                workflow_task_heartbeat_timed_out: false,
                 growth_limits: None,
             },
             WriteFence::Unfenced,
@@ -117,7 +118,11 @@ pub(crate) async fn legacy_copy(
 // Feature: projection-accumulator, Property 3: reset bookkeeping uses seed-capable state and stats.
 #[tokio::test]
 async fn projection_accumulator_runtime_reset_commits_from_materialized_state() {
-    let parent = crate::runtime::workflow_task::tests::open_state("reset-source".into(), None);
+    let mut parent = crate::runtime::workflow_task::tests::open_state("reset-source".into(), None);
+    // This fixture's fixed historical clock must not expire its live runtime
+    // before it has authored the reset fork events.
+    parent.started_at = OffsetDateTime::now_utc();
+    parent.first_run_started_at = Some(parent.started_at);
     let policy = RetryPolicy {
         initial_interval: Duration::seconds(1),
         backoff_coefficient: 1.0,
@@ -206,6 +211,7 @@ async fn projection_accumulator_runtime_reset_commits_from_materialized_state() 
                 timer_ops: Default::default(),
                 dispatch_ops: Default::default(),
                 events_numbered_at_close: 0,
+                workflow_task_heartbeat_timed_out: false,
                 growth_limits: None,
             },
             WriteFence::Unfenced,

@@ -145,6 +145,7 @@ fn schedule(index: usize, input_bytes: usize) -> WorkflowCommand {
         input: input(index, input_bytes),
         header: Some(header(index)),
         request_eager_execution: false,
+        use_workflow_build_id: false,
         retry_policy: None,
         deployment: None,
         build_id: None,
@@ -190,6 +191,9 @@ async fn start_and_schedule(
             worker_deployment_name: None,
             sticky: None,
             commands,
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
+            heartbeat: Default::default(),
             force_new_workflow_task: false,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
@@ -403,6 +407,7 @@ fn schedule_generated(index: usize, scheduled: &Scheduled) -> WorkflowCommand {
         input: scheduled.input.clone(),
         header: scheduled.header.clone(),
         request_eager_execution: false,
+        use_workflow_build_id: false,
         retry_policy: Some(RetryPolicy {
             initial_interval: Duration::ZERO,
             backoff_coefficient: 1.0,
@@ -439,9 +444,9 @@ async fn complete(
     task: StartedWorkflowTask,
     commands: Vec<WorkflowCommand>,
     force_new_workflow_task: bool,
-) -> Result<()> {
-    runtime
-        .complete_workflow_task(WorkflowTaskCompletedRequest {
+) -> Result<tokeira_runtime::WorkflowTaskCompletionOutcome> {
+    let outcome = runtime
+        .complete_workflow_task_with_result(WorkflowTaskCompletedRequest {
             client_discards_speculative_with_events: false,
             token: task.token,
             identity: WorkerIdentity("worker".to_string()),
@@ -453,6 +458,9 @@ async fn complete(
             worker_deployment_name: None,
             sticky: None,
             commands,
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
+            heartbeat: Default::default(),
             force_new_workflow_task,
             limits: Default::default(),
             delivered_update_ids: Vec::new(),
@@ -461,7 +469,7 @@ async fn complete(
             command_sizes: Vec::new(),
         })
         .await?;
-    Ok(())
+    Ok(outcome)
 }
 
 /// Poll until `count` activity tasks start. A poll that finds an offer an
@@ -557,7 +565,8 @@ async fn deliver(
     activities: &[Scheduled],
 ) -> Result<BTreeMap<String, (StartedActivityTask, Scheduled)>> {
     let store = Arc::new(InMemoryStore::default());
-    let mut runtime = runtime(store.clone());
+    let mut runtime =
+        runtime(store.clone()).with_activity_eager_execution(matches!(path, Path::Eager));
     let namespace_id = NamespaceId::new();
     let CommitResult::Applied { new_state } = runtime
         .start_workflow(start_request(namespace_id, "delivery-paths"))
@@ -566,13 +575,24 @@ async fn deliver(
         anyhow::bail!("start not applied");
     };
     let run_key = new_state.run_key;
-    let commands = activities
+    let mut commands: Vec<_> = activities
         .iter()
         .enumerate()
         .map(|(index, scheduled)| schedule_generated(index, scheduled))
         .collect();
+    if matches!(path, Path::Eager) {
+        for command in &mut commands {
+            if let WorkflowCommand::ScheduleActivity {
+                request_eager_execution,
+                ..
+            } = command
+            {
+                *request_eager_execution = true;
+            }
+        }
+    }
     let task = poll_workflow_task(&runtime, namespace_id).await?;
-    complete(
+    let completed = complete(
         &runtime,
         task,
         commands,
@@ -585,26 +605,7 @@ async fn deliver(
     match path {
         Path::Poll => {}
         Path::Eager => {
-            let LoadedRun::Existing(committed) = store.load_run(run_key).await? else {
-                anyhow::bail!("committed run");
-            };
-            let schedule_event_id = committed.activities["activity-0"].schedule_event_id;
-            // The completion's own answer claims the task with the command's
-            // input and header, as the edge's eager path does.
-            started.push(
-                runtime
-                    .try_claim_activity_task(
-                        activity_queue.clone(),
-                        run_key,
-                        "activity-0".to_string(),
-                        schedule_event_id,
-                        WorkerIdentity("worker".to_string()),
-                        activities[0].input.clone(),
-                        activities[0].header.clone(),
-                    )
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("an eager claim"))?,
-            );
+            started = completed.activity_tasks;
         }
         Path::Retry => {
             for task in poll_started(&runtime, namespace_id, activities.len()).await? {

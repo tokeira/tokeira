@@ -134,6 +134,7 @@ fn pending_task(
     started_event_id: Option<i64>,
 ) -> PendingWorkflowTask {
     PendingWorkflowTask {
+        original_scheduled_at: None,
         advice: Default::default(),
         task_type,
         schedule_to_start_deadline: None,
@@ -213,6 +214,9 @@ fn completion(state: &WorkflowState, commands: Vec<WorkflowCommand>) -> Command 
         sticky: None,
         commands,
         command_sizes: Vec::new(),
+        eager_activities: Default::default(),
+        inline_workflow_task: None,
+        heartbeat: Default::default(),
         force_new_workflow_task: false,
         limits: WorkflowTaskCompletionLimits::default(),
         delivered_update_ids: Vec::new(),
@@ -229,6 +233,7 @@ fn schedule_activity(index: usize) -> WorkflowCommand {
         input: payloads_of(4),
         header: None,
         request_eager_execution: false,
+        use_workflow_build_id: false,
         retry_policy: None,
         deployment: None,
         build_id: None,
@@ -484,7 +489,7 @@ fn a_force_close_for_buffered_events_is_numbered_at_close() {
     assert!(force_closed(&transition));
     assert_eq!(
         transition.history_events.len(),
-        1 + MAXIMUM_BUFFERED_EVENTS_BATCH + 1 + 1
+        1 + MAXIMUM_BUFFERED_EVENTS_BATCH + 1
     );
     assert_eq!(
         transition.events_numbered_at_close as usize,
@@ -501,14 +506,10 @@ fn buffered_events_over_the_size_limit_force_close_the_task() {
     assert!(force_closed(&second));
     assert_eq!(
         names(&second),
-        [
-            "WorkflowTaskFailed",
-            "Signaled",
-            "Signaled",
-            "WorkflowTaskScheduled"
-        ]
+        ["WorkflowTaskFailed", "Signaled", "Signaled"]
     );
     assert!(second.next_state.buffered_events.is_empty());
+    assert_eq!(second.next_state.pending_workflow_task.unwrap().attempt, 2);
 }
 
 #[test]
@@ -522,6 +523,10 @@ fn activity_results_over_the_count_limit_force_close_the_task() {
     let transition = complete_activity(state, MAXIMUM_BUFFERED_EVENTS_BATCH, payloads_of(4));
     assert!(force_closed(&transition));
     assert!(transition.next_state.buffered_events.is_empty());
+    assert_eq!(
+        transition.next_state.pending_workflow_task.unwrap().attempt,
+        2
+    );
 }
 
 #[test]
@@ -554,6 +559,7 @@ fn an_activity_start_leaves_the_buffered_limits_to_the_next_transition() {
         payloads_of(4),
     );
     assert!(force_closed(&next));
+    assert_eq!(next.next_state.pending_workflow_task.unwrap().attempt, 2);
 }
 
 /// Activities the property's runs can complete.
@@ -616,6 +622,8 @@ proptest! {
                 prop_assert!(transition.next_state.buffered_events.is_empty());
                 let pending = transition.next_state.pending_workflow_task.as_ref().unwrap();
                 prop_assert!(pending.started_event_id.is_none());
+                prop_assert_eq!(pending.attempt, 2);
+                prop_assert!(!transition.history_events.iter().any(|event| matches!(event.kind, HistoryEventKind::WorkflowTaskScheduled { .. })), "the transient retry has no scheduled event");
                 prop_assert_eq!(
                     transition.events_numbered_at_close as usize,
                     transition.history_events.len()
@@ -626,5 +634,36 @@ proptest! {
             prop_assert_eq!(transition.next_state.buffered_events.len(), count);
             state = transition.next_state;
         }
+    }
+}
+
+#[test]
+fn paused_buffer_overflow_preserves_failure_attempt_without_scheduling() {
+    for sticky in [false, true] {
+        let mut state = started(open_state());
+        state.status = ExecutionStatus::Paused;
+        if sticky {
+            state.sticky = Some(tokeira_types::StickyAffinity {
+                sticky_queue: TaskQueueName("cache".into()),
+                worker_identity: WorkerIdentity("worker".into()),
+                schedule_to_start_timeout: Duration::seconds(5),
+            });
+        }
+        for index in 0..MAXIMUM_BUFFERED_EVENTS_BATCH {
+            state = signal(state, index, payloads_of(4)).next_state;
+        }
+        let result = signal(state, MAXIMUM_BUFFERED_EVENTS_BATCH, payloads_of(4));
+        assert!(force_closed(&result));
+        assert!(result.next_state.pending_workflow_task.is_none());
+        assert!(result.dispatch_ops.is_empty());
+        assert_eq!(
+            result.next_state.workflow_task_attempt,
+            if sticky { 1 } else { 2 }
+        );
+        assert_eq!(
+            result.next_state.workflow_task_attempts_since_last_success,
+            u32::from(!sticky)
+        );
+        assert!(result.next_state.sticky.is_none());
     }
 }

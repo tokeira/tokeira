@@ -379,3 +379,7 @@ and the final gate (W8). Config (W0) is a prerequisite of W4/W5.
   no `ALTER`.
 - Cross-cluster routing of the completion POST (active-cluster lookup, client cache,
   `forwardCompleteOperation`) is `nexus-multi-cluster`, not here.
+
+- [x] 10. Fire tracked deadlines without periodic-tick delay
+  - Cache callback state/backoff after committed outcomes and recovery; add deadline wakes, due-only reloads, full passes and cap continuation. Verify a one-hour loop, cache reload counts and at least 100 generated deadline cases.
+  - _Requirements: 2.10_

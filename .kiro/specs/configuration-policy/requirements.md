@@ -655,6 +655,28 @@ future configuration additions cannot bypass the approved doctrine.
 12. THE feature-catalog guidance test SHALL reject every default-disabled available
     feature that lacks an exact production Enablement Mechanism.
 
+### Requirement 13: Completion-Inline Policy Classification
+
+**User Story:** As an operator, I want inline execution defaults and test controls
+classified accurately, so that production behavior is explicit.
+
+#### Acceptance Criteria
+
+1. WHEN completion-inline activity support lands, THE ledger SHALL classify
+   `system.enableActivityEagerExecution` as deployment policy, default false,
+   with a wired conformance override and deployment-wide typed enablement.
+2. WHEN the heartbeat limit lands, THE ledger SHALL classify
+   `history.workflowTaskHeartbeatTimeout` as a fixed 30-minute behavioral constant
+   with a wired conformance override and no production timeout field.
+3. THE classification SHALL retain Temporal's namespace scope and default evidence
+   while explaining Tokeira's deployment-wide eager setting.
+4. WHEN those consult sites land, THE conformance key registry and ledger SHALL
+   agree on bool/duration types and wired support, and THE renderer SHALL regenerate
+   and check its owned outputs from code and data.
+5. THE classification data and generated treatments SHALL describe both implemented
+   consult sites: the eager deployment setting and the fixed heartbeat limit, each
+   with its typed wired conformance override.
+
 ## Iteration and Feedback Notes
 
 - Owner approval on 2026-07-26 accepted the doctrine and recommendations in

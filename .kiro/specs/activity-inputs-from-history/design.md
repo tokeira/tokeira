@@ -164,7 +164,7 @@ The previous release's state decoder SHALL refuse every state this release write
   - deployment transitions.
 - **What it does.** It reads the scheduled event with `read_history_event(run_key, schedule_event_id)` before the started transition commits. The answer's input and header come from the event's `ActivityTaskScheduled` attributes; every other field comes from where it does today (3.1).
 - **When it fails.** If the read fails, or finds no event, the start commits nothing. The task goes back to its queue, as when the start's commit fails, and the start answers the read's error, or an internal error naming the missing event (2.4).
-- **Eager starts.** The eager path hands the start the input and header of the command that scheduled the activity, which the completion request holds. Given them, the start reads nothing (2.2).
+- **Eager starts.** The [completion-inline path](../activity-dispatch/design.md#offers-and-eager-start) starts the activity inside the completion and builds its response from that scheduling command’s input/header after commit, without a separate start or history-input read (2.2). Ordinary-start rules do not run on this eager first start.
 
 ### Runtime: re-publishing
 

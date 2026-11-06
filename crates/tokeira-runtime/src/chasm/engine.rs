@@ -269,6 +269,12 @@ impl MutableContext for TransitionContext {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ArmedTimer {
+    deadline: Option<i64>,
+    attempted: bool,
+}
+
 /// The concrete CHASM engine (Requirement 6).
 ///
 /// Holds the node repository, the immutable component [`Registry`], the dispatch
@@ -286,7 +292,8 @@ pub struct ChasmEngine {
     /// At most one armed physical-timer deadline per execution (Requirement 7.6).
     /// Engine-local, non-replicated state that never bumps the VT (Requirement
     /// 7.7).
-    timers: Mutex<HashMap<ExecutionKey, Option<i64>>>,
+    timers: Mutex<HashMap<ExecutionKey, ArmedTimer>>,
+    pub(crate) timer_wake: crate::deadline_wake::DeadlineWake,
 }
 
 // Manual impl: composed of trait objects with no `Debug` bound.
@@ -315,6 +322,7 @@ impl ChasmEngine {
             clock: Arc::new(default_now_unix_nanos),
             pollers: Mutex::new(HashMap::new()),
             timers: Mutex::new(HashMap::new()),
+            timer_wake: crate::deadline_wake::DeadlineWake::default(),
         }
     }
 
@@ -351,13 +359,12 @@ impl ChasmEngine {
         self.timers
             .lock()
             .ok()
-            .and_then(|timers| timers.get(key).copied().flatten())
+            .and_then(|timers| timers.get(key).and_then(|entry| entry.deadline))
     }
 
     /// Snapshot every execution that currently has an armed timer deadline, as
-    /// `(key, deadline)` pairs. The CHASM timer sweeper scans this each tick to find
-    /// due executions; it is a point-in-time copy so the sweeper never holds the
-    /// lock across an `await`. Engine-local, non-replicated state (Requirement 7.7).
+    /// `(key, deadline)` pairs, for inspection. The sweeper selects only due entries
+    /// under the lock. Engine-local, non-replicated state (Requirement 7.7).
     pub fn armed_timers_snapshot(&self) -> Vec<(ExecutionKey, i64)> {
         let mut snapshot: Vec<_> = self
             .timers
@@ -365,7 +372,7 @@ impl ChasmEngine {
             .map(|timers| {
                 timers
                     .iter()
-                    .filter_map(|(key, deadline)| deadline.map(|d| (key.clone(), d)))
+                    .filter_map(|(key, deadline)| deadline.deadline.map(|d| (key.clone(), d)))
                     .collect()
             })
             .unwrap_or_default();
@@ -377,6 +384,63 @@ impl ChasmEngine {
             ))
         });
         snapshot
+    }
+
+    /// Plan under the index lock without copying executions. An attempted past
+    /// deadline is left to reconciliation, so a failed evaluator cannot spin.
+    pub(crate) fn timer_delay(
+        &self,
+        now: i64,
+        interval: std::time::Duration,
+    ) -> std::time::Duration {
+        self.timers
+            .lock()
+            .expect("timer registry not poisoned")
+            .values()
+            .filter_map(|entry| {
+                entry.deadline.and_then(|due| {
+                    if due > now {
+                        Some(std::time::Duration::from_nanos(
+                            u64::try_from(i128::from(due) - i128::from(now))
+                                .expect("i64 timestamp distance fits u64"),
+                        ))
+                    } else if !entry.attempted {
+                        Some(std::time::Duration::ZERO)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .fold(interval, std::cmp::min)
+    }
+
+    /// Claim only due executions for this pass, copying no future entries. The
+    /// caller must evaluate each selection; only a full pass releases failures.
+    pub(crate) fn due_timers(&self, now: i64, full: bool) -> Vec<(ExecutionKey, i64)> {
+        let mut timers = self.timers.lock().expect("timer registry not poisoned");
+        let mut due = Vec::new();
+        for (key, entry) in timers.iter_mut() {
+            if full {
+                entry.attempted = false;
+            }
+            if !entry.attempted
+                && let Some(deadline) = entry.deadline.filter(|deadline| *deadline <= now)
+            {
+                // Failed evaluations remain armed but are not retried by unrelated
+                // deadline wakes. Periodic reconciliation releases this suppression.
+                entry.attempted = true;
+                due.push((key.clone(), deadline));
+            }
+        }
+        due.sort_by(|(a, da), (b, db)| {
+            (da, &a.namespace_id, &a.business_id, &a.run_id).cmp(&(
+                db,
+                &b.namespace_id,
+                &b.business_id,
+                &b.run_id,
+            ))
+        });
+        due
     }
 
     /// Re-arm (or clear, with `None`) an execution's physical timer to `deadline`.
@@ -774,7 +838,19 @@ impl ChasmEngine {
     /// 7.6). Replacing the entry is what enforces "at most one armed timer".
     fn arm_timer(&self, key: &ExecutionKey, deadline: Option<i64>) {
         if let Ok(mut timers) = self.timers.lock() {
-            timers.insert(key.clone(), deadline);
+            timers.insert(
+                key.clone(),
+                ArmedTimer {
+                    deadline,
+                    attempted: false,
+                },
+            );
+            // Mutation precedes the wake lock, as in the other deadline indexes.
+            // Every i64 Unix-nanosecond timestamp fits OffsetDateTime's range.
+            self.timer_wake.changed(deadline.map(|at| {
+                time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(at))
+                    .expect("i64 nanoseconds are representable")
+            }));
         }
     }
 

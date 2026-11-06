@@ -436,3 +436,7 @@ one upstream skip and four existing registry exclusions are reported separately.
 - Unexpectedly passing exploration cases and failed preservation properties trigger
   source investigation. Do not weaken properties or amend reviewed requirements
   without the required review.
+
+- [x] 24. Fire tracked deadlines without periodic-tick delay
+  - Wake for discovered Nexus start/cancel backoff and volatile retry deadlines. Reproduce with a one-hour tick and preserve Property 23 and bounded fair discovery.
+  - _Requirements: 5.9_

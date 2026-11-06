@@ -1290,3 +1290,197 @@ pub(crate) fn malformed_page_cases(backend: &impl Backend, runtime: &tokio::runt
         )
         .unwrap();
 }
+
+// Feature: activity-dispatch, Property 7
+// Completion-owned starts never derive rows, including conflict and repair.
+pub(crate) fn eager_completion_cases(backend: &impl Backend, runtime: &tokio::runtime::Runtime) {
+    let mut runner = TestRunner::new(ProptestConfig {
+        cases: 100,
+        failure_persistence: None,
+        ..Default::default()
+    });
+    runner
+        .run(
+            &(1usize..8, any::<bool>(), any::<bool>()),
+            |(count, enabled, paused)| {
+                runtime.block_on(async {
+                    let repo = backend.activity_repo();
+                    let key = RunKey::new();
+                    let mut initial = fresh_transition(key);
+                    initial.next_state.namespace_id = tokeira_types::NamespaceId::new();
+                    initial.next_state.workflow_id.0 = key.0.to_string();
+                    initial.next_state.status = ExecutionStatus::Running;
+                    let CommitResult::Applied { new_state: state } = repo
+                        .commit_transition(key, initial, WriteFence::Unfenced)
+                        .await
+                        .unwrap()
+                    else {
+                        panic!("seed")
+                    };
+                    let start = tokeira_kernel::Kernel::apply(
+                        &tokeira_kernel::BasicKernel,
+                        LoadedRun::Existing(state.clone()),
+                        tokeira_kernel::Command::WorkflowTaskStarted(
+                            tokeira_kernel::StartWorkflowTaskRequest {
+                                logical_seq: state
+                                    .pending_workflow_task
+                                    .as_ref()
+                                    .unwrap()
+                                    .logical_seq,
+                                worker_identity: tokeira_types::WorkerIdentity("a".into()),
+                                request_id: "first".into(),
+                                history_size_bytes: 0,
+                                advice_policy: tokeira_kernel::ContinueAsNewAdvicePolicy::V1_31_0,
+                                deployment_transition: None,
+                                deployment_transition_revision_number: None,
+                                polled_task_queue: state.task_queue.clone(),
+                                now: OffsetDateTime::UNIX_EPOCH,
+                                target_version_changed_enabled: false,
+                                target_deployment_version: None,
+                            },
+                        ),
+                    )
+                    .unwrap();
+                    let CommitResult::Applied {
+                        new_state: mut state,
+                    } = repo
+                        .commit_transition(key, start, WriteFence::Unfenced)
+                        .await
+                        .unwrap()
+                    else {
+                        panic!("start")
+                    };
+                    if paused {
+                        let mut pause = following(&state);
+                        pause.next_state.status = ExecutionStatus::Paused;
+                        let CommitResult::Applied { new_state } = repo
+                            .commit_transition(key, pause, WriteFence::Unfenced)
+                            .await
+                            .unwrap()
+                        else {
+                            panic!("pause")
+                        };
+                        state = new_state;
+                    }
+                    let pending = state.pending_workflow_task.as_ref().unwrap();
+                    let req = tokeira_kernel::WorkflowTaskCompletedRequest {
+                        token: tokeira_types::WorkflowTaskToken {
+                            run_key: key,
+                            logical_seq: pending.logical_seq,
+                            started_event_id: pending.started_event_id.unwrap(),
+                            attempt: pending.attempt,
+                            shard_epoch: tokeira_types::ShardEpoch::ZERO,
+                        },
+                        identity: tokeira_types::WorkerIdentity("a".into()),
+                        client_discards_speculative_with_events: false,
+                        sdk_metadata: None,
+                        metering_metadata: None,
+                        worker_version: None,
+                        versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+                        deployment_version: None,
+                        worker_deployment_name: None,
+                        sticky: None,
+                        commands: (0..count)
+                            .map(|i| tokeira_kernel::WorkflowCommand::ScheduleActivity {
+                                activity_id: format!("a-{i}"),
+                                activity_type: "activity".into(),
+                                task_queue: TaskQueueName("activity-contract".into()),
+                                input: Default::default(),
+                                header: None,
+                                request_eager_execution: true,
+                                use_workflow_build_id: false,
+                                retry_policy: None,
+                                deployment: None,
+                                build_id: None,
+                                schedule_to_close_timeout: None,
+                                schedule_to_start_timeout: None,
+                                start_to_close_timeout: Some(Duration::minutes(1)),
+                                heartbeat_timeout: None,
+                                priority: None,
+                            })
+                            .collect(),
+                        command_sizes: Vec::new(),
+                        heartbeat: Default::default(),
+                        force_new_workflow_task: false,
+                        inline_workflow_task: None,
+                        eager_activities: tokeira_kernel::CompletionActivityStarts {
+                            enabled,
+                            scope: None,
+                            request_ids: (0..count)
+                                .map(|i| (format!("a-{i}"), tokeira_types::Uuid::new_v4()))
+                                .collect(),
+                        },
+                        limits: Default::default(),
+                        delivered_update_ids: Vec::new(),
+                        request: tokeira_types::RequestContext::unattributed(
+                            OffsetDateTime::UNIX_EPOCH,
+                        ),
+                        now: OffsetDateTime::UNIX_EPOCH,
+                    };
+                    let transition = tokeira_kernel::Kernel::apply(
+                        &tokeira_kernel::BasicKernel,
+                        LoadedRun::Existing(state.clone()),
+                        tokeira_kernel::Command::WorkflowTaskCompleted(req),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        transition
+                            .dispatch_ops
+                            .iter()
+                            .filter(|op| matches!(
+                                op,
+                                tokeira_kernel::DispatchOp::EnqueueActivityTask { .. }
+                            ))
+                            .count(),
+                        if enabled || paused { 0 } else { count }
+                    );
+                    let CommitResult::Applied { new_state } = repo
+                        .commit_transition(key, transition.clone(), WriteFence::Unfenced)
+                        .await
+                        .unwrap()
+                    else {
+                        panic!("completion")
+                    };
+                    assert!(matches!(
+                        repo.commit_transition(key, transition, WriteFence::Unfenced)
+                            .await
+                            .unwrap(),
+                        CommitResult::Conflict { .. }
+                    ));
+                    assert_eq!(new_state.transition_seq.0, state.transition_seq.0 + 1);
+                    let home = tokeira_types::execution_home_bundle(
+                        new_state.namespace_id.0.as_bytes(),
+                        new_state.workflow_id.0.as_bytes(),
+                        backend.activity_shard_count(),
+                    );
+                    repair_all(repo, home, key, WriteFence::Unfenced).await;
+                    let rows = repo
+                        .list_activity_dispatch_page(
+                            &ActivityDiscoveryRange {
+                                namespace_id: new_state.namespace_id,
+                                queue_name: TaskQueueName("activity-contract".into()),
+                            },
+                            OffsetDateTime::UNIX_EPOCH + Duration::days(1),
+                            None,
+                            NonZeroU32::new(100).unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        rows.candidates.len(),
+                        if enabled || paused { 0 } else { count }
+                    );
+                    assert_eq!(
+                        new_state
+                            .activities
+                            .values()
+                            .filter(|a| a.started_at.is_some())
+                            .count(),
+                        if enabled && !paused { count } else { 0 }
+                    );
+                    Ok(())
+                })
+            },
+        )
+        .unwrap();
+}

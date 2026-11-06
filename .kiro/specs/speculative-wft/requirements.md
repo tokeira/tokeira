@@ -316,10 +316,15 @@ event takes them.
 #### Acceptance Criteria
 
 1. WHEN a WFT completes (not failing) while admitted updates remain unsent, THE next WFT SHALL be
-   created **speculative** (normal if buffered events or heartbeat force it); today `apply_update`
+   created **speculative** (normal if buffered events, heartbeat, deployment transition or
+   inability to bypass task generation force it); today `apply_update`
    never re-kicks after the started WFT completes, stalling the caller.
    (`respondworkflowtaskcompleted/api.go:512-541 @ v1.31.0`;
    `crates/tokeira-kernel/src/kernel.rs:727-770`.)
+
+2. WHEN that follow-up is returned inline, THE completion SHALL start it without
+   dispatch under [api-conformance-wft-completion Requirement 3](../api-conformance-wft-completion/requirements.md#requirement-3-return-new-workflow-task-semantics),
+   preserving this spec's virtual-history, discard, materialization and timeout rules.
 
 ### Requirement 9: Server-Side RejectUnprocessed (rider)
 

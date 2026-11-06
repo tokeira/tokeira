@@ -183,7 +183,7 @@ preserve the force-close `WorkflowTaskFailed` (B.5).
 
 ## Error Handling
 
-No new `Reject` variants. Transient transitions reuse the existing WFT fencing/reject taxonomy
+Items A/B add no new `Reject` variants; Item C adds a committed timeout outcome, not a rejection. Transient transitions reuse the existing WFT fencing/reject taxonomy
 (`NoPendingWorkflowTask`, `WorkflowTaskNotStarted`, `WorkflowTaskSeqMismatch`,
 `WorkflowTaskTokenMismatch`). The worker's task token references the virtual started id; fencing compares
 against the pending task's stored (virtual) `started_event_id`, so a stale token is still rejected.
@@ -206,8 +206,74 @@ a started WFT at attempt 1 and attempt>1, with and without buffered events, driv
 
 Flip order matches the phases: Phase A flips `…AfterRegularWorkflowTaskStartedAndFailWorkflowTask`;
 Phase B flips the three `TerminationSignal{Before,After}TransientWorkflowTaskStarted[,AndFailWorkflowTask]`
-leaves. `TestWorkflowTaskHeartbeatingWithEmptyResult` stays a registered OverrideDynamicConfig
-out-of-scope skip (Item C, not implemented).
+leaves. Item C supersedes the old heartbeat exclusion: the orchestrator must run
+`TestWorkflowTaskHeartbeatingWithEmptyResult` and
+`TestWorkflowTaskHeartbeatingWithLocalActivitiesResult` with the wired override
+before retiring skip/evidence claims.
+
+## Item C — Completion heartbeat limit
+
+The owner now requires a fixed 30-minute heartbeat limit with a conformance-only
+override. Before completion event creation, test the original wire condition:
+force-new and zero commands and messages. Do not infer message emptiness from the
+translated command list. A positive `original_scheduled_at` expires only when
+`now > original + timeout`, never at equality. A valid heartbeat carries that
+original timestamp to its successor; progress or timeout starts a fresh chain.
+An absent/nonpositive legacy timestamp disables this check for that chain.
+After a failure or timeout during a pause, the task scheduled by unpause takes
+that unpause time as both its schedule and original time; a task scheduled before
+the pause keeps both.
+DescribeWorkflowExecution reports the pending task’s original time, using
+`0001-01-01T00:00:00Z` when it is absent (Item C criteria C.1.4 and C.1.12).
+
+Add `PendingWorkflowTask.original_scheduled_at: Option<OffsetDateTime>` as a
+non-positional field (`#[serde(skip)]`), encoded through a new frozen state-extension
+section keyed to the pending logical sequence. Do not append it to the existing
+postcard payload or rely on `serde(default)` for binary compatibility. Preserve old
+envelopes and absent-section reads as None, reject malformed/mismatched sections,
+and test current bytes, new round trips, split-state/reload and replay. Existing
+codec rules permit optional sections when absence retains legacy behavior; an old
+writer can drop this field, so do not claim mixed-version heartbeat enforcement.
+If rollback must retain enforcement, a new envelope is required instead. No SQL
+schema change is expected. Bind restoration to the pending incarnation so an old
+clock cannot leak into a replacement task.
+
+Use the existing pure WFT timeout logic, including transient event suppression and
+speculative materialization, inside the completion transition. Return a typed
+committed-timeout result through runtime and edge after persistence, mapping it to
+NotFound with the exact message. A kernel Reject would discard the required timeout.
+Apply request sticky attributes after clearing sticky on timeout. Schedule a fresh
+Normal successor with its own original schedule time. It follows completion
+Requirement 3's inline-start gate but is not returned: no response decoration marks
+updates sent, buffered queries remain buffered, and the committed result returns
+NotFound. Its subsequent start-to-close timeout uses the existing sticky timeout
+rules, clearing sticky and scheduling normal work at the same attempt. The exact
+history oracle and authority are in [Item C](requirements.md#requirement-c1-bound-heartbeat-only-progress).
+
+### Property C1: Heartbeat window and compatibility
+
+*For any* original timestamp, elapsed time, command/message presence and force flag,
+the timeout decision SHALL equal the positive-timestamp, heartbeat-only, strict
+comparison predicate. A successful heartbeat preserves its origin, progress resets
+it, and an absent legacy origin stays absent through heartbeat-only successors.
+
+**Validates: Requirements C.1.1, C.1.2, C.1.4–C.1.7**
+
+### Property C2: Committed heartbeat timeout
+
+*For any* heartbeat timeout and commit/conflict/failure outcome, the exact NotFound
+SHALL be exposed only after the timeout state commits; no Completed event SHALL be
+substituted, no failed commit SHALL change state, and the original task SHALL not
+remain completable with its old token.
+
+**Validates: Requirements C.1.2, C.1.3, C.1.8**
+
+Use controlled kernel time/paused runtime clocks for below/equal/above 30-minute
+cases, wire-message-only progress, force=false, old bytes and chain carry/reset.
+The heartbeat reproduction must fail on `main` first. A negative control disabling
+the check must fail it; ordinary completion and in-window heartbeat are preservation
+controls. Run both corpus heartbeat tests through the orchestrator, inspecting
+history and status rather than claiming success from a skipped leaf.
 
 ## Sequencing: A before B (do not invalidate A's goldens)
 

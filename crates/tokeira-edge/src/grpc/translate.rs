@@ -2705,10 +2705,43 @@ fn version_drainage_status_to_proto(value: VersionDrainageStatus) -> i32 {
     }
 }
 
+/// Clear buggy SDK eager requests before command translation
+/// (`service/frontend/overrides.go:23-56 @ v1.31.0`).
+pub(crate) fn disable_eager_activity_for_buggy_clients(
+    request: &mut workflowservice::RespondWorkflowTaskCompletedRequest,
+    headers: &http::HeaderMap,
+) {
+    let client = headers
+        .get("client-name")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let version = headers
+        .get("client-version")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let excluded = match client {
+        "temporal-python" => matches!(version, "0.1a1" | "0.1a2" | "0.1b1" | "0.1b2"),
+        "temporal-typescript" => semver::Version::parse(version)
+            .is_ok_and(|version| version < semver::Version::new(1, 4, 4)),
+        _ => false,
+    };
+    if excluded {
+        for command in &mut request.commands {
+            if let Some(command::command::Attributes::ScheduleActivityTaskCommandAttributes(
+                attributes,
+            )) = &mut command.attributes
+            {
+                attributes.request_eager_execution = false;
+            }
+        }
+    }
+}
+
 #[allow(deprecated)]
 pub fn respond_completed_request_to_edge(
     req: workflowservice::RespondWorkflowTaskCompletedRequest,
 ) -> Result<RespondWorkflowTaskCompletedRequest, ProtoConversionError> {
+    let wire_completion_empty = req.commands.is_empty() && req.messages.is_empty();
     // Index messages by ID so ProtocolMessage commands can
     // look up their corresponding message body. The original request order
     // is preserved separately: messages NOT referenced by any command are
@@ -2863,6 +2896,7 @@ pub fn respond_completed_request_to_edge(
             .is_some_and(|capabilities| capabilities.discard_speculative_workflow_task_with_events),
         commands,
         command_sizes,
+        wire_completion_empty,
         force_create_new_workflow_task: req.force_create_new_workflow_task,
         return_new_workflow_task: req.return_new_workflow_task,
         query_results: req
@@ -3882,6 +3916,15 @@ fn pending_wft_to_proto(
             enums::PendingWorkflowTaskState::Scheduled as i32
         },
         scheduled_time: Some(to_proto_timestamp(wft.scheduled_at)),
+        // Describe encodes Go's zero time for an absent origin, not an omitted
+        // timestamp (service/history/api/describeworkflow/api.go:222-226 @ v1.31.0).
+        original_scheduled_time: Some(wft.original_scheduled_at.map_or(
+            prost_types::Timestamp {
+                seconds: -62_135_596_800,
+                nanos: 0,
+            },
+            to_proto_timestamp,
+        )),
         started_time: wft.started_at.map(to_proto_timestamp),
         attempt: wft.attempt as i32,
         ..Default::default()
@@ -5370,6 +5413,7 @@ pub fn proto_command_to_workflow_command(
                     .unwrap_or_default(),
                 header: attrs.header.as_ref().map(headers_to_domain),
                 request_eager_execution: attrs.request_eager_execution,
+                use_workflow_build_id: attrs.use_workflow_build_id,
                 // Activities always carry a retry policy in v1.31.0; default/ensure it here.
                 retry_policy: Some(activity_retry_policy_with_defaults(
                     attrs.retry_policy.as_ref(),
@@ -5735,6 +5779,7 @@ pub fn workflow_command_to_proto(
             input,
             header,
             request_eager_execution,
+            use_workflow_build_id,
             retry_policy,
             schedule_to_close_timeout,
             schedule_to_start_timeout,
@@ -5754,6 +5799,7 @@ pub fn workflow_command_to_proto(
                 header: header.as_ref().map(headers_from_domain),
                 input: Some(payloads_from_domain(input)),
                 request_eager_execution: *request_eager_execution,
+                use_workflow_build_id: *use_workflow_build_id,
                 schedule_to_close_timeout: schedule_to_close_timeout.map(to_proto_duration),
                 schedule_to_start_timeout: schedule_to_start_timeout.map(to_proto_duration),
                 start_to_close_timeout: start_to_close_timeout.map(to_proto_duration),
@@ -7571,6 +7617,68 @@ mod tests {
     use tokeira_kernel::state::WorkflowVersioningInfo;
     use tokeira_proto::public::temporal::api::{filter::v1 as filter, taskqueue::v1 as taskqueue};
     use tokeira_types::RunKey;
+
+    #[test]
+    fn heartbeat_wire_message_progress_is_independent_of_translated_commands() {
+        let empty = respond_completed_request_to_edge(
+            workflowservice::RespondWorkflowTaskCompletedRequest {
+                force_create_new_workflow_task: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(empty.wire_completion_empty);
+        let mut progress = respond_completed_request_to_edge(
+            workflowservice::RespondWorkflowTaskCompletedRequest {
+                force_create_new_workflow_task: true,
+                messages: vec![
+                    tokeira_proto::public::temporal::api::protocol::v1::Message {
+                        id: "rejection".into(),
+                        body: Some(prost_types::Any {
+                            type_url: "type.googleapis.com/temporal.api.update.v1.Rejection".into(),
+                            value: Vec::new(),
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(progress.commands.len(), 1);
+        progress.commands.clear();
+        assert!(!progress.wire_completion_empty);
+    }
+
+    fn assert_describe_original_time(original: Option<OffsetDateTime>) {
+        let description = crate::translate::PendingWorkflowTaskDescription {
+            original_scheduled_at: original,
+            is_started: true,
+            scheduled_at: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            started_at: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::hours(2)),
+            attempt: 1,
+        };
+        let response = pending_wft_to_proto(&description);
+        assert_eq!(
+            response.original_scheduled_time,
+            Some(prost_types::Timestamp {
+                seconds: original.map_or(-62_135_596_800, |at| at.unix_timestamp()),
+                nanos: original.map_or(0, |at| at.nanosecond() as i32),
+            })
+        );
+    }
+
+    #[test]
+    fn describe_pending_workflow_task_reports_original_time() {
+        assert_describe_original_time(Some(
+            OffsetDateTime::UNIX_EPOCH + time::Duration::nanoseconds(123_456_789),
+        ));
+    }
+
+    #[test]
+    fn describe_pending_workflow_task_reports_zero_for_absent_origin() {
+        assert_describe_original_time(None);
+    }
 
     #[test]
     fn proto_duration_conversion_caps_large_values() {
@@ -11028,3 +11136,88 @@ mod tests {
 #[cfg(test)]
 #[path = "duration_tests.rs"]
 mod duration_tests;
+
+#[cfg(test)]
+mod eager_sdk_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn check(client: &str, version: &str, eager: bool, compatible: bool, excluded: bool) {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("client-name", client.parse().unwrap());
+        headers.insert("client-version", version.parse().unwrap());
+        let mut request = workflowservice::RespondWorkflowTaskCompletedRequest {
+            commands: vec![command::Command {
+                attributes: Some(
+                    command::command::Attributes::ScheduleActivityTaskCommandAttributes(
+                        command::ScheduleActivityTaskCommandAttributes {
+                            activity_id: "a".into(),
+                            request_eager_execution: eager,
+                            use_workflow_build_id: compatible,
+                            ..Default::default()
+                        },
+                    ),
+                ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        disable_eager_activity_for_buggy_clients(&mut request, &headers);
+        let translated = proto_command_to_workflow_command(request.commands.remove(0), "").unwrap();
+        assert!(
+            matches!(translated, WorkflowCommand::ScheduleActivity { request_eager_execution, use_workflow_build_id, .. }
+            if request_eager_execution == (eager && !excluded) && use_workflow_build_id == compatible)
+        );
+    }
+
+    #[test]
+    fn python_eager_exclusions() {
+        for version in ["0.1a1", "0.1a2", "0.1b1", "0.1b2"] {
+            check("temporal-python", version, true, true, true);
+        }
+        check("temporal-python", "1.0.0", true, true, false);
+    }
+
+    #[test]
+    fn typescript_eager_exclusions() {
+        check("temporal-typescript", "1.4.3", true, true, true);
+        check("temporal-typescript", "1.4.4-rc.1", true, true, true);
+        check("temporal-typescript", "1.4.4", true, true, false);
+        check("temporal-typescript", "1.4.5", true, true, false);
+        check("temporal-typescript", "unparseable", true, true, false);
+    }
+
+    fn sdk_version() -> impl Strategy<Value = (&'static str, String, bool)> {
+        prop_oneof![
+            (0usize..5).prop_map(|index| (
+                "temporal-python",
+                ["0.1a1", "0.1a2", "0.1b1", "0.1b2", "1.0.0"][index].into(),
+                index < 4,
+            )),
+            (0u32..4).prop_map(|patch| ("temporal-typescript", format!("1.4.{patch}"), true)),
+            Just(("temporal-typescript", "1.4.4".into(), false)),
+            (5u32..1000).prop_map(|patch| ("temporal-typescript", format!("1.4.{patch}"), false)),
+            (
+                prop::sample::select(vec!["alpha", "beta", "rc"]),
+                0u32..1000
+            )
+                .prop_map(|(kind, number)| (
+                    "temporal-typescript",
+                    format!("1.4.4-{kind}.{number}"),
+                    true
+                )),
+            prop::sample::select(vec!["unparseable", "1.4", "v1.4.3", "1.4.4-01", ""])
+                .prop_map(|version| ("temporal-typescript", version.into(), false)),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+        // Feature: edge-eager-dispatch, Property 10
+        // SDK exclusion changes only eager intent; compatible-build intent survives.
+        #[test]
+        fn eager_sdk_flag_preservation((client, version, excluded) in sdk_version(), eager in any::<bool>(), compatible in any::<bool>()) {
+            check(client, &version, eager, compatible, excluded);
+        }
+    }
+}

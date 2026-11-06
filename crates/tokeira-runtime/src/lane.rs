@@ -28,7 +28,8 @@ use async_trait::async_trait;
 use smallvec::SmallVec;
 use tokeira_clock::{Clock, system_clock};
 use tokeira_kernel::{
-    Command, DispatchOp, HistoryEvent, HistoryEventKind, Kernel, LoadedRun, StartRequest,
+    ActivityOp, Command, DispatchOp, HistoryEvent, HistoryEventKind, Kernel, LoadedRun,
+    StartRequest,
 };
 use tokeira_observability::{
     ChannelTraceContext, ErrorBiasedSamplingReason, NotShardOwnerOperationLabel, RetryOutcomeLabel,
@@ -208,6 +209,26 @@ impl LaneHandle {
         received.await?
     }
 
+    /// Revalidate a scanner timeout against each state used by its fenced commit.
+    /// The observation is volatile; worker resolution commands keep their shape.
+    pub(crate) async fn submit_activity_timeout(
+        &self,
+        run_key: RunKey,
+        request: tokeira_kernel::ActivityResolvedRequest,
+        check: crate::activity_timeout::ActivityTimeoutCheck,
+    ) -> Result<CommitResult> {
+        let (reply, received) = oneshot::channel();
+        let mut message = LaneMessage::new(
+            self.lane_id,
+            run_key,
+            Command::ActivityResolved(request),
+            reply,
+        );
+        message.activity_timeout = Some(check);
+        self.tx.send(message).await?;
+        received.await?
+    }
+
     /// Persist runtime observations without inventing kernel commands or history.
     /// The caller's sequence fences all reads used to select these metadata.
     pub(crate) async fn commit_outbound_metadata(
@@ -318,6 +339,7 @@ struct LaneMessage {
     successor_plan: Option<SuccessorPlan>,
     outbound: Option<OutboundSubmission>,
     observed: Option<ObservedSubmission>,
+    activity_timeout: Option<crate::activity_timeout::ActivityTimeoutCheck>,
 }
 
 impl LaneMessage {
@@ -342,6 +364,7 @@ impl LaneMessage {
             successor_plan: None,
             outbound: None,
             observed: None,
+            activity_timeout: None,
         }
     }
 }
@@ -780,6 +803,7 @@ where
             message.successor_plan.as_ref(),
             message.outbound.as_ref(),
             message.observed.as_ref(),
+            message.activity_timeout.as_ref(),
             &mut successor_effect,
             config.max_occ_retries,
             cache,
@@ -832,7 +856,13 @@ where
 
         let stop_draining = result.is_err() || breach.is_some();
         let reply = match result {
-            Ok((commit_result, mut dispatch_ops, history_events)) => {
+            Ok((
+                commit_result,
+                mut dispatch_ops,
+                history_events,
+                activity_starts,
+                heartbeat_timed_out,
+            )) => {
                 if let CommitResult::Applied { new_state } = &commit_result {
                     // Clear on every committed started-task closure, including
                     // transient failures with no history event. Do this in the
@@ -882,7 +912,49 @@ where
                 };
                 if let CommitResult::Applied { new_state } = &commit_result {
                     let shard_id = shard_id.expect("applied transition has an execution home");
-                    activity_tracking.eligibility.refresh(new_state, shard_id);
+                    // An option update can expose a deferred attempt to eligibility.
+                    // Its old retry anchors must be reset before that wake escapes.
+                    if let Command::UpdateActivityOptions(request) = &committed_command {
+                        for (id, at) in &request.reschedule_at {
+                            if let Some(activity) = new_state.activities.get(id)
+                                && activity.started_at.is_none()
+                                && activity.pause_info.is_none()
+                            {
+                                activity_tracking.record_retry_with_timeouts(
+                                    new_state.run_key,
+                                    id,
+                                    *at,
+                                    Some(crate::activity_timeout::ActivityTimeouts::from(activity)),
+                                );
+                            }
+                        }
+                    }
+                    // Option updates, pause and reset may move a deadline without
+                    // starting an attempt. Unchanged caches do not rearm failed work.
+                    activity_tracking.refresh_timeouts(new_state);
+                    // Only this commit's starts need new deadlines. Existing
+                    // started activities keep their tracking across unrelated commits.
+                    for activity_id in activity_starts {
+                        let Some(activity) = new_state.activities.get(&activity_id) else {
+                            continue;
+                        };
+                        activity_tracking.insert(crate::activity_timeout::ActivityTrackingEntry {
+                            timeouts: Some(crate::activity_timeout::ActivityTimeouts::from(
+                                activity,
+                            )),
+                            run_key: new_state.run_key,
+                            shard_id,
+                            activity_id: activity.activity_id.clone(),
+                            original_scheduled_at: activity.scheduled_at,
+                            last_dispatched_at: activity
+                                .current_attempt_scheduled_at
+                                .unwrap_or(activity.scheduled_at),
+                            started_at: activity.started_at,
+                            last_heartbeat_at: activity.last_heartbeat_at,
+                            cancel_requested: activity.cancel_requested,
+                        });
+                    }
+
                     track_committed_run(
                         new_state,
                         &history_events,
@@ -1013,6 +1085,9 @@ where
                 {
                     if let CommitResult::Applied { new_state } = &commit_result {
                         let shard_id = shard_id.expect("applied transition has an execution home");
+                        // Publication has installed schedule tracking. Only now
+                        // expose any remaining deferred obligations to the scanner.
+                        activity_tracking.refresh_eligibility(new_state, shard_id, clock.now());
                         if let Command::NexusOperationResolved(request) = &committed_command
                             && matches!(
                                 request.resolution,
@@ -1027,17 +1102,20 @@ where
                         }
                         // Retry authority lives in durable operation discovery. Keep
                         // timeout tracking aligned with the original deadline while
-                        // the operation is backing off.
+                        // backing off, and replace schedule-to-start with the committed
+                        // start-to-close anchor after an asynchronous start.
                         if let Command::NexusOperationResolved(request) = &committed_command
                             && matches!(
                                 request.resolution,
                                 tokeira_kernel::NexusResolution::AttemptFailed { .. }
+                                    | tokeira_kernel::NexusResolution::Started { .. }
                             )
                             && let Some(op) = new_state
                                 .pending_nexus_operations
                                 .get(&request.operation_id)
                         {
                             nexus_timeout_tracking.insert(crate::nexus::NexusTimeoutEntry {
+                                timeouts: Some(crate::nexus::NexusTimeouts::from(op)),
                                 run_key: message.run_key,
                                 shard_id,
                                 operation_id: request.operation_id.clone(),
@@ -1055,7 +1133,6 @@ where
                                     history,
                                 } = *committed;
                                 let home = shard_id.expect("paired close has an execution home");
-                                activity_tracking.eligibility.refresh(&state, home);
                                 track_committed_run(
                                     &state,
                                     &history,
@@ -1068,10 +1145,18 @@ where
                                 {
                                     tracing::warn!(?error, run_key = ?state.run_key, "failed to publish successor dispatch");
                                 }
+                                activity_tracking.refresh_eligibility(&state, home, clock.now());
                             }
                         }
                     }
-                    Ok(commit_result)
+                    if heartbeat_timed_out && matches!(commit_result, CommitResult::Applied { .. })
+                    {
+                        // All durable and tracking effects precede this committed
+                        // outcome. In particular, no successor response is built.
+                        Err(crate::errors::WorkflowTaskHeartbeatTimedOut.into())
+                    } else {
+                        Ok(commit_result)
+                    }
                 }
             }
             Err(error) => Err(error),
@@ -1178,6 +1263,7 @@ where
         &tokeira_clock::SystemClock,
     )
     .await
+    .map(|(result, dispatch, history, _, _)| (result, dispatch, history))
 }
 
 /// Bring the loaded state and the command up to date with the update requests
@@ -1242,6 +1328,8 @@ async fn handle_message_with_cache<K, R>(
     CommitResult,
     SmallVec<[DispatchOp; 4]>,
     SmallVec<[HistoryEvent; 8]>,
+    SmallVec<[String; 4]>,
+    bool,
 )>
 where
     K: Kernel + Send + Sync + 'static,
@@ -1254,6 +1342,7 @@ where
         update_registry,
         run_key,
         command,
+        None,
         None,
         None,
         None,
@@ -1277,6 +1366,7 @@ async fn handle_message_with_successor<K, R>(
     successor_plan: Option<&SuccessorPlan>,
     outbound: Option<&OutboundSubmission>,
     observed: Option<&ObservedSubmission>,
+    activity_timeout: Option<&crate::activity_timeout::ActivityTimeoutCheck>,
     successor_effect: &mut Option<SuccessorEffect>,
     max_retries: u32,
     cache: &mut LaneCache,
@@ -1286,6 +1376,8 @@ async fn handle_message_with_successor<K, R>(
     CommitResult,
     SmallVec<[DispatchOp; 4]>,
     SmallVec<[HistoryEvent; 8]>,
+    SmallVec<[String; 4]>,
+    bool,
 )>
 where
     K: Kernel + Send + Sync + 'static,
@@ -1319,8 +1411,12 @@ where
         );
         cache.synchronize_generation(shard_owner);
         let mut loaded = match cache.get(run_key) {
-            Some(loaded) => loaded,
-            None => {
+            Some(loaded)
+                if activity_timeout.is_none_or(|check| !check.predates_observation(&loaded)) =>
+            {
+                loaded
+            }
+            _ => {
                 let loaded = tokeira_storage::read_probe::scope(
                     "execution-owner/lane-cache-or-retry",
                     repo.load_run(run_key),
@@ -1367,6 +1463,8 @@ where
                     },
                     SmallVec::new(),
                     SmallVec::new(),
+                    SmallVec::new(),
+                    false,
                 ));
             };
             let fence = owner.fence_at(execution_home_bundle, acquisition.epoch);
@@ -1409,8 +1507,19 @@ where
                     },
                     SmallVec::new(),
                     SmallVec::new(),
+                    SmallVec::new(),
+                    false,
                 ));
             }
+        }
+        if let Some(check) = activity_timeout
+            && let Err(error) = check.validate(&loaded)
+        {
+            // This rejected image may itself have been superseded. Evict it
+            // before the scanner reloads. Successful validation is fenced by
+            // the transition sequence; OCC conflicts reload and revalidate.
+            cache.evict(run_key);
+            return Err(error.into());
         }
         let processing_span = tracing::Span::current();
         processing_span.record("tokeira.shard_id", execution_home_bundle.0);
@@ -1451,10 +1560,15 @@ where
                 },
                 SmallVec::new(),
                 SmallVec::new(),
+                SmallVec::new(),
+                false,
             ));
         }
+        let timer_due = crate::scanner::earliest_timer_write(&transition.timer_ops);
         let dispatch_ops = transition.dispatch_ops.clone();
         let history_events = transition.history_events.clone();
+        let activity_starts = newly_started_activity_ids(&transition.activity_ops);
+        let heartbeat_timed_out = transition.workflow_task_heartbeat_timed_out;
 
         let commit_result = if let Some(submission) = outbound {
             repo.commit_outbound_transition(
@@ -1476,6 +1590,7 @@ where
                 .apply(LoadedRun::Absent, Command::Start(start.clone()))
                 .map_err(|reject| anyhow::Error::new(KernelRejected(reject)))?;
             successor.growth_limits = transition.growth_limits;
+            let successor_timer_due = crate::scanner::earliest_timer_write(&successor.timer_ops);
             let successor_dispatch = successor.dispatch_ops.clone();
             let successor_history = successor.history_events.clone();
             match repo
@@ -1493,6 +1608,13 @@ where
                     closing_state,
                     successor_state,
                 } => {
+                    if let Some(due) = successor_timer_due {
+                        shard_owner
+                            .read()
+                            .expect("shard owner lock poisoned")
+                            .timer_wake
+                            .changed(execution_home_bundle, due);
+                    }
                     *successor_effect =
                         Some(SuccessorEffect::Committed(Box::new(CommittedSuccessor {
                             state: successor_state,
@@ -1522,6 +1644,13 @@ where
         };
         match commit_result {
             CommitResult::Applied { new_state } => {
+                if let Some(due) = timer_due {
+                    shard_owner
+                        .read()
+                        .expect("shard owner lock poisoned")
+                        .timer_wake
+                        .changed(execution_home_bundle, due);
+                }
                 cache.insert(run_key, LoadedRun::Existing(new_state.clone()));
                 if attempts > 0 {
                     storage_metrics::record_dsql_retry(
@@ -1541,10 +1670,18 @@ where
                     CommitResult::Applied { new_state },
                     dispatch_ops,
                     history_events,
+                    activity_starts,
+                    heartbeat_timed_out,
                 ));
             }
             CommitResult::Duplicate => {
-                return Ok((CommitResult::Duplicate, SmallVec::new(), SmallVec::new()));
+                return Ok((
+                    CommitResult::Duplicate,
+                    SmallVec::new(),
+                    SmallVec::new(),
+                    SmallVec::new(),
+                    false,
+                ));
             }
             CommitResult::CurrentExecutionConflict {
                 existing_run_key,
@@ -1563,6 +1700,8 @@ where
                     },
                     SmallVec::new(),
                     SmallVec::new(),
+                    SmallVec::new(),
+                    false,
                 ));
             }
             CommitResult::Conflict { reason } => {
@@ -1590,6 +1729,28 @@ where
             }
         }
     }
+}
+
+// Lane-owned starts are completion starts: scheduling emits an unstarted upsert
+// before the shared start mutation emits its started upsert. Ordinary starts
+// commit outside the lane and own their tracking. Matching that pair avoids both
+// a scan of every running activity and refreshing an existing start's clocks when
+// another upsert changes its options or cancellation bit. No history event is
+// required, so transient retry-policy starts are included.
+fn newly_started_activity_ids(ops: &[ActivityOp]) -> SmallVec<[String; 4]> {
+    let mut unstarted = HashSet::new();
+    let mut started = SmallVec::new();
+    for op in ops {
+        if let ActivityOp::Upsert(activity) = op {
+            let incarnation = (activity.activity_id.as_str(), activity.schedule_event_id);
+            if activity.started_at.is_none() {
+                unstarted.insert(incarnation);
+            } else if unstarted.remove(&incarnation) {
+                started.push(activity.activity_id.clone());
+            }
+        }
+    }
+    started
 }
 
 fn storage_commit_span(
@@ -2096,6 +2257,7 @@ pub(crate) fn track_committed_run(
 #[cfg(test)]
 mod tests {
     mod atomic_successors;
+    mod heartbeat;
     mod outbound_publication;
     use std::{
         collections::{BTreeMap, HashMap, VecDeque},
@@ -2301,6 +2463,7 @@ mod tests {
                     timer_ops: SmallVec::new(),
                     dispatch_ops: SmallVec::new(),
                     events_numbered_at_close: 0,
+                    workflow_task_heartbeat_timed_out: false,
                     growth_limits: None,
                 });
             }
@@ -2344,6 +2507,7 @@ mod tests {
                 timer_ops: SmallVec::<[TimerOp; 4]>::new(),
                 dispatch_ops: state.dispatch_ops.clone(),
                 events_numbered_at_close: 0,
+                workflow_task_heartbeat_timed_out: false,
                 growth_limits: None,
             })
         }
@@ -3029,6 +3193,7 @@ mod tests {
                 timer_ops: SmallVec::new(),
                 dispatch_ops: SmallVec::new(),
                 events_numbered_at_close: 0,
+                workflow_task_heartbeat_timed_out: false,
                 growth_limits: None,
             })
         }
@@ -3065,6 +3230,7 @@ mod tests {
                 timer_ops: SmallVec::new(),
                 dispatch_ops: SmallVec::new(),
                 events_numbered_at_close: 0,
+                workflow_task_heartbeat_timed_out: false,
                 growth_limits: None,
             })
         }
@@ -3093,6 +3259,7 @@ mod tests {
             external_payload_size_bytes: 0,
             next_workflow_task_seq: LogicalTaskSeq::ONE,
             pending_workflow_task: Some(PendingWorkflowTask {
+                original_scheduled_at: None,
                 advice: Default::default(),
                 task_type: tokeira_kernel::WorkflowTaskType::Normal,
                 schedule_to_start_deadline: None,
@@ -3321,7 +3488,7 @@ mod tests {
 
         let kernel = MockKernel::new(SmallVec::new());
         let mut cache = LaneCache::new(&config);
-        let (result, _, _) = handle_message_with_cache(
+        let (result, ..) = handle_message_with_cache(
             &kernel,
             &repo,
             &owner,
@@ -3362,7 +3529,7 @@ mod tests {
             .unwrap()
             .push("loser".into());
         cache.insert(key, LoadedRun::Existing(loser));
-        let (result, _, _) = handle_message_with_cache(
+        let (result, ..) = handle_message_with_cache(
             &kernel,
             &repo,
             &owner,
@@ -3389,7 +3556,7 @@ mod tests {
             LoadedRun::Existing(new_state)
         );
         cache.evict(key);
-        let (result, _, _) = handle_message_with_cache(
+        let (result, ..) = handle_message_with_cache(
             &kernel,
             &repo,
             &owner,

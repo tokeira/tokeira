@@ -1,0 +1,5 @@
+kind: changed
+body: A workflow task that only heartbeats now times out after 30 minutes without progress, and its worker receives NOT_FOUND.
+time: 2026-11-05T17:31:04.695271+00:00
+custom:
+    Slice: 001f5235-8445-480c-930f-d59ad1b33ac3

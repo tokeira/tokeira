@@ -375,6 +375,19 @@
       infer feature-catalog completeness from the suite result.
     - _Requirements: 5.1–5.10, 6.2–6.5, 7.9, 10.15_
 
+- [x] 14. Apply completion-inline policy classifications with the code
+  - Depend on edge-eager-dispatch task 11 and transient-wft task C.2's real consult
+    sites. Add the typed default-off deployment field/catalog entry, bool and
+    duration `Wired` registry entries, override/reset tests and empty-config checks.
+  - Change only the two owned classification rows as described in the design;
+    preserve source scope/defaults and update evidence/owner/feature enablement.
+    Both rows are implemented with their typed runtime consult sites.
+  - Run ledger tests, `cargo run -p compatibility-docs --locked -- write`, then
+    `cargo run -p compatibility-docs --locked -- check`; inspect all three generated
+    artifacts. Run the existing required policy/renderer properties with the new
+    field and verify production has no harness dependency or heartbeat TOML knob.
+  - _Requirements: 13.1–13.5; existing Properties 1, 4, 7, 13_
+
 ## Task Dependency Graph
 
 ```json
@@ -391,14 +404,15 @@
   "10": ["3", "4", "8"],
   "11": ["10"],
   "12": ["10", "11"],
-  "13": ["3", "6", "9", "12"]
+  "13": ["3", "6", "9", "12"],
+  "14": ["13"]
 }
 ```
 
 ## Notes
 
-- No implementation task changes `tokeira-kernel`; dependency checks make this an
-  explicit invariant rather than an assumption.
+- Configuration tasks do not import config/override readers into `tokeira-kernel`;
+  the companion completion tasks consume explicit pure policy operands.
 - The Temporal source checkout and Go extractor are maintenance inputs only. Normal
   Rust builds, tests, server startup, and documentation checks consume the checked
   snapshot.

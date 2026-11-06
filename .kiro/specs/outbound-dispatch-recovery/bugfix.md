@@ -266,6 +266,8 @@ a timeout, so that losing its first task cannot leave it permanently pending.
 7. THE runtime SHALL preserve scheduled and backing-off completion-callback recovery on closed runs.
 8. THE runtime SHALL use a single attempt lifecycle authority for each Nexus operation, cancellation and callback.
 
+9. WHEN a backing-off Nexus start or cancellation becomes due, THE runtime SHALL attempt it at that time, not at a later discovery tick, within the existing bounded discovery and admission fairness (`components/nexusoperations/statemachine.go:132,552`, `service/history/queues/queue_scheduled.go:159-224,269 @ v1.31.0`).
+
 ### Requirement 6: Durable consequences of closing a run
 
 **User story:** As a workflow author, I want parent-close actions and child results to

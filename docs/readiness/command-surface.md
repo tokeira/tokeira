@@ -250,7 +250,7 @@ Areas where Tokeira's kernel makes deliberate design choices that differ from Te
 | Concurrency limits | Temporal enforces per-entity pending limits (activities, timers, children, signals) | No per-entity ceilings | Deliberate rejection of arbitrary caps. |
 | WFT stamp on pause | `WorkflowTaskStamp` on `ExecutionInfo` | `wft_stamp` on `WorkflowState` | Same semantics, different field location. |
 | Cron scheduling | Handled in `RespondWorkflowTaskCompleted` handler | Not implemented | Cron is a runtime concern, not a kernel state transition. |
-| Eager activity dispatch | Activity can be eagerly started in WFT completion response | Not implemented | Delivery optimisation, not a kernel concern. |
+| Eager activity dispatch | Eligible activities start in the WFT completion transition and return inline | Implemented; deployment-wide setting, off by default | Default-off typed deployment policy; harness override; no count cap, dispatch row or offer; eager first starts bypass workflow rules. [Contract](../../.kiro/specs/activity-dispatch/requirements.md#requirement-9-start-eager-activities-inside-completion). |
 
 ---
 

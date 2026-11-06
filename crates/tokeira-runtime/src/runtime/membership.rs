@@ -81,7 +81,7 @@ where
                     &workflow_tracking, &tracking,
                     &activity_tracking,
                     &nexus_tracking,
-                    &callback_tracking, &repair).await?;
+                    &callback_tracking, &repair, self.clock.as_ref()).await?;
                 // Before activation, finish the
                 // materializations recorded on the shard and hand its records
                 // to the purger, checking the acquisition as the repair does.
@@ -134,6 +134,7 @@ where
         let shutdown = self.runtime_shutdown.cancellation_token();
         let wake = self.disposal_wake.clone();
         let cancel = recovery.acquisition.cancel.clone();
+        let clock = self.clock.clone();
         let _startup = self.runtime_shutdown.spawn(async move {
             let result = tokio::select! {
                 biased;
@@ -142,7 +143,7 @@ where
                 result = async {
                     let _exclusive = crate::serving_gate::quiesce(&repair.owner, &repair.acquisition).await?;
                     crate::recovery::sweep_shard_inner(ShardId(0), repo.as_ref(), &broker,
-                        &workflow, &wft, &activity, &nexus, &callbacks, &repair).await?;
+                        &workflow, &wft, &activity, &nexus, &callbacks, &repair, clock.as_ref()).await?;
                     crate::purge::recover_bulk_writes(ShardId(0), repo.as_ref(), &purger, Some(&repair), &fence).await?;
                     recovery.activate()?;
                     recovery.disarm();
@@ -320,7 +321,7 @@ where
                     &workflow_tracking, &tracking,
                     &activity_tracking,
                     &nexus_tracking,
-                    &callback_tracking, &repair).await?;
+                    &callback_tracking, &repair, self.clock.as_ref()).await?;
                 // Before activation, finish the
                 // materializations recorded on the shard and hand its records
                 // to the purger, checking the acquisition as the repair does.
@@ -722,6 +723,7 @@ mod tests {
         // Tracking the failed sweep had already rebuilt.
         let now = OffsetDateTime::now_utc();
         runtime.activity_tracking.insert(ActivityTrackingEntry {
+            timeouts: None,
             run_key: RunKey::new(),
             shard_id: ShardId(0),
             activity_id: "activity-1".to_owned(),

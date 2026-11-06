@@ -1570,6 +1570,68 @@ pub struct ProtocolMessageSize {
     pub type_name: String,
 }
 
+/// Completion-owned start operands. Absence means normal dispatch, even when
+/// updates alone would otherwise select a speculative task.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompletionWorkflowTaskStart {
+    /// Authenticated resource limits, evaluated against the transition's final
+    /// routing state on every OCC attempt. None denotes an unrestricted worker.
+    pub scope: Option<CompletionWorkflowTaskScope>,
+    /// Persisted history size read before submission and reused on OCC retries,
+    /// as on the poll path; scope is evaluated separately against each run image.
+    pub history_size_bytes: i64,
+    /// Runtime-resolved continue-as-new thresholds for the new start.
+    pub advice_policy: ContinueAsNewAdvicePolicy,
+}
+
+/// Pure, normalized projection of a scoped worker credential. Sticky queues
+/// inherit their normal queue's authorization, just as a sticky poll does.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompletionWorkflowTaskScope {
+    /// Namespace resolved by authentication, never inferred from a queue name.
+    pub namespace_id: NamespaceId,
+    /// Exact normal queues the credential may poll.
+    pub normal_task_queues: Vec<TaskQueueName>,
+    /// Exact deployment authorized for the credential.
+    pub deployment: DeploymentId,
+    /// Exact build authorized for the credential.
+    pub build_id: BuildId,
+}
+
+/// Runtime-resolved eager policy and stable request IDs for one completion.
+/// Reused unchanged on OCC retries; scope is checked against each run image.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CompletionActivityStarts {
+    /// Deployment policy, with any conformance override already applied.
+    pub enabled: bool,
+    /// Authenticated resource scope, independent of the inline workflow flag.
+    pub scope: Option<CompletionWorkflowTaskScope>,
+    /// Fresh request ID per eager ScheduleActivity command, keyed by activity ID.
+    pub request_ids: BTreeMap<String, tokeira_types::Uuid>,
+}
+
+/// Fixed heartbeat-only workflow-task limit; only the harness may override it
+/// (common/dynamicconfig/constants.go:2427-2431 @ v1.31.0).
+pub const WORKFLOW_TASK_HEARTBEAT_TIMEOUT: Duration = Duration::minutes(30);
+
+/// Completion operands resolved before submission and reused across OCC retries.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowTaskHeartbeat {
+    /// Whether the original wire request had neither commands nor messages.
+    pub wire_empty: bool,
+    /// Runtime-resolved limit; the kernel performs no configuration or clock I/O.
+    pub timeout: Duration,
+}
+
+impl Default for WorkflowTaskHeartbeat {
+    fn default() -> Self {
+        Self {
+            wire_empty: false,
+            timeout: WORKFLOW_TASK_HEARTBEAT_TIMEOUT,
+        }
+    }
+}
+
 /// Request from a worker that has finished processing a
 /// workflow task and is returning a batch of commands.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1622,6 +1684,16 @@ pub struct WorkflowTaskCompletedRequest {
     /// If true, the kernel schedules a new WFT even when no
     /// commands require one.
     pub force_new_workflow_task: bool,
+    /// Original wire progress and the heartbeat-only limit for this completion.
+    #[serde(default)]
+    pub heartbeat: WorkflowTaskHeartbeat,
+    /// Eager activity operands resolved before entering the lane.
+    #[serde(default)]
+    pub eager_activities: CompletionActivityStarts,
+    /// Request to start the successor inside this completion. Eligibility and
+    /// scope are decided after commands, against the final state and queue.
+    #[serde(default)]
+    pub inline_workflow_task: Option<CompletionWorkflowTaskStart>,
     /// Runtime-resolved pending-command policy for this completion.
     #[serde(default)]
     pub limits: WorkflowTaskCompletionLimits,
@@ -2195,6 +2267,9 @@ pub enum WorkflowCommand {
         input: Payloads,
         header: Option<Headers>,
         request_eager_execution: bool,
+        /// Route an eager activity to the workflow's assigned build when versioned.
+        #[serde(default)]
+        use_workflow_build_id: bool,
         retry_policy: Option<RetryPolicy>,
         deployment: Option<DeploymentId>,
         build_id: Option<BuildId>,

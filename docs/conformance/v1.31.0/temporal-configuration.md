@@ -17,9 +17,9 @@ Counts below include dynamic settings and the separately audited static groups.
 
 | Tokeira treatment | Count |
 |---|---:|
-| deployment policy | 10 |
+| deployment policy | 11 |
 | pinned behavioral constant | 203 |
-| auto-tuned mechanical setting | 355 |
+| auto-tuned mechanical setting | 354 |
 | conformance-only override | 49 |
 | architecturally irrelevant or excluded | 8 |
 
@@ -406,7 +406,7 @@ Counts below include dynamic settings and the separately audited static groups.
 | `history.visibilityTaskBatchSize` | global / `Int` | `100` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:2140` |
 | `history.workflowIdReuseMinimalInterval` | namespace / `Duration` | `1 * time.Second` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | kernel-excluded | `common/dynamicconfig/constants.go:2785` |
 | `history.workflowTaskCriticalAttempt` | global / `Int` | `10` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:2432` |
-| `history.workflowTaskHeartbeatTimeout` | namespace / `Duration` | `time.Minute * 30` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:2427` |
+| `history.workflowTaskHeartbeatTimeout` | namespace / `Duration` | `time.Minute * 30` | pinned behavioral constant — Fixed 30-minute workflow-task heartbeat limit in production, with no TOML field. The conformance harness may override the duration per test; completion resolves it once before submission. | wired | `common/dynamicconfig/constants.go:2427` |
 | `history.workflowTaskRetryMaxInterval` | global / `Duration` | `time.Minute * 10` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:2437` |
 | `history.xdcCacheMaxSizeBytes` | global / `Int` | `8 * 1024 * 1024` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:1663` |
 | `internal-frontend.globalNamespaceRPS` | namespace / `Int` | `0` | auto-tuned mechanical setting — No production raw-key control; Tokeira runtime defaults or adaptive delivery/storage mechanics own this concern. | none | `common/dynamicconfig/constants.go:736` |
@@ -553,7 +553,7 @@ Counts below include dynamic settings and the separately audited static groups.
 | `system.deadlock.Interval` | global / `Duration` | `60 * time.Second` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:296` |
 | `system.deadlock.MaxWorkersPerRoot` | global / `Int` | `10` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:301` |
 | `system.disallowQuery` | namespace / `Bool` | `false` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:143` |
-| `system.enableActivityEagerExecution` | namespace / `Bool` | `false` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:193` |
+| `system.enableActivityEagerExecution` | namespace / `Bool` | `false` | deployment policy — Startup-static policy.compatibility.enable_activity_eager_execution, false by default, applies to every namespace. A per-test bool override takes precedence. Eligible activities start in the completion transition without a count cap. | wired | `common/dynamicconfig/constants.go:193` |
 | `system.enableActivityRetryStampIncrement` | global / `Bool` | `false` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:208` |
 | `system.enableCrossNamespaceCommands` | global / `Bool` | `false` | conformance-only override — No production raw-key control; a typed conformance consult site exercises the supported behavior. | wired | `common/dynamicconfig/constants.go:148` |
 | `system.enableDataLossMetrics` | global / `Bool` | `false` | pinned behavioral constant — No production raw-key control; behavior is fixed at the v1.31.0 profile or the feature is unavailable as documented in the Feature Catalog. | none | `common/dynamicconfig/constants.go:273` |

@@ -4086,6 +4086,80 @@ fn activity_resolved_canceled_schedules_wft() {
 }
 
 #[test]
+fn timer_due_before_deadline_is_rejected() {
+    for boundary in [
+        now(),
+        OffsetDateTime::UNIX_EPOCH,
+        OffsetDateTime::UNIX_EPOCH - Duration::milliseconds(1),
+    ] {
+        let mut state = make_open_state_with_timer("timer-1");
+        state.timers.get_mut("timer-1").unwrap().fire_at =
+            boundary + Duration::nanoseconds(456_789);
+        let result = kernel().apply(
+            LoadedRun::Existing(state),
+            Command::TimerDue(TimerDueRequest {
+                timer_id: "timer-1".into(),
+                fired_at: boundary - Duration::nanoseconds(1),
+            }),
+        );
+        assert!(matches!(result, Err(Reject::UnknownTimer(id)) if id == "timer-1"));
+    }
+}
+
+#[test]
+fn timer_due_earlier_in_same_millisecond_fires() {
+    for boundary in [
+        now(),
+        OffsetDateTime::UNIX_EPOCH,
+        OffsetDateTime::UNIX_EPOCH - Duration::milliseconds(1),
+    ] {
+        for offset in [Duration::ZERO, Duration::microseconds(456)] {
+            let mut state = make_open_state_with_timer("timer-1");
+            state.timers.get_mut("timer-1").unwrap().fire_at =
+                boundary + Duration::nanoseconds(456_789);
+            let transition = kernel()
+                .apply(
+                    LoadedRun::Existing(state),
+                    Command::TimerDue(TimerDueRequest {
+                        timer_id: "timer-1".into(),
+                        fired_at: boundary + offset,
+                    }),
+                )
+                .expect("an earlier observation in the same millisecond must fire the timer");
+            assert!(!transition.next_state.timers.contains_key("timer-1"));
+            assert!(transition.history_events.iter().any(|event| matches!(
+                &event.kind,
+                HistoryEventKind::TimerFired { timer_id, started_event_id: 7 } if timer_id == "timer-1"
+            )));
+        }
+    }
+}
+
+#[test]
+fn timer_due_at_or_after_deadline_fires() {
+    for elapsed in [Duration::ZERO, Duration::nanoseconds(1)] {
+        let state = make_open_state_with_timer("timer-1");
+        let transition = kernel()
+            .apply(
+                LoadedRun::Existing(state),
+                Command::TimerDue(TimerDueRequest {
+                    timer_id: "timer-1".into(),
+                    fired_at: now() + elapsed,
+                }),
+            )
+            .unwrap();
+        assert!(!transition.next_state.timers.contains_key("timer-1"));
+        assert!(transition.history_events.iter().any(|event| matches!(
+            &event.kind,
+            HistoryEventKind::TimerFired { timer_id, started_event_id: 7 } if timer_id == "timer-1"
+        )));
+        assert!(transition.timer_ops.iter().any(|op| matches!(
+            op, tokeira_kernel::TimerOp::Delete { timer_id } if timer_id == "timer-1"
+        )));
+    }
+}
+
+#[test]
 fn timer_due_schedules_wft() {
     let state = make_open_state_with_timer("timer-1");
     let transition = kernel()

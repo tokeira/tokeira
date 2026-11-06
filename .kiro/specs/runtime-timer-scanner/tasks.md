@@ -160,3 +160,14 @@ Add a background timer scanner to `tokeira-runtime` that periodically discovers 
   - Verify sleeping-scanner delivery, preparation visibility, acquisition, cursor
     rewinds, failure isolation and counted per-shard listings with the node clock.
   - _Requirements: 1.1, 1.6, 5, 6._
+
+- [x] 10. Reject stale timer commands using millisecond deadline precision
+  - Verify an earlier observation in the same millisecond fires a timer with
+    sub-millisecond digits, including at its microsecond-truncated time and before
+    1970. Reject an observation in the preceding millisecond without a transition;
+    preserve firing at and after the exact deadline.
+  - Verify a scanner command built from a microsecond-truncated row fires the
+    nanosecond-state timer exactly once. Keep the captured-listing race test:
+    cancellation and replacement under the same id leave state, history and the
+    later replacement row unchanged on rejection, then fire at its own time.
+  - _Requirements: 2.5._

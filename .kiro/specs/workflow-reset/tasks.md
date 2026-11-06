@@ -88,3 +88,11 @@ Leaf shorthand: `RW/*` = `TestResetWorkflowTestSuite`, `WR/*` = `TestWorkflowRes
 - [ ] 5.2 (CM11, F15) Batch reset: BuildId target, reapply/current_run_only.
       (Both consumers are the 2 worker-deployment-versioning skips; the 6 phase-2 child leaves remain
       upstream `t.Skip`.)
+
+## Pending timer projection
+
+- [x] 6. Name every timer retained by the reset successor in its timer operations.
+  - Verify `reset_publication_wakes_preserved_timer` on the in-memory store: before the fix,
+    the rebuilt state retained the timer but its durable row was absent, failing the row
+    assertion. DSQL's preparation already staged rows from the new run's state.
+  - _Requirements: 2.6._

@@ -52,6 +52,7 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 2. WHEN a `TimerDue` command is delivered for a timer that has already been canceled or fired, THE Kernel SHALL reject it with `Reject::UnknownTimer`, and THE Runtime SHALL treat that rejection as a harmless no-op.
 3. WHEN a `TimerDue` command is delivered for a run that is already closed, THE Kernel SHALL reject it with `Reject::RunClosed`, and THE Runtime SHALL treat that rejection as a harmless no-op.
 4. WHEN a `TimerDue` command is delivered for a run that does not exist, THE Kernel SHALL reject it with `Reject::MissingRun`, and THE Runtime SHALL treat that rejection as a harmless no-op.
+5. WHEN a `TimerDue` command names a timer whose fire time, floored to the millisecond, is after its `fired_at` floored to the millisecond, THE Kernel SHALL reject it with `Reject::UnknownTimer`, and THE Runtime SHALL treat that rejection as a harmless no-op. Flooring SHALL also apply before 1970. Authority: `service/history/timer_queue_active_task_executor.go:163-175`, `service/history/queues/queue_scheduled.go:286-301` and `common/constants.go:46 @ v1.31.0`.
 
 ---
 

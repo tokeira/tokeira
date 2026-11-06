@@ -4134,6 +4134,20 @@ impl BasicKernel {
             .get(&req.timer_id)
             .cloned()
             .ok_or_else(|| Reject::UnknownTimer(req.timer_id.clone()))?;
+        // A listing can outlive cancellation and replacement under the same id.
+        // Compare floored milliseconds like IsTimeExpired in
+        // service/history/queues/queue_scheduled.go:286-301, with the precision in
+        // common/constants.go:46, used by the user timer executor in
+        // service/history/timer_queue_active_task_executor.go:163-175 @ v1.31.0.
+        // DSQL rows keep microseconds while state keeps nanoseconds; since the
+        // scanner submits only rows at or before fired_at, this comparison accepts
+        // current timers despite storage truncation. Euclidean division floors
+        // timestamps before 1970 too, rather than rounding them toward zero.
+        if timer.fire_at.unix_timestamp_nanos().div_euclid(1_000_000)
+            > req.fired_at.unix_timestamp_nanos().div_euclid(1_000_000)
+        {
+            return Err(Reject::UnknownTimer(req.timer_id));
+        }
 
         let mut builder = TransitionBuilder::new(state, req.fired_at, None);
         let fired = HistoryEventKind::TimerFired {

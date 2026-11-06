@@ -606,3 +606,228 @@ async fn reset_publication_wakes_preserved_timer() {
     tokio::join!(scanner, check);
     discovery_tests::stop(&runtime).await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn captured_timer_listing_cannot_fire_replacement_early() {
+    let (store, runtime) = fixture().await;
+    let request = start(&runtime, false);
+    let run = request.run_key;
+    let queue = QueueKey {
+        namespace_id: request.namespace_id,
+        task_queue: request.task_queue.clone(),
+        task_kind: TaskKind::Workflow,
+        deployment: None,
+        build_id: None,
+    };
+    runtime.start_workflow(request).await.unwrap();
+    let first = runtime
+        .poll_workflow_task(
+            queue,
+            WorkerIdentity("worker".into()),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let mut complete = completion_inline_tests::completion(&first, true);
+    complete.force_new_workflow_task = true;
+    complete.now = runtime.clock.now();
+    complete.request.received_at = complete.now;
+    complete.commands = vec![WorkflowCommand::StartTimer {
+        timer_id: "reused".into(),
+        fire_at: complete.now + Duration::milliseconds(200),
+    }];
+    let next = runtime
+        .complete_workflow_task_with_result(complete)
+        .await
+        .unwrap()
+        .workflow_task
+        .unwrap();
+    tokio::time::advance(std::time::Duration::from_millis(200)).await;
+    let fired_at = runtime.clock.now();
+    let captured = store
+        .list_due_timers_for_shard(ShardId(0), fired_at, None, 100)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let replacement_at = fired_at + Duration::seconds(1);
+    let mut replace = completion_inline_tests::completion(&next, false);
+    replace.now = runtime.clock.now();
+    replace.request.received_at = replace.now;
+    replace.commands = vec![
+        WorkflowCommand::CancelTimer {
+            timer_id: "reused".into(),
+        },
+        WorkflowCommand::StartTimer {
+            timer_id: "reused".into(),
+            fire_at: replacement_at,
+        },
+    ];
+    runtime.complete_workflow_task(replace).await.unwrap();
+    let before = store.load_run(run).await.unwrap();
+    let history_before = store.read_history_to_end(run, 0).await.unwrap();
+    let submitted = runtime
+        .submit(
+            run,
+            crate::scanner::command_for_due_timer(captured.clone(), fired_at),
+        )
+        .await;
+    assert!(
+        submitted.is_err(),
+        "captured listing must not fire a replacement timer early"
+    );
+    let error = submitted.unwrap_err();
+    assert!(
+        matches!(error.downcast_ref::<crate::lane::KernelRejected>(),
+        Some(crate::lane::KernelRejected(tokeira_kernel::Reject::UnknownTimer(id))) if id == "reused")
+    );
+    assert!(
+        !crate::scanner::settle_failed_due_timer(
+            store.as_ref(),
+            Some(ShardId(0)),
+            &captured,
+            &error
+        )
+        .await
+    );
+    assert_eq!(store.load_run(run).await.unwrap(), before);
+    assert_eq!(
+        store.read_history_to_end(run, 0).await.unwrap(),
+        history_before
+    );
+    let rows = store
+        .list_due_timers_for_shard(ShardId(0), replacement_at, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].fire_at, replacement_at);
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    crate::scanner::scan_due_timers_once_for_shard(
+        store.as_ref(),
+        ShardId(0),
+        &TimerScannerConfig::default(),
+        runtime.clock.now(),
+        |due, now| {
+            let runtime = &runtime;
+            async move {
+                runtime
+                    .submit(run, crate::scanner::command_for_due_timer(due, now))
+                    .await
+                    .map(|_| ())
+            }
+        },
+    )
+    .await;
+    let history = store.read_history_to_end(run, 0).await.unwrap();
+    let fired: Vec<_> = history
+        .iter()
+        .filter(|event| {
+            matches!(&event.kind,
+        HistoryEventKind::TimerFired { timer_id, .. } if timer_id == "reused")
+        })
+        .collect();
+    assert_eq!(fired.len(), 1);
+    assert_eq!(fired[0].happened_at, replacement_at);
+    let LoadedRun::Existing(state) = store.load_run(run).await.unwrap() else {
+        panic!("run");
+    };
+    assert!(!state.timers.contains_key("reused"));
+    assert!(
+        store
+            .list_due_timers_for_shard(ShardId(0), replacement_at, None, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    discovery_tests::stop(&runtime).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn microsecond_timer_row_fires_current_timer_once() {
+    let (store, runtime) = fixture().await;
+    let request = start(&runtime, false);
+    let run = request.run_key;
+    let queue = QueueKey {
+        namespace_id: request.namespace_id,
+        task_queue: request.task_queue.clone(),
+        task_kind: TaskKind::Workflow,
+        deployment: None,
+        build_id: None,
+    };
+    runtime.start_workflow(request).await.unwrap();
+    let first = runtime
+        .poll_workflow_task(
+            queue,
+            WorkerIdentity("worker".into()),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let mut complete = completion_inline_tests::completion(&first, false);
+    complete.now = runtime.clock.now();
+    complete.request.received_at = complete.now;
+    let fire_at = complete.now + Duration::milliseconds(200) + Duration::nanoseconds(789);
+    complete.commands = vec![WorkflowCommand::StartTimer {
+        timer_id: "precision".into(),
+        fire_at,
+    }];
+    runtime.complete_workflow_task(complete).await.unwrap();
+    let mut row = store
+        .list_due_timers_for_shard(ShardId(0), fire_at, None, 100)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(row.fire_at, fire_at);
+    // DSQL's dispatch timestamp retains microseconds while the run keeps nanoseconds.
+    row.fire_at = fire_at
+        .replace_nanosecond(fire_at.nanosecond() / 1_000 * 1_000)
+        .unwrap();
+    assert!(row.fire_at < fire_at);
+    tokio::time::advance(std::time::Duration::try_from(row.fire_at - runtime.clock.now()).unwrap())
+        .await;
+    let fired_at = runtime.clock.now();
+    assert_eq!(fired_at, row.fire_at);
+    runtime
+        .submit(
+            run,
+            crate::scanner::command_for_due_timer(row.clone(), fired_at),
+        )
+        .await
+        .expect("a current timer must fire at its microsecond row timestamp");
+    let history = store.read_history_to_end(run, 0).await.unwrap();
+    let fired: Vec<_> = history
+        .iter()
+        .filter(|event| {
+            matches!(&event.kind,
+        HistoryEventKind::TimerFired { timer_id, .. } if timer_id == "precision")
+        })
+        .collect();
+    assert_eq!(fired.len(), 1);
+    assert_eq!(fired[0].happened_at, fired_at);
+    let after = store.load_run(run).await.unwrap();
+    let LoadedRun::Existing(state) = &after else {
+        panic!("run");
+    };
+    assert!(!state.timers.contains_key("precision"));
+    assert!(
+        store
+            .list_due_timers_for_shard(ShardId(0), fire_at, None, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let duplicate = runtime
+        .submit(run, crate::scanner::command_for_due_timer(row, fired_at))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(duplicate.downcast_ref::<crate::lane::KernelRejected>(),
+        Some(crate::lane::KernelRejected(tokeira_kernel::Reject::UnknownTimer(id))) if id == "precision")
+    );
+    assert_eq!(store.load_run(run).await.unwrap(), after);
+    assert_eq!(store.read_history_to_end(run, 0).await.unwrap(), history);
+    discovery_tests::stop(&runtime).await;
+}

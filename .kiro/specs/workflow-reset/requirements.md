@@ -234,6 +234,10 @@ earlier point, and the engine forks that base while terminating the (possibly di
    Describe on the new run SHALL report `FirstRunId` = the chain's true first run (F3).
 5. WHEN there is no pending WFT at the fork point THE reset SHALL be rejected (F5,
    workflow_resetter.go:520-529).
+6. WHEN timers started before the reset point are still pending in the new run, THE new run
+   SHALL hold their durable timer rows, so each fires at its time. Authority:
+   `service/history/ndc/state_rebuilder.go:141` and
+   `service/history/workflow/task_refresher.go:433-464 @ v1.31.0`.
 
 ## Requirement 3 — Reset-point resolution and validation
 

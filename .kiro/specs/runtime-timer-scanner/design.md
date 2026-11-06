@@ -292,7 +292,7 @@ If `lane.submit(run_key, command)` returns an `Err` that is not a kernel rejecti
 
 The lane's `submit` path translates kernel `Reject` variants into `Err`. For timer scanning, the relevant rejections are:
 
-- `Reject::UnknownTimer(timer_id)` — the timer was already fired or canceled. Harmless.
+- `Reject::UnknownTimer(timer_id)` — the timer was already fired or canceled, or its current fire time is later than the command observation after both are floored to milliseconds. This precision accepts due microsecond rows for nanosecond state. Harmless; a replacement timer row stays pending.
 - `Reject::RunClosed(status)` — the run reached a terminal state. Harmless.
 - `Reject::MissingRun` — the run does not exist in storage. Harmless.
 
@@ -301,6 +301,16 @@ All three are logged at `debug` level (not warn) and the scanner continues. Thes
 ### Race between timer cancellation and scanner
 
 If a `CancelTimer` workflow command is processed between the scanner's `list_due_timers` call and the `submit` call for that timer, the kernel will reject the `TimerDue` with `Reject::UnknownTimer` because the `CancelTimer` transition already removed the timer from the open set and emitted `TimerOp::Delete`. This is the intended non-authoritative behavior.
+
+If the workflow starts a replacement under the same id before submission, the kernel also
+checks its current `fire_at` against the command's `fired_at`, flooring both to milliseconds,
+including before 1970. DSQL rows keep microseconds while state keeps nanoseconds; since the
+scanner only submits rows at or before `fired_at`, this precision accepts current timers despite
+that storage truncation. A replacement in a later millisecond is rejected with
+`Reject::UnknownTimer`; the runtime keeps its row for its own deadline. No timer identity
+fields or start-delay behavior change (Requirement 2.5;
+`service/history/timer_queue_active_task_executor.go:163-175`,
+`service/history/queues/queue_scheduled.go:286-301` and `common/constants.go:46 @ v1.31.0`).
 
 ### Race between duplicate scanner instances
 

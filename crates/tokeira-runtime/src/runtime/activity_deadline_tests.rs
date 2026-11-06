@@ -25,7 +25,7 @@ async fn scanner_fixture() -> (
     (store, runtime, first, queue)
 }
 
-async fn stop_scanners<R: RunRepository + 'static>(runtime: &mut TokeiraRuntime<R>) {
+pub(super) async fn stop_scanners<R: RunRepository + 'static>(runtime: &mut TokeiraRuntime<R>) {
     runtime.timer_scanner_cancel.cancel();
     runtime.workflow_timeout_scanner_cancel.cancel();
     runtime.wft_timeout_scanner_cancel.cancel();

@@ -47,6 +47,11 @@ HandleFailed`): retryable iff `ApplicationFailureInfo` present, `!NonRetryable`,
    fenced commit.
 2. IF a due timer's validator no longer holds (status/attempt moved) THEN the runtime SHALL drop it
    without effect.
+3. WHEN an armed deadline elapses, THE runtime SHALL evaluate it at that deadline, in
+   deadline order with a stable execution tie-break, not at a later periodic sweep.
+   An earlier arm SHALL wake the sweeper; failed evaluations SHALL wait for the
+   interval backstop. Authority: `chasm/lib/activity/activity_tasks.go:100-152`
+   and `service/history/queues/queue_scheduled.go:159-275 @ v1.31.0`.
 
 ### Requirement 2: Schedule-to-start / schedule-to-close timeout
 

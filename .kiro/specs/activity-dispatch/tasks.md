@@ -456,3 +456,11 @@ active for the live campaign. No implementation commit or PR exists yet.
     earlier/later notifications, shared planning and bounded continuation.
   - Dependency: runtime-activity-timeouts task 9.
   - _Requirements: 6.9._
+
+- [x] 17. Offer eligible retries at the end of backoff
+  - Reuse the loaded authority and deployment routing to offer locally, retaining
+    rule suppression, broker deduplication and discovery for remote queue homes.
+  - Reproduce a waiting poll with discovery absent, verify pause suppression, and
+    run the real timer/eligibility loops with a retry preceding a user timer.
+  - Dependency: task 16.
+  - _Requirements: 6.10._

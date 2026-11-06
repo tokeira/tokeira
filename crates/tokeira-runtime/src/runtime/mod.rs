@@ -126,6 +126,8 @@ pub(crate) mod repair_tests;
 mod reset;
 #[cfg(test)]
 mod successor_semantics_tests;
+#[cfg(test)]
+mod timer_deadline_tests;
 pub(crate) mod workflow_task;
 
 pub use workflow_task::continue_as_new_advice_policy;

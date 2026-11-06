@@ -1,10 +1,10 @@
 //! Background timer scanner and lane-routing helpers.
 //!
 //! Two responsibilities live here. First, the background timer scanner:
-//! periodically reads *durable* storage for timers that are due and submits a
+//! looks ahead in *durable* storage and wakes at the next deadline to submit a
 //! `TimerDue` command to the owning lane. The scanner holds no authoritative
 //! state of its own — storage is the source of truth for which timers are due —
-//! so a missed or duplicated tick is recovered on the next scan and is safe after
+//! so full scans recover a missed notification and duplicated delivery is safe after
 //! crash or failover. A due row whose run has closed or no longer exists can
 //! never fire, so the scanner deletes it rather than resubmit it on every pass
 //! at the front of the shard's oldest-first batch. Second, the deterministic run-to-lane routing
@@ -17,7 +17,10 @@
 //! function of the run key, so all producers (poll handlers, sweepers, the
 //! timeout scanners) agree on the lane without coordination.
 
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex, RwLock},
+};
 
 use anyhow::Result;
 use time::OffsetDateTime;
@@ -31,15 +34,16 @@ use tokeira_types::{RunKey, ShardId, dsql_spread_uuid};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    deadline_wake::{DeadlineWake, FullPass},
     lane::{KernelRejected, LaneHandle},
     metrics as runtime_metrics,
-    shard::ShardOwner,
+    shard::{ShardAcquisition, ShardOwner},
 };
 
 /// Configuration knobs for the background timer scanner.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TimerScannerConfig {
-    /// Delay between storage scans for due timers.
+    /// Maximum interval between full storage scans; deadlines wake sooner.
     pub scan_interval: tokio::time::Duration,
     /// Maximum timers loaded from storage per scan cycle.
     pub max_timers_per_scan: usize,
@@ -207,6 +211,7 @@ pub(crate) async fn scan_due_timers_once<R, F, Fut>(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn scan_due_timers_once_for_shard<R, F, Fut>(
     repo: &R,
     shard_id: ShardId,
@@ -245,13 +250,56 @@ pub(crate) async fn scan_due_timers_once_for_shard<R, F, Fut>(
     }
 }
 
-/// Background loop: every `scan_interval`, inject due timers for each shard this
-/// node currently owns.
-///
-/// The active-shard set is re-read each tick so ownership changes are picked up
-/// without restarting the task, and scanning is scoped per shard so a node only
-/// fires timers for runs it owns. Each due timer routes by `run_key` to the
-/// owning lane, keeping per-run command order intact.
+/// Volatile per-shard invalidations shared by commit paths and acquisition.
+/// Storage remains authoritative; losing a notification costs at most a full pass.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TimerWake {
+    wake: DeadlineWake,
+    changed: Arc<Mutex<BTreeMap<ShardId, OffsetDateTime>>>,
+}
+
+impl TimerWake {
+    /// Announce only visible, committed timers. Preparation completion must precede
+    /// this call because listings hide timers belonging to an unfinished publication.
+    pub(crate) fn changed(&self, shard: ShardId, due: OffsetDateTime) {
+        let mut changed = self.changed.lock().expect("timer wake lock poisoned");
+        changed
+            .entry(shard)
+            .and_modify(|old| *old = (*old).min(due))
+            .or_insert(due);
+        self.wake.changed(Some(due));
+    }
+
+    /// Reconstruct the wake after a prepared run becomes visible to listings.
+    /// This also repairs a lost publication reply without trusting its dispatch ops.
+    pub(crate) fn published(&self, shard: ShardId, state: &tokeira_kernel::WorkflowState) {
+        if let Some(due) = state.timers.values().map(|timer| timer.fire_at).min() {
+            self.changed(shard, due);
+        }
+    }
+}
+
+/// Capture timer hints before consuming a transition; announce them only on Applied.
+pub(crate) fn earliest_timer_write(ops: &[tokeira_kernel::TimerOp]) -> Option<OffsetDateTime> {
+    ops.iter()
+        .filter_map(|op| match op {
+            tokeira_kernel::TimerOp::Upsert(timer) => Some(timer.fire_at),
+            tokeira_kernel::TimerOp::Delete { .. } => None,
+        })
+        .min()
+}
+
+#[derive(Debug)]
+struct TimerScan {
+    acquisition: ShardAcquisition,
+    after: Option<DueTimer>,
+    next: Option<OffsetDateTime>,
+    restart: Option<OffsetDateTime>,
+    failed: BTreeSet<(OffsetDateTime, RunKey, String)>,
+}
+
+/// Submit durable timers at their deadlines, listing only shards that need work.
+/// Full passes reconcile missed notifications; capped pages continue immediately.
 pub(crate) async fn run_timer_scanner<R>(
     repo: Arc<R>,
     lanes: Vec<LaneHandle>,
@@ -263,36 +311,172 @@ pub(crate) async fn run_timer_scanner<R>(
 ) where
     R: RunRepository + 'static,
 {
+    run_timer_scanner_with_submit(repo, shard_owner, config, cancel, clock, |due, fired_at| {
+        let lane = pick_lane_for_run_key(&lanes, lane_count, due.run_key).clone();
+        async move {
+            lane.submit(due.run_key, command_for_due_timer(due, fired_at))
+                .await
+                .map(|_| ())
+        }
+    })
+    .await;
+}
+
+/// Keep storage paging and wake planning identical in production and controlled
+/// submission tests; the closure owns the authoritative lane transition.
+pub(crate) async fn run_timer_scanner_with_submit<R, F, Fut>(
+    repo: Arc<R>,
+    owner: Arc<RwLock<ShardOwner>>,
+    config: TimerScannerConfig,
+    cancel: CancellationToken,
+    clock: Arc<dyn Clock>,
+    mut submit: F,
+) where
+    R: RunRepository + 'static,
+    F: FnMut(DueTimer, OffsetDateTime) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let wake = owner
+        .read()
+        .expect("shard owner lock poisoned")
+        .timer_wake
+        .clone();
+    let mut full = FullPass::new(config.scan_interval, clock.now());
+    let mut scans = BTreeMap::<ShardId, TimerScan>::new();
     loop {
+        let now = clock.now();
+        let revision = wake.wake.begin_plan();
+        {
+            // Ownership precedes the notification lock, as on commit/activation.
+            // No storage I/O holds either lock.
+            let owner = owner.read().expect("shard owner lock poisoned");
+            scans.retain(|_, scan| owner.acquisition_active(&scan.acquisition));
+            for shard in owner.active_shards() {
+                scans.entry(shard).or_insert_with(|| TimerScan {
+                    acquisition: owner.acquisition(shard).expect("active acquisition exists"),
+                    after: None,
+                    next: Some(now),
+                    restart: None,
+                    failed: BTreeSet::new(),
+                });
+            }
+            for (shard, due) in
+                std::mem::take(&mut *wake.changed.lock().expect("timer wake lock poisoned"))
+            {
+                if let Some(scan) = scans.get_mut(&shard) {
+                    scan.restart = Some(scan.restart.map_or(due, |old| old.min(due)));
+                }
+            }
+        }
+        if full.start(now) {
+            for scan in scans.values_mut() {
+                scan.after = None;
+                scan.next = Some(now);
+                scan.failed.clear();
+            }
+        }
+        let next = scans
+            .values()
+            .flat_map(|scan| scan.next.into_iter().chain(scan.restart))
+            .min();
+        let delay = next.map_or(full.remaining(now), |due| {
+            full.remaining(now)
+                .min(std::time::Duration::try_from(due - now).unwrap_or_default())
+        });
+        // Stored dates can exceed the monotonic clock's range. A bounded
+        // segment only replans; due checks still use the unchanged node clock.
+        let delay = wake.wake.plan(
+            now,
+            revision,
+            delay.min(std::time::Duration::from_secs(86_400)),
+        );
         tokio::select! {
             _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(config.scan_interval) => {}
+            _ = wake.wake.notify.notified() => continue,
+            _ = tokio::time::sleep(delay) => {}
         }
-
-        let active_shards: Vec<_> = shard_owner
-            .read()
-            .expect("shard_owner lock poisoned")
-            .active_shards()
-            .collect();
-        for shard_id in active_shards {
-            runtime_metrics::record_scanner_tick("timer", shard_id.0);
-            scan_due_timers_once_for_shard(
-                &*repo,
-                shard_id,
-                &config,
-                clock.now(),
-                |due, fired_at| {
-                    runtime_metrics::record_scanner_dispatched("timer", shard_id.0);
-                    let lane = pick_lane_for_run_key(&lanes, lane_count, due.run_key).clone();
-                    async move {
-                        let run_key = due.run_key;
-                        lane.submit(run_key, command_for_due_timer(due, fired_at))
-                            .await
-                            .map(|_| ())
-                    }
-                },
-            )
-            .await;
+        let now = clock.now();
+        wake.wake.start_scan(now);
+        // A full-pass deadline is handled at the top so it resets every cursor.
+        for (shard, scan) in &mut scans {
+            if !scan
+                .next
+                .into_iter()
+                .chain(scan.restart)
+                .any(|due| due <= now)
+            {
+                continue;
+            }
+            if !owner
+                .read()
+                .expect("shard owner lock poisoned")
+                .acquisition_active(&scan.acquisition)
+            {
+                continue;
+            }
+            if scan.restart.is_some_and(|due| due <= now) {
+                // A new timer can sort before the page cursor, including mid-backlog.
+                // Failed identities survive this rewind until the next full pass.
+                scan.after = None;
+                scan.restart = None;
+            }
+            scan.next = None;
+            runtime_metrics::record_scanner_tick("timer", shard.0);
+            let horizon = tokeira_kernel::deadline_after(
+                now,
+                time::Duration::try_from(config.scan_interval).unwrap_or(time::Duration::MAX),
+            );
+            let rows = match repo
+                .list_due_timers_for_shard(
+                    *shard,
+                    horizon,
+                    scan.after.as_ref(),
+                    config.max_timers_per_scan,
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!(?error, "timer look-ahead failed");
+                    continue;
+                }
+            };
+            let full_page =
+                config.max_timers_per_scan > 0 && rows.len() == config.max_timers_per_scan;
+            let mut future = false;
+            let mut deleted = 0;
+            for due in rows {
+                if due.fire_at > now {
+                    scan.next = Some(due.fire_at);
+                    future = true;
+                    break;
+                }
+                scan.after = Some(due.clone());
+                let key = (due.fire_at, due.run_key, due.timer_id.clone());
+                if scan.failed.contains(&key) {
+                    continue;
+                }
+                if !owner
+                    .read()
+                    .expect("shard owner lock poisoned")
+                    .acquisition_active(&scan.acquisition)
+                {
+                    break;
+                }
+                runtime_metrics::record_scanner_dispatched("timer", shard.0);
+                if let Err(error) = submit(due.clone(), now).await {
+                    deleted += usize::from(
+                        settle_failed_due_timer(repo.as_ref(), Some(*shard), &due, &error).await,
+                    );
+                    scan.failed.insert(key);
+                }
+            }
+            if full_page && !future {
+                scan.next = Some(now);
+            }
+            if deleted > 0 {
+                runtime_metrics::record_scanner_stale_deleted("timer", shard.0, deleted);
+            }
         }
     }
 }
@@ -445,3 +629,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod deadline_tests;

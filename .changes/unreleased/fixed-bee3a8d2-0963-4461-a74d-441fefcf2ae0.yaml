@@ -1,0 +1,5 @@
+kind: fixed
+body: Timers, start delays, standalone activity timeouts and activity retries now take effect at their time rather than up to a second late.
+time: 2026-11-06T00:09:32.416712+00:00
+custom:
+    Slice: bee3a8d2-0963-4461-a74d-441fefcf2ae0

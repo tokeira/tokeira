@@ -1217,8 +1217,8 @@ where
                                 paused: false,
                             }),
                         );
-                        // The owner's eligibility index evaluates delayed rules;
-                        // queue-home discovery supplies offers once the row is due.
+                        // The owner's eligibility index evaluates delayed rules and
+                        // offers locally at the deadline; discovery is the backstop.
                         if *dispatch_at <= self.clock.now()
                             && let Err(error) = async {
                                 #[cfg(test)]

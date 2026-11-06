@@ -1,7 +1,7 @@
 //! Execution-owner retry/rule timers reconstructed from authoritative activities.
 //!
-//! This index never scans dispatch rows or publishes offers. A successful rule
-//! evaluation consumes only its captured revision. A small completed descriptor
+//! This index never scans dispatch rows. Its evaluator offers eligible attempts
+//! locally and consumes only its captured revision. A small completed descriptor
 //! remains until the incarnation changes, preventing unrelated transitions from
 //! rearming an already evaluated timer; acquisition rebuilds every obligation.
 

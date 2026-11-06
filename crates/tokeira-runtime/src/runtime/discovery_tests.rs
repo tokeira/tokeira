@@ -126,7 +126,7 @@ async fn sticky_poll_without_normal_name_never_registers_periodic_discovery() {
     stop(&runtime).await;
 }
 
-pub(super) async fn stop(runtime: &TokeiraRuntime<InMemoryStore>) {
+pub(super) async fn stop<R: RunRepository + 'static>(runtime: &TokeiraRuntime<R>) {
     runtime.runtime_shutdown.begin_shutdown();
     runtime
         .runtime_shutdown

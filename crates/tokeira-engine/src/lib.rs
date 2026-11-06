@@ -3490,16 +3490,7 @@ fn spawn_chasm_timer_sweeper(
     let sweeper = tokeira_runtime::chasm::ChasmTimerSweeper::new(engine)
         .with_evaluator(archetype_id, evaluator);
     let _sweeper = tasks.spawn(async move {
-        let mut interval = tokio::time::interval(CHASM_TIMER_SWEEP_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = interval.tick() => {
-                    sweeper.sweep_once().await;
-                }
-            }
-        }
+        sweeper.run(CHASM_TIMER_SWEEP_INTERVAL, cancel).await;
     });
 }
 

@@ -1,4 +1,4 @@
-//! Fires due CHASM timers in deterministic execution order. Each archetype may
+//! Fires due CHASM timers in deadline order with a stable execution tie-break. Each archetype may
 //! retain an existing timeout evaluator; other roots execute registered pure tasks
 //! under a fenced transition. The armed map is disposable and rebuilt from state.
 
@@ -56,6 +56,42 @@ impl ChasmTimerSweeper {
         self
     }
 
+    /// Evaluate armed timers at their deadlines; `interval` is the reconciliation
+    /// backstop for failed evaluations. Arming an earlier timer interrupts the wait.
+    /// Logical time comes only from the engine's clock, while Tokio owns the sleep.
+    pub async fn run(
+        &self,
+        interval: std::time::Duration,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        let wall = |now: i64| {
+            time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(now))
+                .expect("i64 nanoseconds are representable")
+        };
+        let wake = &self.engine.timer_wake;
+        let mut full = crate::deadline_wake::FullPass::new(interval, wall(self.engine.now()));
+        loop {
+            let now = self.engine.now();
+            let revision = wake.begin_plan();
+            // Bound monotonic waits even when an embedder chooses a very long
+            // reconciliation interval; the logical deadline remains unchanged.
+            let delay = self.engine.timer_delay(
+                now,
+                full.remaining(wall(now))
+                    .min(std::time::Duration::from_secs(86_400)),
+            );
+            let delay = wake.plan(wall(now), revision, delay);
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = wake.notify.notified() => continue,
+                _ = tokio::time::sleep(delay) => {}
+            }
+            let now = self.engine.now();
+            wake.start_scan(wall(now));
+            self.sweep_at(now, full.start(wall(now))).await;
+        }
+    }
+
     async fn evaluate(&self, key: &ExecutionKey, now: i64) -> anyhow::Result<Option<i64>> {
         let Some(root) = self.engine.root_node(key).await? else {
             return Ok(None);
@@ -72,13 +108,13 @@ impl ChasmTimerSweeper {
     /// evaluated (due this pass). A single evaluation error is logged and skipped so
     /// one stuck execution never stalls the others.
     pub async fn sweep_once(&self) -> usize {
-        let now = self.engine.now();
+        self.sweep_at(self.engine.now(), true).await
+    }
+
+    async fn sweep_at(&self, now: i64, full: bool) -> usize {
         let mut evaluated = 0usize;
-        // Snapshot the armed map so the lock is never held across an `await`.
-        for (key, deadline) in self.engine.armed_timers_snapshot() {
-            if deadline > now {
-                continue;
-            }
+        // Only selected executions are copied; no lock crosses an await.
+        for (key, _) in self.engine.due_timers(now, full) {
             match self.evaluate(&key, now).await {
                 Ok(next) => {
                     // Re-arm to the state-derived next deadline (or clear it). This
@@ -230,3 +266,6 @@ mod properties {
         }
     }
 }
+
+#[cfg(test)]
+mod deadline_tests;

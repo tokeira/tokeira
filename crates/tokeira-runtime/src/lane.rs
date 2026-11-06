@@ -1507,6 +1507,7 @@ where
                 false,
             ));
         }
+        let timer_due = crate::scanner::earliest_timer_write(&transition.timer_ops);
         let dispatch_ops = transition.dispatch_ops.clone();
         let history_events = transition.history_events.clone();
         let activity_starts = newly_started_activity_ids(&transition.activity_ops);
@@ -1532,6 +1533,7 @@ where
                 .apply(LoadedRun::Absent, Command::Start(start.clone()))
                 .map_err(|reject| anyhow::Error::new(KernelRejected(reject)))?;
             successor.growth_limits = transition.growth_limits;
+            let successor_timer_due = crate::scanner::earliest_timer_write(&successor.timer_ops);
             let successor_dispatch = successor.dispatch_ops.clone();
             let successor_history = successor.history_events.clone();
             match repo
@@ -1549,6 +1551,13 @@ where
                     closing_state,
                     successor_state,
                 } => {
+                    if let Some(due) = successor_timer_due {
+                        shard_owner
+                            .read()
+                            .expect("shard owner lock poisoned")
+                            .timer_wake
+                            .changed(execution_home_bundle, due);
+                    }
                     *successor_effect =
                         Some(SuccessorEffect::Committed(Box::new(CommittedSuccessor {
                             state: successor_state,
@@ -1578,6 +1587,13 @@ where
         };
         match commit_result {
             CommitResult::Applied { new_state } => {
+                if let Some(due) = timer_due {
+                    shard_owner
+                        .read()
+                        .expect("shard owner lock poisoned")
+                        .timer_wake
+                        .changed(execution_home_bundle, due);
+                }
                 cache.insert(run_key, LoadedRun::Existing(new_state.clone()));
                 if attempts > 0 {
                     storage_metrics::record_dsql_retry(

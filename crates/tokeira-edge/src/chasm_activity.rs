@@ -2047,6 +2047,48 @@ mod tests {
         ))
     }
 
+    #[tokio::test]
+    async fn standalone_deadline_preserves_earlier_schedule_to_start_type() {
+        let engine = engine();
+        let bridge = Arc::new(ActivityBridge::new(
+            engine.clone(),
+            ActivityConfig {
+                enable_standalone: true,
+                ..Default::default()
+            },
+            1000,
+        ));
+        let mut request = start_request();
+        request.schedule_to_start_nanos = 200_000_000;
+        request.schedule_to_close_nanos = 250_000_000;
+        let key = key_of(&request);
+        let reference = bridge.start(request).await.unwrap().reference;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let sweeper = tokeira_runtime::chasm::ChasmTimerSweeper::new(engine)
+            .with_evaluator(bridge.archetype_id, bridge.clone());
+        let wait = async {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                bridge.poll(key, reference.execution_versioned_transition),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.status, ActivityStatus::TimedOut);
+            assert!(
+                result.failure.contains("ScheduleToStart"),
+                "{}",
+                result.failure
+            );
+            cancel.cancel();
+        };
+        tokio::join!(
+            sweeper.run(std::time::Duration::from_secs(3600), cancel.clone()),
+            wait
+        );
+    }
+
     fn bridge(enabled: bool) -> ActivityBridge {
         ActivityBridge::new(
             engine(),

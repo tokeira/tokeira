@@ -7,7 +7,7 @@ use super::*;
 use async_trait::async_trait;
 use std::{
     collections::BTreeMap,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use tokeira_kernel::*;
 use tokeira_storage::*;
@@ -65,8 +65,12 @@ pub(crate) enum OutboundRead {
 
 #[derive(Debug, Default)]
 pub(crate) struct Repo {
+    pub(crate) refuse_pair: AtomicBool,
+    pub(crate) lose_publication_reply: AtomicBool,
     pub(super) inner: InMemoryStore,
     pub(crate) outbound_reads: Mutex<Vec<OutboundRead>>,
+    pub(crate) timer_reads: Mutex<Vec<ShardId>>,
+    pub(crate) timer_fixture: Mutex<Option<BTreeMap<ShardId, Vec<DueTimer>>>>,
     pub(crate) outbound_read: tokio::sync::Notify,
     pub(super) history_reads: AtomicUsize,
     pub(super) fail: Mutex<Option<Point>>,
@@ -603,7 +607,11 @@ impl RunRepository for Repo {
         token: tokeira_storage::PreparationToken,
         fence: tokeira_storage::WriteFence,
     ) -> anyhow::Result<tokeira_storage::PublicationResult> {
-        self.inner.publish_prepared_run(token, fence).await
+        let result = self.inner.publish_prepared_run(token, fence).await?;
+        if self.lose_publication_reply.swap(false, Ordering::SeqCst) {
+            anyhow::bail!("lost publication reply");
+        }
+        Ok(result)
     }
 
     async fn abandon_prepared_run(
@@ -714,6 +722,9 @@ impl RunRepository for Repo {
         successor: Transition,
         fence: WriteFence,
     ) -> Result<tokeira_storage::PairCommitResult> {
+        if self.refuse_pair.load(Ordering::SeqCst) {
+            return Ok(tokeira_storage::PairCommitResult::SizeRefused);
+        }
         self.inner
             .commit_transition_pair(run_key, closing, successor_run_key, successor, fence)
             .await
@@ -1174,6 +1185,20 @@ impl RunRepository for Repo {
         after: Option<&DueTimer>,
         limit: usize,
     ) -> Result<Vec<DueTimer>> {
+        self.timer_reads.lock().unwrap().push(shard_id);
+        if let Some(fixture) = self.timer_fixture.lock().unwrap().as_ref() {
+            let mut rows = fixture.get(&shard_id).cloned().unwrap_or_default();
+            rows.sort_by_key(|row| (row.fire_at, row.run_key, row.timer_id.clone()));
+            rows.retain(|row| {
+                row.fire_at <= now
+                    && after.is_none_or(|after| {
+                        (row.fire_at, row.run_key, &row.timer_id)
+                            > (after.fire_at, after.run_key, &after.timer_id)
+                    })
+            });
+            rows.truncate(limit);
+            return Ok(rows);
+        }
         self.inner
             .list_due_timers_for_shard(shard_id, now, after, limit)
             .await

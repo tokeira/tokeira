@@ -362,6 +362,10 @@ semantics, so that reconciliation does not change workflow results.
 9. WHEN a retry's backoff ends, THE execution owner SHALL evaluate the retry's
    eligibility at that time rather than at a later periodic scan
    (`service/history/workflow/task_generator.go:567-577 @ v1.31.0`).
+10. WHEN a retry's backoff ends and the attempt is eligible, THE execution owner
+    SHALL offer it to a local queue home at that time. A pause rule SHALL publish
+    nothing. Remote queue homes and missed local offers SHALL retain discovery as
+    the backstop (`service/history/workflow/task_generator.go:567-577 @ v1.31.0`).
 
 ### Requirement 7: Cut over and retire duplicate delivery mechanisms
 

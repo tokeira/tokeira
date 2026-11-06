@@ -227,8 +227,13 @@ The companion inline workflow-task contract is in
 
 Retry eligibility shares the activity timeout scanner's earliest-deadline wake,
 including earlier-insert notifications and immediate continuation of unattempted
-capped work, so backoff expiry is evaluated at its due time without changing offer
-discovery (`service/history/workflow/task_generator.go:567-577 @ v1.31.0`).
+capped work, so backoff expiry is evaluated at its due time. Eligible attempts
+are then routed from the already loaded run and deployment registry and offered
+through `publish_activity_task`, after checking dispatch time against the deps'
+clock. A local waiting poll receives that offer without waiting for discovery;
+a remote queue home still finds it on its next discovery pass, as for a first
+attempt. Discovery remains the backstop and broker duplicate suppression handles
+racing offers (`service/history/workflow/task_generator.go:567-577 @ v1.31.0`).
 
 Split `prepare_activity_dispatch_publish` into read-only candidate inspection and
 execution-owner rule application. Discovery does not suppress an otherwise valid

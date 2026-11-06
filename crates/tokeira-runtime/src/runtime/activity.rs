@@ -1964,7 +1964,7 @@ pub(crate) struct ActivityRetryTarget<'a> {
 /// Commit an activity's next attempt and durable eligibility time.
 ///
 /// Canonical storage maintenance retains the future attempt's row; owner
-/// eligibility tracking evaluates rules at the deadline and queue-home discovery
+/// eligibility tracking evaluates rules and offers locally at the deadline; discovery
 /// reconstructs offers. The timeout scanner uses the same transition when a
 /// fired attempt timeout is retryable (`RetryActivity` →
 /// `UpdateActivityInfoForRetries`, mutable_state_impl.go + activity.go:63-97
@@ -2253,7 +2253,7 @@ pub(crate) fn activity_dispatch_task(
     }
 }
 
-/// Execution-owner eligibility outcome; none of these outcomes publishes work.
+/// Execution-owner eligibility outcome; eligible due attempts are offered locally.
 #[derive(Debug)]
 pub(crate) enum ActivityDispatchPreparation {
     /// The due attempt passed owner rule evaluation.
@@ -2301,8 +2301,9 @@ pub(crate) fn activity_backoff_interval_seconds(
     Ok(Some((scheduled_at - completed_at).whole_seconds()))
 }
 
-/// Evaluate the captured execution-owner timer without resolving a queue or
-/// publishing an offer. A non-match is read-only; a pause uses the captured fence.
+/// Evaluate the captured execution-owner timer and offer eligible work locally.
+/// A pause uses the captured fence and publishes nothing. Queue homes on another
+/// node still discover the durable attempt on their next pass, as for first starts.
 pub(crate) async fn evaluate_activity_eligibility<R: RunRepository + 'static>(
     deps: &ActivityRetryDeps<R>,
     task: &DispatchableActivityTask,
@@ -2389,6 +2390,31 @@ async fn prepare_activity_dispatch<R: RunRepository + 'static>(
         let Some(rule) =
             matching_pause_rule(&state, &current, &rules, now, backoff_interval_seconds)
         else {
+            if dispatch_at > deps.clock.now() {
+                return Ok(Preparation::NotYetDispatchable);
+            }
+            let registry = deps
+                .worker_deployment_registry
+                .read()
+                .expect("worker deployment registry lock poisoned")
+                .clone();
+            let mut offer = activity_dispatch_task(task.run_key, &state, &current);
+            (offer.queue, offer.dispatch_revision) =
+                super::workflow_task::route_activity_task_queue(
+                    registry.as_ref(),
+                    &state,
+                    offer.queue,
+                    offer.dispatch_revision,
+                )
+                .await?;
+            captured.validate(&deps.shard_owner)?;
+            // The retry timer supplies matching at its due time
+            // (service/history/workflow/task_generator.go:567-577 @ v1.31.0).
+            // Discovery remains the durable backstop; broker deduplication
+            // tolerates either path arriving first.
+            deps.broker
+                .publish_activity_task(offer, Some(&deps.delivery_metrics))
+                .await?;
             return Ok(Preparation::Eligible);
         };
 

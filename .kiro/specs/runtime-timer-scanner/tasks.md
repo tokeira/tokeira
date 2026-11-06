@@ -153,3 +153,10 @@ Add a background timer scanner to `tokeira-runtime` that periodically discovers 
 
 - [x] Verify Property 7 with the required property and regression tests: `stored_start_delay_deadlines_are_total`, `command_durations_preserve_failure_cause_and_message`.
   _Requirements: 7._
+
+- [x] 9. Deliver durable timers and start delays at their deadlines
+  - Add look-ahead, shard-specific commit/acquisition wakes, immediate capped-page
+    continuation and failure deferral until the full pass.
+  - Verify sleeping-scanner delivery, preparation visibility, acquisition, cursor
+    rewinds, failure isolation and counted per-shard listings with the node clock.
+  - _Requirements: 1.1, 1.6, 5, 6._

@@ -76,6 +76,7 @@ impl OwnedShard {
 /// in the `Active` state accept new commands.
 #[derive(Debug)]
 pub struct ShardOwner {
+    pub(crate) timer_wake: crate::scanner::TimerWake,
     shards: HashMap<ShardId, OwnedShard>,
     shard_count: u32,
     next_generation: u64,
@@ -165,6 +166,7 @@ impl ShardOwner {
     pub fn new(shard_count: u32) -> Self {
         assert!(shard_count > 0, "shard_count must be > 0");
         Self {
+            timer_wake: crate::scanner::TimerWake::default(),
             shards: HashMap::new(),
             shard_count,
             next_generation: 0,
@@ -260,6 +262,8 @@ impl ShardOwner {
     pub fn mark_active(&mut self, shard_id: ShardId) {
         if let Some(owned) = self.shards.get_mut(&shard_id) {
             owned.state = ShardState::Active;
+            self.timer_wake
+                .changed(shard_id, time::PrimitiveDateTime::MIN.assume_utc());
         }
     }
 

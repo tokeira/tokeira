@@ -17,8 +17,10 @@
 //! Cached timeouts select deadline wakes; each selected entry is still reloaded
 //! before a decision. A periodic full pass reconciles stale caches, including
 //! starts missed before schedule tracking and anchors superseded by a retry.
-//! Reloaded attempt anchors authorize decisions; cache repairs are revision guarded
-//! and preserve heartbeats at or after the reloaded start. Retry
+//! Reloaded attempt anchors select observations; each commit rechecks its captured
+//! attempt and deadline against the state it writes, including after OCC conflicts.
+//! Cache repairs are revision guarded and preserve heartbeats at or after the
+//! reloaded start. Retry
 //! eligibility shares the wake, and bounded passes retain unattempted due work.
 
 use tokeira_kernel::deadline_after;
@@ -29,7 +31,7 @@ use crate::shard::ShardOwner;
 
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    ActivityResolution, ActivityResolvedRequest, ActivityState, Command, LoadedRun, RetryState,
+    ActivityResolution, ActivityResolvedRequest, ActivityState, LoadedRun, RetryState,
 };
 use tokeira_observability::OutcomeLabel;
 use tokeira_proto::{
@@ -513,6 +515,14 @@ pub fn evaluate_activity_timeout(
     activity: &ActivityState,
     now: OffsetDateTime,
 ) -> Option<TimeoutViolation> {
+    evaluate_activity_timeout_with_heartbeat(activity, entry.heartbeat_for_activity(activity), now)
+}
+
+fn evaluate_activity_timeout_with_heartbeat(
+    activity: &ActivityState,
+    heartbeat_at: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> Option<TimeoutViolation> {
     if let Some(timeout) = activity.schedule_to_close_timeout
         && !timeout.is_zero()
         && now > deadline_after(activity.scheduled_at, timeout)
@@ -531,7 +541,7 @@ pub fn evaluate_activity_timeout(
             // (`getActivityHeartbeatTimeout`, timer_sequence.go:341-351 @
             // v1.31.0): a time restored from durable state may predate the
             // current attempt, whose clock then runs from its start.
-            let heartbeat_at = entry.heartbeat_for_activity(activity).unwrap_or(started_at);
+            let heartbeat_at = heartbeat_at.unwrap_or(started_at).max(started_at);
             if now > deadline_after(heartbeat_at, timeout) {
                 return Some(TimeoutViolation::Heartbeat);
             }
@@ -557,6 +567,84 @@ pub fn evaluate_activity_timeout(
     }
 
     None
+}
+
+/// Volatile evidence carried with a scanner mutation, never serialized with commands.
+/// Both commit loops recheck it on every OCC attempt against their transition base.
+#[derive(Clone, Debug)]
+pub(crate) struct ActivityTimeoutCheck {
+    activity_id: String,
+    schedule_event_id: i64,
+    attempt: u32,
+    violation: TimeoutViolation,
+    observed_sequence: tokeira_types::TransitionSeq,
+    observed_at: OffsetDateTime,
+}
+
+/// A moved deadline needs a reload; a resolved activity needs conditional removal.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ActivityTimeoutRejection {
+    /// The activity remains open, but this attempt or deadline no longer applies.
+    #[error("activity timeout observation is stale")]
+    Stale,
+    /// The activity or its open run no longer exists.
+    #[error("activity timeout target has resolved")]
+    Resolved,
+}
+
+impl ActivityTimeoutCheck {
+    fn new(
+        activity: &ActivityState,
+        violation: TimeoutViolation,
+        observed_sequence: tokeira_types::TransitionSeq,
+        observed_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            activity_id: activity.activity_id.clone(),
+            schedule_event_id: activity.schedule_event_id,
+            attempt: activity.attempt,
+            violation,
+            observed_sequence,
+            observed_at,
+        }
+    }
+
+    /// A lane cache predating the scanner's read cannot reject that observation.
+    pub(crate) fn predates_observation(&self, loaded: &LoadedRun) -> bool {
+        !matches!(loaded, LoadedRun::Existing(state)
+            if state.transition_seq >= self.observed_sequence)
+    }
+
+    /// Use durable anchors at the captured time; the caller must fence any write
+    /// against this image and repeat validation if it reloads after a conflict.
+    pub(crate) fn validate(&self, loaded: &LoadedRun) -> Result<(), ActivityTimeoutRejection> {
+        let LoadedRun::Existing(state) = loaded else {
+            return Err(ActivityTimeoutRejection::Resolved);
+        };
+        let Some(activity) = state
+            .activities
+            .get(&self.activity_id)
+            .filter(|_| state.is_open())
+        else {
+            return Err(ActivityTimeoutRejection::Resolved);
+        };
+        // The write's expected sequence fences this exact state. Repeating the
+        // check after an OCC conflict provides the workflow-lock guarantee of
+        // service/history/timer_queue_active_task_executor.go:204-258,292-295
+        // @ v1.31.0, without trusting a scanner's earlier read or volatile cache.
+        if activity.attempt != self.attempt
+            || activity.schedule_event_id != self.schedule_event_id
+            || activity.pause_info.is_some()
+            || evaluate_activity_timeout_with_heartbeat(
+                activity,
+                activity.last_heartbeat_at,
+                self.observed_at,
+            ) != Some(self.violation)
+        {
+            return Err(ActivityTimeoutRejection::Stale);
+        }
+        Ok(())
+    }
 }
 
 /// Reconcile all entries, reloading authoritative state before retry or resolution.
@@ -746,6 +834,12 @@ pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
                             activity_id: &entry.activity_id,
                             expected_attempt: activity.attempt,
                             expected_schedule_event_id: activity.schedule_event_id,
+                            timeout: Some(ActivityTimeoutCheck::new(
+                                &activity,
+                                violation,
+                                state.transition_seq,
+                                now,
+                            )),
                         },
                         next_attempt,
                         backoff,
@@ -763,9 +857,23 @@ pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
                             runtime_metrics::record_activity_task_retry(OutcomeLabel::Success);
                         }
                         Err(error) => {
-                            // Lost a race with a concurrent resolution or hit a
-                            // transient commit error: leave the entry; the next
-                            // scan re-evaluates against reloaded state.
+                            match error.downcast_ref::<ActivityTimeoutRejection>() {
+                                Some(ActivityTimeoutRejection::Stale) => {
+                                    tracking.inner.request_refresh(
+                                        &(entry.run_key, entry.activity_id.clone()),
+                                        &tracked,
+                                    )
+                                }
+                                Some(ActivityTimeoutRejection::Resolved) => {
+                                    tracking.inner.remove_submitted(
+                                        &(entry.run_key, entry.activity_id.clone()),
+                                        &tracked,
+                                    )
+                                }
+                                None => {}
+                            }
+                            // Stale observations request a reload; other commit
+                            // failures retain the full pass as their backstop.
                             runtime_metrics::record_activity_task_retry(OutcomeLabel::Failure);
                             tracing::warn!(
                                 ?error,
@@ -828,9 +936,9 @@ pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
         };
         let lane = pick_lane_for_run_key(lanes, lane_count, entry.run_key).clone();
         let result = lane
-            .submit(
+            .submit_activity_timeout(
                 entry.run_key,
-                Command::ActivityResolved(ActivityResolvedRequest {
+                ActivityResolvedRequest {
                     activity_id: entry.activity_id.clone(),
                     resolution: ActivityResolution::TimedOut {
                         timeout_type,
@@ -844,7 +952,8 @@ pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
                     worker_identity: None,
                     request: tokeira_types::RequestContext::unattributed(now),
                     now,
-                }),
+                },
+                ActivityTimeoutCheck::new(&activity, violation, state.transition_seq, now),
             )
             .await
             .map(|_| ());
@@ -857,19 +966,25 @@ pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
                     .remove_submitted(&(entry.run_key, entry.activity_id.clone()), &tracked);
             }
             Err(error) => {
-                let message = error.to_string();
-                // Kernel rejection means the activity already resolved or advanced
-                // past the state this timeout was computed against, so the entry is
-                // stale: drop it instead of retrying. Other errors are transient,
-                // so the entry is kept for the next scan.
-                if message.contains("kernel rejected") {
-                    runtime_metrics::record_activity_task_timed_out(OutcomeLabel::Rejected);
-                    tracing::debug!(
-                        ?error,
-                        run_key = ?entry.run_key,
-                        activity_id = entry.activity_id,
-                        "activity timeout scanner timeout rejected by kernel"
+                // A stale observation is still live work. Request a reload,
+                // including when a concurrent heartbeat advanced its revision.
+                let rejection = error.downcast_ref::<ActivityTimeoutRejection>();
+                let resolved = matches!(rejection, Some(ActivityTimeoutRejection::Resolved))
+                    || matches!(
+                        error.downcast_ref::<crate::KernelRejected>(),
+                        Some(crate::KernelRejected(
+                            tokeira_kernel::Reject::UnknownActivity(_)
+                                | tokeira_kernel::Reject::MissingRun
+                                | tokeira_kernel::Reject::RunClosed(_)
+                        ))
                     );
+                if matches!(rejection, Some(ActivityTimeoutRejection::Stale)) {
+                    runtime_metrics::record_activity_task_timed_out(OutcomeLabel::Rejected);
+                    tracking
+                        .inner
+                        .request_refresh(&(entry.run_key, entry.activity_id.clone()), &tracked);
+                } else if resolved {
+                    runtime_metrics::record_activity_task_timed_out(OutcomeLabel::Rejected);
                     tracking
                         .inner
                         .remove_submitted(&(entry.run_key, entry.activity_id.clone()), &tracked);

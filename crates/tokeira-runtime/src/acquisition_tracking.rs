@@ -124,6 +124,37 @@ impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
         true
     }
 
+    /// A stale observation requests a fresh read even if a start or heartbeat
+    /// advanced this key's revision. This never alters anchors or consumes a
+    /// replacement acquisition's work, and the next examination clears it.
+    pub(crate) fn request_refresh(&self, key: &K, submitted: &Tracked<V>) {
+        let owner = self
+            .owner
+            .get()
+            .map(|owner| owner.read().expect("shard owner lock poisoned"));
+        let mut entries = self.entries.lock().expect("tracking lock poisoned");
+        let Some(entry) = entries.values.get_mut(key) else {
+            return;
+        };
+        let same_acquisition = match (&submitted.acquisition, &entry.acquisition) {
+            (Some(a), Some(b)) => a.generation == b.generation,
+            (None, None) => true,
+            _ => false,
+        };
+        if !same_acquisition
+            || !Self::active_with_owner(owner.as_deref(), entry)
+            || entry.refresh_pending
+        {
+            return;
+        }
+        entry.refresh_pending = true;
+        if let Some(index) = &self.deadlines {
+            index
+                .wake
+                .changed(Some(time::PrimitiveDateTime::MIN.assume_utc()));
+        }
+    }
+
     /// Refresh only derived timing data after a scan, preserving the submission's
     /// revision so its completion cannot retire a concurrent start or heartbeat.
     pub(crate) fn refresh_scanned(

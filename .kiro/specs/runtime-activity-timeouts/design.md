@@ -6,9 +6,9 @@ This design adds activity heartbeat recording and four timeout detection mechani
 
 The feature has two distinct halves:
 
-1. **Heartbeat endpoint.** A new `record_activity_heartbeat` method on `TokeiraRuntime` that accepts an `ActivityTaskToken` and heartbeat details, updates a runtime-local timestamp, and returns a cancellation indicator. This is a purely runtime-side operation — no kernel command, no history event, no storage commit. The heartbeat path reuses the existing token validation logic from Feature 2.
+1. **Heartbeat endpoint.** A new `record_activity_heartbeat` method on `TokeiraRuntime` that accepts an `ActivityTaskToken` and heartbeat details, records the heartbeat durably, updates a runtime-local timestamp, and returns a cancellation indicator. It submits no kernel command and creates no history event. The heartbeat path reuses the existing token validation logic from Feature 2.
 
-2. **Timeout scanner.** A background `tokio::spawn` task (`ActivityTimeoutScanner`) that wakes at cached deadlines, reconciles all entries every interval, and loads authoritative timeout configuration from the kernel's `ActivityState` via storage, and submits `Command::ActivityResolved(TimedOut)` through the lane when a timeout is detected. The scanner is non-authoritative: the kernel is the final arbiter. If the activity was already resolved or the run is closed, the kernel rejects the command harmlessly.
+2. **Timeout scanner.** A background `tokio::spawn` task (`ActivityTimeoutScanner`) that wakes at cached deadlines, reconciles all entries every interval, and loads authoritative timeout configuration from the kernel's `ActivityState` via storage, and submits `Command::ActivityResolved(TimedOut)` through the lane when a timeout is detected. The scanner is non-authoritative: the commit path rechecks the observation against its transition base before applying the kernel mutation. Stale observations retain tracking for a reload; resolved activities are removed conditionally.
 
 The runtime-local tracking state (`ActivityTrackingState`) is a new in-memory structure keyed by `(RunKey, String)` (run_key, activity_id). It records `scheduled_at`, `started_at`, `last_heartbeat_at`, and `cancel_requested` per activity. This state is populated by hooks in the existing activity lifecycle: dispatch publication sets `scheduled_at`, the activity-task-start transaction sets `started_at`, heartbeat calls update `last_heartbeat_at`, and activity resolution removes the entry.
 
@@ -267,6 +267,33 @@ pub fn evaluate_activity_timeout(
 ) -> Option<TimeoutViolation>;
 ```
 
+### Revalidate a timeout at its commit
+
+The scanner carries an `ActivityTimeoutCheck` with the activity ID, schedule event,
+attempt, observed transition sequence, detected timeout type and scanner time. This
+is a volatile operand on the lane submission or retry target; stored commands and
+worker resolutions keep their
+existing forms. The detected type is retained even if retry exhaustion converts the
+terminal failure to schedule-to-close.
+
+Before applying the terminal resolution, the lane checks the observation against
+its transition base, reloading a cached image that predates the scanner's read.
+The direct retry commit loop does the same check after each load.
+Both reuse the timeout evaluator's rules with the current durable anchors and
+heartbeat, and both repeat the check after an OCC conflict. The expected transition
+sequence fences that exact image: a concurrent start, heartbeat or retry cannot be
+silently crossed. A stale lane rejection evicts its cached image so a subsequent
+observation can make progress. This supplies Temporal's current-mutable-state check
+under its workflow lock and rejection of an earlier attempt's timer
+(`service/history/timer_queue_active_task_executor.go:204-258,292-295 @ v1.31.0`).
+
+A typed stale rejection retains tracking and requests an immediate authoritative
+reload under the same acquisition, even if a newer start or heartbeat changed its
+revision. It changes no anchors. The next examination consumes that refresh request;
+load or commit failures still wait for the full pass. A resolved activity instead
+removes only the captured revision and acquisition. Worker completions, failures and
+cancels carry no timeout observation and keep their existing handling.
+
 ### Updated TokeiraRuntime
 
 ```rust
@@ -487,7 +514,9 @@ If `repo.load_run()` fails during a scan cycle (transient network error, DSQL co
 
 ### Scanner kernel rejections
 
-When the scanner submits `Command::ActivityResolved(TimedOut)` and the kernel rejects it (via `Reject::UnknownActivity`, `Reject::RunAlreadyExists`, or any other rejection), the scanner treats this as a successful cleanup: the activity is no longer relevant, so the tracking entry is removed. The rejection is logged at `debug` level.
+A timeout rejected as stale leaves the activity tracked and requests an immediate
+reload. An absent activity or a closed run removes only the captured tracking
+revision and acquisition. Other rejections retain the entry for reconciliation.
 
 ### Scanner lane submission errors
 
@@ -495,11 +524,18 @@ If `self.submit()` returns an `Err` (lane channel closed, OCC exhaustion), the s
 
 ### Race between heartbeat and timeout
 
-If a heartbeat arrives while the scanner is evaluating the same activity, the heartbeat updates `last_heartbeat_at` and the scanner may see the old value. This is acceptable: the scanner will re-evaluate in the next cycle with the updated timestamp. The kernel is the final arbiter — if the activity is still alive, the `ActivityResolved(TimedOut)` command will be rejected because the activity's state has progressed.
+A heartbeat committed after the scanner's read may extend the deadline. The lane
+and direct retry commit loop re-evaluate the captured timeout against the current
+durable heartbeat at the captured scanner time. A heartbeat that wins the commit
+race forces an OCC reload and the same check; a moved deadline yields a stale
+rejection and tracking remains for a fresh read.
 
 ### Race between resolution and scanner
 
-If an activity is resolved (completed/failed) while the scanner is about to submit a timeout for it, the scanner's `ActivityResolved(TimedOut)` command will be rejected by the kernel (activity not found in state). The scanner removes the tracking entry on rejection. This is the intended non-authoritative behavior.
+If a terminal resolution wins the race with a scanner submission, validation or
+the kernel reports the absent activity and the scanner conditionally removes its
+captured entry. A worker failure that retries the activity instead changes its
+attempt: the stale timeout keeps tracking and requests a reload.
 
 ## Testing Strategy
 

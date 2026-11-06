@@ -209,6 +209,26 @@ impl LaneHandle {
         received.await?
     }
 
+    /// Revalidate a scanner timeout against each state used by its fenced commit.
+    /// The observation is volatile; worker resolution commands keep their shape.
+    pub(crate) async fn submit_activity_timeout(
+        &self,
+        run_key: RunKey,
+        request: tokeira_kernel::ActivityResolvedRequest,
+        check: crate::activity_timeout::ActivityTimeoutCheck,
+    ) -> Result<CommitResult> {
+        let (reply, received) = oneshot::channel();
+        let mut message = LaneMessage::new(
+            self.lane_id,
+            run_key,
+            Command::ActivityResolved(request),
+            reply,
+        );
+        message.activity_timeout = Some(check);
+        self.tx.send(message).await?;
+        received.await?
+    }
+
     /// Persist runtime observations without inventing kernel commands or history.
     /// The caller's sequence fences all reads used to select these metadata.
     pub(crate) async fn commit_outbound_metadata(
@@ -319,6 +339,7 @@ struct LaneMessage {
     successor_plan: Option<SuccessorPlan>,
     outbound: Option<OutboundSubmission>,
     observed: Option<ObservedSubmission>,
+    activity_timeout: Option<crate::activity_timeout::ActivityTimeoutCheck>,
 }
 
 impl LaneMessage {
@@ -343,6 +364,7 @@ impl LaneMessage {
             successor_plan: None,
             outbound: None,
             observed: None,
+            activity_timeout: None,
         }
     }
 }
@@ -781,6 +803,7 @@ where
             message.successor_plan.as_ref(),
             message.outbound.as_ref(),
             message.observed.as_ref(),
+            message.activity_timeout.as_ref(),
             &mut successor_effect,
             config.max_occ_retries,
             cache,
@@ -1322,6 +1345,7 @@ where
         None,
         None,
         None,
+        None,
         &mut None,
         max_retries,
         cache,
@@ -1342,6 +1366,7 @@ async fn handle_message_with_successor<K, R>(
     successor_plan: Option<&SuccessorPlan>,
     outbound: Option<&OutboundSubmission>,
     observed: Option<&ObservedSubmission>,
+    activity_timeout: Option<&crate::activity_timeout::ActivityTimeoutCheck>,
     successor_effect: &mut Option<SuccessorEffect>,
     max_retries: u32,
     cache: &mut LaneCache,
@@ -1386,8 +1411,12 @@ where
         );
         cache.synchronize_generation(shard_owner);
         let mut loaded = match cache.get(run_key) {
-            Some(loaded) => loaded,
-            None => {
+            Some(loaded)
+                if activity_timeout.is_none_or(|check| !check.predates_observation(&loaded)) =>
+            {
+                loaded
+            }
+            _ => {
                 let loaded = tokeira_storage::read_probe::scope(
                     "execution-owner/lane-cache-or-retry",
                     repo.load_run(run_key),
@@ -1482,6 +1511,15 @@ where
                     false,
                 ));
             }
+        }
+        if let Some(check) = activity_timeout
+            && let Err(error) = check.validate(&loaded)
+        {
+            // This rejected image may itself have been superseded. Evict it
+            // before the scanner reloads. Successful validation is fenced by
+            // the transition sequence; OCC conflicts reload and revalidate.
+            cache.evict(run_key);
+            return Err(error.into());
         }
         let processing_span = tracing::Span::current();
         processing_span.record("tokeira.shard_id", execution_home_bundle.0);

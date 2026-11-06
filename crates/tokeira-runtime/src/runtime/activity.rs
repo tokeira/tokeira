@@ -1838,6 +1838,7 @@ where
                 activity_id: &token.activity_id,
                 expected_attempt: token.attempt,
                 expected_schedule_event_id: token.schedule_event_id,
+                timeout: None,
             },
             next_attempt,
             backoff,
@@ -1959,6 +1960,8 @@ pub(crate) struct ActivityRetryTarget<'a> {
     pub activity_id: &'a str,
     pub expected_attempt: u32,
     pub expected_schedule_event_id: i64,
+    /// Scanner observations must still hold at each commit; workers leave this absent.
+    pub timeout: Option<crate::activity_timeout::ActivityTimeoutCheck>,
 }
 
 /// Commit an activity's next attempt and durable eligibility time.
@@ -1996,7 +1999,11 @@ where
     });
     let mut attempts = 0u32;
     loop {
-        let LoadedRun::Existing(state) = deps.repo.load_run(run_key).await? else {
+        let loaded = deps.repo.load_run(run_key).await?;
+        if let Some(check) = &target.timeout {
+            check.validate(&loaded)?;
+        }
+        let LoadedRun::Existing(state) = loaded else {
             return Err(anyhow!("run not found for activity retry"));
         };
         // A closed run never schedules another attempt, whoever asks.
@@ -3544,7 +3551,7 @@ mod tests {
                 let (state, token, queue) = seed_started_activity(&runtime, &repo, None).await;
                 let deps = runtime.activity_retry_deps();
                 commit_activity_retry(&deps, ActivityRetryTarget { run_key: token.run_key, activity_id: &token.activity_id,
-                    expected_attempt: token.attempt, expected_schedule_event_id: token.schedule_event_id },
+                    expected_attempt: token.attempt, expected_schedule_event_id: token.schedule_event_id, timeout: None },
                     2, Duration::seconds(backoff_seconds), None, None).await.unwrap();
                 let LoadedRun::Existing(retried) = repo.load_run(token.run_key).await.unwrap() else { panic!("retry exists"); };
                 let due = retried.activities[&token.activity_id].current_attempt_scheduled_at.unwrap();
@@ -3636,6 +3643,7 @@ mod tests {
                 activity_id: &token.activity_id,
                 expected_attempt: token.attempt,
                 expected_schedule_event_id: token.schedule_event_id,
+                timeout: None,
             },
             2,
             backoff,
@@ -3987,6 +3995,7 @@ mod tests {
                             activity_id: &token.activity_id,
                             expected_attempt: token.attempt,
                             expected_schedule_event_id: token.schedule_event_id,
+                            timeout: None,
                         },
                         2,
                         Duration::minutes(1),

@@ -1,0 +1,5 @@
+kind: fixed
+body: An activity timeout no longer closes or retries an attempt that started or heartbeated just before the timeout was applied.
+time: 2026-11-06T10:37:12.812031+00:00
+custom:
+    Slice: a468bcbd-c9cd-493c-95fb-cd6dc450c232

@@ -218,3 +218,17 @@ All code lives in `tokeira-runtime`, in a new `activity_timeout.rs` module (foll
     heartbeat by the revision guard; retain the local-offer regressions.
   - Dependency: task 10.
   - _Requirements: 3.3, 4.1, 4.2, 5.2, 7.3._
+
+- [x] 12. Revalidate timeout observations at terminal and retry commits
+  - Carry attempt, schedule event, timeout type and scanner time as volatile
+    operands; share evaluation rules and recheck every OCC transition base.
+  - Keep stale observations tracked for an authoritative reload, and remove only
+    the captured entry when the activity has resolved.
+  - Reproduce starts, heartbeats and worker retries after the scanner's reload and
+    through lane conflict retries. Assert no timeout or spent attempt, retained
+    tracking, and successful timeout at the later deadline. Cover the scanner's
+    retry commit racing a heartbeat with and without an OCC conflict.
+  - Retain skipped-reset coverage with a delayed heartbeat tracking callback after
+    the retry commits; the old pre-commit heartbeat now invalidates the timeout.
+  - Dependency: task 11.
+  - _Requirements: 7.5, 7.9._

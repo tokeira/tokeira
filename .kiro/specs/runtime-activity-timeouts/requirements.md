@@ -116,14 +116,15 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 1. THE Runtime SHALL run a background task (Activity_Timeout_Scanner) that wakes at the earliest tracked deadline, reloads the due entries, and makes a full pass every scan interval.
 2. THE Activity_Timeout_Scanner SHALL use a configurable scan interval with a sensible default (e.g. 1 second).
 3. THE Activity_Timeout_Scanner SHALL read timeout configuration (heartbeat_timeout, schedule_to_start_timeout, start_to_close_timeout, schedule_to_close_timeout) from the kernel's `ActivityState` via storage, not from the Activity_Tracking_State.
-4. WHEN the Activity_Timeout_Scanner detects a timeout violation, THE Activity_Timeout_Scanner SHALL submit the `ActivityResolved(TimedOut)` command to the owning run's lane using the same `submit` path used by other runtime commands.
-5. THE Activity_Timeout_Scanner SHALL be non-authoritative: the authoritative state transition happens when the kernel processes the `ActivityResolved` command. IF the kernel rejects the command (UnknownActivity, run closed, or activity already resolved), THE Runtime SHALL treat the rejection as a harmless no-op.
+4. WHEN the Activity_Timeout_Scanner detects a timeout violation, THE Activity_Timeout_Scanner SHALL submit the `ActivityResolved(TimedOut)` command to the owning run's lane, carrying the observation that criterion 9 rechecks.
+5. THE Activity_Timeout_Scanner SHALL be non-authoritative: only the fenced transition changes the activity. IF a timeout is rejected as stale, THE Runtime SHALL treat it as a harmless no-op, keep the activity tracked and request a reload. IF the activity has resolved or its run has closed, THE Runtime SHALL remove only the captured tracking entry, without removing a newer revision or acquisition.
 6. THE Activity_Timeout_Scanner SHALL process timeout violations in bounded batches per scan cycle to avoid starving other lane work.
 
 ---
 
 7. WHEN a tracked activity's schedule-to-start, start-to-close, heartbeat or schedule-to-close deadline passes, THE Activity_Timeout_Scanner SHALL submit its timeout at that deadline rather than at a later periodic scan (`service/history/workflow/timer_sequence.go:108-154`; `service/history/queues/queue_scheduled.go:159-224,269 @ v1.31.0`).
 8. THE Activity_Timeout_Scanner SHALL submit due timeouts in deadline order with a stable tie-break, and a pass that stops at its cap SHALL leave no due entry it never attempted waiting for the interval.
+9. WHEN applying a terminal timeout or a timeout retry, THE Runtime SHALL recheck the captured attempt, schedule event, timeout type and scanner time against the state used by each commit, including after an OCC conflict. THE mutation SHALL apply only if the same attempt is pending and the same timeout still holds at that time from its current anchors; schedule-to-start SHALL require the attempt to remain unstarted. Otherwise THE Runtime SHALL reject the observation as stale (`service/history/timer_queue_active_task_executor.go:204-258,292-295 @ v1.31.0`).
 
 ### Requirement 8: Timeout Scanner Lifecycle
 

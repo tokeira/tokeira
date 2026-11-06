@@ -78,13 +78,13 @@ async fn skipped_reset(
         .try_claim_activity_offer(&activity_queue, run, "retry")
         .await
         .unwrap();
-    let started = runtime
+    runtime
         .start_activity_task_offer(offer, WorkerIdentity("worker".into()))
         .await
         .unwrap()
         .unwrap();
     tokio::time::advance(std::time::Duration::from_nanos(1_000_000_001)).await;
-    let (committing, resume) = repo.pause(Point::Commit);
+    let (committing, resume) = repo.pause(Point::Committed);
     let deps = runtime.activity_retry_deps();
     let config = ActivityTimeoutScannerConfig::default();
     let scan = scan_activity_timeouts_once(
@@ -96,10 +96,12 @@ async fn skipped_reset(
     );
     let race = async {
         committing.await.unwrap();
+        // The retry has committed, but its tracking reset has not run. A late
+        // heartbeat reply from the prior attempt can still advance the cache
+        // revision; its durable heartbeat would now be rejected as stale.
         runtime
-            .record_activity_heartbeat(started.token, None, None)
-            .await
-            .unwrap();
+            .activity_tracking
+            .record_heartbeat(run, "retry", runtime.clock.now());
         resume.send(()).unwrap();
     };
     tokio::join!(scan, race);

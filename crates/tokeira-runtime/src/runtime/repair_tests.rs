@@ -31,6 +31,7 @@ impl std::io::Write for PlacementLogCapture {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Point {
     Load,
+    Loaded,
     Candidates,
     Repair,
     Home,
@@ -78,6 +79,7 @@ pub(crate) struct Repo {
     repair_attempts: AtomicUsize,
     repair_fences: Mutex<Vec<WriteFence>>,
     pub(super) loads: AtomicUsize,
+    pub(super) commit_conflicts: AtomicUsize,
     stats_loads: AtomicUsize,
     legacy_delivery_calls: AtomicUsize,
     discovery_gate: Mutex<Option<Arc<discovery_scheduler_tests::Gate>>>,
@@ -797,7 +799,9 @@ impl RunRepository for Repo {
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
         self.loads.fetch_add(1, Ordering::SeqCst);
         self.hit(Point::Load).await?;
-        self.inner.load_run(run_key).await
+        let result = self.inner.load_run(run_key).await?;
+        self.hit(Point::Loaded).await?;
+        Ok(result)
     }
 
     async fn load_run_with_stats(&self, run_key: RunKey) -> Result<(LoadedRun, RunHistoryStats)> {
@@ -909,6 +913,9 @@ impl RunRepository for Repo {
             .inner
             .commit_transition_for_bundle(run_key, execution_home_bundle, transition, fence)
             .await?;
+        if matches!(result, CommitResult::Conflict { .. }) {
+            self.commit_conflicts.fetch_add(1, Ordering::SeqCst);
+        }
         self.hit(Point::Committed).await?;
         Ok(result)
     }

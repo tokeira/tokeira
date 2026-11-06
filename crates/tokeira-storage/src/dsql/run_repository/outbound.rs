@@ -189,12 +189,24 @@ pub(super) async fn validate_guard(
     Ok(())
 }
 
-pub(super) async fn maintain_parent_reference(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+/// Whether `state`'s run can ever hold an `outbound_parent_reference` row.
+///
+/// [`maintain_parent_reference`] is the only writer that inserts a row, and it
+/// inserts the run's own parent, only when [`desired_parent_reference`] names
+/// one. A run's parent fields are set when its state is created and never
+/// change afterwards, so a run whose state lacks either field never had a row
+/// and never will: every other writer only deletes.
+pub(super) fn may_hold_parent_reference(state: &WorkflowState) -> bool {
+    state.parent_workflow_id.is_some() && state.parent_run_key.is_some()
+}
+
+/// The parent reference `state` wants: its parent while `keep` holds, else
+/// none. Every reference [`may_hold_parent_reference`] rules out is none here.
+pub(super) fn desired_parent_reference(
     state: &WorkflowState,
     keep: bool,
-) -> Result<()> {
-    let parent = state
+) -> Option<(Uuid, String)> {
+    state
         .parent_workflow_id
         .as_ref()
         .filter(|_| keep && state.parent_run_key.is_some())
@@ -203,7 +215,20 @@ pub(super) async fn maintain_parent_reference(
                 state.parent_namespace_id.unwrap_or(state.namespace_id).0,
                 workflow.0.clone(),
             )
-        });
+        })
+}
+
+pub(super) async fn maintain_parent_reference(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    state: &WorkflowState,
+    keep: bool,
+) -> Result<()> {
+    // Most runs have no parent. Reading for their reference would cost every
+    // one of their commits a round trip to find the row that cannot exist.
+    if !may_hold_parent_reference(state) {
+        return Ok(());
+    }
+    let parent = desired_parent_reference(state, keep);
     let prior_parent = sqlx::query_as::<_, (Uuid, String)>("SELECT parent_namespace_id,parent_workflow_id FROM outbound_parent_reference WHERE child_run_key=$1")
         .bind(state.run_key.0).fetch_optional(&mut **tx).await?;
     if prior_parent != parent {

@@ -2468,6 +2468,31 @@ mod tests {
         )
     }
 
+    proptest! {
+        // A commit skips its parent-reference read only for a run that can
+        // never want a reference; were the two to disagree, a child's
+        // reference would never be written.
+        #[test]
+        fn a_run_that_cannot_hold_a_parent_reference_never_wants_one(
+            parent_workflow in proptest::option::of("[a-z]{1,8}"),
+            parent_run in any::<Option<[u8; 16]>>(),
+            parent_namespace in any::<Option<[u8; 16]>>(),
+            keep in any::<bool>(),
+        ) {
+            let mut state = sample_state(RunKey::new());
+            state.parent_workflow_id = parent_workflow.map(WorkflowId);
+            state.parent_run_key = parent_run.map(|bytes| RunKey(uuid::Uuid::from_bytes(bytes)));
+            state.parent_namespace_id =
+                parent_namespace.map(|bytes| NamespaceId(uuid::Uuid::from_bytes(bytes)));
+            let desired = super::outbound::desired_parent_reference(&state, keep);
+            if !super::outbound::may_hold_parent_reference(&state) {
+                prop_assert_eq!(desired, None);
+            } else {
+                prop_assert_eq!(desired.is_some(), keep);
+            }
+        }
+    }
+
     fn sample_transition(run_key: RunKey) -> Transition {
         Transition {
             expected_seq: TransitionSeq::ZERO,

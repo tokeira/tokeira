@@ -1,0 +1,5 @@
+kind: changed
+body: A commit for a workflow that is not a child now makes one round trip fewer to Aurora DSQL.
+time: 2026-11-06T20:38:53.571309+00:00
+custom:
+    Slice: f258c16d-c594-4ebc-8f7d-aea77cd6a28d

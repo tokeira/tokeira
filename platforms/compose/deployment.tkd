@@ -74,21 +74,10 @@ fn deployment(cfg: Compose, cx: Context) -> Deployment {
                 ttl: Some("ttl_epoch".into()),
             },
         );
-        let conn_lease = dsql.resource(
-            "conn_lease",
-            DynamoDbTable {
-                table: format!("{}-dsql-conn-lease", cx.project_name),
-                region: storage.region.clone(),
-                hash_key: "pk".into(),
-                ttl: Some("ttl_epoch".into()),
-            },
-        );
-
         d.writeback("infrastructure.storage", "dsql");
         d.writeback("infrastructure.dsql.endpoint", cluster.output("cluster_endpoint"));
         d.writeback("infrastructure.dsql.region", storage.region.clone());
         d.writeback("infrastructure.dsql.rate_limiter_table", rate_limiter.output("table_name"));
-        d.writeback("infrastructure.dsql.conn_lease_table", conn_lease.output("table_name"));
     }
 
     // The engine itself: the recorded server configuration document and the

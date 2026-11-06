@@ -274,76 +274,78 @@ Implementation follows the natural dependency order: foundational components fir
     - _Requirements: 3.2, 4.4, 4.5, 4.8, 12.2, 12.4, 12.5, 16.3_
     - DONE: the seven scenario tests pass forty runs in a row, and the class-permit test fails when the permit is released at drop instead. On a throwaway cluster, 64 workers ran 3,200 operations through a reservoir of 10 and never found it empty. Eight reservoirs each refilled 49 connections five times over: 2,360 connections, 101 refused for the cluster's connection rate, every refill complete and no slot lost. A refill of 49 took a median of 2.1 seconds with eight connects in flight, against 15.0 seconds one at a time.
 
-- [ ] 16. Size by live connections, share the connection rate by arrival time, and wait briefly at checkout
-  - [ ] 16.1 Lengthen connection lifetimes
+- [x] 16. Size by live connections, share the connection rate by arrival time, and wait briefly at checkout
+  - [x] 16.1 Lengthen connection lifetimes
     - `BASE_LIFETIME` = 50 minutes; `LIFETIME_JITTER` = 4 minutes, added as 0..=4 minutes; the embedded reservoirs take the same values through `assign_lifetime`
     - Replace the 15-minute `DSQL_HARD_CUTOFF` with `DSQL_MAX_CONNECTION_DURATION` (60 minutes) less `DSQL_MAX_TRANSACTION` (5 minutes); the configuration check bounds `base_lifetime + lifetime_jitter + guard_window` by it
     - The configuration check rejects a `target_ready` below `MIN_TARGET` (5)
     - _Requirements: 4.6, 9.7, 11.1, 11.3, 11.4, 11.5_
-  - [ ] 16.2 Write property tests for lifetimes
+  - [x] 16.2 Write property tests for lifetimes
     - **Property 1: Lifetime Jitter Bounds** and **Property 2: Lifetime Within DSQL's Connection Duration**
     - **Validates: Requirements 4.6, 11.3, 11.4, 11.5**
-  - [ ] 16.3 Classify refused connects by SQLSTATE
-    - Add `ConnectionFactoryError::Refused` with kind `refused`; `from_dsql_error` maps SQLSTATE `53400` and `53300` to it wherever in the error the SQLSTATE appears, before it looks at the error's type
+  - [x] 16.3 Classify refused connects by SQLSTATE
+    - Add `ConnectionFactoryError::Refused` with kind `refused`; `from_dsql_error` maps SQLSTATE `53400` and `53300` to it wherever in the error's source chain the server's error response appears, before it looks at the error's type
     - _Requirements: 1.4, 1.5, 8.4_
-  - [ ] 16.4 Write property test for refused classification
+  - [x] 16.4 Write property test for refused classification
     - **Property 14: Refused Connects Are Classified by SQLSTATE**
     - **Validates: Requirements 1.4, 1.5, 8.4**
-  - [ ] 16.5 Size the reservoir by live connections
+  - [x] 16.5 Size the reservoir by live connections
     - Add `LiveCount` and `LiveCharge`; the refiller takes a charge before it asks for an admission, and the charge travels in `PhysicalConn`, `DsqlPermit` and `ReturnedConn`, giving its place back on drop
     - The refiller starts a creation only while the live count is below the target; the ready channel's capacity is the configured target
     - The return processor retires a return while the live count exceeds the target, with reason `budget_cap`; `reconfigure_target` floors at `MIN_TARGET`
     - Emit `tokeira_dsql_reservoir_live_connections`
     - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.8, 4.9, 5.5, 5.6, 6.6, 6.7, 8.1, 8.6, 13.1, 16.6, 16.7, 16.8_
-  - [ ] 16.6 Write property test for the live count
+  - [x] 16.6 Write property test for the live count
     - **Property 9: Live Connections Within the Target**
     - **Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.8, 4.9, 5.5, 5.6, 6.6, 6.7, 8.1, 8.6, 16.6, 16.7, 16.8**
-  - [ ] 16.7 Retire the slot block manager
+  - [x] 16.7 Retire the slot block manager
     - Delete `slot_block_manager.rs`, its metrics and its startup step; remove `conn_lease_table` from `DsqlCoordinationConfig` and the engine's startup wiring
     - Keep accepting `infrastructure.dsql.conn_lease_table` in the server configuration, ignore its value, and warn once at startup that it is no longer used
     - Remove the slot lease table and its write-back from the compose, ECS and EKS platform definitions, their tests and `config.example.toml`; record what `tkr infra plan` shows for a deployment that still holds the table
     - Update the connection-management paragraph of `crates/tokeira-storage/AGENTS.md`
     - _Requirements: 8.3, 14.1, 14.6, 14.7, 14.8, 19.2, 19.5_
-  - [ ] 16.8 Rewrite the distributed token bucket as an arrival-time bucket
+    - DONE: the compose, ECS and EKS definitions no longer declare the slot lease table or write its name back; for a deployment that still holds it, `tkr infra plan` lists the table under Delete, as a resource in state that the definition no longer declares, with its data destroyed; that data is leases nothing reads, and the next `tkr infra apply` deletes the table. A node that still finds `conn_lease_table` in its configuration warns once and ignores it. On a throwaway cluster, the distributed startup schema check and single-node claim live tests start their nodes with only the rate limiter table.
+  - [x] 16.8 Rewrite the distributed token bucket as an arrival-time bucket
     - One item per endpoint, `dsql_connect_gcra#{endpoint}`, holding `tat_us` and `ttl_epoch`; the busy and idle conditional updates with `ReturnValuesOnConditionCheckFailure = ALL_OLD`; the first update follows the last Arrival_Time the node saw
     - Refuse an admission scheduled past `RATE_MAX_WAIT`, and after `MAX_ATTEMPTS` updates; report `tokeira_dsql_pool_rate_limiter_tokens` from the latest admission
     - Write the update logic over a store trait with DynamoDB's conditional-update semantics, implemented by the DynamoDB client and by an in-process item for tests
     - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 15.2_
-  - [ ] 16.9 Write property test for the distributed rate bound
+  - [x] 16.9 Write property test for the distributed rate bound
     - **Property 10: Distributed Rate Bound**
     - Several simulated nodes with random clock offsets over the in-process item
     - **Validates: Requirements 7.3, 7.5, 7.6, 7.7, 15.5**
-  - [ ] 16.10 Fall back to a local limiter while DynamoDB fails
+  - [x] 16.10 Fall back to a local limiter while DynamoDB fails
     - After a DynamoDB error other than a failed condition, admit through the fallback limiter for `FALLBACK_PERIOD`, at the node's directive rate share or `FALLBACK_RATE`, with a burst of one second's admissions; warn when the fallback begins and report `tokeira_dsql_pool_rate_limiter_fallback`
     - _Requirements: 7.8, 7.9, 7.10, 12.3, 13.1_
-  - [ ] 16.11 Write property test for fallback admissions
+  - [x] 16.11 Write property test for fallback admissions
     - **Property 13: Fallback Admissions**
     - **Validates: Requirements 7.8, 7.9, 7.10**
-  - [ ] 16.12 Wait up to `CHECKOUT_WAIT` at checkout
+  - [x] 16.12 Wait up to `CHECKOUT_WAIT` at checkout
     - `Reservoir::checkout` waits up to one second on the ready channel, retiring broken connections within the same deadline; the director awaits it and keeps its empty-reservoir mapping
     - _Requirements: 3.1, 3.2, 3.3, 3.5, 3.6, 12.2_
-  - [ ] 16.13 Write property test for bounded checkout
+  - [x] 16.13 Write property test for bounded checkout
     - **Property 11: Bounded Checkout**
     - **Validates: Requirements 3.1, 3.2, 3.5, 3.6, 12.2**
-  - [ ] 16.14 Apply the whole connection budget
+  - [x] 16.14 Apply the whole connection budget
     - `DsqlConnectionDirector::apply_connection_budget(ConnectionBudget)` takes the target `min(configured, max_reservoir_size, capacity)`, floored at `MIN_TARGET`, recomputes the class budgets from it, and hands `rate_per_second` to the fallback limiter
     - _Requirements: 8.2, 9.6, 9.7, 7.9_
-  - [ ] 16.15 Write property test for class budgets under a changing target
+  - [x] 16.15 Write property test for class budgets under a changing target
     - **Property 6: Class Budget Sum Invariant**
     - **Validates: Requirements 9.1, 9.6, 9.7**
-  - [ ] 16.16 Start serving after a partial warmup
+  - [x] 16.16 Start serving after a partial warmup
     - `Reservoir::start` no longer fails when warmup times out: warmup reports the connections held at `WARMUP_TIMEOUT`, startup logs them as a warning and continues, and the refiller keeps filling
     - _Requirements: 15.1, 15.3, 15.4_
-  - [ ] 16.17 Checkpoint — the reservoir, the bucket and the director compile, and all property tests pass
-  - [ ] 16.18 Write scenario, fleet, integration and live tests
+  - [x] 16.17 Checkpoint — the reservoir, the bucket and the director compile, and all property tests pass
+  - [x] 16.18 Write scenario, fleet, integration and live tests
     - The scenario and fleet scenario tests of the design's testing strategy, on paused time, through the in-process rate limiter item and a simulated cluster that enforces DSQL's rate, burst and connection limit
     - The DynamoDB Local integration tests of the arrival-time bucket
     - The live test of several reservoirs sharing a throwaway rate limiter table on a throwaway cluster
     - _Requirements: 3.2, 7.3, 7.8, 8.4, 8.5, 8.6, 15.4, 15.5, 16.8_
-  - [ ] 16.19 Update the architecture documentation
+    - DONE: on paused time, a fleet of a hundred nodes of fifty fills in 40 to 41 seconds with no refusal; a rolling restart refills each node within seven connect latencies; through a DynamoDB outage with the cluster's rate already spent, the fleet refills within 55 seconds at its directive shares with at most a hundred refusals; and 210 nodes of fifty hold exactly 10,000 connections, keep what they hold and retry at most once every few seconds. On a throwaway cluster and table, 64 workers ran 3,200 operations through a reservoir of 10 and never found it empty; eight reservoirs refilled 49 connections five times over, 2,360 connections with 120 refused for the rate and no place lost, at a median of 1.5 seconds a refill against 11.2 seconds one connect at a time; and 24 reservoirs of 50 sharing one rate limiter table opened 1,200 connections in 2.3 seconds with none refused, the cluster's burst and two seconds of its rate. The arrival-time bucket's two DynamoDB tests pass against the same table.
+  - [x] 16.19 Update the architecture documentation
     - `docs/architecture/060-connection-management.md`: lifetimes and the duration they fit, sizing by live connections, the arrival-time bucket and its fallback, fleet capacity, the bounded checkout wait, and the partial warm start
     - _Requirements: 18.1, 18.2, 18.3, 18.5, 18.6_
-  - [ ] 16.20 Final checkpoint — the §10.4 bar passes
+  - [x] 16.20 Final checkpoint — the §10.4 bar passes
 
 ## Notes
 

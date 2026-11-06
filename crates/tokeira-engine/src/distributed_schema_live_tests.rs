@@ -1,14 +1,13 @@
 //! Live checks of a listener-backed distributed node's schema check, on an
-//! operator-supplied Aurora DSQL cluster and the two DynamoDB tables that
-//! coordinate its connections (`docs/testing/dsql-live-suites.md`).
+//! operator-supplied Aurora DSQL cluster and the DynamoDB rate limiter table
+//! its nodes share (`docs/testing/dsql-live-suites.md`).
 //!
 //! Each test brings the schema to this release's target first, so the tests
 //! run in any order and again on the same cluster. They are ignored by default
 //! and fail when their environment is unset.
 
-use std::{collections::BTreeSet, net::TcpListener as StdTcpListener};
+use std::net::TcpListener as StdTcpListener;
 
-use aws_sdk_dynamodb::types::AttributeValue;
 use tokeira_proto::workflowservice::{
     GetSystemInfoRequest, workflow_service_client::WorkflowServiceClient,
 };
@@ -16,12 +15,11 @@ use tokeira_storage::dsql::{ConnectionFactory, schema_state_for_tests};
 
 use super::*;
 
-/// The cluster and tables the tests run against, from the environment.
+/// The cluster and table the tests run against, from the environment.
 pub(super) struct Live {
     pub(super) endpoint: String,
     pub(super) region: String,
     rate_limiter_table: String,
-    conn_lease_table: String,
 }
 
 impl Live {
@@ -34,7 +32,6 @@ impl Live {
             endpoint: var("TOKEIRA_DSQL_DISTRIBUTED_ENDPOINT"),
             region: var("TOKEIRA_DSQL_DISTRIBUTED_REGION"),
             rate_limiter_table: var("TOKEIRA_DSQL_DISTRIBUTED_RATE_LIMITER_TABLE"),
-            conn_lease_table: var("TOKEIRA_DSQL_DISTRIBUTED_CONN_LEASE_TABLE"),
         }
     }
 
@@ -46,7 +43,6 @@ impl Live {
         config.infrastructure.dsql.endpoint = Some(self.endpoint.clone());
         config.infrastructure.dsql.region = Some(self.region.clone());
         config.infrastructure.dsql.rate_limiter_table = Some(self.rate_limiter_table.clone());
-        config.infrastructure.dsql.conn_lease_table = Some(self.conn_lease_table.clone());
         config.policy.nexus_completion.http_addr = format!("127.0.0.1:{nexus}");
         config.policy.nexus_completion.system_callback_url = format!("http://127.0.0.1:{nexus}");
         config
@@ -71,42 +67,6 @@ impl Live {
         )
         .await
     }
-
-    pub(super) async fn dynamodb(&self) -> aws_sdk_dynamodb::Client {
-        let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(aws_config::Region::new(self.region.clone()))
-            .load()
-            .await;
-        aws_sdk_dynamodb::Client::new(&sdk_config)
-    }
-
-    /// The owners of the connection-slot blocks in the lease table. A node
-    /// that leaves its blocks owned adds its own owner here.
-    pub(super) async fn slot_block_owners(
-        &self,
-        dynamodb: &aws_sdk_dynamodb::Client,
-    ) -> BTreeSet<String> {
-        let mut owners = BTreeSet::new();
-        let mut start = None;
-        loop {
-            let page = dynamodb
-                .scan()
-                .table_name(&self.conn_lease_table)
-                .set_exclusive_start_key(start)
-                .send()
-                .await
-                .expect("the connection-lease table scans");
-            for item in page.items() {
-                if let Some(AttributeValue::S(owner)) = item.get("owner_id") {
-                    owners.insert(owner.clone());
-                }
-            }
-            match page.last_evaluated_key() {
-                Some(key) if !key.is_empty() => start = Some(key.clone()),
-                _ => return owners,
-            }
-        }
-    }
 }
 
 /// A loopback port nothing is bound to.
@@ -126,11 +86,9 @@ pub(super) fn bindable(port: u16) -> bool {
 /// started.
 macro_rules! assert_refused_and_nothing_started {
     ($live:expr, $connection:expr, $check:expr) => {{
-        let dynamodb = $live.dynamodb().await;
         let before = schema_state_for_tests::state($connection)
             .await
             .expect("the schema state reads");
-        let owners_before = $live.slot_block_owners(&dynamodb).await;
         let (grpc, nexus) = (free_port(), free_port());
         let error = $live
             .start(grpc, nexus)
@@ -144,11 +102,6 @@ macro_rules! assert_refused_and_nothing_started {
                 .expect("the schema state reads"),
             before,
             "a refused start changes no ledger row, compatibility record or shard lease"
-        );
-        let owners_after = $live.slot_block_owners(&dynamodb).await;
-        assert!(
-            owners_after.is_subset(&owners_before),
-            "a refused start releases its connection-slot blocks: {owners_before:?} then {owners_after:?}"
         );
         assert!(
             bindable(grpc) && bindable(nexus),

@@ -174,15 +174,6 @@ def deployment(cfg: Compose, cx: Context) -> Deployment:
                     ttl="ttl_epoch",
                 ),
             )
-            conn_lease = dsql.resource(
-                "conn_lease",
-                DynamoDbTable(
-                    table=cx.project_name + "-dsql-conn-lease",
-                    region=region,
-                    hash_key="pk",
-                    ttl="ttl_epoch",
-                ),
-            )
 
             d.writeback("infrastructure.storage", "dsql")
             d.writeback(
@@ -192,10 +183,6 @@ def deployment(cfg: Compose, cx: Context) -> Deployment:
             d.writeback(
                 "infrastructure.dsql.rate_limiter_table",
                 rate_limiter.output("table_name"),
-            )
-            d.writeback(
-                "infrastructure.dsql.conn_lease_table",
-                conn_lease.output("table_name"),
             )
         case InMemory():
             pass

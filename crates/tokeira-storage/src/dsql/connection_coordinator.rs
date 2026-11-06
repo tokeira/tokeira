@@ -2,8 +2,8 @@
 //!
 //! This module is deliberately absent from the distributed `tokeirad` path.
 //! Embedded mode uses a monotonic token bucket and atomic slot budget without
-//! constructing DynamoDB resources or changing the established distributed
-//! reservoir, rate limiter, or slot-block manager.
+//! constructing DynamoDB resources or changing the distributed reservoir or
+//! its rate limiter.
 
 use std::{
     fmt,

@@ -227,7 +227,6 @@ async fn build_lease_repository(
     let pool_config = DsqlPoolConfig {
         coordination: DsqlCoordinationConfig {
             rate_limiter_table: format!("{}-dsql-rate-limiter", config.cluster_name),
-            conn_lease_table: format!("{}-dsql-conn-lease", config.cluster_name),
         },
         ..DsqlPoolConfig::default()
     };

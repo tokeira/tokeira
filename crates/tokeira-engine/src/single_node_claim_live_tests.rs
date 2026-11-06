@@ -97,7 +97,6 @@ async fn one_node_without_a_controller_serves_a_cluster() {
     control_lease_state_for_tests::remove(&mut connection, CLAIM_NAME)
         .await
         .expect("the run starts from no claim");
-    let dynamodb = live.dynamodb().await;
 
     // 1. A second node refuses, and nothing of it starts.
     let a = Node::start(&live).await.expect("node A starts");
@@ -113,7 +112,6 @@ async fn one_node_without_a_controller_serves_a_cluster() {
         .clone()
         .expect("node A holds the claim");
     assert!(a_owner.starts_with(OWNER_PREFIX), "{a_owner}");
-    let slot_owners_before = live.slot_block_owners(&dynamodb).await;
     let (grpc, nexus) = (free_port(), free_port());
     let attempted = Instant::now();
     let refusal = match live.start(grpc, nexus).await {
@@ -152,12 +150,6 @@ async fn one_node_without_a_controller_serves_a_cluster() {
         (claim_after.owner_id, claim_after.fence_token),
         (claim_before.owner_id, claim_before.fence_token),
         "a refused start leaves node A's claim with node A"
-    );
-    let slot_owners_after = live.slot_block_owners(&dynamodb).await;
-    assert!(
-        slot_owners_after.is_subset(&slot_owners_before),
-        "a refused start releases its connection-slot blocks: {slot_owners_before:?} then \
-         {slot_owners_after:?}"
     );
     assert!(serves(a.addr()).await, "node A still serves");
 

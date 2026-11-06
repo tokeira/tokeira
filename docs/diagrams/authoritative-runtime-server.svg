@@ -170,10 +170,10 @@
 <tspan x="1883" dy="20">Used only for connection budgeting.</tspan>
 </text>
 <rect x="1448" y="1080" width="385" height="88" rx="14" fill="#F7F0DC" stroke="#E3D394" stroke-width="1.4" opacity="1"/>
-<text x="1468" y="1112" class="subhead" fill="#B08D2E">DynamoDB slot blocks — server mode only</text>
+<text x="1468" y="1112" class="subhead" fill="#B08D2E">Connection budgets — server mode only</text>
 <text x="1468" y="1140" class="small">
-<tspan x="1468" dy="0">Reservoir envelope and hard caps.</tspan>
-<tspan x="1468" dy="20">Keeps DSQL below account limits.</tspan>
+<tspan x="1468" dy="0">Controller shares of the cluster.</tspan>
+<tspan x="1468" dy="20">Keeps DSQL below its connection limit.</tspan>
 </text>
 <rect x="76" y="1008" width="330" height="150" rx="18" fill="#EFF4F5" stroke="#A8CBD2" stroke-width="1.8" opacity="1"/>
 <rect x="76" y="1008" width="8" height="150" rx="4" fill="#0B7285"/>

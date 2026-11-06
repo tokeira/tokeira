@@ -401,15 +401,6 @@ def deployment(cfg: Ecs, cx: Context) -> Deployment:
             ttl="ttl_epoch",
         ),
     )
-    conn_lease = dsql_module.resource(
-        "conn_lease",
-        DynamoDbTable(
-            table=cx.project_name + "-dsql-conn-lease",
-            region=cfg.aws.region,
-            hash_key="pk",
-            ttl="ttl_epoch",
-        ),
-    )
     d.writeback("infrastructure.storage", "dsql")
     d.writeback(
         "infrastructure.dsql.endpoint",
@@ -419,10 +410,6 @@ def deployment(cfg: Ecs, cx: Context) -> Deployment:
     d.writeback(
         "infrastructure.dsql.rate_limiter_table",
         rate_limiter.output("table_name"),
-    )
-    d.writeback(
-        "infrastructure.dsql.conn_lease_table",
-        conn_lease.output("table_name"),
     )
     match cfg.dsql:
         case ManagedDsql():

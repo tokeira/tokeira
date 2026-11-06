@@ -41,7 +41,7 @@ apply writes only canonical `TokeiraConfig` paths:
 - `infrastructure.storage`;
 - `infrastructure.dsql.endpoint` and `.region`;
 - `infrastructure.dsql.runtime_role_arn` and `.admin_role_arn`; and
-- `infrastructure.dsql.rate_limiter_table` and `.conn_lease_table`.
+- `infrastructure.dsql.rate_limiter_table`.
 
 Core server workloads declare the `ServerConfig` resource as an infrastructure
 dependency. Their ECS task definitions receive the same generic loader contract used by

@@ -16,7 +16,6 @@ use std::{
 };
 
 use anyhow::Result;
-use rand::Rng;
 use sqlx::PgConnection;
 use tokeira_observability::OutcomeLabel;
 use tokio::{
@@ -26,18 +25,15 @@ use tokio::{
 
 use crate::metrics;
 
+// The embedded pool's connections live as long as the distributed
+// reservoir's: both are bounded by DSQL's connection duration, not by the IAM
+// token, which DSQL checks only when a connection opens.
+pub(crate) use super::reservoir::{GUARD_WINDOW, assign_lifetime};
 use super::{
     PhysicalConnectionFactory, ReservoirConfig,
     connection_coordinator::EmbeddedConnectionCoordinator,
     connection_factory::create_within_timeout, operation::BrokenFlag,
 };
-
-/// Base age before a connection becomes eligible for retirement.
-pub(crate) const BASE_LIFETIME: StdDuration = StdDuration::from_secs(10 * 60);
-/// Positive jitter applied to spread retirements across time.
-pub(crate) const LIFETIME_JITTER: StdDuration = StdDuration::from_secs(2 * 60);
-/// Safety margin before the DSQL IAM token hard cutoff.
-pub(crate) const GUARD_WINDOW: StdDuration = StdDuration::from_secs(45);
 pub(crate) const SCAN_INTERVAL: StdDuration = StdDuration::from_secs(1);
 pub(crate) const REFILLER_IDLE_INTERVAL: StdDuration = StdDuration::from_millis(100);
 pub(crate) const REFILLER_ERROR_BACKOFF: StdDuration = StdDuration::from_millis(250);
@@ -577,16 +573,6 @@ fn record_retirement(
     coordinator.release_slot();
 }
 
-pub(crate) fn assign_lifetime(config: &ReservoirConfig) -> StdDuration {
-    let base = duration_or_default(config.base_lifetime, BASE_LIFETIME);
-    let jitter_max = duration_or_default(config.lifetime_jitter, LIFETIME_JITTER);
-    if jitter_max.is_zero() {
-        return base;
-    }
-    let jitter = rand::thread_rng().gen_range(0..=jitter_max.as_secs());
-    base + StdDuration::from_secs(jitter)
-}
-
 pub(crate) fn within_guard_window(
     created_at: Instant,
     max_lifetime: StdDuration,
@@ -730,7 +716,7 @@ mod tests {
                 scan_interval: Duration::seconds(1),
             };
             if config.validate().is_ok() {
-                prop_assert!(base_secs + jitter_secs + guard_secs <= 15 * 60);
+                prop_assert!(base_secs + jitter_secs + guard_secs <= 55 * 60);
             }
         }
 
@@ -743,9 +729,12 @@ mod tests {
     }
 
     #[test]
-    fn embedded_lifetime_defaults_match_dsql_token_safety() {
+    fn embedded_lifetime_defaults_fit_dsqls_connection_duration() {
         assert_eq!(SCAN_INTERVAL, StdDuration::from_secs(1));
-        assert!(BASE_LIFETIME + LIFETIME_JITTER + GUARD_WINDOW < StdDuration::from_secs(15 * 60));
+        let longest = super::super::reservoir::BASE_LIFETIME
+            + super::super::reservoir::LIFETIME_JITTER
+            + GUARD_WINDOW;
+        assert!(longest + StdDuration::from_secs(5 * 60) <= StdDuration::from_secs(60 * 60));
     }
 
     #[test]

@@ -1,0 +1,5 @@
+kind: fixed
+body: A storage call now waits up to a second for a DSQL connection when none is ready, instead of failing at once with RESOURCE_EXHAUSTED.
+time: 2026-11-06T18:55:45.293244+00:00
+custom:
+    Slice: 252b3574-3048-4056-9af8-fa09ce4b4b94

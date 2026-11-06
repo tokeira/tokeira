@@ -200,7 +200,7 @@ pub enum ConnectionFactoryError {
 
 Neither sqlx nor the connector bounds a connect, so a peer that accepts TCP and never answers would hold an attempt, its in-flight permit and its place in the live count forever. `CONNECT_TIMEOUT` ends the attempt; the attempt then fails like any other and gives its place back. Until then it counts toward the target (Req 4.9), so a hung connect delays a replacement by at most `CONNECT_TIMEOUT` and never lets the node overshoot.
 
-`from_dsql_error` classifies a refusal by its SQLSTATE before it looks at the error's type: the connector reports a refusal during the startup handshake as a connection error, with the server's error response inside it. `53400` (connection rate exceeded) and `53300` (too many connections) map to `Refused`, wherever in the error the SQLSTATE appears; no other SQLSTATE does. A refused connect lengthens the refiller's failure streak like any other failure, and the `refused` label on `tokeira_dsql_connection_error_total` lets an operator tell the cluster's limits from network trouble.
+`from_dsql_error` classifies a refusal by its SQLSTATE before it looks at the error's type: the connector reports a refusal during the startup handshake as a connection error, with the server's error response inside it. `53400` (connection rate exceeded) and `53300` (too many connections) map to `Refused`, wherever in the error's source chain the server's error response appears; no other SQLSTATE does, and no text in a message does, so a payload that mentions a SQLSTATE cannot change a failure's kind. A refused connect lengthens the refiller's failure streak like any other failure, and the `refused` label on `tokeira_dsql_connection_error_total` lets an operator tell the cluster's limits from network trouble.
 
 ### 2.5 DSQL Coordination Config
 
@@ -860,7 +860,7 @@ All metrics emitted unconditionally via the `metrics` crate. No configuration op
 
 ### Property 14: Refused Connects Are Classified by SQLSTATE
 
-*For any* connect failure whose error carries SQLSTATE `53400` or `53300`, wherever in the error's chain or message it appears, the factory SHALL report the `refused` kind; *for any* other failure it SHALL report the kind it reports today.
+*For any* connect failure whose error carries SQLSTATE `53400` or `53300`, wherever in the error's source chain it appears, the factory SHALL report the `refused` kind; *for any* other failure it SHALL report the kind it reports today.
 
 **Validates: Requirements 1.4, 1.5, 8.4**
 

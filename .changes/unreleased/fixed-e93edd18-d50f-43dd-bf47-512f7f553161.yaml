@@ -1,0 +1,5 @@
+kind: fixed
+body: A node now keeps its last DSQL connection budget through a controller outage, instead of dropping to one connection when the budget expires.
+time: 2026-11-06T18:55:47.293244+00:00
+custom:
+    Slice: e93edd18-d50f-43dd-bf47-512f7f553161

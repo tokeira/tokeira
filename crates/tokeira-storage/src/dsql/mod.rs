@@ -5,10 +5,10 @@
 //! [`DsqlStore`], which wires a connection director, migration runner, and
 //! DSQL `RunRepository` over mode-specific connection foundations.
 //!
-//! Distributed startup retains its established DynamoDB-backed reservoir,
-//! token bucket, and slot-block manager. Exclusive embedded startup uses a
-//! separate bounded process-local reservoir and never constructs DynamoDB
-//! resources; the repository implementations remain shared.
+//! Distributed startup builds a reservoir sized by its live connections and a
+//! connection-rate limiter shared through DynamoDB. Exclusive embedded startup
+//! uses a separate bounded process-local reservoir and never constructs
+//! DynamoDB resources; the repository implementations remain shared.
 
 use std::{sync::Arc, time::Instant};
 
@@ -39,7 +39,6 @@ pub mod run_repository;
 pub mod schema_compatibility;
 #[cfg(any(test, feature = "dsql-integration"))]
 pub mod schema_state_for_tests;
-pub mod slot_block_manager;
 pub mod task_queue_config;
 pub mod validation;
 pub use crate::value_parts;
@@ -61,7 +60,6 @@ pub use projection_log::*;
 pub use reservoir::*;
 pub use run_repository::*;
 pub use schema_compatibility::*;
-pub use slot_block_manager::*;
 pub use task_queue_config::*;
 pub use validation::*;
 pub use worker_compute_repository::*;
@@ -123,7 +121,7 @@ impl DsqlStore {
     /// Construct the foundational DSQL components from IAM auth settings.
     ///
     /// The full startup sequence is internal: DynamoDB coordination validation,
-    /// slot-block ownership, distributed rate limiting, and reservoir warmup.
+    /// distributed rate limiting, and reservoir warmup.
     pub async fn connect(
         auth: config::DsqlAuthConfig,
         config: config::DsqlPoolConfig,
@@ -150,32 +148,21 @@ impl DsqlStore {
             &auth.endpoint,
             &region,
         )?);
-        // DynamoDB coordination is mandatory in production DSQL mode. There is
-        // no local fallback here because uncoordinated refillers can overshoot
-        // DSQL connection limits when more than one node starts. The client is
-        // injected by the caller (a runtime resource, not config) so config
-        // defaults never construct an SDK/TLS stack.
+        // The rate limiter table must be reachable for a node to start: nodes
+        // that start together share the cluster's connection burst through it.
+        // Once running, a node rides out a DynamoDB failure on its fallback
+        // limiter. The client is injected by the caller (a runtime resource,
+        // not config) so config defaults never construct an SDK/TLS stack.
         let bucket = Arc::new(distributed_bucket::DistributedTokenBucket::new(
-            ddb_client.clone(),
+            ddb_client,
             config.coordination.rate_limiter_table.clone(),
-            auth.endpoint.clone(),
+            &auth.endpoint,
             config.connection_rate_per_second,
             config.burst_capacity,
         ));
         bucket.validate_table().await?;
-        let slot_manager = slot_block_manager::SlotBlockManager::start(
-            ddb_client,
-            config.coordination.conn_lease_table.clone(),
-            auth.endpoint.clone(),
-        )
-        .await?;
-        let reservoir = reservoir::Reservoir::start(
-            config.reservoir.clone(),
-            factory,
-            bucket,
-            Arc::clone(&slot_manager),
-        )
-        .await?;
+        let reservoir =
+            reservoir::Reservoir::start(config.reservoir.clone(), factory, bucket).await?;
         Self::from_reservoir(reservoir, config).await
     }
 
@@ -232,15 +219,8 @@ impl DsqlStore {
             config.connection_rate_per_second,
             config.burst_capacity,
         ));
-        let slot_manager =
-            slot_block_manager::SlotBlockManager::local_for_tests(config.reservoir.target_ready);
-        let reservoir = reservoir::Reservoir::start(
-            config.reservoir.clone(),
-            factory,
-            bucket,
-            Arc::clone(&slot_manager),
-        )
-        .await?;
+        let reservoir =
+            reservoir::Reservoir::start(config.reservoir.clone(), factory, bucket).await?;
         Self::from_reservoir(reservoir, config).await
     }
 
@@ -391,7 +371,6 @@ impl DsqlStore {
 
 #[cfg(test)]
 mod tests {
-    use time::Duration;
 
     use super::*;
 
@@ -419,13 +398,7 @@ mod tests {
     #[tokio::test]
     async fn store_connect_rejects_invalid_auth_before_network() {
         let auth = config::DsqlAuthConfig::default();
-        let config = config::DsqlPoolConfig {
-            reservoir: config::ReservoirConfig {
-                base_lifetime: Duration::minutes(50),
-                ..config::ReservoirConfig::default()
-            },
-            ..config::DsqlPoolConfig::default()
-        };
+        let config = config::DsqlPoolConfig::default();
 
         assert!(
             DsqlStore::connect(auth, config, aws_http::offline_ddb_client())

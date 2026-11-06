@@ -28,13 +28,14 @@ use tokio::{
 use crate::{ConnectionDirector, DbClass, PersistenceCapacityExhausted, metrics};
 
 use super::{
-    DsqlPoolConfig, Reservoir, ReservoirEntry, ReservoirError, ReturnedConnection,
+    DsqlPoolConfig, MIN_TARGET, Reservoir, ReservoirEntry, ReservoirError, ReturnedConnection,
     config::ReservoirConfig,
     connection_coordinator::EmbeddedConnectionCoordinator,
     control_lease::{OwnershipAdmissionGate, OwnershipAdmissionPermit, OwnershipAdmissionState},
     embedded_reservoir,
     embedded_reservoir::EmbeddedReservoir,
     operation::{BrokenFlag, note_checkout},
+    reservoir::LiveCharge,
 };
 
 const LEAK_SUSPECT_AFTER: StdDuration = StdDuration::from_secs(30);
@@ -207,13 +208,46 @@ impl ClassBudgets {
         result
     }
 
-    /// Replace allocations while preserving old permits, waiters, and cooldowns.
+    /// Change each class's allocation in place, preserving permits already
+    /// held, waiters, and cooldowns.
+    ///
+    /// A raised allocation adds permits at once. A lowered one forgets the
+    /// permits that are free and collects the rest as their holders release
+    /// them: a task waits for those permits on the class's own semaphore and
+    /// forgets them. Tokio's semaphore serves waiters in order, so callers
+    /// that arrive after the change queue behind that task, and the permits in
+    /// use fall to the new allocation as work completes. Replacing the
+    /// semaphores instead would admit a fresh allocation alongside every
+    /// permit still held, so after a directive lowered the target, more
+    /// callers could be admitted than the node has connections.
     pub async fn reconfigure(&self, allocations: &HashMap<DbClass, usize>) -> Result<()> {
         let total_budget = validate_allocations(allocations)?;
-        let mut budgets = self.budgets.write().await;
-        *budgets = build_budget_map(allocations);
+        let budgets = self.budgets.write().await;
         let mut totals = self.totals.write().await;
-        *totals = allocations.clone();
+        for class in all_classes() {
+            let (Some(semaphore), Some(current)) = (budgets.get(&class), totals.get_mut(&class))
+            else {
+                bail!("missing budget for class {class:?}");
+            };
+            let wanted = allocations[&class];
+            if wanted > *current {
+                semaphore.add_permits(wanted - *current);
+            } else if wanted < *current {
+                let excess = *current - wanted;
+                let outstanding = excess - semaphore.forget_permits(excess);
+                if outstanding > 0 {
+                    let semaphore = Arc::clone(semaphore);
+                    let outstanding = u32::try_from(outstanding).unwrap_or(u32::MAX);
+                    tokio::spawn(async move {
+                        // A closed semaphore (shutdown) ends the collection.
+                        if let Ok(permits) = semaphore.acquire_many_owned(outstanding).await {
+                            permits.forget();
+                        }
+                    });
+                }
+            }
+            *current = wanted;
+        }
         self.total_budget.store(total_budget, Ordering::Release);
         drop(totals);
         drop(budgets);
@@ -315,6 +349,18 @@ impl ReservoirController {
     }
 }
 
+/// A connection budget directive as the reservoir applies it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConnectionBudget {
+    /// This node's share of the cluster's connection rate, which its fallback
+    /// limiter admits at while DynamoDB fails.
+    pub rate_per_second: f64,
+    /// This node's share of the cluster's connections.
+    pub capacity: u64,
+    /// An absolute ceiling on this node's reservoir from the controller.
+    pub max_reservoir_size: u32,
+}
+
 #[derive(Debug)]
 pub struct DsqlConnectionDirector {
     /// Warm physical connections managed independently of operation class.
@@ -345,7 +391,9 @@ impl DsqlConnectionDirector {
     /// Start the background connection reservoir and class-budget controller.
     pub fn start(config: DsqlPoolConfig, reservoir: Reservoir) -> Result<Self> {
         let reservoir = Arc::new(ReservoirController::Distributed(reservoir));
-        let class_budgets = Arc::new(ClassBudgets::new(&default_allocations(&config.reservoir))?);
+        let class_budgets = Arc::new(ClassBudgets::new(&default_allocations(
+            config.reservoir.target_ready,
+        ))?);
         let in_flight = Arc::new(AtomicUsize::new(0));
         let in_flight_changed = Arc::new(Notify::new());
         let leak_tracker = Arc::new(CheckoutLeakTracker::default());
@@ -375,7 +423,9 @@ impl DsqlConnectionDirector {
         reservoir: EmbeddedReservoir,
     ) -> Result<Self> {
         let reservoir = Arc::new(ReservoirController::Embedded(reservoir));
-        let class_budgets = Arc::new(ClassBudgets::new(&default_allocations(config))?);
+        let class_budgets = Arc::new(ClassBudgets::new(&default_allocations(
+            config.target_ready,
+        ))?);
         let in_flight = Arc::new(AtomicUsize::new(0));
         let in_flight_changed = Arc::new(Notify::new());
         let leak_tracker = Arc::new(CheckoutLeakTracker::default());
@@ -406,26 +456,45 @@ impl DsqlConnectionDirector {
         self.class_budgets.reconfigure(allocations).await
     }
 
-    /// Apply a placement-controller connection budget to the reservoir: cap
-    /// the warm target at `min(configured target_ready, max_reservoir_size)`
-    /// and retire idle connections above it. Returns how many were retired.
+    /// Apply a placement-controller connection budget and return the target
+    /// applied: `min(configured target_ready, max_reservoir_size, capacity)`,
+    /// at least [`MIN_TARGET`].
+    ///
+    /// Idle connections above the target retire now and checked-out ones as
+    /// they come back; the class budgets are recomputed from the target, so
+    /// admitted callers never outnumber the connections the node may hold;
+    /// and the directive's rate share becomes the fallback limiter's rate.
     ///
     /// A directive can only lower the target, never raise it above the
     /// operator's configuration; the cluster-wide share is a ceiling on this
-    /// node, not a licence to exceed local limits. Only the distributed
-    /// reservoir is budgeted: the embedded engine never joins a placement
-    /// controller, so a directive reaching an embedded director is a wiring
-    /// error and is reported as one.
-    pub fn apply_connection_budget(&self, max_reservoir_size: u32) -> Result<usize> {
+    /// node, not a licence to exceed local limits. The controller divides the
+    /// cluster's connections among the nodes it budgets, so their targets sum
+    /// to at most its budget. Only the distributed reservoir is budgeted: the
+    /// embedded engine never joins a placement controller, so a directive
+    /// reaching an embedded director is a wiring error and is reported as one.
+    pub async fn apply_connection_budget(&self, budget: ConnectionBudget) -> Result<usize> {
         let ReservoirController::Distributed(reservoir) = self.reservoir.as_ref() else {
             bail!("connection budgets apply only to the distributed DSQL reservoir");
         };
-        let target = usize::try_from(max_reservoir_size)
+        let requested = usize::try_from(budget.max_reservoir_size)
             .unwrap_or(usize::MAX)
-            .min(reservoir.config().target_ready)
-            .max(1);
-        reservoir.reconfigure_target(u32::try_from(target).unwrap_or(u32::MAX));
-        Ok(reservoir.retire_excess(u32::try_from(target).unwrap_or(u32::MAX)))
+            .min(usize::try_from(budget.capacity).unwrap_or(usize::MAX));
+        let (retired, target) = reservoir.reconfigure_target(requested);
+        self.class_budgets
+            .reconfigure(&default_allocations(target))
+            .await?;
+        reservoir
+            .limiter()
+            .set_fallback_rate(budget.rate_per_second);
+        tracing::debug!(
+            rate_per_second = budget.rate_per_second,
+            capacity = budget.capacity,
+            max_reservoir_size = budget.max_reservoir_size,
+            reservoir_target = target,
+            retired,
+            "applied a connection budget to the DSQL reservoir"
+        );
+        Ok(target)
     }
 
     /// Warm connections available for immediate checkout, reported to the
@@ -479,9 +548,7 @@ impl DsqlConnectionDirector {
     pub async fn shutdown(&self) -> Result<()> {
         match self.reservoir.as_ref() {
             ReservoirController::Distributed(reservoir) => {
-                // Preserve the pre-embedded distributed shutdown path exactly:
-                // stop diagnostics, then let the original reservoir release its
-                // DynamoDB slot blocks.
+                // Stop diagnostics, then the reservoir's background tasks.
                 self.reporter_handle.abort();
                 self.leak_detector_handle.abort();
                 reservoir.shutdown().await
@@ -569,9 +636,8 @@ impl DsqlConnectionDirector {
         reservoir: &Reservoir,
         enforce_ownership: bool,
     ) -> Result<DsqlPermit> {
-        // This is the pre-embedded `tokeirad` acquisition sequence: class
-        // permit, immediate checkout, and the existing slot-block-backed permit.
-        // An installed owner gate admits the checkout first, as on the embedded
+        // Class permit, then a checkout bounded by `CHECKOUT_WAIT`. An
+        // installed owner gate admits the checkout first, as on the embedded
         // path, and holds its admission until the permit drops.
         let ownership_gate = enforce_ownership
             .then(|| {
@@ -595,18 +661,18 @@ impl DsqlConnectionDirector {
         {
             bail!("DSQL connection admission is closed");
         }
-        // An empty reservoir after class admission is backpressure (Req 12.2):
-        // the class permit drops with this frame. The typed context lets the
-        // edge answer as v1.31.0 does when persistence capacity is spent, and
-        // the reservoir error stays underneath for callers that retry on it.
-        let entry = reservoir.checkout().map_err(|error| match error {
+        // A reservoir still empty after `CHECKOUT_WAIT` is backpressure (Req
+        // 12.2): the class permit drops with this frame. The typed context lets
+        // the edge answer as v1.31.0 does when persistence capacity is spent,
+        // and the reservoir error stays underneath for callers that retry on it.
+        let entry = reservoir.checkout().await.map_err(|error| match error {
             ReservoirError::Empty => {
                 anyhow::Error::new(error).context(PersistenceCapacityExhausted)
             }
             ReservoirError::Closed => anyhow::Error::new(error),
         })?;
         // From this point until `DsqlPermit::drop`, the connection is out of
-        // the ready reservoir but still owns exactly one slot reservation.
+        // the ready reservoir and its live charge travels with the permit.
         let in_flight = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
         metrics::record_dsql_pool_checkout_duration(db_class_label(class), started.elapsed());
         metrics::set_dsql_reservoir_in_flight(in_flight);
@@ -617,7 +683,6 @@ impl DsqlConnectionDirector {
             entry,
             class_guard,
             reservoir.return_sender(),
-            reservoir.slot_manager(),
             Arc::clone(&self.in_flight),
             Arc::clone(&self.leak_tracker),
             leak_checkout,
@@ -806,9 +871,12 @@ pub struct DsqlPermit {
     /// by the return processor, once the connection is checkable-out again;
     /// see the `reservoir` module.
     class_guard: Option<OwnedSemaphorePermit>,
-    /// Mode-specific return and slot-accounting path. The distributed variant
-    /// retains the original DynamoDB slot manager; embedded uses only local state.
+    /// Mode-specific return path.
     reservoir_return: PermitReturn,
+    /// The distributed connection's place in its reservoir's live count. It
+    /// travels back with the connection, or drops with the permit and gives
+    /// the place back; the embedded pool counts through its coordinator.
+    live: Option<LiveCharge>,
     /// Shared in-flight counter owned by the director.
     director_in_flight: Arc<AtomicUsize>,
     in_flight_changed: Option<Arc<Notify>>,
@@ -824,7 +892,6 @@ pub struct DsqlPermit {
 enum PermitReturn {
     Distributed {
         sender: tokio::sync::mpsc::UnboundedSender<ReturnedConnection>,
-        slot_manager: Arc<super::SlotBlockManager>,
     },
     Embedded {
         sender: tokio::sync::mpsc::UnboundedSender<embedded_reservoir::ReturnedConnection>,
@@ -833,10 +900,12 @@ enum PermitReturn {
 }
 
 impl PermitReturn {
+    /// Give back the embedded pool's slot for a connection that is not
+    /// returned. A distributed connection's place goes back when its
+    /// [`LiveCharge`] drops, so there is nothing to release here.
     fn release_slot(&self) {
-        match self {
-            Self::Distributed { slot_manager, .. } => slot_manager.release_slot(),
-            Self::Embedded { coordinator, .. } => coordinator.release_slot(),
+        if let Self::Embedded { coordinator, .. } = self {
+            coordinator.release_slot();
         }
     }
 }
@@ -847,7 +916,6 @@ impl DsqlPermit {
         entry: ReservoirEntry,
         class_guard: OwnedSemaphorePermit,
         reservoir_return: tokio::sync::mpsc::UnboundedSender<ReturnedConnection>,
-        slot_manager: Arc<super::SlotBlockManager>,
         director_in_flight: Arc<AtomicUsize>,
         leak_tracker: Arc<CheckoutLeakTracker>,
         leak_checkout: CheckoutLeak,
@@ -863,8 +931,8 @@ impl DsqlPermit {
             class_guard: Some(class_guard),
             reservoir_return: PermitReturn::Distributed {
                 sender: reservoir_return,
-                slot_manager,
             },
+            live: Some(entry.live),
             director_in_flight,
             in_flight_changed: None,
             leak_tracker,
@@ -900,6 +968,7 @@ impl DsqlPermit {
                 sender: reservoir_return,
                 coordinator,
             },
+            live: None,
             director_in_flight,
             in_flight_changed: Some(in_flight_changed),
             leak_tracker,
@@ -985,13 +1054,19 @@ impl Drop for DsqlPermit {
         if let Some(connection) = self.connection.take() {
             if self.created_at.elapsed() <= self.max_lifetime {
                 let return_failed = match &self.reservoir_return {
-                    PermitReturn::Distributed { sender, .. } => sender
+                    // A closed channel hands the returned connection back in
+                    // the error, which drops here with its live charge.
+                    PermitReturn::Distributed { sender } => sender
                         .send(ReturnedConnection {
                             entry: ReservoirEntry {
                                 connection,
                                 created_at: self.created_at,
                                 max_lifetime: self.max_lifetime,
                                 broken: self.broken.clone(),
+                                live: self
+                                    .live
+                                    .take()
+                                    .expect("a distributed checkout carries its live charge"),
                             },
                             marked_bad: self.marked_bad,
                             class_permit: self.class_guard.take(),
@@ -1105,16 +1180,17 @@ fn build_budget_map(allocations: &HashMap<DbClass, usize>) -> HashMap<DbClass, A
         .collect()
 }
 
-/// Compute default per-class allocations that sum exactly to `target_ready`.
+/// Compute default per-class allocations that sum exactly to `target`, or to
+/// [`MIN_TARGET`] for a smaller one.
 ///
 /// Priority ratios: Control 10%, Commit 50%, Read 20%, Projection 10%,
 /// Maintenance gets the remainder. Each class gets at least 1 permit.
-fn default_allocations(config: &ReservoirConfig) -> HashMap<DbClass, usize> {
-    let total = config.target_ready.max(5);
+fn default_allocations(target: usize) -> HashMap<DbClass, usize> {
+    let total = target.max(MIN_TARGET);
     // Allocate one permit to every class first, then distribute the remaining
     // capacity by priority. This preserves liveness for maintenance/control
     // while biasing the pool toward commit throughput.
-    let remaining = total - 5;
+    let remaining = total - MIN_TARGET;
     let control = 1 + remaining / 10;
     let commit = 1 + remaining / 2;
     let read = 1 + remaining / 5;
@@ -1463,10 +1539,8 @@ mod tests {
             max_lifetime: std::time::Duration::from_secs(60),
             broken: BrokenFlag::default(),
             class_guard: Some(class_guard),
-            reservoir_return: PermitReturn::Distributed {
-                sender: return_tx,
-                slot_manager: crate::dsql::SlotBlockManager::local_for_tests(1),
-            },
+            reservoir_return: PermitReturn::Distributed { sender: return_tx },
+            live: None,
             director_in_flight: Arc::clone(&in_flight),
             in_flight_changed: None,
             leak_tracker: Arc::clone(&leak_tracker),
@@ -1495,28 +1569,99 @@ mod tests {
         DsqlConnectionDirector::start(config, reservoir).unwrap()
     }
 
-    #[tokio::test]
-    async fn connection_budget_caps_distributed_reservoir_target() {
-        let director = distributed_director(8);
-        assert_eq!(director.reservoir_target(), 8);
-
-        assert_eq!(director.apply_connection_budget(3).unwrap(), 0);
-        assert_eq!(director.reservoir_target(), 3);
-        assert_eq!(director.ready_connections(), 0);
+    fn budget(capacity: u64, max_reservoir_size: u32) -> ConnectionBudget {
+        ConnectionBudget {
+            rate_per_second: 1.0,
+            capacity,
+            max_reservoir_size,
+        }
     }
 
     #[tokio::test]
-    async fn connection_budget_never_raises_target_above_configuration() {
+    async fn connection_budget_caps_the_target_at_the_capacity_share() {
+        let director = distributed_director(50);
+        assert_eq!(director.reservoir_target(), 50);
+
+        // The controller's absolute ceiling is the cluster's whole budget; the
+        // node's share is its capacity.
+        assert_eq!(
+            director
+                .apply_connection_budget(budget(20, 10_000))
+                .await
+                .unwrap(),
+            20
+        );
+        assert_eq!(director.reservoir_target(), 20);
+        assert_eq!(director.class_budgets.total_budget(), 20);
+        assert_eq!(
+            director
+                .apply_connection_budget(budget(10_000, 12))
+                .await
+                .unwrap(),
+            12
+        );
+        assert_eq!(director.class_budgets.total_budget(), 12);
+    }
+
+    #[tokio::test]
+    async fn connection_budget_never_raises_target_above_configuration_or_below_one_per_class() {
         let director = distributed_director(8);
 
-        director.apply_connection_budget(3).unwrap();
-        director.apply_connection_budget(100).unwrap();
+        director
+            .apply_connection_budget(budget(6, 6))
+            .await
+            .unwrap();
+        director
+            .apply_connection_budget(budget(100, 100))
+            .await
+            .unwrap();
         assert_eq!(director.reservoir_target(), 8);
+        assert_eq!(director.class_budgets.total_budget(), 8);
 
-        // The expiry reset a runtime applies after a dropped controller
-        // stream: a share of one keeps the node alive at the floor.
-        director.apply_connection_budget(0).unwrap();
-        assert_eq!(director.reservoir_target(), 1);
+        director
+            .apply_connection_budget(budget(0, 0))
+            .await
+            .unwrap();
+        assert_eq!(director.reservoir_target(), MIN_TARGET);
+        assert_eq!(director.class_budgets.total_budget(), MIN_TARGET);
+    }
+
+    #[tokio::test]
+    async fn a_lowered_allocation_collects_permits_as_their_holders_release_them() {
+        let budgets = ClassBudgets::new(&test_allocations(3)).unwrap();
+        let held: Vec<_> = acquire_all(&budgets, DbClass::Commit, 3).await;
+        budgets.reconfigure(&test_allocations(1)).await.unwrap();
+        assert_eq!(budgets.total_budget(), 5);
+
+        // Two of the three held permits are owed back; the next caller waits
+        // until they and its own permit are free.
+        let mut waiter = Box::pin(budgets.acquire(DbClass::Commit));
+        let mut held = held.into_iter();
+        for _ in 0..2 {
+            drop(held.next());
+            tokio::task::yield_now().await;
+            assert!(
+                waiter
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+        }
+        drop(held.next());
+        let _permit = waiter.await.unwrap();
+        assert_eq!(budgets.class_available(DbClass::Commit).await, Some(0));
+    }
+
+    async fn acquire_all(
+        budgets: &ClassBudgets,
+        class: DbClass,
+        count: usize,
+    ) -> Vec<OwnedSemaphorePermit> {
+        let mut held = Vec::with_capacity(count);
+        for _ in 0..count {
+            held.push(budgets.acquire(class).await.unwrap());
+        }
+        held
     }
 
     #[test]
@@ -1583,15 +1728,42 @@ mod tests {
             prop_assert_eq!(budgets.total_budget(), expected);
         }
 
+        // Feature: dsql-reservoir-redesign, Property 6: Class Budget Sum Invariant
         #[test]
-        fn default_class_budget_sum_invariant(target_ready in 5usize..500) {
-            let config = ReservoirConfig {
-                target_ready,
-                ..ReservoirConfig::default()
-            };
-            let allocations = default_allocations(&config);
-            prop_assert_eq!(allocations.values().sum::<usize>(), target_ready);
-            prop_assert!(allocations.values().all(|permits| *permits >= 1));
+        fn class_budgets_sum_to_the_target_a_directive_applies(
+            configured in MIN_TARGET..500usize,
+            directives in prop::collection::vec((0u64..600, 0u32..600), 1..8),
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let director = distributed_director(configured);
+                for (capacity, max_reservoir_size) in directives {
+                    let target = director
+                        .apply_connection_budget(budget(capacity, max_reservoir_size))
+                        .await
+                        .unwrap();
+                    let expected = configured
+                        .min(usize::try_from(capacity).unwrap())
+                        .min(usize::try_from(max_reservoir_size).unwrap())
+                        .max(MIN_TARGET);
+                    prop_assert_eq!(target, expected);
+                    prop_assert_eq!(director.reservoir_target(), expected);
+                    prop_assert_eq!(director.class_budgets.total_budget(), expected);
+                    let allocations = default_allocations(target);
+                    prop_assert_eq!(allocations.values().sum::<usize>(), expected);
+                    prop_assert!(allocations.values().all(|permits| *permits >= 1));
+                    for class in all_classes() {
+                        prop_assert_eq!(
+                            director.class_budgets.class_available(class).await,
+                            Some(allocations[&class])
+                        );
+                    }
+                }
+                Ok(())
+            })?;
         }
     }
 }

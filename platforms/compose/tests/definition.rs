@@ -119,7 +119,7 @@ fn the_shipped_set_pins_current_observability_images() {
 }
 
 // Selecting DSQL storage in the root's config adds the dsql module and the
-// five writeback declarations — the part-carried `#[create]` types drive
+// four writeback declarations — the part-carried `#[create]` types drive
 // the same structural selection the monolith did. The edit is what an
 // operator's would be: take the two DSQL types from the platform part and
 // swap the storage literal.
@@ -150,12 +150,12 @@ fn selecting_dsql_adds_the_module_and_writeback() {
         .map(|module| module.name())
         .collect();
     assert_eq!(modules, ["local_state", "dsql", "runtime", "observability"]);
-    assert_eq!(output.graph.writeback().len(), 5);
+    assert_eq!(output.graph.writeback().len(), 4);
 }
 
 // Feature: platform-builder-abstraction, Property 16: compose storage modes
 // preserve graph parity. In-memory omits DSQL and carries no writeback;
-// managed and preexisting DSQL add the dsql module and its five writebacks —
+// managed and preexisting DSQL add the dsql module and its four writebacks —
 // and all three modes realize the identical non-DSQL service resource set.
 #[test]
 fn storage_modes_preserve_the_reference_graph_shape() {
@@ -206,9 +206,9 @@ fn storage_modes_preserve_the_reference_graph_shape() {
     assert!(!in_memory_dsql, "in-memory carries no dsql module");
     assert_eq!(in_memory_writebacks, 0);
     assert!(managed_dsql, "managed DSQL adds the dsql module");
-    assert_eq!(managed_writebacks, 5);
+    assert_eq!(managed_writebacks, 4);
     assert!(preexisting_dsql, "preexisting DSQL adds the dsql module");
-    assert_eq!(preexisting_writebacks, 5);
+    assert_eq!(preexisting_writebacks, 4);
 
     assert_eq!(
         in_memory_services, managed_services,

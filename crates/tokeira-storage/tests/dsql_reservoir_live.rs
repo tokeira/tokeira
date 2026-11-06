@@ -1,14 +1,17 @@
 #![cfg(feature = "dsql-integration")]
 
 //! Opt-in load on a live cluster through the production connection factory:
-//! a burst of operations through a small reservoir, and a connection storm from
-//! several reservoirs refilling at once.
+//! a burst of operations through a small reservoir, a connection storm from
+//! several reservoirs refilling at once, and several reservoirs starting
+//! together through one shared rate limiter table.
 //!
-//! Both need `TOKEIRA_DSQL_TEST_ENDPOINT` and `TOKEIRA_DSQL_TEST_REGION`; an
-//! unset gate returns without connecting. Nothing here creates schema. The
-//! storm opens thousands of connections and bypasses the cluster-wide rate
-//! limiter on purpose, so point it only at a throwaway cluster. Each test
-//! prints what it measured.
+//! All need `TOKEIRA_DSQL_TEST_ENDPOINT` and `TOKEIRA_DSQL_TEST_REGION`, and
+//! the shared start also `TOKEIRA_DSQL_TEST_RATE_LIMITER_TABLE`, a DynamoDB
+//! table in that Region keyed by the string `pk`; an unset gate returns without
+//! connecting. Nothing here creates schema. The storm opens thousands of
+//! connections and bypasses the cluster-wide rate limiter on purpose, so point
+//! these only at a throwaway cluster, and run them one at a time: each spends
+//! the cluster's connection burst. Each test prints what it measured.
 
 #![allow(clippy::print_stderr)] // A live probe reports its measurements.
 
@@ -28,7 +31,7 @@ use tokeira_storage::{
     ConnectionDirector, DbClass, PersistenceCapacityExhausted,
     dsql::{
         ConnectionFactory, ConnectionFactoryError, DistributedTokenBucket, DsqlConnectionDirector,
-        DsqlPoolConfig, PhysicalConnectionFactory, Reservoir, ReservoirConfig, SlotBlockManager,
+        DsqlPoolConfig, PhysicalConnectionFactory, Reservoir, ReservoirConfig, WarmupOutcome,
         in_operation,
     },
 };
@@ -72,6 +75,15 @@ impl Counted {
             .expect("the tally is never poisoned")
             .clone()
     }
+
+    /// Connects the cluster refused for its connection rate.
+    fn refused_for_rate(&self) -> usize {
+        self.failures()
+            .iter()
+            .filter(|(key, _)| key.starts_with("SQLSTATE 53400"))
+            .map(|(_, count)| count)
+            .sum()
+    }
 }
 
 #[async_trait]
@@ -108,19 +120,13 @@ fn config(target_ready: usize, inflight_limit: usize) -> ReservoirConfig {
     }
 }
 
-/// A reservoir over `factory` with process-local rate and slot accounting.
-/// The rate is generous enough that only the cluster itself limits connects;
-/// the reservoir may hold `slots` connections at once.
-async fn reservoir(
-    factory: &Arc<Counted>,
-    config: ReservoirConfig,
-    slots: usize,
-) -> Result<Reservoir> {
+/// A reservoir over `factory` with a process-local rate limiter generous
+/// enough that only the cluster itself limits connects.
+async fn reservoir(factory: &Arc<Counted>, config: ReservoirConfig) -> Result<Reservoir> {
     Reservoir::start(
         config,
         Arc::clone(factory) as Arc<dyn PhysicalConnectionFactory>,
         Arc::new(DistributedTokenBucket::local_for_tests(10_000.0, 10_000)),
-        SlotBlockManager::local_for_tests(slots),
     )
     .await
 }
@@ -132,8 +138,7 @@ async fn a_burst_through_a_small_reservoir_never_finds_it_empty() -> Result<()> 
     };
     let factory = Counted::new(&endpoint, &region)?;
     let reservoir_config = config(10, 8);
-    // Returned connections may briefly lift the reservoir to twice its target.
-    let reservoir = reservoir(&factory, reservoir_config.clone(), 2 * 10 + 8).await?;
+    let reservoir = reservoir(&factory, reservoir_config.clone()).await?;
     let director = Arc::new(DsqlConnectionDirector::start(
         DsqlPoolConfig {
             reservoir: reservoir_config,
@@ -187,7 +192,7 @@ async fn a_burst_through_a_small_reservoir_never_finds_it_empty() -> Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_connection_storm_refills_every_reservoir_without_leaking_a_slot() -> Result<()> {
+async fn a_connection_storm_refills_every_reservoir_without_losing_a_place() -> Result<()> {
     let Some((endpoint, region)) = live_cluster() else {
         return Ok(());
     };
@@ -195,31 +200,36 @@ async fn a_connection_storm_refills_every_reservoir_without_leaking_a_slot() -> 
     // The same refill one connect at a time, which is how the refiller worked
     // before it made connections in parallel.
     let factory = Counted::new(&endpoint, &region)?;
-    let serial = reservoir(&factory, config(50, 1), 50).await?;
-    serial.retire_excess(1);
+    let serial = reservoir(&factory, config(50, 1)).await?;
+    serial.retire_ready_for_tests(1);
     let started = Instant::now();
-    serial.warmup().await?;
+    assert!(matches!(serial.warmup().await, WarmupOutcome::Full { .. }));
     let serial_refill = started.elapsed();
     drop(serial);
 
     // Eight reservoirs, eight connects in flight each, retiring and refilling
     // fifty connections five times over: thousands of connects in seconds,
-    // past the cluster's connection burst. Each reservoir has exactly the
-    // slots its target needs, so a slot that a retirement, a refused connect
-    // or a timed-out connect failed to give back stalls the next refill and
-    // its warmup times out.
+    // past the cluster's connection burst. A place in a live count that a
+    // retirement, a refused connect or a timed-out connect failed to give
+    // back would stall the next refill one short, and its warmup would come
+    // back partial.
     let factory = Counted::new(&endpoint, &region)?;
     let mut storm: JoinSet<Result<Vec<Duration>>> = JoinSet::new();
     for _ in 0..8 {
         let factory = Arc::clone(&factory);
         storm.spawn(async move {
-            let reservoir = reservoir(&factory, config(50, 8), 50).await?;
+            let reservoir = reservoir(&factory, config(50, 8)).await?;
             let mut refills = Vec::new();
             for _ in 0..5 {
-                reservoir.retire_excess(1);
+                reservoir.retire_ready_for_tests(1);
                 let started = Instant::now();
-                reservoir.warmup().await?;
+                let outcome = reservoir.warmup().await;
                 refills.push(started.elapsed());
+                anyhow::ensure!(
+                    matches!(outcome, WarmupOutcome::Full { .. }),
+                    "a refill stopped short: {outcome:?}"
+                );
+                anyhow::ensure!(reservoir.live_count() == 50, "a place was lost");
             }
             reservoir.shutdown().await?;
             Ok(refills)
@@ -240,5 +250,66 @@ async fn a_connection_storm_refills_every_reservoir_without_leaking_a_slot() -> 
         refills[refills.len() - 1],
         factory.failures()
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn reservoirs_sharing_a_rate_limiter_table_start_together_past_the_burst() -> Result<()> {
+    let Some((endpoint, region)) = live_cluster() else {
+        return Ok(());
+    };
+    let Ok(table) = std::env::var("TOKEIRA_DSQL_TEST_RATE_LIMITER_TABLE") else {
+        return Ok(());
+    };
+    let aws = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(region.clone()))
+        .load()
+        .await;
+    let client = aws_sdk_dynamodb::Client::new(&aws);
+
+    // Twenty-four reservoirs of fifty: 1,200 connects, past the cluster's
+    // burst of 1,000, so the last 200 wait for its rate.
+    let factory = Counted::new(&endpoint, &region)?;
+    let started = Instant::now();
+    let mut nodes: JoinSet<Result<(Duration, Reservoir)>> = JoinSet::new();
+    for _ in 0..24 {
+        let factory = Arc::clone(&factory);
+        let bucket =
+            DistributedTokenBucket::new(client.clone(), table.clone(), &endpoint, 100.0, 1_000);
+        nodes.spawn(async move {
+            bucket.validate_table().await?;
+            let reservoir = Reservoir::start(
+                config(50, 8),
+                factory as Arc<dyn PhysicalConnectionFactory>,
+                Arc::new(bucket),
+            )
+            .await?;
+            Ok((started.elapsed(), reservoir))
+        });
+    }
+    let mut starts = Vec::new();
+    let mut reservoirs = Vec::new();
+    while let Some(node) = nodes.join_next().await {
+        let (start, reservoir) = node??;
+        starts.push(start);
+        reservoirs.push(reservoir);
+    }
+    let mut full = 0;
+    for reservoir in &reservoirs {
+        if matches!(reservoir.warmup().await, WarmupOutcome::Full { .. }) {
+            full += 1;
+        }
+    }
+    let filled = started.elapsed();
+    starts.sort();
+    eprintln!(
+        "shared start: 24 reservoirs of 50 started in at most {:?} (median {:?}), {full} full          after {filled:?}; {} connections made, {} refused for the rate; failed connects {:?}",
+        starts[starts.len() - 1],
+        starts[starts.len() / 2],
+        factory.created.load(Ordering::Acquire),
+        factory.refused_for_rate(),
+        factory.failures()
+    );
+    assert_eq!(full, 24, "every reservoir fills");
     Ok(())
 }

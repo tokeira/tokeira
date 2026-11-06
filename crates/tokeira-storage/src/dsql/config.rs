@@ -14,11 +14,24 @@ use time::Duration;
 
 use crate::CurrentExecutionConflictPolicy;
 
-/// IAM-authenticated DSQL connections should not be reused past this bound.
-///
-/// The reservoir retires connections before the hard cutoff so callers do not
-/// receive a connection that will expire mid-transaction.
-const DSQL_HARD_CUTOFF: Duration = Duration::minutes(15);
+/// DSQL closes every connection this long after it opened, whatever its IAM
+/// token's expiry: the token is checked only when the connection opens.
+pub const DSQL_MAX_CONNECTION_DURATION: Duration = Duration::minutes(60);
+
+/// DSQL fails a transaction that has run this long.
+pub const DSQL_MAX_TRANSACTION: Duration = Duration::minutes(5);
+
+/// The latest a connection may still be handed out, measured from when it
+/// opened. A transaction begun on a connection just before its guard window
+/// may run for [`DSQL_MAX_TRANSACTION`], so the longest lifetime plus the guard
+/// window must leave that much of DSQL's connection duration; DSQL then never
+/// closes a connection under a transaction the reservoir handed out.
+const DSQL_LIFETIME_CUTOFF: Duration =
+    DSQL_MAX_CONNECTION_DURATION.saturating_sub(DSQL_MAX_TRANSACTION);
+
+/// The smallest target a distributed reservoir runs at: one connection for
+/// each of the five operation classes, so every class can always be admitted.
+pub const MIN_TARGET: usize = 5;
 
 fn default_target_ready() -> usize {
     50
@@ -29,11 +42,11 @@ fn default_inflight_limit() -> usize {
 }
 
 fn default_base_lifetime() -> Duration {
-    Duration::minutes(10)
+    Duration::minutes(50)
 }
 
 fn default_lifetime_jitter() -> Duration {
-    Duration::minutes(2)
+    Duration::minutes(4)
 }
 
 fn default_guard_window() -> Duration {
@@ -102,7 +115,7 @@ pub struct ReservoirConfig {
     /// synchronized wave.
     #[serde(default = "default_lifetime_jitter")]
     pub lifetime_jitter: Duration,
-    /// Time reserved before the DSQL hard cutoff.
+    /// Time reserved at the end of every connection's lifetime.
     ///
     /// Returned and idle connections inside this guard window are retired
     /// instead of being handed to new work.
@@ -148,8 +161,29 @@ impl ReservoirConfig {
         if self.scan_interval <= Duration::ZERO {
             bail!("reservoir scan_interval must be positive");
         }
-        if self.base_lifetime + self.lifetime_jitter > DSQL_HARD_CUTOFF - self.guard_window {
-            bail!("reservoir lifetime exceeds DSQL cutoff minus guard window");
+        if self.base_lifetime + self.lifetime_jitter + self.guard_window > DSQL_LIFETIME_CUTOFF {
+            bail!(
+                "reservoir base_lifetime + lifetime_jitter + guard_window must not exceed {} \
+                 minutes: DSQL closes a connection after {} minutes and a transaction begun \
+                 on it may run for {} minutes",
+                DSQL_LIFETIME_CUTOFF.whole_minutes(),
+                DSQL_MAX_CONNECTION_DURATION.whole_minutes(),
+                DSQL_MAX_TRANSACTION.whole_minutes()
+            );
+        }
+        Ok(())
+    }
+
+    /// Validate a distributed reservoir: [`Self::validate`], and a target of
+    /// at least [`MIN_TARGET`]. The embedded engine's pool may be smaller; its
+    /// class budgets are sized separately.
+    pub fn validate_distributed(&self) -> Result<()> {
+        self.validate()?;
+        if self.target_ready < MIN_TARGET {
+            bail!(
+                "reservoir target_ready must be at least {MIN_TARGET}, one connection for each \
+                 operation class"
+            );
         }
         Ok(())
     }
@@ -261,11 +295,8 @@ pub fn detect_region_from_endpoint(endpoint: &str) -> Option<String> {
 
 /// DynamoDB coordination resources used by the DSQL connection reservoir.
 ///
-/// The two table names are intentionally separate. The rate-limiter table has
-/// one global token-bucket row, while the connection-lease table contains slot
-/// block rows that represent cluster-wide connection capacity. Keeping them
-/// separate lets each table use a narrow key shape and independent IAM/TTL
-/// policies.
+/// The rate-limiter table holds one arrival-time item per DSQL endpoint, which
+/// every node's refiller updates to share the cluster's connection rate.
 ///
 /// This is pure configuration data: it holds table names only. The live
 /// `aws_sdk_dynamodb::Client` is a runtime resource, not config, and is
@@ -280,24 +311,16 @@ pub struct DsqlCoordinationConfig {
     /// DynamoDB table containing the distributed connection-creation bucket.
     #[serde(default = "default_rate_limiter_table")]
     pub rate_limiter_table: String,
-    /// DynamoDB table containing connection slot block leases.
-    #[serde(default = "default_conn_lease_table")]
-    pub conn_lease_table: String,
 }
 
 fn default_rate_limiter_table() -> String {
     "tokeira-dsql-rate-limiter".to_owned()
 }
 
-fn default_conn_lease_table() -> String {
-    "tokeira-dsql-conn-lease".to_owned()
-}
-
 impl Default for DsqlCoordinationConfig {
     fn default() -> Self {
         Self {
             rate_limiter_table: default_rate_limiter_table(),
-            conn_lease_table: default_conn_lease_table(),
         }
     }
 }
@@ -314,7 +337,7 @@ pub struct DsqlPoolConfig {
     pub reservoir: ReservoirConfig,
     /// Migration discovery settings.
     pub migration: MigrationConfig,
-    /// DynamoDB coordination resources for global rate and slot accounting.
+    /// DynamoDB coordination resources for the cluster-wide connection rate.
     pub coordination: DsqlCoordinationConfig,
     /// Node-local connection creation rate.
     ///
@@ -355,7 +378,7 @@ impl DsqlPoolConfig {
     /// Validate config that must be true before constructing any background
     /// reservoir tasks.
     pub fn validate(&self) -> Result<()> {
-        self.reservoir.validate()?;
+        self.reservoir.validate_distributed()?;
         if self.connection_rate_per_second <= 0.0 {
             bail!("connection_rate_per_second must be positive");
         }
@@ -364,9 +387,6 @@ impl DsqlPoolConfig {
         }
         if self.coordination.rate_limiter_table.trim().is_empty() {
             bail!("rate_limiter_table must not be empty");
-        }
-        if self.coordination.conn_lease_table.trim().is_empty() {
-            bail!("conn_lease_table must not be empty");
         }
         if self.shard_count == 0 {
             bail!("shard_count must be greater than zero");
@@ -514,7 +534,6 @@ mod tests {
         // defaulting coordination config must not construct an SDK/TLS client.
         let coordination = DsqlCoordinationConfig::default();
         assert_eq!(coordination.rate_limiter_table, "tokeira-dsql-rate-limiter");
-        assert_eq!(coordination.conn_lease_table, "tokeira-dsql-conn-lease");
         DsqlPoolConfig::default().validate().unwrap();
     }
 
@@ -555,11 +574,40 @@ mod tests {
 
         config = ReservoirConfig {
             target_ready: 1,
-            base_lifetime: Duration::minutes(59),
+            base_lifetime: Duration::minutes(54),
             lifetime_jitter: Duration::minutes(1),
             ..ReservoirConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn a_distributed_reservoir_holds_one_connection_for_each_class() {
+        let mut config = DsqlPoolConfig::default();
+        config.reservoir.target_ready = MIN_TARGET - 1;
+        assert!(config.validate().is_err());
+        assert!(
+            config.reservoir.validate().is_ok(),
+            "the embedded pool may be smaller"
+        );
+
+        config.reservoir.target_ready = MIN_TARGET;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn the_default_lifetime_fits_dsqls_connection_duration() {
+        let config = ReservoirConfig::default();
+        config.validate().unwrap();
+        assert_eq!(config.base_lifetime, Duration::minutes(50));
+        assert_eq!(config.lifetime_jitter, Duration::minutes(4));
+        assert!(
+            config.base_lifetime
+                + config.lifetime_jitter
+                + config.guard_window
+                + DSQL_MAX_TRANSACTION
+                <= DSQL_MAX_CONNECTION_DURATION
+        );
     }
 
     #[test]

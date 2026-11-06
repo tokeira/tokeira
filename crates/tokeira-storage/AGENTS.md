@@ -61,9 +61,10 @@ legacy pointers; new starts and deletes use `chasm_current_execution`.
 ## Connection management is a DSQL survival invariant
 
 `max_idle_conns` MUST equal `max_conns` (root file). Idle decay under DSQL's
-cluster-wide 100 conn/sec rate limit causes rate-limit storms. The reservoir, token
-bucket, and slot-block manager (`src/dsql/`) exist to respect 100/sec and 10k-concurrent;
-do not bypass them with ad-hoc `driver.Open()`-style connection creation.
+cluster-wide 100 conn/sec rate limit causes rate-limit storms. The reservoir, its live
+count, and the arrival-time rate limiter (`src/dsql/`) exist to respect 100/sec and
+10k-concurrent; do not bypass them with ad-hoc `driver.Open()`-style connection
+creation.
 
 ## Determinism in tests
 

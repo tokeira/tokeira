@@ -290,14 +290,14 @@ use tokeira_storage::{
     LeaseRepository, ProjectionLog, RunRepository, TaskQueueConfigRepository,
     WorkerComputeRepository, WorkerDeploymentRepository, WorkerTaskProvenanceStore,
     dsql::{
-        ConnectionControlLeaseRepository, ControlLeaseAcquireOutcome, ControlLeaseAcquireRequest,
-        ControlLeaseClusterIdentity, ControlLeaseError, ControlLeaseGuard, DsqlAuthConfig,
-        DsqlConnectionDirector, DsqlCoordinationConfig, DsqlPoolConfig, DsqlStore,
-        EmbeddedDsqlPoolConfig, MigrationRunner, OWNER_ADMISSION_MARGIN, OWNER_LEASE_DURATION,
-        OWNER_RENEW_INTERVAL, OwnershipAdmissionGate, OwnershipAdmissionState,
-        SCHEMA_MIGRATION_ADMISSION_MARGIN, SCHEMA_MIGRATION_LEASE_DURATION,
-        SchemaCompatibilityError, SchemaDecision, SchemaIncompatibilityCategory,
-        SchemaMigrationPolicy, WarmupDeadline,
+        ConnectionBudget, ConnectionControlLeaseRepository, ControlLeaseAcquireOutcome,
+        ControlLeaseAcquireRequest, ControlLeaseClusterIdentity, ControlLeaseError,
+        ControlLeaseGuard, DsqlAuthConfig, DsqlConnectionDirector, DsqlCoordinationConfig,
+        DsqlPoolConfig, DsqlStore, EmbeddedDsqlPoolConfig, MigrationRunner, OWNER_ADMISSION_MARGIN,
+        OWNER_LEASE_DURATION, OWNER_RENEW_INTERVAL, OwnershipAdmissionGate,
+        OwnershipAdmissionState, SCHEMA_MIGRATION_ADMISSION_MARGIN,
+        SCHEMA_MIGRATION_LEASE_DURATION, SchemaCompatibilityError, SchemaDecision,
+        SchemaIncompatibilityCategory, SchemaMigrationPolicy, WarmupDeadline,
     },
 };
 use tokeira_types::{
@@ -2493,11 +2493,10 @@ fn dsql_pool_config_with_client(
     config: &TokeiraConfig,
     ddb_client: aws_sdk_dynamodb::Client,
 ) -> (DsqlPoolConfig, aws_sdk_dynamodb::Client) {
-    let (rate_limiter_table, conn_lease_table) = dsql_coordination_table_names(config);
+    warn_retired_conn_lease_table(config);
     let pool_config = DsqlPoolConfig {
         coordination: DsqlCoordinationConfig {
-            rate_limiter_table,
-            conn_lease_table,
+            rate_limiter_table: dsql_rate_limiter_table_name(config),
         },
         shard_count: config.infrastructure.placement.shard_count,
         projection_partition_count: config.infrastructure.placement.partition_count,
@@ -2523,17 +2522,34 @@ async fn dsql_pool_config(
     ))
 }
 
-fn dsql_coordination_table_names(config: &TokeiraConfig) -> (String, String) {
-    let dsql = &config.infrastructure.dsql;
-    let rate_limiter = dsql
+fn dsql_rate_limiter_table_name(config: &TokeiraConfig) -> String {
+    config
+        .infrastructure
+        .dsql
         .rate_limiter_table
         .clone()
-        .unwrap_or_else(|| format!("{}-dsql-rate-limiter", config.infrastructure.cluster_name));
-    let conn_lease = dsql
-        .conn_lease_table
-        .clone()
-        .unwrap_or_else(|| format!("{}-dsql-conn-lease", config.infrastructure.cluster_name));
-    (rate_limiter, conn_lease)
+        .unwrap_or_else(|| format!("{}-dsql-rate-limiter", config.infrastructure.cluster_name))
+}
+
+/// Warn that `infrastructure.dsql.conn_lease_table` is set and ignored;
+/// returns whether it warned. Called once, as the DSQL pool is configured.
+///
+/// The key named the DynamoDB table of the per-block connection slot lease.
+/// DSQL nodes no longer lease slots: each stays within its connection target,
+/// and the placement controller divides the cluster's connections among the
+/// nodes it budgets. The key is still accepted so existing configurations
+/// load.
+fn warn_retired_conn_lease_table(config: &TokeiraConfig) -> bool {
+    let Some(table) = config.infrastructure.dsql.conn_lease_table.as_deref() else {
+        return false;
+    };
+    tracing::warn!(
+        table,
+        "infrastructure.dsql.conn_lease_table is set but no longer used: DSQL nodes no longer \
+         lease connection slots from DynamoDB. The value is ignored; remove it from the \
+         configuration"
+    );
+    true
 }
 
 /// Entrypoint the CLI delegates to.
@@ -5026,8 +5042,9 @@ fn membership_config(
 #[derive(Debug)]
 struct NoopConnectionBudgetApplier;
 
+#[async_trait]
 impl ConnectionBudgetApplier for NoopConnectionBudgetApplier {
-    fn apply_budget(
+    async fn apply_budget(
         &self,
         _rate_per_second: f64,
         _capacity: u64,
@@ -5044,34 +5061,31 @@ impl ConnectionBudgetApplier for NoopConnectionBudgetApplier {
 /// Applies controller connection budgets to the DSQL connection director the
 /// whole stack shares, and reports its warm headroom in heartbeats.
 ///
-/// Only the reservoir cap is applied. The directive's `rate_per_second` and
-/// `capacity` describe this node's share of the cluster creation rate, but on
-/// the distributed path the creation-rate limiter is the DynamoDB token bucket
-/// every node shares, which already enforces the cluster rate as one row: a
-/// node writing its per-node share into that row would replace the cluster
-/// rate with a fraction of it. A process-local governor in front of the shared
-/// bucket is the mechanism the share would drive, and does not exist yet.
+/// The whole directive is applied: `capacity` and `max_reservoir_size` cap the
+/// reservoir's target and the class budgets follow it, and `rate_per_second`
+/// becomes the rate the node's fallback limiter admits at while the shared
+/// DynamoDB rate limiter is unreachable. The share is never written into the
+/// shared limiter itself, which holds the whole cluster's rate.
 #[derive(Debug)]
 struct DsqlConnectionBudgetApplier {
     director: Arc<DsqlConnectionDirector>,
 }
 
+#[async_trait]
 impl ConnectionBudgetApplier for DsqlConnectionBudgetApplier {
-    fn apply_budget(
+    async fn apply_budget(
         &self,
         rate_per_second: f64,
         capacity: u64,
         max_reservoir_size: u32,
     ) -> Result<()> {
-        let retired = self.director.apply_connection_budget(max_reservoir_size)?;
-        tracing::debug!(
-            rate_per_second,
-            capacity,
-            max_reservoir_size,
-            reservoir_target = self.director.reservoir_target(),
-            retired,
-            "applied controller connection budget to the DSQL reservoir"
-        );
+        self.director
+            .apply_connection_budget(ConnectionBudget {
+                rate_per_second,
+                capacity,
+                max_reservoir_size,
+            })
+            .await?;
         Ok(())
     }
 
@@ -6785,6 +6799,22 @@ mod tests {
 
         assert_eq!(pool_config.shard_count, 32);
         assert_eq!(pool_config.projection_partition_count, 4);
+    }
+
+    #[test]
+    fn a_configured_conn_lease_table_loads_is_ignored_and_warned_about() {
+        let mut config = TokeiraConfig::default();
+        config.infrastructure.cluster_name = "fleet".to_owned();
+        assert!(!warn_retired_conn_lease_table(&config));
+
+        config.infrastructure.dsql.conn_lease_table = Some("fleet-dsql-conn-lease".to_owned());
+        assert!(warn_retired_conn_lease_table(&config));
+        let (pool_config, _ddb_client) =
+            dsql_pool_config_with_client(&config, tokeira_storage::dsql::offline_ddb_client());
+        assert_eq!(
+            pool_config.coordination.rate_limiter_table,
+            "fleet-dsql-rate-limiter"
+        );
     }
 
     #[test]

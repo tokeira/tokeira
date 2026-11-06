@@ -308,7 +308,6 @@ fn writeback_fixture(
     output: &EvaluatedDefinition<DecodedKind>,
     endpoint: &str,
     rate_limiter: &str,
-    conn_lease: &str,
 ) -> Vec<(String, String)> {
     let package = Path::new(env!("CARGO_MANIFEST_DIR"));
     let verified = verify_definition(output);
@@ -319,7 +318,6 @@ fn writeback_fixture(
     for (logical_id, output_name, value) in [
         ("connection-endpoint", "private_hostname", endpoint),
         ("rate-limiter", "table_name", rate_limiter),
-        ("conn-lease", "table_name", conn_lease),
     ] {
         let resource_id = realized
             .index()
@@ -409,7 +407,7 @@ fn shipped_graph_has_the_canonical_census_and_writebacks() {
             ("services", &["observability".to_string()][..]),
         ]
     );
-    assert_eq!(output.graph.resources().len(), 51);
+    assert_eq!(output.graph.resources().len(), 50);
     let mut writebacks = output
         .graph
         .writeback()
@@ -420,7 +418,6 @@ fn shipped_graph_has_the_canonical_census_and_writebacks() {
     assert_eq!(
         writebacks,
         [
-            "infrastructure.dsql.conn_lease_table",
             "infrastructure.dsql.endpoint",
             "infrastructure.dsql.rate_limiter_table",
             "infrastructure.dsql.region",
@@ -523,7 +520,7 @@ fn assert_private_and_least_privilege_plan(output: &EvaluatedDefinition<DecodedK
         ]
         .contains(&name.as_str())
         {
-            3
+            2
         } else {
             1
         };
@@ -873,7 +870,6 @@ proptest! {
     fn writeback_resolves_exactly_the_declared_dsql_identity(
         endpoint in "[a-z0-9.-]{1,32}",
         rate_limiter in "[a-zA-Z0-9_-]{1,32}",
-        conn_lease in "[a-zA-Z0-9_-]{1,32}",
     ) {
         let output = evaluate_tkd(&shipped("deployment.tkd"))
             .expect("TKD set evaluates");
@@ -881,13 +877,11 @@ proptest! {
             &output,
             &endpoint,
             &rate_limiter,
-            &conn_lease,
         ).into_iter().collect::<BTreeMap<_, _>>();
-        prop_assert_eq!(resolved.len(), 5);
+        prop_assert_eq!(resolved.len(), 4);
         prop_assert_eq!(resolved.get("infrastructure.storage"), Some(&"dsql".to_string()));
         prop_assert_eq!(resolved.get("infrastructure.dsql.endpoint"), Some(&endpoint));
         prop_assert_eq!(resolved.get("infrastructure.dsql.region"), Some(&"eu-west-2".to_string()));
         prop_assert_eq!(resolved.get("infrastructure.dsql.rate_limiter_table"), Some(&rate_limiter));
-        prop_assert_eq!(resolved.get("infrastructure.dsql.conn_lease_table"), Some(&conn_lease));
     }
 }

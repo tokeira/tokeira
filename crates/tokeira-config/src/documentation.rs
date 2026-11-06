@@ -164,7 +164,7 @@ pub const CONFIG_FIELD_CATALOG: &[ConfigFieldDocumentation] = &[
         "<unset>",
         false,
         None,
-        "Provisioned DynamoDB table for distributed connection-slot leases."
+        "No longer used; still accepted so existing configurations load, ignored with a warning at startup."
     ),
     field!(
         "infrastructure.dsql.migration_policy",

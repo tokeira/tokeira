@@ -1,0 +1,5 @@
+kind: added
+body: Add `tokeira_dsql_operation_round_trips`, the round trips of each DSQL operation by cause and transaction outcome, and `tokeira_dsql_unattributed_statements_total`.
+time: 2026-11-05T23:41:32.511901Z
+custom:
+    Slice: 2cf0862e-ccb2-4a2a-8856-bd964a0de215

@@ -27,6 +27,7 @@ pub mod metrics;
 pub mod readiness;
 pub mod redaction;
 pub mod shutdown;
+pub mod statement_accounting;
 pub mod testing;
 pub mod tracing;
 pub mod validation;
@@ -55,15 +56,17 @@ pub use manifest::{
     all_metric_names, is_forbidden_metric_label, validate_manifest, validate_manifests,
 };
 pub use metrics::{
-    BUILD_INFO, EMBEDDED_LIFECYCLE_OPERATIONS_TOTAL, EMBEDDED_METRIC_MANIFEST,
-    PROCESS_METRIC_MANIFEST, PROCESS_START_TIME_SECONDS, install_prometheus_recorder,
-    record_embedded_lifecycle, record_process_metadata,
+    BUILD_INFO, DSQL_OPERATION_ROUND_TRIPS, DSQL_UNATTRIBUTED_STATEMENTS_TOTAL,
+    EMBEDDED_LIFECYCLE_OPERATIONS_TOTAL, EMBEDDED_METRIC_MANIFEST, PROCESS_METRIC_MANIFEST,
+    PROCESS_START_TIME_SECONDS, install_prometheus_recorder, record_embedded_lifecycle,
+    record_process_metadata,
 };
 pub use readiness::{
     ReadinessCheck, ReadinessCheckResult, ReadinessHandle, ReadinessRegistry, ReadinessResult,
     ReadinessStatus,
 };
 pub use shutdown::ObservabilityShutdown;
+pub use statement_accounting::statement_accounting_layer;
 pub use tracing::{
     ChannelTraceContext, ErrorBiasedSamplingReason, install_tracing_subscriber,
     mark_error_biased_sample,

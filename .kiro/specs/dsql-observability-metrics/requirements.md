@@ -527,3 +527,21 @@ Retired by [projection-passes](../projection-passes/bugfix.md) criterion 2.12: n
 4. THE Dashboard search-attribute attribution panel SHALL use `tokeira_projection_sa_index_scan_duration_seconds{quantile="0.95"}` grouped by `index_table`.
 5. THE Dashboard pass panel SHALL use `tokeira_projection_pass_duration_seconds{quantile="0.95"}` grouped by `partition_id`.
 6. THE Dashboard panels SHALL use datasource UID `mimir`.
+
+## Phase 13: Round Trips per Operation
+
+### Requirement 45: DSQL Round Trips per Operation
+
+**User Story:** As a Tokeira operator, I want to see how many round trips each DSQL operation makes and which transition or request caused it, so that I can see where a commit's latency comes from, catch a change that adds a statement, and find the transitions and background loops that cost the most.
+
+#### Acceptance Criteria
+
+1. THE process tracing subscriber SHALL see every statement SQLx reports (its `sqlx::query` events), whatever the operator's log filter.
+2. WHEN a transaction inside a DSQL operation ends with COMMIT or ROLLBACK, THE subscriber SHALL record `tokeira_dsql_operation_round_trips` with the round trips the operation made since its previous transaction ended, the transaction's BEGIN included, labelled `transaction` = `committed` or `rolled_back`.
+3. WHEN a DSQL operation's span closes after statements outside any transaction, THE subscriber SHALL record them as one sample labelled `transaction` = `none`.
+4. THE subscriber SHALL charge a statement to the outermost span named `dsql.<operation>` around it, and label the sample `operation` with that name less its `dsql.` prefix.
+5. THE subscriber SHALL label the sample `command_type` with the `tokeira.command_type` field of the nearest span around the operation that has one, or `none` when no span has one.
+6. WHEN a statement runs outside every DSQL operation span, THE subscriber SHALL increment `tokeira_dsql_unattributed_statements_total`.
+7. THE Run_Repository, every other DSQL repository, the Projection_Log and the Dsql_Visibility_Store SHALL run each trait method in a span named `dsql.<operation>` (`dsql.<store>.<method>` outside the Run_Repository).
+8. THE runtime SHALL name the cause of each transition it commits: the lane's command, or the Temporal request on the activity paths that load and commit outside the lane.
+9. THE live statement-budget suite SHALL check the metric against its own count of each committed commit attempt.

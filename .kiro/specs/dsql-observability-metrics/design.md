@@ -2,7 +2,7 @@
 
 ## Overview
 
-This design adds comprehensive metrics instrumentation to the DSQL storage and projection layers, covering 44 requirements across 12 phases. The implementation follows the established observability foundation pattern: per-crate `metrics.rs` modules with `METRIC_NAMES` manifests and thin recording helper functions, called from the operational code paths.
+This design adds comprehensive metrics instrumentation to the DSQL storage and projection layers, covering 45 requirements across 13 phases. The implementation follows the established observability foundation pattern: per-crate `metrics.rs` modules with `METRIC_NAMES` manifests and thin recording helper functions, called from the operational code paths.
 
 The surface area is large (roughly 30 new metrics plus existing pool helpers) but each individual change is mechanical — a recording helper call at the right code path. The design prioritizes:
 
@@ -679,6 +679,65 @@ All panels use datasource `{"type": "prometheus", "uid": "mimir"}`.
 - Gauges: direct reference (e.g., `tokeira_dsql_pool_connections_total`)
 - Utilization ratio threshold: `tokeira_dsql_reservoir_utilization_ratio` with threshold line at 0.8
 
+
+### 7. Round Trips per Operation (Requirement 45)
+
+Aurora DSQL is reached over the network, so a commit's latency is mostly its
+round trips. A counter at each statement site would be forgotten when a
+statement is added, so the count is taken from what SQLx already reports: each
+statement it runs is one `tracing` event with target `sqlx::query` (DEBUG, or
+WARN once slow), whose `summary` field holds its first four words (sqlx-core
+0.9, `src/logger.rs`). SQLx reports COMMIT and ROLLBACK but not BEGIN.
+
+**Where it lives.** The counting layer is `tokeira-observability::statement_accounting`,
+installed by `install_tracing_subscriber` beside the log and trace-export
+layers. It belongs to the crate that assembles the subscriber; storage and the
+runtime only name spans. The operator's reloadable `EnvFilter` is a per-layer
+filter on the log and export layers, not a global one, so the layer reads
+SQLx's DEBUG events at any log level; its own filter admits only those events,
+`dsql.*` spans and spans with `tokeira.command_type`, and caps its level hint
+at DEBUG.
+
+**Counting.** The layer charges each statement to the outermost `dsql.*` span
+around it: an operation built from other operations is what its caller paid
+for. At a COMMIT or ROLLBACK it records the operation's statements since its
+previous transaction, plus one for an unreported BEGIN; when the operation's
+span closes it records any statements after its last transaction as
+`transaction="none"`. A statement outside every operation increments
+`tokeira_dsql_unattributed_statements_total`. The count is a floor: it omits a
+statement's first prepare on a connection, connection setup, and the ROLLBACK
+SQLx queues for a dropped transaction.
+
+**Naming operations.** Every DSQL trait method runs in a `dsql.*` span. Those
+that had no such span run their body through
+`statement_accounting::in_operation(debug_span!("dsql.<operation>"), …)`, which
+boxes the body before instrumenting it; the projection log's and visibility
+store's existing spans took `dsql.` names. `#[instrument]` would hold an async
+body twice in the future it returns, and an operation's future holds run
+images; on the 2 MiB stack of a tokio worker in an unoptimized build the
+doubled copy overflows. The spans are DEBUG, so logs and exported traces are
+unchanged at the default filter.
+
+**Naming causes.** The lane's `lane.process` span already carries
+`tokeira.command_type`. The runtime's worker-facing activity methods, which
+load and commit outside the lane, run in DEBUG spans naming their Temporal
+request (`RecordActivityTaskStarted`, `RecordActivityTaskHeartbeat`,
+`RespondActivityTaskCompleted`, `RespondActivityTaskFailed`,
+`RespondActivityTaskCanceled`), boxed for the same reason.
+
+| Constant | Name | Type | Labels |
+|----------|------|------|--------|
+| `DSQL_OPERATION_ROUND_TRIPS` | `tokeira_dsql_operation_round_trips` | Histogram | `operation` (≈120 trait methods), `command_type` (≈45), `transaction` (3) |
+| `DSQL_UNATTRIBUTED_STATEMENTS_TOTAL` | `tokeira_dsql_unattributed_statements_total` | Counter | none |
+
+Both are declared in `PROCESS_METRIC_MANIFEST`. The histogram renders as a
+summary like every other. In practice an operation sees a handful of causes,
+so its series number in the hundreds.
+
+**Cost.** With the layer installed SQLx formats each statement's text for its
+event: microseconds against a round trip of milliseconds. Each operation span
+costs a registry slot and one small allocation.
+
 ## Data Models
 
 ### New Metric Names (Complete Manifest Addition)
@@ -778,6 +837,16 @@ Total worst-case time series: ~500. Well within Prometheus/Mimir operational lim
 *For any* `RunKey` and `shard_count > 0`, `shard_for_run_key` SHALL always produce the same `ShardId`, and that `ShardId` SHALL be in the range `[0, shard_count)`. This ensures per-shard metrics are consistently attributed.
 
 **Validates: Requirements 33.2, 34.2, 35.2**
+
+
+### Property 7: Round-trip accounting
+
+*For any* sequence of statements run inside one DSQL operation, the samples
+recorded sum to the number of statements plus one for each transaction whose
+BEGIN SQLx did not report; there is one `committed` sample per COMMIT, one
+`rolled_back` sample per ROLLBACK, and at most one `none` sample.
+
+**Validates: Requirements 45.2, 45.3**
 
 ## Error Handling
 

@@ -6,6 +6,7 @@
 //! ops become visibility rows.
 
 use std::{collections::BTreeSet, sync::Arc, time::Instant};
+use tokeira_observability::statement_accounting::in_operation;
 
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -506,9 +507,13 @@ enum SingleAttempt {
     TooLarge,
 }
 
+// Every method runs in a span named `dsql.<store>.<method>`, the operation
+// the process's statement accounting charges its round trips to
+// (`tokeira_observability::statement_accounting`); a span added only for that
+// is DEBUG, out of logs and traces at the default filter.
 #[async_trait]
 impl VisibilityStore for DsqlVisibilityStore {
-    #[instrument(skip_all, fields(run_key = %row.run_key.0))]
+    #[instrument(name = "dsql.visibility.upsert_execution", skip_all, fields(run_key = %row.run_key.0))]
     async fn upsert_execution(&self, row: &ExecutionRow) -> Result<()> {
         let memo = codec::encode(&row.memo)?;
         let mut permit = self.director.acquire(DbClass::Projection).await?;
@@ -539,7 +544,7 @@ impl VisibilityStore for DsqlVisibilityStore {
         Ok(())
     }
 
-    #[instrument(skip_all, fields(run_key = %tombstone.run_key.0))]
+    #[instrument(name = "dsql.visibility.apply_deletion", skip_all, fields(run_key = %tombstone.run_key.0))]
     async fn apply_deletion(&self, tombstone: &ProjectionRecord) -> Result<()> {
         self.apply_tombstone(tombstone, tombstone.partition_id)
             .await
@@ -557,18 +562,25 @@ impl VisibilityStore for DsqlVisibilityStore {
         attr_type: SearchAttrType,
         value: &SearchAttrValue,
     ) -> Result<()> {
-        let image = ImageAttributes::build(
-            &[(AttrDescriptor { attr_id, attr_type }, value.clone())],
-            false,
-        )?;
-        let mut permit = self.director.acquire(DbClass::Projection).await?;
-        let mut tx = permit.begin().await?;
-        let version = current_version_of(&mut tx, namespace_id, run_key).await?;
-        delete_attribute_at(&mut tx, namespace_id, run_key, version, attr_id, attr_type).await?;
-        insert_cells(&mut tx, namespace_id, run_key, version, &image.cells).await?;
-        insert_values(&mut tx, namespace_id, run_key, version, &image.values).await?;
-        tx.commit().await?;
-        Ok(())
+        in_operation(
+            tracing::debug_span!("dsql.visibility.upsert_search_attr_index"),
+            async move {
+                let image = ImageAttributes::build(
+                    &[(AttrDescriptor { attr_id, attr_type }, value.clone())],
+                    false,
+                )?;
+                let mut permit = self.director.acquire(DbClass::Projection).await?;
+                let mut tx = permit.begin().await?;
+                let version = current_version_of(&mut tx, namespace_id, run_key).await?;
+                delete_attribute_at(&mut tx, namespace_id, run_key, version, attr_id, attr_type)
+                    .await?;
+                insert_cells(&mut tx, namespace_id, run_key, version, &image.cells).await?;
+                insert_values(&mut tx, namespace_id, run_key, version, &image.values).await?;
+                tx.commit().await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     /// Delete one attribute's cells and value at the run's current version.
@@ -579,12 +591,19 @@ impl VisibilityStore for DsqlVisibilityStore {
         attr_id: AttrId,
         attr_type: SearchAttrType,
     ) -> Result<()> {
-        let mut permit = self.director.acquire(DbClass::Projection).await?;
-        let mut tx = permit.begin().await?;
-        let version = current_version_of(&mut tx, namespace_id, run_key).await?;
-        delete_attribute_at(&mut tx, namespace_id, run_key, version, attr_id, attr_type).await?;
-        tx.commit().await?;
-        Ok(())
+        in_operation(
+            tracing::debug_span!("dsql.visibility.remove_search_attr_index"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Projection).await?;
+                let mut tx = permit.begin().await?;
+                let version = current_version_of(&mut tx, namespace_id, run_key).await?;
+                delete_attribute_at(&mut tx, namespace_id, run_key, version, attr_id, attr_type)
+                    .await?;
+                tx.commit().await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     /// Autocommit, one counter row at a time, so not atomic with any row's apply.
@@ -592,7 +611,11 @@ impl VisibilityStore for DsqlVisibilityStore {
     /// with the row (`projection-passes` criterion 2.8), and nothing on DSQL calls
     /// this. A sink composed from it would bring back counters after the commit.
     async fn accumulate_rollup(&self, entries: &[RollupDelta]) -> Result<()> {
-        self.accumulate_rollup_striped(entries).await
+        in_operation(
+            tracing::debug_span!("dsql.visibility.accumulate_rollup"),
+            async move { self.accumulate_rollup_striped(entries).await },
+        )
+        .await
     }
 
     async fn list_executions(
@@ -602,44 +625,51 @@ impl VisibilityStore for DsqlVisibilityStore {
         sort: SortOrder,
         page: &PageBounds,
     ) -> Result<ListResult> {
-        let mut permit = self.director.acquire(DbClass::Projection).await?;
-        let (query, rows) =
-            list_rows(permit.connection()?, namespace_id, filter, sort, page).await?;
-        if memo_page_needs_snapshot(
-            rows.iter()
-                .map(|row| row.try_get("memo_parts"))
-                .collect::<Result<Vec<Option<i32>>, _>>()?
-                .iter()
-                .copied(),
-        ) {
-            // The autocommit page is only a probe. Reread its rows and parts in
-            // one guarded snapshot; a flip may replace parts between reads.
-            let mut tx = permit.begin_read_only().await?;
-            let rows = fetch_list_rows(
-                &mut tx,
-                &query.sql,
-                namespace_id,
-                &query.values,
-                query.limit,
-            )
-            .await?;
-            #[cfg(all(test, feature = "dsql-integration"))]
-            memo_read_pause::reached(namespace_id).await;
-            let result =
-                decode_list_page(&mut tx, rows, namespace_id, sort, query.limit, false).await?;
-            tx.commit().await?;
-            Ok(result)
-        } else {
-            decode_list_page(
-                permit.connection()?,
-                rows,
-                namespace_id,
-                sort,
-                query.limit,
-                false,
-            )
-            .await
-        }
+        in_operation(
+            tracing::debug_span!("dsql.visibility.list_executions"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Projection).await?;
+                let (query, rows) =
+                    list_rows(permit.connection()?, namespace_id, filter, sort, page).await?;
+                if memo_page_needs_snapshot(
+                    rows.iter()
+                        .map(|row| row.try_get("memo_parts"))
+                        .collect::<Result<Vec<Option<i32>>, _>>()?
+                        .iter()
+                        .copied(),
+                ) {
+                    // The autocommit page is only a probe. Reread its rows and parts in
+                    // one guarded snapshot; a flip may replace parts between reads.
+                    let mut tx = permit.begin_read_only().await?;
+                    let rows = fetch_list_rows(
+                        &mut tx,
+                        &query.sql,
+                        namespace_id,
+                        &query.values,
+                        query.limit,
+                    )
+                    .await?;
+                    #[cfg(all(test, feature = "dsql-integration"))]
+                    memo_read_pause::reached(namespace_id).await;
+                    let result =
+                        decode_list_page(&mut tx, rows, namespace_id, sort, query.limit, false)
+                            .await?;
+                    tx.commit().await?;
+                    Ok(result)
+                } else {
+                    decode_list_page(
+                        permit.connection()?,
+                        rows,
+                        namespace_id,
+                        sort,
+                        query.limit,
+                        false,
+                    )
+                    .await
+                }
+            },
+        )
+        .await
     }
 
     async fn list_component_executions(
@@ -649,16 +679,23 @@ impl VisibilityStore for DsqlVisibilityStore {
         sort: SortOrder,
         page: &PageBounds,
     ) -> Result<ListResult> {
-        let mut permit = self.director.acquire(DbClass::Projection).await?;
-        // Both SELECTs must share DSQL's transaction snapshot: the hydration keeps
-        // only the values at each listed row's version, and a flip and its cleanup
-        // between two separate reads would delete them, so the row would list
-        // without its attributes.
-        let mut tx = permit.begin_read_only().await?;
-        let (query, rows) = list_rows(&mut tx, namespace_id, filter, sort, page).await?;
-        let result = decode_list_page(&mut tx, rows, namespace_id, sort, query.limit, true).await?;
-        tx.commit().await?;
-        Ok(result)
+        in_operation(
+            tracing::debug_span!("dsql.visibility.list_component_executions"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Projection).await?;
+                // Both SELECTs must share DSQL's transaction snapshot: the hydration keeps
+                // only the values at each listed row's version, and a flip and its cleanup
+                // between two separate reads would delete them, so the row would list
+                // without its attributes.
+                let mut tx = permit.begin_read_only().await?;
+                let (query, rows) = list_rows(&mut tx, namespace_id, filter, sort, page).await?;
+                let result =
+                    decode_list_page(&mut tx, rows, namespace_id, sort, query.limit, true).await?;
+                tx.commit().await?;
+                Ok(result)
+            },
+        )
+        .await
     }
 
     async fn count_executions(
@@ -667,36 +704,44 @@ impl VisibilityStore for DsqlVisibilityStore {
         filter: &CompiledFilter,
         group_by: Option<GroupByField>,
     ) -> Result<CountResult> {
-        let group_attr_type = match group_by.as_ref() {
-            Some(GroupByField::Custom { attr_type, .. }) => Some(*attr_type),
-            _ => None,
-        };
-        let referenced_tables = referenced_search_attr_index_tables(filter, group_attr_type)?;
-        let started = Instant::now();
-        let result = match group_by {
-            Some(GroupByField::Custom {
-                attr_id, attr_type, ..
-            }) => {
-                count_custom_group(
-                    self.director.as_ref(),
-                    namespace_id,
-                    filter,
-                    attr_id,
-                    attr_type,
-                )
-                .await
-            }
-            Some(GroupByField::System(field)) => {
-                count_system_group(self.director.as_ref(), namespace_id, filter, field).await
-            }
-            None => count_without_group(self.director.as_ref(), namespace_id, filter).await,
-        };
-        let duration = started.elapsed();
-        projection_metrics::record_visibility_query_duration("count", duration);
-        for table in referenced_tables {
-            projection_metrics::record_sa_index_scan_duration(table, duration);
-        }
-        result
+        in_operation(
+            tracing::debug_span!("dsql.visibility.count_executions"),
+            async move {
+                let group_attr_type = match group_by.as_ref() {
+                    Some(GroupByField::Custom { attr_type, .. }) => Some(*attr_type),
+                    _ => None,
+                };
+                let referenced_tables =
+                    referenced_search_attr_index_tables(filter, group_attr_type)?;
+                let started = Instant::now();
+                let result = match group_by {
+                    Some(GroupByField::Custom {
+                        attr_id, attr_type, ..
+                    }) => {
+                        count_custom_group(
+                            self.director.as_ref(),
+                            namespace_id,
+                            filter,
+                            attr_id,
+                            attr_type,
+                        )
+                        .await
+                    }
+                    Some(GroupByField::System(field)) => {
+                        count_system_group(self.director.as_ref(), namespace_id, filter, field)
+                            .await
+                    }
+                    None => count_without_group(self.director.as_ref(), namespace_id, filter).await,
+                };
+                let duration = started.elapsed();
+                projection_metrics::record_visibility_query_duration("count", duration);
+                for table in referenced_tables {
+                    projection_metrics::record_sa_index_scan_duration(table, duration);
+                }
+                result
+            },
+        )
+        .await
     }
 
     async fn count_from_rollup(
@@ -705,24 +750,30 @@ impl VisibilityStore for DsqlVisibilityStore {
         archetype_id: ArchetypeId,
         dimension: RollupDimension,
     ) -> Result<CountResult> {
-        let mut permit = self.director.acquire(DbClass::Projection).await?;
-        // Fan in the stripes for each value (`stripe = hash(run_key) % 16`). `SUM`
-        // over a BIGINT column is NUMERIC, so cast it back to decode as `i64`.
-        let rows = sqlx::query(
-            r#"
-            SELECT value, SUM(counter)::BIGINT AS counter
-            FROM execution_visibility_rollup
-            WHERE namespace_id = $1 AND archetype_id = $2 AND dimension = $3
-            GROUP BY value
-            HAVING SUM(counter) <> 0
-            "#,
+        in_operation(
+            tracing::debug_span!("dsql.visibility.count_from_rollup"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Projection).await?;
+                // Fan in the stripes for each value (`stripe = hash(run_key) % 16`). `SUM`
+                // over a BIGINT column is NUMERIC, so cast it back to decode as `i64`.
+                let rows = sqlx::query(
+                    r#"
+                SELECT value, SUM(counter)::BIGINT AS counter
+                FROM execution_visibility_rollup
+                WHERE namespace_id = $1 AND archetype_id = $2 AND dimension = $3
+                GROUP BY value
+                HAVING SUM(counter) <> 0
+                "#,
+                )
+                .bind(namespace_id.0)
+                .bind(i64::from(archetype_id.0))
+                .bind(dimension.to_db_smallint())
+                .fetch_all(permit.connection()?)
+                .await?;
+                rows_to_count_result(rows)
+            },
         )
-        .bind(namespace_id.0)
-        .bind(i64::from(archetype_id.0))
-        .bind(dimension.to_db_smallint())
-        .fetch_all(permit.connection()?)
-        .await?;
-        rows_to_count_result(rows)
+        .await
     }
 
     async fn resolve_attr(
@@ -730,19 +781,25 @@ impl VisibilityStore for DsqlVisibilityStore {
         namespace_id: NamespaceId,
         name: &str,
     ) -> Result<Option<AttrDescriptor>> {
-        let mut permit = self.director.acquire(DbClass::Projection).await?;
-        let row = sqlx::query(
-            r#"
-            SELECT attr_id, attr_type
-            FROM sa_registry
-            WHERE namespace_id = $1 AND attr_name = $2
-            "#,
+        in_operation(
+            tracing::debug_span!("dsql.visibility.resolve_attr"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Projection).await?;
+                let row = sqlx::query(
+                    r#"
+                SELECT attr_id, attr_type
+                FROM sa_registry
+                WHERE namespace_id = $1 AND attr_name = $2
+                "#,
+                )
+                .bind(namespace_id.0)
+                .bind(name)
+                .fetch_optional(permit.connection()?)
+                .await?;
+                row.map(row_to_attr_descriptor).transpose()
+            },
         )
-        .bind(namespace_id.0)
-        .bind(name)
-        .fetch_optional(permit.connection()?)
-        .await?;
-        row.map(row_to_attr_descriptor).transpose()
+        .await
     }
 
     async fn register_attr(
@@ -751,82 +808,97 @@ impl VisibilityStore for DsqlVisibilityStore {
         name: String,
         attr_type: SearchAttrType,
     ) -> Result<AttrId> {
-        let attr_id = deterministic_attr_id(namespace_id, &name);
-        let attr_id_i64 = i64_from_u64(attr_id.0, "search attribute id")?;
-        let mut permit = self.director.acquire(DbClass::Projection).await?;
-        let insert = sqlx::query(
-            r#"
-            INSERT INTO sa_registry (attr_id, namespace_id, attr_name, attr_type)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (namespace_id, attr_name) DO NOTHING
-            RETURNING attr_id
-            "#,
-        )
-        .bind(attr_id_i64)
-        .bind(namespace_id.0)
-        .bind(&name)
-        .bind(attr_type.to_db_smallint())
-        .fetch_optional(permit.connection()?)
-        .await;
+        in_operation(
+            tracing::debug_span!("dsql.visibility.register_attr"),
+            async move {
+                let attr_id = deterministic_attr_id(namespace_id, &name);
+                let attr_id_i64 = i64_from_u64(attr_id.0, "search attribute id")?;
+                let mut permit = self.director.acquire(DbClass::Projection).await?;
+                let insert = sqlx::query(
+                    r#"
+                INSERT INTO sa_registry (attr_id, namespace_id, attr_name, attr_type)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (namespace_id, attr_name) DO NOTHING
+                RETURNING attr_id
+                "#,
+                )
+                .bind(attr_id_i64)
+                .bind(namespace_id.0)
+                .bind(&name)
+                .bind(attr_type.to_db_smallint())
+                .fetch_optional(permit.connection()?)
+                .await;
 
-        match insert {
-            Ok(Some(row)) => return attr_id_from_i64(row.try_get("attr_id")?),
-            Ok(None) => {}
-            Err(sqlx::Error::Database(error)) if error.constraint() == Some("sa_registry_pkey") => {
-                bail!(
-                    "search attribute id hash collision for namespace {} attribute {name}",
-                    namespace_id.0
-                );
-            }
-            Err(error) => return Err(error.into()),
-        }
+                match insert {
+                    Ok(Some(row)) => return attr_id_from_i64(row.try_get("attr_id")?),
+                    Ok(None) => {}
+                    Err(sqlx::Error::Database(error))
+                        if error.constraint() == Some("sa_registry_pkey") =>
+                    {
+                        bail!(
+                            "search attribute id hash collision for namespace {} attribute {name}",
+                            namespace_id.0
+                        );
+                    }
+                    Err(error) => return Err(error.into()),
+                }
 
-        let row = sqlx::query(
-            r#"
-            SELECT attr_id, attr_type
-            FROM sa_registry
-            WHERE namespace_id = $1 AND attr_name = $2
-            "#,
+                let row = sqlx::query(
+                    r#"
+                SELECT attr_id, attr_type
+                FROM sa_registry
+                WHERE namespace_id = $1 AND attr_name = $2
+                "#,
+                )
+                .bind(namespace_id.0)
+                .bind(&name)
+                .fetch_one(permit.connection()?)
+                .await?;
+                let existing_type: i16 = row.try_get("attr_type")?;
+                let existing_type = SearchAttrType::try_from(existing_type)?;
+                if existing_type != attr_type {
+                    bail!(
+                        "search attribute {name} already registered as {:?}, not {:?}",
+                        existing_type,
+                        attr_type
+                    );
+                }
+                attr_id_from_i64(row.try_get("attr_id")?)
+            },
         )
-        .bind(namespace_id.0)
-        .bind(&name)
-        .fetch_one(permit.connection()?)
-        .await?;
-        let existing_type: i16 = row.try_get("attr_type")?;
-        let existing_type = SearchAttrType::try_from(existing_type)?;
-        if existing_type != attr_type {
-            bail!(
-                "search attribute {name} already registered as {:?}, not {:?}",
-                existing_type,
-                attr_type
-            );
-        }
-        attr_id_from_i64(row.try_get("attr_id")?)
+        .await
     }
 
     // The trait returns Option, not Result, so transient DSQL errors
     // (connection timeout, OCC) are indistinguishable from "row not found."
     // This is a trait-level limitation — the warn! log is the best we can do.
     async fn get_row(&self, run_key: RunKey) -> Option<ExecutionRow> {
-        match self.director.acquire(DbClass::Projection).await {
-            Ok(mut permit) => match get_execution_row(&mut permit, run_key).await {
-                Ok(row) => row,
+        in_operation(tracing::debug_span!("dsql.visibility.get_row"), async move {
+            match self.director.acquire(DbClass::Projection).await {
+                Ok(mut permit) => match get_execution_row(&mut permit, run_key).await {
+                    Ok(row) => row,
+                    Err(error) => {
+                        warn!(%error, run_key = %run_key.0, "failed to read DSQL visibility row");
+                        None
+                    }
+                },
                 Err(error) => {
-                    warn!(%error, run_key = %run_key.0, "failed to read DSQL visibility row");
+                    warn!(%error, run_key = %run_key.0, "failed to acquire DSQL projection permit");
                     None
                 }
-            },
-            Err(error) => {
-                warn!(%error, run_key = %run_key.0, "failed to acquire DSQL projection permit");
-                None
             }
-        }
+        })
+        .await
     }
 }
 
+// Every method runs in a span named `dsql.<store>.<method>`, the operation
+// the process's statement accounting charges its round trips to
+// (`tokeira_observability::statement_accounting`); a span added only for that
+// is DEBUG, out of logs and traces at the default filter.
 #[async_trait]
 impl ProjectionSink for DsqlVisibilityStore {
-    #[instrument(skip_all, fields(run_key = %record.run_key.0, transition_seq = record.transition_seq.0))]
+    #[instrument(name = "dsql.projection_sink.apply", skip_all, fields(run_key = %record.run_key.0, transition_seq = record.transition_seq.0))]
     async fn apply(&self, record: &ProjectionRecord, partition_id: u32) -> Result<ApplyOutcome> {
         let sink_started = Instant::now();
         if record.context.lifecycle_state == VisibilityLifecycleState::Deleted {

@@ -1,0 +1,5 @@
+kind: changed
+body: DSQL connections now begin `application_name` with `tokeira/<version>`, so Aurora DSQL Database Insights attributes their load and plans to Tokeira.
+time: 2026-11-05T23:41:44.947522Z
+custom:
+    Slice: d22147f0-3aa7-4c3d-8a3d-f97bf2a8c46e

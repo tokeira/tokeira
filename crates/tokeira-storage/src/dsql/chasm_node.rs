@@ -40,6 +40,7 @@
 //! commit — normalized to the same `Conflict` so the runtime reloads and re-runs.
 
 use std::{collections::BTreeMap, sync::Arc};
+use tokeira_observability::statement_accounting::in_operation;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
@@ -541,6 +542,9 @@ impl DsqlChasmNodeRepository {
     }
 }
 
+// Every method runs in a DEBUG span named `dsql.<store>.<method>`, the
+// operation the process's statement accounting charges its round trips to
+// (`tokeira_observability::statement_accounting`).
 #[async_trait]
 impl ChasmNodeRepository for DsqlChasmNodeRepository {
     async fn persist_dirty(
@@ -548,34 +552,42 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         key: &ExecutionKey,
         batch: Vec<NodeWrite>,
     ) -> Result<NodePersistOutcome> {
-        let ids = Self::key_parts(key)?;
-        let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.begin().await?;
+        in_operation(
+            tracing::debug_span!("dsql.chasm_node.persist_dirty"),
+            async move {
+                let ids = Self::key_parts(key)?;
+                let mut permit = self.director.acquire(DbClass::Commit).await?;
+                let mut tx = permit.begin().await?;
 
-        // Phase 1 — check every fence before mutating anything (all-or-nothing).
-        let stored_parts = match Self::check_fences(&mut tx, ids, &batch).await? {
-            Ok(stored_parts) => stored_parts,
-            Err(reason) => {
-                tx.rollback().await?;
-                return Ok(NodePersistOutcome::Conflict { reason });
-            }
-        };
+                // Phase 1 — check every fence before mutating anything (all-or-nothing).
+                let stored_parts = match Self::check_fences(&mut tx, ids, &batch).await? {
+                    Ok(stored_parts) => stored_parts,
+                    Err(reason) => {
+                        tx.rollback().await?;
+                        return Ok(NodePersistOutcome::Conflict { reason });
+                    }
+                };
 
-        // Phase 2 — every fence held; upsert the whole batch.
-        if let Some(conflict) = Self::write_nodes(&mut tx, ids, &batch, &stored_parts).await? {
-            tx.rollback().await?;
-            return Ok(conflict);
-        }
+                // Phase 2 — every fence held; upsert the whole batch.
+                if let Some(conflict) =
+                    Self::write_nodes(&mut tx, ids, &batch, &stored_parts).await?
+                {
+                    tx.rollback().await?;
+                    return Ok(conflict);
+                }
 
-        match tx.commit().await {
-            Ok(()) => Ok(NodePersistOutcome::Applied),
-            Err(err) if DsqlRunRepository::is_serialization_failure(&err) => {
-                Ok(NodePersistOutcome::Conflict {
-                    reason: "dsql serialization failure at commit".to_owned(),
-                })
-            }
-            Err(err) => Err(err.into()),
-        }
+                match tx.commit().await {
+                    Ok(()) => Ok(NodePersistOutcome::Applied),
+                    Err(err) if DsqlRunRepository::is_serialization_failure(&err) => {
+                        Ok(NodePersistOutcome::Conflict {
+                            reason: "dsql serialization failure at commit".to_owned(),
+                        })
+                    }
+                    Err(err) => Err(err.into()),
+                }
+            },
+        )
+        .await
     }
 
     async fn persist_new_execution(
@@ -586,115 +598,124 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         current: CurrentRun,
         expected_current: Option<CurrentRun>,
     ) -> Result<NodePersistOutcome> {
-        let ids = Self::key_parts(key)?;
-        let (namespace_id, business_id, _) = ids;
-        let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.begin().await?;
+        in_operation(
+            tracing::debug_span!("dsql.chasm_node.persist_new_execution"),
+            async move {
+                let ids = Self::key_parts(key)?;
+                let (namespace_id, business_id, _) = ids;
+                let mut permit = self.director.acquire(DbClass::Commit).await?;
+                let mut tx = permit.begin().await?;
 
-        // Admission may have observed a legacy pointer before backfill. Use the
-        // same effective lookup here; a new scoped pointer must not erase it just
-        // because the scoped table is still empty. The conditional write below
-        // also fences writers racing after this snapshot was read.
-        if Self::read_current(&mut tx, namespace_id, archetype_id, business_id).await?
-            != expected_current
-        {
-            tx.rollback().await?;
-            return Ok(NodePersistOutcome::Conflict {
-                reason: "current-run pointer changed during start admission".into(),
-            });
-        }
-        let expected_run_id = expected_current
-            .as_ref()
-            .map(|current| Self::parse_uuid("expected current run_id", &current.run_id))
-            .transpose()?;
+                // Admission may have observed a legacy pointer before backfill. Use the
+                // same effective lookup here; a new scoped pointer must not erase it just
+                // because the scoped table is still empty. The conditional write below
+                // also fences writers racing after this snapshot was read.
+                if Self::read_current(&mut tx, namespace_id, archetype_id, business_id).await?
+                    != expected_current
+                {
+                    tx.rollback().await?;
+                    return Ok(NodePersistOutcome::Conflict {
+                        reason: "current-run pointer changed during start admission".into(),
+                    });
+                }
+                let expected_run_id = expected_current
+                    .as_ref()
+                    .map(|current| Self::parse_uuid("expected current run_id", &current.run_id))
+                    .transpose()?;
 
-        // Phase 1 — node fences (all-or-nothing), identical to `persist_dirty`.
-        let stored_parts = match Self::check_fences(&mut tx, ids, &batch).await? {
-            Ok(stored_parts) => stored_parts,
-            Err(reason) => {
-                tx.rollback().await?;
-                return Ok(NodePersistOutcome::Conflict { reason });
-            }
-        };
+                // Phase 1 — node fences (all-or-nothing), identical to `persist_dirty`.
+                let stored_parts = match Self::check_fences(&mut tx, ids, &batch).await? {
+                    Ok(stored_parts) => stored_parts,
+                    Err(reason) => {
+                        tx.rollback().await?;
+                        return Ok(NodePersistOutcome::Conflict { reason });
+                    }
+                };
 
-        // Phase 2 — upsert the node batch.
-        if let Some(conflict) = Self::write_nodes(&mut tx, ids, &batch, &stored_parts).await? {
-            tx.rollback().await?;
-            return Ok(conflict);
-        }
+                // Phase 2 — upsert the node batch.
+                if let Some(conflict) =
+                    Self::write_nodes(&mut tx, ids, &batch, &stored_parts).await?
+                {
+                    tx.rollback().await?;
+                    return Ok(conflict);
+                }
 
-        // Phase 3 — conditionally advance the pointer in the SAME transaction (the
-        // analog of v1.31.0's current_executions write inside the entity-create tx),
-        // so the run's root node and its current-run pointer never tear. Archetype
-        // is part of the key upstream too (schema/postgresql/v12/temporal/versioned/
-        // v1.19/current_chasm_executions.sql @ v1.31.0). A NULL expected run permits
-        // insertion only; a superseding start must replace the exact observed run
-        // and epoch. A miss rolls back node writes, while DSQL OCC rejects a pair
-        // of concurrent writes even if both transactions saw the expected value.
-        let current_run_id = Self::parse_uuid("current run_id", &current.run_id)?;
-        let pointer = sqlx::query(
-            "INSERT INTO chasm_current_execution
-               (namespace_id, business_id, run_id, request_id, status,
-                failover_version, transition_count, archetype_id, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
-             ON CONFLICT (namespace_id, archetype_id, business_id) DO UPDATE SET
-                run_id = EXCLUDED.run_id,
-                request_id = EXCLUDED.request_id,
-                status = EXCLUDED.status,
-                failover_version = EXCLUDED.failover_version,
-                transition_count = EXCLUDED.transition_count,
-                updated_at = EXCLUDED.updated_at
-             WHERE chasm_current_execution.run_id = $9
-               AND chasm_current_execution.failover_version = $10
-               AND chasm_current_execution.transition_count = $11",
+                // Phase 3 — conditionally advance the pointer in the SAME transaction (the
+                // analog of v1.31.0's current_executions write inside the entity-create tx),
+                // so the run's root node and its current-run pointer never tear. Archetype
+                // is part of the key upstream too (schema/postgresql/v12/temporal/versioned/
+                // v1.19/current_chasm_executions.sql @ v1.31.0). A NULL expected run permits
+                // insertion only; a superseding start must replace the exact observed run
+                // and epoch. A miss rolls back node writes, while DSQL OCC rejects a pair
+                // of concurrent writes even if both transactions saw the expected value.
+                let current_run_id = Self::parse_uuid("current run_id", &current.run_id)?;
+                let pointer = sqlx::query(
+                    "INSERT INTO chasm_current_execution
+                   (namespace_id, business_id, run_id, request_id, status,
+                    failover_version, transition_count, archetype_id, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+                 ON CONFLICT (namespace_id, archetype_id, business_id) DO UPDATE SET
+                    run_id = EXCLUDED.run_id,
+                    request_id = EXCLUDED.request_id,
+                    status = EXCLUDED.status,
+                    failover_version = EXCLUDED.failover_version,
+                    transition_count = EXCLUDED.transition_count,
+                    updated_at = EXCLUDED.updated_at
+                 WHERE chasm_current_execution.run_id = $9
+                   AND chasm_current_execution.failover_version = $10
+                   AND chasm_current_execution.transition_count = $11",
+                )
+                .bind(namespace_id)
+                .bind(business_id)
+                .bind(current_run_id)
+                .bind(current.request_id.as_str())
+                .bind(Self::encode_status(current.status))
+                .bind(current.vt_epoch.namespace_failover_version)
+                .bind(current.vt_epoch.transition_count)
+                .bind(i64::from(archetype_id))
+                .bind(expected_run_id)
+                .bind(
+                    expected_current
+                        .as_ref()
+                        .map(|current| current.vt_epoch.namespace_failover_version),
+                )
+                .bind(
+                    expected_current
+                        .as_ref()
+                        .map(|current| current.vt_epoch.transition_count),
+                )
+                .execute(&mut *tx)
+                .await;
+                match pointer {
+                    Ok(result) if result.rows_affected() == 0 => {
+                        tx.rollback().await?;
+                        return Ok(NodePersistOutcome::Conflict {
+                            reason: "current-run pointer changed during start admission".into(),
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(err) if DsqlRunRepository::is_serialization_failure(&err) => {
+                        tx.rollback().await?;
+                        return Ok(NodePersistOutcome::Conflict {
+                            reason: "dsql serialization failure during current-run write"
+                                .to_owned(),
+                        });
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+
+                match tx.commit().await {
+                    Ok(()) => Ok(NodePersistOutcome::Applied),
+                    Err(err) if DsqlRunRepository::is_serialization_failure(&err) => {
+                        Ok(NodePersistOutcome::Conflict {
+                            reason: "dsql serialization failure at commit".to_owned(),
+                        })
+                    }
+                    Err(err) => Err(err.into()),
+                }
+            },
         )
-        .bind(namespace_id)
-        .bind(business_id)
-        .bind(current_run_id)
-        .bind(current.request_id.as_str())
-        .bind(Self::encode_status(current.status))
-        .bind(current.vt_epoch.namespace_failover_version)
-        .bind(current.vt_epoch.transition_count)
-        .bind(i64::from(archetype_id))
-        .bind(expected_run_id)
-        .bind(
-            expected_current
-                .as_ref()
-                .map(|current| current.vt_epoch.namespace_failover_version),
-        )
-        .bind(
-            expected_current
-                .as_ref()
-                .map(|current| current.vt_epoch.transition_count),
-        )
-        .execute(&mut *tx)
-        .await;
-        match pointer {
-            Ok(result) if result.rows_affected() == 0 => {
-                tx.rollback().await?;
-                return Ok(NodePersistOutcome::Conflict {
-                    reason: "current-run pointer changed during start admission".into(),
-                });
-            }
-            Ok(_) => {}
-            Err(err) if DsqlRunRepository::is_serialization_failure(&err) => {
-                tx.rollback().await?;
-                return Ok(NodePersistOutcome::Conflict {
-                    reason: "dsql serialization failure during current-run write".to_owned(),
-                });
-            }
-            Err(err) => return Err(err.into()),
-        }
-
-        match tx.commit().await {
-            Ok(()) => Ok(NodePersistOutcome::Applied),
-            Err(err) if DsqlRunRepository::is_serialization_failure(&err) => {
-                Ok(NodePersistOutcome::Conflict {
-                    reason: "dsql serialization failure at commit".to_owned(),
-                })
-            }
-            Err(err) => Err(err.into()),
-        }
+        .await
     }
 
     async fn current_run(
@@ -703,13 +724,19 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         archetype_id: u32,
         business_id: &str,
     ) -> Result<Option<CurrentRun>> {
-        let namespace_uuid = Self::parse_uuid("namespace_id", namespace_id)?;
-        let mut permit = self.director.acquire(DbClass::Read).await?;
-        Self::read_current(
-            permit.connection()?,
-            namespace_uuid,
-            archetype_id,
-            business_id,
+        in_operation(
+            tracing::debug_span!("dsql.chasm_node.current_run"),
+            async move {
+                let namespace_uuid = Self::parse_uuid("namespace_id", namespace_id)?;
+                let mut permit = self.director.acquire(DbClass::Read).await?;
+                Self::read_current(
+                    permit.connection()?,
+                    namespace_uuid,
+                    archetype_id,
+                    business_id,
+                )
+                .await
+            },
         )
         .await
     }
@@ -720,120 +747,155 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         after: Option<CurrentExecutionCursor>,
         limit: usize,
     ) -> Result<Vec<CurrentExecution>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let namespace = after
-            .as_ref()
-            .map(|key| Self::parse_uuid("cursor namespace_id", &key.namespace_id))
-            .transpose()?;
-        let mut permit = self.director.acquire(DbClass::Read).await?;
-        let rows = sqlx::query(
-            "SELECT namespace_id, archetype_id, business_id, run_id, request_id,
-                    status, failover_version, transition_count
-             FROM chasm_current_execution
-             WHERE status = $1 AND ($2::uuid IS NULL OR
-                 (namespace_id, archetype_id, business_id) > ($2, $3, $4))
-             ORDER BY namespace_id, archetype_id, business_id LIMIT $5",
+        in_operation(
+            tracing::debug_span!("dsql.chasm_node.scan_current_executions"),
+            async move {
+                if limit == 0 {
+                    return Ok(Vec::new());
+                }
+                let namespace = after
+                    .as_ref()
+                    .map(|key| Self::parse_uuid("cursor namespace_id", &key.namespace_id))
+                    .transpose()?;
+                let mut permit = self.director.acquire(DbClass::Read).await?;
+                let rows = sqlx::query(
+                    "SELECT namespace_id, archetype_id, business_id, run_id, request_id,
+                        status, failover_version, transition_count
+                 FROM chasm_current_execution
+                 WHERE status = $1 AND ($2::uuid IS NULL OR
+                     (namespace_id, archetype_id, business_id) > ($2, $3, $4))
+                 ORDER BY namespace_id, archetype_id, business_id LIMIT $5",
+                )
+                .bind(Self::encode_status(status))
+                .bind(namespace)
+                .bind(after.as_ref().map(|key| i64::from(key.archetype_id)))
+                .bind(after.as_ref().map(|key| key.business_id.as_str()))
+                .bind(i64::try_from(limit)?)
+                .fetch_all(permit.connection()?)
+                .await?;
+                rows.iter()
+                    .map(|row| {
+                        let current = Self::current_from_row(row)?;
+                        let namespace: Uuid = row.try_get("namespace_id")?;
+                        let business_id: String = row.try_get("business_id")?;
+                        let archetype: i64 = row.try_get("archetype_id")?;
+                        Ok(CurrentExecution {
+                            key: ExecutionKey::new(
+                                namespace.to_string(),
+                                business_id,
+                                &current.run_id,
+                            ),
+                            archetype_id: u32::try_from(archetype)?,
+                            current,
+                        })
+                    })
+                    .collect()
+            },
         )
-        .bind(Self::encode_status(status))
-        .bind(namespace)
-        .bind(after.as_ref().map(|key| i64::from(key.archetype_id)))
-        .bind(after.as_ref().map(|key| key.business_id.as_str()))
-        .bind(i64::try_from(limit)?)
-        .fetch_all(permit.connection()?)
-        .await?;
-        rows.iter()
-            .map(|row| {
-                let current = Self::current_from_row(row)?;
-                let namespace: Uuid = row.try_get("namespace_id")?;
-                let business_id: String = row.try_get("business_id")?;
-                let archetype: i64 = row.try_get("archetype_id")?;
-                Ok(CurrentExecution {
-                    key: ExecutionKey::new(namespace.to_string(), business_id, &current.run_id),
-                    archetype_id: u32::try_from(archetype)?,
-                    current,
-                })
-            })
-            .collect()
+        .await
     }
 
     async fn backfill_current_executions(&self, archetype_id: u32, batch: usize) -> Result<usize> {
-        anyhow::ensure!(batch > 0, "CHASM backfill batch must be nonzero");
-        let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.begin().await?;
-        // Copied keys are durable progress: exclude them before LIMIT, otherwise a
-        // full first page would make the next call return zero prematurely. This
-        // ordered remaining-key scan resumes after crashes without an in-memory
-        // cursor, and never overwrites a newer pointer. Bootstrap runs before
-        // request admission; errors (including OCC) leave the marker unset.
-        let inserted = sqlx::query(
-            "INSERT INTO chasm_current_execution
-               (namespace_id, archetype_id, business_id, run_id, request_id, status,
-                failover_version, transition_count, updated_at)
-             SELECT old.namespace_id, $1, old.business_id, old.run_id, old.request_id,
-                    old.status, old.failover_version, old.transition_count, old.updated_at
-             FROM chasm_current_run AS old
-             JOIN chasm_node AS root ON root.namespace_id = old.namespace_id
-               AND root.business_id = old.business_id AND root.run_id = old.run_id
-               AND root.encoded_path = '' AND root.archetype_id = $1
-             WHERE NOT EXISTS (SELECT 1 FROM chasm_current_execution AS current
-               WHERE current.namespace_id = old.namespace_id AND current.archetype_id = $1
-                 AND current.business_id = old.business_id)
-             ORDER BY old.namespace_id, old.business_id
-             LIMIT $2
-             ON CONFLICT (namespace_id, archetype_id, business_id) DO NOTHING",
+        in_operation(
+            tracing::debug_span!("dsql.chasm_node.backfill_current_executions"),
+            async move {
+                anyhow::ensure!(batch > 0, "CHASM backfill batch must be nonzero");
+                let mut permit = self.director.acquire(DbClass::Commit).await?;
+                let mut tx = permit.begin().await?;
+                // Copied keys are durable progress: exclude them before LIMIT, otherwise a
+                // full first page would make the next call return zero prematurely. This
+                // ordered remaining-key scan resumes after crashes without an in-memory
+                // cursor, and never overwrites a newer pointer. Bootstrap runs before
+                // request admission; errors (including OCC) leave the marker unset.
+                let inserted = sqlx::query(
+                    "INSERT INTO chasm_current_execution
+                   (namespace_id, archetype_id, business_id, run_id, request_id, status,
+                    failover_version, transition_count, updated_at)
+                 SELECT old.namespace_id, $1, old.business_id, old.run_id, old.request_id,
+                        old.status, old.failover_version, old.transition_count, old.updated_at
+                 FROM chasm_current_run AS old
+                 JOIN chasm_node AS root ON root.namespace_id = old.namespace_id
+                   AND root.business_id = old.business_id AND root.run_id = old.run_id
+                   AND root.encoded_path = '' AND root.archetype_id = $1
+                 WHERE NOT EXISTS (SELECT 1 FROM chasm_current_execution AS current
+                   WHERE current.namespace_id = old.namespace_id AND current.archetype_id = $1
+                     AND current.business_id = old.business_id)
+                 ORDER BY old.namespace_id, old.business_id
+                 LIMIT $2
+                 ON CONFLICT (namespace_id, archetype_id, business_id) DO NOTHING",
+                )
+                .bind(i64::from(archetype_id))
+                .bind(i64::try_from(batch.min(500))?)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+                tx.commit().await?;
+                Ok(usize::try_from(inserted)?)
+            },
         )
-        .bind(i64::from(archetype_id))
-        .bind(i64::try_from(batch.min(500))?)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        tx.commit().await?;
-        Ok(usize::try_from(inserted)?)
+        .await
     }
 
     async fn distinct_archetypes(&self) -> Result<Vec<(u32, u64)>> {
-        let mut permit = self.director.acquire(DbClass::Read).await?;
-        let rows = sqlx::query(
-            "SELECT archetype_id, COUNT(*) AS count FROM chasm_current_execution
-             GROUP BY archetype_id ORDER BY archetype_id",
+        in_operation(
+            tracing::debug_span!("dsql.chasm_node.distinct_archetypes"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Read).await?;
+                let rows = sqlx::query(
+                    "SELECT archetype_id, COUNT(*) AS count FROM chasm_current_execution
+                 GROUP BY archetype_id ORDER BY archetype_id",
+                )
+                .fetch_all(permit.connection()?)
+                .await?;
+                rows.iter()
+                    .map(|row| {
+                        let archetype: i64 = row.try_get("archetype_id")?;
+                        let count: i64 = row.try_get("count")?;
+                        Ok((u32::try_from(archetype)?, u64::try_from(count)?))
+                    })
+                    .collect()
+            },
         )
-        .fetch_all(permit.connection()?)
-        .await?;
-        rows.iter()
-            .map(|row| {
-                let archetype: i64 = row.try_get("archetype_id")?;
-                let count: i64 = row.try_get("count")?;
-                Ok((u32::try_from(archetype)?, u64::try_from(count)?))
-            })
-            .collect()
+        .await
     }
 
     async fn backfill_marker_set(&self, name: &str) -> Result<bool> {
-        let mut permit = self.director.acquire(DbClass::Read).await?;
-        Ok(
-            sqlx::query("SELECT 1 FROM chasm_backfill_marker WHERE marker_name = $1")
-                .bind(name)
-                .fetch_optional(permit.connection()?)
-                .await?
-                .is_some(),
+        in_operation(
+            tracing::debug_span!("dsql.chasm_node.backfill_marker_set"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Read).await?;
+                Ok(
+                    sqlx::query("SELECT 1 FROM chasm_backfill_marker WHERE marker_name = $1")
+                        .bind(name)
+                        .fetch_optional(permit.connection()?)
+                        .await?
+                        .is_some(),
+                )
+            },
         )
+        .await
     }
 
     async fn set_backfill_marker(&self, name: &str) -> Result<()> {
-        let mut permit = self.director.acquire(DbClass::Commit).await?;
-        sqlx::query(
-            "INSERT INTO chasm_backfill_marker (marker_name) VALUES ($1) ON CONFLICT DO NOTHING",
-        )
-        .bind(name)
-        .execute(permit.connection()?)
-        .await?;
-        Ok(())
+        in_operation(tracing::debug_span!("dsql.chasm_node.set_backfill_marker"), async move {
+            let mut permit = self.director.acquire(DbClass::Commit).await?;
+            sqlx::query(
+                "INSERT INTO chasm_backfill_marker (marker_name) VALUES ($1) ON CONFLICT DO NOTHING",
+            )
+            .bind(name)
+            .execute(permit.connection()?)
+            .await?;
+            Ok(())
+        })
+        .await
     }
 
     async fn load_execution(&self, key: &ExecutionKey) -> Result<Vec<(Vec<u8>, ChasmNode)>> {
-        self.load_nodes(key, Nodes::All).await
+        in_operation(
+            tracing::debug_span!("dsql.chasm_node.load_execution"),
+            async move { self.load_nodes(key, Nodes::All).await },
+        )
+        .await
     }
 
     async fn load_subtree(
@@ -841,99 +903,120 @@ impl ChasmNodeRepository for DsqlChasmNodeRepository {
         key: &ExecutionKey,
         encoded_prefix: &[u8],
     ) -> Result<Vec<(Vec<u8>, ChasmNode)>> {
-        let end = tokeira_chasm::path::subtree_range_end(encoded_prefix);
-        let encoded_prefix = Self::path_key(encoded_prefix)?;
-        let encoded_end = Self::path_key(&end)?;
-        self.load_nodes(key, Nodes::Range(encoded_prefix, encoded_end))
-            .await
+        in_operation(
+            tracing::debug_span!("dsql.chasm_node.load_subtree"),
+            async move {
+                let end = tokeira_chasm::path::subtree_range_end(encoded_prefix);
+                let encoded_prefix = Self::path_key(encoded_prefix)?;
+                let encoded_end = Self::path_key(&end)?;
+                self.load_nodes(key, Nodes::Range(encoded_prefix, encoded_end))
+                    .await
+            },
+        )
+        .await
     }
 
     async fn delete_execution(&self, key: &ExecutionKey) -> Result<()> {
-        let (namespace_id, business_id, run_id) = Self::key_parts(key)?;
-        let mut permit = self.director.acquire(DbClass::Commit).await?;
-        let mut tx = permit.begin().await?;
-        sqlx::query(
-            "DELETE FROM chasm_node
-             WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3",
+        in_operation(
+            tracing::debug_span!("dsql.chasm_node.delete_execution"),
+            async move {
+                let (namespace_id, business_id, run_id) = Self::key_parts(key)?;
+                let mut permit = self.director.acquire(DbClass::Commit).await?;
+                let mut tx = permit.begin().await?;
+                sqlx::query(
+                    "DELETE FROM chasm_node
+                 WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3",
+                )
+                .bind(namespace_id)
+                .bind(business_id)
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+                // The nodes' parts go in the same transaction, so no reader sees a node
+                // without its parts, and none outlives its node.
+                sqlx::query(
+                    "DELETE FROM chasm_node_part
+                 WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3",
+                )
+                .bind(namespace_id)
+                .bind(business_id)
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+                // Clear the current-run pointer iff it still points at the deleted run
+                // (read-your-write; a superseded run leaves a newer pointer intact).
+                sqlx::query(
+                    "DELETE FROM chasm_current_execution
+                 WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3",
+                )
+                .bind(namespace_id)
+                .bind(business_id)
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok(())
+            },
         )
-        .bind(namespace_id)
-        .bind(business_id)
-        .bind(run_id)
-        .execute(&mut *tx)
-        .await?;
-        // The nodes' parts go in the same transaction, so no reader sees a node
-        // without its parts, and none outlives its node.
-        sqlx::query(
-            "DELETE FROM chasm_node_part
-             WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3",
-        )
-        .bind(namespace_id)
-        .bind(business_id)
-        .bind(run_id)
-        .execute(&mut *tx)
-        .await?;
-        // Clear the current-run pointer iff it still points at the deleted run
-        // (read-your-write; a superseded run leaves a newer pointer intact).
-        sqlx::query(
-            "DELETE FROM chasm_current_execution
-             WHERE namespace_id = $1 AND business_id = $2 AND run_id = $3",
-        )
-        .bind(namespace_id)
-        .bind(business_id)
-        .bind(run_id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
+        .await
     }
 
     async fn scan_executions(&self) -> Result<Vec<(ExecutionKey, ChasmNode)>> {
-        let mut permit = self.director.acquire(DbClass::Read).await?;
-        let connection = permit.connection()?;
-        // Every execution's root component node (encoded_path = ROOT_PATH, b""),
-        // ordered deterministically for the repair scanner (Req 10.11; AGENTS
-        // determinism). The root is the empty text key.
-        let rows = sqlx::query(
-            "SELECT namespace_id, business_id, run_id, metadata, data, data_parts
-             FROM chasm_node
-             WHERE encoded_path = $1
-             ORDER BY namespace_id ASC, business_id ASC, run_id ASC",
-        )
-        .bind("")
-        .fetch_all(&mut *connection)
-        .await?;
-        let mut roots = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let namespace_id: Uuid = row.try_get("namespace_id")?;
-            let business_id: String = row.try_get("business_id")?;
-            let run_id: Uuid = row.try_get("run_id")?;
-            let root = if row.try_get::<Option<i32>, _>("data_parts")?.is_none() {
-                let metadata_blob: Vec<u8> = row.try_get("metadata")?;
-                Some(ChasmNode {
-                    metadata: codec::decode(&metadata_blob)?,
-                    data: row.try_get("data")?,
-                })
-            } else {
-                // A root stored in parts is read again with its parts, in a
-                // snapshot of its own; each execution's root is independent of
-                // the others'. An execution deleted since the scan's read is left
-                // out, as if the scan had come a moment later.
-                Self::read_nodes_in_snapshot(
-                    &mut permit,
-                    (namespace_id, &business_id, run_id),
-                    Nodes::At(""),
+        in_operation(
+            tracing::debug_span!("dsql.chasm_node.scan_executions"),
+            async move {
+                let mut permit = self.director.acquire(DbClass::Read).await?;
+                let connection = permit.connection()?;
+                // Every execution's root component node (encoded_path = ROOT_PATH, b""),
+                // ordered deterministically for the repair scanner (Req 10.11; AGENTS
+                // determinism). The root is the empty text key.
+                let rows = sqlx::query(
+                    "SELECT namespace_id, business_id, run_id, metadata, data, data_parts
+                 FROM chasm_node
+                 WHERE encoded_path = $1
+                 ORDER BY namespace_id ASC, business_id ASC, run_id ASC",
                 )
-                .await?
-                .pop()
-                .map(|(_, root)| root)
-            };
-            if let Some(root) = root {
-                let key =
-                    ExecutionKey::new(namespace_id.to_string(), business_id, run_id.to_string());
-                roots.push((key, root));
-            }
-        }
-        Ok(roots)
+                .bind("")
+                .fetch_all(&mut *connection)
+                .await?;
+                let mut roots = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    let namespace_id: Uuid = row.try_get("namespace_id")?;
+                    let business_id: String = row.try_get("business_id")?;
+                    let run_id: Uuid = row.try_get("run_id")?;
+                    let root = if row.try_get::<Option<i32>, _>("data_parts")?.is_none() {
+                        let metadata_blob: Vec<u8> = row.try_get("metadata")?;
+                        Some(ChasmNode {
+                            metadata: codec::decode(&metadata_blob)?,
+                            data: row.try_get("data")?,
+                        })
+                    } else {
+                        // A root stored in parts is read again with its parts, in a
+                        // snapshot of its own; each execution's root is independent of
+                        // the others'. An execution deleted since the scan's read is left
+                        // out, as if the scan had come a moment later.
+                        Self::read_nodes_in_snapshot(
+                            &mut permit,
+                            (namespace_id, &business_id, run_id),
+                            Nodes::At(""),
+                        )
+                        .await?
+                        .pop()
+                        .map(|(_, root)| root)
+                    };
+                    if let Some(root) = root {
+                        let key = ExecutionKey::new(
+                            namespace_id.to_string(),
+                            business_id,
+                            run_id.to_string(),
+                        );
+                        roots.push((key, root));
+                    }
+                }
+                Ok(roots)
+            },
+        )
+        .await
     }
 }
 

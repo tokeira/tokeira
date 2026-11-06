@@ -10,6 +10,17 @@ use aurora_dsql_sqlx_connector::{DsqlConnectOptions, DsqlError};
 use sqlx::PgConnection;
 use thiserror::Error;
 
+/// The front of every connection's `application_name`, which names Tokeira and
+/// its release to the cluster. Database Insights attributes load and plans by
+/// `application_name`, so an operator can tell Tokeira's statements from every
+/// other client's, and one release's from the next.
+///
+/// The connector sets `application_name` itself, after any value in the
+/// options, to `{ormPrefix}:aurora-dsql-rust-sqlx/{its version}`; its
+/// `ormPrefix` parameter is the one place a client name goes
+/// (aurora-dsql-sqlx-connector 0.2.2, `src/util.rs`, `build_application_name`).
+pub const APPLICATION_NAME_PREFIX: &str = concat!("tokeira/", env!("CARGO_PKG_VERSION"));
+
 /// Creates IAM-authenticated connections from endpoint and region configuration.
 #[derive(Clone, Debug)]
 pub struct ConnectionFactory {
@@ -20,11 +31,11 @@ impl ConnectionFactory {
     /// Build connector options for the DSQL admin database.
     ///
     /// Aurora DSQL uses IAM authentication through the connector, not a stored
-    /// password in the URL. The URL therefore carries endpoint and region only.
+    /// password in the URL. The URL therefore carries endpoint and region, and
+    /// the [`APPLICATION_NAME_PREFIX`] the connector puts before its own name.
     pub fn new(endpoint: &str, region: &str) -> Result<Self> {
         let connection_string = format!(
-            "postgres://admin@{}:5432/postgres?region={}",
-            endpoint, region
+            "postgres://admin@{endpoint}:5432/postgres?region={region}&ormPrefix={APPLICATION_NAME_PREFIX}"
         );
         let options = DsqlConnectOptions::from_connection_string(&connection_string)?;
         Ok(Self { options })
@@ -129,7 +140,22 @@ mod tests {
     use aurora_dsql_sqlx_connector::DsqlError;
     use proptest::prelude::*;
 
-    use super::ConnectionFactoryError;
+    use super::{APPLICATION_NAME_PREFIX, ConnectionFactory, ConnectionFactoryError};
+
+    // The prefix travels as a query value, where `+` decodes to a space and `&`
+    // ends it, and PostgreSQL truncates `application_name` past 63 bytes.
+    #[test]
+    fn application_name_survives_the_connection_string_and_the_server_limit() {
+        assert!(
+            APPLICATION_NAME_PREFIX
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"./-_".contains(&byte)),
+            "{APPLICATION_NAME_PREFIX}"
+        );
+        let connector_name = ":aurora-dsql-rust-sqlx/0.2.2";
+        assert!(APPLICATION_NAME_PREFIX.len() + connector_name.len() <= 63);
+        assert!(ConnectionFactory::new("example.dsql.us-east-1.on.aws", "us-east-1").is_ok());
+    }
 
     #[test]
     fn dsql_error_classification_returns_stable_categories() {

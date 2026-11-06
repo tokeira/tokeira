@@ -5,6 +5,7 @@
 //! work without the runtime's existing token fence or correlation.
 
 use std::sync::Arc;
+use tokeira_observability::statement_accounting::in_operation;
 
 use async_trait::async_trait;
 use sqlx::Row;
@@ -100,69 +101,90 @@ impl DsqlWorkerTaskProvenanceStore {
     }
 }
 
+// Every method runs in a DEBUG span named `dsql.<store>.<method>`, the
+// operation the process's statement accounting charges its round trips to
+// (`tokeira_observability::statement_accounting`).
 #[async_trait]
 impl WorkerTaskProvenanceStore for DsqlWorkerTaskProvenanceStore {
     async fn put(
         &self,
         record: WorkerTaskProvenance,
     ) -> Result<ProvenancePut, WorkerTaskProvenanceError> {
-        let token_digest_key = key_codec::encode(&record.token_digest);
-        let mut permit = self
-            .director
-            .acquire(DbClass::Commit)
-            .await
-            .map_err(unavailable)?;
-        let result = sqlx::query(
-            "INSERT INTO worker_task_provenance
-             (token_digest, namespace_id, normal_task_queue, task_class, deployment_name,
-              build_id, expires_at, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             ON CONFLICT (token_digest) DO NOTHING",
+        in_operation(
+            tracing::debug_span!("dsql.worker_task_provenance.put"),
+            async move {
+                let token_digest_key = key_codec::encode(&record.token_digest);
+                let mut permit = self
+                    .director
+                    .acquire(DbClass::Commit)
+                    .await
+                    .map_err(unavailable)?;
+                let result = sqlx::query(
+                    "INSERT INTO worker_task_provenance
+                 (token_digest, namespace_id, normal_task_queue, task_class, deployment_name,
+                  build_id, expires_at, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT (token_digest) DO NOTHING",
+                )
+                .bind(token_digest_key)
+                .bind(record.origin.namespace_id.0)
+                .bind(&record.origin.normal_task_queue.0)
+                .bind(record.origin.task_class.to_db_smallint())
+                .bind(&record.origin.deployment.0)
+                .bind(&record.origin.build_id.0)
+                .bind(record.expires_at)
+                .bind(record.created_at)
+                .execute(permit.connection().map_err(unavailable)?)
+                .await
+                .map_err(unavailable)?;
+                drop(permit);
+                if result.rows_affected() == 1 {
+                    return Ok(ProvenancePut::Inserted);
+                }
+                match self.load_any(record.token_digest).await? {
+                    Some(existing) if existing == record => Ok(ProvenancePut::AlreadyPresent),
+                    Some(_) | None => Err(WorkerTaskProvenanceError::DigestConflict),
+                }
+            },
         )
-        .bind(token_digest_key)
-        .bind(record.origin.namespace_id.0)
-        .bind(&record.origin.normal_task_queue.0)
-        .bind(record.origin.task_class.to_db_smallint())
-        .bind(&record.origin.deployment.0)
-        .bind(&record.origin.build_id.0)
-        .bind(record.expires_at)
-        .bind(record.created_at)
-        .execute(permit.connection().map_err(unavailable)?)
         .await
-        .map_err(unavailable)?;
-        drop(permit);
-        if result.rows_affected() == 1 {
-            return Ok(ProvenancePut::Inserted);
-        }
-        match self.load_any(record.token_digest).await? {
-            Some(existing) if existing == record => Ok(ProvenancePut::AlreadyPresent),
-            Some(_) | None => Err(WorkerTaskProvenanceError::DigestConflict),
-        }
     }
 
     async fn get(
         &self,
         token_digest: [u8; 32],
     ) -> Result<Option<WorkerTaskProvenance>, WorkerTaskProvenanceError> {
-        Ok(self
-            .load_any(token_digest)
-            .await?
-            .filter(|record| record.expires_at > OffsetDateTime::now_utc()))
+        in_operation(
+            tracing::debug_span!("dsql.worker_task_provenance.get"),
+            async move {
+                Ok(self
+                    .load_any(token_digest)
+                    .await?
+                    .filter(|record| record.expires_at > OffsetDateTime::now_utc()))
+            },
+        )
+        .await
     }
 
     async fn delete(&self, token_digest: [u8; 32]) -> Result<(), WorkerTaskProvenanceError> {
-        let token_digest_key = key_codec::encode(&token_digest);
-        let mut permit = self
-            .director
-            .acquire(DbClass::Commit)
-            .await
-            .map_err(unavailable)?;
-        sqlx::query("DELETE FROM worker_task_provenance WHERE token_digest = $1")
-            .bind(token_digest_key)
-            .execute(permit.connection().map_err(unavailable)?)
-            .await
-            .map_err(unavailable)?;
-        Ok(())
+        in_operation(
+            tracing::debug_span!("dsql.worker_task_provenance.delete"),
+            async move {
+                let token_digest_key = key_codec::encode(&token_digest);
+                let mut permit = self
+                    .director
+                    .acquire(DbClass::Commit)
+                    .await
+                    .map_err(unavailable)?;
+                sqlx::query("DELETE FROM worker_task_provenance WHERE token_digest = $1")
+                    .bind(token_digest_key)
+                    .execute(permit.connection().map_err(unavailable)?)
+                    .await
+                    .map_err(unavailable)?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     async fn delete_expired(
@@ -170,29 +192,36 @@ impl WorkerTaskProvenanceStore for DsqlWorkerTaskProvenanceStore {
         now: OffsetDateTime,
         limit: usize,
     ) -> Result<usize, WorkerTaskProvenanceError> {
-        let limit = i64::try_from(limit).map_err(|_| corrupt("expiry delete limit exceeds i64"))?;
-        let mut permit = self
-            .director
-            .acquire(DbClass::Maintenance)
-            .await
-            .map_err(unavailable)?;
-        let result = sqlx::query(
-            "DELETE FROM worker_task_provenance
-             WHERE token_digest IN (
-                 SELECT token_digest
-                 FROM worker_task_provenance
-                 WHERE expires_at <= $1
-                 ORDER BY expires_at ASC, token_digest ASC
-                 LIMIT $2
-             )",
+        in_operation(
+            tracing::debug_span!("dsql.worker_task_provenance.delete_expired"),
+            async move {
+                let limit =
+                    i64::try_from(limit).map_err(|_| corrupt("expiry delete limit exceeds i64"))?;
+                let mut permit = self
+                    .director
+                    .acquire(DbClass::Maintenance)
+                    .await
+                    .map_err(unavailable)?;
+                let result = sqlx::query(
+                    "DELETE FROM worker_task_provenance
+                 WHERE token_digest IN (
+                     SELECT token_digest
+                     FROM worker_task_provenance
+                     WHERE expires_at <= $1
+                     ORDER BY expires_at ASC, token_digest ASC
+                     LIMIT $2
+                 )",
+                )
+                .bind(now)
+                .bind(limit)
+                .execute(permit.connection().map_err(unavailable)?)
+                .await
+                .map_err(unavailable)?;
+                usize::try_from(result.rows_affected())
+                    .map_err(|_| corrupt("deleted provenance row count exceeds usize"))
+            },
         )
-        .bind(now)
-        .bind(limit)
-        .execute(permit.connection().map_err(unavailable)?)
         .await
-        .map_err(unavailable)?;
-        usize::try_from(result.rows_affected())
-            .map_err(|_| corrupt("deleted provenance row count exceeds usize"))
     }
 }
 

@@ -143,6 +143,8 @@ Connection metrics use existing `tokeira_dsql_pool_*` names where a signal alrea
 
 These metrics are emitted unconditionally through the `metrics` crate. Operators should read empty-reservoir rate as immediate storage backpressure and slot-block loss as reduced node capacity.
 
+What a connection is used for is counted in round trips. `tokeira_dsql_operation_round_trips` records, for each DSQL operation, the statements it sent plus the BEGIN of each transaction, one sample per transaction it ended, labelled by operation, by the command or request that caused it, and by whether the transaction committed or rolled back. The process's tracing subscriber counts them from SQLx's statement events, whatever the log filter (`tokeira_observability::statement_accounting`). `tokeira_dsql_unattributed_statements_total` counts statements sent outside every operation and should stay at zero. A commit's latency is mostly its round trips, so a rise in a commit's samples is a rise in its latency, and `rolled_back` samples are round trips spent on attempts that lost.
+
 ## Shutdown
 
 The reservoir aborts its background tasks on drop. It also exposes explicit shutdown paths through `Reservoir::shutdown`, `DsqlConnectionDirector::shutdown`, and `DsqlStore::shutdown` so embedding code can release DynamoDB slot blocks before dropping the store.

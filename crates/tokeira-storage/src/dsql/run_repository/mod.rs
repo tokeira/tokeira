@@ -7,6 +7,7 @@
 //! trait in terms of runs, history, leases, dispatch, and sweep entries.
 
 use std::{sync::Arc, time::Instant};
+use tokeira_observability::statement_accounting::in_operation;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -571,6 +572,13 @@ fn classify_connection_error(error: &anyhow::Error) -> Option<&'static str> {
         })
 }
 
+// Every method runs in a DEBUG span `dsql.<method>`. The process's statement
+// accounting charges a statement's round trip to the outermost `dsql.*` span
+// around it (`tokeira_observability::statement_accounting`), so these spans
+// make a round trip's operation the repository call the engine made, and leave
+// no statement unattributed. The INFO spans inside some methods keep their
+// fields for logs and traces; DEBUG keeps these out of both at the default
+// filter.
 #[async_trait]
 impl RunRepository for DsqlRunRepository {
     async fn read_published_preparations(
@@ -580,8 +588,14 @@ impl RunRepository for DsqlRunRepository {
         after: Option<uuid::Uuid>,
         limit: usize,
     ) -> anyhow::Result<crate::OutboundPage<uuid::Uuid, crate::PreparationToken>> {
-        self.do_published_preparations(home, bound, after, limit)
-            .await
+        in_operation(
+            tracing::debug_span!("dsql.read_published_preparations"),
+            async move {
+                self.do_published_preparations(home, bound, after, limit)
+                    .await
+            },
+        )
+        .await
     }
 
     async fn complete_run_preparation(
@@ -589,7 +603,11 @@ impl RunRepository for DsqlRunRepository {
         token: crate::PreparationToken,
         fence: crate::WriteFence,
     ) -> anyhow::Result<bool> {
-        self.do_complete_preparation(token, fence).await
+        in_operation(
+            tracing::debug_span!("dsql.complete_run_preparation"),
+            async move { self.do_complete_preparation(token, fence).await },
+        )
+        .await
     }
 
     async fn commit_successor_fallback(
@@ -599,35 +617,54 @@ impl RunRepository for DsqlRunRepository {
         start: Box<tokeira_kernel::StartRequest>,
         fence: crate::WriteFence,
     ) -> anyhow::Result<crate::CommitResult> {
-        Box::pin(self.do_commit_successor_fallback(run, closing, start, fence)).await
+        in_operation(tracing::debug_span!("dsql.commit_successor_fallback"), async move {
+            Box::pin(self.do_commit_successor_fallback(run, closing, start, fence)).await
+        })
+        .await
     }
 
     async fn find_run_preparation(
         &self,
         request_key: &str,
     ) -> Result<Option<crate::PreparationToken>> {
-        self.do_find_run_preparation(request_key).await
+        in_operation(
+            tracing::debug_span!("dsql.find_run_preparation"),
+            async move { self.do_find_run_preparation(request_key).await },
+        )
+        .await
     }
     async fn prepare_run_publication(
         &self,
         preparation: Box<crate::RunPreparation>,
         fence: WriteFence,
     ) -> Result<crate::PreparationToken> {
-        Box::pin(self.do_prepare_publication(preparation, fence)).await
+        in_operation(
+            tracing::debug_span!("dsql.prepare_run_publication"),
+            async move { Box::pin(self.do_prepare_publication(preparation, fence)).await },
+        )
+        .await
     }
     async fn publish_prepared_run(
         &self,
         token: crate::PreparationToken,
         fence: WriteFence,
     ) -> Result<crate::PublicationResult> {
-        Box::pin(self.do_publish_preparation(token, fence)).await
+        in_operation(
+            tracing::debug_span!("dsql.publish_prepared_run"),
+            async move { Box::pin(self.do_publish_preparation(token, fence)).await },
+        )
+        .await
     }
     async fn abandon_prepared_run(
         &self,
         token: crate::PreparationToken,
         fence: WriteFence,
     ) -> Result<bool> {
-        self.do_abandon_preparation(token, fence).await
+        in_operation(
+            tracing::debug_span!("dsql.abandon_prepared_run"),
+            async move { self.do_abandon_preparation(token, fence).await },
+        )
+        .await
     }
 
     async fn read_operation_page(
@@ -638,8 +675,14 @@ impl RunRepository for DsqlRunRepository {
         after: Option<tokeira_kernel::OperationKey>,
         limit: usize,
     ) -> Result<crate::OutboundPage<tokeira_kernel::OperationKey, crate::OperationRow>> {
-        self.do_read_operation_page(home, kind, bound, after, limit)
-            .await
+        in_operation(
+            tracing::debug_span!("dsql.read_operation_page"),
+            async move {
+                self.do_read_operation_page(home, kind, bound, after, limit)
+                    .await
+            },
+        )
+        .await
     }
     async fn read_intent_page(
         &self,
@@ -648,10 +691,16 @@ impl RunRepository for DsqlRunRepository {
         after: Option<crate::IntentKey>,
         limit: usize,
     ) -> Result<crate::OutboundPage<crate::IntentKey, crate::IntentDescriptor>> {
-        self.do_read_intent_page(home, bound, after, limit).await
+        in_operation(tracing::debug_span!("dsql.read_intent_page"), async move {
+            self.do_read_intent_page(home, bound, after, limit).await
+        })
+        .await
     }
     async fn load_intent(&self, key: crate::IntentKey) -> Result<Option<crate::IntentRow>> {
-        self.do_load_intent(key).await
+        in_operation(tracing::debug_span!("dsql.load_intent"), async move {
+            self.do_load_intent(key).await
+        })
+        .await
     }
     async fn reconcile_outbound_run(
         &self,
@@ -659,21 +708,32 @@ impl RunRepository for DsqlRunRepository {
         run: RunKey,
         fence: WriteFence,
     ) -> Result<()> {
-        self.do_reconcile_outbound_run(home, run, fence).await
+        in_operation(
+            tracing::debug_span!("dsql.reconcile_outbound_run"),
+            async move { self.do_reconcile_outbound_run(home, run, fence).await },
+        )
+        .await
     }
     async fn expand_close_batch(
         &self,
         key: crate::IntentKey,
         fence: crate::WriteFence,
     ) -> anyhow::Result<bool> {
-        self.do_expand_close_batch(key, fence).await
+        in_operation(
+            tracing::debug_span!("dsql.expand_close_batch"),
+            async move { self.do_expand_close_batch(key, fence).await },
+        )
+        .await
     }
     async fn retire_intent(
         &self,
         proof: crate::IntentRetirement,
         fence: WriteFence,
     ) -> Result<bool> {
-        self.do_retire_intent(proof, fence).await
+        in_operation(tracing::debug_span!("dsql.retire_intent"), async move {
+            self.do_retire_intent(proof, fence).await
+        })
+        .await
     }
     async fn commit_outbound_transition(
         &self,
@@ -683,7 +743,19 @@ impl RunRepository for DsqlRunRepository {
         source_fence: WriteFence,
         fence: WriteFence,
     ) -> Result<CommitResult> {
-        Box::pin(self.do_commit_guarded(run, transition, Some((guard, source_fence)), fence)).await
+        in_operation(
+            tracing::debug_span!("dsql.commit_outbound_transition"),
+            async move {
+                Box::pin(self.do_commit_guarded(
+                    run,
+                    transition,
+                    Some((guard, source_fence)),
+                    fence,
+                ))
+                .await
+            },
+        )
+        .await
     }
 
     // Allocate before constructing the erased future. An async-trait body would
@@ -722,18 +794,30 @@ impl RunRepository for DsqlRunRepository {
             .load(std::sync::atomic::Ordering::Acquire)
     }
     async fn ensure_outbound_prepared(&self) -> Result<()> {
-        self.do_ensure_outbound_prepared().await
+        in_operation(
+            tracing::debug_span!("dsql.ensure_outbound_prepared"),
+            async move { self.do_ensure_outbound_prepared().await },
+        )
+        .await
     }
     async fn outbound_upgrade_status(
         &self,
     ) -> Result<crate::outbound_upgrade::OutboundUpgradeStatus> {
-        self.do_outbound_upgrade_status().await
+        in_operation(
+            tracing::debug_span!("dsql.outbound_upgrade_status"),
+            async move { self.do_outbound_upgrade_status().await },
+        )
+        .await
     }
     async fn read_outbound_upgrade_run(
         &self,
         after: Option<RunKey>,
     ) -> Result<Option<WorkflowState>> {
-        self.do_read_outbound_upgrade_run(after).await
+        in_operation(
+            tracing::debug_span!("dsql.read_outbound_upgrade_run"),
+            async move { self.do_read_outbound_upgrade_run(after).await },
+        )
+        .await
     }
     async fn commit_outbound_upgrade_page(
         &self,
@@ -741,16 +825,29 @@ impl RunRepository for DsqlRunRepository {
         next: crate::outbound_upgrade::OutboundUpgradeProgress,
         write: Option<crate::outbound_upgrade::OutboundUpgradeWrite>,
     ) -> Result<()> {
-        self.do_commit_outbound_upgrade_page(expected, next, write)
-            .await
+        in_operation(
+            tracing::debug_span!("dsql.commit_outbound_upgrade_page"),
+            async move {
+                self.do_commit_outbound_upgrade_page(expected, next, write)
+                    .await
+            },
+        )
+        .await
     }
 
     async fn prepare_placement_page(&self) -> Result<crate::PlacementPage> {
-        self.do_prepare_placement_page().await
+        in_operation(
+            tracing::debug_span!("dsql.prepare_placement_page"),
+            async move { self.do_prepare_placement_page().await },
+        )
+        .await
     }
 
     async fn resolve_execution(&self, execution: &ExecutionRef) -> Result<Option<RunKey>> {
-        self.do_resolve_execution(execution).await
+        in_operation(tracing::debug_span!("dsql.resolve_execution"), async move {
+            self.do_resolve_execution(execution).await
+        })
+        .await
     }
 
     async fn find_latest_run(
@@ -758,15 +855,25 @@ impl RunRepository for DsqlRunRepository {
         namespace_id: NamespaceId,
         workflow_id: &WorkflowId,
     ) -> Result<Option<RunKey>> {
-        self.do_find_latest_run(namespace_id, workflow_id).await
+        in_operation(tracing::debug_span!("dsql.find_latest_run"), async move {
+            self.do_find_latest_run(namespace_id, workflow_id).await
+        })
+        .await
     }
 
     async fn list_runs_for_namespace(&self, namespace_id: NamespaceId) -> Result<Vec<RunKey>> {
-        self.do_list_runs_for_namespace(namespace_id).await
+        in_operation(
+            tracing::debug_span!("dsql.list_runs_for_namespace"),
+            async move { self.do_list_runs_for_namespace(namespace_id).await },
+        )
+        .await
     }
 
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
-        self.do_load_run(run_key).await
+        in_operation(tracing::debug_span!("dsql.load_run"), async move {
+            self.do_load_run(run_key).await
+        })
+        .await
     }
 
     async fn validate_activity_start_observation(
@@ -776,50 +883,69 @@ impl RunRepository for DsqlRunRepository {
         home: ShardId,
         fence: WriteFence,
     ) -> Result<bool> {
-        match self
-            .do_validate_activity_start_observation(observed, activity_id, home, &fence)
-            .await
-        {
-            // Resolution or takeover changed the read set: ask the bounded
-            // owner loop to reread authority, never return an unvalidated replay.
-            Err(error)
-                if error
-                    .downcast_ref::<sqlx::Error>()
-                    .is_some_and(Self::is_serialization_failure) =>
-            {
-                Ok(false)
-            }
-            result => result,
-        }
+        in_operation(
+            tracing::debug_span!("dsql.validate_activity_start_observation"),
+            async move {
+                match self
+                    .do_validate_activity_start_observation(observed, activity_id, home, &fence)
+                    .await
+                {
+                    // Resolution or takeover changed the read set: ask the bounded
+                    // owner loop to reread authority, never return an unvalidated replay.
+                    Err(error)
+                        if error
+                            .downcast_ref::<sqlx::Error>()
+                            .is_some_and(Self::is_serialization_failure) =>
+                    {
+                        Ok(false)
+                    }
+                    result => result,
+                }
+            },
+        )
+        .await
     }
 
     async fn load_outbound_source(&self, run: RunKey) -> Result<LoadedRun> {
-        match self.do_load_run(run).await? {
-            LoadedRun::Existing(state) => Ok(LoadedRun::Existing(state)),
-            LoadedRun::Absent => {
-                let mut permit = self.director.acquire(DbClass::Read).await?;
-                let mut tx = permit.begin_read_only().await?;
-                let row = sqlx::query_as::<_, (Vec<u8>, Option<i32>)>(
-                    "SELECT state_data,state_parts FROM outbound_retained_run WHERE run_key=$1",
-                )
-                .bind(run.0)
-                .fetch_optional(&mut *tx)
-                .await?;
-                let result = match row {
-                    Some((first, parts)) => LoadedRun::Existing(codec::decode_workflow_state(
-                        run,
-                        &run_value_parts::join_state(&mut tx, run, first, parts).await?,
-                    )?),
-                    None => LoadedRun::Absent,
-                };
-                tx.commit().await?;
-                Ok(result)
-            }
-        }
+        in_operation(
+            tracing::debug_span!("dsql.load_outbound_source"),
+            async move {
+                match self.do_load_run(run).await? {
+                    LoadedRun::Existing(state) => Ok(LoadedRun::Existing(state)),
+                    LoadedRun::Absent => {
+                        let mut permit = self.director.acquire(DbClass::Read).await?;
+                        let mut tx = permit.begin_read_only().await?;
+                        let row = sqlx::query_as::<_, (Vec<u8>, Option<i32>)>(
+                        "SELECT state_data,state_parts FROM outbound_retained_run WHERE run_key=$1",
+                    )
+                    .bind(run.0)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                        let result = match row {
+                            Some((first, parts)) => {
+                                LoadedRun::Existing(codec::decode_workflow_state(
+                                    run,
+                                    &run_value_parts::join_state(&mut tx, run, first, parts)
+                                        .await?,
+                                )?)
+                            }
+                            None => LoadedRun::Absent,
+                        };
+                        tx.commit().await?;
+                        Ok(result)
+                    }
+                }
+            },
+        )
+        .await
     }
 
     async fn load_run_with_stats(&self, run_key: RunKey) -> Result<(LoadedRun, RunHistoryStats)> {
-        self.do_load_run_with_stats(run_key).await
+        in_operation(
+            tracing::debug_span!("dsql.load_run_with_stats"),
+            async move { self.do_load_run_with_stats(run_key).await },
+        )
+        .await
     }
 
     async fn read_history(
@@ -828,7 +954,10 @@ impl RunRepository for DsqlRunRepository {
         after_event_id: i64,
         limit: usize,
     ) -> Result<Vec<HistoryEvent>> {
-        self.do_read_history(run_key, after_event_id, limit).await
+        in_operation(tracing::debug_span!("dsql.read_history"), async move {
+            self.do_read_history(run_key, after_event_id, limit).await
+        })
+        .await
     }
 
     async fn read_history_event(
@@ -836,7 +965,11 @@ impl RunRepository for DsqlRunRepository {
         run_key: RunKey,
         event_id: i64,
     ) -> Result<Option<HistoryEvent>> {
-        self.do_read_history_event(run_key, event_id).await
+        in_operation(
+            tracing::debug_span!("dsql.read_history_event"),
+            async move { self.do_read_history_event(run_key, event_id).await },
+        )
+        .await
     }
 
     async fn read_attributed_history(
@@ -845,8 +978,14 @@ impl RunRepository for DsqlRunRepository {
         after_event_id: i64,
         limit: usize,
     ) -> Result<Vec<AttributedHistoryEvent>> {
-        self.do_read_attributed_history(run_key, after_event_id, limit)
-            .await
+        in_operation(
+            tracing::debug_span!("dsql.read_attributed_history"),
+            async move {
+                self.do_read_attributed_history(run_key, after_event_id, limit)
+                    .await
+            },
+        )
+        .await
     }
 
     async fn lookup_request_dedupe(
@@ -854,11 +993,19 @@ impl RunRepository for DsqlRunRepository {
         execution: &ExecutionRef,
         request_id: &RequestId,
     ) -> Result<Option<RequestRecord>> {
-        self.do_lookup_request_dedupe(execution, request_id).await
+        in_operation(
+            tracing::debug_span!("dsql.lookup_request_dedupe"),
+            async move { self.do_lookup_request_dedupe(execution, request_id).await },
+        )
+        .await
     }
 
     async fn read_transition_audit(&self, run_key: RunKey) -> Result<Vec<TransitionAuditRecord>> {
-        self.do_read_transition_audit(run_key).await
+        in_operation(
+            tracing::debug_span!("dsql.read_transition_audit"),
+            async move { self.do_read_transition_audit(run_key).await },
+        )
+        .await
     }
 
     async fn has_open_pinned_workflows(
@@ -866,8 +1013,14 @@ impl RunRepository for DsqlRunRepository {
         namespace_id: NamespaceId,
         version: &WorkerDeploymentVersionKey,
     ) -> Result<bool> {
-        self.do_has_open_pinned_workflows(namespace_id, version)
-            .await
+        in_operation(
+            tracing::debug_span!("dsql.has_open_pinned_workflows"),
+            async move {
+                self.do_has_open_pinned_workflows(namespace_id, version)
+                    .await
+            },
+        )
+        .await
     }
 
     async fn create_workflow_rule(
@@ -876,8 +1029,14 @@ impl RunRepository for DsqlRunRepository {
         rule: WorkflowRuleRecord,
         max_rules: usize,
     ) -> Result<WorkflowRuleCreateResult> {
-        self.do_create_workflow_rule(namespace_id, rule, max_rules)
-            .await
+        in_operation(
+            tracing::debug_span!("dsql.create_workflow_rule"),
+            async move {
+                self.do_create_workflow_rule(namespace_id, rule, max_rules)
+                    .await
+            },
+        )
+        .await
     }
 
     async fn get_workflow_rule(
@@ -885,7 +1044,10 @@ impl RunRepository for DsqlRunRepository {
         namespace_id: NamespaceId,
         rule_id: &str,
     ) -> Result<Option<WorkflowRuleRecord>> {
-        self.do_get_workflow_rule(namespace_id, rule_id).await
+        in_operation(tracing::debug_span!("dsql.get_workflow_rule"), async move {
+            self.do_get_workflow_rule(namespace_id, rule_id).await
+        })
+        .await
     }
 
     async fn delete_workflow_rule(
@@ -893,14 +1055,22 @@ impl RunRepository for DsqlRunRepository {
         namespace_id: NamespaceId,
         rule_id: &str,
     ) -> Result<WorkflowRuleDeleteResult> {
-        self.do_delete_workflow_rule(namespace_id, rule_id).await
+        in_operation(
+            tracing::debug_span!("dsql.delete_workflow_rule"),
+            async move { self.do_delete_workflow_rule(namespace_id, rule_id).await },
+        )
+        .await
     }
 
     async fn list_workflow_rules(
         &self,
         namespace_id: NamespaceId,
     ) -> Result<Vec<WorkflowRuleRecord>> {
-        self.do_list_workflow_rules(namespace_id).await
+        in_operation(
+            tracing::debug_span!("dsql.list_workflow_rules"),
+            async move { self.do_list_workflow_rules(namespace_id).await },
+        )
+        .await
     }
 
     async fn commit_transition(
@@ -909,12 +1079,15 @@ impl RunRepository for DsqlRunRepository {
         transition: Transition,
         fence: WriteFence,
     ) -> Result<CommitResult> {
-        if crate::read_probe::reject_commit(run_key) {
-            return Ok(CommitResult::Conflict {
-                reason: "read-baseline injected OCC conflict".into(),
-            });
-        }
-        self.do_commit_transition(run_key, transition, fence).await
+        in_operation(tracing::debug_span!("dsql.commit_transition"), async move {
+            if crate::read_probe::reject_commit(run_key) {
+                return Ok(CommitResult::Conflict {
+                    reason: "read-baseline injected OCC conflict".into(),
+                });
+            }
+            self.do_commit_transition(run_key, transition, fence).await
+        })
+        .await
     }
 
     async fn commit_transition_for_bundle(
@@ -924,13 +1097,24 @@ impl RunRepository for DsqlRunRepository {
         transition: Transition,
         fence: WriteFence,
     ) -> Result<CommitResult> {
-        if crate::read_probe::reject_commit(run_key) {
-            return Ok(CommitResult::Conflict {
-                reason: "read-baseline injected OCC conflict".into(),
-            });
-        }
-        self.do_commit_transition_for_bundle(run_key, execution_home_bundle, transition, fence)
-            .await
+        in_operation(
+            tracing::debug_span!("dsql.commit_transition_for_bundle"),
+            async move {
+                if crate::read_probe::reject_commit(run_key) {
+                    return Ok(CommitResult::Conflict {
+                        reason: "read-baseline injected OCC conflict".into(),
+                    });
+                }
+                self.do_commit_transition_for_bundle(
+                    run_key,
+                    execution_home_bundle,
+                    transition,
+                    fence,
+                )
+                .await
+            },
+        )
+        .await
     }
 
     async fn delete_run_for_bundle(
@@ -940,8 +1124,14 @@ impl RunRepository for DsqlRunRepository {
         request: DeleteRunRequest,
         fence: WriteFence,
     ) -> Result<DeleteRunResult> {
-        self.do_delete_run_for_bundle(run_key, execution_home_bundle, request, fence)
-            .await
+        in_operation(
+            tracing::debug_span!("dsql.delete_run_for_bundle"),
+            async move {
+                self.do_delete_run_for_bundle(run_key, execution_home_bundle, request, fence)
+                    .await
+            },
+        )
+        .await
     }
 
     async fn materialize_reset_successor(
@@ -952,22 +1142,35 @@ impl RunRepository for DsqlRunRepository {
         expected_current: Option<RunKey>,
         fence: WriteFence,
     ) -> Result<()> {
-        self.do_materialize_reset_successor(
-            base_run_key,
-            fork_event_id,
-            successor_run_id,
-            expected_current,
-            fence,
+        in_operation(
+            tracing::debug_span!("dsql.materialize_reset_successor"),
+            async move {
+                self.do_materialize_reset_successor(
+                    base_run_key,
+                    fork_event_id,
+                    successor_run_id,
+                    expected_current,
+                    fence,
+                )
+                .await
+            },
         )
         .await
     }
 
     async fn abandon_materialization(&self, run_key: RunKey, fence: WriteFence) -> Result<()> {
-        self.do_abandon_materialization(run_key, &fence).await
+        in_operation(
+            tracing::debug_span!("dsql.abandon_materialization"),
+            async move { self.do_abandon_materialization(run_key, &fence).await },
+        )
+        .await
     }
 
     async fn purge_run(&self, run_key: RunKey) -> Result<()> {
-        self.do_purge_run(run_key).await
+        in_operation(tracing::debug_span!("dsql.purge_run"), async move {
+            self.do_purge_run(run_key).await
+        })
+        .await
     }
 
     async fn list_run_bulk_writes(
@@ -976,7 +1179,11 @@ impl RunRepository for DsqlRunRepository {
         after: Option<RunKey>,
         limit: usize,
     ) -> Result<Vec<crate::RunBulkWrite>> {
-        self.do_list_run_bulk_writes(shard_id, after, limit).await
+        in_operation(
+            tracing::debug_span!("dsql.list_run_bulk_writes"),
+            async move { self.do_list_run_bulk_writes(shard_id, after, limit).await },
+        )
+        .await
     }
 
     async fn reconcile_workflow_dispatch_run(
@@ -985,18 +1192,24 @@ impl RunRepository for DsqlRunRepository {
         run_key: RunKey,
         fence: WriteFence,
     ) -> Result<()> {
-        self.do_reconcile_workflow_dispatch_run(home, run_key, &fence)
-            .await
-            .map_err(|error| {
-                if error
-                    .downcast_ref::<sqlx::Error>()
-                    .is_some_and(Self::is_serialization_failure)
-                {
-                    crate::WorkflowDispatchRepairConflict.into()
-                } else {
-                    error
-                }
-            })
+        in_operation(
+            tracing::debug_span!("dsql.reconcile_workflow_dispatch_run"),
+            async move {
+                self.do_reconcile_workflow_dispatch_run(home, run_key, &fence)
+                    .await
+                    .map_err(|error| {
+                        if error
+                            .downcast_ref::<sqlx::Error>()
+                            .is_some_and(Self::is_serialization_failure)
+                        {
+                            crate::WorkflowDispatchRepairConflict.into()
+                        } else {
+                            error
+                        }
+                    })
+            },
+        )
+        .await
     }
 
     async fn reconcile_activity_dispatch_page(
@@ -1006,18 +1219,24 @@ impl RunRepository for DsqlRunRepository {
         after: Option<crate::ActivityRepairCursor>,
         fence: WriteFence,
     ) -> Result<crate::ActivityRepairPage> {
-        self.do_reconcile_activity_dispatch_page(home, run_key, after, &fence)
-            .await
-            .map_err(|error| {
-                if error
-                    .downcast_ref::<sqlx::Error>()
-                    .is_some_and(Self::is_serialization_failure)
-                {
-                    crate::ActivityDispatchRepairConflict.into()
-                } else {
-                    error
-                }
-            })
+        in_operation(
+            tracing::debug_span!("dsql.reconcile_activity_dispatch_page"),
+            async move {
+                self.do_reconcile_activity_dispatch_page(home, run_key, after, &fence)
+                    .await
+                    .map_err(|error| {
+                        if error
+                            .downcast_ref::<sqlx::Error>()
+                            .is_some_and(Self::is_serialization_failure)
+                        {
+                            crate::ActivityDispatchRepairConflict.into()
+                        } else {
+                            error
+                        }
+                    })
+            },
+        )
+        .await
     }
 
     /// Read one fixed-cutoff queue-family page without claiming or mutating work.
@@ -1029,8 +1248,14 @@ impl RunRepository for DsqlRunRepository {
         after: Option<crate::ActivityDispatchPosition>,
         limit: std::num::NonZeroU32,
     ) -> Result<crate::ActivityDispatchPage> {
-        self.do_list_activity_dispatch_page(range, cutoff, after, limit)
-            .await
+        in_operation(
+            tracing::debug_span!("dsql.list_activity_dispatch_page"),
+            async move {
+                self.do_list_activity_dispatch_page(range, cutoff, after, limit)
+                    .await
+            },
+        )
+        .await
     }
 
     /// Enumerate every physical activity slot for a home, including legacy/orphan rows.
@@ -1040,8 +1265,14 @@ impl RunRepository for DsqlRunRepository {
         after: Option<crate::ActivityHomePosition>,
         limit: std::num::NonZeroU32,
     ) -> Result<crate::ActivityHomePage> {
-        self.do_list_activity_dispatch_home_page(home, after, limit)
-            .await
+        in_operation(
+            tracing::debug_span!("dsql.list_activity_dispatch_home_page"),
+            async move {
+                self.do_list_activity_dispatch_home_page(home, after, limit)
+                    .await
+            },
+        )
+        .await
     }
 
     async fn list_workflow_dispatch_page(
@@ -1050,8 +1281,14 @@ impl RunRepository for DsqlRunRepository {
         after: Option<crate::WorkflowDispatchPosition>,
         limit: std::num::NonZeroU32,
     ) -> Result<crate::WorkflowDispatchPage> {
-        self.do_list_workflow_dispatch_page(range, after, limit)
-            .await
+        in_operation(
+            tracing::debug_span!("dsql.list_workflow_dispatch_page"),
+            async move {
+                self.do_list_workflow_dispatch_page(range, after, limit)
+                    .await
+            },
+        )
+        .await
     }
 
     async fn list_workflow_dispatch_for_home(
@@ -1060,8 +1297,14 @@ impl RunRepository for DsqlRunRepository {
         after: Option<RunKey>,
         limit: std::num::NonZeroU32,
     ) -> Result<Vec<RunKey>> {
-        self.do_list_workflow_dispatch_for_home(home, after, limit)
-            .await
+        in_operation(
+            tracing::debug_span!("dsql.list_workflow_dispatch_for_home"),
+            async move {
+                self.do_list_workflow_dispatch_for_home(home, after, limit)
+                    .await
+            },
+        )
+        .await
     }
 
     async fn list_sticky_workflow_dispatch(
@@ -1070,8 +1313,14 @@ impl RunRepository for DsqlRunRepository {
         after: Option<RunKey>,
         limit: std::num::NonZeroU32,
     ) -> Result<crate::StickyWorkflowDispatchPage> {
-        self.do_list_sticky_workflow_dispatch(home, after, limit)
-            .await
+        in_operation(
+            tracing::debug_span!("dsql.list_sticky_workflow_dispatch"),
+            async move {
+                self.do_list_sticky_workflow_dispatch(home, after, limit)
+                    .await
+            },
+        )
+        .await
     }
 
     async fn list_dispatchable_workflow_tasks(
@@ -1079,7 +1328,11 @@ impl RunRepository for DsqlRunRepository {
         queue: &QueueKey,
         limit: usize,
     ) -> Result<Vec<DispatchableWorkflowTask>> {
-        self.do_list_dispatchable_workflow_tasks(queue, limit).await
+        in_operation(
+            tracing::debug_span!("dsql.list_dispatchable_workflow_tasks"),
+            async move { self.do_list_dispatchable_workflow_tasks(queue, limit).await },
+        )
+        .await
     }
 
     async fn list_due_dispatchable_activity_tasks(
@@ -1088,8 +1341,14 @@ impl RunRepository for DsqlRunRepository {
         now: OffsetDateTime,
         limit: usize,
     ) -> Result<Vec<DispatchableActivityTask>> {
-        self.do_list_due_dispatchable_activity_tasks(queue, now, limit)
-            .await
+        in_operation(
+            tracing::debug_span!("dsql.list_due_dispatchable_activity_tasks"),
+            async move {
+                self.do_list_due_dispatchable_activity_tasks(queue, now, limit)
+                    .await
+            },
+        )
+        .await
     }
 
     async fn list_all_dispatchable_activity_tasks(
@@ -1097,48 +1356,80 @@ impl RunRepository for DsqlRunRepository {
         queue: &QueueKey,
         limit: usize,
     ) -> Result<Vec<DispatchableActivityTask>> {
-        self.do_list_all_dispatchable_activity_tasks(queue, limit)
-            .await
+        in_operation(
+            tracing::debug_span!("dsql.list_all_dispatchable_activity_tasks"),
+            async move {
+                self.do_list_all_dispatchable_activity_tasks(queue, limit)
+                    .await
+            },
+        )
+        .await
     }
 
     async fn delete_activity_dispatch_if_matches(
         &self,
         candidate: &ActivityDispatchIdentity,
     ) -> Result<bool> {
-        self.do_delete_activity_dispatch_if_matches(candidate).await
+        in_operation(
+            tracing::debug_span!("dsql.delete_activity_dispatch_if_matches"),
+            async move { self.do_delete_activity_dispatch_if_matches(candidate).await },
+        )
+        .await
     }
 
     async fn persist_to_backlog(
         &self,
         entries: Vec<BacklogEntry>,
     ) -> std::result::Result<(), crate::BacklogPersistError> {
-        self.do_persist_to_backlog(entries).await
+        in_operation(
+            tracing::debug_span!("dsql.persist_to_backlog"),
+            async move { self.do_persist_to_backlog(entries).await },
+        )
+        .await
     }
 
     async fn drain_backlog(&self, queue: &QueueKey, limit: usize) -> Result<Vec<BacklogEntry>> {
-        self.do_drain_backlog(queue, limit).await
+        in_operation(tracing::debug_span!("dsql.drain_backlog"), async move {
+            self.do_drain_backlog(queue, limit).await
+        })
+        .await
     }
 
     async fn dispose_workflow_backlog_page(
         &self,
         after: Option<Uuid>,
     ) -> Result<crate::WorkflowBacklogDisposal> {
-        self.do_dispose_workflow_backlog_page(after).await
+        in_operation(
+            tracing::debug_span!("dsql.dispose_workflow_backlog_page"),
+            async move { self.do_dispose_workflow_backlog_page(after).await },
+        )
+        .await
     }
 
     async fn backlog_stats_by_priority(
         &self,
         queue: &QueueKey,
     ) -> Result<std::collections::BTreeMap<i16, crate::BacklogBandStats>> {
-        self.do_backlog_stats_by_priority(queue).await
+        in_operation(
+            tracing::debug_span!("dsql.backlog_stats_by_priority"),
+            async move { self.do_backlog_stats_by_priority(queue).await },
+        )
+        .await
     }
 
     async fn list_versioned_backlog_queue_keys(&self) -> Result<Vec<QueueKey>> {
-        self.do_list_versioned_backlog_queue_keys().await
+        in_operation(
+            tracing::debug_span!("dsql.list_versioned_backlog_queue_keys"),
+            async move { self.do_list_versioned_backlog_queue_keys().await },
+        )
+        .await
     }
 
     async fn list_due_timers(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<DueTimer>> {
-        self.do_list_due_timers(now, limit).await
+        in_operation(tracing::debug_span!("dsql.list_due_timers"), async move {
+            self.do_list_due_timers(now, limit).await
+        })
+        .await
     }
 
     async fn list_recovery_candidates_for_shard(
@@ -1147,8 +1438,14 @@ impl RunRepository for DsqlRunRepository {
         cursor: Option<&RecoveryCursor>,
         limit: usize,
     ) -> Result<RecoveryPage> {
-        self.do_list_recovery_candidates_for_shard(shard_id, cursor, limit)
-            .await
+        in_operation(
+            tracing::debug_span!("dsql.list_recovery_candidates_for_shard"),
+            async move {
+                self.do_list_recovery_candidates_for_shard(shard_id, cursor, limit)
+                    .await
+            },
+        )
+        .await
     }
 
     async fn list_due_dispatchable_activity_tasks_for_shard(
@@ -1158,8 +1455,14 @@ impl RunRepository for DsqlRunRepository {
         after: Option<&DueActivityDispatch>,
         limit: usize,
     ) -> Result<Vec<DueActivityDispatch>> {
-        self.do_list_due_dispatchable_activity_tasks_for_shard(shard_id, now, after, limit)
-            .await
+        in_operation(
+            tracing::debug_span!("dsql.list_due_dispatchable_activity_tasks_for_shard"),
+            async move {
+                self.do_list_due_dispatchable_activity_tasks_for_shard(shard_id, now, after, limit)
+                    .await
+            },
+        )
+        .await
     }
 
     async fn list_due_timers_for_shard(
@@ -1169,8 +1472,14 @@ impl RunRepository for DsqlRunRepository {
         after: Option<&DueTimer>,
         limit: usize,
     ) -> Result<Vec<DueTimer>> {
-        self.do_list_due_timers_for_shard(shard_id, now, after, limit)
-            .await
+        in_operation(
+            tracing::debug_span!("dsql.list_due_timers_for_shard"),
+            async move {
+                self.do_list_due_timers_for_shard(shard_id, now, after, limit)
+                    .await
+            },
+        )
+        .await
     }
 
     async fn delete_due_timer_if_matches(
@@ -1178,7 +1487,11 @@ impl RunRepository for DsqlRunRepository {
         timer: &DueTimer,
         reason: crate::StaleTimer,
     ) -> Result<bool> {
-        self.do_delete_due_timer_if_matches(timer, reason).await
+        in_operation(
+            tracing::debug_span!("dsql.delete_due_timer_if_matches"),
+            async move { self.do_delete_due_timer_if_matches(timer, reason).await },
+        )
+        .await
     }
 }
 

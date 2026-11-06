@@ -71,9 +71,17 @@ impl DsqlProjectionLog {
     }
 }
 
+// Every method runs in a span named `dsql.<store>.<method>`, the operation
+// the process's statement accounting charges its round trips to
+// (`tokeira_observability::statement_accounting`); a span added only for that
+// is DEBUG, out of logs and traces at the default filter.
 #[async_trait]
 impl ProjectionLog for DsqlProjectionLog {
-    #[instrument(skip_all, fields(partition_id, fanout, limit))]
+    #[instrument(
+        name = "dsql.projection_log.read_page",
+        skip_all,
+        fields(partition_id, fanout, limit)
+    )]
     async fn read_page(
         &self,
         partition_id: u32,
@@ -129,7 +137,7 @@ impl ProjectionLog for DsqlProjectionLog {
         })
     }
 
-    #[instrument(skip_all, fields(partition_id, fanout, keys = keys.len()))]
+    #[instrument(name = "dsql.projection_log.delete_images", skip_all, fields(partition_id, fanout, keys = keys.len()))]
     async fn delete_images(
         &self,
         partition_id: u32,

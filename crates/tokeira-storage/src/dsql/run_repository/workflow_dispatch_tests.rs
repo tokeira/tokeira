@@ -510,6 +510,11 @@ impl Backend for Fixture {
     async fn seed_stale_row(&self, state: &WorkflowState) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         super::workflow_dispatch::maintain(&mut tx, state, self.repair_home).await?;
+        // A row written outside a commit is sound only beside an unknown record,
+        // as every such production writer leaves it (`dsql-derived-row-record`
+        // Requirement 3); otherwise the next commit trusts a record that says
+        // the run holds no row and leaves this one in place.
+        super::derived_record::forget(&mut tx, state.run_key).await?;
         tx.commit().await?;
         Ok(())
     }

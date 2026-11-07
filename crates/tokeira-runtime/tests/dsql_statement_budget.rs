@@ -118,23 +118,25 @@ const WFT_COMPLETE_CLOSE: &str = "workflow-task-complete/close";
 const OBSERVE: &str = "observe";
 
 /// Round trips of each committed commit a step writes, in sequence order: BEGIN,
-/// the statements, COMMIT.
+/// the statements, COMMIT. After the start, each commit skips the reads and
+/// the delete its run's derived-row record rules out
+/// (`dsql-derived-row-record`); the start has no record and reads every kind.
 const EXPECTED_COMMIT_ROUND_TRIPS: &[(&str, &[usize])] = &[
     (START, &[17]),
-    (WFT_START, &[10]),
-    (WFT_COMPLETE_SCHEDULE, &[12]),
-    (ACTIVITY_START, &[11]),
-    (ACTIVITY_START_SECOND, &[10]),
-    (HEARTBEAT, &[9]),
-    (ACTIVITY_COMPLETE, &[10]),
-    (ACTIVITY_FAIL_RETRY, &[10]),
-    (ACTIVITY_RETRY_START, &[10]),
-    (ACTIVITY_COMPLETE_SECOND, &[10]),
-    (SIGNAL, &[12]),
-    (WFT_START_SECOND, &[10]),
-    (WFT_COMPLETE_TIMER, &[11]),
-    (TIMER_FIRE_WFT_START, &[11, 10]),
-    (WFT_COMPLETE_CLOSE, &[12]),
+    (WFT_START, &[8]),
+    (WFT_COMPLETE_SCHEDULE, &[9]),
+    (ACTIVITY_START, &[9]),
+    (ACTIVITY_START_SECOND, &[8]),
+    (HEARTBEAT, &[6]),
+    (ACTIVITY_COMPLETE, &[8]),
+    (ACTIVITY_FAIL_RETRY, &[8]),
+    (ACTIVITY_RETRY_START, &[9]),
+    (ACTIVITY_COMPLETE_SECOND, &[8]),
+    (SIGNAL, &[10]),
+    (WFT_START_SECOND, &[8]),
+    (WFT_COMPLETE_TIMER, &[8]),
+    (TIMER_FIRE_WFT_START, &[9, 8]),
+    (WFT_COMPLETE_CLOSE, &[9]),
 ];
 
 // ---------------------------------------------------------------------------
@@ -538,18 +540,42 @@ struct Lifecycle {
     run_key: Option<RunKey>,
     /// Each step and the sequences its transitions were written at.
     steps: Vec<(&'static str, std::ops::Range<u64>)>,
+    /// What the run's state wanted at each step's first sequence.
+    held: BTreeMap<(RunKey, u64), Held>,
+}
+
+/// The kinds of derived row a state wants. The commit that wrote the state
+/// recorded exactly these, since this lifecycle never defers an operation
+/// delete, so the next commit's record rules out the others
+/// (`dsql-derived-row-record`).
+#[derive(Clone, Copy, Debug)]
+struct Held {
+    workflow: bool,
+    activities: bool,
+    operations: bool,
 }
 
 impl Lifecycle {
-    async fn seq(&self) -> Result<u64> {
+    /// The run's sequence and what its state wants.
+    async fn observe(&self) -> Result<(u64, Option<Held>)> {
         self.recorder.enter(OBSERVE);
         let Some(run_key) = self.run_key else {
-            return Ok(0);
+            return Ok((0, None));
         };
-        match self.repo.load_run(run_key).await? {
-            LoadedRun::Existing(state) => Ok(state.transition_seq.0),
-            LoadedRun::Absent => Ok(0),
-        }
+        let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
+            return Ok((0, None));
+        };
+        let home = tokeira_types::execution_home_bundle(
+            state.namespace_id.0.as_bytes(),
+            state.workflow_id.0.as_bytes(),
+            SHARD_COUNT,
+        );
+        let held = Held {
+            workflow: tokeira_storage::derive_workflow_dispatch(&state, home).is_some(),
+            activities: !tokeira_storage::derive_activity_dispatch(&state, home)?.is_empty(),
+            operations: !tokeira_storage::derive_operations(&state, home)?.is_empty(),
+        };
+        Ok((state.transition_seq.0, Some(held)))
     }
 
     /// Run `call` as `step`, and record the sequences its transitions took.
@@ -558,11 +584,14 @@ impl Lifecycle {
         step: &'static str,
         call: impl AsyncFnOnce(&Self) -> Result<T>,
     ) -> Result<T> {
-        let before = self.seq().await?;
+        let (before, held) = self.observe().await?;
         self.recorder.enter(step);
         let value = call(self).await.with_context(|| format!("step {step}"))?;
-        let after = self.seq().await?;
+        let (after, _) = self.observe().await?;
         anyhow::ensure!(after > before, "step {step} wrote no transition");
+        if let (Some(run_key), Some(held)) = (self.run_key, held) {
+            self.held.insert((run_key, before), held);
+        }
         self.steps.push((step, before..after));
         Ok(value)
     }
@@ -1061,6 +1090,7 @@ async fn dsql_statement_budget_of_a_workflow_lifecycle() -> Result<()> {
         workflow_id: WorkflowId(format!("statement-budget-{}", uuid::Uuid::new_v4())),
         run_key: None,
         steps: Vec::new(),
+        held: BTreeMap::new(),
     };
     let before = Accounted::take(&snapshotter);
     let started = std::time::Instant::now();
@@ -1159,6 +1189,47 @@ async fn dsql_statement_budget_of_a_workflow_lifecycle() -> Result<()> {
         .map(|(step, trips)| (*step, trips.to_vec()))
         .collect::<Vec<_>>();
     assert_eq!(measured, expected, "\n{text}");
+
+    // Feature: dsql-derived-row-record, Property 5: A ruled-out kind costs no statement
+    // Each step's first commit finds the record its prior state's commit wrote,
+    // and makes no read or delete of a kind that record rules out. Every kind
+    // is ruled out somewhere in the lifecycle, so each skip is exercised.
+    let mut ruled_out = [0_usize; 3];
+    for (step, sequences) in &lifecycle.steps {
+        let Some(held) = lifecycle
+            .run_key
+            .and_then(|run| lifecycle.held.get(&(run, sequences.start)))
+        else {
+            continue;
+        };
+        for (attempt, sql) in commits_of(&statements, &run_key, sequences) {
+            if attempt.expected_seq != sequences.start || !committed(&sql) {
+                continue;
+            }
+            for (index, (holds, verb, table)) in [
+                (held.workflow, "DELETE", "FROM workflow_dispatch"),
+                (held.activities, "SELECT", "FROM activity_dispatch"),
+                (held.operations, "SELECT", "FROM run_operation"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if !holds {
+                    ruled_out[index] += 1;
+                    assert!(
+                        !sql.iter()
+                            .any(|text| text.starts_with(verb) && text.contains(table)),
+                        "{step}'s commit at {} made a {verb} {table} its record rules out\n{text}",
+                        attempt.expected_seq
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        ruled_out.iter().all(|count| *count > 0),
+        "every kind is ruled out at least once: {ruled_out:?}"
+    );
 
     // The production metric agrees with the recorder: each committed attempt
     // is one `committed` sample of the operation it was charged to.

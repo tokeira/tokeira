@@ -3,6 +3,7 @@
 //! transaction returns the folded state to the caller's cache.
 
 use super::{
+    derived_record::{DerivedKinds, may_hold},
     run_value_parts::{self, OnConflict, RunValueKind, STATE_VALUE_KEY},
     *,
 };
@@ -81,27 +82,30 @@ impl DsqlRunRepository {
                 // NULL column is a row written before V068 and reads as zero. The
                 // stored state's part count comes with them, so the write knows
                 // which parts the new state leaves unused without another
-                // statement (`large-value-parts`).
-                let row = sqlx::query_as::<_, (i64, Option<i64>, Option<i32>)>(
-                    "SELECT transition_seq, history_size_bytes, state_parts FROM workflow_hot \
-                     WHERE run_key = $1 FOR UPDATE",
-                )
-                .bind(run_key.0)
-                .fetch_optional(&mut *tx)
-                .await?;
+                // statement (`large-value-parts`), and so does the derived-row
+                // record (`dsql-derived-row-record`).
+                let row = sqlx::query_as::<_, LockedHot>(LOCK_HOT_SQL)
+                    .bind(run_key.0)
+                    .fetch_optional(&mut *tx)
+                    .await?;
                 metrics::record_dsql_statement_duration(
                     "commit_transition",
                     "load_hot",
                     started.elapsed(),
                 );
-                let (current_seq, prior_history_size_bytes, prior_state_parts) = match row {
-                    Some((seq, history_size_bytes, state_parts)) => (
-                        TransitionSeq(convert::u64_from_i64(seq, "workflow_hot.transition_seq")?),
-                        history_size_bytes.unwrap_or(0),
-                        state_parts,
-                    ),
-                    None => (TransitionSeq::ZERO, 0, None),
-                };
+                let (current_seq, prior_history_size_bytes, prior_state_parts, prior_derived) =
+                    match row {
+                        Some((seq, history_size_bytes, state_parts, kinds, kinds_seq)) => (
+                            TransitionSeq(convert::u64_from_i64(
+                                seq,
+                                "workflow_hot.transition_seq",
+                            )?),
+                            history_size_bytes.unwrap_or(0),
+                            state_parts,
+                            super::derived_record::read_record(seq, kinds, kinds_seq),
+                        ),
+                        None => (TransitionSeq::ZERO, 0, None, None),
+                    };
                 // The transition sequence is the per-run OCC fence. We check it inside
                 // the same transaction as the write set so successful commits remain
                 // linearizable for a single run.
@@ -217,6 +221,7 @@ impl DsqlRunRepository {
                     &mut state,
                     prior_history_size_bytes,
                     prior_state_parts,
+                    prior_derived,
                 )
                 .await?;
                 if let Some(incarnation) = guard.as_ref().and_then(|(guard, _)| guard.operation()) {
@@ -292,6 +297,17 @@ impl DsqlRunRepository {
     }
 }
 
+/// The statement every commit locks the run's hot row with. Besides the OCC
+/// fence it brings back what the write needs without another statement: the
+/// history size, the state's part count and the derived-row record.
+pub(super) const LOCK_HOT_SQL: &str = "SELECT transition_seq, history_size_bytes, state_parts, \
+     derived_kinds, derived_kinds_seq FROM workflow_hot WHERE run_key = $1 FOR UPDATE";
+
+/// One row of [`LOCK_HOT_SQL`].
+pub(super) type LockedHot = (i64, Option<i64>, Option<i32>, Option<i16>, Option<i64>);
+
+/// `prior_derived` is the record [`LOCK_HOT_SQL`] read, or `None` for a run
+/// whose hot row is absent or whose record is unknown.
 pub(super) async fn write_transition(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_key: RunKey,
@@ -301,6 +317,7 @@ pub(super) async fn write_transition(
     state: &mut WorkflowState,
     prior_history_size_bytes: i64,
     prior_state_parts: Option<i32>,
+    prior_derived: Option<DerivedKinds>,
 ) -> Result<()> {
     write_transition_mode(
         tx,
@@ -311,6 +328,7 @@ pub(super) async fn write_transition(
         state,
         prior_history_size_bytes,
         prior_state_parts,
+        prior_derived,
         false,
         &[],
     )
@@ -327,6 +345,7 @@ pub(super) async fn write_transition_with_intents(
     state: &mut WorkflowState,
     prior_history_size_bytes: i64,
     prior_state_parts: Option<i32>,
+    prior_derived: Option<DerivedKinds>,
     extra_intents: &[crate::IntentRow],
 ) -> Result<()> {
     write_transition_mode(
@@ -338,6 +357,7 @@ pub(super) async fn write_transition_with_intents(
         state,
         prior_history_size_bytes,
         prior_state_parts,
+        prior_derived,
         false,
         extra_intents,
     )
@@ -346,6 +366,8 @@ pub(super) async fn write_transition_with_intents(
 
 /// Publish the already-verified staged parts/history/timers of an absent run.
 /// The hot row, dispatch, dedupe, projection and pointer still share this commit.
+/// The run has no hot row, so its record is unknown: staging wrote activity
+/// rows before it, which the commit must read.
 pub(super) async fn write_prepared_transition(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_key: RunKey,
@@ -363,6 +385,7 @@ pub(super) async fn write_prepared_transition(
         state,
         0,
         None,
+        None,
         true,
         &[],
     )
@@ -378,6 +401,7 @@ async fn write_transition_mode(
     state: &mut WorkflowState,
     prior_history_size_bytes: i64,
     prior_state_parts: Option<i32>,
+    prior_derived: Option<DerivedKinds>,
     staged: bool,
     extra_intents: &[crate::IntentRow],
 ) -> Result<()> {
@@ -390,7 +414,14 @@ async fn write_transition_mode(
     }
     // Read the prior source before replacing hot state. This is also called by
     // paired commits, so every publication authors its obligations atomically.
-    super::outbound::maintain(tx, transition, shard_id, extra_intents).await?;
+    let operations_remain = super::outbound::maintain(
+        tx,
+        transition,
+        shard_id,
+        extra_intents,
+        may_hold(prior_derived, DerivedKinds::OPERATIONS),
+    )
+    .await?;
     // The batch is encoded once: the same bytes are inserted and counted, so the
     // History Size is the persisted size by construction (Requirement 1.1).
     let events_data = (!transition.history_events.is_empty())
@@ -428,6 +459,18 @@ async fn write_transition_mode(
     // whole state is rewritten, so every part is, and the parts the previous
     // state used beyond the new count go with it.
     let state_split = value_parts::split(&state_data);
+    // The record the upsert writes must say what the run holds once this
+    // transaction lands, so both dispatch sets are derived here, from the state
+    // just encoded, before the upsert, and handed to their maintenance below.
+    // Each maintenance makes the stored rows equal its set, so the set alone
+    // says whether rows of that kind remain (`dsql-derived-row-record`).
+    let wanted_workflow = crate::derive_workflow_dispatch(state, shard_id);
+    let wanted_activities = crate::derive_activity_dispatch(state, shard_id)?;
+    let derived = DerivedKinds::after_commit(
+        wanted_workflow.is_some(),
+        !wanted_activities.is_empty(),
+        operations_remain,
+    );
     insert_workflow_hot(
         tx,
         run_key,
@@ -435,6 +478,7 @@ async fn write_transition_mode(
         state,
         &state_split,
         history_size_bytes,
+        Some((derived, state.transition_seq)),
     )
     .await?;
     if !staged {
@@ -458,7 +502,14 @@ async fn write_transition_mode(
             .await?;
         }
     }
-    super::workflow_dispatch::maintain(tx, state, shard_id).await?;
+    super::workflow_dispatch::write(
+        tx,
+        state.run_key,
+        shard_id,
+        wanted_workflow.as_ref(),
+        may_hold(prior_derived, DerivedKinds::WORKFLOW_DISPATCH),
+    )
+    .await?;
     if !staged && let Some(events_data) = events_data {
         insert_history_batch(
             tx,
@@ -503,7 +554,13 @@ async fn write_transition_mode(
         .execute(&mut **tx)
         .await?;
     }
-    super::activity_dispatch::maintain(tx, state, shard_id).await?;
+    super::activity_dispatch::maintain(
+        tx,
+        state.run_key,
+        wanted_activities,
+        may_hold(prior_derived, DerivedKinds::ACTIVITY_DISPATCH),
+    )
+    .await?;
     if !staged {
         for op in &transition.timer_ops {
             match op {
@@ -554,21 +611,28 @@ async fn write_transition_mode(
 /// to the commit (recovery-index Requirement 1). `state_data` holds the whole
 /// state, or its first part with the count in `state_parts` (`$9`), which an
 /// update always rewrites: a state that shrinks to the part size has none.
+/// It also writes the derived-row record (`$10`, `$11`), so a commit's record
+/// costs no statement (`dsql-derived-row-record`); NULLs leave it unknown.
 pub(super) const WORKFLOW_HOT_UPSERT_SQL: &str = "INSERT INTO workflow_hot
          (run_key, namespace_id, workflow_id, shard_id, transition_seq, state_data, \
-          history_size_bytes, recovery_needed, state_parts, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+          history_size_bytes, recovery_needed, state_parts, derived_kinds, derived_kinds_seq, \
+          updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
          ON CONFLICT (run_key) DO UPDATE SET
              transition_seq = EXCLUDED.transition_seq,
              state_data = EXCLUDED.state_data,
              history_size_bytes = EXCLUDED.history_size_bytes,
              recovery_needed = EXCLUDED.recovery_needed,
              state_parts = EXCLUDED.state_parts,
+             derived_kinds = EXCLUDED.derived_kinds,
+             derived_kinds_seq = EXCLUDED.derived_kinds_seq,
              shard_id = EXCLUDED.shard_id,
              updated_at = EXCLUDED.updated_at";
 
 /// Write the run's row with `state_data`'s first part and count; the caller
-/// writes the other parts in the same transaction.
+/// writes the other parts in the same transaction. `derived` is the record the
+/// row's transition leaves, stamped with its sequence; `None` writes an
+/// unknown record, as a writer outside a commit must when it creates the row.
 pub(super) async fn insert_workflow_hot(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_key: RunKey,
@@ -576,6 +640,7 @@ pub(super) async fn insert_workflow_hot(
     state: &WorkflowState,
     state_data: &Split<'_>,
     history_size_bytes: i64,
+    derived: Option<(DerivedKinds, TransitionSeq)>,
 ) -> Result<()> {
     // `workflow_hot` is a materialized snapshot for recovery and read paths.
     // It is not the audit trail; history_batch carries the append-only events.
@@ -593,6 +658,12 @@ pub(super) async fn insert_workflow_hot(
         .bind(history_size_bytes)
         .bind(recovery_needed(state))
         .bind(state_data.count)
+        .bind(derived.map(|(kinds, _)| kinds.to_column()))
+        .bind(
+            derived
+                .map(|(_, seq)| convert::i64_from_u64(seq.0, "derived_kinds_seq"))
+                .transpose()?,
+        )
         .execute(&mut **tx)
         .await?;
     metrics::record_dsql_statement_duration(

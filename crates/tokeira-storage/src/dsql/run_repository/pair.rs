@@ -89,6 +89,8 @@ struct SqlPair<'a> {
     partitions: u32,
     prior_history_size: i64,
     prior_state_parts: Option<i32>,
+    /// The closing run's derived-row record, read in its hot-row lock.
+    prior_derived: Option<super::derived_record::DerivedKinds>,
 }
 
 impl DsqlRunRepository {
@@ -133,6 +135,7 @@ impl DsqlRunRepository {
                 partitions: self.projection_partition_count,
                 prior_history_size: 0,
                 prior_state_parts: None,
+                prior_derived: None,
             }))
             .await
         })
@@ -153,10 +156,11 @@ impl PairTransaction for SqlPair<'_> {
     }
 
     async fn check_closing(&mut self) -> Result<Option<PairCommitResult>> {
-        let row = sqlx::query_as::<_, (i64, Option<i64>, Option<i32>)>(
-            "SELECT transition_seq, history_size_bytes, state_parts FROM workflow_hot WHERE run_key = $1 FOR UPDATE",
-        ).bind(self.closing_state.run_key.0).fetch_optional(&mut *self.tx).await?;
-        let Some((seq, size, parts)) = row else {
+        let row = sqlx::query_as::<_, super::commit::LockedHot>(super::commit::LOCK_HOT_SQL)
+            .bind(self.closing_state.run_key.0)
+            .fetch_optional(&mut *self.tx)
+            .await?;
+        let Some((seq, size, parts, kinds, kinds_seq)) = row else {
             return Ok(Some(PairCommitResult::Conflict {
                 reason: "closing run is absent".into(),
             }));
@@ -169,6 +173,7 @@ impl PairTransaction for SqlPair<'_> {
         }
         self.prior_history_size = size.unwrap_or(0);
         self.prior_state_parts = parts;
+        self.prior_derived = super::derived_record::read_record(seq, kinds, kinds_seq);
         check_dedupe(&mut self.tx, &self.closing).await
     }
 
@@ -225,6 +230,7 @@ impl PairTransaction for SqlPair<'_> {
             &mut self.closing_state,
             self.prior_history_size,
             self.prior_state_parts,
+            self.prior_derived,
         )
         .await
     }
@@ -238,6 +244,8 @@ impl PairTransaction for SqlPair<'_> {
             &self.successor,
             &mut self.successor_state,
             0,
+            None,
+            // The successor's hot row is absent until this transaction.
             None,
         )
         .await

@@ -17,18 +17,49 @@ pub(super) const SELECT_ROW: &str = "SELECT run_key, shard_id, queue_namespace, 
     scheduled_at, priority_key, priority_data, sticky_worker, schedule_to_start_deadline
     FROM workflow_dispatch";
 
+/// Make the run's stored row equal the row its state wants. Returns whether it
+/// upserted a row.
 pub(super) async fn maintain(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     state: &WorkflowState,
     home: ShardId,
-) -> Result<()> {
-    let Some(row) = derive_workflow_dispatch(state, home) else {
-        sqlx::query("DELETE FROM workflow_dispatch WHERE run_key = $1")
-            .bind(state.run_key.0)
-            .execute(&mut **tx)
-            .await?;
-        return Ok(());
+) -> Result<bool> {
+    write(
+        tx,
+        state.run_key,
+        home,
+        derive_workflow_dispatch(state, home).as_ref(),
+        true,
+    )
+    .await
+}
+
+/// Make the run's stored row equal `wanted`, the row derived from the state
+/// this transaction writes. `may_hold` is false only when the run's valid
+/// derived-row record rules a workflow dispatch row out: then no row exists to
+/// delete, so a run that wants none costs no statement
+/// (`dsql-derived-row-record`). Returns whether it upserted a row.
+pub(super) async fn write(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_key: RunKey,
+    home: ShardId,
+    wanted: Option<&WorkflowDispatchRow>,
+    may_hold: bool,
+) -> Result<bool> {
+    let Some(row) = wanted else {
+        if may_hold {
+            sqlx::query("DELETE FROM workflow_dispatch WHERE run_key = $1")
+                .bind(run_key.0)
+                .execute(&mut **tx)
+                .await?;
+        }
+        return Ok(false);
     };
+    anyhow::ensure!(
+        row.incarnation.run_key == run_key,
+        "workflow dispatch row for {:?} written for {run_key:?}",
+        row.incarnation.run_key
+    );
     row.validate()?;
     let [queue_key, deployment_key, build_key] = row.lookup_keys();
     let (mode, deployment, build_id) = row.routing.coordinates();
@@ -59,7 +90,7 @@ pub(super) async fn maintain(
         .bind(row.priority.as_ref().map(codec::encode_priority).transpose()?)
         .bind(row.sticky_worker.as_ref().map(|worker| worker.0.as_str()))
         .bind(row.schedule_to_start_deadline).execute(&mut **tx).await?;
-    Ok(())
+    Ok(true)
 }
 
 pub(super) fn decode(row: PgRow) -> Result<WorkflowDispatchRow> {
@@ -145,13 +176,14 @@ impl DsqlRunRepository {
             tx.rollback().await?;
             return Err(lost.into());
         }
-        let hot = sqlx::query_as::<_, (Uuid, Vec<u8>, Option<i32>)>(
-            "SELECT shard_id, state_data, state_parts FROM workflow_hot WHERE run_key=$1",
+        let hot = sqlx::query_as::<_, (Uuid, i64, Vec<u8>, Option<i32>, Option<i16>, Option<i64>)>(
+            "SELECT shard_id, transition_seq, state_data, state_parts, derived_kinds, \
+             derived_kinds_seq FROM workflow_hot WHERE run_key=$1",
         )
         .bind(run_key.0)
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some((stored_home, first, parts)) = hot {
+        if let Some((stored_home, seq, first, parts, kinds, kinds_seq)) = hot {
             anyhow::ensure!(
                 Self::shard_id_from_uuid(stored_home)? == home,
                 "workflow dispatch repair home mismatch for {run_key:?}"
@@ -168,7 +200,21 @@ impl DsqlRunRepository {
             );
             // The local acquisition gate excludes same-owner authoritative
             // writers; the transaction fence excludes a replacement owner.
-            maintain(&mut tx, &state, home).await?;
+            let record = super::derived_record::read_record(seq, kinds, kinds_seq);
+            // The record was read with the state, so a valid one that rules the
+            // row out came from the commit that wrote this state and derived no
+            // row from it. Upserting one anyway (a release whose derivation
+            // differs) must not leave the record claiming the run holds none.
+            // A commit landing after this read conflicts with the clear, which
+            // writes the hot row (`dsql-derived-row-record` Requirement 3).
+            if maintain(&mut tx, &state, home).await?
+                && super::derived_record::must_forget(
+                    record,
+                    super::derived_record::DerivedKinds::WORKFLOW_DISPATCH,
+                )
+            {
+                super::derived_record::forget(&mut tx, run_key).await?;
+            }
         } else {
             let stored_home: Option<Uuid> =
                 sqlx::query_scalar("SELECT shard_id FROM workflow_dispatch WHERE run_key=$1")

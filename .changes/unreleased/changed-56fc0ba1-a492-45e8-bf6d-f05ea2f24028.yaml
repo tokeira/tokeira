@@ -1,0 +1,5 @@
+kind: changed
+body: A commit to Aurora DSQL makes up to three round trips fewer. The run now records which kinds of dispatch and operation row it holds, so a commit no longer reads, or deletes, a kind it holds none of. An activity heartbeat takes six round trips instead of nine.
+time: 2026-11-07T01:37:18.750240+00:00
+custom:
+    Slice: a27f305d-0094-485c-9133-4cdfdfd2f895

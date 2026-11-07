@@ -165,7 +165,8 @@ needed and no bitwise SQL operator is relied on.
 ### Operation maintenance (`outbound.rs`)
 
 - **Returns more.** `maintain_operations` gains `may_hold: bool` and returns
-  `OperationRows { upserted: bool, remain: bool }`:
+  `OperationRows { upserted: bool, remain: bool }`. `plan_operations` wraps `close_batch::operation_changes` and
+  computes `remain`:
   - `upserted`: it wrote at least one row;
   - `remain`: the run holds operation rows once the transaction lands, meaning `desired` is non-empty or deferred
     obsolete keys exist.
@@ -179,10 +180,13 @@ needed and no bitwise SQL operator is relied on.
 
 ### Workflow dispatch row (`workflow_dispatch.rs`)
 
-- **The commit.** `maintain` takes the wanted row and `may_hold: bool`:
+- **The commit.** `write` takes the wanted row and `may_hold: bool`, and returns whether it upserted:
   - `Some(row)`: upsert, as today;
   - `None` with `may_hold`: delete by run key, as today;
   - `None` without it: nothing.
+
+  `maintain` derives the row from a state and calls `write` with `may_hold = true`, for the repair and reset
+  materialization.
 - **Repair.** `do_reconcile_workflow_dispatch_run` adds `transition_seq, derived_kinds, derived_kinds_seq` to the hot
   read it already makes and passes `may_hold = true`. When it upserts and `must_forget(record, WORKFLOW_DISPATCH)`, it
   calls `forget`.
@@ -193,8 +197,8 @@ needed and no bitwise SQL operator is relied on.
 
 ### Activity dispatch rows (`activity_dispatch.rs`, `activity_repair.rs`)
 
-- **The commit.** `maintain` takes the wanted set and `may_hold: bool`. Without `may_hold` it skips `existing_page` and
-  upserts every wanted row. `upsert` keeps its hash-collision check.
+- **The commit.** `maintain` takes the run key, the wanted set and `may_hold: bool`. Without `may_hold` it skips
+  `existing_page` and upserts every wanted row. `upsert` keeps its hash-collision check.
 - **Repair.** The activity repair page's `FOR UPDATE` hot read adds `derived_kinds, derived_kinds_seq`. When the page
   upserts a row and `must_forget(record, ACTIVITY_DISPATCH)`, it calls `forget` in the page's transaction. As with
   workflow dispatch repair, a page that upserts finds the kind included, except after a release that changed the

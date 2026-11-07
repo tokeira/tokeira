@@ -211,6 +211,11 @@ impl DsqlRunRepository {
             for row in page {
                 super::outbound::write_operation_row(&mut tx, row).await?;
             }
+            // These rows are written outside a commit, so the run's record
+            // can't be trusted to include them (`dsql-derived-row-record`
+            // Requirement 3.5). The upgrade runs once, stopped, so the extra
+            // statement per page costs nothing that matters.
+            super::derived_record::forget(&mut tx, key).await?;
             tx.commit().await?;
         }
         Ok(pointer)

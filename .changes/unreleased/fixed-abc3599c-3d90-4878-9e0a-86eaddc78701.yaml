@@ -1,0 +1,5 @@
+kind: fixed
+body: An activity start on Aurora DSQL reads only the history batch that holds its input, rather than a hundred batches. Each history read checks once per statement whether its run is still being prepared, so the read's row limit reaches storage.
+time: 2026-11-07T23:25:23.703546+00:00
+custom:
+    Slice: abc3599c-3d90-4878-9e0a-86eaddc78701

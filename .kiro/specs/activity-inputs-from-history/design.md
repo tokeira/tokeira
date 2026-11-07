@@ -129,7 +129,8 @@ The previous release's state decoder SHALL refuse every state this release write
 
 - The new method is `read_history_event(run_key, event_id) -> Result<Option<HistoryEvent>>`.
 - **Default implementation.** It reads `read_history(run_key, event_id - 1, 1)` and keeps the event only if its id matches. That is correct on any store, and the test doubles use it.
-- **DSQL.** One read statement: `SELECT first_event_id, last_event_id, events_data FROM history_batch WHERE run_key = $1 AND first_event_id <= $2 ORDER BY first_event_id DESC LIMIT 1`.
+- **DSQL.** One read statement: `SELECT first_event_id, last_event_id, events_data FROM history_batch WHERE run_key = $1 AND NOT EXISTS (SELECT 1 FROM run_preparation WHERE target_run_key = $1 AND phase < 4) AND first_event_id <= $2 ORDER BY first_event_id DESC LIMIT 1`.
+  - The `NOT EXISTS` hides a run an unpublished preparation is still staging (`outbound-dispatch-recovery`). It names the bound run key, so the planner tests it once, before the scan. Written against `history_batch.run_key`, it plans as an anti-join above the scan, the limit no longer reaches storage, and storage returns 100 rows for the one the read keeps.
   - The primary key `(run_key, first_event_id)` serves it, and it returns at most one row: the batch that holds the event, by departure 1.
   - A live cluster plans it as a backward scan of the primary key that starts at the event's id: `Index Only Scan Backward`, with both key columns in its index condition, no sort, and the limit pushed down to storage. On a run of 5,000 batches it returned one row, in under a millisecond, both for an event near the end and for one near the start.
   - It decodes that batch, and returns the event with the id, or none.
@@ -212,7 +213,7 @@ The suite runs on an ephemeral cluster under the `dsql-live` profile ([docs/test
 - **The previous release's data.**
   - A dispatch row written with an input reads without it.
   - A backlog entry written with an input drains, and its activity is delivered from history.
-- **The lookup's plan.** On a run of thousands of batches, for an event near the end and one near the start, the lookup's `EXPLAIN` shows a backward scan of the primary key with both key columns in its index condition, no sort, and the limit pushed down to storage. The test asserts it, as the workflow-dispatch suite asserts its continuation plans.
+- **The lookup's plan.** On a run of thousands of batches, for an event near the end and one near the start, the lookup's `EXPLAIN` shows a backward scan of the primary key with both key columns in its index condition, no sort, and the limit pushed down to storage. On the same run, the general read's first page shows its limit pushed down too, and no anti-join. The test asserts both, as the workflow-dispatch suite asserts its continuation plans.
 
 ### Property-Based Tests
 

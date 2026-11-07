@@ -153,7 +153,7 @@ async fn acquisition_spans_recovery_pages(activities: bool) -> Result<()> {
                     .join("../tokeira-storage/migrations"),
             },
             reservoir: ReservoirConfig {
-                target_ready: 4,
+                target_ready: 5,
                 inflight_limit: 2,
                 ..Default::default()
             },
@@ -460,7 +460,7 @@ async fn workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs(
                     .join("../tokeira-storage/migrations"),
             },
             reservoir: ReservoirConfig {
-                target_ready: 4,
+                target_ready: 5,
                 inflight_limit: 2,
                 ..Default::default()
             },
@@ -644,7 +644,7 @@ fn workflow_dispatch_live_fenced_repair_final_gate() {
                         .join("../tokeira-storage/migrations"),
                 },
                 reservoir: ReservoirConfig {
-                    target_ready: 4,
+                    target_ready: 5,
                     inflight_limit: 2,
                     ..Default::default()
                 },
@@ -803,7 +803,7 @@ async fn live_dispatch_observation(lost: Option<TaskKind>) -> Result<()> {
                     .join("../tokeira-storage/migrations"),
             },
             reservoir: ReservoirConfig {
-                target_ready: 4,
+                target_ready: 5,
                 inflight_limit: 2,
                 ..Default::default()
             },
@@ -1402,7 +1402,7 @@ async fn child_release_live_case(case: ChildReleaseCase) -> Result<()> {
                     .join("../tokeira-storage/migrations"),
             },
             reservoir: ReservoirConfig {
-                target_ready: 4,
+                target_ready: 5,
                 inflight_limit: 2,
                 ..Default::default()
             },

@@ -12,7 +12,7 @@ use super::*;
 use crate::{
     ACTIVITY_DISPATCH_PAGE_LIMIT, ActivityDiscoveryRange, ActivityDispatchCandidate,
     ActivityDispatchPage, ActivityDispatchPosition, ActivityDispatchRow, ActivityHomePage,
-    ActivityHomePosition, ActivityIncarnation, activity_dispatch_key, derive_activity_dispatch,
+    ActivityHomePosition, ActivityIncarnation, activity_dispatch_key,
 };
 
 pub(super) const COLUMNS: &str = "key, run_key, activity_id, shard_id, queue_namespace,
@@ -129,21 +129,45 @@ pub(super) async fn existing_page(
     Ok(query.build().fetch_all(&mut **tx).await?)
 }
 
+/// Make the run's stored rows equal `wanted`, the rows derived from the state
+/// this transaction writes.
+///
+/// `may_hold` is false only when the run's valid derived-row record rules
+/// activity dispatch rows out. The run then holds none, so the key pages, which
+/// would find nothing, are skipped and every wanted row is inserted directly
+/// (`dsql-derived-row-record`). The insert keeps its slot-identity conflict
+/// check, so a slot taken by another run still fails the transition.
 pub(super) async fn maintain(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    state: &WorkflowState,
-    home: ShardId,
+    run: RunKey,
+    mut wanted: BTreeMap<Uuid, ActivityDispatchRow>,
+    may_hold: bool,
 ) -> Result<()> {
-    let mut wanted: BTreeMap<_, _> = derive_activity_dispatch(state, home)?;
+    if may_hold {
+        reconcile_existing(tx, run, &mut wanted).await?;
+    }
+    for row in wanted.into_values() {
+        upsert(tx, &row).await?;
+    }
+    Ok(())
+}
+
+/// Page through the run's stored rows, replacing changed wanted rows and
+/// deleting unwanted ones. Leaves in `wanted` only the rows with no stored row.
+async fn reconcile_existing(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run: RunKey,
+    wanted: &mut BTreeMap<Uuid, ActivityDispatchRow>,
+) -> Result<()> {
     let mut after = None;
     loop {
-        let existing = existing_page(tx, state.run_key, after).await?;
+        let existing = existing_page(tx, run, after).await?;
         let exhausted = existing.len() < ACTIVITY_DISPATCH_PAGE_LIMIT as usize;
         for physical in existing {
             let key: Uuid = physical.try_get("key")?;
             let activity_id: String = physical.try_get("activity_id")?;
             anyhow::ensure!(
-                key == activity_dispatch_key(state.run_key, &activity_id),
+                key == activity_dispatch_key(run, &activity_id),
                 "activity dispatch slot disagrees with raw identity"
             );
             if let Some(desired) = wanted.remove(&key) {
@@ -155,7 +179,7 @@ pub(super) async fn maintain(
                     "DELETE FROM activity_dispatch WHERE key=$1 AND run_key=$2 AND activity_id=$3",
                 )
                 .bind(key)
-                .bind(state.run_key.0)
+                .bind(run.0)
                 .bind(activity_id)
                 .execute(&mut **tx)
                 .await?;
@@ -163,13 +187,9 @@ pub(super) async fn maintain(
             after = Some(key);
         }
         if exhausted {
-            break;
+            return Ok(());
         }
     }
-    for row in wanted.into_values() {
-        upsert(tx, &row).await?;
-    }
-    Ok(())
 }
 
 pub(super) fn due_query(

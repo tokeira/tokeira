@@ -115,7 +115,10 @@ changed counts, and completion. Completion is not permission to serve the home.
 Replace operation-driven dispatch maintenance in both stores with desired-set
 maintenance. Within the existing fenced run transaction, derive wanted rows from
 `transition.next_state`, read existing rows in bounded key pages, and write only
-the difference. The desired set includes unaffected activities, so a changed
+the difference. When the run's derived-row record rules activity rows out, the
+run holds none: DSQL skips the pages and inserts every wanted row
+([`dsql-derived-row-record`](../dsql-derived-row-record/design.md)). The desired
+set includes unaffected activities, so a changed
 workflow-level priority/pause/routing value cannot leave their rows stale. Normal
 commits do not split their atomic write set into independently visible chunks.
 DSQL physical refusal rolls back all state/history/rows; memory retains its

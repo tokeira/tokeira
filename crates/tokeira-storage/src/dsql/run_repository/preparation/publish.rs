@@ -57,9 +57,13 @@ impl DsqlRunRepository {
         claim_creation(&mut tx, token.target_run, token.generation).await?;
         let mut prior = Vec::new();
         for transition in &publication.participants {
-            let row = sqlx::query_as::<_, (i64,Option<i64>,Option<i32>)>("SELECT transition_seq,history_size_bytes,state_parts FROM workflow_hot WHERE run_key=$1 FOR UPDATE")
-                .bind(transition.next_state.run_key.0).fetch_optional(&mut *tx).await?;
-            let Some((seq, history_size, parts)) = row else {
+            let row = sqlx::query_as::<_, super::super::commit::LockedHot>(
+                super::super::commit::LOCK_HOT_SQL,
+            )
+            .bind(transition.next_state.run_key.0)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some((seq, history_size, parts, kinds, kinds_seq)) = row else {
                 return Ok(PublicationResult::Conflict {
                     reason: "publication participant is absent".into(),
                 });
@@ -69,12 +73,16 @@ impl DsqlRunRepository {
                     reason: "publication participant sequence changed".into(),
                 });
             }
-            prior.push((history_size.unwrap_or(0), parts));
+            prior.push((
+                history_size.unwrap_or(0),
+                parts,
+                super::super::derived_record::read_record(seq, kinds, kinds_seq),
+            ));
         }
         stage::verify(&mut tx, &token, &publication.new_run).await?;
         super::super::successor::settle_publication(&mut tx, &publication).await?;
         let mut participants = Vec::new();
-        for (transition, (size, parts)) in publication.participants.iter().zip(prior) {
+        for (transition, (size, parts, derived)) in publication.participants.iter().zip(prior) {
             let mut state = transition.next_state.clone();
             super::super::commit::write_transition(
                 &mut tx,
@@ -85,6 +93,7 @@ impl DsqlRunRepository {
                 &mut state,
                 size,
                 parts,
+                derived,
             )
             .await?;
             participants.push(state);

@@ -245,33 +245,73 @@ pub(super) async fn maintain_parent_reference(
     Ok(())
 }
 
+/// What [`maintain_operations`] did to the run's operation rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct OperationRows {
+    /// It inserted or replaced at least one row.
+    pub(super) upserted: bool,
+    /// The run holds operation rows once the transaction lands.
+    pub(super) remain: bool,
+}
+
+/// Plan the run's operation changes with [`close_batch::operation_changes`]
+/// and say whether rows remain once they apply: the run wants some, or the
+/// budget deferred the delete of an obsolete one. A commit records the answer,
+/// so a deferred delete keeps the operation kind in its derived-row record
+/// (`dsql-derived-row-record`).
+pub(super) fn plan_operations(
+    prior: BTreeMap<OperationKey, OperationRow>,
+    desired: Vec<OperationRow>,
+    used: WriteCost,
+    budget: WriteBudget,
+) -> (Vec<OperationRow>, Vec<OperationKey>, bool) {
+    let wanted = desired
+        .iter()
+        .map(|row| row.incarnation.key)
+        .collect::<std::collections::BTreeSet<_>>();
+    let obsolete = prior.keys().filter(|key| !wanted.contains(key)).count();
+    let (upserts, deletes) = close_batch::operation_changes(prior, desired, used, budget);
+    let remain = !wanted.is_empty() || deletes.len() < obsolete;
+    (upserts, deletes, remain)
+}
+
+/// Make the run's operation rows and parent reference equal what its state
+/// wants. `may_hold` is false only when the run's valid derived-row record
+/// rules operation rows out: the run holds none, so the read that would find
+/// none is skipped and an empty prior plans every wanted row as an insert, the
+/// plan the read would have produced (`dsql-derived-row-record`).
 pub(super) async fn maintain_operations(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     state: &WorkflowState,
     home: ShardId,
     used: WriteCost,
-) -> Result<()> {
+    may_hold: bool,
+) -> Result<OperationRows> {
     maintain_parent_reference(tx, state, state.is_open()).await?;
-    let rows = sqlx::query("SELECT source_run_key, kind, initiating_event_id, source_home, requested_event_id, attempt, due_at, target_namespace, target_workflow_id FROM run_operation WHERE source_run_key=$1")
-        .bind(state.run_key.0).fetch_all(&mut **tx).await?;
-    let prior: BTreeMap<_, _> = rows
-        .into_iter()
-        .map(decode_operation)
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .map(|row| (row.incarnation.key, row))
-        .collect();
-    let (upserts, deletes) = close_batch::operation_changes(
+    let prior: BTreeMap<_, _> = if may_hold {
+        sqlx::query("SELECT source_run_key, kind, initiating_event_id, source_home, requested_event_id, attempt, due_at, target_namespace, target_workflow_id FROM run_operation WHERE source_run_key=$1")
+            .bind(state.run_key.0).fetch_all(&mut **tx).await?
+            .into_iter()
+            .map(decode_operation)
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|row| (row.incarnation.key, row))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    let (upserts, deletes, remain) = plan_operations(
         prior,
         crate::derive_operations(state, home)?,
         used,
         WriteBudget::TRANSACTION,
     );
+    let upserted = !upserts.is_empty();
     for row in upserts {
         write_operation_row(tx, &row).await?;
     }
     delete_operations(tx, deletes).await?;
-    Ok(())
+    Ok(OperationRows { upserted, remain })
 }
 
 pub(super) async fn write_operation_row(
@@ -312,12 +352,16 @@ pub(super) async fn insert_intent(
     Ok(())
 }
 
+/// Author a commit's close intents and maintain its operation rows. Returns
+/// whether the run holds operation rows once the commit lands.
+/// `may_hold_operations` comes from the run's derived-row record.
 pub(super) async fn maintain(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     transition: &Transition,
     home: ShardId,
     extra_intents: &[IntentRow],
-) -> Result<()> {
+    may_hold_operations: bool,
+) -> Result<bool> {
     let state = &transition.next_state;
     let mut intents = extra_intents.to_vec();
     if !state.is_open() && !transition.history_events.is_empty() {
@@ -333,7 +377,11 @@ pub(super) async fn maintain(
     for row in intents {
         insert_intent(tx, &row).await?;
     }
-    maintain_operations(tx, state, home, used).await
+    Ok(
+        maintain_operations(tx, state, home, used, may_hold_operations)
+            .await?
+            .remain,
+    )
 }
 
 impl DsqlRunRepository {
@@ -475,7 +523,17 @@ impl DsqlRunRepository {
                 ) == home,
                 "outbound repair home mismatch"
             );
-            maintain_operations(&mut tx, &state, home, WriteCost::default()).await?;
+            // The source read doesn't bring back the derived-row record, so an
+            // upsert forgets it whatever it says. Reconciliation upserts only
+            // rows that differ from what the stored state wants, which a commit
+            // under the same derivation already wrote, so this rarely writes
+            // (`dsql-derived-row-record` Requirement 3.5).
+            if maintain_operations(&mut tx, &state, home, WriteCost::default(), true)
+                .await?
+                .upserted
+            {
+                super::derived_record::forget(&mut tx, run).await?;
+            }
         } else {
             let rows = sqlx::query_as::<_, (i16, i64)>(
                 "SELECT kind,initiating_event_id FROM run_operation

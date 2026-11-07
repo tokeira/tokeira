@@ -81,9 +81,9 @@ impl DsqlRunRepository {
             }
             let current: Option<Uuid> = sqlx::query_scalar("SELECT run_key FROM current_execution WHERE key=$1 FOR UPDATE")
                 .bind(key).fetch_optional(&mut *tx).await?;
-            let prior = sqlx::query_as::<_, (i64, Option<i64>, Option<i32>)>("SELECT transition_seq,history_size_bytes,state_parts FROM workflow_hot WHERE run_key=$1 FOR UPDATE")
+            let prior = sqlx::query_as::<_, super::commit::LockedHot>(super::commit::LOCK_HOT_SQL)
                 .bind(run.0).fetch_optional(&mut *tx).await?;
-            let Some((seq, size, parts)) = prior else {
+            let Some((seq, size, parts, kinds, kinds_seq)) = prior else {
                 return Ok(CommitResult::Conflict { reason: "successor predecessor is absent".into() });
             };
             if current != Some(run.0) || convert::u64_from_i64(seq, "transition_seq")? != closing.expected_seq.0 {
@@ -91,7 +91,8 @@ impl DsqlRunRepository {
             }
             super::commit::write_transition_with_intents(
                 &mut tx, run, home, self.projection_partition_count, &closing, &mut state,
-                size.unwrap_or(0), parts, std::slice::from_ref(&intent),
+                size.unwrap_or(0), parts, super::derived_record::read_record(seq, kinds, kinds_seq),
+                std::slice::from_ref(&intent),
             ).await?;
             super::outbound::maintain_parent_reference(&mut tx, &state, true).await?;
             sqlx::query("INSERT INTO successor_reservation (key,namespace_id,workflow_id,source_home,predecessor_run_key,predecessor_close_seq,successor_run_key,intent_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)")

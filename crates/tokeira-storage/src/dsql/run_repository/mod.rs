@@ -93,6 +93,11 @@ mod commit;
 #[cfg(all(test, feature = "dsql-integration"))]
 mod contract_tests;
 mod delete;
+mod derived_record;
+#[cfg(all(test, feature = "dsql-integration"))]
+mod derived_record_live_tests;
+#[cfg(test)]
+mod derived_record_tests;
 mod dispatch;
 #[cfg(all(test, feature = "dsql-integration"))]
 mod history_event_tests;
@@ -2165,6 +2170,22 @@ mod tests {
         assert!(insert.contains("state_parts"));
         assert!(insert.contains("$9"));
         assert!(update.contains("state_parts = EXCLUDED.state_parts"));
+    }
+
+    /// The hot-state upsert writes the derived-row record and its stamp on
+    /// insert and on update, so every commit's record replaces the last one and
+    /// costs no statement (`dsql-derived-row-record`).
+    #[test]
+    fn workflow_hot_upsert_writes_the_derived_record() {
+        let sql = super::commit::WORKFLOW_HOT_UPSERT_SQL;
+        let (insert, update) = sql.split_once("ON CONFLICT").expect("upsert");
+        assert!(insert.contains("derived_kinds, derived_kinds_seq"));
+        assert!(insert.contains("$10, $11"));
+        assert!(update.contains("derived_kinds = EXCLUDED.derived_kinds"));
+        assert!(update.contains("derived_kinds_seq = EXCLUDED.derived_kinds_seq"));
+        let lock = super::commit::LOCK_HOT_SQL;
+        assert!(lock.contains("derived_kinds, derived_kinds_seq"));
+        assert!(lock.ends_with("FOR UPDATE"));
     }
 
     #[test]

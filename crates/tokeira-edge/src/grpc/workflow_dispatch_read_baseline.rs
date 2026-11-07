@@ -474,7 +474,7 @@ async fn queue_home_delivery_live_read_baseline() -> Result<()> {
                     .join("../tokeira-storage/migrations"),
             },
             reservoir: ReservoirConfig {
-                target_ready: 4,
+                target_ready: 5,
                 inflight_limit: 2,
                 ..ReservoirConfig::default()
             },

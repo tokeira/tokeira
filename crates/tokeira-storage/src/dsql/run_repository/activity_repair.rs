@@ -104,10 +104,16 @@ impl DsqlRunRepository {
         }
         // Use the same locking key as every ordinary transition. Parts must be
         // hydrated inside this snapshot, after the hot row has been serialized.
-        let hot = sqlx::query_as::<_, (Uuid, i64, Vec<u8>, Option<i32>)>(
-            "SELECT shard_id, transition_seq, state_data, state_parts FROM workflow_hot WHERE run_key=$1 FOR UPDATE")
-            .bind(run.0).fetch_optional(&mut *tx).await?;
-        let state = if let Some((stored_home, seq, first, parts)) = hot {
+        let hot = sqlx::query_as::<_, (Uuid, i64, Vec<u8>, Option<i32>, Option<i16>, Option<i64>)>(
+            "SELECT shard_id, transition_seq, state_data, state_parts, derived_kinds, \
+             derived_kinds_seq FROM workflow_hot WHERE run_key=$1 FOR UPDATE",
+        )
+        .bind(run.0)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let mut record = None;
+        let state = if let Some((stored_home, seq, first, parts, kinds, kinds_seq)) = hot {
+            record = super::derived_record::read_record(seq, kinds, kinds_seq);
             anyhow::ensure!(
                 Self::shard_id_from_uuid(stored_home)? == home,
                 "activity repair stored home mismatch for {run:?}"
@@ -178,6 +184,7 @@ impl DsqlRunRepository {
         let mut bytes = 0;
         let mut examined = 0;
         let mut changed = 0;
+        let mut upserted = false;
         for key in keys {
             let physical = observed.get(&key);
             if let Some(row) = physical {
@@ -220,6 +227,7 @@ impl DsqlRunRepository {
                 bytes += cost.bytes;
                 if let Some(row) = desired {
                     super::activity_dispatch::upsert(&mut tx, row).await?;
+                    upserted = true;
                 } else if let Some(row) = physical {
                     delete_observed(&mut tx, row).await?;
                 }
@@ -227,6 +235,19 @@ impl DsqlRunRepository {
             }
             cursor.after = Some(key);
             examined += 1;
+        }
+        // The record was read in the hot-row lock with the state, so a valid
+        // one that rules these rows out came from the commit that wrote this
+        // state and derived none from it. Inserting one anyway (a release whose
+        // derivation differs) must not leave the record claiming the run holds
+        // none (`dsql-derived-row-record` Requirement 3). Deletes leave it as is.
+        if upserted
+            && super::derived_record::must_forget(
+                record,
+                super::derived_record::DerivedKinds::ACTIVITY_DISPATCH,
+            )
+        {
+            super::derived_record::forget(&mut tx, run).await?;
         }
         #[cfg(all(test, feature = "dsql-integration"))]
         pause_point::reached(pause_point::PauseKey::ActivityRepair(run)).await;

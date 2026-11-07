@@ -402,7 +402,7 @@ impl TestContext {
                 migrations_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"),
             },
             reservoir: tokeira_storage::dsql::ReservoirConfig {
-                target_ready: 4,
+                target_ready: 5,
                 inflight_limit: 2,
                 ..tokeira_storage::dsql::ReservoirConfig::default()
             },

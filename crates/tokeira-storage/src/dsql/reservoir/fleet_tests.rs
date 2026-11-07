@@ -246,10 +246,10 @@ async fn a_rolling_restart_refills_each_node_within_the_burst() {
     // The burst recovers between deployments.
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    for index in 0..nodes.len() {
+    for (index, node) in nodes.iter_mut().enumerate() {
         // The old node stops and its connections close as the new one starts.
-        nodes[index] = fleet.start_node(50);
-        let refill = until(|| nodes[index].held() == 50, Duration::from_secs(30)).await;
+        *node = fleet.start_node(50);
+        let refill = until(|| node.held() == 50, Duration::from_secs(30)).await;
         // Fifty connects eight at a time: no admission waited for the rate.
         assert!(
             refill <= 7 * CONNECT_LATENCY + Duration::from_millis(20),

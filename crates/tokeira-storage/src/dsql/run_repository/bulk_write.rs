@@ -860,8 +860,19 @@ impl DsqlRunRepository {
                 state.workflow_id
             );
         }
-        commit::insert_workflow_hot(&mut tx, run_key, shard_id, state, state_data, history_size)
-            .await?;
+        // The record stays unknown: the copy pages staged this run's activity
+        // rows outside any commit, so its first commit must read them
+        // (`dsql-derived-row-record` Requirement 3.2).
+        commit::insert_workflow_hot(
+            &mut tx,
+            run_key,
+            shard_id,
+            state,
+            state_data,
+            history_size,
+            None,
+        )
+        .await?;
         super::workflow_dispatch::maintain(&mut tx, state, shard_id).await?;
         // Bounded cleanup and staging wrote exactly the desired activity set
         // under this same bulk-write guard. No activity fanout belongs in the

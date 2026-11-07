@@ -427,7 +427,7 @@ impl TestContext {
                     .join("../tokeira-storage/migrations"),
             },
             reservoir: tokeira_storage::dsql::ReservoirConfig {
-                target_ready: 4,
+                target_ready: 5,
                 inflight_limit: 2,
                 ..tokeira_storage::dsql::ReservoirConfig::default()
             },

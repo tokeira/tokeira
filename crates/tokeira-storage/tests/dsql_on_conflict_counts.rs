@@ -72,7 +72,7 @@ impl Live {
                     migrations_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"),
                 },
                 reservoir: ReservoirConfig {
-                    target_ready: 4,
+                    target_ready: 5,
                     inflight_limit: 2,
                     ..ReservoirConfig::default()
                 },

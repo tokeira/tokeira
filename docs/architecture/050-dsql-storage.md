@@ -87,6 +87,15 @@ Maps `(namespace_id, workflow_id)` to the current run identity and open/closed s
 
 The small current summary row for an open run.
 
+It also records which kinds of derived row the run may hold: its workflow
+dispatch row, its activity dispatch rows and its operation rows
+(`derived_kinds`), stamped with the transition sequence the record describes
+(`derived_kinds_seq`). A commit reads the record in its hot-row lock and skips
+the read, or the delete, of each kind a valid record rules out. It writes the
+record it leaves in the same upsert as the state. A record whose stamp isn't the
+row's sequence is unknown, and the commit reads every kind
+([`dsql-derived-row-record`](../../.kiro/specs/dsql-derived-row-record/design.md)).
+
 ### `core.history_batch`
 
 Immutable append-only event batches.

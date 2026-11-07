@@ -248,11 +248,15 @@ Do not place hot state or timers by successor run-key hash and rely on a later
 commit to move them. A multi-shard live regression must distinguish those two
 placements and inspect all three immediately after materialization.
 
-The initial implementation deliberately performs one dispatch maintenance
-statement per state-changing commit, including an idempotent delete when no row is
-wanted. This is more conservative than 042's schedule/start-only cost estimate.
-Avoiding unchanged writes is a later measured optimization that must retain the
-same invariant without making old dispatch state authoritative.
+Each state-changing commit performs at most one dispatch maintenance statement:
+an upsert when the state wants a row, and an idempotent delete when it wants none
+and the run may hold one. A run whose derived-row record rules the row out holds
+none, so a commit that wants none makes no statement
+([`dsql-derived-row-record`](../dsql-derived-row-record/design.md)). The record
+only skips a delete that would find nothing; it never makes old dispatch state
+authoritative. This is more conservative than 042's schedule/start-only cost
+estimate. Avoiding unchanged upserts is a later measured optimization that must
+retain the same invariant.
 
 ### Queue-home discovery and broker integration
 

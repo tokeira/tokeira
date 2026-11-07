@@ -486,6 +486,9 @@ async fn outbound_live_successor_reservation_and_interrupted_publication() -> Re
             .await?,
         PublicationResult::Applied { .. }
     ));
+    // The new run had no hot row, so publication read every kind of derived
+    // row staging may have written, and recorded exactly what it left.
+    super::derived_record_live_tests::assert_exact_record(&fixture, request.run_key).await?;
     assert!(matches!(
         repo.publish_prepared_run(token.clone(), WriteFence::Unfenced)
             .await?,

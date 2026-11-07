@@ -264,7 +264,7 @@ mod live {
                 shard_count: 1,
                 projection_partition_count: 16,
                 reservoir: ReservoirConfig {
-                    target_ready: 4,
+                    target_ready: 5,
                     inflight_limit: 2,
                     ..ReservoirConfig::default()
                 },

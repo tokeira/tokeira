@@ -241,7 +241,7 @@ async fn activity_dispatch_live_read_counts() -> Result<()> {
                     .join("../tokeira-storage/migrations"),
             },
             reservoir: tokeira_storage::dsql::ReservoirConfig {
-                target_ready: 4,
+                target_ready: 5,
                 inflight_limit: 2,
                 ..Default::default()
             },

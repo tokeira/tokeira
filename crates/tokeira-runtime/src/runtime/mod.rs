@@ -99,6 +99,8 @@ mod activity_retirement_tests;
 #[cfg(test)]
 mod activity_timeout_commit_tests;
 #[cfg(test)]
+mod activity_timeout_read_tests;
+#[cfg(test)]
 mod activity_tracking_order_tests;
 #[cfg(test)]
 mod buffered_force_close_tests;

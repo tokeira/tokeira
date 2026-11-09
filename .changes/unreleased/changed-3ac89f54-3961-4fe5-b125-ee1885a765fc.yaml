@@ -1,0 +1,5 @@
+kind: changed
+body: The activity timeout scanner reads each run once per reconciliation pass instead of once per open activity, so a run with many open activities costs one read per pass.
+time: 2026-11-09T15:36:09+00:00
+custom:
+    Slice: 3ac89f54-3961-4fe5-b125-ee1885a765fc

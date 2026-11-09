@@ -1,0 +1,5 @@
+kind: changed
+body: Due timers for runs on different lanes now fire concurrently, so a burst of due timers no longer fires one lane commit at a time.
+time: 2026-11-09T12:00:00.000000+00:00
+custom:
+    Slice: c361ce00-5f32-4608-b156-1d5b0f1004f7

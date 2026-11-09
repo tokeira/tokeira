@@ -531,6 +531,7 @@ async fn reset_publication_wakes_preserved_timer() {
         },
         cancel.clone(),
         runtime.clock.clone(),
+        runtime.lanes.len(),
         |due, now| {
             let runtime = &runtime;
             let sent = sent.clone();

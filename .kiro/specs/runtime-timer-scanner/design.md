@@ -38,8 +38,9 @@ flowchart TD
 ### Key design decisions
 
 **Storage-backed look-ahead.** Each active shard lists through `clock.now() + scan_interval`,
-using checked deadline arithmetic. Due entries are submitted in listing order. The first future
-entry sets that shard's next wake. The shared `DeadlineWake` combines these deadlines with
+using checked deadline arithmetic. Due entries on different lanes are submitted concurrently,
+each lane's share in listing order (below). The first future entry sets that shard's next wake.
+The shared `DeadlineWake` combines these deadlines with
 commit and acquisition notifications without losing an insertion during planning.
 
 Successful lane commits announce their earliest `TimerOp::Upsert`, including delayed starts
@@ -54,6 +55,24 @@ continues immediately after its last entry. A new timer rewinds that shard's cur
 insertion behind it is not lost. Failed identities remain suppressed through these rewinds
 until the next full pass. Every interval, all active shards restart from the beginning.
 `command_for_due_timer` and stale-row cleanup remain unchanged.
+
+**Concurrent submission, grouped by lane.** `submit_due_page` groups a page's due rows by
+`lane_index_for_run_key`, the routing every submit path uses, so each group holds exactly the
+rows whose commands land on one lane. Groups run concurrently on the scanner's own task. Within a
+group, each submission waits for its reply before the next one starts. The lane executes one
+command at a time, so queueing more of the scanner's commands on it would not commit any sooner:
+it would only fill more of the lane's 1,024-slot mailbox that worker completions and polls share,
+and it would hand the lane a run's later timer before the earlier one was settled. Waiting keeps
+one run's timers in fire order and keeps the scanner to one mailbox slot per lane, so the work in
+flight is bounded by the lane count and the page size, limits that already exist. It gives up
+same-run coalescing in the lane, which a page of distinct runs' timers rarely reaches.
+
+The acquisition check runs before every submission in every group, so a lost shard submits
+nothing more. A failed submission is settled inside its group before that lane's next
+submission; the page then adds its identity to the failed set. The cursor passes every due row
+before submissions start. `run_timer_scanner_with_submit` takes the lane count next to its submit
+closure, so tests drive the same grouping with a controlled submit. The test-only
+`scan_due_timers_once*` helpers have no lanes and submit their page as a single group.
 
 **Scanner submits through the lane, not directly to the kernel.** The scanner uses the same `self.submit(run_key, Command::TimerDue(...))` path as all other runtime commands. This preserves the lane's single-writer serialization for each run and ensures the kernel's fenced transition logic handles conflicts correctly.
 
@@ -230,7 +249,8 @@ TimerScanner loop:
   3. Wait on cancellation, an earlier-deadline notification, or the planned sleep.
   4. List only due active shards through clock.now() + scan_interval.
      - A full pass restarts every shard cursor and clears failed identities.
-  5. Submit due rows in fire-time order through command_for_due_timer.
+  5. Submit due rows through command_for_due_timer, different lanes concurrently, each lane's
+     share in fire-time order, waiting for each reply before that lane's next submission.
      - A full due page continues immediately after its last row.
      - Remember the first future row's deadline for the next wake.
      - Retain failed identities until the full pass, even if a commit rewinds a cursor.
@@ -387,3 +407,16 @@ Validation and the failure cause follow `service/history/api/command_attr_valida
 Verification: `stored_start_delay_deadlines_are_total`, `command_durations_preserve_failure_cause_and_message`. Admission uses `validate_and_cap_proto_duration`; stored deadlines use saturating arithmetic because earlier rows did not pass that admission boundary. No schema or dependency changes are required.
 
 The appended `StartTimerWithTimeout` command carries the validated duration to the transition clock. This makes `TimerStarted` record the exact capped value; translating an absolute fire time earlier would subtract transport and queueing time from the recorded timeout. The legacy `StartTimer` variant retains its positional encoding. `capped_command_durations_are_recorded_in_history` checks the resulting wire history.
+
+### Property 8: Lanes submit concurrently, each lane in page order
+
+*For any* page of due timers, submissions for different lanes may be in flight together, each
+lane has at most one in flight and submits in page order, every due timer is submitted at most
+once, a failed submission is settled once and suppressed until the next full pass, and no
+submission follows a lost acquisition.
+
+**Validates: Requirements 8.**
+
+Verification: `due_timers_on_different_lanes_are_in_flight_together`,
+`one_runs_due_timers_are_submitted_in_fire_order`, `failed_submission_is_settled_once_per_pass`,
+`lost_acquisition_stops_every_lane`.

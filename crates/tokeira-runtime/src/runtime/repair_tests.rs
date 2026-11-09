@@ -72,6 +72,7 @@ pub(crate) struct Repo {
     pub(crate) outbound_reads: Mutex<Vec<OutboundRead>>,
     pub(crate) timer_reads: Mutex<Vec<ShardId>>,
     pub(crate) timer_fixture: Mutex<Option<BTreeMap<ShardId, Vec<DueTimer>>>>,
+    pub(crate) timer_deletes: Mutex<Vec<DueTimer>>,
     pub(crate) outbound_read: tokio::sync::Notify,
     pub(super) history_reads: AtomicUsize,
     pub(super) fail: Mutex<Option<Point>>,
@@ -1216,6 +1217,7 @@ impl RunRepository for Repo {
         timer: &DueTimer,
         reason: tokeira_storage::StaleTimer,
     ) -> Result<bool> {
+        self.timer_deletes.lock().unwrap().push(timer.clone());
         self.inner.delete_due_timer_if_matches(timer, reason).await
     }
 }

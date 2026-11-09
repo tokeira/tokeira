@@ -946,6 +946,18 @@ pub const HISTORY_READ_PAGE: usize = 1024;
 /// table X with join Y".
 #[async_trait]
 pub trait RunRepository: Send + Sync {
+    /// The most commits this repository can ever run at once, or `None` when
+    /// it has no commit budget.
+    ///
+    /// For DSQL this is the `Commit` class allocation at the reservoir's
+    /// configured target. A controller budget can lower the live allocation
+    /// below it but never raise it above, so the value is fixed for the
+    /// repository's life. The runtime sizes its node-wide activation slots
+    /// from it; every commit still takes a live permit.
+    fn commit_concurrency_ceiling(&self) -> Option<usize> {
+        None
+    }
+
     /// Discover published generations still owed local timeout reconstruction.
     /// This durable handoff covers a lost publication reply after intent retirement.
     async fn read_published_preparations(
@@ -3188,6 +3200,10 @@ impl<T> RunRepository for std::sync::Arc<T>
 where
     T: RunRepository + ?Sized,
 {
+    fn commit_concurrency_ceiling(&self) -> Option<usize> {
+        (**self).commit_concurrency_ceiling()
+    }
+
     async fn read_published_preparations(
         &self,
         home: tokeira_types::ShardId,

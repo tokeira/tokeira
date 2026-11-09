@@ -347,6 +347,15 @@ impl ReservoirController {
             Self::Embedded(reservoir) => reservoir.config().target_ready,
         }
     }
+
+    /// The operator's configured warm-connection target, which a controller
+    /// budget can lower but never raise (`Reservoir::reconfigure_target`).
+    fn configured_target(&self) -> usize {
+        match self {
+            Self::Distributed(reservoir) => reservoir.config().target_ready,
+            Self::Embedded(reservoir) => reservoir.config().target_ready,
+        }
+    }
 }
 
 /// A connection budget directive as the reservoir applies it.
@@ -506,6 +515,17 @@ impl DsqlConnectionDirector {
     /// Live warm-connection target after any controller cap.
     pub fn reservoir_target(&self) -> usize {
         self.reservoir.target_ready()
+    }
+
+    /// The most commits this director can ever admit at once: the `Commit`
+    /// class allocation at the configured target.
+    ///
+    /// Controller budgets only lower the live target, and the class budgets
+    /// follow it, so the live `Commit` allocation never exceeds this value.
+    /// It is fixed for the director's life, which lets callers size
+    /// structures once; the live permit count still gates every commit.
+    pub fn commit_concurrency_ceiling(&self) -> usize {
+        commit_allocation(self.reservoir.configured_target())
     }
 
     /// Install the singleton-owner gate on the director exactly once.
@@ -760,12 +780,22 @@ impl Drop for DsqlConnectionDirector {
 #[async_trait]
 pub(crate) trait DsqlConnectionAcquirer: std::fmt::Debug + Send + Sync {
     async fn acquire(&self, class: DbClass) -> Result<DsqlPermit>;
+
+    /// See [`DsqlConnectionDirector::commit_concurrency_ceiling`]. Test
+    /// acquirers have no class budgets and report none.
+    fn commit_concurrency_ceiling(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[async_trait]
 impl DsqlConnectionAcquirer for DsqlConnectionDirector {
     async fn acquire(&self, class: DbClass) -> Result<DsqlPermit> {
         ConnectionDirector::acquire(self, class).await
+    }
+
+    fn commit_concurrency_ceiling(&self) -> Option<usize> {
+        Some(DsqlConnectionDirector::commit_concurrency_ceiling(self))
     }
 }
 
@@ -1207,6 +1237,14 @@ fn default_allocations(target: usize) -> HashMap<DbClass, usize> {
     allocations
 }
 
+/// The `Commit` share of [`default_allocations`] for `target`.
+fn commit_allocation(target: usize) -> usize {
+    default_allocations(target)
+        .get(&DbClass::Commit)
+        .copied()
+        .expect("default allocations cover every class")
+}
+
 fn all_classes() -> [DbClass; 5] {
     [
         DbClass::Control,
@@ -1567,6 +1605,46 @@ mod tests {
         };
         let reservoir = Reservoir::idle_for_tests(config.reservoir.clone());
         DsqlConnectionDirector::start(config, reservoir).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_commit_ceiling_is_the_commit_allocation_at_the_configured_target() {
+        let director = Arc::new(distributed_director(50));
+        let ceiling = default_allocations(50)[&DbClass::Commit];
+        assert_eq!(director.commit_concurrency_ceiling(), ceiling);
+
+        let repository = crate::dsql::DsqlRunRepository::new(
+            director.clone(),
+            16,
+            16,
+            crate::CurrentExecutionConflictPolicy::Reject,
+            time::Duration::seconds(30),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::RunRepository::commit_concurrency_ceiling(&repository),
+            Some(ceiling)
+        );
+        let shared: Arc<dyn crate::RunRepository> = Arc::new(repository);
+        assert_eq!(
+            crate::RunRepository::commit_concurrency_ceiling(&shared),
+            Some(ceiling)
+        );
+
+        // A controller budget lowers the live allocation, never the ceiling.
+        director
+            .apply_connection_budget(budget(20, 10_000))
+            .await
+            .unwrap();
+        // Nothing holds a permit, so the available count is the allocation.
+        assert_eq!(
+            director
+                .class_budgets
+                .class_available(DbClass::Commit)
+                .await,
+            Some(default_allocations(20)[&DbClass::Commit])
+        );
+        assert_eq!(director.commit_concurrency_ceiling(), ceiling);
     }
 
     fn budget(capacity: u64, max_reservoir_size: u32) -> ConnectionBudget {

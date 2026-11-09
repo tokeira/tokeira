@@ -140,6 +140,26 @@ can be divided by lifecycle. It releases its homes before it ends.
 cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --test dsql_statement_budget --test-threads 1
 ```
 
+Run the lane-concurrency check against a **separate freshly migrated disposable
+database**, selected through `TOKEIRA_DSQL_TEST_DATABASE_URL`, or in the
+preparation-sensitive order above, before any suite that leaves a lease. It
+migrates the database, prepares eight homes and acquires all of them with
+fenced writes. Its runtime has one lane and a reservoir target whose `Commit`
+class has three permits, so the lane runs up to three activations of
+different runs at once. It starts three times that many runs and signals each
+eight times, every run concurrently with the others. It asserts that every
+submit is answered, that each run's history holds its start and every signal
+once and in order, and that same-lane commits overlapped without exceeding the
+`Commit` permits. A commit counts from its first statement to its COMMIT, which
+both run while it holds its permit. It deletes and purges every run and
+releases its homes before it ends. `--no-capture` shows one summary line: runs,
+signals, the activation bound, the `Commit` allocation, the peak of concurrent
+commits and the elapsed time.
+
+```bash
+cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --test dsql_lane_concurrency --test-threads 1 --no-capture
+```
+
 ## URL-gated storage and projection
 
 Set `TOKEIRA_DSQL_TEST_DATABASE_URL` to a connection URL for a disposable test database.

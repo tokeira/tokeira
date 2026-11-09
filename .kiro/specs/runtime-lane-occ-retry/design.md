@@ -42,15 +42,17 @@ flowchart TD
     PUB -->|Child/Signal/Cancel/Nexus| ORCH[Orchestration Handlers]
 ```
 
-The lane task loop changes from processing one message at a time to:
+Each run has its own queue on its lane, and a run has at most one activation in flight. An activation:
 
-1. Receive a message from the channel.
-2. Enter the OCC retry loop for that message.
-3. On success, check the channel for more messages targeting the same `run_key` (up to `drain_limit`).
-4. Process each coalesced message through its own OCC retry loop.
-5. After the drain batch completes (or on error), yield back to the channel recv.
+1. Takes the front command of its run's queue.
+2. Enters the OCC retry loop for that command.
+3. On success, takes the run's next command, up to `drain_limit` commands in total.
+4. Processes each coalesced command through its own OCC retry loop.
+5. After the drain batch completes (or on error), hands the run back to the lane, which makes it ready again behind every run already waiting if its queue is not empty.
 
-Publication happens inside the lane task, immediately after each successful commit, before processing the next coalesced item. This ensures dispatch ops are published even after OCC retries and keeps the publication close to the commit site.
+Activations for different runs on one lane run concurrently, bounded by the node's shared activation slots. The run queues, the dispatcher that starts activations, and the bound are specified by [lane-run-concurrency](../lane-run-concurrency/design.md).
+
+Publication happens inside the activation, immediately after each successful commit, before processing the next coalesced item. This ensures dispatch ops are published even after OCC retries and keeps the publication close to the commit site.
 
 ## Components and Interfaces
 
@@ -133,41 +135,25 @@ async fn handle_message<K, R>(
 
 On `Conflict`, it reloads and reapplies the same `command` up to `max_retries` times. On `Applied`, it returns the result together with the transition's `dispatch_ops` so the caller can publish them. On `Duplicate`, it returns immediately with an empty ops vec.
 
-### Lane task loop with coalescing
+### Lane activation with coalescing
 
 ```rust
-// Pseudocode for the lane task
-loop {
-    let first_msg = rx.recv().await;  // block for first message
-    let run_key = first_msg.run_key;
-    let (result, ops) = handle_message(..., first_msg, config.max_occ_retries);
+// Pseudocode for one activation of `run_key`
+let mut drained = 0;
+while drained < config.max_drain_per_activation {
+    let Some(msg) = run_queues.take_next(run_key) else { break };
+    let (result, ops) = handle_message(..., msg, config.max_occ_retries);
     if let Ok(ref ops) = ops { publisher.publish(run_key, ops).await; }
+    let failed = result.is_err();
     reply(result);
-
-    // Coalescing: drain more items for the SAME run_key only
-    let mut drained = 1;
-    while drained < config.max_drain_per_activation {
-        match rx.try_recv() {
-            Ok(msg) if msg.run_key == run_key => {
-                let (result, ops) = handle_message(...);
-                if let Ok(ref ops) = ops { publisher.publish(run_key, ops).await; }
-                reply(result);
-                drained += 1;
-            }
-            Ok(msg) => {
-                // Different run_key — put it back and stop coalescing.
-                // The next activation will pick it up.
-                requeue(msg);
-                break;
-            }
-            Err(TryRecvEmpty) => break,
-        }
-    }
-    // If limit reached or no more same-run items, yield to let other runs progress
+    drained += 1;
+    if failed { break; }
 }
+// The dispatcher hands the run back: ready again, behind every waiting run,
+// if its queue is not empty.
 ```
 
-Coalescing is strictly per-run. Messages for other runs that appear during the drain are put back into the channel (or held in a local buffer and re-sent) so they are processed in the next activation. This matches the requirement that coalescing reduces load/park cycles for the same run during signal floods, not that it batch-processes unrelated runs.
+Coalescing is strictly per-run. Commands for other runs wait in their own queues and never interrupt the drain; their activations run alongside this one, as [lane-run-concurrency](../lane-run-concurrency/design.md) describes.
 
 ### Updated TokeiraRuntime
 
@@ -307,13 +293,13 @@ The routing function `hash(run_key) mod lane_count` is already implemented in `T
 
 ### Property 5: Mailbox coalescing drains pending items
 
-*For any* sequence of N commands (1 ≤ N ≤ drain_limit) sent to the lane channel before the lane processes the first one, the lane shall process all N commands in one activation cycle without going back to a blocking recv between them.
+*For any* sequence of N commands (1 ≤ N ≤ drain_limit) for one run queued before the lane starts the first one, the lane shall process all N commands in one activation.
 
 **Validates: Requirements 2.1, 2.2**
 
 ### Property 6: Drain limit enforcement
 
-*For any* `max_drain_per_activation` value D and a burst of D + K messages (K > 0), the lane shall process at most D messages before yielding, allowing messages for other runs to be processed.
+*For any* `max_drain_per_activation` value D and a burst of D + K messages (K > 0) for one run, the lane shall process at most D of them in one activation, then make the run ready again behind every run already waiting.
 
 **Validates: Requirements 2.3, 2.6**
 

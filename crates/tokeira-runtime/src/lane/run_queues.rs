@@ -42,6 +42,16 @@ pub(crate) enum LaneRefusal {
     LaneBudgetFull,
 }
 
+impl LaneRefusal {
+    /// The refusal's `kind` label on the lane refusal counter.
+    pub(crate) fn metric_kind(self) -> &'static str {
+        match self {
+            Self::RunShareFull => "busy_workflow",
+            Self::LaneBudgetFull => "overloaded",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RunState {
     Idle,
@@ -216,7 +226,6 @@ impl<T> RunQueues<T> {
     }
 
     /// Activations in flight.
-    #[cfg(test)]
     pub(crate) fn active(&self) -> usize {
         self.active
     }

@@ -3,8 +3,18 @@
 //! A lane is the serialization boundary for all state mutations on a run.
 //! Every command — signal, timer fire, activity resolution, WFT completion —
 //! enters its run's queue on the run's lane, and the lane applies each run's
-//! commands one at a time in the order it accepted them. This eliminates the
-//! need for per-run locking: the lane *is* the lock.
+//! commands one at a time in the order it accepted them: a run has at most
+//! one activation in flight, and that activation takes the run's commands
+//! from the front of its queue. That is the per-execution exclusion v1.31.0
+//! keeps with a weight-one lock on each workflow context (`ContextImpl.Lock`,
+//! `service/history/workflow/context.go @ v1.31.0`), so no other per-run
+//! locking is needed.
+//!
+//! Different runs on one lane are not serialised. Their activations run
+//! concurrently, each holding one of the node's activation slots, which every
+//! lane on the node shares (`node_activation_bound`). Serialising them would
+//! add no guarantee: run-key routing already spreads one shard's runs across
+//! lanes, and a commit touches only its own run's rows.
 //!
 //! Admission is bounded and never waits. A lane holds at most 1024
 //! accepted-but-unstarted commands, and a run at most half of that. Past either
@@ -14,9 +24,11 @@
 //! durable source.
 //!
 //! A lane never sends to its own input: nothing in the lane submits to the
-//! lane, so a full lane can always drain. A lane's dispatcher starts one
-//! activation at a time, for the first ready run, and an activation takes only
-//! its own run's commands.
+//! lane, so a full lane can always drain. A lane's dispatcher starts an
+//! activation for the first ready run whenever a slot is free, and an
+//! activation takes only its own run's commands. The lane's queues and cache
+//! share one mutex that is never held across an await; each access says why it
+//! is race-free.
 //!
 //! A close and its successor are applied separately by the pure kernel, then
 //! committed together. A recognized size refusal instead atomically reserves a
@@ -358,7 +370,11 @@ impl Drop for SubmitReservation {
 impl LaneHandle {
     /// Claim room for one command for `run_key`, or refuse without waiting.
     pub(crate) fn reserve(&self, run_key: RunKey) -> Result<SubmitReservation, LaneRefusal> {
-        self.shared.lock().queues.try_reserve(run_key)?;
+        let reserved = self.shared.lock().queues.try_reserve(run_key);
+        if let Err(refusal) = reserved {
+            runtime_metrics::record_lane_refusal(self.lane_id, refusal.metric_kind());
+            return Err(refusal);
+        }
         Ok(SubmitReservation {
             shared: self.shared.clone(),
             wake: self.wake.clone(),
@@ -532,7 +548,7 @@ impl LaneHandle {
             && !state.queues.is_active(run_key)
             && !state.cache.entries.contains_key(&run_key)
         {
-            state.cache.insert(run_key, loaded);
+            state.cache.insert_at(run_key, loaded, generation);
         }
         identity
     }
@@ -540,6 +556,11 @@ impl LaneHandle {
     /// Commands accepted by this lane and not yet started.
     pub fn queued_depth(&self) -> usize {
         self.shared.lock().queues.queued()
+    }
+
+    /// Activations in flight on this lane, one per active run.
+    pub fn active_activations(&self) -> usize {
+        self.shared.lock().queues.active()
     }
 
     /// Claims held on this lane, queued or still being built.
@@ -608,6 +629,14 @@ impl LaneMessage {
 /// run is hot. Entries are evicted on OCC conflict (the cached base lost the
 /// commit race) and bounded by capacity and idle age so dormant runs don't
 /// pin memory.
+///
+/// Every entry records the shard owner's cache generation it was read under,
+/// and the cache only moves forward through generations: an image from an
+/// older generation is never installed and never returned. Several runs'
+/// activations and identity lookups share one cache, so a load that started
+/// before an ownership change can finish after another task has already
+/// moved the cache on; the per-entry generation is what keeps that load's
+/// image out.
 struct LaneCache {
     max_entries: usize,
     idle_timeout: std::time::Duration,
@@ -624,6 +653,9 @@ struct LaneCache {
 struct CachedRun {
     loaded: LoadedRun,
     last_accessed: std::time::Instant,
+    /// The shard owner's cache generation the image was read or committed
+    /// under.
+    generation: u64,
 }
 
 impl LaneCache {
@@ -638,8 +670,13 @@ impl LaneCache {
         }
     }
 
+    /// Move the cache to `generation`, clearing it, if that is newer.
+    ///
+    /// The owner's generation only grows, so an older value is a read that
+    /// raced a newer one already applied here; going back to it would let a
+    /// stale image in again.
     fn synchronize_to(&mut self, generation: u64) -> bool {
-        if self.generation == generation {
+        if generation <= self.generation {
             return false;
         }
         self.entries.clear();
@@ -651,23 +688,49 @@ impl LaneCache {
 
     // Admission needs only identity; it must not copy the whole cached state.
     fn get_with<T>(&mut self, run_key: RunKey, extract: impl FnOnce(&LoadedRun) -> T) -> Option<T> {
+        self.get_entry(run_key, extract).map(|(value, _)| value)
+    }
+
+    /// The entry's extracted value and the generation its image was read
+    /// under.
+    fn get_entry<T>(
+        &mut self,
+        run_key: RunKey,
+        extract: impl FnOnce(&LoadedRun) -> T,
+    ) -> Option<(T, u64)> {
         let now = std::time::Instant::now();
         let entry = self.entries.get_mut(&run_key)?;
-        if now.duration_since(entry.last_accessed) > self.idle_timeout {
+        // Inserts never install an older generation and moving forward clears
+        // every entry, so this holds; checking keeps a stale image from ever
+        // reaching a commit should either rule be weakened.
+        if now.duration_since(entry.last_accessed) > self.idle_timeout
+            || entry.generation != self.generation
+        {
             self.entries.remove(&run_key);
             return None;
         }
         entry.last_accessed = now;
-        Some(extract(&entry.loaded))
+        Some((extract(&entry.loaded), entry.generation))
     }
 
     fn insert(&mut self, run_key: RunKey, loaded: LoadedRun) {
+        self.insert_at(run_key, loaded, self.generation);
+    }
+
+    /// Install `loaded`, read or committed under `generation`.
+    ///
+    /// An image from before the cache's generation is dropped, and the run's
+    /// entry with it: the run's own activation is the only other writer of
+    /// that entry, so nothing newer is lost. An image from a newer generation
+    /// moves the cache forward first.
+    fn insert_at(&mut self, run_key: RunKey, loaded: LoadedRun, generation: u64) {
         // Another run's lane can now create this run in a pair commit. An
         // earlier missing-run lookup must not hide that start until cache expiry.
-        if matches!(loaded, LoadedRun::Absent) {
+        if matches!(loaded, LoadedRun::Absent) || generation < self.generation {
             self.evict(run_key);
             return;
         }
+        self.synchronize_to(generation);
         self.revision += 1;
         if self.max_entries == 0 {
             return;
@@ -680,6 +743,7 @@ impl LaneCache {
             CachedRun {
                 loaded,
                 last_accessed: now,
+                generation,
             },
         );
         self.evict_over_capacity();
@@ -740,46 +804,60 @@ impl ActivationCache for LaneCache {
 
 /// An activation's view of its lane's shared cache.
 ///
-/// It remembers the generation it last synchronized to, which is the
-/// generation of the image the activation is working from. Identity lookups
-/// in callers' tasks also synchronize the shared cache, so whether *this*
-/// call cleared it says nothing about this activation's image; comparing with
-/// the remembered generation does.
+/// Each operation locks the lane state on its own and never across an await,
+/// so other runs' activations and identity lookups interleave freely between
+/// them. That is race-free because each entry belongs to one run, only that
+/// run's single activation writes an image for it while it is active, and
+/// generations are compared rather than inferred: the access remembers the
+/// generation of the image it is working from (the cached entry's, or the one
+/// it observed before loading) and the generation it last observed from the
+/// shard owner. Whether *this* access cleared the shared cache says nothing
+/// about its image, since any task may move the cache forward.
 struct CacheAccess<'a> {
     shared: &'a LaneShared,
-    generation: Option<u64>,
+    /// Generation of the image this activation is working from.
+    image: Option<u64>,
+    /// The shard owner's generation at this activation's latest check.
+    observed: u64,
 }
 
 impl<'a> CacheAccess<'a> {
     fn new(shared: &'a LaneShared) -> Self {
         Self {
             shared,
-            generation: None,
+            image: None,
+            observed: 0,
         }
     }
 }
 
 impl ActivationCache for CacheAccess<'_> {
-    /// Returns whether the generation moved since this activation's previous
-    /// call, so the check before a commit reloads an image read under an
-    /// older generation however the shared cache was cleared.
+    /// Returns whether this activation's image predates the owner's current
+    /// generation, so the check before a commit reloads it.
     fn synchronize_generation(&mut self, owner: &Arc<RwLock<ShardOwner>>) -> bool {
         let generation = owner
             .read()
             .expect("shard owner lock poisoned")
             .cache_generation();
         self.shared.lock().cache.synchronize_to(generation);
-        self.generation
-            .replace(generation)
-            .is_some_and(|seen| seen != generation)
+        self.observed = generation;
+        self.image.is_some_and(|image| image < generation)
     }
 
     fn get(&mut self, run_key: RunKey) -> Option<LoadedRun> {
-        self.shared.lock().cache.get_with(run_key, Clone::clone)
+        let (loaded, generation) = self.shared.lock().cache.get_entry(run_key, Clone::clone)?;
+        self.image = Some(generation);
+        Some(loaded)
     }
 
+    /// The image is either a load issued after the latest check or a commit
+    /// that check admitted, so it belongs to the generation that check saw.
     fn insert(&mut self, run_key: RunKey, loaded: LoadedRun) {
-        self.shared.lock().cache.insert(run_key, loaded);
+        self.image = Some(self.observed);
+        self.shared
+            .lock()
+            .cache
+            .insert_at(run_key, loaded, self.observed);
     }
 
     fn evict(&mut self, run_key: RunKey) {
@@ -798,8 +876,10 @@ fn loaded_execution_identity(loaded: &LoadedRun) -> Result<(NamespaceId, Workflo
 
 /// Spawn a new lane executor as a background Tokio task.
 ///
-/// Each lane keeps a bounded queue per run and runs one activation at a time.
-/// Commands for the same run are coalesced within a single activation up to
+/// The lane keeps a bounded queue per run and runs one activation per run at
+/// a time, different runs' activations concurrently up to
+/// `max(1, commit ceiling)` slots of its own. Commands for the same run are
+/// coalesced within a single activation up to
 /// [`LaneConfig::max_drain_per_activation`].
 ///
 /// Returns a [`LaneHandle`] that callers use to submit
@@ -821,6 +901,8 @@ where
     R: RunRepository + Clone + 'static,
     P: DispatchPublisher + Clone + 'static,
 {
+    // A standalone lane is a node of one lane: `max(1, ceiling)` slots.
+    let slots = node_activation_bound(1, repo.commit_concurrency_ceiling());
     spawn_lane_with_id(
         0,
         kernel,
@@ -835,8 +917,34 @@ where
         Arc::new(Mutex::new(HashSet::new())),
         config,
         system_clock(),
-        Arc::new(Semaphore::new(1)),
+        Arc::new(Semaphore::new(slots)),
     )
+}
+
+/// The node activation bound `N`: how many activations may be in flight
+/// across all of a node's lanes, as `max(lane_count, ceiling)`.
+///
+/// `ceiling` is the repository's
+/// [`commit_concurrency_ceiling`](RunRepository::commit_concurrency_ceiling).
+/// For DSQL it is the `Commit` share that `default_allocations` (in
+/// `tokeira-storage`'s connection director) gives the reservoir's configured
+/// target, and `ClassBudgets::acquire` makes every commit hold one of those
+/// permits. A controller budget only lowers the target
+/// (`Reservoir::reconfigure_target` never raises it past the configuration),
+/// and the class budgets are recomputed from the lowered target, so no more
+/// commits than the ceiling ever run at once. An activation past that could
+/// only wait on the commit semaphore while holding a loaded image and a
+/// serving-gate read permit: more memory and a longer quiesce for acquisition
+/// repair, and no more throughput. The ceiling rather than the live target is
+/// used so `N` is fixed when the lanes are built; when a controller lowers the
+/// live budget, the commit semaphore is the tighter limit.
+///
+/// The `lane_count` floor keeps at least the one activation per lane a node
+/// had when each lane ran one activation at a time, so a small connection
+/// budget, or a repository with no commit budget at all, never lowers a
+/// node's concurrency. The bound is at least one so a lane can always run.
+pub(crate) fn node_activation_bound(lane_count: usize, ceiling: Option<usize>) -> usize {
+    lane_count.max(ceiling.unwrap_or(0)).max(1)
 }
 
 /// Everything an activation needs, built once per lane and shared by its
@@ -859,6 +967,9 @@ struct LaneContext<K, R, P> {
 }
 
 /// Spawn lane `lane_id`, whose activations each hold one of `slots`.
+///
+/// The runtime gives every lane on a node the same `slots`, so a busy lane can
+/// run as many activations as idle lanes leave room for.
 ///
 /// The lane never sends to its own input: nothing in the lane submits to the
 /// lane, and its dispatcher only moves run keys between the ready order and
@@ -968,25 +1079,48 @@ async fn dispatch<K, R, P>(
                     Err(error) => (error.id(), None),
                 };
                 let run_key = running.remove(&id).expect("every activation task is tracked");
-                let depth = {
+                let (depth, active) = {
                     let mut state = context.shared.lock();
                     state.queues.finish(run_key);
-                    state.queues.queued()
+                    (state.queues.queued(), state.queues.active())
                 };
                 // The slot is held until the run is handed back, so it counts
                 // the activation for its whole life.
                 drop(slot);
                 runtime_metrics::set_lane_queue_depth(context.lane_id, depth);
+                runtime_metrics::set_lane_active_activations(context.lane_id, active);
             }
             slot = slots.clone().acquire_owned(), if ready => {
                 let slot = slot.expect("lane activation slots are never closed");
-                let Some(run_key) = context.shared.lock().queues.pop_ready() else {
+                // Only this task pops the ready order, so the run seen ready
+                // above is still there; `None` is only a defensive path that
+                // gives the slot straight back.
+                let Some((run_key, depth, active)) = ({
+                    let mut state = context.shared.lock();
+                    state
+                        .queues
+                        .pop_ready()
+                        .map(|run_key| (run_key, state.queues.queued(), state.queues.active()))
+                }) else {
                     continue;
                 };
                 let handle = activations.spawn(activate(context.clone(), run_key, slot));
                 running.insert(handle.id(), run_key);
+                runtime_metrics::set_lane_queue_depth(context.lane_id, depth);
+                runtime_metrics::set_lane_active_activations(context.lane_id, active);
             }
-            woken = wake.recv(), if open => {
+            // Not armed while a run is ready. The slot semaphore is shared by
+            // every lane on the node and serves waiters in arrival order; a
+            // wake winning this select would drop the pending acquire and send
+            // the lane to the back of that queue, so a lane whose runs keep
+            // becoming ready could lose its place to quieter lanes forever. A
+            // wake says nothing new while `ready` holds: only this task pops
+            // the ready order, so it stays non-empty until a slot comes. The
+            // wake waits in the capacity-one channel and is read, or the close
+            // seen, once nothing is ready. Some branch is always armed: the
+            // acquire when ready, this one when open, the join when closed with
+            // activations in flight, and otherwise the loop has ended.
+            woken = wake.recv(), if open && !ready => {
                 if woken.is_none() {
                     open = false;
                 }
@@ -2646,6 +2780,7 @@ pub(crate) fn track_committed_run(
 #[cfg(test)]
 mod tests {
     mod atomic_successors;
+    mod cache_generations;
     mod committed_publish;
     mod concurrency;
     mod heartbeat;
@@ -2833,7 +2968,11 @@ mod tests {
     impl Kernel for MockKernel {
         fn apply(&self, loaded: LoadedRun, command: Command) -> Result<Transition, Reject> {
             let mut state = self.state.lock().expect("state lock poisoned");
-            state.applied_commands.push(command);
+            if matches!(&command, Command::Signal(signal) if signal.signal_name == PANIC_SIGNAL) {
+                drop(state);
+                panic!("the test kernel panics on {PANIC_SIGNAL}");
+            }
+            state.applied_commands.push(command.clone());
             state.loaded_runs.push(loaded.clone());
             if state.reject {
                 return Err(Reject::WorkflowPaused);
@@ -2875,7 +3014,12 @@ mod tests {
                 }
             } else {
                 tokeira_kernel::HistoryEventKind::WorkflowExecutionSignaled {
-                    signal_name: "test".to_string(),
+                    // The signal's own name, so a test can read which
+                    // commands a run's history holds.
+                    signal_name: match &command {
+                        Command::Signal(signal) => signal.signal_name.clone(),
+                        _ => "test".to_string(),
+                    },
                     input: Payloads::default(),
                     header: None,
                     links: Vec::new(),
@@ -2904,6 +3048,10 @@ mod tests {
         }
     }
 
+    /// A signal the test kernel panics on, standing in for an activation
+    /// task that ends without finishing.
+    const PANIC_SIGNAL: &str = "panic";
+
     #[derive(Clone)]
     struct MockRepo {
         state: Arc<AsyncMutex<MockRepoState>>,
@@ -2921,6 +3069,16 @@ mod tests {
         /// mean two activations of that run at once.
         in_flight: HashMap<RunKey, usize>,
         overlapped: bool,
+        /// Gates on one run's next load.
+        load_gates: HashMap<RunKey, CommitGate>,
+        /// When set, every load stamps its image with this owner's cache
+        /// generation as the load starts, and every commit records that stamp
+        /// beside the owner's generation as the commit starts.
+        stamp_owner: Option<Arc<RwLock<ShardOwner>>>,
+        stamps: Vec<(u64, u64)>,
+        /// Commits in flight across every run, and the most ever at once.
+        commits_in_flight: usize,
+        commit_high_water: usize,
         pair_behaviors: VecDeque<PairBehavior>,
         pairs: Vec<(Transition, Transition)>,
         fallbacks: Vec<StartRequest>,
@@ -2960,6 +3118,11 @@ mod tests {
                     run_gates: HashMap::new(),
                     in_flight: HashMap::new(),
                     overlapped: false,
+                    load_gates: HashMap::new(),
+                    stamp_owner: None,
+                    stamps: Vec::new(),
+                    commits_in_flight: 0,
+                    commit_high_water: 0,
                     pair_behaviors: VecDeque::new(),
                     pairs: Vec::new(),
                     fallbacks: Vec::new(),
@@ -2999,6 +3162,37 @@ mod tests {
         /// Whether two commits for one run were ever in flight together.
         async fn overlapped(&self) -> bool {
             self.state.lock().await.overlapped
+        }
+
+        /// Holds `run_key`'s next load, as [`Self::hold_next_commit`] does.
+        async fn hold_run_load(
+            &self,
+            run_key: RunKey,
+        ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+            let (held_tx, held_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            self.state.lock().await.load_gates.insert(
+                run_key,
+                CommitGate {
+                    held: held_tx,
+                    release: release_rx,
+                },
+            );
+            (held_rx, release_tx)
+        }
+
+        async fn stamp_generations(&self, owner: Arc<RwLock<ShardOwner>>) {
+            self.state.lock().await.stamp_owner = Some(owner);
+        }
+
+        /// Each commit's image stamp beside the owner's generation at commit.
+        async fn stamps(&self) -> Vec<(u64, u64)> {
+            self.state.lock().await.stamps.clone()
+        }
+
+        /// The most commits ever in flight at once, across every run.
+        async fn commit_high_water(&self) -> usize {
+            self.state.lock().await.commit_high_water
         }
 
         async fn snapshot(&self) -> (usize, usize, LoadedRun) {
@@ -3091,10 +3285,26 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn load_run(&self, _run_key: RunKey) -> Result<LoadedRun> {
+        async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
+            let (gate, stamp) = {
+                let mut state = self.state.lock().await;
+                let stamp = state
+                    .stamp_owner
+                    .as_ref()
+                    .map(|owner| owner.read().expect("owner lock").cache_generation());
+                (state.load_gates.remove(&run_key), stamp)
+            };
+            if let Some(gate) = gate {
+                let _ = gate.held.send(());
+                let _ = gate.release.await;
+            }
             let mut state = self.state.lock().await;
             state.load_calls += 1;
-            Ok(state.loaded.clone())
+            let mut loaded = state.loaded.clone();
+            if let (Some(stamp), LoadedRun::Existing(image)) = (stamp, &mut loaded) {
+                image.wft_stamp = stamp;
+            }
+            Ok(loaded)
         }
 
         async fn read_history(
@@ -3138,6 +3348,13 @@ mod tests {
                 if *in_flight > 1 {
                     state.overlapped = true;
                 }
+                state.commits_in_flight += 1;
+                state.commit_high_water = state.commit_high_water.max(state.commits_in_flight);
+                if let Some(owner) = &state.stamp_owner {
+                    let generation = owner.read().expect("owner lock").cache_generation();
+                    let stamp = (transition.next_state.wft_stamp, generation);
+                    state.stamps.push(stamp);
+                }
                 let run_gate = state.run_gates.remove(&run_key);
                 state.commit_gate.take().or(run_gate)
             };
@@ -3147,6 +3364,7 @@ mod tests {
             }
             let mut state = self.state.lock().await;
             *state.in_flight.entry(run_key).or_default() -= 1;
+            state.commits_in_flight -= 1;
             state.commit_calls += 1;
             match state
                 .commit_behaviors
@@ -3801,6 +4019,37 @@ mod tests {
         (
             LaneMessage::new(0, run_key, sample_command(label), reply_tx),
             reply_rx,
+        )
+    }
+
+    /// A lane whose activations each hold one of `slots`, as the runtime's
+    /// lanes share the node's.
+    fn spawn_slotted_lane<R>(
+        lane_id: usize,
+        kernel: MockKernel,
+        repo: R,
+        owner: Arc<RwLock<ShardOwner>>,
+        config: LaneConfig,
+        slots: Arc<Semaphore>,
+    ) -> LaneHandle
+    where
+        R: RunRepository + Clone + 'static,
+    {
+        spawn_lane_with_id(
+            lane_id,
+            kernel,
+            repo,
+            MockPublisher::new(),
+            owner,
+            crate::activity_timeout::ActivityTrackingState::default(),
+            crate::timeout::WorkflowTimeoutTrackingState::default(),
+            crate::wft_timeout::WftTimeoutTrackingState::default(),
+            crate::nexus::NexusTimeoutTrackingState::default(),
+            crate::UpdateRegistry::new(),
+            Arc::new(Mutex::new(HashSet::new())),
+            config,
+            system_clock(),
+            slots,
         )
     }
 

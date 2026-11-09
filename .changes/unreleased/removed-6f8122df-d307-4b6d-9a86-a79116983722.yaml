@@ -1,0 +1,5 @@
+kind: removed
+body: Remove `tokeira_runtime_lane_carry_overs_total`, which measures nothing now that runs on one lane run concurrently.
+time: 2026-11-09T18:22:37+00:00
+custom:
+    Slice: 6f8122df-d307-4b6d-9a86-a79116983722

@@ -14,8 +14,8 @@
 //! submission path in the runtime, not just timers.
 //!
 //! Routing invariant: every command for a given `run_key` must land on the same
-//! lane, because a lane serializes the commands for the runs it owns and that
-//! serialization is what keeps per-run transitions ordered. The mapping is a pure
+//! lane, because a lane serializes each run's commands and that serialization
+//! is what keeps per-run transitions ordered. The mapping is a pure
 //! function of the run key, so all producers (poll handlers, sweepers, the
 //! timeout scanners) agree on the lane without coordination.
 
@@ -203,12 +203,11 @@ struct DuePage {
 /// uses, so each group holds exactly the rows whose commands land on one lane.
 /// Groups proceed concurrently, so an idle lane does not wait behind another
 /// lane's commit. Within a group each submission awaits its reply before the
-/// next one starts. The lane executes one command at a time, so a deeper queue
-/// of scanner commands would not commit any sooner; it would only occupy more
-/// of the lane's 1,024-slot mailbox (`spawn_lane_with_id`) that worker
-/// completions and polls share, and it would hand the lane a run's later timer
-/// before the earlier one had been settled. Awaiting keeps one run's timers in
-/// fire order, keeps the scanner to at most one mailbox slot per lane, and
+/// next one starts. Submitting a group's whole share at once would occupy more
+/// of the lane's 1,024-command budget (`LANE_BUDGET`) that worker completions
+/// and polls share, and it would hand the lane a run's later timer before the
+/// earlier one had been settled. Awaiting keeps one run's timers in fire
+/// order, keeps the scanner to at most one queued command per lane, and
 /// bounds the work in flight by the lane count and the page size, the two
 /// limits that already exist.
 /// What it gives up is same-run coalescing in the lane, which a page of

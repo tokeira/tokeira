@@ -586,6 +586,10 @@ fn classify_connection_error(error: &anyhow::Error) -> Option<&'static str> {
 // filter.
 #[async_trait]
 impl RunRepository for DsqlRunRepository {
+    fn commit_concurrency_ceiling(&self) -> Option<usize> {
+        self.director.commit_concurrency_ceiling()
+    }
+
     async fn read_published_preparations(
         &self,
         home: tokeira_types::ShardId,

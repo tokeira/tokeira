@@ -16,7 +16,7 @@ The authoritative specifications are [030-runtime-lanes](../../../docs/architect
 
 ## Glossary
 
-- **Lane**: A single-thread serial command processor hosting many run actors. Commands for a run are routed to one Lane via `hash(run_key) mod lane_count`.
+- **Lane**: A command processor hosting many run actors. Commands for a run are routed to one Lane via `hash(run_key) mod lane_count`. A Lane runs one activation per run at a time; activations for different runs on one Lane run concurrently, as [lane-run-concurrency](../lane-run-concurrency/requirements.md) specifies.
 - **Run_Actor**: A demand-loaded in-memory object representing one workflow run on a Lane. Loads state, drains mailbox, invokes kernel, commits, publishes effects, then parks or evicts.
 - **Mailbox**: The per-run message queue on a Lane. Multiple commands for the same run can be drained in one activation cycle.
 - **Mailbox_Coalescing**: Draining multiple Mailbox items for the same run before parking, subject to fairness and transaction-size bounds.
@@ -62,7 +62,7 @@ The authoritative specifications are [030-runtime-lanes](../../../docs/architect
 3. THE Lane SHALL bound the number of same-run Mailbox items drained per activation to a configurable maximum (default 16) to preserve fairness across runs.
 4. WHEN multiple Mailbox items are drained in one activation, THE Lane SHALL process each item sequentially (load, Kernel apply, commit) using the latest committed state.
 5. WHEN a Mailbox item fails during a coalesced drain, THE Lane SHALL return the error for that item and stop draining further items for that run in the current activation.
-6. WHEN the coalescing drain limit is reached and additional Mailbox items remain, THE Lane SHALL yield control to allow other runs on the same Lane to make progress.
+6. WHEN the coalescing drain limit is reached and additional Mailbox items remain, THE Lane SHALL end the run's activation and make the run ready again behind every run already ready on that Lane, as [lane-run-concurrency](../lane-run-concurrency/requirements.md) Requirement 1.5 specifies. Other runs on the Lane do not wait for the drain: their activations run concurrently.
 
 ---
 
@@ -75,7 +75,7 @@ The authoritative specifications are [030-runtime-lanes](../../../docs/architect
 1. THE Runtime SHALL route commands to Lanes using `hash(run_key) mod lane_count`.
 2. THE Runtime SHALL maintain at least one Lane at all times.
 3. WHEN a command is submitted for a run, THE Runtime SHALL always route the command to the same Lane for a given lane_count.
-4. WHEN two commands target different RunKey values that hash to the same Lane, THE Lane SHALL process the commands serially without interleaving their Kernel invocations.
+4. WHEN two commands target different RunKey values that hash to the same Lane, THE Lane SHALL keep each run's commands one at a time and in arrival order, and MAY run the two runs' activations concurrently, as [lane-run-concurrency](../lane-run-concurrency/requirements.md) Requirements 1 and 2 specify.
 
 ---
 

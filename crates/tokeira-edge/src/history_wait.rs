@@ -79,6 +79,10 @@ impl<R> RunRepository for HistoryNotifyingRepository<R>
 where
     R: RunRepository + Send + Sync + 'static,
 {
+    fn commit_concurrency_ceiling(&self) -> Option<usize> {
+        self.inner.commit_concurrency_ceiling()
+    }
+
     async fn read_published_preparations(
         &self,
         home: tokeira_types::ShardId,
@@ -800,6 +804,20 @@ mod tests {
         Memo, Payloads, RequestContext, RunId, SearchAttributes, TaskQueueName, WorkflowRuleAction,
         WorkflowRuleTrigger, WorkflowType,
     };
+
+    #[test]
+    fn the_commit_ceiling_is_the_inner_repositorys() {
+        let repo = HistoryNotifyingRepository::new(
+            Arc::new(InMemoryStore::default().with_commit_concurrency_ceiling(9)),
+            HistoryWaitRegistry::default(),
+        );
+        assert_eq!(repo.commit_concurrency_ceiling(), Some(9));
+        let repo = HistoryNotifyingRepository::new(
+            Arc::new(InMemoryStore::default()),
+            HistoryWaitRegistry::default(),
+        );
+        assert_eq!(repo.commit_concurrency_ceiling(), None);
+    }
 
     fn pinned_start_transition(
         namespace_id: NamespaceId,

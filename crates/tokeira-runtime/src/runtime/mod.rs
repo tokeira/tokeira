@@ -860,6 +860,12 @@ where
         #[cfg(test)]
         let publication_failure = Arc::new(Mutex::new(None));
         let outbound_wake = Arc::new(tokio::sync::Notify::new());
+        // One set of activation slots for every lane on the node, so a busy
+        // lane can use slots idle lanes leave free; see
+        // `node_activation_bound` for why `N` is what it is.
+        let activation_slots = Arc::new(tokio::sync::Semaphore::new(
+            crate::lane::node_activation_bound(lane_count, repo.commit_concurrency_ceiling()),
+        ));
         let lanes: Vec<_> = (0..lane_count)
             .map(|lane_id| {
                 let publisher = RuntimeDispatchPublisher::new(
@@ -902,9 +908,7 @@ where
                     close_attempt_tracking.clone(),
                     config.clone(),
                     clock.clone(),
-                    // One slot per lane: each lane runs one activation at a
-                    // time, so a node runs at most one per lane.
-                    Arc::new(tokio::sync::Semaphore::new(1)),
+                    activation_slots.clone(),
                 )
             })
             .collect();

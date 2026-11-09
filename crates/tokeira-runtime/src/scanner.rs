@@ -7,7 +7,9 @@
 //! so full scans recover a missed notification and duplicated delivery is safe after
 //! crash or failover. A due row whose run has closed or no longer exists can
 //! never fire, so the scanner deletes it rather than resubmit it on every pass
-//! at the front of the shard's oldest-first batch. Second, the deterministic run-to-lane routing
+//! at the front of the shard's oldest-first batch. A page of due timers is
+//! submitted to its lanes concurrently, each lane's share in fire order
+//! (`submit_due_page`). Second, the deterministic run-to-lane routing
 //! (`lane_index_for_run_key`, `pick_lane_for_run_key`) used by every command
 //! submission path in the runtime, not just timers.
 //!
@@ -19,7 +21,9 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     sync::{Arc, Mutex, RwLock},
+    task::Poll,
 };
 
 use anyhow::Result;
@@ -182,16 +186,120 @@ where
     }
 }
 
+/// The identity a failed submission is remembered by until the next full pass.
+type FailedTimer = (OffsetDateTime, RunKey, String);
+
+/// What submitting one page of due timers left to the caller.
+#[derive(Debug, Default)]
+struct DuePage {
+    failed: Vec<FailedTimer>,
+    deleted: usize,
+}
+
+/// Submit one page of due timers: different lanes concurrently, each lane's
+/// share in page order.
+///
+/// Rows are grouped by `lane_index_for_run_key`, the routing every submit path
+/// uses, so each group holds exactly the rows whose commands land on one lane.
+/// Groups proceed concurrently, so an idle lane does not wait behind another
+/// lane's commit. Within a group each submission awaits its reply before the
+/// next one starts. The lane executes one command at a time, so a deeper queue
+/// of scanner commands would not commit any sooner; it would only occupy more
+/// of the lane's 1,024-slot mailbox (`spawn_lane_with_id`) that worker
+/// completions and polls share, and it would hand the lane a run's later timer
+/// before the earlier one had been settled. Awaiting keeps one run's timers in
+/// fire order, keeps the scanner to at most one mailbox slot per lane, and
+/// bounds the work in flight by the lane count and the page size, the two
+/// limits that already exist.
+/// What it gives up is same-run coalescing in the lane, which a page of
+/// distinct runs' timers would rarely reach.
+///
+/// `admit` runs just before each submission; once it answers `false` (the
+/// shard's acquisition was lost) every group stops, so nothing more is
+/// submitted. Each row belongs to exactly one group and each group visits a
+/// row once, so a timer is submitted at most once however the replies
+/// interleave. A failed submission is settled in its group before that lane's
+/// next submission and is reported in `failed`.
+async fn submit_due_page<R, A, F, Fut>(
+    repo: &R,
+    shard_id: Option<ShardId>,
+    rows: Vec<DueTimer>,
+    lane_count: usize,
+    fired_at: OffsetDateTime,
+    admit: A,
+    submit: &F,
+) -> DuePage
+where
+    R: RunRepository + ?Sized,
+    A: Fn() -> bool,
+    F: Fn(DueTimer, OffsetDateTime) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let mut groups = BTreeMap::<usize, Vec<DueTimer>>::new();
+    for due in rows {
+        groups
+            .entry(lane_index_for_run_key(due.run_key, lane_count))
+            .or_default()
+            .push(due);
+    }
+    let admit = &admit;
+    let mut lanes: Vec<_> = groups
+        .into_values()
+        .map(|rows| {
+            Box::pin(async move {
+                let mut page = DuePage::default();
+                for due in rows {
+                    if !admit() {
+                        break;
+                    }
+                    if let Err(error) = submit(due.clone(), fired_at).await {
+                        page.deleted += usize::from(
+                            settle_failed_due_timer(repo, shard_id, &due, &error).await,
+                        );
+                        page.failed.push((due.fire_at, due.run_key, due.timer_id));
+                    }
+                }
+                page
+            })
+        })
+        .collect();
+    // The groups share this task rather than spawning: the submit closure may
+    // borrow from its caller, and the work is waiting on lane replies, not
+    // computing. Polling every unfinished group on each wake costs at most one
+    // poll per lane.
+    let mut page = DuePage::default();
+    std::future::poll_fn(|cx| {
+        lanes.retain_mut(|lane| match lane.as_mut().poll(cx) {
+            Poll::Ready(done) => {
+                page.failed.extend(done.failed);
+                page.deleted += done.deleted;
+                false
+            }
+            Poll::Pending => true,
+        });
+        if lanes.is_empty() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    page
+}
+
+// These helpers have no lanes to route to. One group submits their page in
+// order through the same path, settlement and failure accounting as the
+// scanner.
 #[allow(dead_code)]
 pub(crate) async fn scan_due_timers_once<R, F, Fut>(
     repo: &R,
     config: &TimerScannerConfig,
     fired_at: OffsetDateTime,
-    mut submit_due_timer: F,
+    submit_due_timer: F,
 ) where
     R: RunRepository + ?Sized,
-    F: FnMut(DueTimer, OffsetDateTime) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    F: Fn(DueTimer, OffsetDateTime) -> Fut,
+    Fut: Future<Output = Result<()>>,
 {
     let due_timers = match repo
         .list_due_timers(fired_at, config.max_timers_per_scan)
@@ -203,12 +311,16 @@ pub(crate) async fn scan_due_timers_once<R, F, Fut>(
             return;
         }
     };
-
-    for due in due_timers {
-        if let Err(error) = submit_due_timer(due.clone(), fired_at).await {
-            settle_failed_due_timer(repo, None, &due, &error).await;
-        }
-    }
+    submit_due_page(
+        repo,
+        None,
+        due_timers,
+        1,
+        fired_at,
+        || true,
+        &submit_due_timer,
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -217,11 +329,11 @@ pub(crate) async fn scan_due_timers_once_for_shard<R, F, Fut>(
     shard_id: ShardId,
     config: &TimerScannerConfig,
     fired_at: OffsetDateTime,
-    mut submit_due_timer: F,
+    submit_due_timer: F,
 ) where
     R: RunRepository + ?Sized,
-    F: FnMut(DueTimer, OffsetDateTime) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    F: Fn(DueTimer, OffsetDateTime) -> Fut,
+    Fut: Future<Output = Result<()>>,
 {
     let due_timers = match repo
         .list_due_timers_for_shard(shard_id, fired_at, None, config.max_timers_per_scan)
@@ -237,16 +349,18 @@ pub(crate) async fn scan_due_timers_once_for_shard<R, F, Fut>(
             return;
         }
     };
-
-    let mut deleted = 0usize;
-    for due in due_timers {
-        if let Err(error) = submit_due_timer(due.clone(), fired_at).await {
-            deleted +=
-                usize::from(settle_failed_due_timer(repo, Some(shard_id), &due, &error).await);
-        }
-    }
-    if deleted > 0 {
-        runtime_metrics::record_scanner_stale_deleted("timer", shard_id.0, deleted);
+    let page = submit_due_page(
+        repo,
+        Some(shard_id),
+        due_timers,
+        1,
+        fired_at,
+        || true,
+        &submit_due_timer,
+    )
+    .await;
+    if page.deleted > 0 {
+        runtime_metrics::record_scanner_stale_deleted("timer", shard_id.0, page.deleted);
     }
 }
 
@@ -295,7 +409,7 @@ struct TimerScan {
     after: Option<DueTimer>,
     next: Option<OffsetDateTime>,
     restart: Option<OffsetDateTime>,
-    failed: BTreeSet<(OffsetDateTime, RunKey, String)>,
+    failed: BTreeSet<FailedTimer>,
 }
 
 /// Submit durable timers at their deadlines, listing only shards that need work.
@@ -311,30 +425,42 @@ pub(crate) async fn run_timer_scanner<R>(
 ) where
     R: RunRepository + 'static,
 {
-    run_timer_scanner_with_submit(repo, shard_owner, config, cancel, clock, |due, fired_at| {
-        let lane = pick_lane_for_run_key(&lanes, lane_count, due.run_key).clone();
-        async move {
-            lane.submit(due.run_key, command_for_due_timer(due, fired_at))
-                .await
-                .map(|_| ())
-        }
-    })
+    run_timer_scanner_with_submit(
+        repo,
+        shard_owner,
+        config,
+        cancel,
+        clock,
+        lane_count,
+        |due, fired_at| {
+            let lane = pick_lane_for_run_key(&lanes, lane_count, due.run_key).clone();
+            async move {
+                lane.submit(due.run_key, command_for_due_timer(due, fired_at))
+                    .await
+                    .map(|_| ())
+            }
+        },
+    )
     .await;
 }
 
 /// Keep storage paging and wake planning identical in production and controlled
 /// submission tests; the closure owns the authoritative lane transition.
+///
+/// `lane_count` must be the count `submit` routes with, so a page's rows are
+/// grouped by the lane their commands land on (see `submit_due_page`).
 pub(crate) async fn run_timer_scanner_with_submit<R, F, Fut>(
     repo: Arc<R>,
     owner: Arc<RwLock<ShardOwner>>,
     config: TimerScannerConfig,
     cancel: CancellationToken,
     clock: Arc<dyn Clock>,
-    mut submit: F,
+    lane_count: usize,
+    submit: F,
 ) where
     R: RunRepository + 'static,
-    F: FnMut(DueTimer, OffsetDateTime) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    F: Fn(DueTimer, OffsetDateTime) -> Fut,
+    Fut: Future<Output = Result<()>>,
 {
     let wake = owner
         .read()
@@ -444,38 +570,49 @@ pub(crate) async fn run_timer_scanner_with_submit<R, F, Fut>(
             let full_page =
                 config.max_timers_per_scan > 0 && rows.len() == config.max_timers_per_scan;
             let mut future = false;
-            let mut deleted = 0;
+            let mut due_rows = Vec::new();
             for due in rows {
                 if due.fire_at > now {
                     scan.next = Some(due.fire_at);
                     future = true;
                     break;
                 }
+                // The cursor passes every due row now, before any submission
+                // finishes, so out-of-order replies cannot move it backwards.
                 scan.after = Some(due.clone());
-                let key = (due.fire_at, due.run_key, due.timer_id.clone());
-                if scan.failed.contains(&key) {
-                    continue;
-                }
-                if !owner
-                    .read()
-                    .expect("shard owner lock poisoned")
-                    .acquisition_active(&scan.acquisition)
+                if !scan
+                    .failed
+                    .contains(&(due.fire_at, due.run_key, due.timer_id.clone()))
                 {
-                    break;
-                }
-                runtime_metrics::record_scanner_dispatched("timer", shard.0);
-                if let Err(error) = submit(due.clone(), now).await {
-                    deleted += usize::from(
-                        settle_failed_due_timer(repo.as_ref(), Some(*shard), &due, &error).await,
-                    );
-                    scan.failed.insert(key);
+                    due_rows.push(due);
                 }
             }
+            let acquisition = &scan.acquisition;
+            let page = submit_due_page(
+                repo.as_ref(),
+                Some(*shard),
+                due_rows,
+                lane_count,
+                now,
+                || {
+                    let active = owner
+                        .read()
+                        .expect("shard owner lock poisoned")
+                        .acquisition_active(acquisition);
+                    if active {
+                        runtime_metrics::record_scanner_dispatched("timer", shard.0);
+                    }
+                    active
+                },
+                &submit,
+            )
+            .await;
+            scan.failed.extend(page.failed);
             if full_page && !future {
                 scan.next = Some(now);
             }
-            if deleted > 0 {
-                runtime_metrics::record_scanner_stale_deleted("timer", shard.0, deleted);
+            if page.deleted > 0 {
+                runtime_metrics::record_scanner_stale_deleted("timer", shard.0, page.deleted);
             }
         }
     }

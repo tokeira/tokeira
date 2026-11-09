@@ -171,3 +171,13 @@ Add a background timer scanner to `tokeira-runtime` that periodically discovers 
     cancellation and replacement under the same id leave state, history and the
     later replacement row unchanged on rejection, then fire at its own time.
   - _Requirements: 2.5._
+
+- [x] 11. Submit a page's due timers lanes concurrently
+  - Group due rows by the run-to-lane routing; run the groups concurrently, each in page
+    order and waiting for each reply. Check the acquisition before every submission, settle
+    each failure once, and advance the cursor before submissions start.
+  - Verify Property 8: `due_timers_on_different_lanes_are_in_flight_together`,
+    `one_runs_due_timers_are_submitted_in_fire_order`,
+    `failed_submission_is_settled_once_per_pass`, `lost_acquisition_stops_every_lane`.
+  - DONE: `submit_due_page` in `scanner.rs` serves the scanner and the test-only helpers.
+  - _Requirements: 8._

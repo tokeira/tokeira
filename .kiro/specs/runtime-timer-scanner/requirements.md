@@ -33,7 +33,7 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 
 #### Acceptance Criteria
 
-1. THE Runtime SHALL run a background Timer_Scanner that lists timers through one scan interval ahead, submits those already due in fire-time order, and wakes for the earliest future timer. Deadline wakes SHALL list only affected active shards; a full pass SHALL list every active shard each interval.
+1. THE Runtime SHALL run a background Timer_Scanner that lists timers through one scan interval ahead, submits those already due (each lane's share in fire-time order, Requirement 8), and wakes for the earliest future timer. Deadline wakes SHALL list only affected active shards; a full pass SHALL list every active shard each interval.
 2. WHEN the listing returns one or more DueTimer entries whose fire time has arrived, THE Timer_Scanner SHALL submit a `Command::TimerDue(TimerDueRequest { timer_id, fired_at })` for each entry to the owning run's lane via the same `submit` path used by other runtime commands.
 3. THE Timer_Scanner SHALL use a configurable scan interval with a default suitable for sub-second timer resolution (e.g. 200ms).
 4. THE Timer_Scanner SHALL use a configurable batch limit to bound the number of timers processed per scan cycle.
@@ -116,3 +116,20 @@ Validation and the failure cause follow `service/history/api/command_attr_valida
 2. WHEN a timer delay exceeds 100 × 365 days, THE Edge SHALL cap it before computing and recording its fire time.
 3. WHEN an ordinary or first-workflow-task timer is created or reconstructed from stored durations, THE Kernel SHALL saturate unrepresentable dates at the latest date without panicking.
 4. WHEN a durable deadline exceeds the monotonic clock range, THE Runtime SHALL wait in bounded segments without truncating the deadline or firing early.
+
+---
+
+### Requirement 8: Due timers on different lanes fire concurrently
+
+**User Story:** As an operator, I want due timers whose runs live on different lanes to fire together, so that a burst of due timers does not wait for one lane commit at a time.
+
+A lane executes one command at a time, and a submission's result arrives only after the lane has committed and published. Submitting one page's due timers one after another would therefore fire about one timer per lane round trip, however idle the other lanes are.
+
+#### Acceptance Criteria
+
+1. WHEN a listed page holds due timers whose runs route to different lanes, THE Timer_Scanner SHALL submit them concurrently, routing each timer with the same run-to-lane function every other submission uses.
+2. WITHIN one lane, THE Timer_Scanner SHALL submit due timers in the page's order (fire time, then run key, then timer id) and SHALL wait for each submission's result before submitting the next, so one run's timers are submitted in fire order.
+3. THE Timer_Scanner SHALL have at most one submission per lane in flight, and at most `max_timers_per_scan` per page. It SHALL need no configuration of its own for this bound.
+4. THE Timer_Scanner SHALL check the shard's acquisition before each submission. WHEN the acquisition is lost, no lane SHALL submit another timer from that page.
+5. THE Timer_Scanner SHALL submit each due timer at most once per page and settle each failed submission once, whatever order the submissions finish in. A failed timer's identity SHALL stay suppressed until the next full pass.
+6. THE Timer_Scanner SHALL advance its page cursor past every due row it listed before the submissions start, so replies that finish out of order cannot move it back.

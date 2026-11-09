@@ -1,0 +1,5 @@
+kind: changed
+body: A commit that dispatches a sticky workflow task, or a task routed by worker deployments, no longer reads the run back from storage to route it.
+time: 2026-11-09T12:00:00.000000+00:00
+custom:
+    Slice: e21abfeb-8544-4a35-9449-a9e2b66bcf56

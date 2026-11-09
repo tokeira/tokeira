@@ -112,6 +112,7 @@ Produce:
    and external status/code.
 8. **Testing Strategy** — PBT for the property set, example-based unit tests for fixed
    edge cases, and integration tests for end-to-end paths; state where each lives.
+9. **Feature Interactions** — answer every item of the checklist in `references/design-template.md`.
 
 Full structure and an annotated exemplar: `references/design-template.md`.
 

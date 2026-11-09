@@ -12,12 +12,16 @@ If accepted, it revises design principle 4 of [000-overview](000-overview.md), "
 
 Three of its protocols are modelled in `spec/tla`: `40_dispatch_handoff.tla`, the hand-off from a dispatch row to a started task; `30_bundle_lease.tla`, the shard lease fence on DSQL; and `42_outbound_discovery.tla`, the outbound driver's discovery rounds. See [Validation](#validation).
 
-## The four rules
+## The five rules
 
 1. **Durable intent is state, not a queue message.** Every asynchronous consequence that must survive failure has a durable representation, committed in the same transaction as the transition that creates it. A row says what should happen now. It isn't a message waiting to be consumed.
 2. **Discovery is level-triggered; notification is acceleration.** Correctness never depends on receiving a notification or advancing a cursor. A consumer asks what actionable work exists now, starting from the head each time. State that only a notification announces is allowed only where another recoverable transition later turns it into discoverable state: `NotificationOnly(x) ⇒ ◇(Discoverable(x) ∨ NotWanted(x))`.
 3. **Run commits and consumers never contend on a mutable row.** Consumers read actionable state. Lifecycle changes belong to run transitions, except where this design names another single writer for rows that no later commit writes. On DSQL, two transactions writing one row conflict and the later commit aborts, so this rule keeps consumers off the commit path.
 4. **Every actionable representation has one lifecycle authority.** Before code exists, each kind of row names its incarnation, discoverer, executor, remover, retry authority and deduplication identity. The [inventory](#inventory) is that list.
+5. **A decision made outside the lane carries what it was computed for, and the commit checks that it still holds.** A scanner computing a timeout, a poll matching a task and a router choosing a queue all read run state without holding the lane, so the run can move on before the decision reaches it. The decision carries the attempt, sequence or stamp it read, and the lane's commit rejects it if the run moved on. The caller then recomputes from a fresh read or drops the decision. Tokeira already does this in three places:
+   - The activity-timeout scanner carries the attempt, schedule event and violation it saw. `ActivityTimeoutCheck::validate` in `crates/tokeira-runtime/src/activity_timeout.rs` repeats the check against the state the commit is fenced to, and rejects the timeout if the attempt moved on.
+   - An activity start whose rules and routing were evaluated before it reached the lane carries the transition sequence and run id it read (`ObservedSubmission`, sent by `commit_activity_start_gate` in `crates/tokeira-runtime/src/runtime/activity.rs`). The lane in `crates/tokeira-runtime/src/lane.rs` returns a conflict if the run's sequence or run id has changed.
+   - An outbound delivery carries the operation's initiating event and attempt, and the destination's commit reads the source in the same transaction (`DeliveryGuard` in `crates/tokeira-storage/src/outbound.rs`).
 
 Rule 1's representations come in two kinds:
 
@@ -175,7 +179,7 @@ Speculative workflow tasks, queries, eager dispatch and updates before acceptanc
 
 Neither table may hold delivery lifecycle: no claim, acknowledgement, executor ownership, attempt status or dead-letter state. Every column is the operation's identity, its payload, or a projection of run state. A Nexus row's `next_attempt_at` is the last kind, because the run records each attempt. The only write an executor ever makes is deleting an intent row it has resolved. A column that breaks this rule is the first step back to a transfer queue.
 
-CHASM components and worker-compute actions already keep durable outboxes of their own: a CHASM root's metadata outbox, rebuilt by the CHASM sweeper, and `worker_compute_action`. They are outside this design; check them against the four rules later.
+CHASM components and worker-compute actions already keep durable outboxes of their own: a CHASM root's metadata outbox, rebuilt by the CHASM sweeper, and `worker_compute_action`. They are outside this design; check them against the five rules later.
 
 ## Lifecycles
 

@@ -34,6 +34,18 @@ pure core with no I/O vs. an I/O layer. State where each new piece lives.>
 ## Data Models
 <Durable and in-memory types. Trace each field to its contract source.>
 
+## Feature Interactions
+<For each feature below, say whether the change meets it and how it behaves there.
+"Not affected, because …" is a valid answer; a blank one is not.>
+- **Workflow pause:** <behaviour while the run is paused, and on unpause.>
+- **Activity pause:** <behaviour for a paused activity, and when it is unpaused or reset.>
+- **Sticky queues:** <behaviour when the task is on a sticky queue, or sticky affinity is cleared.>
+- **Transient and speculative workflow tasks:** <behaviour when the task has no durable events yet.>
+- **Buffered events:** <behaviour while a workflow task is started and new events are buffered.>
+- **Reset:** <behaviour for the reset base run and the new run.>
+- **Continue-as-new:** <behaviour across the predecessor's close and the successor's start.>
+- **Closed runs:** <behaviour when the run closes before, during or after the change acts.>
+
 ## Correctness Properties
 *A property is a statement that holds across all valid executions — the bridge between a
 human-readable spec and a machine-checkable guarantee.*
@@ -71,6 +83,9 @@ human-readable spec and a machine-checkable guarantee.*
 - **Properties are the centre of gravity.** Derive them from the requirements, make each
   universally quantified ("*For any* …"), deduplicate, and give each a
   `**Validates: Requirements X.Y**` line. See `property-based-testing.md`.
+- **Walk every feature interaction.** These features are where a change most often meets
+  state it didn't plan for. Answer each one with a sentence, and cite the targeted release
+  where its behaviour decides the answer.
 - **Error table is total.** Every error condition in the requirements maps to exactly one
   internal type and one external code.
 - **Testing strategy names placement.** Say which module each property/unit/integration

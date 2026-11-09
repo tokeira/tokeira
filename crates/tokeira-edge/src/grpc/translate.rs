@@ -122,7 +122,6 @@ use crate::translate::{
 use tokeira_kernel::state::ParentClosePolicy;
 use tokeira_proto::public::temporal::api::command::v1::command::Attributes;
 
-const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_STICKY_TTL: Duration = Duration::from_secs(30);
 const NON_RETRYABLE_ACTIVITY_SENTINEL: &str = "__tokeira_non_retryable__";
 // These are Temporal's v1.31.0 admission defaults, not deployment tuning:
@@ -1561,7 +1560,10 @@ pub fn poll_request_to_edge(
         deployment,
         build_id,
         sticky_run: None,
-        timeout: DEFAULT_POLL_TIMEOUT,
+        // The wait cap; the gRPC handler adds the caller's deadline, which
+        // shortens the wait (`crate::long_poll::task_poll_deadline`).
+        timeout: crate::long_poll::TASK_POLL_TIMEOUT,
+        caller_deadline: None,
         sticky_ttl: DEFAULT_STICKY_TTL,
     })
 }
@@ -6470,7 +6472,8 @@ pub fn poll_activity_request_to_edge(
         worker_rate_limit: req
             .task_queue_metadata
             .and_then(|metadata| metadata.max_tasks_per_second),
-        timeout: DEFAULT_POLL_TIMEOUT,
+        timeout: crate::long_poll::TASK_POLL_TIMEOUT,
+        caller_deadline: None,
     })
 }
 

@@ -1156,12 +1156,15 @@ impl ActivityBridge {
     /// Poll a standalone activity, waiting when this queue has a delayed retry or a
     /// started attempt whose timeout may produce one. A never-seen standalone queue
     /// still returns immediately so the shared RPC can fall through to ordinary
-    /// workflow activities.
+    /// workflow activities. Waiting ends empty at `until`, the poll's deadline; only
+    /// the waits are bounded, never a claim in progress, so a task is never claimed
+    /// and then dropped.
     pub async fn poll_activity_task_waiting(
         &self,
         task_queue: &str,
         worker_identity: &str,
         admitted: Option<&DeploymentVersionTarget>,
+        until: tokio::time::Instant,
     ) -> EdgeResult<Option<PolledActivityTask>> {
         let queue = self
             .dispatch_executor
@@ -1194,10 +1197,14 @@ impl ActivityBridge {
                     _ = tokio::time::sleep(std::time::Duration::from_nanos(
                         u64::try_from(remaining).unwrap_or(u64::MAX),
                     )) => {},
+                    _ = tokio::time::sleep_until(until) => return Ok(None),
                 }
             } else if queue.has_seen_queue(task_queue, admitted) {
                 // A started attempt can time out and enqueue its retry later.
-                dispatch_available.await;
+                tokio::select! {
+                    _ = dispatch_available => {},
+                    _ = tokio::time::sleep_until(until) => return Ok(None),
+                }
             } else {
                 return Ok(None);
             }

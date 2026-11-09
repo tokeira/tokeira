@@ -126,6 +126,8 @@ mod outbound_delivery;
 mod outbound_tests;
 #[cfg(test)]
 mod paused_workflow_task_tests;
+#[cfg(test)]
+mod poll_start_budget_tests;
 mod query;
 #[cfg(test)]
 mod queue_home_delivery_exploration_tests;
@@ -157,6 +159,33 @@ pub const REPORTED_PROBLEMS_THRESHOLD: u32 = 5;
 /// v1.31.0 defaults worker-shutdown poll cancellation off
 /// (`common/dynamicconfig/constants.go:3207-3212 @ v1.31.0`).
 const CANCEL_WORKER_POLLS_ON_SHUTDOWN: bool = false;
+
+/// Time a polled task's start may take once matching has handed it to the poll,
+/// independent of what remains of the poll's wait. v1.31.0 gives a matched task's
+/// `Record*TaskStarted` call a fresh context of this length under the caller's context,
+/// because the long poll's own budget is unsuitable for the start
+/// (`recordTaskStartedDefaultTimeout`, `newRecordTaskStartedContext` in
+/// `service/matching/matching_engine.go @ v1.31.0`). Without it a task matched in the
+/// poll's last moments fails to start.
+///
+/// v1.31.0 shortens this to one second for a sync-matched task, whose producer blocks
+/// on the poll's reply (`recordTaskStartedSyncMatchTimeout`, `isSyncMatchTask` in
+/// `service/matching/task.go @ v1.31.0`). Tokeira has no such producer: publication to
+/// the broker never waits for a poll to start the task, and the reserved-poll hand-off
+/// delivers a task its producer already started. Every start a poll makes is therefore
+/// the backlog case, and takes this budget.
+const POLLED_TASK_START_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The instant a polled task's start must finish by: [`POLLED_TASK_START_BUDGET`] from
+/// `now`, but never past the caller's deadline, since v1.31.0 derives the start's context
+/// from the caller's.
+fn polled_task_start_deadline(
+    now: tokio::time::Instant,
+    caller_deadline: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    let budget = now + POLLED_TASK_START_BUDGET;
+    caller_deadline.map_or(budget, |caller| caller.min(budget))
+}
 
 #[cfg(not(feature = "conformance"))]
 #[inline]

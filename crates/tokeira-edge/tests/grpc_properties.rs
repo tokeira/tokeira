@@ -809,6 +809,7 @@ fn arb_poll_request() -> impl Strategy<Value = PollWorkflowTaskQueueRequest> {
             build_id: None,
             sticky_run: None,
             timeout: Duration::from_secs(60),
+            caller_deadline: None,
             sticky_ttl: Duration::from_secs(30),
             normal_task_queue: None,
         },
@@ -1515,6 +1516,7 @@ fn arb_poll_activity_request() -> impl Strategy<Value = PollActivityTaskQueueReq
             build_id: None,
             worker_rate_limit: None,
             timeout: Duration::from_secs(60),
+            caller_deadline: None,
         },
     )
 }

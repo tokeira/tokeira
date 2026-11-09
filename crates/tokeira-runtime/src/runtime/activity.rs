@@ -254,11 +254,33 @@ where
     }
 
     /// Long-poll for an activity task, then atomically mark it as started.
+    ///
+    /// Waits up to `timeout_after` for a task; a matched task's start then gets
+    /// its own budget. Callers with a deadline of their own use
+    /// [`Self::poll_activity_task_within`].
     pub async fn poll_activity_task(
         &self,
         queue: QueueKey,
         worker_identity: WorkerIdentity,
         timeout_after: tokio::time::Duration,
+    ) -> Result<Option<StartedActivityTask>> {
+        self.poll_activity_task_within(queue, worker_identity, timeout_after, None)
+            .await
+    }
+
+    /// Long-poll for an activity task for up to `timeout_after`, then atomically
+    /// mark it as started within the caller's deadline.
+    ///
+    /// The wait and the start have separate budgets, as in v1.31.0: the wait ends
+    /// at `timeout_after`, and a task matched before then gets
+    /// `POLLED_TASK_START_BUDGET` to start, capped at `caller_deadline`. A start
+    /// that needs a fresh offer goes back to waiting only while the wait lasts.
+    pub async fn poll_activity_task_within(
+        &self,
+        queue: QueueKey,
+        worker_identity: WorkerIdentity,
+        timeout_after: tokio::time::Duration,
+        caller_deadline: Option<tokio::time::Instant>,
     ) -> Result<Option<StartedActivityTask>> {
         let deadline = tokio::time::Instant::now() + timeout_after;
         loop {
@@ -277,13 +299,17 @@ where
                 request_id: offer.request_id,
                 worker: worker_identity.clone(),
             };
+            // One budget covers every owner attempt, as v1.31.0 makes one
+            // RecordActivityTaskStarted call under it (`recordActivityTaskStarted`
+            // in `service/matching/matching_engine.go @ v1.31.0`). Bounding the start
+            // by the wait instead would fail a task matched as the wait ends.
+            let start_deadline =
+                super::polled_task_start_deadline(tokio::time::Instant::now(), caller_deadline);
             let mut outcome = None;
             for attempt in 0..3 {
-                let until = deadline
-                    .min(tokio::time::Instant::now() + tokio::time::Duration::from_secs(10));
                 let result = tokio::time::timeout_at(
-                    until,
-                    self.route_activity_start(request.clone(), deadline),
+                    start_deadline,
+                    self.route_activity_start(request.clone(), start_deadline),
                 )
                 .await
                 .unwrap_or_else(|_| {
@@ -298,7 +324,7 @@ where
                         if (error.is::<crate::RetryableActivityTaskStart>()
                             || error.is::<crate::NotShardOwner>())
                             && attempt < 2
-                            && tokio::time::Instant::now() < deadline =>
+                            && tokio::time::Instant::now() < start_deadline =>
                     {
                         tokio::task::yield_now().await;
                     }

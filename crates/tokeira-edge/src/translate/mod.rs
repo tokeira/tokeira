@@ -283,7 +283,11 @@ pub struct PollWorkflowTaskQueueRequest {
     pub deployment: Option<DeploymentId>,
     pub build_id: Option<BuildId>,
     pub sticky_run: Option<RunKey>,
+    /// Longest the poll waits for a task when the caller's deadline allows it.
     pub timeout: Duration,
+    /// The caller's gRPC deadline, when it sent one. The poll answers empty a second
+    /// before it, and a matched task's start never runs past it.
+    pub caller_deadline: Option<tokio::time::Instant>,
     pub sticky_ttl: Duration,
 }
 
@@ -751,7 +755,11 @@ pub struct PollActivityTaskQueueRequest {
     pub build_id: Option<BuildId>,
     /// Worker-advertised dispatch ceiling in tasks per second.
     pub worker_rate_limit: Option<f64>,
+    /// Longest the poll waits for a task when the caller's deadline allows it.
     pub timeout: Duration,
+    /// The caller's gRPC deadline, when it sent one. The poll answers empty a second
+    /// before it, and a matched task's start never runs past it.
+    pub caller_deadline: Option<tokio::time::Instant>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

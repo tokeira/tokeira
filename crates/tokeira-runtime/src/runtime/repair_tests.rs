@@ -32,6 +32,7 @@ impl std::io::Write for PlacementLogCapture {
 pub(super) enum Point {
     Load,
     Loaded,
+    StatsLoad,
     Candidates,
     Repair,
     Home,
@@ -89,6 +90,7 @@ pub(crate) struct Repo {
     preparation_retries: AtomicUsize,
     preparation_attempts: AtomicUsize,
     pause: Mutex<Option<Pause>>,
+    slow: Mutex<Option<(Point, std::time::Duration)>>,
     dispatch_fixture: Mutex<Option<BTreeMap<RunKey, WorkflowDispatchRow>>>,
 }
 
@@ -122,6 +124,12 @@ impl Repo {
         });
         (observed, resume)
     }
+    /// Makes the next visit to `point` take `by` on tokio's clock, so a paused-time
+    /// test can model a slow storage call without a gate.
+    pub(super) fn slow(&self, point: Point, by: std::time::Duration) {
+        *self.slow.lock().unwrap() = Some((point, by));
+    }
+
     async fn hit(&self, point: Point) -> Result<()> {
         if point == Point::Repair {
             self.repair_attempts.fetch_add(1, Ordering::SeqCst);
@@ -144,6 +152,17 @@ impl Repo {
         };
         if fail {
             anyhow::bail!("injected {point:?} failure");
+        }
+        let slow = {
+            let mut slow = self.slow.lock().unwrap();
+            if slow.is_some_and(|(at, _)| at == point) {
+                slow.take().map(|(_, by)| by)
+            } else {
+                None
+            }
+        };
+        if let Some(by) = slow {
+            tokio::time::sleep(by).await;
         }
         let pause = {
             let mut pause = self.pause.lock().unwrap();
@@ -810,6 +829,7 @@ impl RunRepository for Repo {
 
     async fn load_run_with_stats(&self, run_key: RunKey) -> Result<(LoadedRun, RunHistoryStats)> {
         self.stats_loads.fetch_add(1, Ordering::SeqCst);
+        self.hit(Point::StatsLoad).await?;
         self.inner.load_run_with_stats(run_key).await
     }
 

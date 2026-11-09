@@ -921,19 +921,13 @@ fn parse_grpc_timeout(metadata: &tonic::metadata::MetadataMap) -> Option<std::ti
     Some(std::time::Duration::from_nanos(nanos))
 }
 
-/// Effective describe long-poll wait: `Min(caller_deadline - buffer, long_poll_timeout)`
-/// (`chasm/lib/activity/handler.go` → `contextutil.WithDeadlineBuffer` @ v1.31.0). With no
-/// caller deadline, the full server timeout. A non-positive result means the caller's
-/// deadline is within the buffer, so the wait returns empty immediately.
-fn describe_long_poll_budget(
-    caller: Option<std::time::Duration>,
-    timeout: std::time::Duration,
-    buffer: std::time::Duration,
-) -> std::time::Duration {
-    match caller {
-        Some(caller) => caller.saturating_sub(buffer).min(timeout),
-        None => timeout,
-    }
+/// The caller's `grpc-timeout` as an instant on tokio's clock, which the poll waits and
+/// the runtime's start budgets run on. Read at handler entry so admission time counts
+/// against it, as v1.31.0's handler context deadline does. A timeout too large to
+/// represent behaves as no deadline.
+fn parse_grpc_deadline(metadata: &tonic::metadata::MetadataMap) -> Option<tokio::time::Instant> {
+    parse_grpc_timeout(metadata)
+        .and_then(|timeout| tokio::time::Instant::now().checked_add(timeout))
 }
 
 /// Build a `DescribeActivityExecutionResponse`. `long_poll_token` is the caller-
@@ -1162,8 +1156,10 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::PollWorkflowTaskQueueRequest>,
     ) -> Result<Response<workflowservice::PollWorkflowTaskQueueResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let edge_req = translate::poll_request_to_edge(request.into_inner())
+        let caller_deadline = parse_grpc_deadline(request.metadata());
+        let mut edge_req = translate::poll_request_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
+        edge_req.caller_deadline = caller_deadline;
         debug!(task_queue = %edge_req.task_queue, "poll_workflow_task_queue");
         let edge_resp = self
             .inner
@@ -1283,12 +1279,14 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::PollActivityTaskQueueRequest>,
     ) -> Result<Response<workflowservice::PollActivityTaskQueueResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
+        let caller_deadline = parse_grpc_deadline(request.metadata());
         let req = request.into_inner();
         // Retain the complete poll target before the standalone-activity fast
         // path. The edge then authenticates and authorizes the final target
         // before either CHASM or workflow-backed delivery can claim work.
-        let edge_req = translate::poll_activity_request_to_edge(req.clone())
+        let mut edge_req = translate::poll_activity_request_to_edge(req.clone())
             .map_err(proto_conversion_status)?;
+        edge_req.caller_deadline = caller_deadline;
         let context = self
             .inner
             .admit_activity_task_queue_poll(&headers, &edge_req)
@@ -1301,6 +1299,21 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 deployment_name: scope.deployment_name().to_owned(),
                 build_id: scope.build_id().to_owned(),
             });
+        // Answer empty at once when the caller's deadline leaves no more than the tail
+        // room, after admission as v1.31.0's frontend does (`PollActivityTaskQueue` in
+        // `service/frontend/workflow_handler.go @ v1.31.0`). The standalone wait below
+        // ends at the same deadline; the workflow-activity path derives its own from
+        // the same request.
+        let entered = tokio::time::Instant::now();
+        let Some(poll_deadline) = crate::long_poll::task_poll_deadline(
+            edge_req.caller_deadline,
+            entered,
+            edge_req.timeout,
+        ) else {
+            return Ok(Response::new(
+                workflowservice::PollActivityTaskQueueResponse::default(),
+            ));
+        };
         // CHASM-first: serve a queued standalone-activity task if one is waiting on
         // this task queue, before falling through to the workflow-activity path
         // (the two share this RPC). Only authenticated scope supplies an admitted
@@ -1314,7 +1327,12 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 .map(|q| q.name.clone())
                 .unwrap_or_default();
             if let Some(task) = bridge
-                .poll_activity_task_waiting(&task_queue, &req.identity, admitted.as_ref())
+                .poll_activity_task_waiting(
+                    &task_queue,
+                    &req.identity,
+                    admitted.as_ref(),
+                    poll_deadline,
+                )
                 .await?
             {
                 if let Some(target) = &task.version_target {
@@ -1355,6 +1373,14 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                     &req.namespace,
                     task,
                 )));
+            }
+            // A standalone wait that used up the poll's budget answers empty rather
+            // than starting a second wait on the workflow-activity path. A zero
+            // budget waited for nothing, so it still tries that path once.
+            if poll_deadline > entered && tokio::time::Instant::now() >= poll_deadline {
+                return Ok(Response::new(
+                    workflowservice::PollActivityTaskQueueResponse::default(),
+                ));
             }
         }
         debug!(task_queue = %edge_req.task_queue, "poll_activity_task_queue");
@@ -3805,8 +3831,9 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         // Time the wait out at Min(caller_deadline - buffer, long_poll_timeout) and return an
         // empty, non-error response on elapse so the caller resubmits — never letting the
         // caller's gRPC deadline fire (`chasm/lib/activity/handler.go` →
-        // `contextutil.WithDeadlineBuffer` @ v1.31.0).
-        let budget = describe_long_poll_budget(
+        // `contextutil.WithDeadlineBuffer` @ v1.31.0). A zero budget means the caller's
+        // deadline is within the buffer, so the wait returns empty immediately.
+        let budget = crate::long_poll::long_poll_budget(
             caller_timeout,
             bridge.long_poll_timeout(),
             bridge.long_poll_buffer(),
@@ -6836,6 +6863,7 @@ mod tests {
             build_id: None,
             worker_rate_limit: None,
             timeout: std::time::Duration::from_millis(50),
+            caller_deadline: None,
         };
         let result = service.poll_activity_task_queue(&headers, req).await;
 
@@ -6846,6 +6874,125 @@ mod tests {
 
         // Release the permit
         drop(permit);
+    }
+
+    fn blocking_poll_grpc(cache: Arc<InMemoryNamespaceCache>) -> WorkflowServiceGrpc {
+        let service = WorkflowService::new(
+            Arc::new(BlockingPollRuntime {
+                ready: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+            }),
+            Arc::new(NoopResolver),
+            Arc::new(EmptyVisibilityApi),
+            Arc::new(tokeira_storage::InMemoryStore::default()),
+            Arc::new(InMemoryOperatorApi::new("tokeira-local", "0.1.0+test0001")),
+            cache.clone(),
+            Arc::new(EdgeInterceptors::permissive(cache)),
+            PollerRegistry::default(),
+            crate::PendingQueryStore::default(),
+            tokeira_runtime::InMemoryBroker::default(),
+            LongPollGate::new(LongPollConfig::default()),
+            Arc::new(LocalOnlyRouter),
+        );
+        WorkflowServiceGrpc::new(service)
+    }
+
+    fn with_grpc_timeout<T>(message: T, timeout: &str) -> Request<T> {
+        let mut request = Request::new(message);
+        request
+            .metadata_mut()
+            .insert("grpc-timeout", timeout.parse().unwrap());
+        request
+    }
+
+    // A caller deadline within the one-second tail room answers both task polls empty
+    // without reaching the runtime, whose polls here block or panic.
+    #[tokio::test(start_paused = true)]
+    async fn task_polls_near_the_caller_deadline_answer_empty_at_once() {
+        let cache = Arc::new(InMemoryNamespaceCache::new());
+        cache
+            .insert(ResolvedNamespace::active("default"))
+            .await
+            .unwrap();
+        let grpc = blocking_poll_grpc(cache);
+        let task_queue = Some(
+            tokeira_proto::public::temporal::api::taskqueue::v1::TaskQueue {
+                name: "queue".to_string(),
+                ..Default::default()
+            },
+        );
+        for timeout in ["999m", "1S", "250000u"] {
+            let workflow = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                grpc.poll_workflow_task_queue(with_grpc_timeout(
+                    workflowservice::PollWorkflowTaskQueueRequest {
+                        namespace: "default".to_string(),
+                        task_queue: task_queue.clone(),
+                        identity: "worker-1".to_string(),
+                        ..Default::default()
+                    },
+                    timeout,
+                )),
+            )
+            .await
+            .expect("a workflow poll near its deadline answers at once")
+            .expect("an empty answer is a success, not a deadline error");
+            assert_eq!(
+                workflow.into_inner(),
+                workflowservice::PollWorkflowTaskQueueResponse::default(),
+                "{timeout}"
+            );
+            let activity = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                grpc.poll_activity_task_queue(with_grpc_timeout(
+                    workflowservice::PollActivityTaskQueueRequest {
+                        namespace: "default".to_string(),
+                        task_queue: task_queue.clone(),
+                        identity: "worker-1".to_string(),
+                        ..Default::default()
+                    },
+                    timeout,
+                )),
+            )
+            .await
+            .expect("an activity poll near its deadline answers at once")
+            .expect("an empty answer is a success, not a deadline error");
+            assert_eq!(
+                activity.into_inner(),
+                workflowservice::PollActivityTaskQueueResponse::default(),
+                "{timeout}"
+            );
+        }
+    }
+
+    // With more than the tail room left, the poll does wait for work.
+    #[tokio::test(start_paused = true)]
+    async fn workflow_poll_with_time_to_spare_waits_for_work() {
+        let cache = Arc::new(InMemoryNamespaceCache::new());
+        cache
+            .insert(ResolvedNamespace::active("default"))
+            .await
+            .unwrap();
+        let grpc = blocking_poll_grpc(cache);
+        let waiting = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            grpc.poll_workflow_task_queue(with_grpc_timeout(
+                workflowservice::PollWorkflowTaskQueueRequest {
+                    namespace: "default".to_string(),
+                    task_queue: Some(
+                        tokeira_proto::public::temporal::api::taskqueue::v1::TaskQueue {
+                            name: "queue".to_string(),
+                            ..Default::default()
+                        },
+                    ),
+                    identity: "worker-1".to_string(),
+                    ..Default::default()
+                },
+                "5S",
+            )),
+        )
+        .await;
+        assert!(waiting.is_err(), "the poll reached the runtime and waited");
     }
 
     #[tokio::test]

@@ -823,6 +823,31 @@ where
         worker_identity: WorkerIdentity,
         timeout_after: tokio::time::Duration,
     ) -> Result<Option<WorkflowActivation>> {
+        self.poll_workflow_activation_within(
+            queue,
+            normal_queue,
+            is_sticky,
+            worker_identity,
+            timeout_after,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::poll_workflow_activation_with_kind`] for a caller with a deadline.
+    ///
+    /// The wait and the start have separate budgets, as in v1.31.0: the wait ends
+    /// at `timeout_after`, and a task matched before then gets
+    /// `POLLED_TASK_START_BUDGET` to start, capped at `caller_deadline`.
+    pub async fn poll_workflow_activation_within(
+        &self,
+        queue: QueueKey,
+        normal_queue: Option<QueueKey>,
+        is_sticky: bool,
+        worker_identity: WorkerIdentity,
+        timeout_after: tokio::time::Duration,
+        caller_deadline: Option<tokio::time::Instant>,
+    ) -> Result<Option<WorkflowActivation>> {
         // Polls create demand before the first take, even if no publication ever
         // reached matching. Sticky polls retain their notification/timer path.
         self.ready().await?;
@@ -861,10 +886,19 @@ where
                     // it still starts a task already matched by the broker.
                     // Applying an expired timer here races that start's first
                     // lane yield and can consume a ready task without returning it.
+                    // Otherwise the start has its own budget, not what remains of the
+                    // wait (`newRecordTaskStartedContext` in
+                    // `service/matching/matching_engine.go @ v1.31.0`), so a task
+                    // matched as the wait ends still starts.
                     let start = if timeout_after.is_zero() {
                         start.await
                     } else {
-                        let Ok(result) = tokio::time::timeout_at(deadline, start).await else {
+                        let start_deadline = super::polled_task_start_deadline(
+                            tokio::time::Instant::now(),
+                            caller_deadline,
+                        );
+                        let Ok(result) = tokio::time::timeout_at(start_deadline, start).await
+                        else {
                             return Ok(None);
                         };
                         result

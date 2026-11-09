@@ -1,0 +1,5 @@
+kind: fixed
+body: Task polls now answer empty a second before the caller's deadline instead of running past it, and a task matched at the end of a poll still starts.
+time: 2026-11-09T12:00:00+00:00
+custom:
+    Slice: 6fda6e33-0296-47f7-b0a8-aaa3cb3fd0c7

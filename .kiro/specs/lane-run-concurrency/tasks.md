@@ -131,81 +131,118 @@ multi-thread Tokio runtime. No test sleeps.
     of making the caller wait.
   - **DONE.** Both crates clippy-clean; the runtime and edge suites pass under nextest.
 
-- [ ] 7. The commit ceiling
-  - [ ] 7.1 Tests for the ceiling
+- [x] 7. The commit ceiling
+  - [x] 7.1 Tests for the ceiling
     - `DsqlRunRepository::commit_concurrency_ceiling` equals the `Commit` allocation `default_allocations`
       gives the configured `target_ready`; `InMemoryStore` returns `None`; the `Arc<T>` impl and
       `HistoryNotifyingRepository` forward.
     - _Requirements: 5.2, 5.3_
-  - [ ] 7.2 Add `RunRepository::commit_concurrency_ceiling` with a `None` default and the forwards
+    - **DONE.** `the_commit_ceiling_is_the_commit_allocation_at_the_configured_target` (which also lowers the
+      live budget and checks the ceiling stays), `the_memory_store_reports_no_commit_ceiling` and
+      `the_commit_ceiling_is_the_inner_repositorys`.
+  - [x] 7.2 Add `RunRepository::commit_concurrency_ceiling` with a `None` default and the forwards
     - _Requirements: 5.2, 5.3, 5.5_
+    - **DONE.** `DsqlRunRepository` reports `DsqlConnectionDirector::commit_concurrency_ceiling`, the `Commit`
+      share of `default_allocations` at the reservoir's configured target. The memory store reports a ceiling
+      only when a test asks for one with `with_commit_concurrency_ceiling`.
 
-- [ ] 8. A lane cache safe for concurrent runs
-  - [ ] 8.1 Property test: Property 7 — the cache never feeds a commit a stale-generation image
+- [x] 8. A lane cache safe for concurrent runs
+  - [x] 8.1 Property test: Property 7 — the cache never feeds a commit a stale-generation image
     - Generate interleavings of activations, identity lookups, outbound metadata commits and generation
       changes against the gated repository; record the generation each commit's image carried.
     - Tag: `// Feature: lane-run-concurrency, Property 7: The cache never feeds a commit a stale-generation image`
     - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.7_
-  - [ ] 8.2 Record generations on images and compare before commit
+    - **DONE.** `the_cache_never_feeds_a_commit_a_stale_generation_image` in `lane/tests/cache_generations.rs`
+      parks loads, changes the generation under them and stamps each image with the generation it was read
+      under.
+  - [x] 8.2 Record generations on images and compare before commit
     - Add `generation` to `CachedRun`; replace `&mut LaneCache` in the activation path with a `CacheAccess`
       that locks per operation and remembers the generation it handed out; reload before committing when the
       owner's generation differs. Keep the existing cache tests green.
     - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.7, 3.8_
+    - **DONE.** `CachedRun` records its generation. The cache only moves forward and never installs or returns
+      an older image (`the_cache_refuses_an_image_from_an_older_generation`). `CacheAccess` tracks the
+      generation of the image it hands out and reloads before a commit when the owner's is newer.
 
-- [ ] 9. Node-wide activation slots
-  - [ ] 9.1 Property test: Property 2 — a slow run doesn't delay another run on the same lane
+- [x] 9. Node-wide activation slots
+  - [x] 9.1 Property test: Property 2 — a slow run doesn't delay another run on the same lane
     - Park run A's commit; generate commands for other runs on the same lane; assert all complete while A is
       parked. Fails against one-slot lanes.
     - Tag: `// Feature: lane-run-concurrency, Property 2: A slow run doesn't delay another run on the same lane`
     - _Requirements: 2.1, 2.2, 2.4_
-  - [ ] 9.2 Property test: Property 3 — the bound on activations is never exceeded
+    - **DONE.** `a_slow_run_does_not_delay_another_run_on_the_same_lane` in `lane/tests/concurrency.rs`.
+  - [x] 9.2 Property test: Property 3 — the bound on activations is never exceeded
     - Generate lane counts, `N` and workloads with parked commits; track the in-flight count with an atomic
       high-water mark; assert it never passes `N` and reaches `min(N, ready runs)`.
     - Tag: `// Feature: lane-run-concurrency, Property 3: The bound on activations is never exceeded`
     - _Requirements: 5.1, 5.6_
-  - [ ] 9.3 Share one semaphore of `N` slots across the node's lanes
+    - **DONE.** `the_bound_on_activations_is_never_exceeded`, over several lanes sharing one semaphore.
+  - [x] 9.3 Share one semaphore of `N` slots across the node's lanes
     - `N = max(lane_count, ceiling)`, fixed at construction, with a comment deriving it; standalone
       `spawn_lane` uses `max(1, ceiling)`. On a failed join, mark the run idle and re-ready it if it has work.
     - _Requirements: 5.1, 5.2, 5.3, 5.4, 8.7_
-  - [ ] 9.4 Property test: Property 4 — no command is lost or duplicated across a shard handoff
+    - **DONE.** `node_activation_bound` derives `N`; `TokeiraRuntime` builds one semaphore of `N` slots for all
+      its lanes (`the_node_bound_is_the_larger_of_the_lane_count_and_the_commit_ceiling`).
+  - [x] 9.4 Property test: Property 4 — no command is lost or duplicated across a shard handoff
     - Interleave submissions with relinquish and re-acquire through `ShardOwner`; assert one reply per
       accepted command and that history holds exactly the `Applied` commands, each once.
     - Tag: `// Feature: lane-run-concurrency, Property 4: No command is lost or duplicated across a shard handoff`
     - _Requirements: 8.1, 8.2, 8.3, 8.4, 3.3, 3.4_
-  - [ ] 9.5 Property test: Property 9 — below the bounds, replies match the serial lane
+    - **DONE.** `no_command_is_lost_or_duplicated_across_a_shard_handoff`, against the memory store's histories.
+  - [x] 9.5 Property test: Property 9 — below the bounds, replies match the serial lane
     - Run the same per-run sequences through a one-slot lane and an `N`-slot lane; compare replies and
       committed histories.
     - Tag: `// Feature: lane-run-concurrency, Property 9: Below the bounds, replies match the serial lane`
     - _Requirements: 10.1, 10.2, 4.1, 4.5_
-  - [ ] 9.6 Shutdown and abandoned-activation examples
+    - **DONE.** `below_the_bounds_replies_match_the_serial_lane`, including runs that were never started.
+  - [x] 9.6 Shutdown and abandoned-activation examples
     - Drop every handle with work queued: every reply arrives and the dispatcher ends after its last
       activation. Abort an activation task: the run's later commands still run.
     - _Requirements: 8.6, 8.7_
+    - **DONE.** `dropping_every_handle_still_answers_every_queued_command` and
+      `an_activation_that_ends_without_finishing_leaves_its_run_runnable`.
 
-- [ ] 10. Observability
-  - [ ] 10.1 Metrics and heartbeat
+- [x] 10. Observability
+  - [x] 10.1 Metrics and heartbeat
     - `tokeira_runtime_lane_queue_depth` reports accepted-but-unstarted commands; add an in-flight activation
       gauge per lane and a refusal counter by lane and kind; report in-flight activations as the heartbeat's
       `active_actors`; stop emitting `tokeira_runtime_lane_carry_overs_total`. Extend the metrics and
       membership tests.
     - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5_
+    - **DONE.** `tokeira_runtime_lane_active_activations` and `tokeira_runtime_lane_refusals_total{lane_id, kind}`
+      (`helpers_emit_expected_metrics_and_labels`); the heartbeat reports in-flight activations
+      (`the_heartbeat_reports_in_flight_activations_as_active_actors`).
 
-- [ ] 11. Align documentation and specs
-  - [ ] 11.1 Update the lane's module and item docs to the per-run model, citing `ContextImpl.Lock`
+- [x] 11. Align documentation and specs
+  - [x] 11.1 Update the lane's module and item docs to the per-run model, citing `ContextImpl.Lock`
     (`service/history/workflow/context.go @ v1.31.0`) for the per-run exclusion
     - _Requirements: 1.1, 2.1_
-  - [ ] 11.2 Amend runtime-lane-occ-retry Requirements 2.6 and 3.4, and its design, to point to this spec; correct
+    - **DONE.** The `lane` module doc, `spawn_lane`, `spawn_lane_with_id` and the scanner's routing notes.
+  - [x] 11.2 Amend runtime-lane-occ-retry Requirements 2.6 and 3.4, and its design, to point to this spec; correct
     [030-runtime-lanes](../../../docs/architecture/030-runtime-lanes.md) and `docs/crates/runtime.md` wherever
     they say a lane serialises different runs
     - _Requirements: 1.5, 2.1_
-  - [ ] 11.3 Changelog fragments: one `changed` for concurrent activations within a lane, one `removed` for
+    - **DONE.** runtime-lane-occ-retry's glossary, Requirements 2.6 and 3.4, and its design's activation loop
+      and Properties 5 and 6; 030-runtime-lanes. `docs/crates/runtime.md` already describes per-execution
+      serialisation only.
+  - [x] 11.3 Changelog fragments: one `changed` for concurrent activations within a lane, one `removed` for
     the carry-over metric
     - _Requirements: 9.5_
+    - **DONE.**
 
-- [ ] 12. Final checkpoint
+- [x] 12. Final checkpoint
   - The crate-scoped commands from task 6, plus `tokeira-storage`; then the live DSQL suite on an ephemeral
     cluster, per the [runbook](../../../docs/testing/dsql-live-suites.md), with commit permits as the
-    observed limit.
+    observed limit. The live check is `tokeira-runtime`'s `dsql_lane_concurrency` integration test
+    (`dsql_lane_concurrent_commits_stay_within_commit_permits`): `3 * N` runs on one lane, each started and
+    signalled in order, every submit answered and every history whole, and the peak of concurrent commit
+    statement windows above one and at most the `Commit` allocation.
+  - **DONE.** The crate-scoped commands passed for `tokeira-runtime`, `tokeira-storage` and `tokeira-edge`, and
+    so did the full workspace checks. On an ephemeral cluster,
+    `dsql_lane_concurrent_commits_stay_within_commit_permits` ran nine runs on one lane with three `Commit`
+    permits and made 81 commits; peak concurrent commits reached 3 and never exceeded the permits. Every
+    run's history held its start and its eight signals once each, in order. The cluster was deleted
+    afterwards.
 
 ## Task Dependency Graph
 

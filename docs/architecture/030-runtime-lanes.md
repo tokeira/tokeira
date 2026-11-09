@@ -19,7 +19,7 @@ The runtime should be the **single place** where a run becomes active in memory.
 
 ## Design claim
 
-Tokeira should run **many isolated workflow actors on a small number of single-thread execution lanes**, rather than dedicating a thread to every workflow or treating a Task Queue as a thread-affinity boundary.
+Tokeira should run **many isolated workflow actors on a small number of execution lanes**, rather than dedicating a thread to every workflow or treating a Task Queue as a thread-affinity boundary.
 
 This works because Temporal’s semantic boundary is the workflow execution, not the task queue, and because Tokio explicitly supports single-thread execution and `!Send` tasks via the current-thread scheduler, `LocalSet`, and `spawn_local`.[^task-queue][^tokio-current-thread][^tokio-localset][^tokio-spawn-local]
 
@@ -29,7 +29,11 @@ Lanes give us three valuable properties at once:
 
 ### 1. Per-run serialization by construction
 
-A run actor only executes on one lane at a time.
+A run actor only executes on one lane at a time, and a lane runs at most one activation per run, taking that
+run's commands in the order it accepted them. A lane does not serialise *different* runs: their activations run
+concurrently, up to the node's shared activation slots, the same per-execution exclusion Temporal keeps with one
+lock per workflow context (`ContextImpl.Lock`, `service/history/workflow/context.go @ v1.31.0`). See
+[lane-run-concurrency](../../.kiro/specs/lane-run-concurrency/design.md).
 
 ### 2. Low coordination overhead
 
@@ -69,10 +73,10 @@ Holds the current shard lease epoch and is responsible for:
 
 ### Lane executor
 
-A single-thread executor with:
+An executor that runs one activation per run at a time and different runs' activations concurrently, with:
 
 - run actor map,
-- lane mailbox,
+- a bounded queue per run, refusing a submit at once past its bounds,
 - local waiter caches / live-ready structures,
 - eviction policy.
 

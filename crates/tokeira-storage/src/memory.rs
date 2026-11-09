@@ -130,6 +130,10 @@ pub struct InMemoryStore {
     /// see one switch; [`InMemoryStore::with_own_renewal_stall`] gives a handle
     /// its own, so a harness can cut one node of several off.
     renewal_stall: Arc<watch::Sender<bool>>,
+    /// The memory store has no commit budget, so it reports no ceiling unless
+    /// a test asks for one with
+    /// [`InMemoryStore::with_commit_concurrency_ceiling`].
+    commit_concurrency_ceiling: Option<usize>,
 }
 
 impl Default for InMemoryStore {
@@ -658,6 +662,7 @@ impl InMemoryStore {
             lease_duration: None,
             clock: system_clock(),
             renewal_stall: Arc::new(watch::Sender::new(false)),
+            commit_concurrency_ceiling: None,
         }
     }
 
@@ -667,6 +672,14 @@ impl InMemoryStore {
     pub fn with_lease_duration(mut self, duration: time::Duration) -> Self {
         assert!(duration.is_positive(), "a lease duration must be positive");
         self.lease_duration = Some(duration);
+        self
+    }
+
+    /// Report `ceiling` as this handle's commit concurrency ceiling, as a DSQL
+    /// repository reports its commit allocation, so a test can size a
+    /// runtime's activation slots above its lane count.
+    pub fn with_commit_concurrency_ceiling(mut self, ceiling: usize) -> Self {
+        self.commit_concurrency_ceiling = Some(ceiling);
         self
     }
 
@@ -902,6 +915,7 @@ impl InMemoryStore {
             lease_duration: None,
             clock: system_clock(),
             renewal_stall: Arc::new(watch::Sender::new(false)),
+            commit_concurrency_ceiling: None,
         })
     }
 }
@@ -1333,6 +1347,10 @@ impl SnapshotDoc {
 
 #[async_trait]
 impl RunRepository for InMemoryStore {
+    fn commit_concurrency_ceiling(&self) -> Option<usize> {
+        self.commit_concurrency_ceiling
+    }
+
     async fn load_outbound_source(&self, run: RunKey) -> Result<LoadedRun> {
         let store = self.inner.lock().await;
         if let Some(state) = store.runs.get(&run) {
@@ -9413,5 +9431,17 @@ mod tests {
                 .expect("commit");
             assert!(matches!(applied, CommitResult::Applied { .. }));
         }
+    }
+}
+
+#[cfg(test)]
+mod commit_ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn the_memory_store_reports_no_commit_ceiling() {
+        assert_eq!(InMemoryStore::default().commit_concurrency_ceiling(), None);
+        let shared = Arc::new(InMemoryStore::default().with_commit_concurrency_ceiling(7));
+        assert_eq!(RunRepository::commit_concurrency_ceiling(&shared), Some(7));
     }
 }

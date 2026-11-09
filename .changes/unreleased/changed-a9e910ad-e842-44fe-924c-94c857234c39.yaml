@@ -1,0 +1,5 @@
+kind: changed
+body: Different runs on one lane now run concurrently, up to the node's commit capacity, and lanes report their in-flight activations and refusals.
+time: 2026-11-09T18:22:37+00:00
+custom:
+    Slice: a9e910ad-e842-44fe-924c-94c857234c39

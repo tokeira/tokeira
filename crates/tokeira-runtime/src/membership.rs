@@ -472,7 +472,9 @@ impl HeartbeatInputs {
                 HeartbeatLanePressure {
                     lane_id: lane_id as u32,
                     runnable_depth,
-                    active_actors: if runnable_depth > 0 { 1 } else { 0 },
+                    // Different runs on a lane run concurrently, so the
+                    // lane's actors are its in-flight activations.
+                    active_actors: lane.active_activations() as u64,
                     utilization,
                 }
             })

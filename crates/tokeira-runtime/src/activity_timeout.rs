@@ -14,9 +14,11 @@
 //! Entries are keyed by `(RunKey, activity_id)` and tagged with their
 //! `ShardId` so a handoff evicts exactly the activities this node no longer owns.
 //!
-//! Cached timeouts select deadline wakes; each selected entry is still reloaded
-//! before a decision. A periodic full pass reconciles stale caches, including
-//! starts missed before schedule tracking and anchors superseded by a retry.
+//! Cached timeouts select deadline wakes; each selected entry is still decided
+//! from an authoritative read, taken once per run per pass and shared by every
+//! selected activity of that run. A periodic full pass reconciles stale caches,
+//! including starts missed before schedule tracking and anchors superseded by a
+//! retry, at a cost of one read per tracked run.
 //! Reloaded attempt anchors select observations; each commit rechecks its captured
 //! attempt and deadline against the state it writes, including after OCC conflicts.
 //! Cache repairs are revision guarded and preserve heartbeats at or after the
@@ -25,7 +27,10 @@
 
 use tokeira_kernel::deadline_after;
 
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use crate::shard::ShardOwner;
 
@@ -484,6 +489,13 @@ pub struct ActivityTimeoutScannerConfig {
     pub scan_interval: tokio::time::Duration,
     /// Upper bound on timeouts submitted per scan, bounding the work one tick can
     /// do when many activities expire together.
+    ///
+    /// It counts submissions (timeout resolutions and retry commits), not run
+    /// reads: submissions are what occupy lanes and write history, which is the
+    /// work this cap protects. Reads are bounded separately, by one per tracked
+    /// run per pass. Counting reads would not lower what a full pass reads, since
+    /// unattempted refreshes continue at once in the next wake; it would only
+    /// split the pass and change what this option bounds.
     pub max_timeouts_per_scan: usize,
 }
 
@@ -660,9 +672,18 @@ pub(crate) async fn scan_activity_timeouts_once<R: RunRepository + 'static>(
     scan_activity_timeouts_at(deps, shard_id, lanes, lane_count, config, deps.clock.now()).await;
 }
 
-/// Reload due entries in stable deadline order. Full-pass obligations also refresh
-/// future caches. Mark attempts before I/O so failed loads/submissions wait for the
-/// next interval; a capped pass leaves unattempted entries immediately runnable.
+/// One run read shared by every entry of that run selected in a pass.
+#[derive(Clone)]
+enum PassRead {
+    Existing(Arc<tokeira_kernel::WorkflowState>),
+    Absent,
+    Failed,
+}
+
+/// Reload due entries in stable deadline order, reading each run once per pass.
+/// Full-pass obligations also refresh future caches. Mark attempts before I/O so
+/// failed loads/submissions wait for the next interval; a capped pass leaves
+/// unattempted entries immediately runnable.
 pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
     deps: &ActivityRetryDeps<R>,
     shard_id: Option<ShardId>,
@@ -688,7 +709,23 @@ pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
         )
     });
 
-    for tracked in entries {
+    // A run is read at most once per pass, and that one read serves every
+    // selected activity of the run. Reusing it after an earlier entry of the
+    // same run has committed is safe: the scanner's read only proposes a
+    // decision, and both commit paths revalidate the captured attempt and
+    // deadline against their own fenced transition base
+    // (`ActivityTimeoutCheck::validate`). A timeout or retry of one activity
+    // does not change another's attempt, anchors or options, so an older image
+    // yields the same per-activity decision. The image is held only until the
+    // run's last selected entry, so a pass of one activity per run caches nothing.
+    let last_use: HashMap<RunKey, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, tracked)| (tracked.value.run_key, index))
+        .collect();
+    let mut reads: HashMap<RunKey, PassRead> = HashMap::new();
+
+    for (index, tracked) in entries.into_iter().enumerate() {
         if !tracking.inner.active(&tracked) {
             continue;
         }
@@ -703,23 +740,47 @@ pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
         {
             continue;
         }
-        let state = match deps.repo.load_run(entry.run_key).await {
-            Ok(LoadedRun::Existing(state)) => state,
-            Ok(LoadedRun::Absent) => {
+        let last = last_use.get(&entry.run_key) == Some(&index);
+        let cached = if last {
+            reads.remove(&entry.run_key)
+        } else {
+            reads.get(&entry.run_key).cloned()
+        };
+        let read = match cached {
+            Some(read) => read,
+            None => {
+                let read = match deps.repo.load_run(entry.run_key).await {
+                    Ok(LoadedRun::Existing(state)) => PassRead::Existing(Arc::new(state)),
+                    Ok(LoadedRun::Absent) => PassRead::Absent,
+                    // A failed read fails the run's remaining entries for this
+                    // pass too. Each is marked attempted as it is reached, so
+                    // they wait for the next full pass instead of re-reading a
+                    // store that just failed.
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            run_key = ?entry.run_key,
+                            activity_id = entry.activity_id,
+                            "activity timeout scanner failed to load run"
+                        );
+                        PassRead::Failed
+                    }
+                };
+                if !last {
+                    reads.insert(entry.run_key, read.clone());
+                }
+                read
+            }
+        };
+        let state = match read {
+            PassRead::Existing(state) => state,
+            PassRead::Absent => {
                 tracking
                     .inner
                     .remove_submitted(&(entry.run_key, entry.activity_id.clone()), &tracked);
                 continue;
             }
-            Err(error) => {
-                tracing::warn!(
-                    ?error,
-                    run_key = ?entry.run_key,
-                    activity_id = entry.activity_id,
-                    "activity timeout scanner failed to load run"
-                );
-                continue;
-            }
+            PassRead::Failed => continue,
         };
 
         if !tracking.inner.active(&tracked) {

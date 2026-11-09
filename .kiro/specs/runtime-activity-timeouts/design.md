@@ -189,13 +189,38 @@ The scanner loop:
 2. Sleep until that time, cancellation, or an earlier-deadline notification.
 3. Snapshot due entries in deadline order, with run/activity identity as the stable
    tie-break. Every interval, include all entries to reconcile stale caches.
-4. Before each await, mark the captured entry revision attempted. Reload its run,
-   refresh cached timeouts and pause state, then evaluate authoritative activity
-   state using the existing precedence, retry decisions and lane submission.
+4. Before each await, mark the captured entry revision attempted. Read its run
+   unless this pass already read it, refresh cached timeouts and pause state, then
+   evaluate authoritative activity state using the existing precedence, retry
+   decisions and lane submission.
 5. Retire successful/stale entries conditionally on revision and acquisition.
    Failed attempts wait for the next interval. A bounded pass leaves unattempted
    due entries ready for an immediate continuation, independently for timeout and
    eligibility caps; eligibility cursors remain acquisition-scoped.
+
+A pass reads each run at most once and decides every selected activity of that
+run from the one read. The read is kept only until the run's last selected entry,
+so a pass with one activity per run holds no extra state. A failed or absent read
+applies to all of the run's entries in that pass: an absent run removes each
+captured entry, and a failed read leaves each one for the next full pass.
+Reusing the read after an earlier entry of the same run has committed is safe:
+the read only proposes a decision, and both commit paths recheck the captured
+attempt and deadline against their own fenced base. A timeout or retry of one
+activity leaves the attempt, anchors and options of the run's other activities
+unchanged, so the older image gives each of them the same decision.
+
+Reconciliation cost and bound: every `scan_interval`, the full pass reads each
+shard-owned run with at least one tracked activity once, so its cost is the number
+of such runs, not the number of tracked activities. Every tracked entry is
+reconciled by the pass, so a stale cache is repaired within one `scan_interval`
+unless its run's read fails, which leaves it for the next pass.
+Losing the cache costs only the recovery rebuild from durable state.
+
+`max_timeouts_per_scan` counts submissions (terminal timeouts and retry commits),
+not reads. Submissions occupy lanes and write history, which is the work the cap
+protects; reads are already bounded by one per run per pass. Counting reads would
+not lower what a full pass reads, because unattempted refreshes continue at once
+in the next wake.
 
 Cache all four timeout values and the pause flag beside the timing anchors. Unknown
 configuration is immediately due for one reload. Paused activities and zero/unset

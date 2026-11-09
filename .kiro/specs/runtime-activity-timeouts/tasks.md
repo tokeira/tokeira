@@ -232,3 +232,16 @@ All code lives in `tokeira-runtime`, in a new `activity_timeout.rs` module (foll
     the retry commits; the old pre-commit heartbeat now invalidates the timeout.
   - Dependency: task 11.
   - _Requirements: 7.5, 7.9._
+
+- [x] 13. Read each run once per timeout pass
+  - Share one storage read per run across every entry of that run selected in a
+    pass, keeping deadline order, attempt marking, conditional removal and each
+    entry's decision unchanged. Hold the read only until the run's last selected
+    entry; a failed or absent read applies to the run's remaining entries.
+  - Keep `max_timeouts_per_scan` counting submissions.
+  - Count repository reads across two full passes over three tracked activities of
+    one run: one read per pass. Then fire all three schedule-to-start timeouts from
+    one shared read, each surviving commit revalidation.
+  - DONE: `full_pass_reads_a_run_once_and_still_decides_each_activity`.
+  - Dependency: task 12.
+  - _Requirements: 7.1, 7.8, 7.10._

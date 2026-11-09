@@ -672,6 +672,29 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
             .await
     }
 
+    /// Poll as [`Self::poll_workflow_activation_with_kind`] for a caller whose
+    /// deadline bounds a matched task's start; `timeout` still bounds the wait.
+    /// Runtimes without a separate start budget ignore the deadline.
+    async fn poll_workflow_activation_within(
+        &self,
+        queue: tokeira_types::QueueKey,
+        normal_queue: Option<tokeira_types::QueueKey>,
+        is_sticky: bool,
+        worker_identity: tokeira_types::WorkerIdentity,
+        timeout: std::time::Duration,
+        caller_deadline: Option<tokio::time::Instant>,
+    ) -> Result<Option<WorkflowActivation>> {
+        let _ = caller_deadline;
+        self.poll_workflow_activation_with_kind(
+            queue,
+            normal_queue,
+            is_sticky,
+            worker_identity,
+            timeout,
+        )
+        .await
+    }
+
     /// Return a poller-count delta after a successful workflow poll, if the
     /// matching plane currently observes pressure on that physical queue.
     async fn workflow_poller_scaling_decision(
@@ -728,6 +751,21 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         worker_identity: tokeira_types::WorkerIdentity,
         timeout: std::time::Duration,
     ) -> Result<Option<StartedActivityTask>>;
+
+    /// Poll as [`Self::poll_activity_task`] for a caller whose deadline bounds a
+    /// matched task's start; `timeout` still bounds the wait. Runtimes without a
+    /// separate start budget ignore the deadline.
+    async fn poll_activity_task_within(
+        &self,
+        queue: tokeira_types::QueueKey,
+        worker_identity: tokeira_types::WorkerIdentity,
+        timeout: std::time::Duration,
+        caller_deadline: Option<tokio::time::Instant>,
+    ) -> Result<Option<StartedActivityTask>> {
+        let _ = caller_deadline;
+        self.poll_activity_task(queue, worker_identity, timeout)
+            .await
+    }
 
     /// Poll an activity offer without starting it so workflow rules can run at
     /// the v1.31.0 activity-start boundary.
@@ -4852,6 +4890,18 @@ impl WorkflowService {
                         .await?,
                 )?;
 
+                // Answer empty at once when the caller's deadline leaves no more than the
+                // tail room: an empty response is a success the SDK re-polls at once, a
+                // deadline error one it backs off from. v1.31.0 checks after admission and
+                // before registering the poller (`service/frontend/workflow_handler.go`,
+                // `contextNearDeadline` @ v1.31.0).
+                let Some(poll_deadline) = crate::long_poll::task_poll_deadline(
+                    req.caller_deadline,
+                    tokio::time::Instant::now(),
+                    req.timeout,
+                ) else {
+                    return Ok(None);
+                };
                 let _permit = self.long_polls.acquire().await?;
                 let poller = self.poller_registry.register(
                     queue_key_for_poll(
@@ -4903,6 +4953,7 @@ impl WorkflowService {
                     decorations: forwarded_decorations.clone(),
                 };
                 let is_sticky = req.is_sticky;
+                let caller_deadline = req.caller_deadline;
                 let internal = to_internal::poll_request(req);
                 let scaling_queue = internal.queue.clone();
                 if internal.queue.deployment.is_some() {
@@ -4919,12 +4970,13 @@ impl WorkflowService {
                 let activation = crate::grpc::workflow_dispatch::FORWARDED_POLL
                     .scope(
                         forwarding,
-                        self.runtime.poll_workflow_activation_with_kind(
+                        self.runtime.poll_workflow_activation_within(
                             internal.queue,
                             internal.normal_queue,
                             is_sticky,
                             internal.worker_identity.clone(),
-                            internal.timeout,
+                            poll_deadline.saturating_duration_since(tokio::time::Instant::now()),
+                            caller_deadline,
                         ),
                     )
                     .await;
@@ -6863,7 +6915,6 @@ impl WorkflowService {
         req: PollActivityTaskQueueRequest,
         admitted: Option<EdgeContext>,
     ) -> EdgeResult<Option<PollActivityTaskQueueResponse>> {
-        let deadline = tokio::time::Instant::now() + req.timeout;
         let namespace_label = req.namespace.clone();
         self.observe_edge_call(
             headers,
@@ -6892,6 +6943,18 @@ impl WorkflowService {
                         .await?,
                 )?;
 
+                // Answer empty at once when the caller's deadline leaves no more than the
+                // tail room: an empty response is a success the SDK re-polls at once, a
+                // deadline error one it backs off from. v1.31.0 checks after admission and
+                // before registering the poller (`service/frontend/workflow_handler.go`,
+                // `contextNearDeadline` @ v1.31.0).
+                let Some(deadline) = crate::long_poll::task_poll_deadline(
+                    req.caller_deadline,
+                    tokio::time::Instant::now(),
+                    req.timeout,
+                ) else {
+                    return Ok(None);
+                };
                 let _permit = self.long_polls.acquire().await?;
                 let poller = self.poller_registry.register(
                     queue_key_for_poll(
@@ -6942,6 +7005,7 @@ impl WorkflowService {
                     workflow_namespace.clone(),
                     namespace_id,
                 );
+                let caller_deadline = req.caller_deadline;
                 let internal = to_internal::poll_activity_request(req);
                 let scaling_queue = internal.queue.clone();
                 if internal.queue.deployment.is_some() {
@@ -6996,10 +7060,11 @@ impl WorkflowService {
                         forwarding,
                         tokeira_runtime::scope_activity_start_response(
                             preflight,
-                            self.runtime.poll_activity_task(
+                            self.runtime.poll_activity_task_within(
                                 internal.queue,
                                 internal.worker_identity,
                                 deadline.saturating_duration_since(tokio::time::Instant::now()),
+                                caller_deadline,
                             ),
                         ),
                     )
@@ -12044,6 +12109,7 @@ mod tests {
                     build_id: workflow_queue.build_id.clone(),
                     sticky_run: None,
                     timeout: std::time::Duration::from_secs(1),
+                    caller_deadline: None,
                     sticky_ttl: std::time::Duration::from_secs(10),
                 },
             )

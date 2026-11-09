@@ -486,9 +486,14 @@ The translation layer maps between proto wire types and the existing edge DTOs d
 
 The proto `PollWorkflowTaskQueueRequest` does not carry explicit timeout or sticky TTL fields. The adapter applies sensible defaults:
 
-- `timeout`: 60 seconds (standard Temporal long-poll duration)
+- `timeout`: 60 seconds, the longest a poll waits (`matching.longPollExpirationInterval`'s default in v1.31.0)
+- `caller_deadline`: the request's gRPC deadline, read from `grpc-timeout` by the gRPC adapter; `None` when the caller sent none
 - `sticky_ttl`: 30 seconds
 - `sticky_run`: `None` (sticky execution not yet wired)
+
+A task poll waits until one second before `caller_deadline`, and at most `timeout`. When one second or less remains, it returns the empty response at once: the SDK polls again at once after an empty response, but backs off after a deadline error. This mirrors v1.31.0, where the frontend answers empty within one second of the deadline (`longPollTailRoom`, `service/frontend/workflow_handler.go`) and matching ends its wait one second before it (`returnEmptyTaskTimeBudget`, `service/matching/physical_task_queue_manager.go`). `crate::long_poll::task_poll_deadline` computes the wait.
+
+Once a poll is matched to a task, the runtime gives the task's start 10 seconds of its own, ending at the caller's deadline if that is sooner, as v1.31.0 does (`recordTaskStartedDefaultTimeout`, `service/matching/matching_engine.go`). A task matched in the poll's last moments therefore still starts. v1.31.0 gives a sync-matched task only one second, because its producer waits for the reply. Tokeira has no such producer: publishing a task never waits for a poll to start it, so every start a poll makes takes the 10-second budget.
 
 ### gRPC Reflection Configuration
 
@@ -1191,7 +1196,8 @@ pub fn poll_activity_request_to_edge(
         namespace: req.namespace,
         task_queue: task_queue_to_domain(task_queue).0,
         worker_identity: req.identity,
-        timeout: DEFAULT_POLL_TIMEOUT,
+        timeout: crate::long_poll::TASK_POLL_TIMEOUT,
+        caller_deadline: None, // the gRPC adapter sets this from `grpc-timeout`
     })
 }
 
@@ -1399,7 +1405,6 @@ fn deserialize_activity_token(bytes: &[u8]) -> Result<ActivityTaskToken, ProtoCo
 
 // --- Constants ---
 
-const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
 ```
@@ -1814,6 +1819,8 @@ Unit tests complement property tests by covering specific examples and edge case
 - **Query timeout**: Verify that when the runtime returns a timeout error for `query_workflow`, the adapter maps it to an appropriate gRPC status.
 - **Update wait policy mapping**: Verify that proto `wait_policy` values 0 and 1 map to `UpdateWaitPolicy::Accepted` and `UpdateWaitPolicy::Completed` respectively.
 - **Default poll timeout for activity**: Verify that the adapter applies 60s timeout default for activity polls.
+- **Poll wait from the caller's deadline**: Verify that a far deadline waits 60 seconds, a near deadline waits until one second before it, one second or less answers empty at once, and no deadline waits 60 seconds.
+- **Matched task start budget**: Verify that a task whose start outlasts the poll's wait still starts, and that a start never runs past the caller's deadline.
 - **Default query timeout**: Verify that the adapter applies 10s timeout default for queries.
 - **Default update timeout**: Verify that the adapter applies 30s timeout default for updates.
 - **Activity poll shares LongPollGate**: Verify that activity polls and workflow polls compete for the same semaphore by exhausting the gate with workflow polls and verifying activity polls are rejected with `RESOURCE_EXHAUSTED`.

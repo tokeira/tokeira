@@ -331,6 +331,17 @@ Wire the existing `tokeira-edge` service layer and `tokeira-proto` generated bin
     - Run focused kernel and edge tests, then two clean consecutive `TestLinksTestSuite` runs against the final binary.
     - _Requirements: 10.5, 10.6, 10.7_
 
+- [x] 27. Task polls honour the caller's deadline
+  - [x] 27.1 Wait until one second before the caller's gRPC deadline, at most 60 seconds, and answer empty at once when one second or less remains
+    - Read `grpc-timeout` in the gRPC adapter, carry it on both edge poll DTOs, and decide the wait after admission with `crate::long_poll::task_poll_deadline`.
+    - Bound the standalone-activity wait by the same deadline.
+    - DONE. `long_poll::tests` pins the arithmetic; `task_polls_near_the_caller_deadline_answer_empty_at_once` pins the empty answer's shape for both polls.
+    - _Requirements: 7.4, 7.5, 7.6_
+  - [x] 27.2 Give a matched task's start its own 10-second budget within the caller's deadline
+    - Apply the budget to workflow and activity starts in the runtime.
+    - DONE. `runtime::poll_start_budget_tests` pins both starts. The tests fail when the start is bounded by the poll's wait.
+    - _Requirements: 7.7_
+
 ## Notes
 
 - Tasks marked with `*` are optional and can be skipped for faster MVP

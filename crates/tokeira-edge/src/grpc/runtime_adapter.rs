@@ -229,6 +229,27 @@ where
             .await
     }
 
+    async fn poll_workflow_activation_within(
+        &self,
+        queue: tokeira_types::QueueKey,
+        normal_queue: Option<tokeira_types::QueueKey>,
+        is_sticky: bool,
+        worker_identity: tokeira_types::WorkerIdentity,
+        timeout: std::time::Duration,
+        caller_deadline: Option<tokio::time::Instant>,
+    ) -> Result<Option<tokeira_runtime::WorkflowActivation>> {
+        self.runtime
+            .poll_workflow_activation_within(
+                queue,
+                normal_queue,
+                is_sticky,
+                worker_identity,
+                timeout,
+                caller_deadline,
+            )
+            .await
+    }
+
     async fn workflow_poller_scaling_decision(
         &self,
         queue: &tokeira_types::QueueKey,
@@ -297,6 +318,18 @@ where
     ) -> Result<Option<StartedActivityTask>> {
         self.runtime
             .poll_activity_task(queue, worker_identity, timeout)
+            .await
+    }
+
+    async fn poll_activity_task_within(
+        &self,
+        queue: tokeira_types::QueueKey,
+        worker_identity: tokeira_types::WorkerIdentity,
+        timeout: std::time::Duration,
+        caller_deadline: Option<tokio::time::Instant>,
+    ) -> Result<Option<StartedActivityTask>> {
+        self.runtime
+            .poll_activity_task_within(queue, worker_identity, timeout, caller_deadline)
             .await
     }
 

@@ -289,6 +289,12 @@ async fn complete(
 
 /// Poll until `count` activity tasks start; an offer a reset left stale answers
 /// nothing, and polling goes on.
+///
+/// Each poll may wait for whatever remains of the suite's one-minute budget, the
+/// same minute a worker's long poll gets. A poll answers as soon as a task starts,
+/// so the long wait costs nothing when inputs arrive; it only spares the suite from
+/// racing short polls against DSQL round trips, so a failure here means an input
+/// went missing, never that a poll timed out first.
 async fn poll_started(
     runtime: &TokeiraRuntime<DsqlRunRepository>,
     namespace_id: NamespaceId,
@@ -297,8 +303,9 @@ async fn poll_started(
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
     let mut started = Vec::new();
     while started.len() < count {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         anyhow::ensure!(
-            tokio::time::Instant::now() < deadline,
+            !remaining.is_zero(),
             "{} of {count} activity tasks started",
             started.len()
         );
@@ -306,7 +313,7 @@ async fn poll_started(
             .poll_activity_task(
                 queue(namespace_id, ACTIVITY_QUEUE, TaskKind::Activity),
                 WorkerIdentity("worker".to_string()),
-                tokio::time::Duration::from_secs(1),
+                remaining,
             )
             .await?
         {

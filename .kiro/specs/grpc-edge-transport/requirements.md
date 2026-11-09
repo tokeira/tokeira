@@ -108,6 +108,10 @@ Requirements 1–8 cover the initial gRPC transport milestone: workflow task pol
 1. WHEN a `PollWorkflowTaskQueue` request is received and no task is immediately available, THE WorkflowService_Adapter SHALL hold the gRPC stream open until a task becomes available or the poll timeout expires.
 2. WHEN the poll timeout expires without a task becoming available, THE WorkflowService_Adapter SHALL return an empty response (default `PollWorkflowTaskQueueResponse`) rather than an error.
 3. WHILE the long-poll gate has reached its concurrency limit, THE WorkflowService_Adapter SHALL reject new poll requests with gRPC status `RESOURCE_EXHAUSTED`.
+4. WHEN a `PollWorkflowTaskQueue` or `PollActivityTaskQueue` request carries a gRPC deadline, THE WorkflowService_Adapter SHALL wait for a task until one second before that deadline, and never longer than 60 seconds. For example, a poll with a 10-second deadline waits 9 seconds, and a poll with a 5-minute deadline waits 60 seconds.
+5. WHEN a task poll's gRPC deadline leaves one second or less, THE WorkflowService_Adapter SHALL return the empty response at once, without waiting, as v1.31.0's frontend does (`service/frontend/workflow_handler.go @ v1.31.0`).
+6. WHEN a task poll carries no gRPC deadline, THE WorkflowService_Adapter SHALL wait for a task for up to 60 seconds.
+7. WHEN a task poll is matched to a task, THE runtime SHALL give the task's start 10 seconds of its own, however little of the poll's wait remains, and SHALL end the start at the caller's deadline if that comes first (`service/matching/matching_engine.go @ v1.31.0`).
 
 ### Requirement 8: Runtime Adapter Wiring
 

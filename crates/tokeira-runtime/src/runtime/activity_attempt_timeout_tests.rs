@@ -245,3 +245,88 @@ async fn skipped_reset_schedule_to_start_uses_the_new_attempt_deadline() {
     assert_eq!(timeouts, ["schedule_to_start"]);
     discovery_tests::stop(&runtime).await;
 }
+
+// A scanner timeout refused by a run at its lane share stays tracked, and
+// times the attempt out on a later pass once the run has room.
+#[tokio::test(start_paused = true)]
+async fn a_refused_activity_timeout_is_delivered_once_the_run_has_room() {
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::new());
+    let repo = Arc::new(Repo::with_inner(
+        InMemoryStore::default().with_clock(clock.clone()),
+    ));
+    let runtime = fixture_on(repo.clone(), clock).await;
+    let request = start(&runtime, false);
+    let run = request.run_key;
+    let queue = QueueKey {
+        namespace_id: request.namespace_id,
+        task_queue: request.task_queue.clone(),
+        task_kind: TaskKind::Workflow,
+        deployment: None,
+        build_id: None,
+    };
+    runtime.start_workflow(request).await.unwrap();
+    let first = runtime
+        .poll_workflow_task(
+            queue.clone(),
+            WorkerIdentity("worker".into()),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let mut command = completion_eager_tests::schedule("retry", true);
+    if let WorkflowCommand::ScheduleActivity {
+        retry_policy,
+        start_to_close_timeout,
+        ..
+    } = &mut command
+    {
+        retry_policy.as_mut().unwrap().maximum_attempts = 1;
+        *start_to_close_timeout = Some(Duration::seconds(1));
+    }
+    let mut completion = completion_inline_tests::completion(&first, false);
+    completion.now = runtime.clock.now();
+    completion.request.received_at = completion.now;
+    completion.commands = vec![command];
+    runtime.complete_workflow_task(completion).await.unwrap();
+    let activity_queue = QueueKey {
+        task_kind: TaskKind::Activity,
+        task_queue: TaskQueueName("activities".into()),
+        ..queue
+    };
+    let offer = runtime
+        .activity_broker
+        .try_claim_activity_offer(&activity_queue, run, "retry")
+        .await
+        .unwrap();
+    runtime
+        .start_activity_task_offer(offer, WorkerIdentity("worker".into()))
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::advance(std::time::Duration::from_nanos(1_000_000_001)).await;
+
+    let lane = crate::scanner::pick_lane_for_run_key(&runtime.lanes, runtime.lanes.len(), run);
+    let mut claims = Vec::new();
+    while let Ok(claim) = lane.reserve(run) {
+        claims.push(claim);
+    }
+    scan(&runtime).await;
+    let LoadedRun::Existing(state) = repo.load_run(run).await.unwrap() else {
+        panic!("run")
+    };
+    assert!(
+        state.activities["retry"].started_at.is_some(),
+        "a refused timeout must leave the attempt running"
+    );
+
+    drop(claims);
+    scan(&runtime).await;
+    let LoadedRun::Existing(state) = repo.load_run(run).await.unwrap() else {
+        panic!("run")
+    };
+    assert!(
+        !state.activities.contains_key("retry"),
+        "the timeout reaches the run once it has room"
+    );
+}

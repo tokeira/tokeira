@@ -9112,6 +9112,8 @@ fn grpc_error_code(error: &EdgeError) -> &'static str {
         EdgeError::ResourceExhausted(_) => "resource_exhausted",
         EdgeError::ConcurrentLimitExceeded(_) => "resource_exhausted",
         EdgeError::WorkflowClosing => "resource_exhausted",
+        EdgeError::WorkflowBusy => "resource_exhausted",
+        EdgeError::LaneOverloaded(_) => "resource_exhausted",
         EdgeError::PersistenceLimitExceeded => "resource_exhausted",
         EdgeError::ConsistentQueryBufferExceeded => "resource_exhausted",
         EdgeError::WorkflowNotReady(_) => "failed_precondition",
@@ -12650,6 +12652,41 @@ mod tests {
             .expect_err("valid but unknown run_id must not fall back to current");
         assert!(matches!(error, EdgeError::WorkflowNotFound { .. }));
         assert_eq!(error.status_code(), http::StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    // A signal to a run at its lane share is refused at once with v1.31.0's
+    // busy-workflow shape, with or without a run id, and goes through once the
+    // run has room.
+    #[tokio::test]
+    async fn signal_path_refuses_a_run_at_its_share_at_once() -> Result<()> {
+        let (service, runtime, namespace_id, workflow_id, run_id) = update_test_service().await?;
+        let run_key = runtime
+            .repo()
+            .resolve_execution(&tokeira_types::ExecutionRef {
+                namespace_id,
+                workflow_id: workflow_id.clone(),
+                run_id: Some(run_id),
+            })
+            .await?
+            .expect("the started run resolves");
+        let mut claims = Vec::new();
+        while let Ok(claim) = runtime.reserve_submit(run_key) {
+            claims.push(claim);
+        }
+        for run in [None, Some(run_id.0.to_string())] {
+            let error = service
+                .signal_workflow_execution(&HeaderMap::new(), signal_request(&workflow_id, run))
+                .await
+                .expect_err("a run at its share refuses the signal");
+            assert!(matches!(error, EdgeError::WorkflowBusy), "{error:?}");
+            assert_eq!(error.status_code(), http::StatusCode::TOO_MANY_REQUESTS);
+        }
+        drop(claims);
+        let response = service
+            .signal_workflow_execution(&HeaderMap::new(), signal_request(&workflow_id, None))
+            .await?;
+        assert!(response.accepted);
         Ok(())
     }
 

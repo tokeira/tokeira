@@ -1,0 +1,5 @@
+kind: changed
+body: An overloaded lane or workflow run now answers RESOURCE_EXHAUSTED at once instead of making the caller wait for room.
+time: 2026-11-09T17:24:33+00:00
+custom:
+    Slice: 56e0e76e-8a38-4b40-8e36-59c611b4d5bb

@@ -27,6 +27,14 @@ impl From<EdgeError> for Status {
                 message,
             ),
             EdgeError::WorkflowClosing => workflow_closing_status(),
+            error @ EdgeError::WorkflowBusy => {
+                busy_workflow_resource_exhausted_status(error.to_string())
+            }
+            EdgeError::LaneOverloaded(message) => resource_exhausted_status(
+                ResourceExhaustedCause::SystemOverloaded,
+                ResourceExhaustedScope::System,
+                message,
+            ),
             error @ EdgeError::PersistenceLimitExceeded => resource_exhausted_status(
                 ResourceExhaustedCause::PersistenceLimit,
                 ResourceExhaustedScope::System,
@@ -720,6 +728,57 @@ mod tests {
             ResourceExhaustedCause::ConcurrentLimit as i32
         );
         assert_eq!(failure.scope, ResourceExhaustedScope::Namespace as i32);
+    }
+
+    fn decode_resource_exhausted(status: &Status) -> (i32, i32) {
+        use tokeira_proto::public::temporal::api::errordetails::v1::ResourceExhaustedFailure;
+
+        let rpc_status = RpcStatus::decode(status.details()).expect("decode google.rpc.Status");
+        let detail = &rpc_status.details[0];
+        assert_eq!(
+            detail.type_url,
+            "type.googleapis.com/temporal.api.errordetails.v1.ResourceExhaustedFailure"
+        );
+        let failure =
+            ResourceExhaustedFailure::decode(detail.value.as_slice()).expect("decode detail");
+        (failure.cause, failure.scope)
+    }
+
+    #[test]
+    fn a_busy_run_answers_v1_31_0s_busy_workflow() {
+        // `ErrResourceExhaustedBusyWorkflow` (`service/history/consts/const.go @ v1.31.0`).
+        let error = EdgeError::from(anyhow::Error::new(tokeira_runtime::WorkflowBusy));
+        assert_eq!(error.status_code(), http::StatusCode::TOO_MANY_REQUESTS);
+        let status: Status = error.into();
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(status.message(), "Workflow is busy.");
+        assert_eq!(
+            decode_resource_exhausted(&status),
+            (
+                ResourceExhaustedCause::BusyWorkflow as i32,
+                ResourceExhaustedScope::Namespace as i32
+            )
+        );
+    }
+
+    #[test]
+    fn an_overloaded_lane_answers_the_system_overloaded_shape() {
+        // The shape of `ErrCacheFull` (`common/cache/lru.go @ v1.31.0`).
+        let error = EdgeError::from(anyhow::Error::new(tokeira_runtime::LaneOverloaded));
+        assert_eq!(error.status_code(), http::StatusCode::TOO_MANY_REQUESTS);
+        let status: Status = error.into();
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(
+            status.message(),
+            tokeira_runtime::LaneOverloaded.to_string()
+        );
+        assert_eq!(
+            decode_resource_exhausted(&status),
+            (
+                ResourceExhaustedCause::SystemOverloaded as i32,
+                ResourceExhaustedScope::System as i32
+            )
+        );
     }
 
     #[test]

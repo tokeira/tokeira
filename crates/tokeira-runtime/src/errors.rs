@@ -171,6 +171,38 @@ pub struct InvalidWorkflowCommand {
 #[error("workflow operation can not be applied because workflow is closing")]
 pub struct WorkflowClosing;
 
+/// A submit refused because its run already holds its share of its lane's
+/// pending commands: the run produces work faster than its own commits retire
+/// it. v1.31.0 answers the same condition, a caller that cannot get a busy
+/// execution's lock in time, with `ErrResourceExhaustedBusyWorkflow`:
+/// RESOURCE_EXHAUSTED with cause BUSY_WORKFLOW, scope NAMESPACE, and this exact
+/// message (`service/history/consts/const.go @ v1.31.0`).
+///
+/// Nothing about the run changed, so the caller may retry after a backoff.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("Workflow is busy.")]
+pub struct WorkflowBusy;
+
+/// A submit refused because its lane holds its whole budget of pending
+/// commands across its runs. The shape is v1.31.0's `ErrCacheFull` for a host
+/// cache full of locked executions: RESOURCE_EXHAUSTED with cause
+/// SYSTEM_OVERLOADED and scope SYSTEM (`common/cache/lru.go @ v1.31.0`). The
+/// message is Tokeira's own, saying what to do next.
+///
+/// Nothing about the run changed, so the caller may retry after a backoff.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("The server is at capacity for this workflow; retry after a backoff.")]
+pub struct LaneOverloaded;
+
+impl From<crate::lane::LaneRefusal> for anyhow::Error {
+    fn from(refusal: crate::lane::LaneRefusal) -> Self {
+        match refusal {
+            crate::lane::LaneRefusal::RunShareFull => WorkflowBusy.into(),
+            crate::lane::LaneRefusal::LaneBudgetFull => LaneOverloaded.into(),
+        }
+    }
+}
+
 /// Query or update admission rejected because the workflow cannot take it right
 /// now — v1.31.0's `serviceerror.WorkflowNotReady` (gRPC FAILED_PRECONDITION
 /// with a `WorkflowNotReadyFailure` detail). The message is one of the three

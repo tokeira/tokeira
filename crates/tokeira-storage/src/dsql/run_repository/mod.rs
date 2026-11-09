@@ -2339,6 +2339,21 @@ mod tests {
         assert!(sql.trim_end().ends_with("LIMIT $3"));
     }
 
+    #[test]
+    fn history_reads_check_preparation_once_per_statement() {
+        for sql in [
+            super::load::READ_HISTORY_BATCHES_SQL,
+            super::load::READ_HISTORY_EVENT_BATCH_SQL,
+            super::load::READ_ALL_HISTORY_BATCHES_SQL,
+        ] {
+            assert!(
+                sql.contains("WHERE target_run_key = $1 AND phase < 4"),
+                "{sql}"
+            );
+            assert!(!sql.contains("history_batch.run_key"), "{sql}");
+        }
+    }
+
     #[tokio::test]
     async fn read_history_zero_limit_does_not_acquire_connection() {
         let recorder = Arc::new(RecordingAcquirer::default());

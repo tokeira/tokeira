@@ -50,11 +50,19 @@ fn decode_hot_state(
 /// History batches after a cursor, in order, a page at a time, so a history
 /// read fetches only the batches it returns (`history-pagination` criterion 2.3).
 /// Each row is a [`StoredBatchRow`].
+///
+/// Each history read hides a run that an unpublished preparation is still
+/// staging (`outbound-dispatch-recovery`). The check names the bound run key,
+/// not `history_batch.run_key`: the two are equal on every row the read can
+/// return, but only the bound key lets the planner test it once, before the
+/// scan, as a one-time filter. Correlated on the row, it plans as an anti-join
+/// above the primary-key scan, which keeps the `LIMIT` from reaching storage,
+/// and storage then returns up to 100 rows for each one the read keeps.
 pub(super) const READ_HISTORY_BATCHES_SQL: &str = "
     SELECT first_event_id, last_event_id, transition_seq, events_data, events_parts,
         principals_data, principals_parts
     FROM history_batch
-    WHERE run_key = $1 AND NOT EXISTS (SELECT 1 FROM run_preparation WHERE target_run_key = history_batch.run_key AND phase < 4) AND last_event_id > $2
+    WHERE run_key = $1 AND NOT EXISTS (SELECT 1 FROM run_preparation WHERE target_run_key = $1 AND phase < 4) AND last_event_id > $2
     ORDER BY first_event_id ASC
     LIMIT $3";
 
@@ -70,21 +78,24 @@ const HISTORY_BATCH_PAGE: usize = 64;
 /// `(run_key, first_event_id)` serves it as a backward scan that starts at the
 /// event's id and stops at the first row (`activity-inputs-from-history` criterion
 /// 2.3). [`READ_HISTORY_BATCHES_SQL`] can't stand in: no index covers its
-/// `last_event_id` filter, so it walks the run's batches from the first.
+/// `last_event_id` filter, so it walks the run's batches from the first. The
+/// preparation check names the bound run key so that the limit reaches storage,
+/// as [`READ_HISTORY_BATCHES_SQL`] explains.
 pub(super) const READ_HISTORY_EVENT_BATCH_SQL: &str = "
     SELECT first_event_id, last_event_id, transition_seq, events_data, events_parts,
         principals_data, principals_parts
     FROM history_batch
-    WHERE run_key = $1 AND NOT EXISTS (SELECT 1 FROM run_preparation WHERE target_run_key = history_batch.run_key AND phase < 4) AND first_event_id <= $2
+    WHERE run_key = $1 AND NOT EXISTS (SELECT 1 FROM run_preparation WHERE target_run_key = $1 AND phase < 4) AND first_event_id <= $2
     ORDER BY first_event_id DESC
     LIMIT 1";
 
-/// Every history batch of a run, in order, each a [`StoredBatchRow`].
+/// Every history batch of a run, in order, each a [`StoredBatchRow`]. Its
+/// preparation check names the bound run key, as the bounded reads' must.
 pub(super) const READ_ALL_HISTORY_BATCHES_SQL: &str = "
     SELECT first_event_id, last_event_id, transition_seq, events_data, events_parts,
         principals_data, principals_parts
     FROM history_batch
-    WHERE run_key = $1 AND NOT EXISTS (SELECT 1 FROM run_preparation WHERE target_run_key = history_batch.run_key AND phase < 4)
+    WHERE run_key = $1 AND NOT EXISTS (SELECT 1 FROM run_preparation WHERE target_run_key = $1 AND phase < 4)
     ORDER BY first_event_id ASC";
 
 /// One of the reads of a run's history batches.

@@ -68,7 +68,7 @@ The edge's last event id SHALL equal the run state's `last_event_id`, and each r
 ### Storage (`tokeira-storage`)
 
 - `RunRepository::read_history_to_end(run_key, after_event_id)` and `read_attributed_history_to_end(run_key, after_event_id)` are default methods. They call `read_history` or `read_attributed_history` with pages of `HISTORY_READ_PAGE` (1,024) events, each after the previous page's last event, until a short page. Wrappers and test doubles inherit them.
-- DSQL removes `effective_history_limit` and `DEFAULT_HISTORY_PAGE_SIZE`. `do_read_attributed_history` selects `WHERE run_key = $1 AND last_event_id > $2 ORDER BY first_event_id ASC LIMIT $3`, 64 batches a statement. It decodes them, keeping events after `after_event_id`, and repeats after the last batch's `last_event_id` until it holds `limit` events or a statement returns fewer than 64 batches.
+- DSQL removes `effective_history_limit` and `DEFAULT_HISTORY_PAGE_SIZE`. `do_read_attributed_history` selects `WHERE run_key = $1 AND NOT EXISTS (SELECT 1 FROM run_preparation WHERE target_run_key = $1 AND phase < 4) AND last_event_id > $2 ORDER BY first_event_id ASC LIMIT $3`, 64 batches a statement. The `NOT EXISTS` hides a run an unpublished preparation is still staging, and names the bound run key so that the limit reaches storage (`activity-inputs-from-history` design). It decodes them, keeping events after `after_event_id`, and repeats after the last batch's `last_event_id` until it holds `limit` events or a statement returns fewer than 64 batches.
 - The in-memory repository already meets 2.1 and is unchanged.
 
 ### Edge (`tokeira-edge`)
@@ -100,6 +100,7 @@ Poll responses still carry the whole history in one message, where v1.31.0 sends
 ### Exploratory Bug Condition Checking
 
 - A DSQL unit test asserts that the batch statement carries a `LIMIT`, and the test that pinned `effective_history_limit(usize::MAX)` to 1,000 goes with the function.
+- A DSQL unit test asserts that every history read checks preparation against the bound run key, and the live lookup-plan test asserts that a page's limit reaches storage.
 - On live DSQL, when a cluster is available: a run with more than 1,000 events reads completely through both history calls.
 
 ### Property-Based Tests

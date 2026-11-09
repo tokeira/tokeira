@@ -460,7 +460,14 @@ async fn outbound_live_successor_reservation_and_interrupted_publication() -> Re
         repo.load_run(source.run_key).await?,
         LoadedRun::Existing(closed)
     );
+    // Staging wrote the new run's history; the reads hide it until publication.
+    let staged: i64 = sqlx::query_scalar("SELECT count(*) FROM history_batch WHERE run_key = $1")
+        .bind(request.run_key.0)
+        .fetch_one(&fixture.pool)
+        .await?;
+    assert!(staged > 0);
     assert!(repo.read_history(request.run_key, 0, 100).await?.is_empty());
+    assert_eq!(repo.read_history_event(request.run_key, 1).await?, None);
     assert_eq!(
         repo.prepare_run_publication(Box::new(manifest), WriteFence::Unfenced)
             .await?,

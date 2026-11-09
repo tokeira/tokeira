@@ -1,6 +1,6 @@
 //! The shared history-event read contracts (`activity-inputs-from-history`)
 //! against an operator-owned ephemeral Aurora DSQL cluster; the lookup's plan on
-//! a run of thousands of batches; and the dispatch rows and backlog entries an
+//! a run of thousands of batches, and the paged read's; and the dispatch rows and backlog entries an
 //! earlier release wrote with an activity's input. No connection occurs unless
 //! the dedicated test URL is provided.
 
@@ -8,7 +8,11 @@ use sqlx::QueryBuilder;
 use tokeira_kernel::{ActivityOp, DispatchOp, HistoryEvent, HistoryEventKind};
 use tokeira_types::{Payload, Payloads};
 
-use super::{bulk_write_tests::Fixture, load::READ_HISTORY_EVENT_BATCH_SQL, *};
+use super::{
+    bulk_write_tests::Fixture,
+    load::{READ_HISTORY_BATCHES_SQL, READ_HISTORY_EVENT_BATCH_SQL},
+    *,
+};
 use crate::{
     BacklogEntry, BacklogPayload, DeliveryOrder,
     bulk_write_tests::{commit, noise, timer, with_events},
@@ -40,11 +44,14 @@ async fn dsql_history_event_read_from_a_reset_successors_copied_batches() -> Res
 /// Batches the plan's run holds, and events in each.
 const PLAN_BATCHES: i64 = 5_000;
 const PLAN_EVENTS_PER_BATCH: i64 = 3;
+/// Batches in a page of the plan's paged read.
+const PLAN_PAGE: i64 = 4;
 
 /// On a run of 5,000 batches, the lookup reads the batch that holds an event near
 /// the end, and one near the start, with a backward scan of the primary key that
 /// starts at the event's id: both key columns in its index condition, no sort,
-/// and the limit pushed down to storage, which returns one row.
+/// and the limit pushed down to storage, which returns one row. The paged read's
+/// limit reaches storage too, which returns one page.
 #[tokio::test]
 async fn dsql_history_event_lookup_plan() -> Result<()> {
     let Some(fixture) = Fixture::connect().await? else {
@@ -134,6 +141,42 @@ async fn dsql_history_event_lookup_plan() -> Result<()> {
             report.push_str(line);
             report.push('\n');
         }
+    }
+    // A page from the run's first batch. The table holds this run alone, so a
+    // cursor near its end makes a full scan and a sort look cheaper than the
+    // primary key, and no limit passes a sort; that choice is the test's, not
+    // the preparation check's.
+    let mut explain = QueryBuilder::<sqlx::Postgres>::new("EXPLAIN ANALYZE ");
+    explain.push(READ_HISTORY_BATCHES_SQL);
+    let plan = explain
+        .build_query_as::<(String,)>()
+        .bind(run_key.0)
+        .bind(0_i64)
+        .bind(PLAN_PAGE)
+        .fetch_all(&fixture.pool)
+        .await?;
+    let lines = plan.iter().map(|(line,)| line.as_str()).collect::<Vec<_>>();
+    assert!(
+        !lines.iter().any(|line| line.contains("Anti Join")),
+        "the preparation check is no join: {lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.trim() == format!("Limit: {PLAN_PAGE}")),
+        "the limit pushed down to storage: {lines:#?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("Storage Scan")
+            && line.contains(&format!("actual rows={PLAN_PAGE} "))),
+        "storage returns one page: {lines:#?}"
+    );
+    report.push_str(&format!(
+        "The first page of {PLAN_PAGE} batches of a run of {PLAN_BATCHES} batches:\n"
+    ));
+    for line in lines {
+        report.push_str(line);
+        report.push('\n');
     }
     if let Some(path) = std::env::var_os("TOKEIRA_HISTORY_EVENT_PLAN_OUTPUT") {
         std::fs::write(path, report)?;

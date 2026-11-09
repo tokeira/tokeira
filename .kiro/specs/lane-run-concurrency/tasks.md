@@ -15,46 +15,58 @@ multi-thread Tokio runtime. No test sleeps.
 
 ## Tasks
 
-- [ ] 1. The pure per-run queue core
-  - [ ] 1.1 Property test: Property 5 — reservation accounting is exact and refusals don't wait
+- [x] 1. The pure per-run queue core
+  - [x] 1.1 Property test: Property 5 — reservation accounting is exact and refusals don't wait
     - In `crates/tokeira-runtime/src/lane/run_queues.rs`, generate operation sequences over a few run keys
       and small `L`; compare claims, per-run claims and refusal kinds with a reference model.
     - Tag: `// Feature: lane-run-concurrency, Property 5: Reservation accounting is exact and refusals don't wait`
     - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7_
-  - [ ] 1.2 Property test: Property 6 — ready order and the drain bound
+    - **DONE.** `reservation_accounting_is_exact` in `lane/run_queues.rs`.
+  - [x] 1.2 Property test: Property 6 — ready order and the drain bound
     - Same module and generator; assert a run is ready at most once and never while active, FIFO ready order,
       and re-entry at the back after `finish` with a non-empty queue.
     - Tag: `// Feature: lane-run-concurrency, Property 6: Ready order and the drain bound`
     - _Requirements: 1.3, 1.5, 2.3_
-  - [ ] 1.3 Implement `RunQueues<T>` and `LaneRefusal`
+    - **DONE.** `ready_order_and_drain_bound` in `lane/run_queues.rs`.
+  - [x] 1.3 Implement `RunQueues<T>` and `LaneRefusal`
     - `L` is the lane's existing mailbox capacity, named once as a constant; `R = L / 2`. Check the run share
       before the lane budget. Remove an entry once it is idle with no claims and an empty queue.
     - _Requirements: 1.2, 1.5, 2.3, 6.1, 6.2, 6.5, 6.6, 6.7, 6.11_
+    - **DONE.** `RunQueues` with `LANE_BUDGET = 1024` and the run share `L / 2`; `drain_all` serves a lane
+      whose dispatcher has gone (`drain_all_returns_every_queued_item_and_its_claims`).
 
-- [ ] 2. Refusal errors and their wire mapping
-  - [ ] 2.1 Edge tests for both refusals
+- [x] 2. Refusal errors and their wire mapping
+  - [x] 2.1 Edge tests for both refusals
     - One example per refusal asserting gRPC RESOURCE_EXHAUSTED, the `ResourceExhaustedFailure` cause and
       scope, the busy-workflow message `Workflow is busy.`, and HTTP 429.
     - _Requirements: 6.8, 6.9_
-  - [ ] 2.2 Add `WorkflowBusy` and `LaneOverloaded`
+    - **DONE.** `a_busy_run_answers_v1_31_0s_busy_workflow` and
+      `an_overloaded_lane_answers_the_system_overloaded_shape` in `grpc/errors.rs`.
+  - [x] 2.2 Add `WorkflowBusy` and `LaneOverloaded`
     - In `crates/tokeira-runtime/src/errors.rs`, with `From<LaneRefusal>`, citing `service/history/consts/const.go @ v1.31.0`
       and `common/cache/lru.go @ v1.31.0`. Map them in `crates/tokeira-edge/src/errors.rs` and
       `crates/tokeira-edge/src/grpc/errors.rs` through the existing `resource_exhausted_status` helper.
     - _Requirements: 6.3, 6.4, 6.8, 6.9, 10.2_
+    - **DONE.** Runtime errors with `From<LaneRefusal> for anyhow::Error`; `EdgeError::WorkflowBusy` and
+      `EdgeError::LaneOverloaded` map through `resource_exhausted_status` and answer HTTP 429.
 
-- [ ] 3. The lane on per-run queues
-  - [ ] 3.1 Rewrite the lane's overload regression tests
+- [x] 3. The lane on per-run queues
+  - [x] 3.1 Rewrite the lane's overload regression tests
     - Rewrite `lane_drains_full_mailbox_with_parked_submitters_in_arrival_order` to fill the lane budget, then
       expect `LaneOverloaded` from the next submit and every admitted reply in arrival order. Add a test that a
       submit past a run's share returns `WorkflowBusy` on its first poll.
     - _Requirements: 1.2, 6.3, 6.4, 6.5_
-  - [ ] 3.2 Property test: Property 1 — per-run order holds under concurrency
+    - **DONE.** `a_full_lane_refuses_at_once_and_drains_in_arrival_order` replaces the parked-submitter test;
+      `a_submit_past_its_runs_share_is_refused_on_its_first_poll`.
+  - [x] 3.2 Property test: Property 1 — per-run order holds under concurrency
     - In `crates/tokeira-runtime/src/lane/tests/concurrency.rs`, use the in-memory store behind a test-only
       gated repository that parks chosen runs' commits and records kernel entry and exit per run. Generate
       runs, interleavings and parked commits; assert one activation per run and arrival order per run.
     - Tag: `// Feature: lane-run-concurrency, Property 1: Per-run order holds under concurrency`
     - _Requirements: 1.1, 1.2, 1.7, 4.2_
-  - [ ] 3.3 Implement `LaneShared`, `SubmitReservation`, `LaneItem` and the dispatcher
+    - **DONE.** `per_run_order_holds_under_concurrency` in `lane/tests/concurrency.rs`, on the lane test
+      repository with per-run commit gates and an overlap detector.
+  - [x] 3.3 Implement `LaneShared`, `SubmitReservation`, `LaneItem` and the dispatcher
     - The dispatcher wakes on a capacity-one channel whose closing tells it every handle is gone. It acquires
       a slot from a semaphore the lane is given, pops the first ready run, and spawns its activation into a
       `JoinSet`; on join it calls `finish`. In this PR each lane gets its own one-slot semaphore, which keeps
@@ -66,40 +78,58 @@ multi-thread Tokio runtime. No test sleeps.
     - Remove the carry-over slot and the identity and metadata channels. Keep the module doc's rule that the
       lane never sends to its own input.
     - _Requirements: 1.1–1.7, 2.4, 3.5, 3.6, 3.8, 4.1–4.7, 6.5, 6.6, 6.7, 8.1, 8.3_
-  - [ ] 3.4 Reserve the start's parked poll after the slot
+    - **DONE.** The lane state is one mutex over `RunQueues<LaneItem>` and the cache. Activations reach the
+      cache through `CacheAccess`, which remembers the generation of its own image, so the check before a
+      commit reloads however the shared cache was cleared. Identity lookups synchronise the generation and
+      install only when the cache did not change during their load.
+  - [x] 3.4 Reserve the start's parked poll after the slot
     - Keep `a_parked_poll_stays_free_while_its_start_waits_in_the_lane_queue` and the other reserved-poll tests
       green; add a case where the start waits for a slot.
     - _Requirements: 4.3_
+    - **DONE.** `a_start_reserves_its_parked_poll_only_once_it_holds_a_slot`.
 
-- [ ] 4. Internal submitters treat a refusal as transient
-  - [ ] 4.1 Tests per internal submitter
+- [x] 4. Internal submitters treat a refusal as transient
+  - [x] 4.1 Tests per internal submitter
     - For the timer, workflow-timeout, workflow-task-timeout, activity-timeout, Nexus-timeout and
       completion-callback scanners, recovery, the publisher's `submit_to_run`, and the outbound driver
       (`submit_outbound`, `submit_observed`, `commit_outbound_metadata`): with the target run at its share,
       the work is still delivered once the run drains.
     - _Requirements: 6.10, 8.5_
-  - [ ] 4.2 Make any submitter that drops refused work retry from its durable source
+    - **DONE.** `a_refused_due_timer_keeps_its_row` (timer scanner and recovery),
+      `a_refused_workflow_timeout_is_delivered_on_a_later_pass`, `a_refused_workflow_task_timeout_stays_tracked`,
+      `a_refused_activity_timeout_is_delivered_once_the_run_has_room` and
+      `a_refused_nexus_timeout_is_delivered_once_the_run_has_room`. The outbound driver retries any error that is
+      not a recovery classification, as its injected-failure tests pin; the completion-callback attempt leaves
+      its tracking entry for the scanner on any commit error.
+  - [x] 4.2 Make any submitter that drops refused work retry from its durable source
     - Cite `Nack`, `service/history/queues/executable.go @ v1.31.0` where the retry needs a reason.
     - _Requirements: 6.10, 8.5_
+    - **DONE.** No submitter drops refused work: each keeps its durable row or tracked entry for a later
+      pass. The publisher's `submit_to_run` has no caller.
 
-- [ ] 5. Admission before reads on the signal path
-  - [ ] 5.1 Property test: Property 8 — a refused signal reads only its run key
+- [x] 5. Admission before reads on the signal path
+  - [x] 5.1 Property test: Property 8 — a refused signal reads only its run key
     - Use a counting repository wrapper that records every read by kind; fill the target lane, or the run's
       share, with reservations; generate signals with and without a run id; assert the refusal and the reads.
       Cover early returns (duplicate, closing workflow, missing run) releasing their claim.
     - Tag: `// Feature: lane-run-concurrency, Property 8: A refused signal reads only its run key`
     - _Requirements: 7.1, 7.2, 7.3, 7.4_
-  - [ ] 5.2 Reserve before `execution_for_run`
+    - **DONE.** `a_refused_signal_reads_only_its_run_key` in `runtime/signal_admission_tests.rs`;
+      `signal_path_refuses_a_run_at_its_share_at_once` in the edge.
+  - [x] 5.2 Reserve before `execution_for_run`
     - Add `TokeiraRuntime::reserve_submit`. `RuntimeAdapter::signal_workflow` reserves first and passes the
       reservation through `signal_workflow` and `signal_run` to `submit_admitted`, which spends it. If the
       runtime resolves a different run key, drop the reservation and reserve for the resolved key.
     - _Requirements: 7.1, 7.2, 7.3, 7.4_
+    - **DONE.** The adapter reserves, then calls `TokeiraRuntime::signal_workflow_reserved`;
+      `signal_workflow` keeps its signature and reserves in `signal_run` once the run key resolves.
 
-- [ ] 6. Checkpoint: first PR green
+- [x] 6. Checkpoint: first PR green
   - `cargo +nightly fmt --all`; `cargo clippy -p tokeira-runtime --all-targets --locked -- -D warnings`, and
     the same for `tokeira-edge`; the lane, signal-path and edge tests above under `cargo nextest run`.
   - Add one `changed` changelog fragment: an overloaded lane or run answers RESOURCE_EXHAUSTED at once instead
     of making the caller wait.
+  - **DONE.** Both crates clippy-clean; the runtime and edge suites pass under nextest.
 
 - [ ] 7. The commit ceiling
   - [ ] 7.1 Tests for the ceiling

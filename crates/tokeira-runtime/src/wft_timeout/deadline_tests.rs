@@ -367,3 +367,35 @@ async fn loop_does_not_lose_an_insert_during_submission() {
     .await
     .expect("an insert during scanning must reach the next pass");
 }
+
+// A lane refusal is transient: the timeout stays tracked for the next pass.
+#[tokio::test]
+async fn a_refused_workflow_task_timeout_stays_tracked() {
+    let (tracking, _) = active_tracking();
+    let now = fixed_now();
+    let entry = sample_entry(RunKey::new(), now - Duration::seconds(10));
+    tracking.insert(entry.clone());
+    for refusal in [
+        anyhow::Error::new(crate::WorkflowBusy),
+        anyhow::Error::new(crate::LaneOverloaded),
+    ] {
+        let refusal = std::sync::Mutex::new(Some(refusal));
+        tracking.start_scan(now);
+        scan_wft_timeouts_at(
+            &tracking,
+            Some(ShardId(0)),
+            &WftTimeoutScannerConfig::default(),
+            now,
+            |_, _| {
+                let error = refusal
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("one submission per pass");
+                async move { Err(error) }
+            },
+        )
+        .await;
+        assert_eq!(tracking.snapshot(), vec![entry.clone()]);
+    }
+}

@@ -81,7 +81,9 @@ pub(crate) struct Repo {
     repair_fences: Mutex<Vec<WriteFence>>,
     pub(super) loads: AtomicUsize,
     pub(super) commit_conflicts: AtomicUsize,
-    stats_loads: AtomicUsize,
+    pub(super) stats_loads: AtomicUsize,
+    pub(super) resolutions: AtomicUsize,
+    pub(super) dedupe_lookups: AtomicUsize,
     legacy_delivery_calls: AtomicUsize,
     discovery_gate: Mutex<Option<Arc<discovery_scheduler_tests::Gate>>>,
     preparation_retries: AtomicUsize,
@@ -782,6 +784,7 @@ impl RunRepository for Repo {
     }
 
     async fn resolve_execution(&self, execution: &ExecutionRef) -> Result<Option<RunKey>> {
+        self.resolutions.fetch_add(1, Ordering::SeqCst);
         self.inner.resolve_execution(execution).await
     }
 
@@ -838,6 +841,7 @@ impl RunRepository for Repo {
         execution: &ExecutionRef,
         request_id: &RequestId,
     ) -> Result<Option<RequestRecord>> {
+        self.dedupe_lookups.fetch_add(1, Ordering::SeqCst);
         self.inner
             .lookup_request_dedupe(execution, request_id)
             .await

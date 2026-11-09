@@ -54,7 +54,7 @@ use crate::{
     },
     fairness::{DeliveryMetrics, FairnessState, run_control_loop},
     heartbeat::{InMemoryHeartbeatStore, spawn_heartbeat_maintenance},
-    lane::{LaneConfig, LaneHandle, spawn_lane_with_id},
+    lane::{LaneConfig, LaneHandle, SubmitReservation, spawn_lane_with_id},
     membership::{
         ConnectionBudgetApplier, HeartbeatInputs, MembershipClient, MembershipConfig,
         MembershipShardLifecycle,
@@ -132,6 +132,8 @@ mod queue_home_delivery_exploration_tests;
 #[cfg(test)]
 pub(crate) mod repair_tests;
 mod reset;
+#[cfg(test)]
+mod signal_admission_tests;
 #[cfg(test)]
 mod successor_semantics_tests;
 #[cfg(test)]
@@ -900,6 +902,9 @@ where
                     close_attempt_tracking.clone(),
                     config.clone(),
                     clock.clone(),
+                    // One slot per lane: each lane runs one activation at a
+                    // time, so a node runs at most one per lane.
+                    Arc::new(tokio::sync::Semaphore::new(1)),
                 )
             })
             .collect();

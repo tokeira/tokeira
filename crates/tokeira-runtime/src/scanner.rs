@@ -627,6 +627,24 @@ mod tests {
     use tokeira_types::RunKey;
     use uuid::Uuid;
 
+    // A lane refusal is transient: the due timer's row stays for a later pass.
+    #[tokio::test]
+    async fn a_refused_due_timer_keeps_its_row() {
+        let repo = tokeira_storage::InMemoryStore::default();
+        let due = DueTimer {
+            run_key: RunKey::new(),
+            timer_id: "timer".into(),
+            fire_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        for refusal in [
+            anyhow::Error::new(crate::WorkflowBusy),
+            anyhow::Error::new(crate::LaneOverloaded),
+        ] {
+            assert!(rejected_because_run_is_gone(&refusal).is_none());
+            assert!(!settle_failed_due_timer(&repo, None, &due, &refusal).await);
+        }
+    }
+
     // A timer rejected because its run is missing keeps that reason, so storage
     // can keep the row of a run still being materialized (`bounded-bulk-writes`).
     #[test]

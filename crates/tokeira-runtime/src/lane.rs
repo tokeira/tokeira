@@ -1,13 +1,22 @@
-//! Serial command execution lanes.
+//! Command execution lanes.
 //!
 //! A lane is the serialization boundary for all state mutations on a run.
 //! Every command — signal, timer fire, activity resolution, WFT completion —
-//! enters through a lane's bounded channel and is processed one at a time.
-//! This eliminates the need for per-run locking: the lane *is* the lock.
+//! enters its run's queue on the run's lane, and the lane applies each run's
+//! commands one at a time in the order it accepted them. This eliminates the
+//! need for per-run locking: the lane *is* the lock.
 //!
-//! Commands run in arrival order. A lane never sends to its own channel: when
-//! the channel is full, such a send waits for a slot that only the lane itself
-//! can free, and the lane stops for good.
+//! Admission is bounded and never waits. A lane holds at most 1024
+//! accepted-but-unstarted commands, and a run at most half of that. Past either
+//! bound a submit is refused at once with v1.31.0's matching overload shape
+//! (`service/history/consts/const.go`, `common/cache/lru.go @ v1.31.0`).
+//! Internal submitters treat a refusal as transient and retry from their
+//! durable source.
+//!
+//! A lane never sends to its own input: nothing in the lane submits to the
+//! lane, so a full lane can always drain. A lane's dispatcher starts one
+//! activation at a time, for the first ready run, and an activation takes only
+//! its own run's commands.
 //!
 //! A close and its successor are applied separately by the pure kernel, then
 //! committed together. A recognized size refusal instead atomically reserves a
@@ -39,9 +48,14 @@ use tokeira_storage::{CommitResult, PairCommitResult, RunRepository, metrics as 
 use tokeira_types::{
     NamespaceId, QueueKey, RunKey, ShardId, TaskKind, WorkflowId, execution_home_bundle,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+mod run_queues;
+
+pub(crate) use run_queues::LaneRefusal;
+use run_queues::{LANE_BUDGET, RunQueues};
 
 use crate::{
     UpdateRegistry, UpdateResolution,
@@ -150,20 +164,26 @@ pub trait DispatchPublisher: Send + Sync {
     }
 }
 
-/// A lane is a single serial command processor.
+/// A handle to one lane: it admits commands into the lane's per-run queues.
 ///
 /// Insight: lanes are *execution locality* devices. They reduce lock pressure
 /// and make it obvious which piece of code serializes commands for a run, but
 /// they do not define correctness. If a run moves between lanes later, the run's
 /// durable state remains the source of truth.
+///
+/// Every submit takes a [`SubmitReservation`] first, which never waits: a lane
+/// at its bounds refuses at once with [`WorkflowBusy`](crate::WorkflowBusy) or
+/// [`LaneOverloaded`](crate::LaneOverloaded), and the caller backs off.
 #[derive(Clone, Debug)]
 pub struct LaneHandle {
     lane_id: usize,
     /// Retry budget shared by command execution and outbound metadata updates.
     pub(crate) max_occ_retries: u32,
-    tx: mpsc::Sender<LaneMessage>,
-    identity_tx: mpsc::Sender<IdentityRequest>,
-    metadata_tx: mpsc::Sender<OutboundMetadataRequest>,
+    shared: Arc<LaneShared>,
+    /// Wakes the dispatcher when a run becomes ready. Only handles and
+    /// reservations hold a sender, so the dispatcher learns that the lane is
+    /// closing when the last one is gone.
+    wake: mpsc::Sender<()>,
     #[cfg(test)]
     pub(crate) identity_requests: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -196,13 +216,176 @@ struct OutboundMetadataRequest {
     reply: oneshot::Sender<Result<CommitResult>>,
 }
 
+/// One unit of work in a run's queue. Outbound metadata commits share the
+/// run's queue so they apply in arrival order with the run's commands.
+enum LaneItem {
+    Command(LaneMessage),
+    OutboundMetadata(OutboundMetadataRequest),
+}
+
+impl std::fmt::Debug for LaneItem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Command(message) => formatter
+                .debug_struct("Command")
+                .field("run_key", &message.run_key)
+                .field("command", &command_type_name(&message.command))
+                .finish_non_exhaustive(),
+            Self::OutboundMetadata(request) => formatter
+                .debug_tuple("OutboundMetadata")
+                .field(request)
+                .finish(),
+        }
+    }
+}
+
+/// State shared by a lane's handles, its dispatcher and its activations.
+///
+/// One mutex covers the queues and the cache, so an identity lookup's install
+/// rule (no entry, no activation in flight, nothing changed since its read) is
+/// one atomic check and no lock order exists. The lock is never held across an
+/// await.
+struct LaneShared {
+    state: Mutex<LaneState>,
+    shard_owner: Arc<RwLock<ShardOwner>>,
+}
+
+struct LaneState {
+    queues: RunQueues<LaneItem>,
+    cache: LaneCache,
+    /// Set when the dispatcher has gone, so a late submit drops its command and
+    /// its caller sees the lane closed instead of waiting forever.
+    closed: bool,
+}
+
+impl std::fmt::Debug for LaneShared {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("LaneShared").finish_non_exhaustive()
+    }
+}
+
+impl LaneShared {
+    fn new(config: &LaneConfig, shard_owner: Arc<RwLock<ShardOwner>>) -> Self {
+        Self {
+            state: Mutex::new(LaneState {
+                queues: RunQueues::new(LANE_BUDGET),
+                cache: LaneCache::new(config),
+                closed: false,
+            }),
+            shard_owner,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LaneState> {
+        self.state.lock().expect("lane state lock poisoned")
+    }
+
+    fn owner_generation(&self) -> u64 {
+        self.shard_owner
+            .read()
+            .expect("shard owner lock poisoned")
+            .cache_generation()
+    }
+
+    fn take_next(&self, run_key: RunKey) -> Option<LaneItem> {
+        self.lock().queues.take_next(run_key)
+    }
+}
+
+/// A claim on one place in a lane's budget and in its run's share, taken
+/// before the caller builds its command so that a refusal costs nothing.
+///
+/// Spending it with a command moves the claim onto the queued command, which
+/// gives it back when the command starts. Dropping it unspent, on any early
+/// return, gives it back at once.
 #[derive(Debug)]
-struct IdentityRequest {
+pub struct SubmitReservation {
+    shared: Arc<LaneShared>,
+    wake: mpsc::Sender<()>,
+    lane_id: usize,
     run_key: RunKey,
-    reply: oneshot::Sender<Result<(NamespaceId, WorkflowId)>>,
+    spent: bool,
+}
+
+impl SubmitReservation {
+    /// The run this reservation admits a command for.
+    pub fn run_key(&self) -> RunKey {
+        self.run_key
+    }
+
+    fn enqueue(mut self, item: LaneItem) {
+        self.spent = true;
+        let mut state = self.shared.lock();
+        if state.closed {
+            state.queues.release(self.run_key);
+            drop(state);
+            // Dropping the item drops its reply sender: the caller sees the
+            // lane closed, as a send to a closed channel would have shown.
+            drop(item);
+            return;
+        }
+        let became_ready = state.queues.enqueue(self.run_key, item);
+        drop(state);
+        if became_ready {
+            // Capacity one is enough: a pending wake already makes the
+            // dispatcher look at the ready order, which holds this run.
+            let _ = self.wake.try_send(());
+        }
+    }
+
+    /// Spend the reservation on `command` and wait for its commit result.
+    pub(crate) async fn submit(
+        self,
+        command: Command,
+        reserve_poller: bool,
+    ) -> Result<CommitResult> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut message = LaneMessage::new(self.lane_id, self.run_key, command, reply_tx);
+        message.reserve_poller = reserve_poller;
+        self.enqueue(LaneItem::Command(message));
+        reply_rx.await?
+    }
+}
+
+impl Drop for SubmitReservation {
+    fn drop(&mut self) {
+        if !self.spent {
+            self.shared.lock().queues.release(self.run_key);
+        }
+    }
 }
 
 impl LaneHandle {
+    /// Claim room for one command for `run_key`, or refuse without waiting.
+    pub(crate) fn reserve(&self, run_key: RunKey) -> Result<SubmitReservation, LaneRefusal> {
+        self.shared.lock().queues.try_reserve(run_key)?;
+        Ok(SubmitReservation {
+            shared: self.shared.clone(),
+            wake: self.wake.clone(),
+            lane_id: self.lane_id,
+            run_key,
+            spent: false,
+        })
+    }
+
+    async fn send(
+        &self,
+        message: LaneMessage,
+        reply: oneshot::Receiver<Result<CommitResult>>,
+    ) -> Result<CommitResult> {
+        self.reserve(message.run_key)?
+            .enqueue(LaneItem::Command(message));
+        reply.await?
+    }
+
+    /// Enqueue a prepared message, or refuse it, without waiting.
+    #[cfg(test)]
+    fn try_enqueue(&self, message: LaneMessage) -> Result<(), LaneRefusal> {
+        self.reserve(message.run_key)?
+            .enqueue(LaneItem::Command(message));
+        Ok(())
+    }
+
     /// Serialize a source outcome or destination effect with its captured fence.
     pub(crate) async fn submit_outbound(
         &self,
@@ -213,8 +396,7 @@ impl LaneHandle {
         let (reply, received) = oneshot::channel();
         let mut message = LaneMessage::new(self.lane_id, run_key, command, reply);
         message.outbound = Some(submission);
-        self.tx.send(message).await?;
-        received.await?
+        self.send(message, received).await
     }
 
     /// Apply a state-dependent decision only to its original run image.
@@ -227,8 +409,7 @@ impl LaneHandle {
         let (reply, received) = oneshot::channel();
         let mut message = LaneMessage::new(self.lane_id, run_key, command, reply);
         message.observed = Some(observed);
-        self.tx.send(message).await?;
-        received.await?
+        self.send(message, received).await
     }
 
     /// Revalidate a scanner timeout against each state used by its fenced commit.
@@ -247,25 +428,26 @@ impl LaneHandle {
             reply,
         );
         message.activity_timeout = Some(check);
-        self.tx.send(message).await?;
-        received.await?
+        self.send(message, received).await
     }
 
     /// Persist runtime observations without inventing kernel commands or history.
     /// The caller's sequence fences all reads used to select these metadata.
+    ///
+    /// The commit joins its run's queue, so it applies in arrival order with
+    /// that run's commands and never alongside one of them.
     pub(crate) async fn commit_outbound_metadata(
         &self,
         transition: Box<tokeira_kernel::Transition>,
         attempt: crate::outbound::driver::Attempt,
     ) -> Result<CommitResult> {
         let (reply, received) = oneshot::channel();
-        self.metadata_tx
-            .send(OutboundMetadataRequest {
+        self.reserve(transition.next_state.run_key)?
+            .enqueue(LaneItem::OutboundMetadata(OutboundMetadataRequest {
                 transition,
                 attempt,
                 reply,
-            })
-            .await?;
+            }));
         received.await?
     }
     /// Carry runtime reads alongside a close, without adding I/O or plans to the kernel.
@@ -278,15 +460,14 @@ impl LaneHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         let mut message = LaneMessage::new(self.lane_id, run_key, command, reply_tx);
         message.successor_plan = successor_plan;
-        self.tx.send(message).await?;
-        reply_rx.await?
+        self.send(message, reply_rx).await
     }
     /// Submit a command for `run_key` and wait for the
     /// commit result.
     ///
-    /// The command is serialized through the lane's
-    /// single-threaded executor, so callers never need
-    /// external locking on the run.
+    /// The lane runs the run's commands one at a time in arrival order, so
+    /// callers never need external locking on the run. A lane or run at its
+    /// bound refuses at once instead of making the caller wait.
     pub async fn submit(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
         self.submit_message(run_key, command, false).await
     }
@@ -309,35 +490,64 @@ impl LaneHandle {
         command: Command,
         reserve_poller: bool,
     ) -> Result<CommitResult> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let mut message = LaneMessage::new(self.lane_id, run_key, command, reply_tx);
-        message.reserve_poller = reserve_poller;
-        self.tx.send(message).await?;
-        reply_rx.await?
+        self.reserve(run_key)?.submit(command, reserve_poller).await
     }
 
-    /// Resolve routing identity from the lane's existing cache. A cold lookup
-    /// installs the ordinary load result so the following command reuses it.
-    pub(crate) async fn execution_identity(
+    /// Resolve routing identity from the lane's cache, or by a load in the
+    /// caller's task, so a lookup never waits for an activation.
+    ///
+    /// A cold load is installed for the following command only when it cannot
+    /// be staler than what the cache would otherwise hold: the cache is at the
+    /// generation the load was read under, nothing in the cache changed while
+    /// the load ran, the run has no entry, and no activation for the run is in
+    /// flight. Otherwise the load only answers this lookup.
+    pub(crate) async fn execution_identity<R: RunRepository + ?Sized>(
         &self,
         run_key: RunKey,
+        repo: &R,
     ) -> Result<(NamespaceId, WorkflowId)> {
         #[cfg(test)]
         self.identity_requests
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (reply, received) = oneshot::channel();
-        self.identity_tx
-            .send(IdentityRequest { run_key, reply })
-            .await?;
-        received.await?
+        // Images from before an ownership change are dropped before the
+        // lookup reads the cache, as an activation drops them.
+        let generation = self.shared.owner_generation();
+        let revision = {
+            let mut state = self.shared.lock();
+            state.cache.synchronize_to(generation);
+            if let Some(identity) = state.cache.get_with(run_key, loaded_execution_identity) {
+                return identity;
+            }
+            state.cache.revision
+        };
+        let loaded = tokeira_storage::read_probe::scope(
+            "execution-owner/admission-cache",
+            repo.load_run(run_key),
+        )
+        .await?;
+        let identity = loaded_execution_identity(&loaded);
+        let mut state = self.shared.lock();
+        if state.cache.generation == generation
+            && state.cache.revision == revision
+            && !state.queues.is_active(run_key)
+            && !state.cache.entries.contains_key(&run_key)
+        {
+            state.cache.insert(run_key, loaded);
+        }
+        identity
     }
 
-    /// Current number of queued lane messages waiting behind the bounded channel.
+    /// Commands accepted by this lane and not yet started.
     pub fn queued_depth(&self) -> usize {
-        self.tx.max_capacity().saturating_sub(self.tx.capacity())
+        self.shared.lock().queues.queued()
+    }
+
+    /// Claims held on this lane, queued or still being built.
+    #[cfg(test)]
+    pub(crate) fn reserved_claims(&self) -> usize {
+        self.shared.lock().queues.reserved()
     }
 }
-
 /// Only committed pairs and explicit size fallbacks can produce successor effects.
 enum SuccessorEffect {
     Committed(Box<CommittedSuccessor>),
@@ -404,6 +614,10 @@ struct LaneCache {
     entries: HashMap<RunKey, CachedRun>,
     order: VecDeque<RunKey>,
     generation: u64,
+    /// Bumped by every insert, eviction and clear. An identity lookup installs
+    /// its load only if this is unchanged since it missed, so a load that
+    /// raced an activation's commit can't replace the newer image.
+    revision: u64,
 }
 
 #[derive(Clone)]
@@ -420,25 +634,19 @@ impl LaneCache {
             entries: HashMap::new(),
             order: VecDeque::new(),
             generation: 0,
+            revision: 0,
         }
     }
 
-    fn synchronize_generation(&mut self, owner: &Arc<RwLock<ShardOwner>>) -> bool {
-        let generation = owner
-            .read()
-            .expect("shard owner lock poisoned")
-            .cache_generation();
+    fn synchronize_to(&mut self, generation: u64) -> bool {
         if self.generation == generation {
             return false;
         }
         self.entries.clear();
         self.order.clear();
         self.generation = generation;
+        self.revision += 1;
         true
-    }
-
-    fn get(&mut self, run_key: RunKey) -> Option<LoadedRun> {
-        self.get_with(run_key, Clone::clone)
     }
 
     // Admission needs only identity; it must not copy the whole cached state.
@@ -460,6 +668,7 @@ impl LaneCache {
             self.evict(run_key);
             return;
         }
+        self.revision += 1;
         if self.max_entries == 0 {
             return;
         }
@@ -477,6 +686,7 @@ impl LaneCache {
     }
 
     fn evict(&mut self, run_key: RunKey) {
+        self.revision += 1;
         self.entries.remove(&run_key);
         self.order.retain(|key| *key != run_key);
     }
@@ -491,6 +701,92 @@ impl LaneCache {
     }
 }
 
+/// The cache operations an activation makes.
+///
+/// A lane's activations run in their own tasks while identity lookups read the
+/// same cache from callers' tasks, so a lane's activation goes through
+/// [`CacheAccess`], which locks the lane state for each operation and never
+/// across an await. Tests drive a bare [`LaneCache`].
+trait ActivationCache: Send {
+    /// Clear the cache if the shard owner's generation moved since the last
+    /// call, returning whether this call cleared it.
+    fn synchronize_generation(&mut self, owner: &Arc<RwLock<ShardOwner>>) -> bool;
+    fn get(&mut self, run_key: RunKey) -> Option<LoadedRun>;
+    fn insert(&mut self, run_key: RunKey, loaded: LoadedRun);
+    fn evict(&mut self, run_key: RunKey);
+}
+
+impl ActivationCache for LaneCache {
+    fn synchronize_generation(&mut self, owner: &Arc<RwLock<ShardOwner>>) -> bool {
+        let generation = owner
+            .read()
+            .expect("shard owner lock poisoned")
+            .cache_generation();
+        self.synchronize_to(generation)
+    }
+
+    fn get(&mut self, run_key: RunKey) -> Option<LoadedRun> {
+        self.get_with(run_key, Clone::clone)
+    }
+
+    fn insert(&mut self, run_key: RunKey, loaded: LoadedRun) {
+        LaneCache::insert(self, run_key, loaded);
+    }
+
+    fn evict(&mut self, run_key: RunKey) {
+        LaneCache::evict(self, run_key);
+    }
+}
+
+/// An activation's view of its lane's shared cache.
+///
+/// It remembers the generation it last synchronized to, which is the
+/// generation of the image the activation is working from. Identity lookups
+/// in callers' tasks also synchronize the shared cache, so whether *this*
+/// call cleared it says nothing about this activation's image; comparing with
+/// the remembered generation does.
+struct CacheAccess<'a> {
+    shared: &'a LaneShared,
+    generation: Option<u64>,
+}
+
+impl<'a> CacheAccess<'a> {
+    fn new(shared: &'a LaneShared) -> Self {
+        Self {
+            shared,
+            generation: None,
+        }
+    }
+}
+
+impl ActivationCache for CacheAccess<'_> {
+    /// Returns whether the generation moved since this activation's previous
+    /// call, so the check before a commit reloads an image read under an
+    /// older generation however the shared cache was cleared.
+    fn synchronize_generation(&mut self, owner: &Arc<RwLock<ShardOwner>>) -> bool {
+        let generation = owner
+            .read()
+            .expect("shard owner lock poisoned")
+            .cache_generation();
+        self.shared.lock().cache.synchronize_to(generation);
+        self.generation
+            .replace(generation)
+            .is_some_and(|seen| seen != generation)
+    }
+
+    fn get(&mut self, run_key: RunKey) -> Option<LoadedRun> {
+        self.shared.lock().cache.get_with(run_key, Clone::clone)
+    }
+
+    fn insert(&mut self, run_key: RunKey, loaded: LoadedRun) {
+        self.shared.lock().cache.insert(run_key, loaded);
+    }
+
+    fn evict(&mut self, run_key: RunKey) {
+        self.shared.lock().cache.evict(run_key);
+    }
+}
+
 fn loaded_execution_identity(loaded: &LoadedRun) -> Result<(NamespaceId, WorkflowId)> {
     match loaded {
         LoadedRun::Existing(state) => Ok((state.namespace_id, state.workflow_id.clone())),
@@ -500,40 +796,10 @@ fn loaded_execution_identity(loaded: &LoadedRun) -> Result<(NamespaceId, Workflo
     }
 }
 
-async fn resolve_identity_request<R: RunRepository>(
-    repo: &R,
-    owner: &Arc<RwLock<ShardOwner>>,
-    cache: &mut LaneCache,
-    request: IdentityRequest,
-) {
-    if request.reply.is_closed() {
-        return;
-    }
-    cache.synchronize_generation(owner);
-    let result = async {
-        match cache.get_with(request.run_key, loaded_execution_identity) {
-            Some(identity) => identity,
-            None => {
-                let loaded = tokeira_storage::read_probe::scope(
-                    "execution-owner/admission-cache",
-                    repo.load_run(request.run_key),
-                )
-                .await?;
-                let identity = loaded_execution_identity(&loaded);
-                cache.insert(request.run_key, loaded);
-                identity
-            }
-        }
-    }
-    .await;
-    let _ = request.reply.send(result);
-}
-
 /// Spawn a new lane executor as a background Tokio task.
 ///
-/// Each lane owns a bounded channel and processes commands
-/// serially. Commands for the same run are coalesced within
-/// a single activation up to
+/// Each lane keeps a bounded queue per run and runs one activation at a time.
+/// Commands for the same run are coalesced within a single activation up to
 /// [`LaneConfig::max_drain_per_activation`].
 ///
 /// Returns a [`LaneHandle`] that callers use to submit
@@ -569,9 +835,35 @@ where
         Arc::new(Mutex::new(HashSet::new())),
         config,
         system_clock(),
+        Arc::new(Semaphore::new(1)),
     )
 }
 
+/// Everything an activation needs, built once per lane and shared by its
+/// activation tasks.
+struct LaneContext<K, R, P> {
+    lane_id: usize,
+    kernel: K,
+    repo: R,
+    publisher: P,
+    shard_owner: Arc<RwLock<ShardOwner>>,
+    activity_tracking: crate::activity_timeout::ActivityTrackingState,
+    workflow_timeout_tracking: crate::timeout::WorkflowTimeoutTrackingState,
+    wft_timeout_tracking: crate::wft_timeout::WftTimeoutTrackingState,
+    nexus_timeout_tracking: crate::nexus::NexusTimeoutTrackingState,
+    update_registry: UpdateRegistry,
+    close_attempt_tracking: Arc<Mutex<HashSet<RunKey>>>,
+    config: LaneConfig,
+    clock: Arc<dyn Clock>,
+    shared: Arc<LaneShared>,
+}
+
+/// Spawn lane `lane_id`, whose activations each hold one of `slots`.
+///
+/// The lane never sends to its own input: nothing in the lane submits to the
+/// lane, and its dispatcher only moves run keys between the ready order and
+/// activations. So a full lane can always make progress, and commands for a
+/// run start in the order the lane accepted them.
 pub(crate) fn spawn_lane_with_id<K, R, P>(
     lane_id: usize,
     kernel: K,
@@ -586,110 +878,164 @@ pub(crate) fn spawn_lane_with_id<K, R, P>(
     close_attempt_tracking: Arc<Mutex<HashSet<RunKey>>>,
     config: LaneConfig,
     clock: Arc<dyn Clock>,
+    slots: Arc<Semaphore>,
 ) -> LaneHandle
 where
     K: Kernel + Send + Sync + 'static,
     R: RunRepository + Clone + 'static,
     P: DispatchPublisher + Clone + 'static,
 {
-    let (tx, mut rx) = mpsc::channel::<LaneMessage>(1024);
-    let (identity_tx, mut identity_rx) = mpsc::channel::<IdentityRequest>(1024);
-    let (metadata_tx, mut metadata_rx) = mpsc::channel::<OutboundMetadataRequest>(64);
+    // Capacity one: a wake only says "look at the ready order", so one pending
+    // wake covers any number of runs that became ready since the last look.
+    let (wake, wake_rx) = mpsc::channel::<()>(1);
     let max_occ_retries = config.max_occ_retries;
-    tokio::spawn(async move {
-        // One lane-local cache shared across activations: a run's loaded state
-        // survives between commands so repeated work on the same run avoids a
-        // storage reload. The cache is never authoritative — it is evicted on
-        // conflict and bounded by capacity/idle policy.
-        let mut cache = LaneCache::new(&config);
-        // The other run's command that stopped the last activation's drain. It
-        // was the head of the channel, so it runs before anything still queued.
-        // Holding it here instead of re-sending it keeps arrival order, and it
-        // keeps the lane live: with the channel full, the slot freed by taking
-        // it goes to the first parked submitter, so a re-send would wait for a
-        // slot that only this task can free.
-        let mut carry_over: Option<LaneMessage> = None;
-        loop {
-            // A bounded metadata batch shares the lane's serialization and cache
-            // with normal commands; neither stream may starve the other.
-            for _ in 0..config.max_drain_per_activation.max(1) {
-                let Ok(request) = metadata_rx.try_recv() else {
-                    break;
-                };
-                commit_outbound_metadata(&repo, &shard_owner, &mut cache, request).await;
-            }
-            // A perpetually nonempty command queue can retain a carry-over
-            // forever. Serve a bounded batch of immutable identity reads between
-            // activations so admission cannot starve, without reordering writes.
-            for _ in 0..config.max_drain_per_activation.max(1) {
-                let Ok(request) = identity_rx.try_recv() else {
-                    break;
-                };
-                resolve_identity_request(&repo, &shard_owner, &mut cache, request).await;
-            }
-            let message = match carry_over.take() {
-                Some(message) => message,
-                None => tokio::select! {
-                    message = rx.recv() => match message {
-                        Some(message) => message,
-                        None => break,
-                    },
-                    Some(request) = identity_rx.recv() => {
-                        resolve_identity_request(&repo, &shard_owner, &mut cache, request).await;
-                        continue;
-                    }
-                    Some(request) = metadata_rx.recv() => {
-                        commit_outbound_metadata(&repo, &shard_owner, &mut cache, request).await;
-                        continue;
-                    }
-                },
-            };
-            carry_over = Box::pin(run_activation_with_cache(
-                &kernel,
-                &repo,
-                &publisher,
-                &shard_owner,
-                &activity_tracking,
-                &workflow_timeout_tracking,
-                &wft_timeout_tracking,
-                &nexus_timeout_tracking,
-                &update_registry,
-                &close_attempt_tracking,
-                &mut rx,
-                message,
-                &config,
-                &mut cache,
-                clock.as_ref(),
-            ))
-            .await;
-            if carry_over.is_some() {
-                runtime_metrics::record_lane_carry_over(lane_id);
-            }
-            // Sampled after each activation rather than before, so an idle lane
-            // reads zero instead of the depth its last activation started with.
-            runtime_metrics::set_lane_queue_depth(
-                lane_id,
-                rx.len() + usize::from(carry_over.is_some()),
-            );
-        }
+    let shared = Arc::new(LaneShared::new(&config, shard_owner.clone()));
+    let context = Arc::new(LaneContext {
+        lane_id,
+        kernel,
+        repo,
+        publisher,
+        shard_owner,
+        activity_tracking,
+        workflow_timeout_tracking,
+        wft_timeout_tracking,
+        nexus_timeout_tracking,
+        update_registry,
+        close_attempt_tracking,
+        config,
+        clock,
+        shared: shared.clone(),
     });
+    tokio::spawn(dispatch(context, slots, wake_rx));
     LaneHandle {
         lane_id,
         max_occ_retries,
-        tx,
-        identity_tx,
-        metadata_tx,
+        shared,
+        wake,
         #[cfg(test)]
         identity_requests: Arc::default(),
     }
 }
 
-async fn commit_outbound_metadata<R: RunRepository>(
+/// Marks the lane closed when its dispatcher ends, however it ends, and drops
+/// whatever is still queued so those callers see the lane closed.
+struct CloseOnExit(Arc<LaneShared>);
+
+impl Drop for CloseOnExit {
+    fn drop(&mut self) {
+        let orphans = {
+            let mut state = self.0.lock();
+            state.closed = true;
+            state.queues.drain_all()
+        };
+        drop(orphans);
+    }
+}
+
+/// The lane's dispatcher: start an activation for the first ready run whenever
+/// a slot is free, and hand each run back when its activation ends.
+///
+/// It is the only code that moves a run into or out of activation, so a run
+/// never has two activations at once. It ends only when every handle and
+/// reservation is gone, no run is ready, and every activation it spawned has
+/// ended, so every accepted command gets its reply.
+async fn dispatch<K, R, P>(
+    context: Arc<LaneContext<K, R, P>>,
+    slots: Arc<Semaphore>,
+    mut wake: mpsc::Receiver<()>,
+) where
+    K: Kernel + Send + Sync + 'static,
+    R: RunRepository + Clone + 'static,
+    P: DispatchPublisher + Clone + 'static,
+{
+    let _close = CloseOnExit(context.shared.clone());
+    let mut activations = tokio::task::JoinSet::new();
+    let mut running = HashMap::new();
+    let mut open = true;
+    loop {
+        let ready = context.shared.lock().queues.has_ready();
+        if !open && !ready && activations.is_empty() {
+            break;
+        }
+        tokio::select! {
+            biased;
+            Some(joined) = activations.join_next_with_id() => {
+                let (id, slot) = match joined {
+                    Ok((id, slot)) => (id, Some(slot)),
+                    // A panicked or aborted activation dropped its slot and the
+                    // reply of the command it held; the run's later commands
+                    // still run.
+                    Err(error) => (error.id(), None),
+                };
+                let run_key = running.remove(&id).expect("every activation task is tracked");
+                let depth = {
+                    let mut state = context.shared.lock();
+                    state.queues.finish(run_key);
+                    state.queues.queued()
+                };
+                // The slot is held until the run is handed back, so it counts
+                // the activation for its whole life.
+                drop(slot);
+                runtime_metrics::set_lane_queue_depth(context.lane_id, depth);
+            }
+            slot = slots.clone().acquire_owned(), if ready => {
+                let slot = slot.expect("lane activation slots are never closed");
+                let Some(run_key) = context.shared.lock().queues.pop_ready() else {
+                    continue;
+                };
+                let handle = activations.spawn(activate(context.clone(), run_key, slot));
+                running.insert(handle.id(), run_key);
+            }
+            woken = wake.recv(), if open => {
+                if woken.is_none() {
+                    open = false;
+                }
+            }
+        }
+    }
+}
+
+/// One activation of `run_key`, holding `slot` until the dispatcher has handed
+/// the run back.
+async fn activate<K, R, P>(
+    context: Arc<LaneContext<K, R, P>>,
+    run_key: RunKey,
+    slot: OwnedSemaphorePermit,
+) -> OwnedSemaphorePermit
+where
+    K: Kernel + Send + Sync + 'static,
+    R: RunRepository + Clone + 'static,
+    P: DispatchPublisher + Clone + 'static,
+{
+    let mut cache = CacheAccess::new(&context.shared);
+    Box::pin(run_activation_with_cache(
+        &context.kernel,
+        &context.repo,
+        &context.publisher,
+        &context.shard_owner,
+        &context.activity_tracking,
+        &context.workflow_timeout_tracking,
+        &context.wft_timeout_tracking,
+        &context.nexus_timeout_tracking,
+        &context.update_registry,
+        &context.close_attempt_tracking,
+        &context.shared,
+        run_key,
+        &context.config,
+        &mut cache,
+        context.clock.as_ref(),
+    ))
+    .await;
+    slot
+}
+
+/// Commit an outbound metadata transition; returns whether it committed.
+async fn commit_outbound_metadata<R: RunRepository, C: ActivationCache>(
     repo: &R,
     owner: &Arc<RwLock<ShardOwner>>,
-    cache: &mut LaneCache,
+    cache: &mut C,
     request: OutboundMetadataRequest,
-) {
+) -> bool {
     let run = request.transition.next_state.run_key;
     let result = async {
         let transition = *request.transition;
@@ -712,11 +1058,15 @@ async fn commit_outbound_metadata<R: RunRepository>(
     .await;
     // Even an ambiguous commit may have written. Reload before the next command
     // instead of allowing a cached no-op to hide that committed observation.
-    cache.entries.remove(&run);
-    cache.order.retain(|key| *key != run);
+    cache.evict(run);
+    let committed = result.is_ok();
     let _ = request.reply.send(result);
+    committed
 }
 
+/// Run one activation of the first message's run against a lane holding
+/// `first_message` and everything queued in `rx`, then return the first
+/// command still queued, if any.
 #[cfg(test)]
 async fn run_activation<K, R, P>(
     kernel: &K,
@@ -737,7 +1087,24 @@ where
     R: RunRepository + Clone + 'static,
     P: DispatchPublisher + Clone + 'static,
 {
-    let mut cache = LaneCache::new(config);
+    let shared = LaneShared::new(config, shard_owner.clone());
+    {
+        let mut state = shared.lock();
+        let mut message = Some(first_message);
+        while let Some(next) = message.take().or_else(|| rx.try_recv().ok()) {
+            state
+                .queues
+                .try_reserve(next.run_key)
+                .expect("the test lane has room");
+            state.queues.enqueue(next.run_key, LaneItem::Command(next));
+        }
+    }
+    let run_key = shared
+        .lock()
+        .queues
+        .pop_ready()
+        .expect("the first message's run is ready");
+    let mut cache = CacheAccess::new(&shared);
     Box::pin(run_activation_with_cache(
         kernel,
         repo,
@@ -749,29 +1116,34 @@ where
         nexus_timeout_tracking,
         update_registry,
         &Arc::new(Mutex::new(HashSet::new())),
-        rx,
-        first_message,
+        &shared,
+        run_key,
         config,
         &mut cache,
         &tokeira_clock::SystemClock,
     ))
-    .await
+    .await;
+    let mut state = shared.lock();
+    state.queues.finish(run_key);
+    let next = state.queues.pop_ready()?;
+    match state.queues.take_next(next)? {
+        LaneItem::Command(message) => Some(message),
+        LaneItem::OutboundMetadata(_) => None,
+    }
 }
 
-/// Process one activation for `first_message.run_key`: handle the triggering
-/// command, then opportunistically drain further commands for the *same* run
-/// from the channel without yielding the lane.
+/// Process one activation for `run_key`: take commands from the front of its
+/// queue one at a time and run each to its reply.
 ///
 /// Coalescing same-run work into one activation is what makes bursty runs
 /// cheap (signal storms, rapid update/resolution traffic) — the run's state
 /// stays hot in the lane cache across the batch instead of being reloaded per
-/// command. The drain stops at the first command for *another* run and returns
-/// it, so this lane never starts processing a second run mid-activation. That
-/// command was the head of the channel, so the caller runs it before receiving
-/// again, which keeps arrival order. The drain is bounded by
-/// [`LaneConfig::max_drain_per_activation`] to keep one hot run from starving
-/// the rest of the lane.
-async fn run_activation_with_cache<K, R, P>(
+/// command. Other runs' commands wait in their own queues and never interrupt
+/// the drain. The drain is bounded by
+/// [`LaneConfig::max_drain_per_activation`]; the dispatcher then puts a run
+/// with work left behind every run already waiting, so one hot run can't
+/// starve the rest of the lane.
+async fn run_activation_with_cache<K, R, P, C>(
     kernel: &K,
     repo: &R,
     publisher: &P,
@@ -782,24 +1154,34 @@ async fn run_activation_with_cache<K, R, P>(
     nexus_timeout_tracking: &crate::nexus::NexusTimeoutTrackingState,
     update_registry: &UpdateRegistry,
     close_attempt_tracking: &Arc<Mutex<HashSet<RunKey>>>,
-    rx: &mut mpsc::Receiver<LaneMessage>,
-    first_message: LaneMessage,
+    shared: &LaneShared,
+    run_key: RunKey,
     config: &LaneConfig,
-    cache: &mut LaneCache,
+    cache: &mut C,
     clock: &dyn Clock,
-) -> Option<LaneMessage>
-where
+) where
     K: Kernel + Send + Sync + 'static,
     R: RunRepository + Clone + 'static,
     P: DispatchPublisher + Clone + 'static,
+    C: ActivationCache,
 {
-    let active_run_key = first_message.run_key;
-    let mut current = Some(first_message);
-    let mut carry_over = None;
     let mut drained = 0usize;
     let drain_limit = config.max_drain_per_activation.max(1) as usize;
 
-    while let Some(mut message) = current.take() {
+    while drained < drain_limit {
+        let Some(item) = shared.take_next(run_key) else {
+            break;
+        };
+        drained += 1;
+        let mut message = match item {
+            LaneItem::Command(message) => message,
+            LaneItem::OutboundMetadata(request) => {
+                if commit_outbound_metadata(repo, shard_owner, cache, request).await {
+                    continue;
+                }
+                break;
+            }
+        };
         // A start asking for a parked poll reserves it now, as its lane takes
         // it: until then the poll takes other work, so a start waiting behind
         // a busy lane holds none.
@@ -1197,35 +1579,13 @@ where
         }
         runtime_metrics::record_lane_processing_duration(command_type, processing_start.elapsed());
         let _ = message.reply_tx.send(reply);
-        drained += 1;
 
         // Stop the activation on error so a failing command doesn't drag the
-        // rest of the batch down, and honor the drain bound so one hot run
-        // can't monopolize the lane.
-        if stop_draining || drained >= drain_limit {
+        // rest of the batch down.
+        if stop_draining {
             break;
         }
-
-        match rx.try_recv() {
-            // Same run: keep draining within this activation so its state stays
-            // hot in the cache (the coalescing win for bursty runs).
-            Ok(next) if next.run_key == active_run_key => {
-                current = Some(next);
-            }
-            // Different run: stop and hand it back as the next activation's
-            // first command rather than processing it here. Switching runs
-            // mid-activation would break the one-run-per-activation residency
-            // the cache relies on.
-            Ok(other) => {
-                carry_over = Some(other);
-                break;
-            }
-            Err(mpsc::error::TryRecvError::Empty) => break,
-            Err(mpsc::error::TryRecvError::Disconnected) => break,
-        }
     }
-
-    carry_over
 }
 
 fn lane_processing_span(message: &LaneMessage, command_type: &'static str) -> tracing::Span {
@@ -1340,7 +1700,7 @@ fn reconcile_held_updates(
 /// ops and history events from the *committed* transition so the caller can
 /// publish derived effects only after durability is established.
 #[allow(clippy::too_many_arguments)]
-async fn handle_message_with_cache<K, R>(
+async fn handle_message_with_cache<K, R, C>(
     kernel: &K,
     repo: &R,
     shard_owner: &Arc<RwLock<ShardOwner>>,
@@ -1348,7 +1708,7 @@ async fn handle_message_with_cache<K, R>(
     run_key: RunKey,
     command: Command,
     max_retries: u32,
-    cache: &mut LaneCache,
+    cache: &mut C,
     write_admission: &mut Option<crate::serving_gate::WritePermit>,
     clock: &dyn Clock,
 ) -> Result<(
@@ -1361,6 +1721,7 @@ async fn handle_message_with_cache<K, R>(
 where
     K: Kernel + Send + Sync + 'static,
     R: RunRepository + 'static,
+    C: ActivationCache,
 {
     Box::pin(handle_message_with_successor(
         kernel,
@@ -1383,7 +1744,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_message_with_successor<K, R>(
+async fn handle_message_with_successor<K, R, C>(
     kernel: &K,
     repo: &R,
     shard_owner: &Arc<RwLock<ShardOwner>>,
@@ -1396,7 +1757,7 @@ async fn handle_message_with_successor<K, R>(
     activity_timeout: Option<&crate::activity_timeout::ActivityTimeoutCheck>,
     successor_effect: &mut Option<SuccessorEffect>,
     max_retries: u32,
-    cache: &mut LaneCache,
+    cache: &mut C,
     write_admission: &mut Option<crate::serving_gate::WritePermit>,
     clock: &dyn Clock,
 ) -> Result<(
@@ -1409,6 +1770,7 @@ async fn handle_message_with_successor<K, R>(
 where
     K: Kernel + Send + Sync + 'static,
     R: RunRepository + 'static,
+    C: ActivationCache,
 {
     if matches!(command, Command::Reset(_)) {
         return Err(
@@ -2285,6 +2647,7 @@ pub(crate) fn track_committed_run(
 mod tests {
     mod atomic_successors;
     mod committed_publish;
+    mod concurrency;
     mod heartbeat;
     mod outbound_publication;
     use std::{
@@ -2552,6 +2915,12 @@ mod tests {
         commit_calls: usize,
         commit_behaviors: VecDeque<CommitBehavior>,
         commit_gate: Option<CommitGate>,
+        /// Gates on one run's next commit, for tests that park chosen runs.
+        run_gates: HashMap<RunKey, CommitGate>,
+        /// Commits in flight per run; a second one for the same run would
+        /// mean two activations of that run at once.
+        in_flight: HashMap<RunKey, usize>,
+        overlapped: bool,
         pair_behaviors: VecDeque<PairBehavior>,
         pairs: Vec<(Transition, Transition)>,
         fallbacks: Vec<StartRequest>,
@@ -2588,6 +2957,9 @@ mod tests {
                     commit_calls: 0,
                     commit_behaviors: commit_behaviors.into(),
                     commit_gate: None,
+                    run_gates: HashMap::new(),
+                    in_flight: HashMap::new(),
+                    overlapped: false,
                     pair_behaviors: VecDeque::new(),
                     pairs: Vec::new(),
                     fallbacks: Vec::new(),
@@ -2605,6 +2977,28 @@ mod tests {
                 release: release_rx,
             });
             (held_rx, release_tx)
+        }
+
+        /// Holds `run_key`'s next commit, as [`Self::hold_next_commit`] does.
+        async fn hold_run_commit(
+            &self,
+            run_key: RunKey,
+        ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+            let (held_tx, held_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            self.state.lock().await.run_gates.insert(
+                run_key,
+                CommitGate {
+                    held: held_tx,
+                    release: release_rx,
+                },
+            );
+            (held_rx, release_tx)
+        }
+
+        /// Whether two commits for one run were ever in flight together.
+        async fn overlapped(&self) -> bool {
+            self.state.lock().await.overlapped
         }
 
         async fn snapshot(&self) -> (usize, usize, LoadedRun) {
@@ -2733,16 +3127,26 @@ mod tests {
         // carries the real epoch from the ShardOwner.
         async fn commit_transition(
             &self,
-            _run_key: RunKey,
+            run_key: RunKey,
             transition: Transition,
             _fence: WriteFence,
         ) -> Result<CommitResult> {
-            let gate = self.state.lock().await.commit_gate.take();
+            let gate = {
+                let mut state = self.state.lock().await;
+                let in_flight = state.in_flight.entry(run_key).or_default();
+                *in_flight += 1;
+                if *in_flight > 1 {
+                    state.overlapped = true;
+                }
+                let run_gate = state.run_gates.remove(&run_key);
+                state.commit_gate.take().or(run_gate)
+            };
             if let Some(gate) = gate {
                 let _ = gate.held.send(());
                 let _ = gate.release.await;
             }
             let mut state = self.state.lock().await;
+            *state.in_flight.entry(run_key).or_default() -= 1;
             state.commit_calls += 1;
             match state
                 .commit_behaviors
@@ -3746,33 +4150,41 @@ mod tests {
         }
     }
 
-    #[test]
-    fn queued_depth_reflects_bounded_channel_occupancy() {
-        let (tx, _rx) = mpsc::channel(4);
-        let (identity_tx, _) = mpsc::channel(1);
-        let (metadata_tx, _) = mpsc::channel(1);
-        let handle = LaneHandle {
+    /// A lane handle whose queue nothing drains, for accounting tests.
+    fn detached_lane() -> LaneHandle {
+        let (wake, _) = mpsc::channel(1);
+        LaneHandle {
             lane_id: 0,
             max_occ_retries: LaneConfig::default().max_occ_retries,
-            tx,
-            identity_tx,
-            metadata_tx,
+            shared: Arc::new(LaneShared::new(&LaneConfig::default(), test_shard_owner())),
+            wake,
             identity_requests: Arc::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn queued_depth_counts_accepted_unstarted_commands() {
+        let handle = detached_lane();
+        let run_key = RunKey::new();
         assert_eq!(handle.queued_depth(), 0);
 
+        let unspent = handle.reserve(run_key).unwrap();
         let (reply_tx, _reply_rx) = oneshot::channel();
         handle
-            .tx
-            .try_send(LaneMessage::new(
+            .try_enqueue(LaneMessage::new(
                 0,
-                RunKey::new(),
+                run_key,
                 sample_command("queued"),
                 reply_tx,
             ))
             .unwrap();
-
         assert_eq!(handle.queued_depth(), 1);
+        assert_eq!(handle.reserved_claims(), 2);
+
+        // A reservation dropped without a command gives its claim back.
+        drop(unspent);
+        assert_eq!(handle.queued_depth(), 1);
+        assert_eq!(handle.reserved_claims(), 1);
     }
 
     /// Serializes the tests that install tracing dispatchers.
@@ -4081,7 +4493,7 @@ mod tests {
         tx.send(second).await.unwrap();
         tx.send(_foreign).await.unwrap();
 
-        let carry_over = run_activation(
+        let next_queued = run_activation(
             &kernel,
             &repo,
             &publisher,
@@ -4109,7 +4521,10 @@ mod tests {
             second_reply.await.unwrap().unwrap(),
             CommitResult::Applied { .. }
         ));
-        assert_eq!(carry_over.map(|message| message.run_key), Some(foreign_key));
+        assert_eq!(
+            next_queued.map(|message| message.run_key),
+            Some(foreign_key)
+        );
 
         let (commands, loaded_runs) = kernel.snapshot();
         assert_eq!(commands.len(), 2);
@@ -4129,17 +4544,9 @@ mod tests {
         assert_eq!(publisher.snapshot().await.publishes.len(), 2);
     }
 
-    /// Runs alternate, so every activation ends by carrying the other run's
-    /// command over; a lane that re-sent it to its full mailbox would stall.
-    #[tokio::test]
-    async fn lane_drains_full_mailbox_with_parked_submitters_in_arrival_order() {
-        let run_a = RunKey::new();
-        let run_b = RunKey::new();
-        let repo = MockRepo::new(LoadedRun::Existing(sample_state(run_a)), Vec::new());
-        let (commit_held, release_commit) = repo.hold_next_commit().await;
-        let kernel = MockKernel::new(SmallVec::new());
-        let lane = spawn_lane(
-            kernel.clone(),
+    fn spawn_test_lane(kernel: MockKernel, repo: MockRepo) -> LaneHandle {
+        spawn_lane(
+            kernel,
             repo,
             MockPublisher::new(),
             test_shard_owner(),
@@ -4149,53 +4556,81 @@ mod tests {
             crate::nexus::NexusTimeoutTrackingState::default(),
             crate::UpdateRegistry::new(),
             LaneConfig::default(),
-        );
+        )
+    }
 
-        let (reply_tx, first_reply) = oneshot::channel();
-        lane.tx
-            .try_send(LaneMessage::new(0, run_a, sample_command("0"), reply_tx))
-            .unwrap();
+    fn enqueue_signal(
+        lane: &LaneHandle,
+        run_key: RunKey,
+        label: &str,
+    ) -> oneshot::Receiver<Result<CommitResult>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        lane.try_enqueue(LaneMessage::new(
+            0,
+            run_key,
+            sample_command(label),
+            reply_tx,
+        ))
+        .unwrap();
+        reply_rx
+    }
+
+    fn applied_signals(kernel: &MockKernel) -> Vec<String> {
+        kernel
+            .snapshot()
+            .0
+            .into_iter()
+            .map(|command| match command {
+                Command::Signal(signal) => signal.signal_name,
+                other => panic!("unexpected command {other:?}"),
+            })
+            .collect()
+    }
+
+    async fn first_poll_error(
+        submit: impl std::future::Future<Output = Result<CommitResult>>,
+    ) -> anyhow::Error {
+        let mut submit = std::pin::pin!(submit);
+        match poll_fn(|cx| Poll::Ready(submit.as_mut().poll(cx))).await {
+            Poll::Ready(Err(error)) => error,
+            Poll::Ready(Ok(result)) => panic!("expected a refusal, got {result:?}"),
+            Poll::Pending => panic!("a refusal must not wait"),
+        }
+    }
+
+    /// Two runs fill the lane's budget while a third run's command is in
+    /// flight. The next submit is refused at once, and the lane, which never
+    /// sends to its own input, drains every accepted command, each run's in
+    /// arrival order.
+    #[tokio::test]
+    async fn a_full_lane_refuses_at_once_and_drains_in_arrival_order() {
+        let (run_a, run_b, run_c) = (RunKey::new(), RunKey::new(), RunKey::new());
+        let repo = MockRepo::new(LoadedRun::Existing(sample_state(run_a)), Vec::new());
+        let (commit_held, release_commit) = repo.hold_next_commit().await;
+        let kernel = MockKernel::new(SmallVec::new());
+        let lane = spawn_test_lane(kernel.clone(), repo);
+
+        let mut replies = vec![enqueue_signal(&lane, run_c, "c-0")];
         commit_held.await.unwrap();
-
-        let mut arrivals = vec!["0".to_string()];
-        let mut replies = vec![first_reply];
-        for index in 1..=lane.tx.max_capacity() {
-            let run_key = if index % 2 == 1 { run_b } else { run_a };
-            let label = index.to_string();
-            let (reply_tx, reply_rx) = oneshot::channel();
-            lane.tx
-                .try_send(LaneMessage::new(
-                    0,
-                    run_key,
-                    sample_command(&label),
-                    reply_tx,
-                ))
-                .unwrap();
-            arrivals.push(label);
-            replies.push(reply_rx);
+        let mut arrivals: HashMap<char, Vec<String>> = HashMap::new();
+        arrivals.entry('c').or_default().push("c-0".into());
+        for index in 1..=LANE_BUDGET {
+            let (run_key, prefix) = if index % 2 == 1 {
+                (run_b, 'b')
+            } else {
+                (run_a, 'a')
+            };
+            let label = format!("{prefix}-{index}");
+            replies.push(enqueue_signal(&lane, run_key, &label));
+            arrivals.entry(prefix).or_default().push(label);
         }
-        assert_eq!(lane.tx.capacity(), 0);
+        assert_eq!(lane.queued_depth(), LANE_BUDGET);
 
-        let mut parked = Vec::new();
-        for index in 0..2 {
-            let label = format!("parked-{index}");
-            let (handle, command) = (lane.clone(), sample_command(&label));
-            let mut submit = Box::pin(async move { handle.submit(run_b, command).await });
-            // One poll queues the submit for the next free slot, ahead of any
-            // send the lane could make to itself.
-            assert!(poll_fn(|cx| Poll::Ready(submit.as_mut().poll(cx).is_pending())).await);
-            arrivals.push(label);
-            parked.push(submit);
-        }
+        let error = first_poll_error(lane.submit(run_c, sample_command("refused"))).await;
+        assert!(error.is::<crate::LaneOverloaded>(), "{error:?}");
 
         release_commit.send(()).unwrap();
         tokio::time::timeout(StdDuration::from_secs(10), async {
-            for submit in parked {
-                assert!(matches!(
-                    submit.await.unwrap(),
-                    CommitResult::Applied { .. }
-                ));
-            }
             for reply in replies {
                 assert!(matches!(
                     reply.await.unwrap().unwrap(),
@@ -4204,18 +4639,46 @@ mod tests {
             }
         })
         .await
-        .expect("the lane stalled on a full mailbox");
+        .expect("the lane stalled at its budget");
 
-        let applied: Vec<String> = kernel
-            .snapshot()
-            .0
-            .into_iter()
-            .map(|command| match command {
-                Command::Signal(signal) => signal.signal_name,
-                other => panic!("unexpected command {other:?}"),
-            })
-            .collect();
+        let mut applied: HashMap<char, Vec<String>> = HashMap::new();
+        for label in applied_signals(&kernel) {
+            applied
+                .entry(label.chars().next().unwrap())
+                .or_default()
+                .push(label);
+        }
         assert_eq!(applied, arrivals);
+        assert_eq!(lane.reserved_claims(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_submit_past_its_runs_share_is_refused_on_its_first_poll() {
+        let (run_a, run_b) = (RunKey::new(), RunKey::new());
+        let repo = MockRepo::new(LoadedRun::Existing(sample_state(run_a)), Vec::new());
+        let (commit_held, release_commit) = repo.hold_next_commit().await;
+        let kernel = MockKernel::new(SmallVec::new());
+        let lane = spawn_test_lane(kernel.clone(), repo);
+
+        let mut replies = vec![enqueue_signal(&lane, run_a, "in-flight")];
+        commit_held.await.unwrap();
+        for index in 0..LANE_BUDGET / 2 {
+            replies.push(enqueue_signal(&lane, run_a, &index.to_string()));
+        }
+
+        let error = first_poll_error(lane.submit(run_a, sample_command("refused"))).await;
+        assert!(error.is::<crate::WorkflowBusy>(), "{error:?}");
+        // The lane itself still has room for other runs.
+        drop(lane.reserve(run_b).expect("another run still has room"));
+
+        release_commit.send(()).unwrap();
+        for reply in replies {
+            assert!(matches!(
+                reply.await.unwrap().unwrap(),
+                CommitResult::Applied { .. }
+            ));
+        }
+        assert!(!applied_signals(&kernel).contains(&"refused".to_string()));
     }
 
     #[tokio::test]
@@ -4245,7 +4708,7 @@ mod tests {
         tx.send(second).await.unwrap();
         tx.send(third).await.unwrap();
 
-        let carry_over = run_activation(
+        let next_queued = run_activation(
             &kernel,
             &repo,
             &publisher,
@@ -4265,7 +4728,8 @@ mod tests {
         )
         .await;
 
-        assert!(carry_over.is_none());
+        // The third command stays queued for the run's next activation.
+        assert_eq!(next_queued.map(|message| message.run_key), Some(run_key));
         assert!(matches!(
             first_reply.await.unwrap().unwrap(),
             CommitResult::Applied { .. }
@@ -4274,7 +4738,6 @@ mod tests {
             second_reply.await.unwrap().unwrap(),
             CommitResult::Applied { .. }
         ));
-        assert!(rx.try_recv().is_ok());
     }
 
     #[tokio::test]
@@ -4304,7 +4767,7 @@ mod tests {
         tx.send(second).await.unwrap();
         tx.send(third).await.unwrap();
 
-        let carry_over = run_activation(
+        let next_queued = run_activation(
             &kernel,
             &repo,
             &publisher,
@@ -4320,13 +4783,13 @@ mod tests {
         )
         .await;
 
-        assert!(carry_over.is_none());
+        // The failure ends the activation; the third command stays queued.
+        assert_eq!(next_queued.map(|message| message.run_key), Some(run_key));
         assert!(matches!(
             first_reply.await.unwrap().unwrap(),
             CommitResult::Applied { .. }
         ));
         assert!(second_reply.await.unwrap().is_err());
-        assert!(rx.try_recv().is_ok());
     }
 
     #[tokio::test]
@@ -4349,7 +4812,7 @@ mod tests {
         let update_registry = crate::UpdateRegistry::new();
         let shard_owner = test_shard_owner();
 
-        let carry_over = run_activation(
+        let next_queued = run_activation(
             &kernel,
             &repo,
             &publisher,
@@ -4365,7 +4828,7 @@ mod tests {
         )
         .await;
 
-        assert!(carry_over.is_none());
+        assert!(next_queued.is_none());
         assert!(matches!(
             first_reply.await.unwrap().unwrap(),
             CommitResult::Applied { .. }
@@ -4448,7 +4911,7 @@ mod tests {
         let update_registry = crate::UpdateRegistry::new();
         let shard_owner = test_shard_owner();
 
-        let carry_over = run_activation(
+        let next_queued = run_activation(
             &kernel,
             &repo,
             &publisher,
@@ -4464,7 +4927,7 @@ mod tests {
         )
         .await;
 
-        assert!(carry_over.is_none());
+        assert!(next_queued.is_none());
         assert!(matches!(
             first_reply.await.unwrap().unwrap(),
             CommitResult::Applied { .. }
@@ -4497,7 +4960,7 @@ mod tests {
         let update_registry = crate::UpdateRegistry::new();
         let shard_owner = test_shard_owner();
 
-        let carry_over = run_activation(
+        let next_queued = run_activation(
             &kernel,
             &repo,
             &publisher,
@@ -4513,7 +4976,7 @@ mod tests {
         )
         .await;
 
-        assert!(carry_over.is_none());
+        assert!(next_queued.is_none());
         assert!(matches!(
             first_reply.await.unwrap().unwrap(),
             CommitResult::Applied { .. }
@@ -4606,7 +5069,7 @@ mod tests {
         let update_registry = crate::UpdateRegistry::new();
         let shard_owner = test_shard_owner();
 
-        let carry_over = run_activation(
+        let next_queued = run_activation(
             &kernel,
             &repo,
             &publisher,
@@ -4622,7 +5085,7 @@ mod tests {
         )
         .await;
 
-        assert!(carry_over.is_none());
+        assert!(next_queued.is_none());
         assert!(matches!(
             first_reply.await.unwrap().unwrap(),
             CommitResult::Applied { .. }
@@ -4962,7 +5425,7 @@ mod tests {
         message: LaneMessage,
     ) {
         let (_tx, mut rx) = mpsc::channel(8);
-        let carry_over = run_activation(
+        let next_queued = run_activation(
             &tokeira_kernel::BasicKernel,
             repo,
             publisher,
@@ -4980,7 +5443,7 @@ mod tests {
             },
         )
         .await;
-        assert!(carry_over.is_none());
+        assert!(next_queued.is_none());
     }
 
     // Feature: reserved-poll-handoff, Property 3. A start's lane reserves a
@@ -5120,14 +5583,13 @@ mod tests {
         );
         // The lane is busy with another run's command.
         let (reply_tx, busy_reply) = oneshot::channel();
-        lane.tx
-            .try_send(LaneMessage::new(
-                0,
-                busy_run,
-                sample_command("busy"),
-                reply_tx,
-            ))
-            .unwrap();
+        lane.try_enqueue(LaneMessage::new(
+            0,
+            busy_run,
+            sample_command("busy"),
+            reply_tx,
+        ))
+        .unwrap();
         commit_held.await.unwrap();
 
         let request = crate::runtime::tests::sample_start_request(None, None);
@@ -5173,6 +5635,73 @@ mod tests {
         assert!(publishes_workflow_task(
             &publisher.snapshot().await.publishes
         ));
+    }
+
+    // Feature: reserved-poll-handoff, Property 3. A start waiting for its
+    // lane's activation slot holds no poll; once it has the slot, it reserves
+    // the parked poll and hands it the first workflow task.
+    #[tokio::test]
+    async fn a_start_reserves_its_parked_poll_only_once_it_holds_a_slot() {
+        let broker = crate::broker::InMemoryBroker::default();
+        let busy_run = RunKey::new();
+        let repo = MockRepo::new(LoadedRun::Existing(sample_state(busy_run)), Vec::new());
+        let (commit_held, release_commit) = repo.hold_next_commit().await;
+        let publisher = MockPublisher::new().with_broker(broker.clone());
+        let lane = spawn_lane(
+            StartingKernel(MockKernel::new(SmallVec::new())),
+            repo,
+            publisher.clone(),
+            test_shard_owner(),
+            crate::activity_timeout::ActivityTrackingState::default(),
+            crate::timeout::WorkflowTimeoutTrackingState::default(),
+            crate::wft_timeout::WftTimeoutTrackingState::default(),
+            crate::nexus::NexusTimeoutTrackingState::default(),
+            crate::UpdateRegistry::new(),
+            LaneConfig::default(),
+        );
+        // Another run's activation holds the lane's only slot.
+        let busy_reply = enqueue_signal(&lane, busy_run, "busy");
+        commit_held.await.unwrap();
+
+        let request = crate::runtime::tests::sample_start_request(None, None);
+        let queue = start_queue(&request);
+        let worker = WorkerIdentity("parked-poller".to_string());
+        let poll = parked_workflow_poll(&broker, &queue, &worker).await;
+        let start = {
+            let lane = lane.clone();
+            let command = Command::Start(request.clone());
+            tokio::spawn(
+                async move { lane.submit_reserving_poller(request.run_key, command).await },
+            )
+        };
+        while lane.queued_depth() == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !poll.is_finished(),
+            "a start waiting for a slot took the poll"
+        );
+
+        release_commit.send(()).unwrap();
+        assert!(matches!(
+            busy_reply.await.unwrap().unwrap(),
+            CommitResult::Applied { .. }
+        ));
+        let CommitResult::Applied { new_state } = start.await.unwrap().unwrap() else {
+            panic!("the start should commit");
+        };
+        let started_event_id = new_state
+            .pending_workflow_task
+            .as_ref()
+            .and_then(|task| task.started_event_id)
+            .expect("the start's commit starts its first workflow task");
+        match poll.await.unwrap().unwrap() {
+            Some(crate::broker::WorkflowPollResult::Started(task)) => {
+                assert_eq!(task.worker_identity, worker);
+                assert_eq!(task.token.started_event_id, started_event_id);
+            }
+            other => panic!("expected the start's first workflow task, got {other:?}"),
+        }
     }
 
     // Feature: reserved-poll-handoff, Property 3. A home lost between the commit

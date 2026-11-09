@@ -146,8 +146,16 @@ where
         run_key: tokeira_types::RunKey,
         req: SignalRequest,
     ) -> Result<WorkflowMutationOutcome> {
+        // Admission before reads: the claim is a pure in-memory check, so a
+        // signal to a lane or run at its bound is refused having read nothing
+        // past the run-key resolution its caller already made. An early return
+        // below drops the claim, which gives it back.
+        let reservation = self.runtime.reserve_submit(run_key)?;
         let execution = execution_for_run(self.runtime.as_ref(), run_key).await?;
-        let result = self.runtime.signal_workflow(execution, req).await?;
+        let result = self
+            .runtime
+            .signal_workflow_reserved(execution, req, reservation)
+            .await?;
         commit_result_to_outcome(result)
     }
 

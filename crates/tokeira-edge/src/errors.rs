@@ -53,6 +53,20 @@ pub enum EdgeError {
     #[error("workflow operation can not be applied because workflow is closing")]
     WorkflowClosing,
 
+    /// The run already holds its share of its lane's pending commands.
+    /// v1.31.0's `consts.ErrResourceExhaustedBusyWorkflow`: RESOURCE_EXHAUSTED
+    /// with cause BUSY_WORKFLOW, scope NAMESPACE, and this exact message
+    /// (`service/history/consts/const.go @ v1.31.0`).
+    #[error("Workflow is busy.")]
+    WorkflowBusy,
+
+    /// The run's lane holds its whole budget of pending commands. The shape of
+    /// v1.31.0's `ErrCacheFull`: RESOURCE_EXHAUSTED with cause
+    /// SYSTEM_OVERLOADED and scope SYSTEM (`common/cache/lru.go @ v1.31.0`);
+    /// the message is the runtime's own.
+    #[error("{0}")]
+    LaneOverloaded(String),
+
     /// Storage had no free database connection for the request, which did not
     /// run. v1.31.0's `ErrPersistenceSystemLimitExceeded`: RESOURCE_EXHAUSTED
     /// with cause PERSISTENCE_LIMIT, scope SYSTEM and this exact message
@@ -225,6 +239,8 @@ impl EdgeError {
             EdgeError::ResourceExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::ConcurrentLimitExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::WorkflowClosing => StatusCode::TOO_MANY_REQUESTS,
+            EdgeError::WorkflowBusy => StatusCode::TOO_MANY_REQUESTS,
+            EdgeError::LaneOverloaded(_) => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::PersistenceLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::ConsistentQueryBufferExceeded => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::WorkflowNotReady(_) => StatusCode::PRECONDITION_FAILED,
@@ -273,6 +289,8 @@ impl EdgeError {
             EdgeError::ResourceExhausted(_) => "resource_exhausted",
             EdgeError::ConcurrentLimitExceeded(_) => "concurrent_limit_exceeded",
             EdgeError::WorkflowClosing => "workflow_closing",
+            EdgeError::WorkflowBusy => "workflow_busy",
+            EdgeError::LaneOverloaded(_) => "lane_overloaded",
             EdgeError::PersistenceLimitExceeded => "persistence_limit_exceeded",
             EdgeError::ConsistentQueryBufferExceeded => "consistent_query_buffer_exceeded",
             EdgeError::WorkflowNotReady(_) => "workflow_not_ready",
@@ -496,6 +514,14 @@ impl From<anyhow::Error> for EdgeError {
             .is_some()
         {
             return Self::ConsistentQueryBufferExceeded;
+        }
+        // A lane refusing a submit at its bounds answers at once with the
+        // matching v1.31.0 overload shape instead of making the caller wait.
+        if value.is::<tokeira_runtime::WorkflowBusy>() {
+            return Self::WorkflowBusy;
+        }
+        if let Some(overloaded) = value.downcast_ref::<tokeira_runtime::LaneOverloaded>() {
+            return Self::LaneOverloaded(overloaded.to_string());
         }
         // The close-attempted signal gate surfaces v1.31.0's
         // `ErrWorkflowClosing` (signal_workflow_util.go:63-70).

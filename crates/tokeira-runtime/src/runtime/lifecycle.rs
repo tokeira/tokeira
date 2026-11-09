@@ -741,6 +741,7 @@ where
                             now: request.now,
                         },
                         DuplicateOrder::AfterRefusals,
+                        None,
                     )
                     .await?
                 {
@@ -814,23 +815,57 @@ where
         execution: ExecutionRef,
         request: SignalRequest,
     ) -> Result<CommitResult> {
-        self.signal_run(execution, request, DuplicateOrder::BeforeRefusals)
+        self.signal_run(execution, request, DuplicateOrder::BeforeRefusals, None)
             .await
+    }
+
+    /// Deliver a client's signal as [`signal_workflow`](Self::signal_workflow)
+    /// does, spending `reservation`, which the caller took for the run key it
+    /// resolved before reading any run state.
+    pub async fn signal_workflow_reserved(
+        &self,
+        execution: ExecutionRef,
+        request: SignalRequest,
+        reservation: SubmitReservation,
+    ) -> Result<CommitResult> {
+        self.signal_run(
+            execution,
+            request,
+            DuplicateOrder::BeforeRefusals,
+            Some(reservation),
+        )
+        .await
     }
 
     /// Deliver a signal to a run, answering its refusals in `order` with its
     /// request id.
+    ///
+    /// The signal's lane claim is taken as soon as the run key is known and
+    /// before any run-state read, so a lane or run at its bound refuses the
+    /// signal for the cost of the run-key resolution alone. Every early return
+    /// below drops the claim, which gives it back.
     async fn signal_run(
         &self,
         execution: ExecutionRef,
         request: SignalRequest,
         order: DuplicateOrder,
+        reservation: Option<SubmitReservation>,
     ) -> Result<CommitResult> {
         let run_key = self
             .repo
             .resolve_execution(&execution)
             .await?
             .ok_or_else(|| anyhow!("execution not found"))?;
+        // A claim the caller took for a run key that no longer resolves here
+        // would admit this signal against another run's queue: give it back and
+        // claim for the run this resolution names.
+        let reservation = match reservation {
+            Some(reservation) if reservation.run_key() == run_key => reservation,
+            stale => {
+                drop(stale);
+                self.reserve_submit(run_key)?
+            }
+        };
         let request_id = request.request.request_id.clone();
         let applied = || {
             crate::signal_limits::run_applied_request(
@@ -882,7 +917,10 @@ where
                 }
             }
         }
-        match self.submit(run_key, Command::Signal(request)).await {
+        match self
+            .submit_reserved(run_key, Command::Signal(request), reservation)
+            .await
+        {
             Err(error)
                 if order == DuplicateOrder::BeforeRefusals
                     && crate::signal_limits::SignalRefusal::of(&error).is_some() =>

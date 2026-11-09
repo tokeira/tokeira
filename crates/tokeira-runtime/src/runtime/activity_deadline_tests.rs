@@ -1853,3 +1853,62 @@ async fn recovered_scheduled_callback_is_delivered_immediately() {
 async fn rebuilt_scheduled_callback_is_delivered_immediately() {
     recovered_callback_is_due_immediately(true).await;
 }
+
+// A Nexus timeout refused by a run at its lane share stays tracked, and
+// resolves the operation on a later pass once the run has room.
+#[tokio::test]
+async fn a_refused_nexus_timeout_is_delivered_once_the_run_has_room() {
+    let (store, runtime, first, _) = counting_fixture_with_cache(0).await;
+    let now = OffsetDateTime::now_utc();
+    let LoadedRun::Existing(mut state) = store.load_run(first.run_key).await.unwrap() else {
+        panic!("run");
+    };
+    let mut op = cached_operation(0, now);
+    op.schedule_to_close_timeout = Some(Duration::seconds(-1));
+    runtime
+        .nexus_timeout_tracking
+        .insert(crate::NexusTimeoutEntry {
+            timeouts: Some(crate::nexus::NexusTimeouts::from(&op)),
+            run_key: first.run_key,
+            shard_id: ShardId(0),
+            operation_id: op.operation_id.clone(),
+            scheduled_event_id: op.scheduled_event_id,
+            scheduled_at: now,
+        });
+    state
+        .pending_nexus_operations
+        .insert(op.operation_id.clone(), op);
+    install_deadline_state(store.as_ref(), state).await;
+    let config = NexusTimeoutScannerConfig::default();
+    let scan = || {
+        crate::nexus::scan_nexus_timeouts_at(
+            store.as_ref(),
+            &runtime.nexus_timeout_tracking,
+            None,
+            &runtime.lanes,
+            runtime.lanes.len(),
+            &config,
+            now,
+        )
+    };
+
+    let lane = runtime.pick_lane(first.run_key);
+    let mut claims = Vec::new();
+    while let Ok(claim) = lane.reserve(first.run_key) {
+        claims.push(claim);
+    }
+    for _ in 0..2 {
+        scan().await;
+        assert_eq!(runtime.nexus_timeout_tracking.snapshot().len(), 1);
+        runtime.nexus_timeout_tracking.inner.begin_full_pass(true);
+    }
+
+    drop(claims);
+    scan().await;
+    assert!(runtime.nexus_timeout_tracking.snapshot().is_empty());
+    let LoadedRun::Existing(state) = store.load_run(first.run_key).await.unwrap() else {
+        panic!("run");
+    };
+    assert!(state.pending_nexus_operations.is_empty());
+    finish(&runtime).await;
+}

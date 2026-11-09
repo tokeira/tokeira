@@ -643,4 +643,37 @@ mod deadline_tests {
             std::time::Duration::ZERO
         );
     }
+
+    // A lane refusal is transient: the timeout stays tracked and is delivered
+    // on a later pass, once the run has room.
+    #[tokio::test]
+    async fn a_refused_workflow_timeout_is_delivered_on_a_later_pass() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let tracking = WorkflowTimeoutTrackingState::default();
+        let expired = entry(now, 1);
+        tracking.insert(expired.clone());
+        let now = now + Duration::seconds(5);
+        let config = WorkflowTimeoutScannerConfig::default();
+        let refusals: [fn() -> anyhow::Error; 2] = [
+            || crate::WorkflowBusy.into(),
+            || crate::LaneOverloaded.into(),
+        ];
+        let mut attempts = 0;
+        for refusal in refusals {
+            scan_workflow_timeouts_once(&tracking, None, &config, now, |_, _, _| {
+                attempts += 1;
+                async move { Err(refusal()) }
+            })
+            .await;
+            tracking.inner.begin_full_pass(false);
+        }
+        assert_eq!(attempts, 2);
+        let mut delivered = Vec::new();
+        scan_workflow_timeouts_once(&tracking, None, &config, now, |entry, _, _| {
+            delivered.push(entry.run_key);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(delivered, [expired.run_key]);
+    }
 }

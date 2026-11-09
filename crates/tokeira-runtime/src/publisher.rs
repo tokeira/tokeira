@@ -8,6 +8,7 @@
 use tokeira_kernel::deadline_after;
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     future::Future,
     sync::{Arc, Mutex, RwLock},
@@ -25,7 +26,8 @@ use tokeira_clock::{Clock, system_clock};
 use tokeira_kernel::{
     CallbackAttemptOutcome, CallbackCompletionOutcome, CallbackSpec, CallbackState, Command,
     CompletionCallback, CompletionCallbackAttemptedRequest, DispatchOp, Link, LoadedRun,
-    NexusCancellationAttemptOutcome, PendingNexusOperation, callback_completion_outcome,
+    NexusCancellationAttemptOutcome, PendingNexusOperation, WorkflowState,
+    callback_completion_outcome,
 };
 use tokeira_observability::ChannelTraceContext;
 use tokeira_proto::{
@@ -296,9 +298,27 @@ where
         self
     }
 
+    /// The run state that routes a publish: the state the publishing lane
+    /// just committed when it passed one, otherwise the stored run. `None`
+    /// means the run is absent, and routing keeps the queue it was given.
+    async fn routing_state<'a>(
+        &self,
+        run_key: RunKey,
+        committed: Option<&'a WorkflowState>,
+    ) -> Result<Option<Cow<'a, WorkflowState>>> {
+        if let Some(state) = committed {
+            return Ok(Some(Cow::Borrowed(state)));
+        }
+        Ok(match self.repo.load_run(run_key).await? {
+            LoadedRun::Existing(state) => Some(Cow::Owned(state)),
+            LoadedRun::Absent => None,
+        })
+    }
+
     async fn route_workflow_task_queue(
         &self,
         run_key: RunKey,
+        committed: Option<&WorkflowState>,
         mut queue: QueueKey,
     ) -> Result<QueueKey> {
         if queue.deployment.is_some() {
@@ -314,7 +334,7 @@ where
         else {
             return Ok(queue);
         };
-        let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
+        let Some(state) = self.routing_state(run_key, committed).await? else {
             return Ok(queue);
         };
         let preferred_deployment = state
@@ -350,9 +370,10 @@ where
     async fn hydrate_sticky_workflow_task_target(
         &self,
         run_key: RunKey,
+        committed: Option<&WorkflowState>,
         mut queue: QueueKey,
     ) -> Result<(QueueKey, Option<OffsetDateTime>)> {
-        let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
+        let Some(state) = self.routing_state(run_key, committed).await? else {
             return Ok((queue, None));
         };
         // Sticky affinity is established by a completed WFT, so the run's
@@ -382,6 +403,7 @@ where
     async fn route_activity_task_queue(
         &self,
         run_key: RunKey,
+        committed: Option<&WorkflowState>,
         queue: QueueKey,
         dispatch_revision: i64,
     ) -> Result<(QueueKey, i64)> {
@@ -393,7 +415,7 @@ where
         let Some(registry) = registry else {
             return Ok((queue, dispatch_revision));
         };
-        let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
+        let Some(state) = self.routing_state(run_key, committed).await? else {
             return Ok((queue, dispatch_revision));
         };
         route_activity_task_queue(Some(&registry), &state, queue, dispatch_revision).await
@@ -1059,6 +1081,47 @@ where
         execution_home: ShardId,
         ops: &[DispatchOp],
     ) -> Result<()> {
+        self.publish_routed(run_key, execution_home, None, ops)
+            .await
+    }
+
+    async fn publish_committed(
+        &self,
+        committed: &WorkflowState,
+        execution_home: ShardId,
+        ops: &[DispatchOp],
+    ) -> Result<()> {
+        self.publish_routed(committed.run_key, execution_home, Some(committed), ops)
+            .await
+    }
+
+    async fn submit_to_run(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
+        self.pick_lane(run_key).submit(run_key, command).await
+    }
+
+    async fn reserve_start_poller(&self, queue: &QueueKey) -> Option<ReservedPoller> {
+        self.broker.try_reserve_poller(queue).await
+    }
+
+    async fn return_start_poller(&self, reserved: ReservedPoller) {
+        self.broker.return_reserved_poller(reserved).await;
+    }
+}
+
+impl<R> RuntimeDispatchPublisher<R>
+where
+    R: RunRepository + 'static,
+{
+    /// Publish `ops` for `run_key`. Routing reads `committed` when the
+    /// publishing lane passed the state it just committed, and reloads the run
+    /// otherwise; both give the same queues for the same stored state.
+    async fn publish_routed(
+        &self,
+        run_key: RunKey,
+        execution_home: ShardId,
+        committed: Option<&WorkflowState>,
+        ops: &[DispatchOp],
+    ) -> Result<()> {
         // This hint shortens the normal path. Discovery remains sufficient when
         // the whole publication is lost, including operation-free source closes.
         self.outbound_wake.notify_one();
@@ -1080,7 +1143,11 @@ where
                     let (final_queue, final_sticky, normal_queue, sticky_deadline) =
                         if let Some((_, normal_name)) = sticky_normal {
                             let (sticky_queue, sticky_deadline) = self
-                                .hydrate_sticky_workflow_task_target(run_key, workflow_queue)
+                                .hydrate_sticky_workflow_task_target(
+                                    run_key,
+                                    committed,
+                                    workflow_queue,
+                                )
                                 .await?;
                             // Re-resolve the normal queue without the sticky
                             // offer's deployment fields. A Current change makes the
@@ -1096,8 +1163,9 @@ where
                                 build_id: None,
                                 ..queue.clone()
                             };
-                            let routed_normal =
-                                self.route_workflow_task_queue(run_key, normal).await?;
+                            let routed_normal = self
+                                .route_workflow_task_queue(run_key, committed, normal)
+                                .await?;
                             let sticky_target_changed = self.worker_deployment_routing_enabled()
                                 && (sticky_queue.deployment != routed_normal.deployment
                                     || sticky_queue.build_id != routed_normal.build_id);
@@ -1113,7 +1181,7 @@ where
                             }
                         } else {
                             (
-                                self.route_workflow_task_queue(run_key, workflow_queue)
+                                self.route_workflow_task_queue(run_key, committed, workflow_queue)
                                     .await?,
                                 None,
                                 None,
@@ -1188,7 +1256,12 @@ where
                     } = op
                     {
                         let (queue, dispatch_revision) = self
-                            .route_activity_task_queue(run_key, queue.clone(), *dispatch_revision)
+                            .route_activity_task_queue(
+                                run_key,
+                                committed,
+                                queue.clone(),
+                                *dispatch_revision,
+                            )
                             .await?;
                         let task = DispatchableActivityTask {
                             run_key,
@@ -1318,18 +1391,6 @@ where
             }
         }
         Ok(())
-    }
-
-    async fn submit_to_run(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
-        self.pick_lane(run_key).submit(run_key, command).await
-    }
-
-    async fn reserve_start_poller(&self, queue: &QueueKey) -> Option<ReservedPoller> {
-        self.broker.try_reserve_poller(queue).await
-    }
-
-    async fn return_start_poller(&self, reserved: ReservedPoller) {
-        self.broker.return_reserved_poller(reserved).await;
     }
 }
 

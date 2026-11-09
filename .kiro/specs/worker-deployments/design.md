@@ -674,6 +674,23 @@ queue from the deployment registry's routing config:
 Routing decisions are derived effects of durable registry + per-run state; no
 correctness weight rests on transient queues (Requirement 13.6).
 
+The per-run state that routes a publish is the state the publish follows from:
+
+- **After a lane commit.** The lane publishes the transition's dispatch with the
+  state that transition committed. Routing reads the workflow-task queue, sticky
+  hydration and activity queue from that state, and reads no run back from
+  storage. While the lane waits on the publish, no lane-ordered command can change
+  the run. The writes that bypass the lane (activity heartbeat, start and retry
+  commits, and rule pauses) change only activity entries, which routing does not
+  read. So the committed state routes each task to the same queue as a fresh read.
+- **Any other publish.** A successor run that a close commits alongside it, a
+  successor or reset run published through outbound preparation, and any caller
+  without a commit of its own route from the run as storage holds it. Another lane
+  may already be serving such a run.
+
+The registry side of the decision is read at publish time on both paths. A routing
+change made after the commit therefore still applies to the task being published.
+
 #### WFT target-notification input
 
 `start_polled_workflow_task` already calls `resolve_polled_workflow_task_target` before

@@ -29,7 +29,7 @@ use smallvec::SmallVec;
 use tokeira_clock::{Clock, system_clock};
 use tokeira_kernel::{
     ActivityOp, Command, DispatchOp, HistoryEvent, HistoryEventKind, Kernel, LoadedRun,
-    StartRequest,
+    StartRequest, WorkflowState,
 };
 use tokeira_observability::{
     ChannelTraceContext, ErrorBiasedSamplingReason, NotShardOwnerOperationLabel, RetryOutcomeLabel,
@@ -107,6 +107,28 @@ pub trait DispatchPublisher: Send + Sync {
         execution_home: ShardId,
         ops: &[DispatchOp],
     ) -> Result<()>;
+
+    /// Publish the dispatch batch of a transition the caller has just
+    /// committed, routing from `committed` — the transition's applied state —
+    /// instead of reading the run back from storage.
+    ///
+    /// Only the lane that committed the transition may call this, still holding
+    /// the commit's write admission and before it takes its next command. Every
+    /// write that can change what routing reads (versioning, deployment and
+    /// workflow-task fields) is a lane-ordered kernel transition. The commits
+    /// that bypass the lane (activity heartbeat, start, retry, rule pause) touch
+    /// only activity entries. An exclusive publication (reset, successor) waits
+    /// for the admission. So while the lane waits on this publish, `committed`
+    /// is the run's routing state. The default reads storage as
+    /// [`publish`](Self::publish) does.
+    async fn publish_committed(
+        &self,
+        committed: &WorkflowState,
+        execution_home: ShardId,
+        ops: &[DispatchOp],
+    ) -> Result<()> {
+        self.publish(committed.run_key, execution_home, ops).await
+    }
 
     /// Submit a command to a specific run, used by
     /// orchestration follow-up paths such as child
@@ -1070,10 +1092,15 @@ where
                     // broker-enqueue op to avoid scheduling the same WFT twice.
                     dispatch_ops.retain(|op| !matches!(op, DispatchOp::EnqueueWorkflowTask { .. }));
                 }
+                // Route from the state this activation just committed: the lane
+                // holds the run until the publish returns, so a reload would read
+                // the same routing fields back at the cost of a storage read on
+                // the run's critical path.
                 if !dispatch_ops.is_empty()
+                    && let CommitResult::Applied { new_state } = &commit_result
                     && let Some(shard_id) = shard_id
                     && let Err(error) = publisher
-                        .publish(message.run_key, shard_id, &dispatch_ops)
+                        .publish_committed(new_state, shard_id, &dispatch_ops)
                         .instrument(processing_span.clone())
                         .await
                 {
@@ -2257,6 +2284,7 @@ pub(crate) fn track_committed_run(
 #[cfg(test)]
 mod tests {
     mod atomic_successors;
+    mod committed_publish;
     mod heartbeat;
     mod outbound_publication;
     use std::{

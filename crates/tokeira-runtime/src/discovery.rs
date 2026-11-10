@@ -5,7 +5,7 @@
 //! Demand and offers are volatile; only the authoritative start can consume work.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt::Debug,
     num::NonZeroU32,
     sync::{Arc, Mutex, RwLock},
@@ -47,6 +47,44 @@ pub(crate) struct QueueHome {
     pub(crate) id: ShardId,
     pub(crate) generation: u64,
     pub(crate) cancel: CancellationToken,
+    pub(crate) deadline: Arc<Mutex<Option<Instant>>>,
+}
+
+impl QueueHome {
+    /// Check the live cancellation/deadline shared with the lease renewer.
+    /// The provider separately verifies that this generation is still serving.
+    pub(crate) fn valid(&self) -> bool {
+        !self.cancel.is_cancelled()
+            && self
+                .deadline
+                .lock()
+                .expect("acquisition deadline lock poisoned")
+                .is_none_or(|deadline| Instant::now() < deadline)
+    }
+
+    /// Wait independently of discovery, allowing renewals to extend the deadline.
+    /// Active acquisitions have their first deadline installed before publication.
+    pub(crate) async fn retired(&self) -> &'static str {
+        loop {
+            let deadline = *self
+                .deadline
+                .lock()
+                .expect("acquisition deadline lock poisoned");
+            tokio::select! {
+                _ = self.cancel.cancelled() => return "cancelled",
+                _ = async {
+                    match deadline {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // Renewal only extends an active acquisition's deadline. Re-read at
+                    // the old deadline so a successful renewal cannot retire live work.
+                    if !self.valid() { return "deadline"; }
+                }
+            }
+        }
+    }
 }
 
 /// Supplies the queue partition's home, independently of execution placement.
@@ -77,6 +115,7 @@ impl PlacementQueueHomes {
             id: home,
             generation: acquisition.generation,
             cancel: acquisition.cancel,
+            deadline: acquisition.deadline,
         })
     }
 }
@@ -268,6 +307,9 @@ struct Registration {
 #[derive(Debug, Default)]
 struct RegistryState {
     ranges: HashMap<RangeKey, Registration>,
+    // Keep the watcher registration through idle-range eviction. Renewed demand
+    // in the same acquisition must not wake retirement to clone its maps again.
+    acquisitions: BTreeMap<(ShardId, u64), QueueHome>,
     turn: u64,
 }
 
@@ -277,6 +319,7 @@ pub(crate) struct DiscoveryRegistry {
     pub(crate) test_gate: Arc<crate::discovery::test_gate::TestPassGate>,
     state: Arc<Mutex<RegistryState>>,
     pub(crate) wake: Arc<Notify>,
+    pub(crate) retirement_wake: Arc<Notify>,
 }
 
 #[derive(Debug)]
@@ -341,6 +384,13 @@ impl DiscoveryRegistry {
             });
         }
         let mut state = self.state.lock().expect("discovery registry lock poisoned");
+        state
+            .acquisitions
+            .entry((home.id, home.generation))
+            .or_insert_with(|| {
+                self.retirement_wake.notify_one();
+                home.clone()
+            });
         for key in &keys {
             let turn = state.turn;
             state.turn += 1;
@@ -457,6 +507,28 @@ impl DiscoveryRegistry {
         }
     }
 
+    /// Snapshot demand-only acquisitions too, so even a page that has not started
+    /// gets a lifecycle watcher. Duplicate queues share one watcher per generation.
+    pub(crate) fn acquisitions(&self) -> Vec<QueueHome> {
+        let state = self.state.lock().expect("discovery registry lock poisoned");
+        state.acquisitions.values().cloned().collect()
+    }
+
+    /// Cancel pages and remove demand only for this generation. Late page results
+    /// cannot recreate a registration, or complete into a replacement generation.
+    pub(crate) fn retire_acquisition(&self, home: &QueueHome) {
+        let mut state = self.state.lock().expect("discovery registry lock poisoned");
+        state.acquisitions.remove(&(home.id, home.generation));
+        state.ranges.retain(|key, entry| {
+            let remove = key.home == home.id && key.generation == home.generation;
+            if remove {
+                entry.cancel.cancel();
+            }
+            !remove
+        });
+        self.wake.notify_one();
+    }
+
     fn retire(&self, now: Instant) -> Vec<(QueueHome, QueueKey)> {
         let mut state = self.state.lock().expect("discovery registry lock poisoned");
         let mut idle: HashMap<ShardId, Vec<(Instant, u64, RangeKey)>> = HashMap::new();
@@ -566,12 +638,6 @@ async fn run_slice<R: RunRepository + 'static>(
         if !range.matches(&row) {
             metrics::counter!(crate::metrics::WORKFLOW_DISPATCH_SKIPS_TOTAL, "reason" => "incompatible")
                 .increment(1);
-        } else if broker
-            .knows_offer((row.incarnation.run_key, row.incarnation.logical_seq))
-            .await
-        {
-            metrics::counter!(crate::metrics::WORKFLOW_DISPATCH_SKIPS_TOTAL, "reason" => "known")
-                .increment(1);
         } else if let Some(task) = source.resolve(&row).await? {
             if registry.compatible(key, pass.registration, &task.queue) {
                 match broker
@@ -587,6 +653,8 @@ async fn run_slice<R: RunRepository + 'static>(
                             .increment(1)
                     }
                     OfferAdmission::Full => return Ok(SliceOutcome::Capacity),
+                    OfferAdmission::NotHome => return Ok(SliceOutcome::Cancelled),
+                    OfferAdmission::Expired => {},
                 }
             } else {
                 metrics::counter!(crate::metrics::WORKFLOW_DISPATCH_SKIPS_TOTAL, "reason" => "incompatible")

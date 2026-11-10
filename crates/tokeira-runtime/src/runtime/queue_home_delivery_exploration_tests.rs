@@ -220,9 +220,8 @@ fn queue_home_delivery_exploration_retirement_without_discovery() {
         .enable_all()
         .build()
         .unwrap();
-    expected_failure(
-        "retired acquisition still exposes a ready offer",
-        |copies| {
+    for copies in 1..=100 {
+        assert!({
             rt.block_on(async {
                 let repo = Arc::new(InMemoryStore::with_shard_count(8));
                 let queue = queue("retirement");
@@ -246,6 +245,6 @@ fn queue_home_delivery_exploration_retirement_without_discovery() {
                 homes.local_home(&queue).unwrap().cancel.cancel();
                 broker.try_claim_workflow_task(&queue, key).await.is_none()
             })
-        },
-    );
+        });
+    }
 }

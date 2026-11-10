@@ -12,6 +12,7 @@ fn home(generation: u64) -> QueueHome {
         id: ShardId(7),
         generation,
         cancel: CancellationToken::new(),
+        deadline: Default::default(),
     }
 }
 

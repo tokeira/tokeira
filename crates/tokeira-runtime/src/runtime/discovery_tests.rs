@@ -553,7 +553,138 @@ async fn claim_workflow_task<R: RunRepository + 'static>(
         return Ok(None);
     };
     Ok(runtime
-        .start_polled_workflow_task(offered.0, offered.1, identity)
+        .start_polled_workflow_task(offered.0, offered.1.into(), identity)
         .await
         .ok())
+}
+
+type HandedOverStart = (
+    ShardId,
+    DispatchableWorkflowTask,
+    WorkerIdentity,
+    oneshot::Sender<Result<StartedWorkflowTask>>,
+);
+
+#[derive(Debug)]
+struct HeldOwnerReply {
+    request: Mutex<Option<oneshot::Sender<HandedOverStart>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::WorkflowTaskStarter for HeldOwnerReply {
+    async fn start(
+        &self,
+        home: ShardId,
+        offered: DispatchableWorkflowTask,
+        worker: WorkerIdentity,
+    ) -> Result<StartedWorkflowTask> {
+        let (reply, result) = oneshot::channel();
+        self.request
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .send((home, offered, worker, reply))
+            .unwrap();
+        result.await.unwrap()
+    }
+}
+
+#[tokio::test]
+async fn retirement_during_owner_start_delivers_committed_result() {
+    for retire_before_commit in [true, false] {
+        let store = Arc::new(InMemoryStore::with_shard_count(8));
+        let queue = queue();
+        let queue_home = tokeira_types::bundle_for_partition(
+            tokeira_types::workflow_queue_partition(queue.namespace_id, &queue.task_queue.0, 8),
+            8,
+        );
+        let item = (0..100)
+            .map(|n| transition(&queue, n))
+            .find(|item| {
+                execution_home_bundle(
+                    queue.namespace_id.0.as_bytes(),
+                    item.next_state.workflow_id.0.as_bytes(),
+                    8,
+                ) != queue_home
+            })
+            .unwrap();
+        let execution_home = execution_home_bundle(
+            queue.namespace_id.0.as_bytes(),
+            item.next_state.workflow_id.0.as_bytes(),
+            8,
+        );
+        let hint = offer(&item);
+        store
+            .commit_transition(hint.run_key, item, WriteFence::Unfenced)
+            .await
+            .unwrap();
+        let node = Arc::new(runtime(store.clone(), home(queue_home.0)));
+        let owner = runtime(store.clone(), home(execution_home.0));
+        for id in 0..8 {
+            if id != queue_home.0 {
+                node.shard_owner.write().unwrap().remove(ShardId(id));
+            }
+            if id != execution_home.0 {
+                owner.shard_owner.write().unwrap().remove(ShardId(id));
+            }
+        }
+        let (request, handed_over) = oneshot::channel();
+        node.set_workflow_task_starter(Arc::new(HeldOwnerReply {
+            request: Mutex::new(Some(request)),
+        }));
+        node.broker.publish_workflow_task(hint.clone(), None).await;
+        let acquisition =
+            crate::discovery::QueueHomeProvider::local_home(node.discovery.1.as_ref(), &queue)
+                .unwrap();
+        let poll_node = node.clone();
+        let poll = tokio::spawn(async move {
+            poll_node
+                .poll_workflow_activation(
+                    queue,
+                    None,
+                    WorkerIdentity("worker".into()),
+                    std::time::Duration::ZERO,
+                )
+                .await
+        });
+        let (destination, offered, worker, reply) = handed_over.await.unwrap();
+        assert_eq!(destination, execution_home);
+        if retire_before_commit {
+            acquisition.cancel.cancel();
+            node.broker
+                .retire_acquisition(&acquisition, "cancelled")
+                .await;
+        }
+        let started = owner
+            .start_forwarded_workflow_task(offered, worker)
+            .await
+            .unwrap();
+        let expected = started.token.clone();
+        if !retire_before_commit {
+            acquisition.cancel.cancel();
+            node.broker
+                .retire_acquisition(&acquisition, "cancelled")
+                .await;
+        }
+        let LoadedRun::Existing(state) = store.load_run(hint.run_key).await.unwrap() else {
+            panic!("run missing")
+        };
+        assert_eq!(
+            state
+                .pending_workflow_task
+                .as_ref()
+                .unwrap()
+                .started_event_id,
+            Some(expected.started_event_id)
+        );
+        let _ = reply.send(Ok(started));
+        let result = poll.await.unwrap().unwrap();
+        assert!(
+            matches!(&result, Some(WorkflowActivation::WorkflowTask(task)) if task.token == expected),
+            "retirement dropped an owner-committed start: {result:?}"
+        );
+        stop(&node).await;
+        stop(&owner).await;
+    }
 }

@@ -245,6 +245,32 @@ helper scripts (`run_suite.sh`, `run_nexus_outbound_conformance.sh`, and four `d
       top-level classified skip under the campaign's framework-internals exclusion.
     - _Requirements: 6.1, 6.3, 8.6_
 
+## 2026-11-10 — Run and label instead of skip
+
+Fork change: [tokeira/temporal#2](https://github.com/tokeira/temporal/pull/2) on `tokeira/conformance-v1.31.0`.
+This amendment supersedes the skip fallback and teardown behaviour recorded in Task 11 above.
+
+- [x] 16. Amend the fork bridge and runners
+  - [x] 16.1 Send harness settings at Shape-2 cluster start
+    - Send the corpus-wide defaults, SDK callback template and both task-queue partition counts;
+      report each unhonoured harness key once per cluster without skipping or labelling tests.
+    - _Requirements: 6.5_
+  - [x] 16.2 Run and label tests whose overrides are not honoured
+    - Include the full test name, key, requested value and control answer or delivery/encoding
+      error; apply suite overrides separately for each test. Omit the label when the encoded
+      override equals the harness value. Keep named registry skips and corpus test bodies unchanged.
+    - _Requirements: 5.2, 6.3, 6.4, 6.5_
+  - [x] 16.3 Restore or clear each delivered override
+    - Share once-only cleanup between the returned closure and test teardown: restore an honoured
+      harness value, otherwise clear the key; fail the test on cleanup failure. Do not reset all
+      overrides at teardown.
+    - _Requirements: 6.1, 6.2, 6.5_
+  - [x] 16.4 List unhonoured test and harness settings at the end of every run
+    - Both runners retain every distinct requested value and answer, grouped by test and key for
+      test labels and by key for harness settings. Add single-suite `-repeat N` via
+      `go test -count=N`.
+    - _Requirements: 5.2, 6.4, 6.5_
+
 ## Task Dependency Graph
 
 ```
@@ -263,6 +289,7 @@ helper scripts (`run_suite.sh`, `run_nexus_outbound_conformance.sh`, and four `d
 13 (incremental wiring)     depends on 7,11     # 13.3 also depends on the reported-problems feature (external)
 14 (final checkpoint)       depends on 13
 15 (callback overrides)     depends on 4,5,11
+16 (run and label)          depends on 11
 ```
 
 Critical path: 1 → 4 → 5 → 10 → 11 → 13 → 14. Tasks 2, 7, 8 parallelize off 1/5.

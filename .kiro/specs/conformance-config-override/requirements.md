@@ -13,7 +13,10 @@ TOML), and `tokeirad` takes no env vars on invocation (`AGENTS.md` §Configurati
 harness originally recorded the consequence: `OverrideDynamicConfig` could not reach an
 out-of-process `tokeirad`, so such leaves were either independent tagged runs or classified skips.
 The conformance control service and fork bridge implemented by this spec now deliver supported
-overrides to the external process; kernel-excluded and unwired settings retain those fallback paths.
+overrides to the external process. Unless the registry skips it by name, a test whose override is not
+honoured runs with a label naming what it ran without, and the runners list those tests and settings
+at the end of each run. The skip registry retains tests skipped by name, including the
+kernel-excluded leaves in Requirement 4.4.
 
 This spec **does not change that production posture**. It introduces a surface that exists **only in a
 `conformance`-feature build** and is **inert unless explicitly mounted**, through which the harness can
@@ -35,7 +38,7 @@ observable effect is inside a conformance build.
   registry, and the "conventions for acting on a run." This spec is an **enabling capability** for that
   campaign: it converts a recurring skip class into real coverage. It does **not** replace the
   "independent runs" convention (still used for feature modes and for kernel-const cases) or the skip
-  registry (still used for genuinely-unbridgeable cases).
+  registry (still used for tests skipped by name, including the kernel-excluded leaves).
 - **The conformance metrics bridge** (`docs/HANDOVER-conformance-metrics-bridge.md`, retired to git
   history; `tests/testcore/tokeira_metrics_bridge.go`) is the **direct precedent**: it makes an in-process
   Temporal test seam (`CaptureMetricsHandler`) work against out-of-process `tokeirad` by pointing it at
@@ -108,7 +111,7 @@ observable effect is inside a conformance build.
 - **Fork bridge:** the tokeira-specific onebox seam in the pinned Temporal fork that turns an
   `OverrideDynamicConfig` call into control-service RPCs.
 - **Honesty boundary:** the rule that an override only takes effect where tokeira genuinely honours it;
-  an unsupported override never fabricates behaviour and never turns a test green.
+  an unsupported override never fabricates behaviour, and a result names what did not take effect.
 
 ## Target State
 
@@ -118,7 +121,8 @@ observable effect is inside a conformance build.
 - The control service, when explicitly mounted on its own loopback listener, honours
   set/clear/reset of scalar and structured-JSON overrides for **wired, non-kernel** setting keys.
 - The pinned Temporal fork's out-of-process `OverrideDynamicConfig` delivers to the control service and
-  cleans up per test.
+  cleans up per test, restoring honoured harness settings or clearing keys without one. Undelivered
+  overrides are labelled in test output and listed at the end of each run.
 - An initial wired key (`MaxBufferedQueryCount`) proving the loop, then incremental wiring of
   page-size, long-poll interval, and the reported-problems threshold (unblocking Tier 3.22 leaf 4).
 - Callback admission limits and the structured `component.callbacks.allowedAddresses` rule list are
@@ -154,7 +158,9 @@ coverage (see Requirement 0).
 | Tokeira-owned Connect-RPC precedent | `crates/tokeira-compatibility-service/`, `proto/tokeira/compatibility/v1/` | buffa/connect-rust |
 | Out-of-process test-seam precedent | fork `tests/testcore/tokeira_metrics_bridge.go` | scrape-backed `CaptureMetricsHandler` |
 | Harness override entry points | fork `tests/testcore/functional_test_base.go:645`, `test_cluster.go:636` | `OverrideDynamicConfig` |
-| Skip registry (fallback) | fork `tests/testcore/tokeira_conformance_skip.go` | OverrideDynamicConfig-class skips |
+| Skip registry (named skips) | fork `tests/testcore/tokeira_conformance_skip.go` | Tests skipped by name, including kernel-excluded leaves; not a fallback for refused overrides |
+| Harness settings and test labels | fork `tests/testcore/tokeira_dynamic_config_bridge.go`, `tokeira_conformance_cluster.go` | `applyHarness`, `deliver`, `restore`, `matchesHarness` |
+| End-of-run listings | fork `tests/tokeira_conformance_runner/dynamic_config.go`, `tests/tokeira_conformance_runsuite/main.go`, `tests/tokeira_conformance_runall/main.go` | `DynamicConfigReport`; requested values and answers grouped by test and key |
 
 **Target authority:** the Temporal v1.31.0 `dynamicconfig` settings and their value types
 (`common/dynamicconfig/constants.go @ v1.31.0`) define the key namespace and per-key value type the
@@ -246,6 +252,10 @@ overrides at runtime, it additionally unlocks leaf 4 (`TestWFTFailureReportedPro
 mid-run 0→2), which is **un-skipped in scope**. `connectrpc` pinned at `0.8.1`. Kernel exclusion and the
 honesty boundary stand as written.
 
+**Amended (2026-11-10, owner):** a refused test override now runs labelled instead of falling back
+to the skip registry. A skip would hide about 590 test groups, about half of them in suites the
+v0.1.0 release evidence records as passing.
+
 ---
 
 ## Requirement 1 — Conformance-gated override registry
@@ -336,9 +346,11 @@ test by fabricating behaviour tokeira does not implement.
 **Acceptance criteria:**
 1. IF `SetDynamicConfigOverride` names a key with no wired consult-site accessor THEN the service SHALL
    respond `Unsupported` AND SHALL NOT record it.
-2. WHEN the fork bridge receives an `Unsupported` (or `InvalidArgument`) response THE bridge SHALL fall
-   back to the existing skip-registry behaviour for that test (skipped with a cited reason), and SHALL
-   NOT allow the test to proceed as if the override took effect.
+2. WHEN the fork bridge receives an `Unsupported` (or `InvalidArgument`) response for an override a
+   test sets THE bridge SHALL let the test run without it AND SHALL label the test: its output SHALL
+   name each setting it ran without, with the value asked for and `tokeirad`'s answer, and the
+   runners SHALL list every such test and setting at the end of each run, so that no result is
+   reported as if the override took effect.
 3. THE set of wired keys SHALL grow only as a genuine consult-site accessor is added; a key becomes
    honourable **only** when a real site reads it — mirroring the metrics-bridge honesty boundary.
 4. A `Not-enforced` setting (e.g. a size limit tokeira does not enforce) SHALL be `Unsupported`, never
@@ -346,21 +358,31 @@ test by fabricating behaviour tokeira does not implement.
 
 ## Requirement 6 — Fork harness bridge
 
-**User story:** As the corpus, I want `OverrideDynamicConfig` to "just work" against out-of-process
-`tokeirad`, so that leaves needing a non-default value run instead of skipping — without editing corpus
-test bodies.
+**User story:** As a conformance engineer, I want harness settings and test overrides delivered to
+out-of-process `tokeirad`, with unhonoured settings reported and delivered overrides cleaned up, so
+that tests run with an explicit record of what they ran without — without editing corpus test
+bodies.
 
 **Acceptance criteria:**
 1. WHEN a test calls `OverrideDynamicConfig(setting, value)` against an out-of-process tokeira cluster
-   THE bridge SHALL call `SetDynamicConfigOverride(setting.Key(), coerce(value))` and SHALL return a
-   `cleanup` closure that calls `ClearDynamicConfigOverride(setting.Key())`.
-2. WHEN a test (or sub-test) tears down THE bridge SHALL call `ResetDynamicConfigOverrides()` so that no
-   override leaks across tests.
+   THE bridge SHALL call `SetDynamicConfigOverride(setting.Key(), coerce(value))` and, for each
+   delivered override, SHALL return a `cleanup` closure that restores the harness's value for the
+   key when that value was honoured, or calls `ClearDynamicConfigOverride(setting.Key())` when the
+   harness sets none or its value was not honoured.
+2. WHEN a test (or sub-test) tears down THE bridge SHALL run the cleanup of each override it
+   delivered, so that no override leaks across tests, AND SHALL fail the test if a restore or clear
+   fails.
 3. THE bridge SHALL live in the tokeira onebox/Shape-2 seam (`tests/testcore/tokeira_*.go`), mirroring
    `tokeira_metrics_bridge.go`, and SHALL NOT edit any corpus test body.
-4. WHERE the control service is unreachable or the override is `Unsupported`/`InvalidArgument` THE
-   bridge SHALL apply the Requirement 5.2 fallback (skip), never a silent no-op that lets the test
-   proceed.
+4. WHERE no control listener is configured, the control service is unreachable, the bridge can't
+   encode a value, or setting the override returns any RPC failure (including
+   `Unsupported`/`InvalidArgument`) THE bridge SHALL apply the Requirement 5.2 labelling, never a
+   silent no-op; when no `tokeirad` answer is available, the label SHALL report the delivery or
+   encoding error.
+5. WHEN the Shape-2 cluster starts THE harness SHALL send `tokeirad` every setting it applies to all
+   tests, AND SHALL report each one `tokeirad` doesn't honour once per cluster and at the end of
+   each run; a refused harness setting SHALL NOT skip or label a test, and a test whose override
+   has the same encoded value as the harness's SHALL NOT be labelled for it.
 
 ## Requirement 7 — First consumer and phased wiring
 

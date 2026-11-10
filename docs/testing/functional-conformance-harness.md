@@ -63,12 +63,16 @@ any manual command below.
 
 **Out-of-scope skips.** A small, curated set of corpus tests touches an internal surface the Shape-2
 onebox does not front or depends on an override key that is deliberately unwired, kernel-excluded,
-or not enforced. Supported `OverrideDynamicConfig` values are delivered to a conformance-enabled
-out-of-process `tokeirad`; this includes static suite-level overrides applied while the Shape-2
-cluster is constructed as well as test-scoped changes. Remaining exclusions are registered by name in
+or not enforced. These tests are skipped by name in
 `tests/testcore/tokeira_conformance_skip.go` with a cited reason — **never** by editing a corpus test
-body. The registry is applied two ways: the shared `SetupTest`/`SetupSubTest` hooks skip whole methods
-and `s.Run` sub-tests, and the run-all runner additionally derives a `go test -skip` regexp from the
+body. Any other test whose override `tokeirad` doesn't honour runs
+without it, its output names what it ran without, and every run lists such tests at its end.
+The Shape-2 cluster sends the corpus-wide defaults, SDK callback template and partition counts to a
+conformance-enabled `tokeirad` at startup; unhonoured harness settings are reported once per cluster
+and skip or label no test. Suite overrides are delivered separately for each test, alongside its own
+overrides; an override matching the encoded harness value gets no test label. The registry is
+applied two ways: the shared `SetupTest`/`SetupSubTest` hooks skip whole methods and `s.Run`
+sub-tests, and the run-all runner additionally derives a `go test -skip` regexp from the
 registry (`testcore.ConformanceSkipRegexp`) so raw `t.Run` sub-tests — which testify cannot intercept —
 are skipped too, by leaf only. Skipped tests still emit a `skip` outcome the ledger classifies; nothing
 is silently dropped.
@@ -104,9 +108,11 @@ TOKEIRA_CONFORMANCE_FRONTEND_ADDR=127.0.0.1:7233 \
 
 The runner takes an arbitrary `-run` regexp (a single leaf works too, e.g.
 `'^TestNexusWorkflowTestSuite/TestNexusOperationSyncNexusFailure$'`) and an optional `-timeout`
-(default 8m). To drive `go test` directly against an already-running frontend instead, apply the
-registry's skips yourself so the manual run matches the runner (omit `-skip` to see the out-of-scope
-tests fail):
+(default 8m), plus `-repeat N` (default 1, at least 1), which passes `-count=N` to one `go test`
+invocation; the timeout covers that invocation, including all repetitions. After a change, run the
+tests it touches on their own, ten times (`-repeat 10`), as well as in their suites. To drive
+`go test` directly against an already-running frontend instead, apply the registry's skips yourself
+so the manual run matches the runner (omit `-skip` to see the out-of-scope tests fail):
 
 ```bash
 TOKEIRA_CONFORMANCE_FRONTEND_ADDR=127.0.0.1:7233 \
@@ -115,6 +121,12 @@ GOTOOLCHAIN=go1.26.2 \
 ```
 
 ## Interpreting results
+
+Both runners end each run by listing every test that ran without a setting it asked for, followed by
+the harness settings `tokeirad` did not honour. Each entry includes the setting, requested value and
+`tokeirad`'s answer (or the delivery or encoding error); test entries are grouped by test and key,
+and harness entries by key, retaining every distinct value and answer. These listings qualify
+PASS/FAIL/SKIP results: a pass does not establish that an unhonoured override took effect.
 
 A large number of failing tests is **expected** on an incomplete surface and is the point of the
 run-all posture — the value is in the clustering and classification, not the raw pass rate. Failures

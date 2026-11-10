@@ -188,10 +188,11 @@ deadline through repetition and expiry, an expired row leaves the rest of its pa
 current work behind retired entries.
 
 The full bar passes on the final code, on macOS: fmt, lint, check, doctest and doc, and test (4,578 passed,
-3 skipped). One `tkr` test, `discovered_selection_creates_and_checks_with_the_generated_compose_provisioner`, builds
-a nested workspace and expects its binary in that workspace's default `target` directory. A `CARGO_TARGET_DIR`
-override for the whole run placed the binary elsewhere, so that test is left to CI. `cargo clippy --features
-dsql-integration` is clean for the storage, runtime, engine, edge and projection crates. The changie dry run,
+3 skipped). One `tkr` test, `discovered_selection_creates_and_checks_with_the_generated_compose_provisioner`, failed:
+it builds a nested workspace and expects its binary in that workspace's default `target` directory, and a
+`CARGO_TARGET_DIR` override for the whole run placed the binary elsewhere. `tkr` does not depend on
+`tokeira-runtime`, the only crate this change touches, so that test's code is the same as on `main`. `cargo clippy
+--features dsql-integration` is clean for the storage, runtime, engine, edge and projection crates. The changie dry run,
 offline Markdown links and `git diff --check` pass.
 
 No live DSQL or network validation is claimed. The offer handler, dependency graph, lockfile, migrations and

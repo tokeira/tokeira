@@ -292,6 +292,13 @@ driving an external `tokeirad` over the public wire, per
 
 - `TestEagerWorkflowTestSuite/TestEagerWorkflowStart_TerminateDuplicate` — requires OverrideDynamicConfig(WorkflowIdReuseMinimalInterval=0) to allow an immediate TerminateIfRunning restart; v1.31.0 migrates that reuse policy to TERMINATE_EXISTING and applies the default 1s minimal-reuse gate, while tokeira cannot receive dynamic-config injection over the wire (tests/eager_workflow_start_test.go, common/dynamicconfig/constants.go, service/history/api/workflow_id_dedup.go @ v1.31.0; established OverrideDynamicConfig-class skip)
 
+  Correction: this recorded reason is wrong. v1.31.0 applies
+  `WorkflowIdReuseMinimalInterval` to a restart only when
+  `history.enableWorkflowIdReuseStartTimeValidation` is on, and that is off by default, so
+  the leaf restarts at once without the override. It was excluded when this evidence was
+  measured. Since fork commit `a1efa3557` it runs without the refused override, labelled,
+  and passes.
+
 #### `TestSizeLimitFunctionalSuite`
 
 - `TestSizeLimitFunctionalSuite/TestTerminateWorkflowCausedByHistoryCountLimit` — requires HistoryCountLimitError=20 (and warn=10) vs the v1.31.0 default 50*1024 events so a short activity/signal history force-terminates; the corpus delivers those values only through WithDynamicConfig, which cannot reach an out-of-process tokeirad (tests/sizelimit_test.go:43-51 and common/dynamicconfig/constants.go:376-384 @ v1.31.0; established OverrideDynamicConfig-class skip)

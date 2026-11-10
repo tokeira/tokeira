@@ -299,7 +299,7 @@ Every property test runs at least 100 cases and carries `// Feature: edge-eager-
 - A dropped eager task times out and is delivered through normal matching.
 - An immediate same-request retry returns the same live first WFT; a post-timeout retry omits it.
 - Workflow retry successors are not themselves eager.
-- Temporal `TestEagerWorkflowTestSuite` passes clean except the cited `OverrideDynamicConfig(WorkflowIdReuseMinimalInterval=0)` leaf, which is a classified skip.
+- Temporal `TestEagerWorkflowTestSuite` passes clean, all six leaves. `TestEagerWorkflowStart_TerminateDuplicate` asks for `OverrideDynamicConfig(WorkflowIdReuseMinimalInterval=0)`, which tokeirad refuses, so it runs without it, labelled; v1.31.0 applies that interval to a restart only when `history.enableWorkflowIdReuseStartTimeValidation` is on, and that is off by default.
 - Earlier clean workflow, WFT-timeout, retry, conflict-policy, history, and activity cohorts remain green.
 
 Completion-inline coverage adds a parked-poll reproducer that must fail on `main`

@@ -178,6 +178,7 @@ Tasks 1-5 record the original eager workflow/activity implementation. Tier 3.18 
   - [x] 9.1 Add a cited skip for `TestEagerWorkflowStart_TerminateDuplicate`
     - The leaf requires `OverrideDynamicConfig(WorkflowIdReuseMinimalInterval=0)`; the pinned default is 1 second and cannot be injected over the wire
     - Edit only the fork skip registry, never the corpus test body
+    - Superseded: the leaf doesn't need the override. v1.31.0 applies that interval to a restart only when `history.enableWorkflowIdReuseStartTimeValidation` is on, and that is off by default. The fork stopped skipping it at commit `a1efa3557`; it runs without the refused override, labelled, and passes.
   - [x] 9.2 Promote compatibility evidence only after the suite is clean
     - Mark eager workflow start Implemented, remove the experimental-only config key, and cite Tier 3.18 evidence
     - Add the clean Tier 3.18 result to `docs/readiness/conformance.md`

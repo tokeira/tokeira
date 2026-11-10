@@ -3610,6 +3610,10 @@ mod tests {
 
     #[async_trait]
     impl LeaseRepository for MockRepo {
+        fn bundle_lease_duration(&self) -> Option<time::Duration> {
+            None
+        }
+
         async fn try_acquire_bundle(
             &self,
             _bundle: ShardId,

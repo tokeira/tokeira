@@ -5428,6 +5428,8 @@ mod tests {
         trace::{SdkTracerProvider, SpanData, SpanExporter},
     };
     use proptest::prelude::*;
+    use prost::Message as _;
+    use tokeira_proto::workflowservice::StartWorkflowExecutionRequest;
     use tracing_subscriber::layer::SubscriberExt as _;
     // Endpoint target/config types are referenced only by the Nexus endpoint store
     // tests below; importing them here (not at crate scope) keeps the lib build clean.
@@ -6382,6 +6384,67 @@ mod tests {
         );
         restored.shutdown().await.expect("clean restart shutdown");
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// The runtime the engine builds stops admitting writes at the deadline of
+    /// the lease its storage grants. The engine builds the runtime on a wrapper
+    /// around the storage, not on the storage itself, so this holds only if
+    /// every layer between them passes the lease duration on.
+    #[tokio::test(start_paused = true)]
+    async fn the_engines_runtime_stops_admitting_at_the_storages_lease_deadline() {
+        const LEASE: std::time::Duration = std::time::Duration::from_secs(10);
+        let store = InMemoryStore::default().with_lease_duration(time::Duration::seconds(10));
+        let config =
+            embedded_config(TokeiraConfig::default()).expect("embedded defaults are valid");
+        // Recovering a self-assigned home acquires its lease through the
+        // runtime's own acquisition, the path a controller directive takes, so
+        // the runtime sets its deadline from whatever repository it was given.
+        let stack = build_embedded(
+            Arc::new(config),
+            store.clone(),
+            true,
+            ChasmExtensions::default(),
+        )
+        .await
+        .expect("the embedded stack builds");
+        let start = |workflow_id: &str| InProcessGrpcRequest {
+            service: "temporal.api.workflowservice.v1.WorkflowService".to_owned(),
+            rpc: "StartWorkflowExecution".to_owned(),
+            headers: Default::default(),
+            proto: StartWorkflowExecutionRequest {
+                namespace: "default".to_owned(),
+                workflow_id: workflow_id.to_owned(),
+                workflow_type: Some(tokeira_proto::common::WorkflowType {
+                    name: "lease-deadline-workflow".to_owned(),
+                }),
+                task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                    name: "lease-deadline-queue".to_owned(),
+                    ..Default::default()
+                }),
+                request_id: workflow_id.to_owned(),
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into(),
+        };
+
+        stack
+            .service
+            .call(start("before-the-deadline"))
+            .await
+            .expect("the owner admits a write inside its lease");
+        // A stalled renewal never answers, so nothing extends the lease from
+        // here: only the local deadline can stop the owner.
+        store.stall_lease_renewals();
+        tokio::time::advance(LEASE).await;
+        let refused = stack.service.call(start("after-the-deadline")).await;
+        stack.background_cancel.cancel();
+        let status = refused.expect_err("the owner admitted a write after its lease deadline");
+        assert_eq!(status.code(), tonic::Code::Aborted, "{status:?}");
+        assert!(
+            status.message().contains("not shard owner"),
+            "the refusal names the lapsed ownership: {status:?}"
+        );
     }
 
     #[test]

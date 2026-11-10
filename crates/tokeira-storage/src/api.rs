@@ -3047,9 +3047,15 @@ pub trait LeaseRepository: Send + Sync {
     /// Duration granted by a successful acquire or renewal. `None` denotes a
     /// non-expiring local lease, as in the memory backend. Runtime admission may
     /// use the request start plus this duration as a conservative local deadline.
-    fn bundle_lease_duration(&self) -> Option<time::Duration> {
-        None
-    }
+    ///
+    /// Required, with no default, because the runtime is usually built on a
+    /// wrapper around the backend rather than on the backend itself. A default
+    /// `None` let a wrapper that forgot to forward this silently turn an
+    /// expiring lease into a non-expiring one: the fence still refused the
+    /// lapsed owner's writes, but the owner kept starting commits past its
+    /// lease, and on DSQL each fenced commit that lands first aborts the
+    /// takeover's. Every implementer, wrapper or backend, states its answer.
+    fn bundle_lease_duration(&self) -> Option<time::Duration>;
 
     /// Attempt to acquire ownership of `bundle`.
     ///

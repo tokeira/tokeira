@@ -753,6 +753,10 @@ impl<R> LeaseRepository for HistoryNotifyingRepository<R>
 where
     R: LeaseRepository + Send + Sync + 'static,
 {
+    fn bundle_lease_duration(&self) -> Option<time::Duration> {
+        self.inner.bundle_lease_duration()
+    }
+
     async fn try_acquire_bundle(
         &self,
         bundle: ShardId,
@@ -817,6 +821,20 @@ mod tests {
             HistoryWaitRegistry::default(),
         );
         assert_eq!(repo.commit_concurrency_ceiling(), None);
+    }
+
+    #[test]
+    fn the_lease_duration_is_the_inner_repositorys() {
+        let repo = HistoryNotifyingRepository::new(
+            Arc::new(InMemoryStore::default().with_lease_duration(Duration::seconds(10))),
+            HistoryWaitRegistry::default(),
+        );
+        assert_eq!(repo.bundle_lease_duration(), Some(Duration::seconds(10)));
+        let repo = HistoryNotifyingRepository::new(
+            Arc::new(InMemoryStore::default()),
+            HistoryWaitRegistry::default(),
+        );
+        assert_eq!(repo.bundle_lease_duration(), None);
     }
 
     fn pinned_start_transition(

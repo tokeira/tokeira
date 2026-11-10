@@ -1,0 +1,5 @@
+kind: fixed
+body: Under controller-managed placement, a node whose shard lease has lapsed now stops starting writes at its lease deadline, so it no longer holds back the node taking over.
+time: 2026-11-09T19:55:48+00:00
+custom:
+    Slice: 6cd04ddd-9c4d-412c-a4bf-72d5a7f9ce15

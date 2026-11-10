@@ -2,7 +2,7 @@
 
 ## Introduction
 
-Complete the remaining activity delivery work in remediation item 1.4. Workflow
+Complete the remaining activity delivery work. Workflow
 task dispatch already uses durable actionable state; workflow-backed activity
 tasks still depend on execution-owner publication, a first-page reconciliation
 scan, and a second persisted backlog. This is the activity successor to
@@ -63,7 +63,7 @@ Activity timeout tracking and timeout transitions remain active and authoritativ
 
 The full queue-home-to-execution-owner start path is included: forwarding an offer
 alone cannot make an activity poll succeed. Proactive cross-node offer push and
-other remaining item 4.7 work are not prerequisites for correctness here. General
+the rest of queue-home delivery are not prerequisites for correctness here. General
 run-scoped RPC forwarding, speculative workflow tasks, standalone CHASM activities,
 new public RPC support, timeout architecture redesign, and changes to other
 derived-operation or intent families are out of scope. Existing eager workflow

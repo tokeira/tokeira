@@ -3,8 +3,8 @@
 ## Review status and overview
 
 Design and [tasks.md](tasks.md) approved on 31 October 2026, against the approved
-[requirements](bugfix.md). All remaining item 1.9 changes belong to one implementation
-PR. Baseline: `e057750774e38776019bb6c8e7043ebde902a1d5`.
+[requirements](bugfix.md). All remaining outbound-recovery changes belong to one
+implementation PR. Baseline: `e057750774e38776019bb6c8e7043ebde902a1d5`.
 
 Committed run state retains pending operations; a derived `run_operation` index makes
 them continuously discoverable. A separate immutable `run_intent` record retains what
@@ -34,8 +34,8 @@ review, not an assertion that the baseline order was already correct.
 
 No public Temporal RPC, vendored proto change, new dependency, package, or compatibility
 pin is introduced. The new internal RPC is necessary when source and destination have
-different owners; it does not complete general forwarding (4.6) or queue-home delivery
-(4.7). Callback delivery retains its existing scanner. General activity reconciliation,
+different owners; it does not complete general forwarding or queue-home delivery.
+Callback delivery retains its existing scanner. General activity reconciliation,
 projection, CHASM and worker-compute are unchanged.
 
 The proposed architecture 042 remains a proposal outside this PR's scope. This design

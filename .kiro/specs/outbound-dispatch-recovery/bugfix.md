@@ -2,8 +2,8 @@
 
 ## Status and scope
 
-Requirements approved on 31 October 2026. This is the combined remaining delivery for remediation
-item 1.9, in one PR containing the reviewed specification, implementation, verification
+Requirements approved on 31 October 2026. This is the combined remaining delivery for recoverable
+outbound dispatches, in one PR containing the reviewed specification, implementation, verification
 and change record. Baseline: `e057750774e38776019bb6c8e7043ebde902a1d5`.
 
 The behavioural authority is Temporal server **v1.31.0**; wire shape comes from the
@@ -24,10 +24,10 @@ conflict with these requirements. Their unrelated behaviour remains binding.
 [Durable Actionable State](../../../docs/architecture/042-durable-actionable-state.md)
 is a proposal, not an approved implementation design. This document adopts its recovery
 objectives; concrete representations and interfaces belong in the subsequent design.
-Workflow/activity dispatch reconciliation (item 1.4), general storage-contract coverage
-(1.8), queue-home transport (4.7), projection and CHASM/worker-compute redesign are
-separate deliveries. This PR includes the storage and routing changes necessary for
-these outbound operations, without depending on those later items for recovery.
+Workflow/activity dispatch reconciliation, general storage-contract coverage, queue-home
+transport, projection and CHASM/worker-compute redesign are separate deliveries. This PR
+includes the storage and routing changes necessary for these outbound operations, without
+depending on those later deliveries for recovery.
 
 ## Bug summary
 
@@ -332,7 +332,7 @@ whose intent or outcome is no longer knowable.
 ### Requirement 10: Preservation and verification
 
 **User story:** As a maintainer, I want executable recovery and preservation evidence,
-so that completing item 1.9 does not weaken existing workflow semantics.
+so that completing outbound recovery does not weaken existing workflow semantics.
 
 1. THE implementation SHALL preserve the kernel's deterministic, I/O-free single-run transition boundary.
 2. THE implementation SHALL preserve successful-path payloads, public history ordering and validation outside the explicitly corrected recovery/ordering cases.
@@ -342,7 +342,7 @@ so that completing item 1.9 does not weaken existing workflow semantics.
 6. THE verification suite SHALL cover duplicate discovery, transient failures, competing owners, stale incarnations and payload hydration in both storage backends.
 7. THE verification suite SHALL cover missing-timeout Nexus operations, first-child-task release, child-chain reuse, reset publication and oversized-successor recovery.
 8. THE delivery SHALL include pinned Temporal conformance evidence for the affected child, external-operation, Nexus, reset and successor behaviours.
-9. THE PR SHALL include the repository completion checks, a change record and a path-by-path item 1.9 completion ledger.
+9. THE PR SHALL include the repository completion checks, a change record and a path-by-path completion ledger.
 
 ## Preservation set
 

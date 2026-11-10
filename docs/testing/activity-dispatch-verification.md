@@ -1,6 +1,6 @@
 # Activity dispatch verification and rollout
 
-This change delivers remediation item 1.4 using the approved
+This change delivers the remaining activity dispatch work using the approved
 [activity-dispatch plan](../../.kiro/specs/activity-dispatch/tasks.md).
 The evidence below distinguishes implementation, memory/transport checks and
 physical DSQL checks. A compiled live test is not a completed live check.

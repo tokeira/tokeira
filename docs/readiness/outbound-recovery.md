@@ -1,6 +1,6 @@
-# Remediation 1.9 delivery ledger
+# Outbound recovery delivery ledger
 
-This is the combined remaining item 1.9 delivery after PRs 338–340. The
+This is the combined remaining outbound-recovery delivery after PRs 338–340. The
 [approved specification](../../.kiro/specs/outbound-dispatch-recovery/bugfix.md) owns
 scope; the [cutover runbook](../operations/outbound-recovery-cutover.md) owns operator
 procedure. Architecture 042's unrelated proposals remain proposed.

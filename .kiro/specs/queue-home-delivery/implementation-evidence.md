@@ -79,6 +79,125 @@ The changed fragment is: “Controller-managed clusters need a peer credential f
 tokeirad, stop every node, and set it in each node's configuration before restarting.” The changie dry run, offline
 Markdown links, `git diff --check` and a scan of the diff for key material pass.
 
+## Part 3: admission and retirement
+
+### Activated behavior
+
+Normal local publication and discovery now converge on the broker's bounded admission path. A directly invoked
+pushed source exercises that same path, but the authenticated offer handler still returns `Unavailable`. There is
+no outbound sender, remote push, new sticky sweep, or start-read consolidation in this change. The remaining
+sticky routing/fallback conditions and distributed delivery wiring belong to the subsequent push change.
+Discovery resolves each row before admission, and a row retained in this acquisition answers `Known` after
+resolution, because another home's record cannot suppress it and same-home retargeting needs the current routing.
+
+The receiver captures its own queue-home acquisition and rechecks it under the broker lock before either
+`Known` or admission. Cancellation and the mutable admission deadline are checked there and at dequeue; a stale
+page reservation cannot authorize the next acquisition. Retention keys include home, generation and incarnation.
+Revisions distinguish same-tick replacement and same-home retargeting, and completion releases only its revision.
+A second index maps `(OfferKey, revision)` to the retained scope, keeping take and completion constant-time.
+Per-key scope counts keep speculative publication's `contains` check constant-time through retargeting and removal.
+A current local routing/availability decision permits retargeting; an unvalidated pushed hint cannot retarget by
+arrival order. A conflicting hint without retarget authority is `Known`, with no saturation outcome. Authorized
+retargeting replaces the selected hint atomically and cancels the old attempt if its start has not been handed over.
+
+Ready retention and in-flight leases are capped by the absolute sticky deadline. Neither a take nor `Known`
+extends the existing retention limit. The local broker preserves that deadline on its existing normal fallback,
+consistent with `service/history/transfer_queue_active_task_executor.go @ v1.31.0`, `processWorkflowTask`.
+This includes the local half of requirement 2.7: a repeated fallback retains the same deadline and expires at it.
+The remaining sticky fallback conditions and remote push work remain open.
+Admission adds a 64 MiB node-wide serialized-envelope budget to the existing 256-per-queue and 8,192-per-home
+limits. Counting uses a bounded writer rather than allocating a serialized copy. Page guards release unused
+reservations on capacity or ownership refusal and on cancellation. Known and expired rows preserve the remaining
+slots for later candidates in the same slice; retained and in-flight entries both consume capacity.
+
+The runtime starts a separate retirement task owned by its shutdown tracker. It watches acquisition cancellation
+(including lease loss) and the shared admission deadline, re-reading deadlines after renewal. It does not wait for
+a discovery tick. Only first registration of an acquisition wakes retirement; repeated reservations, admissions
+and polls do not. Expiry compares retention times only: acquisition watchers remove lost generations, and the
+dequeue guard checks the captured acquisition while cleanup is pending, including after replacement.
+A take skips retired or newly expired entries and continues selecting eligible work under the same broker lock.
+Cleanup removes only the matching generation's records, counters and discovery registrations, and cancels starts
+before handoff. The claimant carries its cancellation token from dequeue to that check. After invoking the start
+path, the start completes under the poll's context and its result reaches the poller even if retirement precedes
+the commit or reply. This matches `service/matching/matching_engine.go @ v1.31.0`, `PollWorkflowTaskQueue` and
+`recordWorkflowTaskStarted`, which pass the poll's request context to the history client.
+Sticky polls cannot consume normal offers through an alias
+when their own queue home is not locally serving. Activity accounting and delivery, speculative/eager/query paths,
+discovery period and per-pass admission limit, durable storage, migrations and protobuf contracts are unchanged.
+
+Admission counters use finite source/outcome labels, saturation uses count/bytes, and retirement uses
+cancelled/deadline/shutdown. No run, queue identity or credential is a label on these new counters.
+
+### Generated regression inventory
+
+Every property below is configured for 100 generated cases. Broker tests exercise the production admission and
+retirement implementations with real placement acquisitions. Accounting tests compare bounded retention against
+an independent finite-trace model; they do not claim distributed start or live DSQL evidence.
+
+| Property | Test | Cases |
+| --- | --- | --- |
+| 2 | `property_2_colocated_distinct_homes` | 100 |
+| 2 | `property_2_publication_discovery_races` | 100 |
+| 2 | `property_2_same_home_retarget_and_late_result` | 100 |
+| 2 | `property_2_full_releases_reservations` | 100 |
+| 2 | `property_2_expiry_and_delayed_results` | 100 |
+| 2 | `property_2_count_and_byte_exhaustion` | 100 |
+| 2 | `property_2_retention_traces_match_model` | 100 |
+| 5 | `property_5_cancelled_generation_cannot_dequeue` | 100 |
+| 5 | `property_5_admission_rechecks_acquisition` | 100 |
+| 5 | `property_5_cleanup_without_discovery` | 100 |
+| 5 | `property_5_sticky_poll_requires_its_home` | 100 |
+| 5 | `property_5_renewed_deadline` | 100 |
+| 5 | `property_5_stale_page_reservation` | 100 |
+
+On the unchanged implementation at `af53084e44719c4d23c2c336faad8f379d514820`, the new cancelled-generation dequeue
+property failed with one publication, and the colocated-home property failed with one incarnation on two homes.
+Both shrank to queue index zero and failed their named invariants. These are executed pre-fix failures, not inferred
+counterexamples. The existing retirement exploration is now a passing stored-intent regression; the split-home
+publication explorations remain expected failures until push is activated.
+
+The cleanup property never starts a discovery scheduler: it awaits retirement's capacity notification and verifies
+removal directly, without invoking dequeue/expiry as cleanup. It checks retained attempts, page reservations and
+demand registrations, then invokes old-generation cleanup and a late result against the replacement. Retargeting
+covers both ready and in-flight entries, acknowledges stale peer hints without retargeting, and proves a late
+result cannot release the new normal-queue revision.
+
+The review regressions first failed on the preceding implementation: `retirement_wakes_only_for_new_acquisitions`
+observed a redundant reservation wake; `expiry_does_not_query_placement_per_offer` observed 32 provider calls;
+`property_2_same_home_retarget_and_late_result` observed `Full` instead of `Known`; and
+`retirement_during_owner_start_delivers_committed_result` observed an empty poll after a real durable start.
+The latter holds the owner response and tests retirement both before and after the commit.
+`local_fallback_preserves_absolute_sticky_deadline` already passed before review fixes: fallback keeps the deadline,
+a repeated offer leaves its revision and deadline unchanged, and the entry expires at that deadline.
+The finite-trace accounting property also checks that every retained revision has exactly one index entry.
+
+The subsequent discovery and dequeue regressions also failed before their fixes:
+`expired_row_preserves_reservation_for_following_rows` returned `Capacity` at an expired normal row instead of
+admitting the three rows behind it in the same slice; `poll_skips_retired_entries_before_current_generation`
+returned an empty poll with two retired entries ahead of current work. The latter covers both general and sticky
+ready queues. `contains_survives_scope_removal_and_retargeting` passed before the lookup optimization and preserves
+lookup behavior across homes, generations, duplicate admission, retargeting, ready removal, completion, expiry,
+retirement and run removal. The finite-trace model additionally checks the per-key scope counts.
+
+### Validation
+
+All thirteen generated properties passed at 100 cases each (1,300 generated cases). Pre-handoff cancellation
+follows the existing bounded retry path, without asserting that the authoritative incarnation is obsolete. After
+handoff, both retirement schedules deliver the owner-committed task. The fallback example preserves its original
+deadline through repetition and expiry, an expired row leaves the rest of its page admissible, and a poll reaches
+current work behind retired entries.
+
+The full bar passes on the final code, on macOS: fmt, lint, check, doctest and doc, and test (4,578 passed,
+3 skipped). One `tkr` test, `discovered_selection_creates_and_checks_with_the_generated_compose_provisioner`, failed:
+it builds a nested workspace and expects its binary in that workspace's default `target` directory, and a
+`CARGO_TARGET_DIR` override for the whole run placed the binary elsewhere. `tkr` does not depend on
+`tokeira-runtime`, the only crate this change touches, so that test's code is the same as on `main`. `cargo clippy
+--features dsql-integration` is clean for the storage, runtime, engine, edge and projection crates. The changie dry run,
+offline Markdown links and `git diff --check` pass.
+
+No live DSQL or network validation is claimed. The offer handler, dependency graph, lockfile, migrations and
+protobuf definitions are unchanged.
+
 ## Exploration
 
 Base: `ad71615c129e5d9c85417b6553ea62e42dfc6d21`. The runtime tests invoke the existing publisher and broker over

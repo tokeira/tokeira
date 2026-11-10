@@ -81,21 +81,24 @@ bar belongs to the code PRs.
     - **Validates: Requirements 2.13, 2.16, 2.17, 2.18, 2.19, 2.20.**
     - DONE — Real-file restart/rotation and upgrade properties pass at 100 cases each; create-only mode, overwrite refusal, symlink and diagnostic examples pass. The two no-peer startup properties pass in the full bar on a devbox. See implementation-evidence.md; live durable readiness is not claimed.
 
-- [ ] 4. Shared admission and acquisition-driven retirement
-  - [ ] 4.1 Route local, pushed and discovered normal offers through common bounded admission. Check generation,
+- [x] 4. Shared admission and acquisition-driven retirement
+  - [x] 4.1 Route local, pushed and discovered normal offers through common bounded admission. Check generation,
     cancellation and admission deadline before `Known` or admission; isolate deduplication by home/acquisition and
     retain incarnation/revision checks through ready/in-flight expiry. Add the aggregate byte budget.
     - _Requirements: 2.2, 2.3, 2.10, 2.14, 3.5_
-  - [ ] 4.2 Attach retirement to acquisition loss/deadline, guarded by generation, and make dequeue reject retired
+    - DONE — Local publication, discovery and the directly tested pushed source share receiver-owned admission, scoped revisions and count/byte accounting. Known does not extend retention, including conflicting hints without retarget authority; take and completion use revision lookups. Validated same-home retargeting cancels the previous revision before start handoff. Existing local normal fallback retains its absolute sticky deadline, covering the local half of requirement 2.7; the remaining fallback and push work stays open below. The offer handler remains unavailable.
+  - [x] 4.2 Attach retirement to acquisition loss/deadline, guarded by generation, and make dequeue reject retired
     offers before asynchronous cleanup finishes. Cancel associated work/reservations and prevent cross-home sticky
     polls consuming a local normal queue they do not own.
     - _Requirements: 2.10, 3.1, 3.5_
-  - [ ] 4.3 Generate publication/discovery races, expiry, delayed results, byte/count exhaustion, colocated distinct
+    - DONE — Shutdown-tracked acquisition watchers retire offers, page reservations, discovery work and starts awaiting handoff on cancellation/loss or deadline. Only first registration wakes retirement. Dequeue checks ownership before cleanup, and old-generation cleanup preserves replacements. A handed-over start completes under the poll's context and delivers its result even if retirement precedes its commit or reply.
+  - [x] 4.3 Generate publication/discovery races, expiry, delayed results, byte/count exhaustion, colocated distinct
     homes, same-home sticky-to-normal retargeting and replacement acquisitions; verify cleanup without advancing
     discovery's tick, and ensure late results cannot remove a retargeted offer.
     - **Property 2: Bounded deduplication**
     - **Property 5: Acquisition retirement is immediate and isolated**
     - **Validates: Requirements 2.2, 2.3, 2.10, 2.14, 3.5.**
+    - DONE — All thirteen generated properties for Properties 2 and 5 pass at 100 cases each, covering source races, retention, delayed results, both bounds, colocated homes, retargeting, locked admission checks, deadlines and replacement acquisitions. Cancellation/dequeue and colocated-home properties first failed against the unchanged implementation; see implementation-evidence.md for case counts and validation.
 
 - [ ] 5. Bounded push and all sticky fallback conditions
   - [ ] 5.1 Add the post-commit sender queue and provider-agnostic sink, wire the edge client to trusted placement and

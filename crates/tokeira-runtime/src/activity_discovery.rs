@@ -578,6 +578,10 @@ pub(crate) async fn run_slice<S: ActivityDiscoverySource>(
         {
             match broker.publish_discovered(task, &mut reservation).await {
                 OfferAdmission::Full => return Ok(SliceOutcome::Capacity),
+                // These workflow-only outcomes cannot be produced by activity admission.
+                OfferAdmission::NotHome | OfferAdmission::Expired => {
+                    unreachable!("activity admission has no workflow ownership outcomes")
+                }
                 OfferAdmission::Admitted | OfferAdmission::Known => {}
             }
         }

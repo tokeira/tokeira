@@ -1828,7 +1828,7 @@ where
     pub(super) async fn start_polled_workflow_task(
         &self,
         offered: DispatchableWorkflowTask,
-        entered_at: tokio::time::Instant,
+        stamp: crate::broker::WorkflowOfferStamp,
         worker_identity: WorkerIdentity,
     ) -> Result<StartedWorkflowTask> {
         let span = tracing::info_span!(
@@ -1841,10 +1841,27 @@ where
             tokeira.attempt = tracing::field::Empty,
         );
         let offer_key = (offered.run_key, offered.logical_seq);
-        let result = self
-            .route_polled_workflow_task(offered, entered_at, worker_identity)
-            .instrument(span.clone())
-            .await;
+        let entered_at = stamp.entered_at;
+        let result = if stamp
+            .cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.is_cancelled())
+        {
+            // Retirement is not an authoritative stale result: preserve the poll's
+            // retry budget, including zero-wait polls, before handing off the start.
+            Err(crate::RetryableWorkflowTaskStart(
+                "queue-home offer retired before its start was handed over".into(),
+            )
+            .into())
+        } else {
+            // Once invoked, the start belongs to the poll's context, not the queue
+            // acquisition. Racing retirement here can discard a committed start
+            // and strand the task until its timeout (service/matching/matching_engine.go
+            // @ v1.31.0, recordWorkflowTaskStarted).
+            self.route_polled_workflow_task(offered, entered_at, worker_identity)
+                .instrument(span.clone())
+                .await
+        };
         // Ambiguous failures and cancelled futures keep only the bounded lease.
         // A late outcome cannot remove a replacement admitted after that lease.
         if result.is_ok()

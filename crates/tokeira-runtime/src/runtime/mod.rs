@@ -1098,6 +1098,11 @@ where
             let registry = &discovery.0;
             let cancel = CancellationToken::new();
             runtime_shutdown.register_cancellation(cancel.clone());
+            let _retirement_handle = runtime_shutdown.spawn(
+                broker
+                    .clone()
+                    .run_retirement(registry.clone(), runtime_shutdown.cancellation_token()),
+            );
             let _discovery_handle = runtime_shutdown.spawn(crate::discovery::run_discovery(
                 crate::discovery::WorkflowSource {
                     repo: repo.clone(),

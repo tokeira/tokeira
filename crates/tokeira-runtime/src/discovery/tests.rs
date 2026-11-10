@@ -27,6 +27,7 @@ pub(crate) fn home(id: u32) -> QueueHome {
         id: ShardId(id),
         generation: 1,
         cancel: CancellationToken::new(),
+        deadline: Default::default(),
     }
 }
 
@@ -128,6 +129,82 @@ async fn commit(store: &InMemoryStore, transition: Transition) {
             .unwrap(),
         CommitResult::Applied { .. }
     ));
+}
+
+#[derive(Debug)]
+struct FrozenClock(OffsetDateTime);
+
+impl tokeira_clock::Clock for FrozenClock {
+    fn now(&self) -> OffsetDateTime {
+        self.0
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_row_preserves_reservation_for_following_rows() {
+    let store = Arc::new(InMemoryStore::with_shard_count(8));
+    let queue = queue();
+    let home = home(3);
+    let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60);
+    let broker = InMemoryBroker::with_discovery(Arc::new(Homes(Mutex::new(home.clone()))))
+        .with_clock(Arc::new(FrozenClock(now)));
+    let registry = DiscoveryRegistry::default();
+    let _guard = registry.register_poll(queue.clone(), home.clone(), Instant::now());
+    let source = WorkflowSource {
+        repo: store.clone(),
+        registry: Arc::new(RwLock::new(None)),
+    };
+    let mut expired = transition(&queue, 0);
+    expired
+        .next_state
+        .pending_workflow_task
+        .as_mut()
+        .unwrap()
+        .schedule_to_start_deadline = Some(now - time::Duration::seconds(1));
+    expired.next_state.priority = Some(Priority {
+        priority_key: 1,
+        fairness_key: String::new(),
+        fairness_weight: 1.0,
+    });
+    assert!(expired.next_state.sticky.is_none());
+    let expired_key = expired.next_state.run_key;
+    commit(&store, expired).await;
+    let mut following = Vec::new();
+    for index in 1..4 {
+        let item = transition(&queue, index);
+        following.push(item.next_state.run_key);
+        commit(&store, item).await;
+    }
+    let (key, _, mut pass) = registry.select(Instant::now()).unwrap();
+    let page = source
+        .page(&key.range(), None, NonZeroU32::new(PAGE_SIZE).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(page.candidates[0].incarnation.run_key, expired_key);
+    assert_eq!(
+        run_slice(&source, &registry, &broker, &key, &home, &mut pass)
+            .await
+            .unwrap(),
+        SliceOutcome::Complete,
+        "an expired row exhausted the page reservation"
+    );
+    assert_eq!(pass.pages, 1);
+    assert_eq!(pass.examined, 4);
+    assert_eq!(pass.admissions, following.len());
+    assert!(
+        broker
+            .try_claim_workflow_task(&queue, expired_key)
+            .await
+            .is_none()
+    );
+    for run_key in following {
+        assert!(
+            broker
+                .try_claim_workflow_task(&queue, run_key)
+                .await
+                .is_some()
+        );
+    }
 }
 
 proptest! {

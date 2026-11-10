@@ -1,0 +1,5 @@
+kind: fixed
+body: Workflow task delivery now drops stale offers promptly when queue ownership changes and prevents one queue home from suppressing another's work.
+time: 2026-11-10T00:00:00Z
+custom:
+    Slice: c4c1124c-56bc-462e-a8f1-519e891a301c

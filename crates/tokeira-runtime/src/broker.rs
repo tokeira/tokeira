@@ -18,7 +18,8 @@
 //!
 //! ## Deduplication
 //!
-//! Each workflow task is keyed by `(RunKey, LogicalTaskSeq)` and each activity
+//! Normal workflow offers are scoped by home, acquisition generation and
+//! `(RunKey, LogicalTaskSeq)`; speculative work retains its local identity. Each activity
 //! task by `(RunKey, activity_id, schedule_event_id, attempt, stamp)`. Duplicate publications are
 //! silently suppressed so that scanner sweeps and retry paths can safely
 //! re-publish without creating phantom work items.
@@ -74,10 +75,66 @@ use crate::{
     activity_offers::{ActivityOfferReservation, ActivityOfferToken, ActivityOffers, incarnation},
     discovery::{QueueHome, QueueHomeProvider},
     effective_priority, metrics as runtime_metrics,
-    workflow_offers::{OfferAdmission, OfferKey, OfferReservation, WorkflowOffers},
+    workflow_offers::{
+        OfferAdmission, OfferAdmissionInput, OfferKey, OfferReservation, OfferRevision,
+        OfferSource, WorkflowOffers,
+    },
 };
 
 const STICKY_POLLER_AVAILABILITY_WINDOW: Duration = Duration::from_secs(10);
+
+#[cfg(test)]
+mod admission_tests;
+
+struct AdmissionOutcome(Option<OfferSource>);
+
+impl AdmissionOutcome {
+    fn record(&self, result: OfferAdmission) -> OfferAdmission {
+        if let Some(source) = self.0 {
+            metrics::counter!(runtime_metrics::WORKFLOW_OFFER_ADMISSIONS_TOTAL,
+                "source" => source.label(), "outcome" => result.label())
+            .increment(1);
+        }
+        result
+    }
+}
+
+// Cancellation while awaiting policy releases the whole page; admitted, known
+// and expired rows leave remaining slots for the same bounded discovery pass.
+struct AdmissionReservation<'a>(Option<&'a mut OfferReservation>, bool);
+
+impl Drop for AdmissionReservation<'_> {
+    fn drop(&mut self) {
+        if !self.1
+            && let Some(reservation) = self.0.as_mut()
+        {
+            reservation.release();
+        }
+    }
+}
+
+fn serialized_hint_bytes(task: &DispatchableWorkflowTask) -> usize {
+    struct ByteCount(usize);
+    impl std::io::Write for ByteCount {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            if self.0 > crate::workflow_offers::BYTE_CAPACITY {
+                return Err(std::io::Error::other("offer byte budget exceeded"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    // Count the complete serialized envelope without allocating another copy of
+    // an oversized local hint. The aggregate budget covers ready and in-flight hints.
+    let mut count = ByteCount(0);
+    if serde_json::to_writer(&mut count, task).is_err() {
+        return crate::workflow_offers::BYTE_CAPACITY + 1;
+    }
+    count.0
+}
 
 /// Lightweight in-memory workflow-task broker.
 ///
@@ -93,6 +150,7 @@ pub struct InMemoryBroker {
     policy: Arc<BrokerPolicy>,
     queue_homes: Option<Arc<dyn QueueHomeProvider>>,
     capacity_changed: Arc<Notify>,
+    retirement_changed: Arc<Notify>,
     /// Judges sticky-query deadlines and backlog age. It must be the clock the
     /// runtime stamps those deadlines and `scheduled_at` with.
     clock: Arc<dyn Clock>,
@@ -230,6 +288,7 @@ impl Default for ActivityBrokerState {
 
 #[derive(Default)]
 struct BrokerState {
+    acquisitions: BTreeMap<(tokeira_types::ShardId, u64), QueueHome>,
     offers: WorkflowOffers,
     sticky_ready: HashMap<QueueKey, OrderedReady<TimestampedWorkflowTask>>,
     general_ready: HashMap<QueueKey, OrderedReady<TimestampedWorkflowTask>>,
@@ -404,6 +463,7 @@ impl Default for InMemoryBroker {
             policy: Arc::new(BrokerPolicy::default()),
             queue_homes: None,
             capacity_changed: Arc::new(Notify::new()),
+            retirement_changed: Arc::new(Notify::new()),
             clock: system_clock(),
         }
     }
@@ -592,9 +652,29 @@ impl ReservedPoller {
 /// ([`ReservedPoller`]), so no further start work is needed.
 #[derive(Debug)]
 pub enum WorkflowPollResult {
-    Queued(DispatchableWorkflowTask, Instant),
+    Queued(DispatchableWorkflowTask, WorkflowOfferStamp),
     Started(StartedWorkflowTask),
     Query(QueryTask),
+}
+
+/// Local delivery revision and cancellation carried from dequeue to start.
+///
+/// Keeping the token with the claimant lets retirement stop a start before its
+/// handoff. Once invoked, a start completes under the poll's context. Unretained
+/// speculative work carries no token and keeps its existing delivery behavior.
+#[derive(Clone, Debug)]
+pub struct WorkflowOfferStamp {
+    pub(crate) entered_at: Instant,
+    pub(crate) cancel: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl From<Instant> for WorkflowOfferStamp {
+    fn from(entered_at: Instant) -> Self {
+        Self {
+            entered_at,
+            cancel: None,
+        }
+    }
 }
 
 impl PartialEq for WorkflowPollResult {
@@ -621,7 +701,7 @@ impl PartialEq for WorkflowPollResult {
 impl WorkflowPollResult {
     pub fn into_queued(self) -> Option<(DispatchableWorkflowTask, Instant)> {
         match self {
-            Self::Queued(task, entered_at) => Some((task, entered_at)),
+            Self::Queued(task, stamp) => Some((task, stamp.entered_at)),
             Self::Started(_) | Self::Query(_) => None,
         }
     }
@@ -636,6 +716,7 @@ impl WorkflowPollResult {
 
 #[derive(Clone, Debug)]
 pub(crate) struct TimestampedWorkflowTask {
+    managed: bool,
     pub(crate) task: DispatchableWorkflowTask,
     pub(crate) entered_at: Instant,
     pub(crate) scheduled_at: OffsetDateTime,
@@ -656,6 +737,108 @@ enum ActivityTakeOutcome {
 }
 
 impl InMemoryBroker {
+    /// Admit an already selected destination. `retarget` requires a current local
+    /// routing/availability decision; a peer's arrival order is insufficient.
+    /// Ownership is always obtained from this broker's provider, never the sender.
+    pub(crate) async fn admit_workflow_offer(
+        &self,
+        task: DispatchableWorkflowTask,
+        source: OfferSource,
+        scheduled_at: Option<OffsetDateTime>,
+        reservation: Option<&mut OfferReservation>,
+        retarget: bool,
+    ) -> OfferAdmission {
+        if self.queue_homes.is_none() {
+            if let Some(reservation) = reservation {
+                reservation.release();
+            }
+            return AdmissionOutcome(Some(source)).record(OfferAdmission::NotHome);
+        }
+        self.publish_workflow_offer(
+            task,
+            None,
+            scheduled_at,
+            reservation,
+            Some(source),
+            retarget,
+        )
+        .await
+    }
+
+    /// Serialize generation-specific cleanup with admission; detached page counters
+    /// and late results cannot debit a replacement's capacity.
+    pub(crate) async fn retire_acquisition(&self, home: &QueueHome, reason: &'static str) {
+        let mut inner = self.inner.lock().await;
+        let removed = inner.offers.retire_home(home);
+        Self::forget_offers(&mut inner, &removed);
+        if inner
+            .acquisitions
+            .remove(&(home.id, home.generation))
+            .is_some()
+        {
+            metrics::counter!(runtime_metrics::WORKFLOW_OFFER_RETIREMENTS_TOTAL, "reason" => reason).increment(1);
+        }
+        self.capacity_changed.notify_one();
+    }
+
+    /// Own and join cancellation/deadline watchers independently of discovery.
+    /// The runtime's shutdown tracker owns this loop and therefore its child work.
+    pub(crate) async fn run_retirement(
+        self,
+        registry: crate::discovery::DiscoveryRegistry,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        let mut watchers = tokio::task::JoinSet::new();
+        let mut watching = HashSet::new();
+        loop {
+            // Register before inspecting acquisitions, so first admission cannot
+            // race the cleanup task into sleeping without its cancellation watcher.
+            let changed = self.retirement_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let registry_changed = registry.retirement_wake.notified();
+            tokio::pin!(registry_changed);
+            registry_changed.as_mut().enable();
+            let mut homes = self.inner.lock().await.acquisitions.clone();
+            for home in registry.acquisitions() {
+                homes.insert((home.id, home.generation), home);
+            }
+            for (scope, home) in homes {
+                if watching.insert(scope) {
+                    watchers.spawn(async move {
+                        let reason = home.retired().await;
+                        (home, reason)
+                    });
+                }
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = changed => {},
+                _ = registry_changed => {},
+                result = watchers.join_next(), if !watchers.is_empty() => {
+                    if let Some(Ok((home, reason))) = result {
+                        registry.retire_acquisition(&home);
+                        self.retire_acquisition(&home, reason).await;
+                        watching.remove(&(home.id, home.generation));
+                    }
+                }
+            }
+        }
+        watchers.abort_all();
+        while watchers.join_next().await.is_some() {}
+        let homes = self
+            .inner
+            .lock()
+            .await
+            .acquisitions
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for home in homes {
+            registry.retire_acquisition(&home);
+            self.retire_acquisition(&home, "shutdown").await;
+        }
+    }
     pub(crate) fn with_discovery(queue_homes: Arc<dyn QueueHomeProvider>) -> Self {
         Self {
             queue_homes: Some(queue_homes),
@@ -670,41 +853,53 @@ impl InMemoryBroker {
         self
     }
 
-    fn forget_offers(inner: &mut BrokerState, keys: &[OfferKey]) {
+    fn forget_offers(inner: &mut BrokerState, keys: &[OfferRevision]) {
         if keys.is_empty() {
             return;
         }
         let keys: HashSet<_> = keys.iter().copied().collect();
-        inner.enqueued.retain(|key| !keys.contains(key));
         for ready in inner
             .general_ready
             .values_mut()
             .chain(inner.sticky_ready.values_mut())
         {
-            ready.retain(|entry| !keys.contains(&(entry.task.run_key, entry.task.logical_seq)));
+            ready.retain(|entry| {
+                !keys.contains(&(
+                    (entry.task.run_key, entry.task.logical_seq),
+                    entry.entered_at,
+                ))
+            });
         }
     }
 
-    fn expire_locked(inner: &mut BrokerState, now: Instant) {
+    fn expire_locked(&self, inner: &mut BrokerState, now: Instant) {
         let keys = inner.offers.expire(now);
         Self::forget_offers(inner, &keys);
     }
 
     pub(crate) async fn expire_offers(&self, now: Instant) {
-        Self::expire_locked(&mut *self.inner.lock().await, now);
+        self.expire_locked(&mut *self.inner.lock().await, now);
     }
 
     pub(crate) async fn reserve_offers(&self, home: &QueueHome, count: usize) -> OfferReservation {
         let mut inner = self.inner.lock().await;
-        Self::expire_locked(&mut inner, Instant::now());
-        let mut reservation = inner.offers.reserve(home.id, count);
-        reservation.generation = home.generation;
-        reservation
+        self.expire_locked(&mut inner, Instant::now());
+        if home.valid() {
+            inner
+                .acquisitions
+                .entry((home.id, home.generation))
+                .or_insert_with(|| {
+                    self.retirement_changed.notify_one();
+                    home.clone()
+                });
+        }
+        inner.offers.reserve(home, count)
     }
 
+    #[cfg(test)]
     pub(crate) async fn knows_offer(&self, key: OfferKey) -> bool {
         let mut inner = self.inner.lock().await;
-        Self::expire_locked(&mut inner, Instant::now());
+        self.expire_locked(&mut inner, Instant::now());
         inner.enqueued.contains(&key) || inner.offers.contains(key)
     }
 
@@ -720,7 +915,7 @@ impl InMemoryBroker {
 
     pub(crate) async fn retire_offers(&self, home: &QueueHome, queue: &QueueKey) {
         let mut inner = self.inner.lock().await;
-        let removed = if home.cancel.is_cancelled() {
+        let removed = if !home.valid() {
             inner.offers.retire_home(home)
         } else {
             inner.offers.retire_ready_queue(home, queue)
@@ -735,8 +930,14 @@ impl InMemoryBroker {
         scheduled_at: OffsetDateTime,
         reservation: &mut OfferReservation,
     ) -> OfferAdmission {
-        self.publish_workflow_offer(task, None, false, Some(scheduled_at), Some(reservation))
-            .await
+        self.admit_workflow_offer(
+            task,
+            OfferSource::Discovered,
+            Some(scheduled_at),
+            Some(reservation),
+            true,
+        )
+        .await
     }
 
     pub(crate) async fn publish_speculative_workflow_task(
@@ -744,7 +945,7 @@ impl InMemoryBroker {
         task: DispatchableWorkflowTask,
         metrics: Option<&DeliveryMetrics>,
     ) {
-        self.publish_workflow_offer(task, metrics, true, None, None)
+        self.publish_workflow_offer(task, metrics, None, None, None, true)
             .await;
     }
 
@@ -1003,8 +1204,12 @@ impl InMemoryBroker {
     ) -> Option<(DispatchableWorkflowTask, Instant)> {
         let mut inner = self.inner.lock().await;
         if self.queue_homes.is_some() {
-            Self::expire_locked(&mut inner, Instant::now());
+            self.expire_locked(&mut inner, Instant::now());
         }
+        let owns_poll = self
+            .queue_homes
+            .as_ref()
+            .is_none_or(|homes| homes.local_home(queue).is_some_and(|home| home.valid()));
         if let Some(worker) = worker
             && inner.denied_workers.contains(&(
                 queue.namespace_id,
@@ -1017,7 +1222,8 @@ impl InMemoryBroker {
 
         let matched = inner.sticky_ready.get_mut(queue).and_then(|sticky| {
             sticky.remove_where(|task| {
-                task.task.run_key == run_key
+                (!task.managed || owns_poll)
+                    && task.task.run_key == run_key
                     && worker.is_some()
                     && task.task.sticky_preferred.as_ref() == worker
             })
@@ -1025,14 +1231,18 @@ impl InMemoryBroker {
 
         let matched = matched.or_else(|| {
             let ready = inner.general_ready.get_mut(normal_queue.unwrap_or(queue))?;
-            ready.remove_where(|task| task.task.run_key == run_key)
+            ready.remove_where(|task| (!task.managed || owns_poll) && task.task.run_key == run_key)
         });
 
         if let Some(removed) = matched {
-            inner.offers.take(
+            let cancellation = inner.offers.take(
                 (removed.task.run_key, removed.task.logical_seq),
+                removed.entered_at,
                 Instant::now(),
             );
+            if removed.managed && cancellation.is_none() {
+                return None;
+            }
             let metric_key = removed
                 .task
                 .sticky_preferred
@@ -1316,7 +1526,7 @@ impl InMemoryBroker {
         task: DispatchableWorkflowTask,
         metrics: Option<&DeliveryMetrics>,
     ) {
-        self.publish_workflow_offer(task, metrics, false, None, None)
+        self.publish_workflow_offer(task, metrics, None, None, Some(OfferSource::Local), true)
             .await;
     }
 
@@ -1324,15 +1534,23 @@ impl InMemoryBroker {
         &self,
         mut task: DispatchableWorkflowTask,
         metrics: Option<&DeliveryMetrics>,
-        speculative: bool,
         scheduled_at: Option<OffsetDateTime>,
-        mut reservation: Option<&mut OfferReservation>,
+        reservation: Option<&mut OfferReservation>,
+        source: Option<OfferSource>,
+        retarget: bool,
     ) -> OfferAdmission {
+        let mut reservation = AdmissionReservation(reservation, false);
+        let speculative = source.is_none();
+        let outcome = AdmissionOutcome(source);
+        let captured = self
+            .queue_homes
+            .as_ref()
+            .and_then(|homes| homes.local_home(&task.queue));
         let (mode, scope_generation, config) = self.policy.delivery_inputs(&task.queue).await;
         let mut inner = self.inner.lock().await;
         let now = Instant::now();
         if self.queue_homes.is_some() {
-            Self::expire_locked(&mut inner, now);
+            self.expire_locked(&mut inner, now);
         }
         inner.ordering.enter_scope(scope_generation);
         if task.sticky_preferred.is_some()
@@ -1341,37 +1559,86 @@ impl InMemoryBroker {
         {
             task.queue = normal_queue;
             task.sticky_preferred = None;
-            task.sticky_deadline = None;
+            // Matching retains the sticky timeout as TTL on a normal fallback
+            // (service/history/transfer_queue_active_task_executor.go @ v1.31.0).
+            if speculative {
+                task.sticky_deadline = None;
+            }
         }
         runtime_metrics::record_broker_publish(&task.queue);
         let queue = task.queue.clone();
         let dedupe_key = (task.run_key, task.logical_seq);
-        if inner.enqueued.contains(&dedupe_key) || inner.offers.contains(dedupe_key) {
-            return OfferAdmission::Known;
-        }
+        let mut revision = now;
         if !speculative && let Some(homes) = &self.queue_homes {
             let Some(home) = homes.local_home(&queue) else {
-                return OfferAdmission::Full;
+                return outcome.record(OfferAdmission::NotHome);
             };
-            if reservation.as_ref().is_some_and(|reserved| {
-                reserved.home != home.id
-                    || reserved.generation != home.generation
-                    || reserved.remaining() == 0
+            // A same-queue acquisition captured before awaiting policy must still be
+            // current under this lock. Fallback resolves its selected home here.
+            if !home.valid()
+                || captured.as_ref().is_some_and(|old| {
+                    old.id == home.id && (old.generation != home.generation || !old.valid())
+                })
+            {
+                return outcome.record(OfferAdmission::NotHome);
+            }
+            if reservation.0.as_ref().is_some_and(|reserved| {
+                reserved.home != home.id || reserved.generation != home.generation
             }) {
-                return OfferAdmission::Full;
+                return outcome.record(OfferAdmission::NotHome);
             }
-            let result =
-                inner
-                    .offers
-                    .admit(dedupe_key, queue.clone(), &home, now, reservation.is_some());
+            if reservation
+                .0
+                .as_ref()
+                .is_some_and(|reserved| reserved.remaining() == 0)
+            {
+                metrics::counter!(runtime_metrics::WORKFLOW_OFFER_SATURATION_TOTAL, "bound" => "count").increment(1);
+                return outcome.record(OfferAdmission::Full);
+            }
+            inner
+                .acquisitions
+                .entry((home.id, home.generation))
+                .or_insert_with(|| {
+                    self.retirement_changed.notify_one();
+                    home.clone()
+                });
+            let bytes = serialized_hint_bytes(&task);
+            let admission_now = Instant::now();
+            // Counting a large local hint can cross an existing offer's expiry.
+            // The final Known check must use the time after that bounded work.
+            self.expire_locked(&mut inner, admission_now);
+            let deadline = task.sticky_deadline.map(|at| {
+                let remaining: Duration =
+                    (at - self.clock.now()).try_into().unwrap_or(Duration::ZERO);
+                admission_now + remaining.min(crate::workflow_offers::READY_RETENTION)
+            });
+            let (result, admitted_revision, removed) = inner.offers.admit(OfferAdmissionInput {
+                key: dedupe_key,
+                queue: queue.clone(),
+                home: &home,
+                now: admission_now,
+                reserved: reservation.0.is_some(),
+                bytes,
+                deadline,
+                retarget,
+            });
+            Self::forget_offers(&mut inner, &removed);
             if result != OfferAdmission::Admitted {
-                return result;
+                // Expiry skips one candidate, not the rest of the page. Releasing
+                // its slots here would restart discovery at the same expired row.
+                reservation.1 = matches!(result, OfferAdmission::Known | OfferAdmission::Expired);
+                return outcome.record(result);
             }
-            if let Some(reserved) = reservation.as_mut() {
+            revision = admitted_revision;
+            if let Some(reserved) = reservation.0.as_mut() {
                 reserved.consume();
             }
+        } else {
+            if inner.enqueued.contains(&dedupe_key) || inner.offers.contains(dedupe_key) {
+                return outcome.record(OfferAdmission::Known);
+            }
+            inner.enqueued.insert(dedupe_key);
         }
-        inner.enqueued.insert(dedupe_key);
         let is_sticky = task.sticky_preferred.is_some();
         let order = match task.order {
             Some(order) => inner.ordering.preserve(order),
@@ -1398,8 +1665,9 @@ impl InMemoryBroker {
             }
         }
         let timestamped = TimestampedWorkflowTask {
+            managed: !speculative && self.queue_homes.is_some(),
             task,
-            entered_at: now,
+            entered_at: revision,
             scheduled_at: scheduled_at.unwrap_or_else(|| self.clock.now()),
         };
 
@@ -1436,7 +1704,8 @@ impl InMemoryBroker {
         for alias_wake in alias_wakes {
             alias_wake.notify_waiters();
         }
-        OfferAdmission::Admitted
+        reservation.1 = true;
+        outcome.record(OfferAdmission::Admitted)
     }
 
     fn sticky_poller_available(inner: &BrokerState, task: &DispatchableWorkflowTask) -> bool {
@@ -1774,13 +2043,15 @@ impl InMemoryBroker {
     ) -> Vec<TimestampedWorkflowTask> {
         let mut inner = self.inner.lock().await;
         if self.queue_homes.is_some() {
-            Self::expire_locked(&mut inner, Instant::now());
+            self.expire_locked(&mut inner, Instant::now());
         }
         let protected: HashSet<_> = inner
-            .enqueued
-            .iter()
-            .copied()
-            .filter(|key| inner.offers.contains(*key))
+            .general_ready
+            .values()
+            .chain(inner.sticky_ready.values())
+            .flat_map(OrderedReady::iter)
+            .filter(|entry| entry.managed)
+            .map(|entry| (entry.task.run_key, entry.task.logical_seq))
             .collect();
         let active_queues: HashSet<_> = inner
             .last_take_at
@@ -1835,13 +2106,13 @@ impl InMemoryBroker {
         normal_queue: Option<&QueueKey>,
         worker: &WorkerIdentity,
         waiter_id: Option<u64>,
-    ) -> Result<Option<(DispatchableWorkflowTask, Instant)>> {
+    ) -> Result<Option<(DispatchableWorkflowTask, WorkflowOfferStamp)>> {
         let mut inner = self.inner.lock().await;
         if waiter_id.is_some_and(|id| !Self::waiter_registered(&inner, queue, id)) {
             return Ok(None);
         }
         if self.queue_homes.is_some() {
-            Self::expire_locked(&mut inner, Instant::now());
+            self.expire_locked(&mut inner, Instant::now());
         }
         if inner.denied_workers.contains(&(
             queue.namespace_id,
@@ -1850,36 +2121,60 @@ impl InMemoryBroker {
         )) {
             return Ok(None);
         }
-        let sticky_priority = inner.sticky_ready.get(queue).and_then(|sticky| {
-            sticky
-                .iter()
-                .find(|task| task.task.sticky_preferred.as_ref() == Some(worker))
-                .and_then(|task| task.task.order)
-                .map(|order| order.priority_key)
-        });
+        let owns_poll = self
+            .queue_homes
+            .as_ref()
+            .is_none_or(|homes| homes.local_home(queue).is_some_and(|home| home.valid()));
         let general_queue = normal_queue.unwrap_or(queue);
-        let general_priority = inner
-            .general_ready
-            .get(general_queue)
-            .and_then(OrderedReady::front)
-            .and_then(|task| task.task.order)
-            .map(|order| order.priority_key);
-        let select_sticky = prefer_sticky_candidate(sticky_priority, general_priority);
-        let task = if select_sticky {
-            inner.sticky_ready.get_mut(queue).and_then(|sticky| {
-                sticky.remove_where(|task| task.task.sticky_preferred.as_ref() == Some(worker))
-            })
-        } else {
-            inner
+        let selected = loop {
+            let sticky_priority = inner.sticky_ready.get(queue).and_then(|sticky| {
+                sticky
+                    .iter()
+                    .find(|task| {
+                        (!task.managed || owns_poll)
+                            && task.task.sticky_preferred.as_ref() == Some(worker)
+                    })
+                    .and_then(|task| task.task.order)
+                    .map(|order| order.priority_key)
+            });
+            let general_priority = inner
                 .general_ready
-                .get_mut(general_queue)
-                .and_then(OrderedReady::pop_front)
+                .get(general_queue)
+                .and_then(|ready| ready.iter().find(|task| !task.managed || owns_poll))
+                .and_then(|task| task.task.order)
+                .map(|order| order.priority_key);
+            let select_sticky = prefer_sticky_candidate(sticky_priority, general_priority);
+            let task = if select_sticky {
+                inner.sticky_ready.get_mut(queue).and_then(|sticky| {
+                    sticky.remove_where(|task| {
+                        (!task.managed || owns_poll)
+                            && task.task.sticky_preferred.as_ref() == Some(worker)
+                    })
+                })
+            } else {
+                inner
+                    .general_ready
+                    .get_mut(general_queue)
+                    .and_then(|ready| ready.remove_where(|task| !task.managed || owns_poll))
+            };
+            let Some(task) = task else {
+                break None;
+            };
+            let cancel = inner.offers.take(
+                (task.task.run_key, task.task.logical_seq),
+                task.entered_at,
+                Instant::now(),
+            );
+            if task.managed && cancel.is_none() {
+                // Cleanup can lag retirement, and an entry can expire after the
+                // initial sweep. Keep selecting under the lock so discarding it
+                // cannot park a poll with live work still waiting behind it.
+                continue;
+            }
+            break Some((task, cancel));
         };
 
-        if let Some(task) = task {
-            inner
-                .offers
-                .take((task.task.run_key, task.task.logical_seq), Instant::now());
+        if let Some((task, cancel)) = selected {
             let metric_key = task
                 .task
                 .sticky_preferred
@@ -1911,7 +2206,13 @@ impl InMemoryBroker {
             if let Some(metric_key) = metric_key {
                 self.policy.queue_metrics().record_dispatch(metric_key);
             }
-            return Ok(Some((task.task, task.entered_at)));
+            return Ok(Some((
+                task.task,
+                WorkflowOfferStamp {
+                    entered_at: task.entered_at,
+                    cancel,
+                },
+            )));
         }
         Self::emit_queue_depths(&inner, queue);
         if general_queue != queue {
@@ -3001,7 +3302,7 @@ mod tests {
         ) {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
                 let queue = activity_queue("policy-preservation");
-                let home = PolicyHome(crate::discovery::QueueHome { id: tokeira_types::ShardId(0), generation: 7, cancel: tokio_util::sync::CancellationToken::new() });
+                let home = PolicyHome(crate::discovery::QueueHome { id: tokeira_types::ShardId(0), generation: 7, cancel: tokio_util::sync::CancellationToken::new(), deadline: Default::default() });
                 let stop = home.0.cancel.clone();
                 let bounded = InMemoryActivityBroker::with_discovery(Arc::new(home));
                 let existing = InMemoryActivityBroker::default();
@@ -4432,10 +4733,11 @@ mod tests {
             task_queue: TaskQueueName("normal".into()),
             ..sticky_queue.clone()
         };
+        let deadline = OffsetDateTime::now_utc() + time::Duration::seconds(30);
         let task = DispatchableWorkflowTask {
             sticky_preferred: Some(WorkerIdentity("worker-a".to_string())),
             normal_queue: Some(normal_queue.clone()),
-            sticky_deadline: Some(OffsetDateTime::UNIX_EPOCH),
+            sticky_deadline: Some(deadline),
             ..workflow_task(sticky_queue)
         };
 
@@ -4454,7 +4756,7 @@ mod tests {
             .expect("workflow task");
         assert_eq!(delivered.0.queue, normal_queue);
         assert_eq!(delivered.0.sticky_preferred, None);
-        assert_eq!(delivered.0.sticky_deadline, None);
+        assert_eq!(delivered.0.sticky_deadline, Some(deadline));
     }
 
     #[tokio::test]

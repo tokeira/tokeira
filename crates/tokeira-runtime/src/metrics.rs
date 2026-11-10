@@ -14,6 +14,13 @@ use tokeira_types::{
 
 use crate::worker_compute::{ObserveResult, ScalerSuppression, WorkerComputeProviderTargetKind};
 
+/// Workflow hint admission attempts by bounded source and outcome labels.
+pub const WORKFLOW_OFFER_ADMISSIONS_TOTAL: &str = "tokeira_runtime_workflow_offer_admissions_total";
+/// Workflow hint refusals by count or aggregate serialized-byte bound.
+pub const WORKFLOW_OFFER_SATURATION_TOTAL: &str = "tokeira_runtime_workflow_offer_saturation_total";
+/// Queue-home acquisition cleanup by cancellation, deadline or shutdown.
+pub const WORKFLOW_OFFER_RETIREMENTS_TOTAL: &str =
+    "tokeira_runtime_workflow_offer_retirements_total";
 /// Candidate rows returned by workflow discovery pages.
 pub const WORKFLOW_DISPATCH_READS_TOTAL: &str = "tokeira_runtime_workflow_dispatch_reads_total";
 /// Examined workflow candidates skipped, labelled only by a bounded reason.
@@ -158,6 +165,9 @@ pub const OUTBOUND_ATTEMPTS_TOTAL: &str = "tokeira_runtime_outbound_attempts_tot
 pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (OUTBOUND_PENDING_OBSERVATIONS_TOTAL, MetricType::Counter),
     (OUTBOUND_ATTEMPTS_TOTAL, MetricType::Counter),
+    (WORKFLOW_OFFER_ADMISSIONS_TOTAL, MetricType::Counter),
+    (WORKFLOW_OFFER_SATURATION_TOTAL, MetricType::Counter),
+    (WORKFLOW_OFFER_RETIREMENTS_TOTAL, MetricType::Counter),
     (WORKFLOW_DISPATCH_READS_TOTAL, MetricType::Counter),
     (WORKFLOW_DISPATCH_SKIPS_TOTAL, MetricType::Counter),
     (WORKFLOW_DISPATCH_ADMISSIONS_TOTAL, MetricType::Counter),

@@ -535,7 +535,19 @@ async fn an_activation_that_ends_without_finishing_leaves_its_run_runnable() {
         other.await.unwrap(),
         Ok(CommitResult::Applied { .. })
     ));
-    assert_eq!(lane.active_activations(), 0);
+    // An activation replies before it ends, and the dispatcher hands its run
+    // back only after joining the task, so the count reaches zero some time
+    // after the last reply. The timeout turns a leaked activation into a
+    // failure instead of a hang.
+    tokio::time::timeout(StdDuration::from_secs(10), async {
+        while lane.active_activations() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("every activation ends, leaving zero active activations");
+    // Each command's claim is released when its activation takes it, before
+    // the reply, so no wait is needed here.
     assert_eq!(lane.reserved_claims(), 0);
 }
 

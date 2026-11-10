@@ -17,7 +17,8 @@ config run instead of skipping. It is derived from three sources verified this i
 The design is bounded by the requirements' three lines: **compile-time gating** (production contains
 none of it), a **kernel-purity exclusion** (the pure deterministic engine never reads it), and an
 **honesty boundary** (only genuinely-wired keys are honoured; everything else is `Unsupported` and the
-fork falls back to the skip registry).
+fork runs the test with a label naming what it ran without, also listed at the end of the run, unless
+the registry skips it by name).
 
 ## Dependencies and Non-Goals
 
@@ -25,7 +26,7 @@ fork falls back to the skip registry).
 - **`temporal-functional-conformance`** owns the corpus, the skip registry, and the drive-to-green
   conventions. This design is an enabling capability it consumes; it does not replace the
   "independent runs" convention (kept for kernel-const and feature-mode cases) or the skip registry
-  (kept for unbridgeable cases).
+  (kept for tests skipped by name, including the kernel-excluded leaves in Requirement 4.4).
 - **This design consumes** the pinned Temporal v1.31.0 `dynamicconfig` key namespace and per-key value
   types (`common/dynamicconfig/constants.go @ v1.31.0`) as the set of override keys.
 - **The consumer planes** (`tokeira-runtime`, `tokeira-edge`, `tokeira-projection`) gain a
@@ -57,7 +58,7 @@ flowchart LR
     subgraph Tokeirad["tokeirad --features conformance, --conformance-control (loopback)"]
         Ctl["ConformanceControlService (connect-rust)"]
         Reg["tokeira-conformance: process-global registry + key classification"]
-        Bridge -->|Set/Clear/Reset RPC| Ctl
+        Bridge -->|Set/Clear RPC| Ctl
         Ctl -->|honour wired keys only| Reg
 
         subgraph Data["request handling"]
@@ -198,22 +199,61 @@ if conformance_control_enabled() {                 // mirrors wire_coverage_enab
 
 ### Fork bridge — `tests/testcore/tokeira_dynamic_config_bridge.go` (new, onebox seam)
 
-Mirrors `tokeira_metrics_bridge.go`. For the tokeira out-of-process cluster it overrides
-`OverrideDynamicConfig` to call the control service; returns a `cleanup` that clears; `TearDownTest`
-resets. It never edits a corpus test body.
+Mirrors `tokeira_metrics_bridge.go`. At Shape-2 cluster construction,
+`tests/testcore/tokeira_conformance_cluster.go` calls `applyHarness`: the bridge sends the
+corpus-wide `dynamicConfigOverrides`, the SDK callback URL template derived from the frontend
+address, and the read/write task-queue partition counts (both 1). Each unhonoured harness key is
+reported once per cluster, with the requested value and the control answer or delivery/encoding
+error. These reports skip or label no test (Requirement 6.5).
 
-```go
-// pseudocode
-func (c *tokeiraCluster) OverrideDynamicConfig(setting dynamicconfig.GenericSetting, value any) func() {
-    v, ok := coerce(setting, value)
-    resp := c.control.SetDynamicConfigOverride(setting.Key(), v)   // gRPC/Connect
-    if !ok || isUnsupported(resp) || isInvalidArgument(resp) {
-        c.markSkip(setting.Key())   // Requirement 5.2 fallback — never a silent no-op
-    }
-    return func() { c.control.ClearDynamicConfigOverride(setting.Key()) }
-}
-// TearDownTest → c.control.ResetDynamicConfigOverrides()
+Test-scoped `OverrideDynamicConfig` calls attempt a Connect JSON-over-HTTP `Set`. Suite-level
+settings are collected and delivered separately for each test by `applySuite`, so an unhonoured
+suite override is attributed to each affected test. Any failed `Set`, missing listener or
+unencodable value lets the test run with a label containing its full name, the key, the requested
+value and the answer or error. If the test and harness values both encode successfully to the same
+value, the bridge omits the test label for that key (Requirements 5.2, 6.4, 6.5).
+
+Only delivered overrides register remote cleanup. The returned closure and `t.Cleanup` share a
+once-only action: restore the harness value if it was honoured, otherwise clear the key. A failed
+restore or clear fails the test. Teardown does not call `ResetDynamicConfigOverrides`, which would
+also discard the harness settings (Requirements 6.1, 6.2). No corpus test body is edited.
+
+```text
+Shape-2 cluster start:
+    harness = corpus defaults + SDK callback template + read/write partition counts of 1
+    once per cluster, attempt Set(key, encode(value)) for every harness setting
+    report each failed harness key once, with its requested value and answer or error
+
+Suite-level OverrideDynamicConfig(key, value):
+    remember the setting; deliver it separately for each test during setup
+
+Test-scoped delivery(key, value):
+    attempt Set(key, encode(value))
+    on failure (including no listener or encoding failure):
+        unless the test and harness values have identical successful encodings:
+            label the full test name, key, requested value and answer or error
+        return an empty cleanup; let the test run
+    on success:
+        cleanup = once-only action:
+            if the harness has an honoured value for key: Set(key, encode(harness[key]))
+            otherwise: Clear(key)
+            fail the test if this action fails
+        register cleanup with the test and return it
+
+Test or sub-test teardown:
+    run registered cleanup actions; preserve honoured harness settings
+
+End of run:
+    list labelled tests and settings, then unhonoured harness settings
 ```
+
+Both runners use `DynamicConfigReport` in `tests/tokeira_conformance_runner/dynamic_config.go` to
+read the bridge's fixed-prefix output: `tokeira_conformance_runsuite/main.go` reads verbose output;
+`tokeira_conformance_runall/main.go` reads the combined JSON stream. Their end-of-run listings group
+test labels by full test name and key, and harness reports by key, retaining every distinct
+requested value and answer. The single-suite runner's `-repeat N` passes `-count=N` to one `go test`
+invocation; its `-timeout` therefore covers all repetitions together. Labels do not change the test
+outcome.
 
 ## Data Models
 
@@ -300,10 +340,21 @@ site are identical to a plain build, and no control listener is bound.
 **Validates: Requirements 3.2, 3.3, 3.4, 3.5, 8.5**
 
 ### Property 7: Between-test isolation
-*For any* sequence of per-test `Set`/`Clear` calls followed by a `Reset()` at teardown, no override
-set during test *i* is observable during test *i+1*.
+*For any* sequence of `Set`/`Clear` calls followed by `reset()`, no override is observable.
+This validates the registry reset contract in Requirement 2.6; the fork bridge no longer resets at
+teardown.
 
-**Validates: Requirements 6.2, 6.1**
+**Validates: Requirements 2.6**
+
+### Property 8: Fork bridge cleanup
+*For any* delivered test override, successful cleanup restores the honoured harness value for its
+key, or clears the key when no honoured harness value exists. A test or sub-test runs each
+registered cleanup at most once, even if the caller already invoked it; a failed restore or clear
+fails the test.
+After successful cleanup, no test-specific override remains for the next test, and honoured harness
+settings remain in place.
+
+**Validates: Requirements 6.1, 6.2, 6.5**
 
 ## Error Handling
 
@@ -317,8 +368,10 @@ set during test *i* is observable during test *i+1*.
 | `Set` for a `Wired` key, type-valid | — | `ok` (`applied = true`) |
 | `Clear` / `Reset` | — | `ok` (idempotent) |
 
-The fork bridge treats `unimplemented` and `invalid_argument` identically: fall back to the skip
-registry (Requirement 5.2). `ok` lets the test proceed.
+The fork bridge lets the test proceed after any failed `Set`, labelling the requested setting and
+answer or error unless both values have identical successful encodings (Requirements 5.2, 6.4, 6.5).
+Harness failures are reported once per cluster and in the runners' end-of-run listings; failed
+restore-or-clear cleanup fails the test (Requirement 6.2).
 
 ## Testing Strategy
 
@@ -332,6 +385,10 @@ registry (Requirement 5.2). `ok` lets the test proceed.
 - **Unit tests (example-based):** `KEY_CLASSIFICATION` invariants (every entry's `value_type` is
   self-consistent; no `Wired` entry names a kernel plane); value coercion edge cases (duration nanos,
   structured JSON, negative ints, `usize` conversion bounds).
+- **Fork bridge Go unit tests (Property 8):** honoured harness values are restored, other keys are cleared,
+  cleanup is once-only and its failures fail the test; refused settings produce test or harness
+  reports with the encoded-value equality exception. Runner tests cover both output formats and
+  grouping repeated labels without losing distinct requested values or answers.
 - **Structural test (Property 5):** a manifest/dependency assertion that `tokeira-kernel`'s
   dependencies do not include `tokeira-conformance` (a small test or a CI `cargo metadata` check), plus
   the documented invariant that `apply` is unchanged.
@@ -342,7 +399,7 @@ registry (Requirement 5.2). `ok` lets the test proceed.
     `crates/tokeira-runtime` tests.
 - **Corpus validation:** once the reported-problems threshold is wired (Requirement 7.3), Tier 3.22
   `TestWFTFailureReportedProblems_DynamicConfigChanges` runs green over the bridge (two clean runs);
-  until then it stays a classified skip.
+  if its override is not honoured, it runs labelled.
 - **Placement:** registry/service PBTs in the two new crates; the first-consumer integration test in
   `tokeira-runtime`; the dependency assertion at the workspace test level; the fork bridge exercised by
   the corpus run, not a Rust test.

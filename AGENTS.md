@@ -518,8 +518,9 @@ name** in the fork's skip registry (`tests/testcore/tokeira_conformance_skip.go`
 with a cited reason and a classified `skip` outcome, never by editing a corpus test
 body. Tests needing non-default dynamic config are not blanket skips: the override
 bridge delivers wired keys to a `--features conformance` `tokeirad`
-(`.kiro/specs/conformance-config-override/`); only unwired, kernel-excluded, or
-not-enforced keys fall back to the registry.
+(`.kiro/specs/conformance-config-override/`); a test whose override `tokeirad` doesn't
+honour runs without it unless the registry skips it by name; its output names what it
+ran without, and every run lists such tests at its end.
 
 Campaign order and per-tier ledger:
 [docs/readiness/functional-test-order.md](docs/readiness/functional-test-order.md) ·

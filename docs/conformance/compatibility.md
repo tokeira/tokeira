@@ -97,6 +97,8 @@ Before bumping the server compatibility claim:
 1. Confirm the feature matrix supports the target Temporal server release.
 2. Confirm SDK matrix evidence covers the claimed behavior.
 3. Document known divergences and mitigations.
-4. Ensure `GetSystemInfo` capabilities remain conservative and SDK-safe.
-5. Run compatibility checks and the full workspace verification suite.
-6. Include the rationale and evidence references in the bump change.
+4. Walk the target release's history task types against
+   [`task-types.md`](task-types.md) and update it.
+5. Ensure `GetSystemInfo` capabilities remain conservative and SDK-safe.
+6. Run compatibility checks and the full workspace verification suite.
+7. Include the rationale and evidence references in the bump change.

@@ -345,3 +345,82 @@ lookups. Every recorded inline/split read total matched the baseline matrix. Sha
 after each new suite and 31 / 28 after the existing ordered-page suite.
 The additional ephemeral Aurora DSQL cluster was deleted and its absence verified. The review devbox was
 expired and its absence from the active inventory verified.
+
+
+## Part 4: push and sticky fallbacks
+
+### Activated behavior
+
+Committed normal workflow tasks now reach their queue home by local admission or authenticated push. The runtime
+owns the bounded sender; the edge implements its provider-agnostic sink using trusted placement, pooled channels
+and peer tokens. The handler acknowledges retention or an incarnation already known in this acquisition, without
+starting work or waiting for a lane. Engine wiring installs the sender only with a validated peer endpoint.
+No-peer modes deliver locally without constructing a sender, sink or endpoint.
+
+The sticky home checks its ten-second recent-poller window first, including completed polls without a waiter and
+worker shutdown. With a poller present it checks deployment change, using the same current/ramping selection as
+Tokeira's start path. Pinned tasks and directives with an assigned build bypass deployment fallback; a nil target
+is not unavailability. The internal request adds workflow identity and the initial ramping choice. Upstream protos
+and the existing routing hash are unchanged. Only no recent poller and deployment change are produced, following
+the [worker-versioning decision](../worker-deployments/reference/v1-v2-conformance-decision.md); wire reasons 3 and
+4 remain reserved. Poller-first ordering follows `AddWorkflowTask`, `service/matching/matching_engine.go @ v1.31.0`.
+
+Local publication uses committed state and its existing deployment decision, with no run reload or second policy
+lookup. One state-based resolver supplies the normal fallback target to both publication and the off-lane sender.
+The sender's fallback reload is attributed to `publication-fallback`, separately from start reads. Routing read
+failure is transient only after an available poller; it cannot override `NoRecentPoller`.
+
+Fallback reaches the original normal queue's home and keeps the sticky origin and absolute deadline, including
+the publisher's deployment-change branch. Same-home retargeting requires the receiving home's own decision;
+arrival order alone answers `Known`. Obsolete incarnations have their own outcome, distinct from expiry.
+No hint outcome writes authoritative state. Activity, speculative, eager, query and start delivery are unchanged.
+
+### Bounds and recovery seam
+
+The sender retains at most 1,024 entries and 16 MiB per node, counting active work as well as queued work and
+coalescing by incarnation. Sender and broker use the same capped serialized-envelope byte counter. Up to 32
+attempts run per node, at most eight per destination; source alternation and round-robin homes share capacity
+between publication and recovery. Each attempt includes routing, credentials and RPC within 500 ms; residence,
+retries and fallback share one second. At most three delivery attempts use bounded jitter, with one trusted
+placement refresh after `NotHome`. Acquisition loss cancels queued and active work. Fallback re-enters scheduling
+for its second destination. Saturation and delivery counters use bounded outcome/source/reason labels.
+
+The recovery source is available to the subsequent sticky sweep. That sweep will traverse durable sticky intent
+and republish through this sender after lost publication or placement changes. It is not active here. Ordinary
+discovery's period and limits, acquisition-driven admission retirement, storage formats and migrations are unchanged.
+
+### Regression inventory
+
+All generated properties below configure 100 cases each: sixteen runtime properties and three edge properties,
+1,900 cases in total. They use injected time or synchronization barriers, with no sleeps.
+
+| Property | Generated tests |
+| --- | --- |
+| 4 | `off_home_sticky_never_selects_local_fallback`, `sticky_conditions_and_controls`, `same_home_fallback_and_absolute_deadline`, `distinct_homes_fallback_and_lost_reply` |
+| 4 | `receiver_ramping_and_recent_window`, `local_fallback_with_failed_run_loads`, `no_poller_precedes_routing_failure`, `local_publication_reuses_routing` |
+| 7 | `receipts_and_interleaved_discovery`, `publishing_lane_paused_until_receipt`, `full_sticky_home_never_selects_fallback` |
+| 7 | `sender_retention_bounds`, `sender_fairness_and_concurrency`, `sender_budgets_refresh_and_failures`, `sender_acquisition_loss`, `obsolete_fallback_outcome` |
+| 4 / 7 | Edge `wire_routing_and_sticky_origin`, `handler_and_sink_in_process`, `sink_placement_and_destination_cap` |
+
+Test names carry the corresponding `property_4_` or `property_7_` prefix. The edge tests call the real handler and
+sink preparation in-process; they do not claim multi-runtime socket integration. Routing properties include each
+sticky cause alone and together, pinned/assigned controls, completed polls, worker shutdown, unavailable policy,
+repeated fallback and deadline-versus-selection races. Durable snapshots remain unchanged by delivery outcomes.
+
+Before implementation, the off-home sticky property admitted at the wrong home and the existing
+`sticky_dispatch_moves_to_normal_queue_when_current_target_changes` test lost its deadline. Both failed against
+main before their fixes. Before the review corrections, local fallback was lost when every run load failed and
+no poller with failed routing returned `Routing` instead of `StickyUnavailable(NoRecentPoller)`.
+
+
+### Validation
+
+The four-crate nextest run (`-p tokeira-runtime -p tokeira-storage -p tokeira-edge -p tokeira-engine --locked
+--offline --no-fail-fast`) passes on macOS: 2,472 tests passed and one was skipped. All nineteen generated
+routing/scheduling properties passed at 100 cases each, including the paused lane, ramping window and full broker.
+The two main-first regressions also pass. In-process edge checks need no listener. Real multi-runtime gRPC and live
+DSQL verification remain separate.
+
+Warning-denied workspace/all-targets clippy and the five-crate `dsql-integration` clippy command pass with
+`--locked --offline`. Nightly formatting and `git diff --check` pass. There is no changelog fragment or dependency
+change.

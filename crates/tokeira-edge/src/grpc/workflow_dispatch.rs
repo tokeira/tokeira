@@ -390,12 +390,20 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
         if self.peer.is_none() {
             return Err(Status::unimplemented("unknown method"));
         }
-        super::workflow_offer::validate_request(request.get_ref())?;
-        // Legacy publication deduplicates before checking ownership and clears
-        // sticky deadlines on fallback. It cannot back a positive acknowledgement.
-        Err(Status::unavailable(
-            "workflow offer admission is not active",
-        ))
+        let deadline = tokio::time::Instant::now() + super::workflow_offer::OFFER_TIMEOUT;
+        let destination = ShardId(request.get_ref().destination_home);
+        let offer = super::workflow_offer::delivery::decode(request.get_ref())?;
+        let outcome = tokio::time::timeout_at(
+            deadline,
+            self.runtime
+                .admit_pushed_workflow_offer(&offer, destination),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("workflow offer deadline exceeded"))?
+        .map_err(super::workflow_offer::delivery::status)?;
+        Ok(Response::new(super::workflow_offer::delivery::response(
+            outcome,
+        )))
     }
 
     async fn start_workflow_task(

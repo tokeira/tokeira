@@ -3974,7 +3974,7 @@ where
         let routing_cache = initial_routing_cache
             .expect("controller snapshot validated before runtime construction");
         let routing_config = EdgeRoutingConfig {
-            controller_endpoint,
+            controller_endpoint: controller_endpoint.clone(),
             max_retries: effective_config
                 .infrastructure
                 .placement
@@ -4021,10 +4021,18 @@ where
                     routing_cache.clone(),
                     peer.clone(),
                 );
+            let mut offer_sink =
+                tokeira_edge::grpc::workflow_offer::delivery::PeerWorkflowOfferSink::new(
+                    routing_cache.clone(),
+                    controller_endpoint.clone(),
+                    peer.clone(),
+                );
             if let Some(connector) = &peer_connector {
+                offer_sink = offer_sink.with_peer_connector(connector.clone());
                 activity_starter = activity_starter.with_peer_connector(connector.clone());
                 outbound_delivery = outbound_delivery.with_peer_connector(connector.clone());
             }
+            runtime.set_workflow_offer_sink(Arc::new(offer_sink));
             runtime.set_activity_task_starter(Arc::new(activity_starter));
             runtime.set_outbound_delivery_transport(Arc::new(outbound_delivery));
         }

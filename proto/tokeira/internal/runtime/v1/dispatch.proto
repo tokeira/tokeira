@@ -79,6 +79,9 @@ message OfferWorkflowTaskRequest {
   google.protobuf.Timestamp scheduled_at = 10;
   OfferPriority priority = 11;
   OfferStickyOrigin sticky_origin = 12;
+  // Inputs for the receiver's own current/ramping target selection.
+  string workflow_id = 13;
+  bool use_ramping_version = 14;
 }
 
 enum OfferOutcome {

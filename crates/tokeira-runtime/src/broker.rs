@@ -113,29 +113,6 @@ impl Drop for AdmissionReservation<'_> {
     }
 }
 
-fn serialized_hint_bytes(task: &DispatchableWorkflowTask) -> usize {
-    struct ByteCount(usize);
-    impl std::io::Write for ByteCount {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.saturating_add(bytes.len());
-            if self.0 > crate::workflow_offers::BYTE_CAPACITY {
-                return Err(std::io::Error::other("offer byte budget exceeded"));
-            }
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    // Count the complete serialized envelope without allocating another copy of
-    // an oversized local hint. The aggregate budget covers ready and in-flight hints.
-    let mut count = ByteCount(0);
-    if serde_json::to_writer(&mut count, task).is_err() {
-        return crate::workflow_offers::BYTE_CAPACITY + 1;
-    }
-    count.0
-}
-
 /// Lightweight in-memory workflow-task broker.
 ///
 /// The broker exists so pollers do not become durable objects. The interesting
@@ -1523,11 +1500,33 @@ impl InMemoryBroker {
     /// placed in the sticky tier; all others go to general.
     pub async fn publish_workflow_task(
         &self,
-        task: DispatchableWorkflowTask,
+        mut task: DispatchableWorkflowTask,
         metrics: Option<&DeliveryMetrics>,
     ) {
+        // Legacy in-process callers have no routing envelope. They may observe
+        // availability only at the sticky home; runtime publication uses the
+        // shared delivery procedure and calls admission with a selected target.
+        if task.sticky_preferred.is_some() {
+            if self
+                .queue_homes
+                .as_ref()
+                .is_some_and(|homes| homes.local_home(&task.queue).is_none())
+            {
+                return;
+            }
+            if !Self::sticky_poller_available(&*self.inner.lock().await, &task)
+                && let Some(normal) = task.normal_queue.take()
+            {
+                task.queue = normal;
+                task.sticky_preferred = None;
+            }
+        }
         self.publish_workflow_offer(task, metrics, None, None, Some(OfferSource::Local), true)
             .await;
+    }
+
+    pub(crate) async fn sticky_available(&self, queue: &QueueKey, worker: &WorkerIdentity) -> bool {
+        Self::sticky_worker_available(&*self.inner.lock().await, queue, worker)
     }
 
     async fn publish_workflow_offer(
@@ -1553,7 +1552,8 @@ impl InMemoryBroker {
             self.expire_locked(&mut inner, now);
         }
         inner.ordering.enter_scope(scope_generation);
-        if task.sticky_preferred.is_some()
+        if speculative
+            && task.sticky_preferred.is_some()
             && !Self::sticky_poller_available(&inner, &task)
             && let Some(normal_queue) = task.normal_queue.take()
         {
@@ -1602,7 +1602,10 @@ impl InMemoryBroker {
                     self.retirement_changed.notify_one();
                     home.clone()
                 });
-            let bytes = serialized_hint_bytes(&task);
+            let bytes = crate::workflow_offers::serialized_hint_bytes(
+                &task,
+                crate::workflow_offers::BYTE_CAPACITY,
+            );
             let admission_now = Instant::now();
             // Counting a large local hint can cross an existing offer's expiry.
             // The final Known check must use the time after that bounded work.

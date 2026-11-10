@@ -84,7 +84,10 @@ The following anchors were read in the local Temporal reference checkout at **v1
 | A changed current deployment or a build-id redirect makes the sticky destination unavailable. | `service/matching/task_queue_partition_manager.go`, `getPhysicalQueuesForAdd`, deployment and redirect branches |
 | In older compatible-version-set routing, a known build that is no longer its set's default also makes sticky delivery unavailable. An unknown build does not trigger this condition. | `service/matching/version_sets.go`, `checkVersionForStickyAdd`, lines 430–448; its call in `task_queue_partition_manager.go` |
 
-The last row is an additional fallback condition, distinct from a redirect rule. All four conditions are required.
+The last row is an additional v1.31.0 condition, distinct from a redirect rule. Tokeira implements the two
+reachable conditions: no recent poller and a changed deployment. Redirect and compatible-set changes cannot
+arise because the build-id APIs remain disabled; see the
+[worker-versioning decision](../worker-deployments/reference/v1-v2-conformance-decision.md).
 
 ## Bug Analysis
 
@@ -137,10 +140,10 @@ lost its execution home THEN it SHALL not commit.
 2.5 WHEN sticky delivery is attempted THEN availability SHALL be evaluated at the sticky queue's current home using
 the ten-second recent-poller condition, not merely the presence of a waiting poll.
 
-2.6 WHEN any Temporal v1.31.0 sticky-unavailability condition applies THEN delivery SHALL use the original normal
-queue with current version routing: missing/recently unpolled sticky partition, changed current deployment,
-build-id redirect, or a known build superseded as its compatible version set's default. An unknown build alone
-SHALL not trigger the last condition.
+2.6 WHEN the sticky partition has no recent eligible poller or its deployment changes under the task's directive
+THEN delivery SHALL use the original normal queue with current version routing. Pinned directives and directives
+with an assigned build SHALL NOT fall back for deployment change. Redirect and compatible-set conditions are
+unreachable under the [worker-versioning decision](../worker-deployments/reference/v1-v2-conformance-decision.md).
 
 2.7 WHEN delivery falls back THEN the offer SHALL retain the pending task's absolute sticky schedule-to-start
 deadline and the run SHALL retain durable sticky affinity; repeated offers SHALL not extend that deadline.

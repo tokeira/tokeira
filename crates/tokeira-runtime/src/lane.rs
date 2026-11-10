@@ -3060,6 +3060,7 @@ mod tests {
     struct MockRepoState {
         loaded: LoadedRun,
         load_calls: usize,
+        fail_loads: bool,
         commit_calls: usize,
         commit_behaviors: VecDeque<CommitBehavior>,
         commit_gate: Option<CommitGate>,
@@ -3112,6 +3113,7 @@ mod tests {
                 state: Arc::new(AsyncMutex::new(MockRepoState {
                     loaded: initial,
                     load_calls: 0,
+                    fail_loads: false,
                     commit_calls: 0,
                     commit_behaviors: commit_behaviors.into(),
                     commit_gate: None,
@@ -3300,6 +3302,9 @@ mod tests {
             }
             let mut state = self.state.lock().await;
             state.load_calls += 1;
+            if state.fail_loads {
+                anyhow::bail!("injected run load failure");
+            }
             let mut loaded = state.loaded.clone();
             if let (Some(stamp), LoadedRun::Existing(image)) = (stamp, &mut loaded) {
                 image.wft_stamp = stamp;

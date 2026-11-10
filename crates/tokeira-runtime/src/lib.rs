@@ -79,6 +79,11 @@ pub mod update;
 pub mod wft_timeout;
 pub mod worker_compute;
 pub mod worker_registry;
+mod workflow_delivery;
+pub use workflow_delivery::{
+    RemoteWorkflowOfferSink, StickyUnavailableReason, WorkflowOffer, WorkflowOfferDirective,
+    WorkflowOfferError, WorkflowOfferOutcome,
+};
 mod workflow_offers;
 mod workflow_rules;
 

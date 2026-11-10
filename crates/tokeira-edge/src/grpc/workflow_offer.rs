@@ -2,8 +2,9 @@
 //!
 //! The gate runs before decoding and shares its semaphore across connections.
 //! Public start forwarding retains its own authorization and response budget.
-//! Valid offers remain unavailable until acquisition-scoped broker admission can
-//! back an acknowledgement; this module must never call the legacy publisher.
+//! Valid offers enter acquisition-scoped runtime admission without starting work.
+
+pub mod delivery;
 
 use std::{
     fmt,
@@ -45,8 +46,7 @@ pub const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Validated bootstrap capability. Construction is restricted to peer startup.
 pub struct PeerOfferEndpoint {
     verifier: PeerVerifier,
-    // Retain validated signing material for the later bounded sender. No sender
-    // or renewal task is activated by installing the wire contract.
+    // Only a validated endpoint can supply the sender's purpose-specific signer.
     signer: PeerSigner,
     handlers: Arc<Semaphore>,
     outbound_handlers: Arc<Semaphore>,
@@ -208,6 +208,7 @@ where
     }
 
     fn call(&mut self, request: Request<B>) -> Self::Future {
+        let offer = request.uri().path() == OFFER_PATH;
         let outbound = request.uri().path() == OUTBOUND_PATH;
         let activity_start = request.uri().path() == super::activity_dispatch::START_PATH;
         if request.uri().path() != OFFER_PATH && !outbound && !activity_start {
@@ -239,7 +240,12 @@ where
         };
         let permit = match entered {
             Ok(permit) => permit,
-            Err(status) => return Box::pin(async move { Ok(status.into_http()) }),
+            Err(status) => {
+                if offer {
+                    record_failure(&status);
+                }
+                return Box::pin(async move { Ok(status.into_http()) });
+            }
         };
         let response = self.inner.call(request);
         Box::pin(async move {
@@ -253,11 +259,19 @@ where
                 {
                     // Tonic's pre-decode message cap reports OutOfRange. Offer
                     // overload uses ResourceExhausted; Start keeps its mapping.
-                    Ok(Status::resource_exhausted("offer request limit exceeded").into_http())
+                    let status = Status::resource_exhausted("offer request limit exceeded");
+                    if offer {
+                        record_failure(&status);
+                    }
+                    Ok(status.into_http())
                 }
                 Ok(result) => result,
                 Err(_) => {
-                    Ok(Status::deadline_exceeded("offer attempt deadline exceeded").into_http())
+                    let status = Status::deadline_exceeded("offer attempt deadline exceeded");
+                    if offer {
+                        record_failure(&status);
+                    }
+                    Ok(status.into_http())
                 }
             }
         })
@@ -331,6 +345,14 @@ where
     }
 }
 
+pub(crate) fn record_failure(status: &Status) {
+    metrics::counter!(tokeira_runtime::metrics::WORKFLOW_OFFER_DELIVERY_TOTAL, "source" => "pushed", "outcome" => match status.code() {
+        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => "authentication",
+        tonic::Code::ResourceExhausted => "capacity", tonic::Code::DeadlineExceeded => "deadline",
+        tonic::Code::InvalidArgument => "invalid", _ => "transport",
+    }).increment(1);
+}
+
 fn invalid() -> Status {
     Status::invalid_argument("malformed workflow offer")
 }
@@ -365,7 +387,8 @@ pub fn validate_request(value: &OfferWorkflowTaskRequest) -> Result<(), Status> 
             return Err(invalid());
         }
     }
-    if value.logical_seq == 0 || value.logical_seq > i64::MAX as u64 {
+    if value.logical_seq == 0 || value.logical_seq > i64::MAX as u64 || value.workflow_id.is_empty()
+    {
         return Err(invalid());
     }
     let selected = queue(value.selected_queue.as_ref())?;
@@ -382,7 +405,7 @@ pub fn validate_request(value: &OfferWorkflowTaskRequest) -> Result<(), Status> 
     let directive = value.version_directive.as_ref().ok_or_else(invalid)?;
     let behavior = OfferVersionBehavior::try_from(directive.behavior).map_err(|_| invalid())?;
     if behavior == OfferVersionBehavior::Unspecified
-        || directive.build_id.is_some() && directive.deployment.is_none()
+        || directive.build_id.is_some() != directive.deployment.is_some()
         || behavior == OfferVersionBehavior::Pinned
             && (directive.deployment.is_none() || directive.build_id.is_none())
     {
@@ -670,6 +693,7 @@ mod tests {
 
     fn request() -> OfferWorkflowTaskRequest {
         OfferWorkflowTaskRequest {
+            workflow_id: "workflow".into(),
             run_key: Uuid::new_v4().as_bytes().to_vec(),
             namespace_id: Uuid::new_v4().as_bytes().to_vec(),
             logical_seq: 1,

@@ -58,9 +58,7 @@ use crate::{
     },
     scanner::pick_lane_for_run_key,
     shard::ShardOwner,
-    workflow_task::{
-        resolve_child_versioning, resolve_workflow_task_target_version, route_activity_task_queue,
-    },
+    workflow_task::{resolve_child_versioning, route_activity_task_queue},
 };
 use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -169,6 +167,7 @@ fn spawn_dispatch_owned<F>(
 pub struct RuntimeDispatchPublisher<R> {
     #[cfg(test)]
     pub(crate) publication_failure: Arc<Mutex<Option<tokeira_types::TaskKind>>>,
+    workflow_delivery: Option<Arc<crate::workflow_delivery::WorkflowDelivery<R>>>,
     broker: InMemoryBroker,
     activity_broker: InMemoryActivityBroker,
     repo: Arc<R>,
@@ -210,6 +209,7 @@ impl<R> Clone for RuntimeDispatchPublisher<R> {
         Self {
             #[cfg(test)]
             publication_failure: self.publication_failure.clone(),
+            workflow_delivery: self.workflow_delivery.clone(),
             broker: self.broker.clone(),
             activity_broker: self.activity_broker.clone(),
             repo: self.repo.clone(),
@@ -257,6 +257,7 @@ where
         Self {
             #[cfg(test)]
             publication_failure: Arc::new(Mutex::new(None)),
+            workflow_delivery: None,
             broker,
             activity_broker,
             repo,
@@ -289,6 +290,14 @@ where
         Ok(())
     }
 
+    pub(crate) fn with_workflow_delivery(
+        mut self,
+        delivery: Arc<crate::workflow_delivery::WorkflowDelivery<R>>,
+    ) -> Self {
+        self.workflow_delivery = Some(delivery);
+        self
+    }
+
     /// Attach the shared deployment registry used for derived dispatch routing.
     pub(crate) fn with_worker_deployment_registry(
         mut self,
@@ -319,7 +328,7 @@ where
         &self,
         run_key: RunKey,
         committed: Option<&WorkflowState>,
-        mut queue: QueueKey,
+        queue: QueueKey,
     ) -> Result<QueueKey> {
         if queue.deployment.is_some() {
             return Ok(queue);
@@ -337,24 +346,7 @@ where
         let Some(state) = self.routing_state(run_key, committed).await? else {
             return Ok(queue);
         };
-        let preferred_deployment = state
-            .effective_deployment()
-            .map(|version| version.deployment_name.as_str())
-            .or(state.worker_deployment_name.as_deref());
-        let routing = registry
-            .workflow_task_routing_config(
-                state.namespace_id,
-                &queue.task_queue.0,
-                preferred_deployment,
-            )
-            .await
-            .map_err(anyhow::Error::new)?;
-        let target = resolve_workflow_task_target_version(&routing, &state);
-        if let Some(version) = target.deployment_version {
-            queue.deployment = Some(tokeira_types::DeploymentId(version.deployment_name));
-            queue.build_id = Some(tokeira_types::BuildId(version.build_id));
-        }
-        Ok(queue)
+        crate::workflow_delivery::fallback_target(Some(&registry), &state, queue).await
     }
 
     fn worker_deployment_routing_enabled(&self) -> bool {
@@ -372,9 +364,13 @@ where
         run_key: RunKey,
         committed: Option<&WorkflowState>,
         mut queue: QueueKey,
-    ) -> Result<(QueueKey, Option<OffsetDateTime>)> {
+    ) -> Result<(
+        QueueKey,
+        Option<OffsetDateTime>,
+        Option<crate::WorkflowOfferDirective>,
+    )> {
         let Some(state) = self.routing_state(run_key, committed).await? else {
-            return Ok((queue, None));
+            return Ok((queue, None, None));
         };
         // Sticky affinity is established by a completed WFT, so the run's
         // effective Version identifies the cache-owning worker when an older
@@ -397,6 +393,7 @@ where
                 .pending_workflow_task
                 .as_ref()
                 .and_then(|pending| pending.schedule_to_start_deadline),
+            Some(crate::WorkflowOfferDirective::from_state(&state)),
         ))
     }
 
@@ -1142,7 +1139,7 @@ where
                         .filter(|(_, normal_name)| **normal_name != queue.task_queue);
                     let (final_queue, final_sticky, normal_queue, sticky_deadline) =
                         if let Some((_, normal_name)) = sticky_normal {
-                            let (sticky_queue, sticky_deadline) = self
+                            let (sticky_queue, sticky_deadline, directive) = self
                                 .hydrate_sticky_workflow_task_target(
                                     run_key,
                                     committed,
@@ -1167,10 +1164,18 @@ where
                                 .route_workflow_task_queue(run_key, committed, normal)
                                 .await?;
                             let sticky_target_changed = self.worker_deployment_routing_enabled()
+                                && routed_normal.deployment.is_some()
+                                && directive.as_ref().is_some_and(|directive| {
+                                    directive.behavior != tokeira_kernel::VersioningBehavior::Pinned
+                                        && directive
+                                            .assigned_build_id
+                                            .as_ref()
+                                            .is_none_or(|id| id.0.is_empty())
+                                })
                                 && (sticky_queue.deployment != routed_normal.deployment
                                     || sticky_queue.build_id != routed_normal.build_id);
                             if sticky_target_changed {
-                                (routed_normal, None, None, None)
+                                (routed_normal, None, None, sticky_deadline)
                             } else {
                                 (
                                     sticky_queue,
@@ -1205,6 +1210,23 @@ where
                         self.broker
                             .publish_speculative_workflow_task(task, Some(&self.delivery_metrics))
                             .await;
+                    } else if let Some(delivery) = &self.workflow_delivery {
+                        if let Some(state) = self.routing_state(run_key, committed).await?
+                            && let Some(mut offer) =
+                                crate::workflow_delivery::WorkflowOffer::from_state(
+                                    &state,
+                                    execution_home,
+                                )?
+                            && offer.hint.task.logical_seq == *logical_seq
+                        {
+                            // The row-derived envelope preserves schedule order and
+                            // sticky origin even when the selected task is normal.
+                            let local_fallback = task.normal_queue.clone();
+                            offer.hint.task = task;
+                            delivery.publish(offer, local_fallback).await;
+                        } else {
+                            crate::workflow_delivery::record_obsolete_publication();
+                        }
                     } else {
                         self.broker
                             .publish_workflow_task(task, Some(&self.delivery_metrics))

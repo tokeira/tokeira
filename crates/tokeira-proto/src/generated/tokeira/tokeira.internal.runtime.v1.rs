@@ -933,6 +933,11 @@ pub struct OfferWorkflowTaskRequest {
     pub priority: ::core::option::Option<OfferPriority>,
     #[prost(message, optional, tag = "12")]
     pub sticky_origin: ::core::option::Option<OfferStickyOrigin>,
+    /// Inputs for the receiver's own current/ramping target selection.
+    #[prost(string, tag = "13")]
+    pub workflow_id: ::prost::alloc::string::String,
+    #[prost(bool, tag = "14")]
+    pub use_ramping_version: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OfferWorkflowTaskResponse {

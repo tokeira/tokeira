@@ -21,6 +21,14 @@ pub const WORKFLOW_OFFER_SATURATION_TOTAL: &str = "tokeira_runtime_workflow_offe
 /// Queue-home acquisition cleanup by cancellation, deadline or shutdown.
 pub const WORKFLOW_OFFER_RETIREMENTS_TOTAL: &str =
     "tokeira_runtime_workflow_offer_retirements_total";
+/// Post-commit workflow delivery outcomes, with finite source and outcome labels.
+pub const WORKFLOW_OFFER_DELIVERY_TOTAL: &str = "tokeira_runtime_workflow_offer_delivery_total";
+/// Sticky semantic fallback decisions, labelled only by the supported reason.
+pub const WORKFLOW_OFFER_STICKY_FALLBACK_TOTAL: &str =
+    "tokeira_runtime_workflow_offer_sticky_fallback_total";
+/// Sender refusal by entries or retained bytes.
+pub const WORKFLOW_OFFER_SENDER_SATURATION_TOTAL: &str =
+    "tokeira_runtime_workflow_offer_sender_saturation_total";
 /// Candidate rows returned by workflow discovery pages.
 pub const WORKFLOW_DISPATCH_READS_TOTAL: &str = "tokeira_runtime_workflow_dispatch_reads_total";
 /// Examined workflow candidates skipped, labelled only by a bounded reason.
@@ -166,6 +174,9 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (OUTBOUND_PENDING_OBSERVATIONS_TOTAL, MetricType::Counter),
     (OUTBOUND_ATTEMPTS_TOTAL, MetricType::Counter),
     (WORKFLOW_OFFER_ADMISSIONS_TOTAL, MetricType::Counter),
+    (WORKFLOW_OFFER_DELIVERY_TOTAL, MetricType::Counter),
+    (WORKFLOW_OFFER_STICKY_FALLBACK_TOTAL, MetricType::Counter),
+    (WORKFLOW_OFFER_SENDER_SATURATION_TOTAL, MetricType::Counter),
     (WORKFLOW_OFFER_SATURATION_TOTAL, MetricType::Counter),
     (WORKFLOW_OFFER_RETIREMENTS_TOTAL, MetricType::Counter),
     (WORKFLOW_DISPATCH_READS_TOTAL, MetricType::Counter),

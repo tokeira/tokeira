@@ -68,6 +68,24 @@ fn runtime() -> tokio::runtime::Runtime {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
+    // Feature: queue-home-delivery, Property 4: only the sticky home judges availability.
+    #[test]
+    fn property_4_off_home_sticky_never_selects_local_fallback(index in 0u32..100) {
+        runtime().block_on(async {
+            let (broker, homes) = fixture();
+            let sticky = queue(index);
+            let normal = (index + 1..index + 100).map(queue).find(|q| home_id(q) != home_id(&sticky)).unwrap();
+            homes.owner.write().unwrap().remove(home_id(&sticky));
+            let mut offer = task(&sticky, index);
+            offer.sticky_preferred = Some(WorkerIdentity("absent-here".into()));
+            offer.normal_queue = Some(normal.clone());
+            offer.sticky_deadline = Some(OffsetDateTime::now_utc() + time::Duration::seconds(30));
+            prop_assert_eq!(broker.admit_workflow_offer(offer, OfferSource::Pushed, None, None, false).await, OfferAdmission::NotHome);
+            prop_assert_eq!(broker.backlog_stats(&normal).await.count, 0);
+            Ok(())
+        })?;
+    }
+
     // Feature: queue-home-delivery, Property 5: cancellation fences dequeue before cleanup.
     #[test]
     fn property_5_cancelled_generation_cannot_dequeue(index in 0u32..100, copies in 1..8usize) {
@@ -190,7 +208,7 @@ proptest! {
                 let hint = task(&queue, id as u32);
                 prop_assert_eq!(broker.inner.lock().await.offers.admit(OfferAdmissionInput {
                     key: (hint.run_key, hint.logical_seq), queue: queue.clone(), home: &home, now: Instant::now(), reserved: false,
-                    bytes: if bytes_full { crate::workflow_offers::BYTE_CAPACITY } else { serialized_hint_bytes(&hint) },
+                    bytes: if bytes_full { crate::workflow_offers::BYTE_CAPACITY } else { crate::workflow_offers::serialized_hint_bytes(&hint, crate::workflow_offers::BYTE_CAPACITY) },
                     deadline: None, retarget: true,
                 }).0, OfferAdmission::Admitted);
             }

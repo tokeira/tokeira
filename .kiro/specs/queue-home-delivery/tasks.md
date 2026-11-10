@@ -100,27 +100,32 @@ bar belongs to the code PRs.
     - **Validates: Requirements 2.2, 2.3, 2.10, 2.14, 3.5.**
     - DONE — All thirteen generated properties for Properties 2 and 5 pass at 100 cases each, covering source races, retention, delayed results, both bounds, colocated homes, retargeting, locked admission checks, deadlines and replacement acquisitions. Cancellation/dequeue and colocated-home properties first failed against the unchanged implementation; see implementation-evidence.md for case counts and validation.
 
-- [ ] 5. Bounded push and all sticky fallback conditions
-  - [ ] 5.1 Add the post-commit sender queue and provider-agnostic sink, wire the edge client to trusted placement and
+- [x] 5. Bounded push and reachable sticky fallback conditions
+  - [x] 5.1 Add the post-commit sender queue and provider-agnostic sink, wire the edge client to trusted placement and
     pooled channels, and connect local/remote admission. Keep all network waits outside the publishing lane and
     acknowledge admission independently of a start. Implement bounded coalescing, fairness, cancellation, deadline,
     refresh/retry and outcome diagnostics.
     - _Requirements: 2.1, 2.4, 2.13, 2.14, 2.16_
-  - [ ] 5.2 Evaluate sticky availability at its home and preserve all Temporal v1.31.0 fallbacks: recent poller,
-    deployment change, redirect and compatible-version-set default change. Route normal fallback to its home,
-    preserving the absolute deadline and affinity. Test an unknown compatible-set build as a non-fallback control.
+    - DONE — Runtime-owned bounded scheduling, the provider-agnostic sink, authenticated handler and peer-gated engine wiring are active. Local admission reuses committed routing; remote attempts run off the lane, with finite outcome and saturation diagnostics.
+  - [x] 5.2 Evaluate sticky availability at its home for the two reachable Temporal v1.31.0 conditions: no recent
+    poller and deployment change. Route normal fallback to its home, preserving the absolute deadline and affinity.
+    Test pinned directives and directives with an assigned build as deployment non-fallback controls, following
+    the [worker-versioning decision](../worker-deployments/reference/v1-v2-conformance-decision.md).
     Preserve the existing publisher deployment fallback while repairing its lost deadline.
     - _Requirements: 2.5, 2.6, 2.7, 3.4_
-  - [ ] 5.3 Generate interleavings of push, duplicate discovery, unavailable/full/moving homes and lost replies.
+    - DONE — The sticky home checks the recent poller before deployment routing, using the same current/ramping selection as Tokeira's start path. Normal fallback keeps its origin and absolute deadline, resolves its own home, and can retarget a retained sticky offer only with the receiver's decision. Pinned and assigned-build controls remain.
+  - [x] 5.3 Generate interleavings of push, duplicate discovery, unavailable/full/moving homes and lost replies.
     Pause the publishing lane until the admission response is received to detect an acknowledgement/start cycle.
-    Test every sticky cause independently and in combinations, including recent completed polls without a waiter,
+    Test both reachable sticky causes independently and together, including recent completed polls without a waiter,
     unavailable routing data, shutdown workers, repeated fallback and deadline-versus-start races.
     - **Property 4: Sticky routing and deadline preservation** (routing portion; recovery portion in 6.2)
     - **Property 7: Authorized, bounded and non-blocking hints** (scheduling portion)
     - **Validates: Requirements 2.5, 2.6, 2.7, 2.8, 2.13, 2.14, 2.16, 3.2, 3.4.**
-  - [ ] 5.4 Checkpoint: focused storage, runtime, edge and auth checks pass; no authoritative write depends on push
+    - DONE — Nineteen generated properties cover routing and scheduling at 100 cases each, including a paused publishing lane, separate homes, lost replies, saturation, acquisition loss, poller/routing failures and local publication without run reloads. Regression and command evidence is recorded in implementation-evidence.md.
+  - [x] 5.4 Checkpoint: focused storage, runtime, edge and auth checks pass; no authoritative write depends on push
     admission, and neither activity nor speculative delivery has acquired an unsupported remote path.
     - _Requirements: 3.2, 3.3_
+    - DONE — All nineteen generated routing/scheduling properties pass. Both warning-denied clippy commands, nightly formatting and diff checks pass. The four-crate suite passes: 2,472 tests, one skipped. No durable writes or unsupported activity/speculative paths were added.
 
 - [ ] 6. Complete sticky recovery and liveness
   - [ ] 6.1 Start a fair bounded sticky sweep after execution-home activation, using the new repository operation.

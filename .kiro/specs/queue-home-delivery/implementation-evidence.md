@@ -181,27 +181,20 @@ retirement and run removal. The finite-trace model additionally checks the per-k
 
 ### Validation
 
-All thirteen generated properties passed at 100 cases each (1,300 generated cases). The latest focused review run
-also passed the three new reservation, dequeue and lookup examples: 16 tests passed. Pre-handoff cancellation
+All thirteen generated properties passed at 100 cases each (1,300 generated cases). Pre-handoff cancellation
 follows the existing bounded retry path, without asserting that the authoritative incarnation is obsolete. After
 handoff, both retirement schedules deliver the owner-committed task. The fallback example preserves its original
-deadline through repetition and expiry.
+deadline through repetition and expiry, an expired row leaves the rest of its page admissible, and a poll reaches
+current work behind retired entries.
 
-| Command | Result |
-| --- | --- |
-| `cargo nextest run -p tokeira-runtime -p tokeira-storage -p tokeira-edge --locked --offline --no-fail-fast` | 2,033 passed (one marked leaky), 21 failed, one skipped. Every failure was a known sandbox socket failure: six edge wire tests and fifteen runtime HTTP tests. There were no other failures, and no test was excluded. |
-| `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | Passed on the final code. |
-| `cargo clippy -p tokeira-storage -p tokeira-runtime -p tokeira-engine -p tokeira-edge -p tokeira-projection --features dsql-integration --all-targets --locked --offline -- -D warnings` | Passed on the final code. |
-| `cargo +nightly fmt --all -- --check` | Passed. |
-| `git diff --check` | Passed. |
+The full bar passes on the final code, on macOS: fmt, lint, check, doctest and doc, and test (4,578 passed,
+3 skipped). One `tkr` test, `discovered_selection_creates_and_checks_with_the_generated_compose_provisioner`, builds
+a nested workspace and expects its binary in that workspace's default `target` directory. A `CARGO_TARGET_DIR`
+override for the whole run placed the binary elsewhere, so that test is left to CI. `cargo clippy --features
+dsql-integration` is clean for the storage, runtime, engine, edge and projection crates. The changie dry run,
+offline Markdown links and `git diff --check` pass.
 
-The passing `unpause_workflow_routes_through_submit_and_resumes` test was marked leaky in the full run. Repeating
-the same package command with `-E 'test(unpause_workflow_routes_through_submit_and_resumes)'` passed normally:
-one passed, with no leak warning.
-
-Disk space was checked before every build and remained above 12 GiB. Logs are under the existing target directory.
-The sandbox permits neither the affected socket operations nor approval escalation, so the wire failures remain
-unverified here. No live DSQL execution is claimed. The offer handler, dependency graph, lockfile, migrations and
+No live DSQL or network validation is claimed. The offer handler, dependency graph, lockfile, migrations and
 protobuf definitions are unchanged.
 
 ## Exploration

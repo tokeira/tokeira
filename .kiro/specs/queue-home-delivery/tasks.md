@@ -247,7 +247,7 @@ bar belongs to the code PRs.
       and its outcome are in implementation-evidence.md, Part 8.
     - _Requirements: 2.15, 3.2_
 
-- [ ] 10. Align documentation and finish the code PRs
+- [x] 10. Align documentation and finish the code PRs
   - [x] 10.1 Align workflow-dispatch's sticky recovery, offer lifecycle and start-read descriptions, configuration
     and credential-file docs and the suite runbook with the implemented contract. Record measured
     baseline/result counts, query plans, limitations and outcomes without cluster identifiers, live-run dates/times
@@ -260,9 +260,13 @@ bar belongs to the code PRs.
       cluster identifiers, dates, times or Region. The `changed` fragment keeps the stopped-node upgrade line; the
       credential step and no-peer exemption already stand in the operations guide and the 0.7.0 notes.
     - _Requirements: 2.8, 2.10, 2.11, 2.13, 2.15, 2.16, 2.17, 2.18, 2.19, 2.20, 3.3_
-  - [ ] 10.2 Run the full root AGENTS.md §10.4 bar for each code PR, plus its applicable focused/live checks and
+  - [x] 10.2 Run the full root AGENTS.md §10.4 bar for each code PR, plus its applicable focused/live checks and
     offline links/fragment validation. Report every omission and why; tick only work actually completed. Rebase at
     the PR boundary and follow the repository's attribution, review and exact-head merge protocol.
+    - **DONE:** The full bar, the five-crate `dsql-integration` clippy, dependency checks, offline links, the changie
+      dry run and a clean tree pass at the Part 8 commit. The one `tkr` test that cannot pass under a private
+      target directory passed alone without it. No rebase was needed; review and the exact-head merge follow with
+      this PR. See implementation-evidence.md, Finish bar.
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14, 2.15, 2.16, 2.17, 2.18, 2.19, 2.20, 3.1, 3.2, 3.3, 3.4, 3.5_
 
 ## Task Dependency Graph

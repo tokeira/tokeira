@@ -807,3 +807,29 @@ batched join; either way at most 64 payloads are fetched by primary key.
 Each suite ran once. The first migrating test used 1,138.6 of the profile's 1,200 seconds, almost all of it
 waiting for index builds; the runbook now records that margin. The read counts come from a two-runtime fixture
 with one injected conflict, not from competing writers under load.
+
+
+## Finish bar
+
+The root AGENTS.md §10.4 bar ran on macOS at `6a135153`, the Part 8 commit, with a private target directory:
+
+| Command | Result |
+| --- | --- |
+| `cargo +nightly fmt --all -- --check` | Passed. |
+| `cargo lint --locked --offline -- -D warnings` | Passed. |
+| `cargo clippy -p tokeira-storage -p tokeira-runtime -p tokeira-engine -p tokeira-edge -p tokeira-projection --features dsql-integration --all-targets --locked --offline -- -D warnings` | Passed. |
+| `cargo check --workspace --locked --offline` | Passed. |
+| `cargo nextest run --workspace --locked --offline --no-fail-fast` | 4,638 passed; the three existing opt-in tests were skipped. One `tkr` test failed, as described below. |
+| `cargo test --workspace --doc --locked --offline` | Passed. |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --offline` | Passed. |
+| `cargo deny check bans licenses sources` | Passed. |
+| Offline `lychee` over every Markdown file, as in CI, also excluding `.tokeira-build` | No errors. |
+| `changie batch minor --dry-run` in a scratch copy | The fragment renders under Changed. |
+| `git diff --exit-code` and `git status` | Clean. |
+
+`tkr`'s `discovered_selection_creates_and_checks_with_the_generated_compose_provisioner` builds a nested workspace
+and expects its binary in that workspace's default target directory; the private target directory put it
+elsewhere. `tkr` depends on `tokeira-proto`, which this change extends, so the same test binary was run again
+without the override and passed. The skipped tests are `sdk_echo_roundtrip_against_post_sync_tokeirad`,
+`sdk_scoped_worker_roundtrip_uses_production_authorization_bootstrap` and
+`child_fan_out_starts_every_child`.

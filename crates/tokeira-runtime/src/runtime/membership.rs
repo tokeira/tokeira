@@ -91,6 +91,8 @@ where
             } => result?,
         };
         let result = Self::settle_self_assigned_recovery(&mut recovery, Ok(result))?;
+        self.workflow_delivery
+            .start_sticky_sweep(recovery.acquisition.clone());
         self.disposal_wake.notify_one();
         Ok(result)
     }
@@ -135,6 +137,7 @@ where
         let wake = self.disposal_wake.clone();
         let cancel = recovery.acquisition.cancel.clone();
         let clock = self.clock.clone();
+        let delivery = self.workflow_delivery.clone();
         let _startup = self.runtime_shutdown.spawn(async move {
             let result = tokio::select! {
                 biased;
@@ -146,6 +149,7 @@ where
                         &workflow, &wft, &activity, &nexus, &callbacks, &repair, clock.as_ref()).await?;
                     crate::purge::recover_bulk_writes(ShardId(0), repo.as_ref(), &purger, Some(&repair), &fence).await?;
                     recovery.activate()?;
+                    delivery.start_sticky_sweep(recovery.acquisition.clone());
                     recovery.disarm();
                     wake.notify_one();
                     anyhow::Ok(())
@@ -339,6 +343,8 @@ where
             return Err(anyhow!("shard lease lost before activation"));
         }
         recovery.activate()?;
+        self.workflow_delivery
+            .start_sticky_sweep(recovery.acquisition.clone());
         self.disposal_wake.notify_one();
         let _watcher = self.runtime_shutdown.spawn(async move {
             tokio::select! {

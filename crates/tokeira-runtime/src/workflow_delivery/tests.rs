@@ -62,11 +62,11 @@ pub(super) fn home(queue: &QueueKey) -> ShardId {
         8,
     )
 }
-pub(super) fn node(
-    repo: Arc<InMemoryStore>,
+pub(super) fn node<R: RunRepository + 'static>(
+    repo: Arc<R>,
     ids: &[ShardId],
     clock: Arc<dyn Clock>,
-) -> Arc<WorkflowDelivery<InMemoryStore>> {
+) -> Arc<WorkflowDelivery<R>> {
     let mut owner = ShardOwner::new(8);
     for id in ids {
         owner.record_acquired(*id, ShardEpoch::ZERO);
@@ -120,7 +120,10 @@ pub(super) async fn stored(
         .unwrap();
     offer
 }
-async fn recent(delivery: &WorkflowDelivery<InMemoryStore>, offer: &WorkflowOffer) {
+pub(super) async fn recent<R: RunRepository + 'static>(
+    delivery: &WorkflowDelivery<R>,
+    offer: &WorkflowOffer,
+) {
     let origin = offer.hint.sticky_origin.as_ref().unwrap();
     delivery
         .broker
@@ -259,7 +262,7 @@ proptest! {
             let node = node(repo.clone(), &[home(&normal)], clock.clone());
             recent(&node, &offer).await;
             prop_assert_eq!(node.receive(&offer, home(&sticky), OfferSource::Pushed).await.unwrap(), WorkflowOfferOutcome::Admitted);
-            let fallback = node.fallback(offer.clone()).await.unwrap().unwrap();
+            let fallback = node.fallback(offer.clone(), PublicationSource::Publication).await.unwrap().unwrap();
             prop_assert_eq!(node.receive(&fallback, home(&normal), OfferSource::Pushed).await.unwrap(), WorkflowOfferOutcome::Known);
             node.broker.deny_worker(sticky.namespace_id, sticky.task_queue.clone(), WorkerIdentity("worker".into())).await;
             for copy in 0..copies {

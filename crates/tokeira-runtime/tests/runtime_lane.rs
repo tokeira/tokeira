@@ -827,46 +827,39 @@ async fn restart_preserves_wft_completion_routing_metadata() -> Result<()> {
         })
     );
 
+    let shutdown = runtime_before_restart.shutdown_handle();
+    shutdown.begin_shutdown();
+    shutdown
+        .wait(std::time::Instant::now() + std::time::Duration::from_secs(2))
+        .await?;
     let runtime_after_restart = recovering_runtime_with_store(store.clone());
     runtime_after_restart.acquire_shard(ShardId(0)).await?;
 
-    // Reconstruction retains the sticky deadline. Cold affinity alone cannot
-    // make a normal queue discover this task before its authoritative timeout.
-    assert!(
+    // A cold sticky home has no recent poller. Recovery must offer the original
+    // incarnation on the normal queue before the authoritative timeout fires.
+    let Some(tokeira_runtime::WorkflowActivation::WorkflowTask(recovered_task)) =
         runtime_after_restart
-            .poll_workflow_task(
+            .poll_workflow_activation(
                 queue(namespace_id, queue_name),
-                WorkerIdentity("worker-b".into()),
-                tokio::time::Duration::ZERO,
+                None,
+                WorkerIdentity("worker-b".to_string()),
+                tokio::time::Duration::from_secs(3),
             )
             .await?
-            .is_none()
-    );
-    let pending = completed.pending_workflow_task.as_ref().unwrap();
-    runtime_after_restart
-        .submit(
-            started.run_key,
-            Command::WorkflowTaskTimedOut(tokeira_kernel::WorkflowTaskTimedOutRequest {
-                logical_seq: pending.logical_seq,
-                started_event_id: 0,
-                timeout_type: tokeira_kernel::WorkflowTaskTimeoutType::ScheduleToStart,
-                now: pending.schedule_to_start_deadline.unwrap() + Duration::milliseconds(1),
-            }),
-        )
-        .await?;
-
-    let recovered_task = runtime_after_restart
-        .poll_workflow_task(
-            queue(namespace_id, queue_name),
-            WorkerIdentity("worker-b".to_string()),
-            tokio::time::Duration::from_secs(1),
-        )
-        .await?
-        .expect("recovered pending WFT should retain durable affinity and versioned routing");
+    else {
+        panic!("sticky recovery must fall back before its original deadline");
+    };
     assert_eq!(recovered_task.run_key, started.run_key);
-    // The timeout has rescheduled on the normal queue, so its delivery sends
-    // full history (`setHistoryForRecordWfTaskStartedResp`,
-    // recordworkflowtaskstarted/api.go @ v1.31.0).
+    assert_eq!(
+        recovered_task.token.logical_seq,
+        completed
+            .pending_workflow_task
+            .as_ref()
+            .unwrap()
+            .logical_seq
+    );
+    // Normal fallback sends full history even while the pending task's sticky
+    // origin is retained until start (recordworkflowtaskstarted/api.go @ v1.31.0).
     assert!(!recovered_task.is_sticky_match);
 
     Ok(())

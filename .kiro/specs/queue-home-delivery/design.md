@@ -288,9 +288,12 @@ rescan. The memory implementation must have identical candidate, cursor and exha
 
 Start only after this execution acquisition is Active and repair is complete. For each candidate, verify ownership
 and cancellation, hydrate current state/routing, and compare the derived incarnation/intent before enqueueing.
-Stale rows are skipped; this read path performs no repairs or cross-home writes. Advance by the last examined key,
-including skipped/refused rows. Keep the cursor on an incomplete read, then retry with backoff. After exhaustion,
-wrap to the beginning on the next scheduled pass. New rows behind the cursor are found on that next traversal.
+Stale rows are skipped. Rows whose deadline has passed, or which were scheduled less than the sender's total
+budget ago, are skipped before hydration; the next pass revisits the recent ones. This read path performs no
+repairs or cross-home writes. Advance after each examined row, including skipped/refused rows. On an incomplete
+read, retain the exclusive cursor before the failing row and retry that row with backoff without repeating the
+completed prefix. After the last row use the page's last examined key; exhaustion wraps to the beginning on the
+next scheduled pass. New rows behind the cursor are found on that next traversal.
 
 Do not persist a sweep cursor or a successful-delivery bit. A new acquisition restarts from the beginning. A lost
 sticky push leaves its sticky row; a lost normal-fallback push also leaves that row. Both are revisited through the

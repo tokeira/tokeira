@@ -962,6 +962,9 @@ where
             let shard_id = ShardId(0);
             let _ = owner.record_acquired(shard_id, ShardEpoch::ZERO);
             owner.mark_active(shard_id);
+            let acquisition = owner.acquisition(shard_id).expect("seeded acquisition");
+            drop(owner);
+            workflow_delivery.start_sticky_sweep(acquisition);
         }
         completion_callback_tracking.set_shutdown(runtime_shutdown.clone());
         let timer_scanner_cancel = CancellationToken::new();
@@ -4754,3 +4757,6 @@ pub(crate) mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod sticky_recovery_tests;

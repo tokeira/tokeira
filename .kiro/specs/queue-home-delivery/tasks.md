@@ -127,13 +127,19 @@ bar belongs to the code PRs.
     - _Requirements: 3.2, 3.3_
     - DONE — All nineteen generated routing/scheduling properties pass. Both warning-denied clippy commands, nightly formatting and diff checks pass. The four-crate suite passes: 2,472 tests, one skipped. No durable writes or unsupported activity/speculative paths were added.
 
-- [ ] 6. Complete sticky recovery and liveness
-  - [ ] 6.1 Start a fair bounded sticky sweep after execution-home activation, using the new repository operation.
+- [x] 6. Complete sticky recovery and liveness
+  - **DONE:** Acquisition-scoped recovery, read reuse and its generated liveness evidence are recorded in
+    [Part 5: sticky recovery](implementation-evidence.md#part-5-sticky-recovery).
+  - [x] 6.1 Start a fair bounded sticky sweep after execution-home activation, using the new repository operation.
     Validate candidates against current state and republish through task 5. Advance skipped/refused candidates,
     wrap at exhaustion, retry incomplete reads, restart on acquisition, and cancel on loss. Leave ordinary normal
     discovery and the authoritative sticky timeout transition intact.
     - _Requirements: 2.8, 2.9, 2.15, 3.2, 3.4, 3.5_
-  - [ ] 6.2 Generate lost sticky and lost normal-fallback pushes separately, with no useful sticky poll demand,
+    - **DONE:** All activation modes start one tracked sweep after repair, with 64-row pages, eight fair node
+      slots, per-home pacing, read validation, row-by-row cursor retry/wrap and acquisition cancellation. Expired
+      and recent rows skip hydration; local fallback reuses the hydrated run. Recovery shares task 5's sender
+      and uses the same local policy without a sender; it writes no durable state.
+  - [x] 6.2 Generate lost sticky and lost normal-fallback pushes separately, with no useful sticky poll demand,
     process restart, queue-home movement, rows inserted behind the cursor, saturation and deadline expiry. Include
     affinity-cleared non-sticky rows covered by normal discovery and finite faults followed by a fair suffix.
     Drive the appropriate recovery reader independently: normal discovery for non-sticky rows, the sticky sweep
@@ -142,6 +148,11 @@ bar belongs to the code PRs.
     - **Property 4: Sticky routing and deadline preservation** (recovery portion)
     - **Property 8: Complete bounded sticky traversal** (runtime portion)
     - **Validates: Requirements 2.1, 2.5, 2.6, 2.7, 2.8, 2.9, 2.15, 3.2, 3.4, 3.5.**
+    - **DONE:** Fifteen generated properties run 100 cases each, with independent sticky/normal recovery readers,
+      finite fault prefixes, refusal and wrap, restart/movement, stale rows, repair gates and replacement isolation.
+      Load and offer counts prove that middle-row failures preserve completed progress, recent/expired rows incur
+      no hydration, recent rows recover on a later pass, and local fallback uses one run load per pass.
+      The lost-sticky-row property failed on main before the fix; Part 5 retains its shrunk counterexample.
 
 - [ ] 7. Consolidate remote start reads under unchanged authorization
   - [ ] 7.1 Route from the hint's execution home without a queue-home run load. At the owner, reuse one local

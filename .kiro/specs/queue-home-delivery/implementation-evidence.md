@@ -424,3 +424,91 @@ DSQL verification remain separate.
 Warning-denied workspace/all-targets clippy and the five-crate `dsql-integration` clippy command pass with
 `--locked --offline`. Nightly formatting and `git diff --check` pass. There is no changelog fragment or dependency
 change.
+
+## Part 5: sticky recovery
+
+### Acquisition lifecycle and bounds
+
+Every successfully repaired execution-home acquisition installs one continuing sticky sweep, after activation.
+Controller acquisition, self-assigned recovery, seeded recovery and empty-store startup all use the same hook.
+Duplicate installation for one generation is ignored. The runtime shutdown tracker owns each sweep; cancellation,
+lease deadline or runtime shutdown drops its pending read, permit and cursor. A delayed predecessor cannot install
+work for its replacement. Only volatile per-home query pacing survives a local reacquisition; traversal restarts
+at the beginning.
+
+The sweep reads `list_sticky_workflow_dispatch(home, after, 64)`. FIFO node-wide capacity admits at most eight
+pages concurrently, including their serial hydration, and releases capacity before a home's next period. Each
+home starts at most one query per second, including across replacement. Each completed row advances the cursor,
+including skipped and refused candidates. A failed page query preserves the cursor; a failed hydration leaves
+the exclusive cursor immediately before that row, retaining progress through the completed prefix. Retries use
+two-second exponential backoff capped at 32 seconds. Individual reads time out after one second; there is no
+whole-page timeout that could repeatedly prevent later rows from being examined. After the last row the page's
+last examined key is used; exhaustion wraps on the following pass. No cursor, delivery bit, repair or cross-home
+write is persisted.
+
+Before hydration, rows with an expired deadline are skipped as `expired`, and rows younger than the sender's
+one-second total budget are skipped as `recent`. Both advance the cursor; wrapping revisits recent rows after
+publication has had its retry budget. Eligible candidates are hydrated off-lane and compared with their freshly
+derived dispatch row, including incarnation and intent. Current candidates become `WorkflowOffer`s with
+`PublicationSource::Recovery`. The existing sender coalesces and bounds publication and recovery together:
+1,024 entries, 16 MiB, 32 active attempts and eight per
+destination, alternating sources and scheduling homes fairly. No-sender modes invoke the same local receiver and
+resolve normal fallback with `fallback_target` using the already hydrated state, with one run load per pass.
+Both paths re-decide sticky availability and deployment policy even after an earlier normal fallback, and
+retain the original absolute deadline. This preserves the fallback/TTL rule in
+`service/history/transfer_queue_active_task_executor.go @ v1.31.0` and recent-poller check in
+`service/matching/matching_engine.go @ v1.31.0`.
+
+Hydration loads use `sticky-recovery`; only the sender's later fallback reloads under `sticky-recovery-fallback`,
+separate from `publication-fallback` and start reads. The three `tokeira_runtime_workflow_offer_sweep_*_total` counters record
+examined candidates, retained/queued/coalesced offers, and skips/incomplete reads by bounded reason. They carry no
+run or queue labels. Ordinary normal discovery, timeout transitions, admission/retirement, other task kinds,
+storage and migrations are unchanged.
+
+### Generated runtime evidence
+
+Fifteen properties configure 100 cases each (1,500 generated cases), using paused clocks and channel barriers.
+They exercise real memory-store pages, delivery components and the runtime activation hooks. Remote attempts use
+an in-process fault sink; real multi-runtime gRPC and live DSQL execution remain tasks 8 and 9.
+
+| Property | Tests and coverage |
+| --- | --- |
+| 1 | `property_1_lost_sticky_row_recovered_before_deadline`: a full runtime recovers a committed sticky row without publication or normal discovery demand, in empty-start and self-assigned modes. |
+| 1 | `property_1_recovery_finite_fault_prefix_fair_suffix`: finite page/load failures and full broker capacity followed by a fair suffix offer every pending task; durable snapshots are unchanged. |
+| 4 | `property_4_recovery_lost_sticky_push` and `property_4_recovery_lost_normal_fallback_push`: separately dropped transport attempts, sender restart over a memory snapshot, queue-home replacement and finite delivery faults. Normal fallback has no useful sticky demand. |
+| 4 | `property_4_recovery_expiry_and_cleared_affinity`: expiry leaves state unchanged; cleared affinity and an authoritative timeout successor are recovered by normal discovery alone. |
+| 4 | `property_4_recovery_local_fallback_reuses_hydration`: sticky-unavailable rows reach the normal queue without a sender, with exactly one run load per pass and the original deadline. |
+| 8 | `property_8_recovery_cursor_wrap_and_saturation`: multiple pages, saturated sender, strict continuation past refused rows, and insertion behind the cursor found after wrapping. |
+| 8 | `property_8_recovery_fair_bounded_scheduler`: 9–24 homes, duplicate activation notifications, FIFO progress, eight-query bound, one-second pacing and tracked shutdown. |
+| 8 | `property_8_recovery_incomplete_read_retries`: page failures preserve the continuation; middle-row hydration failures retry that row after backoff without loading or offering completed rows again. Load counts and offer counts cover the fair suffix. |
+| 8 | `property_8_recovery_recent_rows_skip_hydration`: recent rows cause no run loads, advance the cursor and recover on a later pass at the sender budget boundary. |
+| 8 | `property_8_recovery_expired_rows_skip_hydration`: expired rows cause no run loads or offers and leave durable state unchanged for timeout processing. |
+| 8 | `property_8_recovery_cancelled_acquisition`: cancellation/deadline during a held read cannot populate replacement delivery; replacement starts from the beginning. |
+| 8 | `property_8_recovery_stale_candidate`: incarnation and affinity changes after page selection are skipped while cursor progress and other candidates are preserved. |
+| 8 | `property_8_recovery_reacquisition_restarts_at_head`: replacing a continued traversal resets its cursor while preserving one-second home pacing. |
+| 8 | `property_8_sticky_sweep_waits_for_repair`: seeded and explicit repair barriers prevent premature reads; interrupted repair never starts a sweep. |
+
+The main-first regression was executed against an archived `origin/main` at
+`b62607d69cf744ad0095ceea4ad3a6cdee4f84fa`, with only the new test and its module declaration added.
+`property_1_lost_sticky_row_recovered_before_deadline` failed: no normal offer arrived within three seconds,
+before the original 30-second deadline. The shrunk counterexample was `index = 0, seeded = false`, with seed
+`c7ae6fa1d9a36b220f97d3f742f169ed03b2fe746d4ab89d0d7d2eab1fe82728`. It passes with the sweep.
+The other new tests are implementation coverage, not additional claims of execution against main.
+
+The existing `restart_preserves_wft_completion_routing_metadata` test passed on main but assumed cold sticky work
+remained unavailable until timeout. Its manual timeout could now leave an older recovery hint ahead of the
+replacement task, which its task-only polling helper reports as a stale-sequence error. The updated test shuts
+down the old runtime, polls through the public activation path and asserts normal fallback of the original
+incarnation before its deadline, with full-history delivery. Start and timeout implementations are unchanged.
+
+### Validation
+
+- `cargo nextest run -p tokeira-runtime -p tokeira-storage -p tokeira-edge -p tokeira-engine --locked --offline --no-fail-fast`: 2,432 passed, 55 failed, one skipped. Every remaining failure is a socket/listener operation rejected by the sandbox (`Operation not permitted`); no other failure remains. All fifteen generated recovery properties pass at 100 cases each, as does the updated restart test.
+- `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`: passed.
+- `cargo clippy -p tokeira-storage -p tokeira-runtime -p tokeira-engine -p tokeira-edge -p tokeira-projection --features dsql-integration --all-targets --locked --offline -- -D warnings`: passed; this is compile/lint coverage, not live DSQL execution.
+- `cargo +nightly fmt --all -- --check`: passed.
+- `git diff --check`: passed.
+
+Disk space was checked before every build and remained above the 12 GiB cutoff. Logs and the main-source test
+archive remain under the existing target directory. No dependency, lockfile, storage, migration or changelog
+change is included. Changes are left uncommitted.

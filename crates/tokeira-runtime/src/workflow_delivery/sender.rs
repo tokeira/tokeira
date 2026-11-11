@@ -444,7 +444,7 @@ async fn attempt<R: RunRepository + 'static>(
             if work.fallback {
                 // Routing fallback is a separate scheduled step. It never uses a
                 // second home's RPC slot while still charged to the sticky home.
-                return delivery.fallback(work.offer.clone()).await.map(Attempt::Fallback);
+                return delivery.fallback(work.offer.clone(), work.source).await.map(Attempt::Fallback);
             }
             work.attempts += 1;
             if delivery.homes.local_home(&work.offer.hint.task.queue).is_some() {

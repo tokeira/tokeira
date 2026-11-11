@@ -33,12 +33,13 @@ use crate::{
 };
 
 mod sender;
+mod sweep;
 #[cfg(test)]
 mod tests;
 use sender::PublicationSource;
 
 /// Resolve a normal queue from the caller's state using the start path's policy.
-/// Local publication supplies committed state; only off-lane recovery reloads it.
+/// Local publication and recovery reuse their state; deferred sender fallback reloads it.
 pub(crate) async fn fallback_target(
     registry: Option<&DeploymentRegistry>,
     state: &WorkflowState,
@@ -242,6 +243,7 @@ pub(crate) struct WorkflowDelivery<R> {
     sender: RwLock<Option<sender::WorkflowOfferSender>>,
     shutdown: RuntimeShutdownHandle,
     clock: Arc<dyn Clock>,
+    sweeps: sweep::Sweeps,
 }
 impl<R> Debug for WorkflowDelivery<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -265,6 +267,7 @@ impl<R: RunRepository + 'static> WorkflowDelivery<R> {
             sender: RwLock::new(None),
             shutdown,
             clock,
+            sweeps: sweep::Sweeps::default(),
         })
     }
     pub(crate) fn install_sender(self: &Arc<Self>, sink: Arc<dyn RemoteWorkflowOfferSink>) {
@@ -465,6 +468,7 @@ impl<R: RunRepository + 'static> WorkflowDelivery<R> {
     async fn fallback(
         &self,
         mut offer: WorkflowOffer,
+        source: PublicationSource,
     ) -> Result<Option<WorkflowOffer>, WorkflowOfferError> {
         let origin = offer
             .hint
@@ -472,7 +476,10 @@ impl<R: RunRepository + 'static> WorkflowDelivery<R> {
             .as_ref()
             .expect("sticky fallback has origin");
         let LoadedRun::Existing(state) = tokeira_storage::read_probe::scope(
-            "publication-fallback",
+            match source {
+                PublicationSource::Publication => "publication-fallback",
+                PublicationSource::Recovery => "sticky-recovery-fallback",
+            },
             self.repo.load_run(offer.hint.task.run_key),
         )
         .await

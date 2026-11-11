@@ -58,7 +58,7 @@ use time::OffsetDateTime;
 use tokeira_clock::{Clock, system_clock};
 use tokeira_storage::{DeliveryOrder, DispatchableActivityTask, DispatchableWorkflowTask};
 use tokeira_types::{
-    LogicalTaskSeq, NamespaceId, QueueKey, RunKey, TaskQueueName, WorkerComputeQueueKey,
+    LogicalTaskSeq, NamespaceId, QueueKey, RunKey, ShardId, TaskQueueName, WorkerComputeQueueKey,
     WorkerComputeTaskType, WorkerIdentity,
 };
 use tokio::{
@@ -643,6 +643,8 @@ pub enum WorkflowPollResult {
 pub struct WorkflowOfferStamp {
     pub(crate) entered_at: Instant,
     pub(crate) cancel: Option<tokio_util::sync::CancellationToken>,
+    /// Volatile route; absent only for legacy/speculative publication.
+    pub(crate) execution_home: Option<ShardId>,
 }
 
 impl From<Instant> for WorkflowOfferStamp {
@@ -650,6 +652,7 @@ impl From<Instant> for WorkflowOfferStamp {
         Self {
             entered_at,
             cancel: None,
+            execution_home: None,
         }
     }
 }
@@ -694,6 +697,7 @@ impl WorkflowPollResult {
 #[derive(Clone, Debug)]
 pub(crate) struct TimestampedWorkflowTask {
     managed: bool,
+    execution_home: Option<ShardId>,
     pub(crate) task: DispatchableWorkflowTask,
     pub(crate) entered_at: Instant,
     pub(crate) scheduled_at: OffsetDateTime,
@@ -717,6 +721,7 @@ impl InMemoryBroker {
     /// Admit an already selected destination. `retarget` requires a current local
     /// routing/availability decision; a peer's arrival order is insufficient.
     /// Ownership is always obtained from this broker's provider, never the sender.
+    #[cfg(test)]
     pub(crate) async fn admit_workflow_offer(
         &self,
         task: DispatchableWorkflowTask,
@@ -724,6 +729,20 @@ impl InMemoryBroker {
         scheduled_at: Option<OffsetDateTime>,
         reservation: Option<&mut OfferReservation>,
         retarget: bool,
+    ) -> OfferAdmission {
+        self.admit_workflow_offer_at_home(task, source, scheduled_at, reservation, retarget, None)
+            .await
+    }
+
+    /// Keep the disposable route with the retained revision, including fallback.
+    pub(crate) async fn admit_workflow_offer_at_home(
+        &self,
+        task: DispatchableWorkflowTask,
+        source: OfferSource,
+        scheduled_at: Option<OffsetDateTime>,
+        reservation: Option<&mut OfferReservation>,
+        retarget: bool,
+        execution_home: Option<ShardId>,
     ) -> OfferAdmission {
         if self.queue_homes.is_none() {
             if let Some(reservation) = reservation {
@@ -738,6 +757,7 @@ impl InMemoryBroker {
             reservation,
             Some(source),
             retarget,
+            execution_home,
         )
         .await
     }
@@ -901,18 +921,32 @@ impl InMemoryBroker {
         self.capacity_changed.notify_one();
     }
 
+    #[cfg(test)]
     pub(crate) async fn publish_discovered(
         &self,
         task: DispatchableWorkflowTask,
         scheduled_at: OffsetDateTime,
         reservation: &mut OfferReservation,
     ) -> OfferAdmission {
-        self.admit_workflow_offer(
+        self.publish_discovered_at_home(task, scheduled_at, reservation, None)
+            .await
+    }
+
+    /// Retain the row-derived route alongside its immutable scheduling time.
+    pub(crate) async fn publish_discovered_at_home(
+        &self,
+        task: DispatchableWorkflowTask,
+        scheduled_at: OffsetDateTime,
+        reservation: &mut OfferReservation,
+        execution_home: Option<ShardId>,
+    ) -> OfferAdmission {
+        self.admit_workflow_offer_at_home(
             task,
             OfferSource::Discovered,
             Some(scheduled_at),
             Some(reservation),
             true,
+            execution_home,
         )
         .await
     }
@@ -922,7 +956,7 @@ impl InMemoryBroker {
         task: DispatchableWorkflowTask,
         metrics: Option<&DeliveryMetrics>,
     ) {
-        self.publish_workflow_offer(task, metrics, None, None, None, true)
+        self.publish_workflow_offer(task, metrics, None, None, None, true, None)
             .await;
     }
 
@@ -1500,8 +1534,20 @@ impl InMemoryBroker {
     /// placed in the sticky tier; all others go to general.
     pub async fn publish_workflow_task(
         &self,
+        task: DispatchableWorkflowTask,
+        metrics: Option<&DeliveryMetrics>,
+    ) {
+        self.publish_workflow_task_at_home(task, metrics, None)
+            .await;
+    }
+
+    /// Publish with an execution-home hint carried to the poll without a run read.
+    /// The owner still validates the hint against authoritative execution identity.
+    pub async fn publish_workflow_task_at_home(
+        &self,
         mut task: DispatchableWorkflowTask,
         metrics: Option<&DeliveryMetrics>,
+        execution_home: Option<ShardId>,
     ) {
         // Legacy in-process callers have no routing envelope. They may observe
         // availability only at the sticky home; runtime publication uses the
@@ -1521,14 +1567,24 @@ impl InMemoryBroker {
                 task.sticky_preferred = None;
             }
         }
-        self.publish_workflow_offer(task, metrics, None, None, Some(OfferSource::Local), true)
-            .await;
+        self.publish_workflow_offer(
+            task,
+            metrics,
+            None,
+            None,
+            Some(OfferSource::Local),
+            true,
+            execution_home,
+        )
+        .await;
     }
 
     pub(crate) async fn sticky_available(&self, queue: &QueueKey, worker: &WorkerIdentity) -> bool {
         Self::sticky_worker_available(&*self.inner.lock().await, queue, worker)
     }
 
+    // Each argument belongs to admission; the home stays outside the serialized task.
+    #[allow(clippy::too_many_arguments)]
     async fn publish_workflow_offer(
         &self,
         mut task: DispatchableWorkflowTask,
@@ -1537,6 +1593,7 @@ impl InMemoryBroker {
         reservation: Option<&mut OfferReservation>,
         source: Option<OfferSource>,
         retarget: bool,
+        execution_home: Option<ShardId>,
     ) -> OfferAdmission {
         let mut reservation = AdmissionReservation(reservation, false);
         let speculative = source.is_none();
@@ -1669,6 +1726,7 @@ impl InMemoryBroker {
         }
         let timestamped = TimestampedWorkflowTask {
             managed: !speculative && self.queue_homes.is_some(),
+            execution_home,
             task,
             entered_at: revision,
             scheduled_at: scheduled_at.unwrap_or_else(|| self.clock.now()),
@@ -2214,6 +2272,7 @@ impl InMemoryBroker {
                 WorkflowOfferStamp {
                     entered_at: task.entered_at,
                     cancel,
+                    execution_home: task.execution_home,
                 },
             )));
         }

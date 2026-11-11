@@ -154,15 +154,31 @@ bar belongs to the code PRs.
       no hydration, recent rows recover on a later pass, and local fallback uses one run load per pass.
       The lost-sticky-row property failed on main before the fix; Part 5 retains its shrunk counterexample.
 
-- [ ] 7. Consolidate remote start reads under unchanged authorization
-  - [ ] 7.1 Route from the hint's execution home without a queue-home run load. At the owner, reuse one local
+- [x] 7. Consolidate remote start reads under unchanged authorization
+  - **DONE:** owner preparation, synchronous lane revalidation and the per-phase memory matrix are implemented
+    with the wire contract unchanged; evidence and external gRPC follow-up are recorded in
+    [Part 6: start reads](implementation-evidence.md#part-6-start-reads).
+  - [x] 7.1 Route from the hint's execution home without a queue-home run load. At the owner, reuse one local
     state/statistics preparation across namespace/queue/version binding, authoritative sticky authorization,
     metadata and attachment checks, and runtime target resolution. Invalidate affected preparation if state changes;
     retain serving/incarnation/lease checks, fresh OCC reloads and owner-held attachments/waiters.
+    - **DONE:** volatile broker metadata carries every production source's execution home. One owner-local
+      state/statistics preparation supplies authorization, sizing and routing. Registry and stored routing inputs
+      are captured before submission; the lane performs no routing I/O. It re-derives queue/sticky/version/transition
+      decisions from its own state, accepts unrelated transitions and retains prepared history size. Run identity,
+      kernel incarnation, serving/fence checks and fresh OCC reloads remain mandatory. The start wire contract,
+      durable task format, storage and migrations are unchanged.
     - _Requirements: 2.11, 2.12, 3.1, 3.3_
-  - [ ] 7.2 Re-run the baseline matrix with counted retries. Generate forged execution-home, namespace, normal/sticky
+  - [x] 7.2 Re-run the baseline matrix with counted retries. Generate forged execution-home, namespace, normal/sticky
     queue, worker and version coordinates; concurrent policy/state changes; exact and over-limit attachments; and
     cold/admission cache misses. Account for all moved or newly introduced reads explicitly.
+    - **DONE:** the eight-case in-process memory matrix meets 0 queue-home and 1 warm / 2 cold owner loads,
+      plus one per conflict. Six generated properties pass 100 cases each, including unrelated signals, changed
+      sticky/version decisions, captured routing and wrong-owner refusal without a wire home field. A gated
+      deployment repository checks that starts and another run on the same lane commit without routing reads.
+      The extended 100-case sweep property checks its home hint too. The budget assertion failed on archived main
+      first. Socket and live DSQL matrices have updated expectations; socket execution is sandbox-blocked and
+      live DSQL remains task 9.
     - **Property 6: Fewer reads without weakened start checks**
     - **Validates: Requirements 2.11, 2.12, 3.1, 3.3.**
 

@@ -470,3 +470,36 @@ proptest! {
         })?;
     }
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+    // Feature: queue-home-delivery, Property 6. Every normal source preserves the execution route through dequeue.
+    #[test]
+    fn property_6_offer_sources_carry_execution_home(index in 0u32..10000) {
+        runtime().block_on(async {
+            for source in 0..4 {
+                let repo = Arc::new(InMemoryStore::with_shard_count(8));
+                let clock = clock();
+                let normal = queue(index);
+                let sticky = queue(index + 10000);
+                let offer = stored(&repo, &normal, (source == 3).then_some(&sticky), index, clock.as_ref()).await;
+                let delivery = node(repo, &(0..8).map(ShardId).collect::<Vec<_>>(), clock);
+                match source {
+                    0 | 3 => delivery.publish(offer.clone(), (source == 3).then(|| normal.clone())).await,
+                    1 => { prop_assert_eq!(delivery.receive(&offer, home(&normal), OfferSource::Pushed).await.unwrap(), WorkflowOfferOutcome::Admitted); }
+                    _ => {
+                        let acquisition = delivery.homes.local_home(&normal).unwrap();
+                        let mut reservation = delivery.broker.reserve_offers(&acquisition, 1).await;
+                        prop_assert_eq!(delivery.broker.publish_discovered_at_home(offer.hint.task.clone(), offer.hint.scheduled_at, &mut reservation, Some(offer.hint.execution_home)).await, OfferAdmission::Admitted);
+                    }
+                }
+                let result = delivery.broker.poll_workflow_task(&normal, &WorkerIdentity("worker".into()), Duration::ZERO).await.unwrap().unwrap();
+                let crate::broker::WorkflowPollResult::Queued(task, stamp) = result else { panic!("expected offer") };
+                prop_assert_eq!(stamp.execution_home, Some(offer.hint.execution_home));
+                prop_assert_eq!(task.run_key, offer.hint.task.run_key);
+                prop_assert_eq!(task.sticky_deadline, offer.hint.task.sticky_deadline);
+            }
+            Ok(())
+        })?;
+    }
+}

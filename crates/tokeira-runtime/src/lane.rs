@@ -351,9 +351,21 @@ impl SubmitReservation {
         command: Command,
         reserve_poller: bool,
     ) -> Result<CommitResult> {
+        self.submit_checked_start(command, reserve_poller, None)
+            .await
+    }
+
+    /// Carry owner validation with a start while preserving ordinary lane admission.
+    pub(crate) async fn submit_checked_start(
+        self,
+        command: Command,
+        reserve_poller: bool,
+        check: Option<crate::runtime::workflow_task::WorkflowStartCheck>,
+    ) -> Result<CommitResult> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let mut message = LaneMessage::new(self.lane_id, self.run_key, command, reply_tx);
         message.reserve_poller = reserve_poller;
+        message.workflow_start = check;
         self.enqueue(LaneItem::Command(message));
         reply_rx.await?
     }
@@ -593,6 +605,7 @@ struct LaneMessage {
     outbound: Option<OutboundSubmission>,
     observed: Option<ObservedSubmission>,
     activity_timeout: Option<crate::activity_timeout::ActivityTimeoutCheck>,
+    workflow_start: Option<crate::runtime::workflow_task::WorkflowStartCheck>,
 }
 
 impl LaneMessage {
@@ -618,6 +631,7 @@ impl LaneMessage {
             outbound: None,
             observed: None,
             activity_timeout: None,
+            workflow_start: None,
         }
     }
 }
@@ -1342,6 +1356,7 @@ async fn run_activation_with_cache<K, R, P, C>(
             message.outbound.as_ref(),
             message.observed.as_ref(),
             message.activity_timeout.as_ref(),
+            message.workflow_start.as_ref(),
             &mut successor_effect,
             config.max_occ_retries,
             cache,
@@ -1868,6 +1883,7 @@ where
         None,
         None,
         None,
+        None,
         &mut None,
         max_retries,
         cache,
@@ -1889,6 +1905,7 @@ async fn handle_message_with_successor<K, R, C>(
     outbound: Option<&OutboundSubmission>,
     observed: Option<&ObservedSubmission>,
     activity_timeout: Option<&crate::activity_timeout::ActivityTimeoutCheck>,
+    workflow_start: Option<&crate::runtime::workflow_task::WorkflowStartCheck>,
     successor_effect: &mut Option<SuccessorEffect>,
     max_retries: u32,
     cache: &mut C,
@@ -2013,7 +2030,11 @@ where
         // Refresh after admission, before applying the kernel: stale state can
         // otherwise return a false no-op or rejection without any OCC check.
         if cache.synchronize_generation(shard_owner) {
-            loaded = repo.load_run(run_key).await?;
+            loaded = tokeira_storage::read_probe::scope(
+                "execution-owner/lane-cache-or-retry",
+                repo.load_run(run_key),
+            )
+            .await?;
             cache.insert(run_key, loaded.clone());
         }
         if let Some(observed) = observed {
@@ -2043,6 +2064,14 @@ where
             // the transition sequence; OCC conflicts reload and revalidate.
             cache.evict(run_key);
             return Err(error.into());
+        }
+        if let Some(check) = workflow_start {
+            // Re-derive decisions synchronously from this image, including after
+            // an OCC reload. Preparation never overwrites fresher lane state.
+            if let Err(error) = check.validate(&loaded) {
+                cache.evict(run_key);
+                return Err(error);
+            }
         }
         let processing_span = tracing::Span::current();
         processing_span.record("tokeira.shard_id", execution_home_bundle.0);

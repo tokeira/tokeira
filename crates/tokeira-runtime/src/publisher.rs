@@ -1229,7 +1229,11 @@ where
                         }
                     } else {
                         self.broker
-                            .publish_workflow_task(task, Some(&self.delivery_metrics))
+                            .publish_workflow_task_at_home(
+                                task,
+                                Some(&self.delivery_metrics),
+                                Some(execution_home),
+                            )
                             .await;
                     }
                 }

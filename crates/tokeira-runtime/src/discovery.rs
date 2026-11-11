@@ -205,8 +205,11 @@ impl<R: RunRepository + 'static> WorkflowSource<R> {
             WorkflowDispatchRouting::Live => {
                 // Hydration is serial within the page. Never retain 64 decoded
                 // histories, and never turn a registry-selected target into intent.
-                let LoadedRun::Existing(state) =
-                    self.repo.load_run(row.incarnation.run_key).await?
+                let LoadedRun::Existing(state) = tokeira_storage::read_probe::scope(
+                    "normal-discovery",
+                    self.repo.load_run(row.incarnation.run_key),
+                )
+                .await?
                 else {
                     return Ok(None);
                 };
@@ -641,7 +644,7 @@ async fn run_slice<R: RunRepository + 'static>(
         } else if let Some(task) = source.resolve(&row).await? {
             if registry.compatible(key, pass.registration, &task.queue) {
                 match broker
-                    .publish_discovered(task, row.scheduled_at, &mut reservation)
+                    .publish_discovered_at_home(task, row.scheduled_at, &mut reservation, Some(row.execution_home))
                     .await
                 {
                     OfferAdmission::Admitted => {

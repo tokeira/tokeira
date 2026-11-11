@@ -449,12 +449,13 @@ impl<R: RunRepository + 'static> WorkflowDelivery<R> {
         }
         let result = self
             .broker
-            .admit_workflow_offer(
+            .admit_workflow_offer_at_home(
                 offer.hint.task.clone(),
                 source,
                 Some(offer.hint.scheduled_at),
                 None,
                 retarget,
+                Some(offer.hint.execution_home),
             )
             .await;
         Ok(match result {

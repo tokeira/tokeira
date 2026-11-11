@@ -627,9 +627,10 @@ proptest! {
             for pass in 1..=passes {
                 page(&delivery, &acquisition, &mut cursor).await.unwrap();
                 prop_assert_eq!(repo.observed_loads.lock().unwrap().clone().unwrap(), vec![offer.hint.task.run_key; pass]);
-                let (task, stamp) = delivery.broker.try_claim_workflow_task(&queue(0), offer.hint.task.run_key).await.unwrap();
+                let crate::broker::WorkflowPollResult::Queued(task, stamp) = delivery.broker.poll_workflow_task(&queue(0), &WorkerIdentity("worker".into()), Duration::ZERO).await.unwrap().unwrap() else { panic!("expected recovered offer") };
+                prop_assert_eq!(stamp.execution_home, Some(offer.hint.execution_home));
                 prop_assert_eq!(task.sticky_deadline, offer.hint.task.sticky_deadline);
-                delivery.broker.finish_offer((task.run_key, task.logical_seq), stamp).await;
+                delivery.broker.finish_offer((task.run_key, task.logical_seq), stamp.entered_at).await;
             }
             prop_assert_eq!(repo.inner.snapshot().await.unwrap(), before);
             Ok(())

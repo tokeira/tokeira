@@ -164,7 +164,7 @@ proptest! {
             let repo = MockRepo::new(LoadedRun::Existing(state.clone()), vec![CommitBehavior::Applied]);
             repo.state.lock().await.pair_behaviors = std::iter::repeat_n(PairBehavior::Conflict, conflicts).chain([match outcome { 0 => PairBehavior::Applied, 1 => PairBehavior::SizeRefused, 2 => PairBehavior::Duplicate, _ => PairBehavior::Error }]).collect();
             let mut effect = None;
-            let result = handle_message_with_successor(&kernel, &repo, &test_shard_owner(), &UpdateRegistry::new(), state.run_key, sample_command("close"), plan.as_ref(), None, None, None, &mut effect, 5, &mut LaneCache::new(&LaneConfig::default()), &mut None, &SystemClock).await;
+            let result = handle_message_with_successor(&kernel, &repo, &test_shard_owner(), &UpdateRegistry::new(), state.run_key, sample_command("close"), plan.as_ref(), None, None, None, None, &mut effect, 5, &mut LaneCache::new(&LaneConfig::default()), &mut None, &SystemClock).await;
             let recorded = repo.state.lock().await;
             prop_assert_eq!(recorded.pairs.len(), conflicts + 1);
             let first = &recorded.pairs[0].1;
@@ -247,7 +247,7 @@ proptest! {
             let repo = MockRepo::new(LoadedRun::Existing(state.clone()), vec![CommitBehavior::Applied]);
             let kernel = RejectSuccessor { kind };
             let plan = plan(&state, kind, Payloads::default(), None, state.started_at);
-            let result = Box::pin(handle_message_with_successor(&kernel, &repo, &test_shard_owner(), &UpdateRegistry::new(), run_key, sample_command("close"), plan.as_ref(), None, None, None, &mut None, 5, &mut LaneCache::new(&LaneConfig::default()), &mut None, &SystemClock)).await;
+            let result = Box::pin(handle_message_with_successor(&kernel, &repo, &test_shard_owner(), &UpdateRegistry::new(), run_key, sample_command("close"), plan.as_ref(), None, None, None, None, &mut None, 5, &mut LaneCache::new(&LaneConfig::default()), &mut None, &SystemClock)).await;
             prop_assert!(result.is_err(), "a rejected successor must fail the close command");
             let (_, commits, loaded) = repo.snapshot().await;
             prop_assert_eq!(commits, 0);

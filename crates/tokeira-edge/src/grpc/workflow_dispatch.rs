@@ -441,23 +441,28 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
             uuid::Uuid::from_slice(&request.run_key)
                 .map_err(|_| Status::invalid_argument("run_key must be a UUID"))?,
         );
-        if request.sticky {
-            let tokeira_kernel::LoadedRun::Existing(state) = tokeira_storage::read_probe::scope(
-                "execution-owner/sticky-binding",
-                self.runtime.repo().load_run(run_key),
-            )
+        let prepared = self
+            .runtime
+            .prepare_workflow_start(run_key)
             .await
-            .map_err(|_| Status::unavailable("workflow state could not be loaded"))?
-            else {
-                return Err(stale_offer_status());
-            };
+            .map_err(|error| {
+                if error.is::<tokeira_runtime::KernelRejected>() {
+                    stale_offer_status()
+                } else {
+                    Status::unavailable("workflow state could not be loaded")
+                }
+            })?;
+        let state = prepared.state();
+        if state.namespace_id != namespace_id {
+            return Err(stale_offer_status());
+        }
+        if request.sticky {
             // Sticky policy uses the supplied normal queue. Bind that coordinate
             // to authority before trusting the authorization decision above.
-            if state.namespace_id != namespace_id
-                || request
-                    .normal_task_queue
-                    .as_deref()
-                    .is_some_and(|normal| normal != state.task_queue.0)
+            if request
+                .normal_task_queue
+                .as_deref()
+                .is_some_and(|normal| normal != state.task_queue.0)
             {
                 return Err(stale_offer_status());
             }
@@ -489,15 +494,6 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
         // this request. Six bytes per source byte bounds JSON escaping, with
         // repeated queue fields included. Refuse even malformed restored state
         // before starting, rather than trusting only public admission limits.
-        let tokeira_kernel::LoadedRun::Existing(state) = tokeira_storage::read_probe::scope(
-            "execution-owner/metadata",
-            self.runtime.repo().load_run(run_key),
-        )
-        .await
-        .map_err(|_| Status::unavailable("workflow metadata unavailable"))?
-        else {
-            return Err(stale_offer_status());
-        };
         let metadata_bound = request
             .encoded_len()
             .saturating_mul(6)
@@ -509,7 +505,6 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
                 "internal workflow-start metadata exceeds reserved envelope space",
             ));
         }
-        drop(state);
         let mut decorations = WorkflowTaskDecorations {
             queries: queries
                 .iter()
@@ -528,7 +523,15 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
                 .map(|update| update_message(update, i64::MAX))
                 .collect(),
         };
-        if decorations.encode_proto().len() > self.attachment_limit {
+        let attachment_bytes = decorations.encode_proto().len();
+        // Account for both protobuf byte fields and their length prefixes too.
+        // The metadata bound includes all JSON escaping and start-only fields.
+        if attachment_bytes > self.attachment_limit
+            || metadata_bound
+                .saturating_add(attachment_bytes)
+                .saturating_add(20)
+                > MAX_START_RESPONSE_BYTES
+        {
             return Err(Status::resource_exhausted(
                 "internal workflow-start attachments exceed the 128 MiB envelope",
             ));
@@ -552,7 +555,7 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
         };
         let started = self
             .runtime
-            .start_forwarded_workflow_task(task, worker)
+            .start_prepared_workflow_task(prepared, task, worker)
             .await
             .map_err(|error| {
                 if error.is::<WorkflowOfferRejected>() {
@@ -607,6 +610,10 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
 #[cfg(test)]
 #[path = "workflow_dispatch_read_baseline.rs"]
 mod read_baseline;
+
+#[cfg(test)]
+#[path = "workflow_dispatch_prepared_tests.rs"]
+mod prepared_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1242,7 +1249,7 @@ mod tests {
             .unwrap();
     }
 
-    fn authorized_reply<T>(value: T) -> Request<T> {
+    pub(super) fn authorized_reply<T>(value: T) -> Request<T> {
         let mut request = Request::new(value);
         request
             .metadata_mut()
@@ -1320,7 +1327,7 @@ mod tests {
         }
     }
 
-    fn buffer_query(
+    pub(super) fn buffer_query(
         runtime: &TokeiraRuntime<InMemoryStore>,
         key: RunKey,
         barrier: i64,

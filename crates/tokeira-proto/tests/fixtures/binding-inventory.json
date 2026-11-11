@@ -26317,6 +26317,16 @@
         "type_name": ""
       },
       {
+        "field": "use_ramping_version",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferWorkflowTaskRequest",
+        "number": 14,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BOOL",
+        "type_name": ""
+      },
+      {
         "field": "use_versioning",
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.common.v1.WorkerVersionCapabilities",
@@ -28811,6 +28821,16 @@
         "label": "LABEL_OPTIONAL",
         "message": "temporal.api.workflowservice.v1.UnpauseWorkflowExecutionRequest",
         "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "workflow_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferWorkflowTaskRequest",
+        "number": 13,
         "oneof": null,
         "proto3_optional": false,
         "type": "TYPE_STRING",

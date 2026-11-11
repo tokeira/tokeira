@@ -512,3 +512,130 @@ incarnation before its deadline, with full-history delivery. Start and timeout i
 Disk space was checked before every build and remained above the 12 GiB cutoff. Logs and the main-source test
 archive remain under the existing target directory. No dependency, lockfile, storage, migration or changelog
 change is included. Changes are left uncommitted.
+
+
+## Part 6: start reads
+
+### Owner preparation and the disposable route
+
+Publication, pushed admission, normal discovery, sticky fallback and sticky recovery carry the execution home
+through the broker's volatile `TimestampedWorkflowTask` and `WorkflowOfferStamp`. The queue home forwards from
+that hint without hydrating the run. `DispatchableWorkflowTask`, durable backlog encodings, storage and migrations
+are unchanged. Legacy in-process callers and speculative offers without the hint retain their resolver, still
+attributed to `queue-home/resolve`. The start wire contract is unchanged: the queue home uses its volatile home
+hint to choose a destination, and the owner's serving gate checks the home derived from authoritative state.
+A node that does not serve that home refuses the request; a request reaching the real owner can start regardless
+of the hint used to reach it. The binding inventory fixture now also records offer fields 13 and 14 from Part 4,
+which it omitted.
+
+The authenticated owner calls `load_run_with_stats` once under `execution-owner/preparation`. Its non-serializable
+`PreparedWorkflowStart` supplies namespace and authoritative normal-queue binding, repeated sticky worker policy,
+metadata bounds, history size and target/version resolution. Query and update snapshots are frozen before the
+start; metadata, attachment bytes and protobuf framing must all fit before submission. Refusal does not mark an
+update sent or consume a query waiter. Successful delivery marks only the frozen update selection and binds the
+frozen queries on the execution owner, preserving their waiters.
+
+The existing submit path retains its admission-cache lookup. The lane uses its own state, serving acquisition and
+commit fence; it never installs the prepared image. The check captures registry routing config and stored routing
+config before submission. On every attempt the lane synchronously re-derives queue/sticky binding, version target
+and deployment transition using its own state and those captured inputs, with no routing read or await. A changed
+run identity or decision is refused, while an unrelated signal, activity completion or update admission can advance
+the transition sequence without refusing the start. The started event records the prepared history size.
+
+`service/history/api/recordworkflowtaskstarted/api.go @ v1.31.0` checks that the run is running, then checks the task's
+scheduled event ID, stamp and whether it has already started; it does not reject every mutable-state version change.
+Tokeira retains the kernel's task-incarnation check and the execution component's serving/fence checks. Every OCC
+conflict still evicts and reloads, followed by synchronous decision revalidation against that fresh state. Routing
+changes after preparation are not caught in the lane, matching main's pre-submit routing lookup. Pair commits,
+successor construction and update reconciliation are unchanged.
+
+### Memory matrix and read accounting
+
+The baseline below is the previously executed two-runtime gRPC measurement. The new eight-case matrix runs the
+same two runtimes, repository and authenticated owner handler with an in-process `WorkflowTaskStarter`, because
+the sandbox refuses listener creation. The original gRPC matrix retains the same assertions for external execution.
+Each cell is **zero conflicts / one rejected commit**. The target has not changed.
+
+| Phase | Normal warm before → after | Normal cold before → after | Sticky warm before → after | Sticky cold before → after |
+| --- | --- | --- | --- | --- |
+| `queue-home/resolve` | 1/1 → 0/0 | 1/1 → 0/0 | 1/1 → 0/0 | 1/1 → 0/0 |
+| `execution-owner/sticky-binding` | 0/0 → 0/0 | 0/0 → 0/0 | 1/1 → 0/0 | 1/1 → 0/0 |
+| `execution-owner/metadata` | 1/1 → 0/0 | 1/1 → 0/0 | 1/1 → 0/0 | 1/1 → 0/0 |
+| `execution-owner/resolve` | 1/1 → 0/0 | 1/1 → 0/0 | 1/1 → 0/0 | 1/1 → 0/0 |
+| `execution-owner/preparation` | 0/0 → 1/1 | 0/0 → 1/1 | 0/0 → 1/1 | 0/0 → 1/1 |
+| `execution-owner/admission-cache` | 0/0 → 0/0 | 1/1 → 1/1 | 0/0 → 0/0 | 1/1 → 1/1 |
+| `execution-owner/lane-cache-or-retry` | 0/1 → 0/1 | 0/1 → 0/1 | 0/1 → 0/1 | 0/1 → 0/1 |
+| **All logical loads** | **3/4 → 1/2** | **4/5 → 2/3** | **4/5 → 1/2** | **5/6 → 2/3** |
+
+No run read moved to publication or hydration. Immediate local publication still uses committed state with zero
+run reloads; normal discovery's existing live-routing hydration is now explicitly scoped as `normal-discovery`
+(exact routing requires no hydration). Sticky sweep hydration remains `sticky-recovery`; later sender fallbacks
+remain `publication-fallback` or `sticky-recovery-fallback`. These scopes are excluded and separately visible in
+the reports. Unexpected scopes fail the per-phase assertions. Lane ownership-generation refreshes, previously
+unscoped, now also count as `execution-owner/lane-cache-or-retry`; concurrent acquisition changes are separate from
+the stable-cache matrix. Live registry/policy queries and history fetches remain outside the run-load metric.
+When configured, preparation performs the existing `workflow_task_routing_config` and `load_deployment` lookups
+before submission and captures their results. Lane revalidation performs zero registry/deployment reads, including
+on OCC retry; the mandatory fresh run reload is unchanged. No routing read moved into the lane or into an excluded
+hydration scope. The unversioned baseline has no configured deployment repository.
+
+The live DSQL variant's per-phase logical and SQL expectations use the new matrix but **were not executed**.
+One inline load still means one fast hot-state SELECT; one split load still means that SELECT plus BEGIN,
+snapshot SELECT, value-parts SELECT and COMMIT. Consequently the expected SQL totals are 1/2 warm and 2/3 cold
+for inline state, or 5/10 warm and 10/15 cold for split state, for both normal and sticky starts. These are
+expectations for task 9, not new live measurements.
+
+### Regression evidence
+
+`queue_home_delivery_prepared_reads_in_process` was executed against an archived `origin/main` at
+`b62607d69cf744ad0095ceea4ad3a6cdee4f84fa`, with only the new socket-free test harness added. It failed on the first
+cold normal case: `(queue loads, owner loads) = (1, 3)`, expected `(0, 2)`. The report attributed one each to queue
+resolution, owner metadata, owner resolution and owner admission cache. This is the executed main-first regression;
+the additional generated properties are implementation coverage, not claims of execution against main.
+
+Six Property 6 tests configure 100 cases each:
+
+- `property_6_prepared_read_budget`: normal/sticky, warm/cold and zero/one injected conflict, asserting every phase.
+- `property_6_prepared_bindings_and_envelope`: a misrouted request is refused by the non-owner's serving gate without
+  a home wire field; eight forged request coordinates per case; query and update attachments one byte over a bounded
+  limit and exactly at it; refusal before commit, retained query waiter and one-time update send.
+- `property_6_prepared_state_and_policy_changes`: a signal committed after preparation, through the lane or a
+  competing durable writer, still allows the pending task to start. Warm stale state reloads after the real OCC
+  conflict. Per-phase read counts stay unchanged and the start records the prepared history size. A barrier changes
+  worker policy before repeated sticky authorization, which must use the authoritative normal queue.
+- `property_6_prepared_lane_uses_captured_routing`: routing changes after target resolution and before lane execution;
+  normal and sticky starts retain their captured policy, matching main's off-lane lookup.
+- `property_6_prepared_lane_refuses_changed_decision`: a real sticky reset or versioning override between preparation
+  and execution still refuses the start, on warm/cold state and after competing writes requiring OCC reload.
+- `property_6_offer_sources_carry_execution_home`: local publication, pushed admission, discovery and sticky fallback
+  carry the original execution home through dequeue. The existing 100-case
+  `property_4_recovery_local_fallback_reuses_hydration` additionally checks the sweep's home hint through dequeue.
+
+`prepared_start_does_not_read_deployments_in_lane` covers both normal and sticky starts. After preparation, a gated
+repository proves that a deployment read blocks. While that gate stays closed, the prepared start and a signal on
+another run using the same one-lane runtime both commit; any additional deployment read fails the test.
+
+The first generated test run exposed two fixture errors, both corrected: reusing an empty signal request ID
+caused legitimate deduplication instead of a state change, and `snapshot_pending_updates` deliberately retains
+sent-but-unaccepted transport. The corrected tests use unique signal request IDs and assert that a second
+non-retry send selection is empty while the transport and waiter remain available.
+
+### Validation
+
+- `cargo nextest run -p tokeira-runtime -p tokeira-storage -p tokeira-edge -p tokeira-engine --locked --offline --no-fail-fast`: 2,440 passed, 55 failed, one skipped. All 55 failures report socket/listener operations denied by the sandbox (`Operation not permitted`); no other failure remains. The eight-case in-process matrix, all six 100-case Property 6 tests, the two-scenario gated-repository test and the extended 100-case sweep property pass.
+- `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`: passed.
+- `cargo clippy -p tokeira-storage -p tokeira-runtime -p tokeira-engine -p tokeira-edge -p tokeira-projection --features dsql-integration --all-targets --locked --offline -- -D warnings`: passed; compile/lint coverage only.
+- `cargo +nightly fmt --all -- --check`: passed.
+- `git diff --check`: passed.
+- `cargo run -p proto-sync --locked --offline -- generate`: passed. `WIRE_PARITY_CAPTURE=1 cargo nextest run -p tokeira-proto --test binding_inventory --locked --offline` updated the inventory; rerunning without the capture flag passed its one test.
+
+The two task-specific socket tests to run externally are
+`grpc::workflow_dispatch::read_baseline::queue_home_delivery_exploration_read_baseline` and
+`grpc::workflow_dispatch::tests::forwarded_start_and_replies_use_owner_waiters_and_reauthenticate` in
+`tokeira-edge`. The target-directory `start-reads-corrections-socket-tests.txt` inventory lists all 55 failed tests by binary and exact name.
+`queue_home_delivery_live_read_baseline` has updated logical/SQL expectations and is deliberately not run here.
+
+Disk space was checked before each build (100–105 GiB free), above the 12 GiB stop threshold. Logs,
+main-source archive and the pre-edit spec snapshot are under the existing target directory. No dependencies,
+lockfile, durable storage format, migration or changelog changed. Git operations were read-only; changes remain
+uncommitted. Tasks 8, 9 and 10 are not marked complete.

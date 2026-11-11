@@ -142,7 +142,7 @@ mod successor_semantics_tests;
 mod timer_deadline_tests;
 pub(crate) mod workflow_task;
 
-pub use workflow_task::continue_as_new_advice_policy;
+pub use workflow_task::{PreparedWorkflowStart, continue_as_new_advice_policy};
 
 pub(crate) use activity::{
     ActivityRetryDeps, ActivityRetryTarget, activity_dispatch_task, commit_activity_retry,

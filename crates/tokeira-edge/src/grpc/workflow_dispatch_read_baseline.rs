@@ -1,11 +1,12 @@
-//! Real remote-start read attribution before preparation is consolidated.
+//! Remote-start read budgets across two runtimes and the authenticated owner.
 //!
 //! The offer is already at the queue home: publication and recovery are outside
-//! this measurement. Both runtimes and the actual authenticated gRPC endpoint
-//! participate; repository observation includes their independently spawned lanes.
+//! this measurement. The socket matrix uses the gRPC endpoint; the sandbox
+//! matrix calls the same handler in process. Observation follows spawned lanes.
 
 use super::*;
 use crate::{EdgeContext, InMemoryNamespaceCache, NamespaceCache, ResolvedNamespace};
+use proptest::prelude::*;
 use std::{collections::BTreeMap, sync::atomic::AtomicUsize};
 use tokeira_kernel::{BasicKernel, Command, Kernel, LoadedRun, SignalRequest, TerminateRequest};
 use tokeira_runtime::{
@@ -29,7 +30,10 @@ use tokeira_types::{
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
-fn runtime<R: RunRepository + 'static>(repo: Arc<R>, identity: &str) -> Arc<TokeiraRuntime<R>> {
+pub(super) fn runtime<R: RunRepository + 'static>(
+    repo: Arc<R>,
+    identity: &str,
+) -> Arc<TokeiraRuntime<R>> {
     Arc::new(TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
         repo,
         1,
@@ -50,7 +54,7 @@ fn runtime<R: RunRepository + 'static>(repo: Arc<R>, identity: &str) -> Arc<Toke
     ))
 }
 
-async fn stop<R: RunRepository + 'static>(runtime: &TokeiraRuntime<R>) {
+pub(super) async fn stop<R: RunRepository + 'static>(runtime: &TokeiraRuntime<R>) {
     let shutdown = runtime.shutdown_handle();
     shutdown.begin_shutdown();
     shutdown
@@ -65,13 +69,9 @@ fn assert_start_reads(
     warm: bool,
     conflict: bool,
 ) -> BTreeMap<(&'static str, &'static str), usize> {
-    let mut expected = BTreeMap::from([
-        (("queue-home/resolve", "logical"), 1),
-        (("execution-owner/metadata", "logical"), 1),
-        (("execution-owner/resolve", "logical"), 1),
-    ]);
+    let _ = sticky;
+    let mut expected = BTreeMap::from([(("execution-owner/preparation", "logical"), 1)]);
     for (phase, present) in [
-        ("execution-owner/sticky-binding", sticky),
         ("execution-owner/admission-cache", !warm),
         ("execution-owner/lane-cache-or-retry", conflict),
     ] {
@@ -87,7 +87,17 @@ fn assert_start_reads(
     let actual = report
         .counts
         .iter()
-        .filter(|((phase, kind), _)| *kind == "logical" && *phase != "outside-start")
+        .filter(|((phase, kind), _)| {
+            *kind == "logical"
+                && !matches!(
+                    *phase,
+                    "outside-start"
+                        | "normal-discovery"
+                        | "publication-fallback"
+                        | "sticky-recovery"
+                        | "sticky-recovery-fallback"
+                )
+        })
         .map(|(key, count)| (*key, *count))
         .collect::<BTreeMap<_, _>>();
     assert_eq!(actual, expected, "{report:?}");
@@ -99,17 +109,15 @@ fn read_baseline_separates_background_reads_and_rejects_extra_start_reads() {
     let report = ReadReport {
         attempt: "overlapping-discovery".into(),
         counts: BTreeMap::from([
-            (("queue-home/resolve", "logical"), 1),
-            (("execution-owner/metadata", "logical"), 1),
-            (("execution-owner/resolve", "logical"), 1),
+            (("execution-owner/preparation", "logical"), 1),
             (("execution-owner/admission-cache", "logical"), 1),
             (("outside-start", "logical"), 1),
         ]),
     };
     let measured = assert_start_reads(&report, false, false, false);
-    assert_eq!(measured.values().sum::<usize>(), 4);
+    assert_eq!(measured.values().sum::<usize>(), 2);
     assert_eq!(report.counts[&("outside-start", "logical")], 1);
-    for phase in ["execution-owner/resolve", "unexpected-start-phase"] {
+    for phase in ["execution-owner/preparation", "unexpected-start-phase"] {
         let mut extra = report.clone();
         *extra.counts.entry((phase, "logical")).or_default() += 1;
         assert!(
@@ -119,7 +127,7 @@ fn read_baseline_separates_background_reads_and_rejects_extra_start_reads() {
     let mut misplaced = report.clone();
     misplaced
         .counts
-        .remove(&("execution-owner/resolve", "logical"));
+        .remove(&("execution-owner/preparation", "logical"));
     misplaced
         .counts
         .insert(("execution-owner/metadata", "logical"), 2);
@@ -128,12 +136,53 @@ fn read_baseline_separates_background_reads_and_rejects_extra_start_reads() {
     );
 }
 
+pub(super) async fn owner_service<R: RunRepository + 'static>(
+    repo: Arc<R>,
+    owner: Arc<TokeiraRuntime<R>>,
+    auth: Arc<dyn crate::interceptors::Authenticator>,
+) -> WorkflowTaskDispatchGrpc<R> {
+    let namespaces = Arc::new(InMemoryNamespaceCache::new());
+    namespaces
+        .insert(ResolvedNamespace::active("default"))
+        .await
+        .unwrap();
+    namespaces
+        .insert(ResolvedNamespace::active("other"))
+        .await
+        .unwrap();
+    let interceptors = Arc::new(EdgeInterceptors::configured(
+        namespaces.clone(),
+        auth,
+        false,
+    ));
+    let workflow = WorkflowService::new_with_buffered_queries_and_history_wait_registry(
+        Arc::new(crate::grpc::runtime_adapter::RuntimeAdapter::new(
+            owner.clone(),
+        )),
+        Arc::new(crate::InMemoryExecutionResolver::new()),
+        Arc::new(crate::EmptyVisibilityApi),
+        repo.clone(),
+        Arc::new(crate::InMemoryOperatorApi::new("test", "test")),
+        namespaces,
+        interceptors.clone(),
+        crate::PollerRegistry::default(),
+        crate::PendingQueryStore::default(),
+        owner.buffered_queries(),
+        owner.broker(),
+        crate::LongPollGate::new(crate::LongPollConfig::default()),
+        Arc::new(crate::LocalOnlyRouter),
+        crate::HistoryWaitRegistry::default(),
+    );
+    WorkflowTaskDispatchGrpc::new(owner.clone(), interceptors, workflow)
+}
+
 async fn case<R: RunRepository + LeaseRepository + 'static>(
     repo: Arc<R>,
     sticky: bool,
     warm: bool,
     conflict: bool,
     split: bool,
+    sockets: bool,
 ) -> ReadReport {
     let context = EdgeContext {
         request_id: crate::request_id::RequestId::new("read-baseline"),
@@ -233,56 +282,42 @@ async fn case<R: RunRepository + LeaseRepository + 'static>(
             .unwrap();
     }
 
-    let namespaces = Arc::new(InMemoryNamespaceCache::new());
-    namespaces
-        .insert(ResolvedNamespace::active("default"))
-        .await
-        .unwrap();
-    let interceptors = Arc::new(EdgeInterceptors::configured(
-        namespaces.clone(),
-        Arc::new(super::tests::WorkerAuth(AtomicUsize::new(0))),
-        false,
-    ));
-    let workflow = WorkflowService::new_with_buffered_queries_and_history_wait_registry(
-        Arc::new(crate::grpc::runtime_adapter::RuntimeAdapter::new(
-            owner.clone(),
-        )),
-        Arc::new(crate::InMemoryExecutionResolver::new()),
-        Arc::new(crate::EmptyVisibilityApi),
+    let service = owner_service(
         repo.clone(),
-        Arc::new(crate::InMemoryOperatorApi::new("test", "test")),
-        namespaces,
-        interceptors.clone(),
-        crate::PollerRegistry::default(),
-        crate::PendingQueryStore::default(),
-        owner.buffered_queries(),
-        owner.broker(),
-        crate::LongPollGate::new(crate::LongPollConfig::default()),
-        Arc::new(crate::LocalOnlyRouter),
-        crate::HistoryWaitRegistry::default(),
-    );
-    let service = WorkflowTaskDispatchGrpc::new(owner.clone(), interceptors, workflow);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+        owner.clone(),
+        Arc::new(super::tests::WorkerAuth(AtomicUsize::new(0))),
+    )
+    .await;
     let cancel = CancellationToken::new();
-    let accept_cancel = cancel.clone();
-    let (send, receive) = tokio::sync::mpsc::channel(4);
-    let accept = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = accept_cancel.cancelled() => break,
-                socket = listener.accept() => if send.send(socket.map(|(socket, _)| socket)).await.is_err() { break; },
+    let (address, transport) = if sockets {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept_cancel = cancel.clone();
+        let (send, receive) = tokio::sync::mpsc::channel(4);
+        let accept = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = accept_cancel.cancelled() => break,
+                    socket = listener.accept() => if send.send(socket.map(|(socket, _)| socket)).await.is_err() { break; },
+                }
             }
-        }
-    });
-    let server_cancel = cancel.clone();
-    let server = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(service.into_service())
-            .serve_with_incoming_shutdown(ReceiverStream::new(receive), server_cancel.cancelled())
-            .await
-            .unwrap();
-    });
+        });
+        let server_cancel = cancel.clone();
+        let server_service = service.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(server_service.into_service())
+                .serve_with_incoming_shutdown(
+                    ReceiverStream::new(receive),
+                    server_cancel.cancelled(),
+                )
+                .await
+                .unwrap();
+        });
+        (address, Some((accept, server)))
+    } else {
+        ("127.0.0.1:1".parse().unwrap(), None)
+    };
     let placement = PlacementConfig {
         shard_count: 8,
         bundle_count: 8,
@@ -307,14 +342,18 @@ async fn case<R: RunRepository + LeaseRepository + 'static>(
         },
     );
     cache.replace_snapshot(snapshot);
-    queue_runtime.set_workflow_task_starter(Arc::new(RemoteWorkflowTaskStarter::new(cache)));
+    if sockets {
+        queue_runtime.set_workflow_task_starter(Arc::new(RemoteWorkflowTaskStarter::new(cache)));
+    } else {
+        queue_runtime.set_workflow_task_starter(Arc::new(InProcessStarter(service)));
+    }
     let broker = queue_runtime.broker();
     broker
         .poll_workflow_task(&selected, &worker, Duration::ZERO)
         .await
         .unwrap();
     broker
-        .publish_workflow_task(
+        .publish_workflow_task_at_home(
             DispatchableWorkflowTask {
                 run_key: key,
                 logical_seq: LogicalTaskSeq::ONE,
@@ -326,6 +365,7 @@ async fn case<R: RunRepository + LeaseRepository + 'static>(
                 order: None,
             },
             None,
+            Some(execution_home),
         )
         .await;
     let attempt = format!("sticky={sticky},warm={warm},conflict={conflict}");
@@ -373,8 +413,10 @@ async fn case<R: RunRepository + LeaseRepository + 'static>(
         .await
         .unwrap();
     cancel.cancel();
-    accept.await.unwrap();
-    server.await.unwrap();
+    if let Some((accept, server)) = transport {
+        accept.await.unwrap();
+        server.await.unwrap();
+    }
     stop(&queue_runtime).await;
     stop(&owner).await;
     let LoadedRun::Existing(state) = repo.load_run(key).await.unwrap() else {
@@ -417,6 +459,7 @@ async fn queue_home_delivery_exploration_read_baseline() {
                     warm,
                     conflict,
                     false,
+                    true,
                 )
                 .await;
                 assert_start_reads(&report, sticky, warm, conflict);
@@ -428,26 +471,15 @@ async fn queue_home_delivery_exploration_read_baseline() {
                     })
                     .map(|(_, count)| *count)
                     .sum();
-                for (met, failure) in [
-                    (
-                        report.counts[&("queue-home/resolve", "logical")] == 0,
-                        "queue-home must not load run state",
-                    ),
-                    (
-                        owner_loads <= 1 + usize::from(!warm) + usize::from(conflict),
-                        "owner exceeds the preparation and required reload target",
-                    ),
-                ] {
-                    let desired = if met {
-                        Ok(())
-                    } else {
-                        Err(proptest::test_runner::TestCaseError::fail(failure))
-                    };
-                    assert!(
-                        matches!(desired, Err(proptest::test_runner::TestCaseError::Fail(ref reason)) if reason.to_string() == failure),
-                        "expected {failure}: {report:?}"
-                    );
-                }
+                assert_eq!(
+                    report
+                        .counts
+                        .get(&("queue-home/resolve", "logical"))
+                        .copied()
+                        .unwrap_or(0),
+                    0
+                );
+                assert_eq!(owner_loads, 1 + usize::from(!warm) + usize::from(conflict));
                 tracing::info!(?report, "queue-home delivery read baseline");
             }
         }
@@ -502,7 +534,7 @@ async fn queue_home_delivery_live_read_baseline() -> Result<()> {
         for sticky in [false, true] {
             for warm in [false, true] {
                 for conflict in [false, true] {
-                    let report = case(repo.clone(), sticky, warm, conflict, split).await;
+                    let report = case(repo.clone(), sticky, warm, conflict, split, true).await;
                     let logical = assert_start_reads(&report, sticky, warm, conflict);
                     for ((purpose, _), count) in &logical {
                         assert_eq!(
@@ -536,4 +568,92 @@ async fn queue_home_delivery_live_read_baseline() -> Result<()> {
     assert_eq!(executed, 16);
     director.shutdown().await?;
     Ok(())
+}
+
+struct InProcessStarter<R: RunRepository + 'static>(WorkflowTaskDispatchGrpc<R>);
+
+impl<R: RunRepository + 'static> std::fmt::Debug for InProcessStarter<R> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InProcessStarter")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl<R: RunRepository + 'static> WorkflowTaskStarter for InProcessStarter<R> {
+    async fn start(
+        &self,
+        _home: ShardId,
+        task: DispatchableWorkflowTask,
+        worker: WorkerIdentity,
+    ) -> Result<StartedWorkflowTask> {
+        let context = FORWARDED_POLL.try_with(Clone::clone)?;
+        let mut request = Request::new(StartWorkflowTaskRequest {
+            run_key: task.run_key.0.as_bytes().to_vec(),
+            logical_seq: task.logical_seq.0,
+            namespace: context.namespace,
+            task_queue: task.queue.task_queue.0,
+            deployment: task.queue.deployment.map(|v| v.0),
+            build_id: task.queue.build_id.map(|v| v.0),
+            worker_identity: worker.0,
+            sticky: context.sticky,
+            normal_task_queue: context.normal_task_queue,
+            scoped_versioned: context.scoped_versioned,
+        });
+        *request.metadata_mut() = super::super::peer_transport::start_metadata(context.headers);
+        let response = self.0.start_workflow_task(request).await?.into_inner();
+        Ok(serde_json::from_slice(&response.started_task_json)?)
+    }
+}
+
+// Feature: queue-home-delivery, Property 6. Every phase meets the preparation budget.
+#[tokio::test]
+async fn queue_home_delivery_prepared_reads_in_process() {
+    for sticky in [false, true] {
+        for warm in [false, true] {
+            for conflict in [false, true] {
+                let report = case(
+                    Arc::new(InMemoryStore::with_shard_count(8)),
+                    sticky,
+                    warm,
+                    conflict,
+                    false,
+                    false,
+                )
+                .await;
+                assert_start_reads(&report, sticky, warm, conflict);
+                let queue = report
+                    .counts
+                    .get(&("queue-home/resolve", "logical"))
+                    .copied()
+                    .unwrap_or(0);
+                let owner: usize = report
+                    .counts
+                    .iter()
+                    .filter(|((phase, kind), _)| {
+                        phase.starts_with("execution-owner/") && *kind == "logical"
+                    })
+                    .map(|(_, count)| count)
+                    .sum();
+                assert_eq!(
+                    (queue, owner),
+                    (0, 1 + usize::from(!warm) + usize::from(conflict)),
+                    "{report:?}"
+                );
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+    // Feature: queue-home-delivery, Property 6. Cache misses and conflicts retain their separate read costs.
+    #[test]
+    fn property_6_prepared_read_budget(sticky in any::<bool>(), warm in any::<bool>(), conflict in any::<bool>()) {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let report = case(Arc::new(InMemoryStore::with_shard_count(8)), sticky, warm, conflict, false, false).await;
+            assert_start_reads(&report, sticky, warm, conflict);
+        });
+    }
 }

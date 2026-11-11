@@ -45,7 +45,8 @@ where
     /// the edge maps to the retryable not-owner status. Routing is by run key,
     /// so the same run always serializes on the same lane.
     pub async fn submit(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
-        self.submit_admitted(run_key, command, false, None).await
+        self.submit_admitted(run_key, command, false, None, None)
+            .await
     }
 
     /// Claim room for one command for `run_key` on its lane, or refuse at once
@@ -67,7 +68,7 @@ where
         command: Command,
         reservation: SubmitReservation,
     ) -> Result<CommitResult> {
-        self.submit_admitted(run_key, command, false, Some(reservation))
+        self.submit_admitted(run_key, command, false, Some(reservation), None)
             .await
     }
 
@@ -81,7 +82,18 @@ where
         command: Command,
         reserve_poller: bool,
     ) -> Result<CommitResult> {
-        self.submit_admitted(run_key, command, reserve_poller, None)
+        self.submit_admitted(run_key, command, reserve_poller, None, None)
+            .await
+    }
+
+    /// Preserve admission/cache lookup and carry owner validation into every lane attempt.
+    pub(super) async fn submit_workflow_task_start(
+        &self,
+        run_key: RunKey,
+        command: Command,
+        check: Option<super::workflow_task::WorkflowStartCheck>,
+    ) -> Result<CommitResult> {
+        self.submit_admitted(run_key, command, false, None, check)
             .await
     }
 
@@ -91,6 +103,7 @@ where
         command: Command,
         reserve_poller: bool,
         reservation: Option<SubmitReservation>,
+        check: Option<super::workflow_task::WorkflowStartCheck>,
     ) -> Result<CommitResult> {
         self.ready().await?;
         let shard_id = self.command_home(run_key, &command).await?;
@@ -126,7 +139,9 @@ where
         debug_assert_eq!(reservation.run_key(), run_key);
         let lane_id = lane_index_for_run_key(run_key, self.lanes.len());
         let started = std::time::Instant::now();
-        let result = reservation.submit(command, reserve_poller).await?;
+        let result = reservation
+            .submit_checked_start(command, reserve_poller, check)
+            .await?;
         runtime_metrics::record_lane_submit_duration(lane_id, started.elapsed());
         self.handle_post_commit(run_key, &result);
         Ok(result)

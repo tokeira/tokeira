@@ -674,7 +674,10 @@ async fn applied_commits_refresh_only_their_runs_changed_activity_caches() {
     let tracking = &runtime.activity_tracking.inner;
     for entry in tracking.snapshot(None) {
         assert!(tracking.mark_attempted(
-            &(entry.value.run_key, entry.value.activity_id.clone()),
+            &(
+                entry.value.entry.run_key,
+                entry.value.entry.activity_id.clone()
+            ),
             &entry
         ));
     }
@@ -716,10 +719,10 @@ async fn applied_commits_refresh_only_their_runs_changed_activity_caches() {
     assert!(matches!(updated, CommitResult::Applied { .. }));
     let target = tracking.tracked(&(first.run_key, "target".into())).unwrap();
     assert_eq!(
-        target.value.timeouts.unwrap().start_to_close,
+        target.value.entry.timeouts.unwrap().start_to_close,
         Some(Duration::minutes(2))
     );
-    assert!(!target.value.timeouts.unwrap().paused);
+    assert!(!target.value.entry.timeouts.unwrap().paused);
     assert!(target.deadline_pending);
     let paused = runtime
         .pause_activities(
@@ -744,6 +747,7 @@ async fn applied_commits_refresh_only_their_runs_changed_activity_caches() {
             .tracked(&(first.run_key, "target".into()))
             .unwrap()
             .value
+            .entry
             .timeouts
             .unwrap()
             .paused

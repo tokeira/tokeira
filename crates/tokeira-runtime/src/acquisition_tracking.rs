@@ -4,7 +4,9 @@
 //! with installation. Every authoritative tracking mutation advances a revision: an awaited scan may
 //! retire only the exact value it submitted, even when its logical key is reused.
 //! Scanner-only cache refreshes preserve that revision. They may reconcile attempt
-//! anchors from authority, but cannot overwrite a concurrently updated entry.
+//! anchors from authority, but cannot overwrite a concurrently updated entry,
+//! either by revision or by the order a conditional refresh checks. A requested
+//! reload stays requested until a scan takes the entry: updates never clear it.
 
 use std::{
     collections::HashMap,
@@ -136,12 +138,7 @@ impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
         let Some(entry) = entries.values.get_mut(key) else {
             return;
         };
-        let same_acquisition = match (&submitted.acquisition, &entry.acquisition) {
-            (Some(a), Some(b)) => a.generation == b.generation,
-            (None, None) => true,
-            _ => false,
-        };
-        if !same_acquisition
+        if !Self::same_generation(&submitted.acquisition, &entry.acquisition)
             || !Self::active_with_owner(owner.as_deref(), entry)
             || entry.refresh_pending
         {
@@ -175,6 +172,46 @@ impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
         update(&mut entry.value);
         if let Some(index) = &self.deadlines {
             entry.deadline_pending = (index.due)(&entry.value).is_some_and(|due| due > now);
+        }
+    }
+
+    /// Refresh derived timing data after a scan when `update` accepts the
+    /// current value, even if another update advanced its revision since the
+    /// scan captured it. `update` returns whether it changed the value, and
+    /// leaves it untouched when it declines. The revision is preserved, as in
+    /// [`Self::refresh_scanned`], and only the captured acquisition's entry is
+    /// refreshed.
+    pub(crate) fn refresh_scanned_if(
+        &self,
+        key: &K,
+        submitted: &Tracked<V>,
+        now: OffsetDateTime,
+        update: impl FnOnce(&mut V) -> bool,
+    ) {
+        let owner = self
+            .owner
+            .get()
+            .map(|owner| owner.read().expect("shard owner lock poisoned"));
+        let mut entries = self.entries.lock().expect("tracking lock poisoned");
+        let Some(entry) = entries.values.get_mut(key).filter(|entry| {
+            Self::same_generation(&submitted.acquisition, &entry.acquisition)
+                && Self::active_with_owner(owner.as_deref(), entry)
+        }) else {
+            return;
+        };
+        if !update(&mut entry.value) {
+            return;
+        }
+        if let Some(index) = &self.deadlines {
+            entry.deadline_pending = (index.due)(&entry.value).is_some_and(|due| due > now);
+        }
+    }
+
+    fn same_generation(a: &Option<ShardAcquisition>, b: &Option<ShardAcquisition>) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) => a.generation == b.generation,
+            (None, None) => true,
+            _ => false,
         }
     }
 
@@ -319,6 +356,11 @@ impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
             .checked_add(1)
             .expect("tracking revision exhausted");
         let revision = inner.revision;
+        // A replacement keeps a reload already requested for this key.
+        let refresh_pending = inner
+            .values
+            .get(&key)
+            .is_some_and(|entry| entry.refresh_pending);
         self.changed_deadline(&value, owner.as_deref(), acquisition.as_ref());
         inner.values.insert(
             key,
@@ -328,9 +370,23 @@ impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
                 revision,
                 acquisition,
                 deadline_pending: self.deadlines.is_some(),
-                refresh_pending: false,
+                refresh_pending,
             },
         );
+    }
+
+    /// Whether this handle's captured revision, acquisition and the current
+    /// owner all admit a mutation of `entry`.
+    fn admits(&self, owner: Option<&ShardOwner>, entry: &Tracked<V>) -> bool {
+        self.submitted_revision
+            .is_none_or(|revision| entry.revision == revision)
+            && self.acquisition.as_ref().is_none_or(|scope| {
+                entry
+                    .acquisition
+                    .as_ref()
+                    .is_some_and(|a| a.generation == scope.generation)
+            })
+            && Self::current(owner, entry.acquisition.as_ref(), entry.home)
     }
 
     pub(crate) fn update<T>(&self, key: &K, update: impl FnOnce(&mut V) -> T) -> Option<T> {
@@ -339,32 +395,52 @@ impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
             .get()
             .map(|owner| owner.read().expect("shard owner lock poisoned"));
         let mut inner = self.entries.lock().expect("tracking lock poisoned");
-        let entry = inner.values.get(key)?;
-        if self
-            .submitted_revision
-            .is_some_and(|revision| entry.revision != revision)
-            || self.acquisition.as_ref().is_some_and(|scope| {
-                entry
-                    .acquisition
-                    .as_ref()
-                    .is_none_or(|a| a.generation != scope.generation)
-            })
-            || !Self::current(owner.as_deref(), entry.acquisition.as_ref(), entry.home)
-        {
-            return None;
-        }
-        inner.revision = inner
+        let entries = &mut *inner;
+        let entry = entries
+            .values
+            .get_mut(key)
+            .filter(|entry| self.admits(owner.as_deref(), entry))?;
+        entries.revision = entries
             .revision
             .checked_add(1)
             .expect("tracking revision exhausted");
-        let revision = inner.revision;
-        let entry = inner.values.get_mut(key).expect("entry remains under lock");
-        entry.revision = revision;
+        entry.revision = entries.revision;
         let result = update(&mut entry.value);
         entry.deadline_pending = self.deadlines.is_some();
-        entry.refresh_pending = false;
         self.changed_deadline(&entry.value, owner.as_deref(), entry.acquisition.as_ref());
         Some(result)
+    }
+
+    /// Update an entry this handle admits only when `update` accepts its
+    /// current value. `update` returns whether it changed the value, and
+    /// leaves it untouched when it declines; only an applied update advances
+    /// the revision and rearms the deadline. Callers order their updates in
+    /// `update` itself instead of capturing a revision.
+    pub(crate) fn update_if(&self, key: &K, update: impl FnOnce(&mut V) -> bool) -> bool {
+        let owner = self
+            .owner
+            .get()
+            .map(|owner| owner.read().expect("shard owner lock poisoned"));
+        let mut inner = self.entries.lock().expect("tracking lock poisoned");
+        let entries = &mut *inner;
+        let Some(entry) = entries
+            .values
+            .get_mut(key)
+            .filter(|entry| self.admits(owner.as_deref(), entry))
+        else {
+            return false;
+        };
+        if !update(&mut entry.value) {
+            return false;
+        }
+        entries.revision = entries
+            .revision
+            .checked_add(1)
+            .expect("tracking revision exhausted");
+        entry.revision = entries.revision;
+        entry.deadline_pending = self.deadlines.is_some();
+        self.changed_deadline(&entry.value, owner.as_deref(), entry.acquisition.as_ref());
+        true
     }
 
     pub(crate) fn get(&self, key: &K) -> Option<V> {
@@ -406,6 +482,25 @@ impl<K: Clone + Eq + Hash, V: Clone> AcquisitionEntries<K, V> {
                     .as_ref()
                     .is_some_and(|a| a.generation == scope.generation)
             })
+        }) {
+            inner.values.remove(key);
+        }
+    }
+
+    /// Remove an entry in this handle's scope only when `remove` accepts its
+    /// current value.
+    pub(crate) fn remove_if(&self, key: &K, remove: impl FnOnce(&V) -> bool) {
+        let mut inner = self.entries.lock().expect("tracking lock poisoned");
+        if inner.values.get(key).is_some_and(|entry| {
+            self.submitted_revision
+                .is_none_or(|revision| entry.revision == revision)
+                && self.acquisition.as_ref().is_none_or(|scope| {
+                    entry
+                        .acquisition
+                        .as_ref()
+                        .is_some_and(|a| a.generation == scope.generation)
+                })
+                && remove(&entry.value)
         }) {
             inner.values.remove(key);
         }

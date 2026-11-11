@@ -1,7 +1,13 @@
-//! Reloaded attempt anchors remain authoritative after a scoped reset loses a race.
+//! Reloaded attempt anchors remain authoritative when a retry's reset is
+//! missing from the cache.
+//!
+//! A retry's own update is ordered by the image it committed, so a racing
+//! heartbeat no longer skips it. A writer without an image, such as recovery
+//! or the lane's own insert, can still leave the previous attempt's anchors in
+//! the cache; these cases install them directly after the retry.
 
 use super::{
-    repair_tests::{Point, Repo},
+    repair_tests::Repo,
     timer_deadline_tests::{fixture_on, start},
     *,
 };
@@ -84,47 +90,38 @@ async fn skipped_reset(
         .unwrap()
         .unwrap();
     tokio::time::advance(std::time::Duration::from_nanos(1_000_000_001)).await;
-    let (committing, resume) = repo.pause(Point::Committed);
-    let deps = runtime.activity_retry_deps();
-    let config = ActivityTimeoutScannerConfig::default();
-    let scan = scan_activity_timeouts_once(
-        &deps,
-        Some(ShardId(0)),
-        &runtime.lanes,
-        runtime.lanes.len(),
-        &config,
-    );
-    let race = async {
-        committing.await.unwrap();
-        // The retry has committed, but its tracking reset has not run. A late
-        // heartbeat reply from the prior attempt can still advance the cache
-        // revision; its durable heartbeat would now be rejected as stale.
+    let cached = |runtime: &TokeiraRuntime<Repo>| {
         runtime
             .activity_tracking
-            .record_heartbeat(run, "retry", runtime.clock.now());
-        resume.send(()).unwrap();
+            .snapshot()
+            .into_iter()
+            .find(|entry| entry.activity_id == "retry")
+            .unwrap()
     };
-    tokio::join!(scan, race);
+    let mut stale = cached(&runtime);
+    assert!(stale.started_at.is_some());
+    scan(&runtime).await;
     let LoadedRun::Existing(state) = repo.load_run(run).await.unwrap() else {
         panic!("run")
     };
     assert_eq!(state.activities["retry"].attempt, 2);
     assert!(state.activities["retry"].started_at.is_none());
-    let cached = runtime
-        .activity_tracking
-        .snapshot()
-        .into_iter()
-        .find(|entry| entry.activity_id == "retry")
-        .unwrap();
-    assert!(
-        cached.started_at.is_some(),
-        "the heartbeat must make the captured reset stale"
-    );
-    assert_ne!(
-        Some(cached.last_dispatched_at),
+    let reset = cached(&runtime);
+    assert_eq!(reset.started_at, None);
+    assert_eq!(
+        Some(reset.last_dispatched_at),
         state.activities["retry"].current_attempt_scheduled_at
     );
-    (repo, runtime, run, cached)
+    // Put the previous attempt's anchors back, with a heartbeat the durable
+    // state would now reject, as a writer without an image can leave them.
+    stale.last_heartbeat_at = Some(runtime.clock.now());
+    runtime.activity_tracking.insert(stale.clone());
+    assert_eq!(cached(&runtime), stale);
+    assert_ne!(
+        Some(stale.last_dispatched_at),
+        state.activities["retry"].current_attempt_scheduled_at
+    );
+    (repo, runtime, run, stale)
 }
 
 async fn scan(runtime: &TokeiraRuntime<Repo>) {

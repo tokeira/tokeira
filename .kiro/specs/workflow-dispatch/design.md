@@ -4,7 +4,9 @@
 
 Persist one narrow `workflow_dispatch` row per wanted workflow task, in the
 transaction that persists its run. Queue homes discover normal work through
-poll-registered, level-triggered passes. Delivery remains in memory; only a run
+poll-registered, level-triggered passes, and execution homes push each task they
+publish to its queue's home ([queue-home delivery](../queue-home-delivery/design.md)).
+Delivery remains in memory; only a run
 transition can start a task or change its dispatch intent. Acquisition repairs the
 complete derived view before admitting commands.
 
@@ -38,7 +40,7 @@ allocation, SQL layout, and scan scheduling are Tokeira mechanisms.
 |---|---|
 | Kernel | Pure task eligibility, incarnation allocation, start and timeout validation. No SQL, broker access, clock reads, or registry lookups. |
 | Storage | One shared derivation, atomic maintenance on both stores, read-only pages, and fenced acquisition repair. |
-| Runtime | Poll registration, queue-home discovery, bounded volatile offers, sticky timeout reconstruction, and the serving gate. |
+| Runtime | Poll registration, queue-home discovery and push, bounded volatile offers, the execution home's sticky sweep, sticky timeout reconstruction, and the serving gate. |
 | Worker deployments | Existing live routing resolver and authoritative start checks remain the authority for selecting and accepting a worker version. |
 | Projection accumulator | Existing atomic accumulator maintenance and extension tag 3 remain intact in every commit and materialization path. |
 | Lease fencing | Supply the transaction-local ownership contract below before enabling repair under competing execution-home owners. |
@@ -273,7 +275,10 @@ RPC. It forwards the admitted poll's credentials and worker target. The receivin
 edge re-authenticates and re-authorizes the poll, validates the run namespace, and
 starts only through its local runtime's serving gate and fenced lane commit. It
 returns the committed start envelope and token; it accepts no arbitrary command or
-history. Stale offers are discarded, whereas transport failures retain the bounded
+history. Published, pushed, discovered and recovered offers carry their execution
+home, so the queue owner forwards them without reading the run. The owner reads the
+run once to prepare the start and checks the home derived from that authoritative
+state ([queue-home delivery](../queue-home-delivery/design.md)). Stale offers are discarded, whereas transport failures retain the bounded
 in-flight lease for retry after expiry. This transport assumes every node runs the
 same release under the stopped-upgrade policy.
 
@@ -814,11 +819,14 @@ replacement with a new sequence. Stale timeout sequence checks remain mandatory.
 This follows `resetstickytaskqueue/api.go` and the schedule-to-start handler in
 `service/history/timer_queue_active_task_executor.go @ v1.31.0`.
 
-Sticky rows have no periodic queue scan. Post-commit notification and acquisition
-republishing may retain existing normal fallback when a compatible sticky worker
-is unavailable. Neither fallback selection nor observing an idle worker changes
-durable affinity. If every notification/fallback is lost, the restored deadline
-still converts or ends the task. Speculative timeout recovery stays with its
+Queue homes never scan sticky rows. Post-commit publication, acquisition
+republishing and the execution home's sticky sweep may take the existing normal
+fallback when a compatible sticky worker is unavailable; the sweep pages its
+home's sticky rows every second and republishes each task still pending
+([queue-home delivery](../queue-home-delivery/design.md)). Neither fallback
+selection nor observing an idle worker changes durable affinity. If every
+publication and fallback is lost, the restored deadline still converts or ends
+the task. Speculative timeout recovery stays with its
 owning spec; excluding speculative rows is not permission to remove its timers.
 
 ### Stopped upgrade and legacy cleanup
@@ -1004,7 +1012,7 @@ For any normal sticky task, restart point, affinity reset, and clock position,
 reconstruction preserves its absolute pending deadline before serving. Overdue
 deadlines are immediately eligible after serving; valid timeouts create normal
 discoverable replacement work, while stale timeouts do not change a newer or
-started task. Sticky scans are absent and fallback reads do not mutate affinity.
+started task. Queue homes never scan sticky rows, and fallback reads do not mutate affinity.
 For any tracked task set and clock position, the next sleep is no longer than the
 scan interval or any active future due time. Earlier inserts advance the wake;
 entries inserted during scanning remain visible before the next sleep.

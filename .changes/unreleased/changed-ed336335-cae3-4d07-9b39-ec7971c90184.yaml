@@ -1,0 +1,5 @@
+kind: changed
+body: Workflow tasks, sticky ones included, are now pushed to their task queue's home when scheduled, with discovery as the backup; a lost sticky task is sent again instead of waiting for its schedule-to-start timeout, and a remote start reads its run once or twice instead of three to five times. Upgrade with every node stopped.
+time: 2026-11-11T00:00:00Z
+custom:
+    Slice: ed336335-cae3-4d07-9b39-ec7971c90184

@@ -419,11 +419,10 @@ The four-crate nextest run (`-p tokeira-runtime -p tokeira-storage -p tokeira-ed
 --offline --no-fail-fast`) passes on macOS: 2,472 tests passed and one was skipped. All nineteen generated
 routing/scheduling properties passed at 100 cases each, including the paused lane, ramping window and full broker.
 The two main-first regressions also pass. In-process edge checks need no listener. Real multi-runtime gRPC and live
-DSQL verification remain separate.
+DSQL verification are recorded in Parts 7 and 8.
 
 Warning-denied workspace/all-targets clippy and the five-crate `dsql-integration` clippy command pass with
-`--locked --offline`. Nightly formatting and `git diff --check` pass. There is no changelog fragment or dependency
-change.
+`--locked --offline`. Nightly formatting and `git diff --check` pass. There is no dependency change.
 
 ## Part 5: sticky recovery
 
@@ -469,7 +468,7 @@ storage and migrations are unchanged.
 
 Fifteen properties configure 100 cases each (1,500 generated cases), using paused clocks and channel barriers.
 They exercise real memory-store pages, delivery components and the runtime activation hooks. Remote attempts use
-an in-process fault sink; real multi-runtime gRPC and live DSQL execution remain tasks 8 and 9.
+an in-process fault sink; real multi-runtime gRPC and live DSQL execution are recorded in Parts 7 and 8.
 
 | Property | Tests and coverage |
 | --- | --- |
@@ -503,15 +502,13 @@ incarnation before its deadline, with full-history delivery. Start and timeout i
 
 ### Validation
 
-- `cargo nextest run -p tokeira-runtime -p tokeira-storage -p tokeira-edge -p tokeira-engine --locked --offline --no-fail-fast`: 2,432 passed, 55 failed, one skipped. Every remaining failure is a socket/listener operation rejected by the sandbox (`Operation not permitted`); no other failure remains. All fifteen generated recovery properties pass at 100 cases each, as does the updated restart test.
+- `cargo nextest run -p tokeira-runtime -p tokeira-storage -p tokeira-edge -p tokeira-engine --locked --offline --no-fail-fast`: 2,487 passed and one skipped, including the socket tests. All fifteen generated recovery properties pass at 100 cases each, as does the updated restart test.
 - `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`: passed.
 - `cargo clippy -p tokeira-storage -p tokeira-runtime -p tokeira-engine -p tokeira-edge -p tokeira-projection --features dsql-integration --all-targets --locked --offline -- -D warnings`: passed; this is compile/lint coverage, not live DSQL execution.
 - `cargo +nightly fmt --all -- --check`: passed.
 - `git diff --check`: passed.
 
-Disk space was checked before every build and remained above the 12 GiB cutoff. Logs and the main-source test
-archive remain under the existing target directory. No dependency, lockfile, storage, migration or changelog
-change is included. Changes are left uncommitted.
+No dependency, lockfile, storage or migration change is included.
 
 
 ## Part 6: start reads
@@ -552,8 +549,8 @@ successor construction and update reconciliation are unchanged.
 ### Memory matrix and read accounting
 
 The baseline below is the previously executed two-runtime gRPC measurement. The new eight-case matrix runs the
-same two runtimes, repository and authenticated owner handler with an in-process `WorkflowTaskStarter`, because
-the sandbox refuses listener creation. The original gRPC matrix retains the same assertions for external execution.
+same two runtimes, repository and authenticated owner handler twice: with an in-process `WorkflowTaskStarter`, and
+over real gRPC in `queue_home_delivery_exploration_read_baseline`, with the same assertions.
 Each cell is **zero conflicts / one rejected commit**. The target has not changed.
 
 | Phase | Normal warm before → after | Normal cold before → after | Sticky warm before → after | Sticky cold before → after |
@@ -579,11 +576,11 @@ before submission and captures their results. Lane revalidation performs zero re
 on OCC retry; the mandatory fresh run reload is unchanged. No routing read moved into the lane or into an excluded
 hydration scope. The unversioned baseline has no configured deployment repository.
 
-The live DSQL variant's per-phase logical and SQL expectations use the new matrix but **were not executed**.
+The live DSQL variant's per-phase logical and SQL expectations use the new matrix.
 One inline load still means one fast hot-state SELECT; one split load still means that SELECT plus BEGIN,
 snapshot SELECT, value-parts SELECT and COMMIT. Consequently the expected SQL totals are 1/2 warm and 2/3 cold
-for inline state, or 5/10 warm and 10/15 cold for split state, for both normal and sticky starts. These are
-expectations for task 9, not new live measurements.
+for inline state, or 5/10 warm and 10/15 cold for split state, for both normal and sticky starts. The live run
+in Part 8 measured exactly these totals.
 
 ### Regression evidence
 
@@ -622,23 +619,18 @@ non-retry send selection is empty while the transport and waiter remain availabl
 
 ### Validation
 
-- `cargo nextest run -p tokeira-runtime -p tokeira-storage -p tokeira-edge -p tokeira-engine --locked --offline --no-fail-fast`: 2,440 passed, 55 failed, one skipped. All 55 failures report socket/listener operations denied by the sandbox (`Operation not permitted`); no other failure remains. The eight-case in-process matrix, all six 100-case Property 6 tests, the two-scenario gated-repository test and the extended 100-case sweep property pass.
+- `cargo nextest run -p tokeira-runtime -p tokeira-storage -p tokeira-edge -p tokeira-engine -p tokeira-proto --locked --offline --no-fail-fast`: 2,505 passed and one skipped, including the socket tests. The eight-case in-process and gRPC matrices, all six 100-case Property 6 tests, the two-scenario gated-repository test and the extended 100-case sweep property pass.
 - `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`: passed.
 - `cargo clippy -p tokeira-storage -p tokeira-runtime -p tokeira-engine -p tokeira-edge -p tokeira-projection --features dsql-integration --all-targets --locked --offline -- -D warnings`: passed; compile/lint coverage only.
 - `cargo +nightly fmt --all -- --check`: passed.
 - `git diff --check`: passed.
 - `cargo run -p proto-sync --locked --offline -- generate`: passed. `WIRE_PARITY_CAPTURE=1 cargo nextest run -p tokeira-proto --test binding_inventory --locked --offline` updated the inventory; rerunning without the capture flag passed its one test.
 
-The two task-specific socket tests to run externally are
+The task-specific socket tests are
 `grpc::workflow_dispatch::read_baseline::queue_home_delivery_exploration_read_baseline` and
 `grpc::workflow_dispatch::tests::forwarded_start_and_replies_use_owner_waiters_and_reauthenticate` in
-`tokeira-edge`. The target-directory `start-reads-corrections-socket-tests.txt` inventory lists all 55 failed tests by binary and exact name.
-`queue_home_delivery_live_read_baseline` has updated logical/SQL expectations and is deliberately not run here.
-
-Disk space was checked before each build (100–105 GiB free), above the 12 GiB stop threshold. Logs,
-main-source archive and the pre-edit spec snapshot are under the existing target directory. No dependencies,
-lockfile, durable storage format, migration or changelog changed. Git operations were read-only; changes remain
-uncommitted. Tasks 8, 9 and 10 are not marked complete.
+`tokeira-edge`. `queue_home_delivery_live_read_baseline` has updated logical/SQL expectations; its live run is
+recorded in Part 8. No dependency, lockfile, durable storage format or migration changed.
 
 
 ## Part 7: fencing, preservation and multi-runtime integration
@@ -662,8 +654,7 @@ while its queue acquisition is retired, then delivers the same current hint to t
 
 `queue_home_delivery_live_fenced_starts` runs those same two helpers with a real DSQL repository, 100 schedules
 per helper, behind `dsql-integration` and `TOKEIRA_DSQL_TEST_DATABASE_URL`. Placement is prepared before leases;
-owned runs are terminated and purged and owned leases are relinquished. This variant is compile-checked only;
-no live execution is claimed.
+owned runs are terminated and purged and owned leases are relinquished. Its live run is recorded in Part 8.
 
 Five generated preservation tests use committed memory state and injected clocks: local priority ordering,
 eager/reserved start suppression, speculative update transport and rejection, query/update owner attachments with
@@ -738,7 +729,7 @@ All requested commands complete successfully:
 
 | Command | Result |
 | --- | --- |
-| `cargo nextest run -p tokeira-runtime -p tokeira-storage -p tokeira-edge -p tokeira-engine -p tokeira-proto --locked --offline --no-fail-fast` | 2,523 passed, one existing ignored measurement; 103.114 seconds of test execution. |
+| `cargo nextest run -p tokeira-runtime -p tokeira-storage -p tokeira-edge -p tokeira-engine -p tokeira-proto --locked --offline --no-fail-fast` | 2,523 passed, one existing ignored measurement; about 100 seconds of test execution. |
 | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | Passed. |
 | `cargo clippy -p tokeira-storage -p tokeira-runtime -p tokeira-engine -p tokeira-edge -p tokeira-projection --features dsql-integration --all-targets --locked --offline -- -D warnings` | Passed, including compilation of the live fencing/movement variant. |
 | `cargo +nightly fmt --all -- --check` | Passed after `cargo +nightly fmt --all`. |
@@ -753,8 +744,66 @@ recovery tests, and `runtime_query`, `runtime_update` and `runtime_admitted_upda
 `grpc::workflow_dispatch` read/prepared/attachment tests, `grpc::workflow_offer` gate/delivery tests and workflow
 service contracts; engine `peer::tests`, `embedded_dsql_tests` and the new wire harness; and the proto suite.
 `generated_no_peer_startup` and `generated_durable_peer_exemption` each pass 100 cases. The existing ignored test is
-`outbound::bug_condition_exploration_tests::child_fan_out_starts_every_child`, an opt-in measurement.
+`outbound::bug_condition_exploration_tests::child_fan_out_starts_every_child`, an opt-in measurement. The live DSQL
+runs are recorded in Part 8.
 
-Disk space is checked before every build and remains above 12 GiB (93 GiB at the final checks). Logs are under
-the configured target directory. Live DSQL is not run, no
-changelog fragment is added, and git operations are read-only.
+
+## Part 8: live DSQL
+
+### Run and outcomes
+
+The live suites ran from a nextest archive of `c5f8df3dac8f4b325f0e58162bdbb420c16e2b60`, the Part 7 commit, on
+one ephemeral Aurora DSQL cluster created for this run. Each step was a separate nextest process under the
+`dsql-live` profile, one test at a time, with the URL gate set. All five tests passed:
+
+| Step | Test | Seconds | Executed evidence |
+| --- | --- | ---: | --- |
+| 1 | Edge `queue_home_delivery_live_read_baseline` | 1,138.6 | Sixteen real two-runtime gRPC starts, each logging its executed report. The time includes migrating the new database, whose 44 asynchronous index builds took 1,042.8 seconds. |
+| 2 | Storage `queue_home_delivery_live_sticky_pages` | 54.6 | All 100 generated bounded traversal and cursor-mutation cases on reserved homes. |
+| 2 | Storage `queue_home_delivery_live_sticky_query_plans` | 14.0 | Exact-builder plans at offsets 0, 512 and 960 over 8,192 fixture rows, 1,024 of them sticky in the selected home, with 64-key page assertions. |
+| 3 | Runtime `workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs` | 8.3 | The unchanged acquisition-hook regression: real lease acquisition, interrupted recovery and refused old-generation installs. This change starts the sticky sweep from that hook. |
+| 4 | Engine `queue_home_delivery_live_fenced_starts` | 590.0 | 100 generated fencing schedules and 100 queue-home movements through real gRPC between runtimes with peer credentials. |
+
+The durations, the sixteen executed reports and the written plans show that every live body ran; none returned
+at its gate. The read baseline ran first, on the new database, as the runbook's isolated check, and deleted each
+run and released both leases between scenarios. The sticky fixtures then wrote and removed only their own keys on
+reserved homes. The acquisition check and the fenced starts each prepared the same eight homes, which placement
+accepts only while no lease is live, and each relinquished its leases; the fenced starts terminated and purged
+every run they made. After the last step the cluster was deleted and its absence confirmed.
+
+The rest of the shared-cluster campaign was not rerun. This change alters no storage code, schema or migration,
+and the two storage suites above cover the only storage read the sweep uses.
+
+### Start reads
+
+All sixteen scenarios measured exactly the Part 6 expectations. Each cell gives zero conflicts / one rejected
+commit:
+
+| Start | Cache | Logical loads | Inline read SQL | Split read SQL |
+| --- | --- | ---: | ---: | ---: |
+| Normal | Warm | 1 / 2 | 1 / 2 | 5 / 10 |
+| Normal | Cold | 2 / 3 | 2 / 3 | 10 / 15 |
+| Sticky | Warm | 1 / 2 | 1 / 2 | 5 / 10 |
+| Sticky | Cold | 2 / 3 | 2 / 3 | 10 / 15 |
+
+Every load was the owner's: preparation once, the admission cache once when cold, and one lane reload per
+rejected commit. The queue home loaded nothing. Before this change the same matrix measured 3/4 to 5/6 logical
+loads ([start-read baseline](#start-read-baseline)). Reads outside the start were reported separately, as
+designed: each normal scenario recorded one `normal-discovery` hydration, and five of the eight sticky scenarios
+recorded one `sticky-recovery` hydration by the execution home's sweep, depending on when it reached the row.
+Neither fallback scope recorded a read.
+
+### Sticky plans
+
+The three plans have the shapes recorded under [sticky page contract](#sticky-page-contract). Each selects
+candidates with an Index Only Scan of `idx_workflow_dispatch_sticky_home` under the limit. The first page has
+`shard_id` alone as its index condition; both continuations add `run_key > cursor` to that index condition.
+Each candidate's payload comes from an Index Only Scan of `workflow_dispatch_pkey` on `run_key`, and the final
+sort holds only the bounded page. The planner chose a plain nested loop here, where the earlier run showed a
+batched join; either way at most 64 payloads are fetched by primary key.
+
+### Limitations
+
+Each suite ran once. The first migrating test used 1,138.6 of the profile's 1,200 seconds, almost all of it
+waiting for index builds; the runbook now records that margin. The read counts come from a two-runtime fixture
+with one injected conflict, not from competing writers under load.

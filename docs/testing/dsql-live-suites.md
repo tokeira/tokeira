@@ -11,8 +11,9 @@ output.
 Run every live suite with the repository's `dsql-live` nextest profile
 (`.config/nextest.toml`): it runs one test at a time, never retries, and allows each
 test twenty minutes. On a new cluster the first test that migrates applies the whole
-embedded corpus and waits for every asynchronous index build, which takes about ten
-minutes, longer than the default profile's three-minute ceiling.
+embedded corpus and waits for every asynchronous index build. With the current corpus
+that has taken about seventeen minutes: far beyond the default profile's three-minute
+ceiling, and close to this profile's limit.
 
 The [activity-dispatch verification matrix](activity-dispatch-verification.md)
 adds strict live selections: nine shared 100-case storage properties, three
@@ -73,15 +74,28 @@ those homes. Placement tests retain work there, which can exhaust this fixture's
 four-connection reservoir before the measured start. Database isolation preserves
 all 16 scenarios, exact read assertions and production admission behavior. The
 baseline closes and deletes each run and releases both leases between scenarios.
-Its report retains unscoped `outside-start` reads, including discovery hydration;
-assertions compare the exact logical counts of every scoped start phase and its
-physical SQL. Background reads do not enter the start metric, and unexpected
-scoped phases still fail.
+Its report also lists reads outside the start: `outside-start`, `normal-discovery`,
+`sticky-recovery` and the two publication-fallback scopes. Assertions compare the
+exact logical counts of every start phase and its physical SQL. Background reads do
+not enter the start metric, and unexpected start phases still fail.
 This isolated check may also run after the shared-database campaign; keep the
 live test processes serial.
 
 ```bash
 cargo nextest run -p tokeira-edge --features dsql-integration --locked --profile dsql-live --lib -E 'test(queue_home_delivery_live_read_baseline)'
+```
+
+The sticky-page contracts, the runtime acquisition check and the engine's fenced
+starts may follow on the baseline's database, in that order. The sticky fixtures
+use reserved homes. The other two prepare the same eight homes, and each
+relinquishes its leases before it ends. The fenced starts run 100 generated
+takeover and stale-incarnation schedules and 100 queue-home movements through real
+gRPC, terminating and purging each run; they take about ten minutes.
+
+```bash
+cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --lib -E 'test(queue_home_delivery_live_sticky_)'
+cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --lib -E 'test(workflow_dispatch_live_acquisition)'
+cargo nextest run -p tokeira-engine --features dsql-integration --locked --profile dsql-live --lib -E 'test(queue_home_delivery_live_fenced_starts)'
 ```
 
 Restore the shared-suite database selection before the remaining commands.
@@ -198,6 +212,7 @@ point them at a database holding application data.
 | Storage `queue_home_delivery_live_sticky_pages` | 1 | 100 shared generated bounded sticky traversals and cursor mutations on reserved homes, removing only the fixture's own keys; `dsql-integration`, URL gate only |
 | Storage `queue_home_delivery_live_sticky_query_plans` | 1 | Actual first and deep continuation SQL over 8,192 fixture rows: sticky partial-index bounds and bounded primary-key payload lookups; set `TOKEIRA_QUEUE_HOME_PLAN_OUTPUT` to save plans; `dsql-integration`, URL gate only |
 | Edge `queue_home_delivery_live_read_baseline` | 1 | 16 actual remote starts: normal/sticky, warm/cold, inline/split state, and one injected commit conflict or none, with logical run loads and physical read SQL attributed by node and phase; `dsql-integration`, URL gate only |
+| Engine `queue_home_delivery_live_fenced_starts` | 1 | Property 3 on DSQL: 100 generated takeover and stale-incarnation schedules, each refusing the former writer's commit and starting under the new epoch, and 100 queue-home movements with an offer held on the wire; real gRPC between runtimes with peer credentials; `dsql-integration`, URL gate only; run after the read baseline, as above |
 | Storage `workflow_dispatch_live_reset_uses_execution_home` | 1 | Eight-shard reset placement of hot state, timers and dispatch before any follow-up commit, with execution home distinct from the successor run-hash shard; `dsql-integration`, URL gate only |
 | Storage `workflow_dispatch_live_generated_ordered_traversal` | 1 | Property 3: 100 generated ordered traversals, ties, multiple execution homes, read-only pages and mutations behind a cursor; `dsql-integration`, URL gate only |
 | Storage `workflow_dispatch_live_generated_sticky_recovery` | 1 | Property 7: 100 generated durable deadline, affinity-reset, paused, speculative, closed and legacy cases, with normal rediscovery after timeout; `dsql-integration`, URL gate only |

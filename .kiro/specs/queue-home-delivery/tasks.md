@@ -44,7 +44,7 @@ bar belongs to the code PRs.
     - **Property 8: Complete bounded sticky traversal** (storage portion; runtime portion in 6.2)
     - **Validates: Requirements 2.8, 2.9, 2.15, 3.2, 3.5.**
 
-- [ ] 3. Internal offer RPC, protected credential files and dedicated peer policy
+- [x] 3. Internal offer RPC, protected credential files and dedicated peer policy
   - [x] 3.1 Extend the Tokeira internal proto/service with `OfferWorkflowTask` and its typed outcomes. Implement the
     field-policy table, unknown-enum/shape validation, request/response bounds and handler concurrency cap. Preserve
     the existing start method and its larger response limit; do not modify upstream Temporal protos.
@@ -220,32 +220,45 @@ bar belongs to the code PRs.
       injected clocks/barriers and retained generated fixture counterexamples documented in the evidence.
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14, 2.15, 2.16, 2.17, 2.18, 2.19, 2.20_
 
-- [ ] 9. Live DSQL contracts and plans
-  - [ ] 9.1 Under [the live-suite runbook](../../../docs/testing/dsql-live-suites.md), create and clean up an ephemeral
+- [x] 9. Live DSQL contracts and plans
+  - [x] 9.1 Under [the live-suite runbook](../../../docs/testing/dsql-live-suites.md), create and clean up an ephemeral
     Aurora DSQL cluster. Verify schema/index readiness and run generated sticky page contracts, including large
     unrelated homes and long continuations. `EXPLAIN` the exact first/continuation repository SQL; confirm a bounded
     sticky-home index seek and bounded payload fetch. Do not infer a good plan from an equivalent handwritten query.
+    - **DONE:** On one ephemeral cluster, after migration and index readiness, all 100 generated sticky-page cases
+      passed. The exact first and continuation plans seek the sticky-home index with the cursor in the index
+      condition and fetch at most 64 payloads by primary key. The cluster was deleted and its absence confirmed.
     - **Property 8: Complete bounded sticky traversal** (DSQL execution)
     - **Validates: Requirements 2.8, 2.9, 2.15, 3.2, 3.5.**
-  - [ ] 9.2 Run competing-start, stale-incarnation and takeover schedules against real DSQL with the existing fence.
+  - [x] 9.2 Run competing-start, stale-incarnation and takeover schedules against real DSQL with the existing fence.
     Run a split-home runtime case using the real repository and internal RPC, plus affected live regression suites.
     Account for schema bootstrap and fixture isolation; inspect gates to prove each intended live body ran.
+    - **DONE:** 100 generated fencing schedules and 100 queue-home movements passed through real gRPC on DSQL. The
+      sixteen split-home remote starts measured the expected reads exactly, and the acquisition-hook regression
+      passed. Durations, executed reports and written plans show that every live body ran.
     - **Property 3: Only a current writer and incarnation start** (DSQL execution)
     - _Requirements: 2.1, 2.3, 2.4, 2.8, 2.9, 3.2_
-  - [ ] 9.3 Add executable suite entries, isolation/ordering rules and evidence of what ran and its outcome. Preserve
+  - [x] 9.3 Add executable suite entries, isolation/ordering rules and evidence of what ran and its outcome. Preserve
     the placement-before-live-leases order. Clean owned fixtures so unrelated suites do not multiply recovery work;
     do not raise time limits to hide shared-cluster contamination. No PostgreSQL substitute or URL-gated early-return
     pass counts as live DSQL evidence.
+    - **DONE:** The runbook adds the fenced-starts entry, its order and command after the read baseline, and the
+      current migration time. Fixtures remove their own runs, keys and leases; no time limit was raised. What ran
+      and its outcome are in implementation-evidence.md, Part 8.
     - _Requirements: 2.15, 3.2_
 
 - [ ] 10. Align documentation and finish the code PRs
-  - [ ] 10.1 Align workflow-dispatch's sticky recovery, offer lifecycle and start-read descriptions, configuration
+  - [x] 10.1 Align workflow-dispatch's sticky recovery, offer lifecycle and start-read descriptions, configuration
     and credential-file docs and the suite runbook with the implemented contract. Record measured
     baseline/result counts, query plans, limitations and outcomes without cluster identifiers, live-run dates/times
     or Region. Preserve the one-line stopped-node upgrade instruction and the explicit activity/speculative/security
     deferrals. Add the controller-managed upgrade's generate/install/configure step to rollout documentation and
     an implementation `changed` fragment; every node must be stopped during installation before any restarts.
     State that no-peer single-node/embedded upgrades need no credential file.
+    - **DONE:** The workflow-dispatch design, the peer wire contract and the runbook describe push, the execution
+      home's sticky sweep and one-read owner starts. Counts, plans, limitations and outcomes are recorded without
+      cluster identifiers, dates, times or Region. The `changed` fragment keeps the stopped-node upgrade line; the
+      credential step and no-peer exemption already stand in the operations guide and the 0.7.0 notes.
     - _Requirements: 2.8, 2.10, 2.11, 2.13, 2.15, 2.16, 2.17, 2.18, 2.19, 2.20, 3.3_
   - [ ] 10.2 Run the full root AGENTS.md §10.4 bar for each code PR, plus its applicable focused/live checks and
     offline links/fragment validation. Report every omission and why; tick only work actually completed. Rebase at

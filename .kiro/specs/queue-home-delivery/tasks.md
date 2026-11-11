@@ -182,27 +182,42 @@ bar belongs to the code PRs.
     - **Property 6: Fewer reads without weakened start checks**
     - **Validates: Requirements 2.11, 2.12, 3.1, 3.3.**
 
-- [ ] 8. Fencing, preservation and real multi-runtime integration
-  - [ ] 8.1 Generate duplicate and obsolete incarnations, execution-owner loss before/during a start and queue-home
+- [x] 8. Fencing, preservation and real multi-runtime integration
+  - **DONE:** Fencing, preservation, authenticated multi-runtime scenarios and the executable property inventory
+    are recorded in [Part 7](implementation-evidence.md#part-7-fencing-preservation-and-multi-runtime-integration).
+  - [x] 8.1 Generate duplicate and obsolete incarnations, execution-owner loss before/during a start and queue-home
     movement mid-push. Include a delayed former publisher's still-current hint accepted by the current writer.
     Drive real memory-store transitions and retain the live DSQL variants for task 9.
+    - **DONE:** Two generated properties run 100 cases each against real memory transitions and authenticated
+      internal gRPC. Commit and transport barriers cover ownership loss, duplicate/obsolete incarnations,
+      delayed current hints and queue movement. The same helpers have a compiled, unrun live DSQL variant.
     - **Property 3: Only a current writer and incarnation start**
     - **Validates: Requirements 2.3, 2.4, 3.2.**
-  - [ ] 8.2 Write preservation properties for local delivery, priority, eager/reserved tasks, speculative tasks,
+  - [x] 8.2 Write preservation properties for local delivery, priority, eager/reserved tasks, speculative tasks,
     query/update attachments and completion/failure routing, timeout reconstruction and repair. Re-run the existing
     affected contract suites, including no-peer startup without credentials; do not change the deferred paths to
     simplify a test.
+    - **DONE:** Five generated preservation properties run 100 cases each. The affected storage, runtime,
+      edge, engine and proto suites pass, including the 100-case no-peer startup and durable exemption tests.
+      Auth/config peer contracts also pass; deferred delivery behavior is unchanged.
     - **Property 9: Preservation outside the defect**
     - **Validates: Requirements 2.19, 3.1, 3.2, 3.3, 3.4.**
-  - [ ] 8.3 Exercise actual internal gRPC with at least two runtimes for normal push and remote start, then three with
+  - [x] 8.3 Exercise actual internal gRPC with at least two runtimes for normal push and remote start, then three with
     distinct execution/sticky/normal homes for all sticky fallbacks. Prove push with discovery paused; separately
     drop sticky push, normal fallback and acknowledgement. Use the credential file and path configuration emitted by
     the daemon generator, and keep it running past initial token expiry.
     Check peer-policy failures, saturation, takeover, prompt retirement, reply statuses and warm/cold read counters,
     without bypassing the wire authorization path or depending on an external identity provider.
+    - **DONE:** Real two/three-runtime scenarios cover both sticky causes, independent message/acknowledgement
+      loss, the correct recovery reader, wire policy and reply statuses, handler/broker saturation, takeover,
+      immediate retirement and warm/cold reads. Generated-file credentials renew across injected expiry on
+      running nodes. Socket scenarios execute locally and finish in seconds.
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14, 2.16, 2.17, 2.18, 3.5_
-  - [ ] 8.4 Checkpoint: exploration tests now pass, negative controls fail for the intended reason, and all ten
+  - [x] 8.4 Checkpoint: exploration tests now pass, negative controls fail for the intended reason, and all ten
     properties have executable coverage with deterministic synchronization and useful shrunk counterexamples.
+    - **DONE:** Connected exploration passes; disconnected controls accept only their intended failure and
+      retained one-publication counterexample. All ten properties have executed coverage, with case counts,
+      injected clocks/barriers and retained generated fixture counterexamples documented in the evidence.
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14, 2.15, 2.16, 2.17, 2.18, 2.19, 2.20_
 
 - [ ] 9. Live DSQL contracts and plans

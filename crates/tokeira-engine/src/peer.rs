@@ -1,14 +1,16 @@
 //! Peer credential generation and controller-managed daemon bootstrap.
 //! Embedded construction never enters bootstrap, even with a public listener.
 
-use std::{io::Write, os::unix::fs::PermissionsExt, path::Path, sync::Arc};
+use std::{io::Write, os::unix::fs::PermissionsExt, path::Path};
 
 use anyhow::{Context, Result};
 use tokeira_auth::peer::{PeerError, PeerMaterial, PeerVerifier};
 use tokeira_config::peer::{PeerConfig, create_protected_file, load_peer_file};
 use tokeira_edge::grpc::workflow_offer::PeerOfferEndpoint;
 
-pub(crate) fn bootstrap(config: Option<&PeerConfig>) -> Result<Arc<PeerOfferEndpoint>> {
+/// The endpoint is returned unshared, so service wiring can set the runtime's
+/// clock before any sender or verifier holds it.
+pub(crate) fn bootstrap(config: Option<&PeerConfig>) -> Result<PeerOfferEndpoint> {
     let config = config.ok_or(PeerError::MissingMaterial)?;
     let bytes = load_peer_file(Path::new(&config.path)).map_err(|error| match error {
         // Only a definite not-found result establishes absence. Invalid paths,
@@ -26,7 +28,7 @@ pub(crate) fn bootstrap(config: Option<&PeerConfig>) -> Result<Arc<PeerOfferEndp
     signer
         .token_at(0)
         .map_err(|_| PeerError::InconsistentMaterial)?;
-    Ok(Arc::new(PeerOfferEndpoint::new(verifier, signer)))
+    Ok(PeerOfferEndpoint::new(verifier, signer))
 }
 
 /// Only the explicit CLI command creates material. Returning path-only TOML
@@ -64,6 +66,7 @@ mod tests {
     use super::*;
     use clap::Parser;
     use proptest::prelude::*;
+    use std::sync::Arc;
     use tokeira_auth::peer::REPAIR;
     use tokeira_proto::internal::runtime::{
         OfferWorkflowTaskRequest, workflow_task_dispatch_client::WorkflowTaskDispatchClient,
@@ -306,3 +309,6 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::Unimplemented);
     }
 }
+
+#[cfg(test)]
+mod delivery_tests;

@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
 };
 use time::OffsetDateTime;
 use tokeira_kernel::{VersioningBehavior, WorkerDeploymentVersionRef};
@@ -353,10 +352,10 @@ impl PeerWorkflowOfferSink {
             .channels
             .get(&authority)
             .map_err(|_| WorkflowOfferError::Transport)?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| WorkflowOfferError::Authentication)?
-            .as_secs();
+        let now = self
+            .peer
+            .unix_seconds()
+            .map_err(|_| WorkflowOfferError::Authentication)?;
         let token = self
             .peer
             .signer()

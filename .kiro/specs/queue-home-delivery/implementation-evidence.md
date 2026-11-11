@@ -639,3 +639,122 @@ Disk space was checked before each build (100–105 GiB free), above the 12 GiB 
 main-source archive and the pre-edit spec snapshot are under the existing target directory. No dependencies,
 lockfile, durable storage format, migration or changelog changed. Git operations were read-only; changes remain
 uncommitted. Tasks 8, 9 and 10 are not marked complete.
+
+
+## Part 7: fencing, preservation and multi-runtime integration
+
+`PeerOfferEndpoint` owns a system-clock default and a clock builder; its Unix-seconds method supplies verification
+and all three peer signing purposes. Engine startup installs the runtime clock before sharing the endpoint, so
+runtime deadlines and peer credentials use the same time without changing the 300-second lifetime, renewal below
+60 seconds, 30-second leeway or verification policy.
+
+### Fencing and preservation
+
+The engine's `peer::delivery_tests` harness follows the authenticated runtime/placement setup in
+`workflow_dispatch_read_baseline`. Real memory repositories retain their transition and lease checks; a forwarding
+repository adds independent recovery-reader gates, counted loads and a one-shot commit barrier. The generated
+fencing case takes execution ownership before a start or while its commit is held, checks that the former writer
+cannot commit, replays its still-current hint through the peer gate and starts under the new epoch. It checks
+repeated starts, forged future sequences and an obsolete sequence after a real worker failure creates a successor.
+The successor is completed before counting durable history: transient retry starts materialize at completion
+(`service/history/workflow/workflow_task_state_machine.go @ v1.31.0`). The movement case holds an offer on the wire
+while its queue acquisition is retired, then delivers the same current hint to the replacement home.
+
+`queue_home_delivery_live_fenced_starts` runs those same two helpers with a real DSQL repository, 100 schedules
+per helper, behind `dsql-integration` and `TOKEIRA_DSQL_TEST_DATABASE_URL`. Placement is prepared before leases;
+owned runs are terminated and purged and owned leases are relinquished. This variant is compile-checked only;
+no live execution is claimed.
+
+Five generated preservation tests use committed memory state and injected clocks: local priority ordering,
+eager/reserved start suppression, speculative update transport and rejection, query/update owner attachments with
+completion/failure forwarding, and acquisition reconstruction of sticky timeout/dispatch state. The deferred
+production delivery paths are unchanged; activity and outbound senders only use the endpoint's time source.
+
+### Wire scenarios
+
+Each node loads the protected file produced by the daemon's `generate` function using the path configuration it
+prints. The runtimes, interceptors and peer endpoints share a controllable clock. Advancing it by 331 seconds
+makes the original token fail at the actual wire gate while renewed tokens continue delivering between the same
+running nodes; the credential file remains unchanged. Public polling and remote starts use a worker authenticator
+and real gRPC, without an external identity provider. Offer fault injection drops requests or replies outside the
+unchanged authorization gate; all delivered requests traverse that gate.
+
+The focused wire set, including the generated fencing and attachment cases and the token boundary test, passes
+in 4.193 seconds. Per-test wall times from that run are:
+
+| Test | Seconds | Evidence |
+| --- | ---: | --- |
+| `grpc_normal_push_remote_start_and_renewal` | 0.231 | Two runtimes, both recovery readers blocked, remote start with zero queue loads and one warm owner load, expiry and renewal. |
+| `grpc_three_homes_no_recent_poller` | 0.286 | Separate execution, sticky and normal homes; immediate normal fallback retains affinity and deadline. |
+| `grpc_three_homes_deployment_changed` | 0.294 | Recent sticky poll; a barrier changes deployment between send and receive; a versioned public poll remotely starts the current version. |
+| `grpc_dropped_sticky_push_recovered_by_sweep` | 0.325 | Sticky attempts are lost; only the execution-home reader is released; sticky delivery recovers. |
+| `grpc_dropped_fallback_push_recovered_by_sweep` | 0.391 | Normal fallback attempts are lost; the sticky reader re-evaluates and republishes the original durable intent. |
+| `grpc_dropped_acknowledgement_recovered_by_sweep` | 0.442 | Admitted normal fallback loses its replies and volatile offer; the sticky reader recovers it. |
+| `grpc_dropped_normal_push_recovered_by_discovery` | 0.263 | Only normal discovery is released after all normal attempts are lost. |
+| `grpc_peer_policy_capacity_statuses_and_retirement` | 0.432 | Unauthenticated, wrong-purpose, invalid shape and size refusals; admitted/known/full/expired/not-home replies; 64 held authenticated handlers plus immediate retirement and replacement admission. |
+| `property_3_fenced_starts_and_delayed_hints` | 4.119 | 100 generated fenced takeover/incarnation schedules through gRPC, including cold and warm owner load counters. |
+| `property_3_queue_movement_mid_push` | 2.960 | 100 generated queue-movement schedules through gRPC. |
+| `property_9_query_update_and_reply_routing` | 2.024 | 100 generated attachment and reply-routing cases through the existing authenticated owner service. |
+| `peer_clock_expiry_and_renewal_through_gate` | 0.060 | Seven validity/renewal boundary requests plus a negative-epoch refusal. |
+
+The normal/sticky, warm/cold, zero/one-conflict socket read matrix additionally checks zero queue-home loads,
+one warm or two cold owner loads, and one fresh owner load per conflict. Reader barriers isolate prompt-push
+claims; they are released explicitly for recovery claims. No test sleeps or waits for real token expiry.
+
+### Property coverage and checkpoint
+
+Every generated test below configures 100 cases. Names grouped by prefix refer only to queue-home-delivery tests
+in the indicated modules; other features' similarly numbered tests are not included. Additional example and matrix
+coverage is stated separately.
+
+| Property | Executable coverage | Generated cases |
+| --- | --- | ---: |
+| 1 | `property_1_lost_sticky_row_recovered_before_deadline`, `property_1_recovery_finite_fault_prefix_fair_suffix`, `queue_home_delivery_exploration_normal_split_home`; normal push and discovery wire scenarios above | 3 × 100 |
+| 2 | Seven `property_2_*` tests in `broker::admission_tests` and `workflow_offers::tests`; wire capacity/deduplication scenario | 7 × 100 |
+| 3 | `property_3_fenced_starts_and_delayed_hints`, `property_3_queue_movement_mid_push` | 2 × 100 |
+| 4 | Eight runtime routing properties, edge `property_4_wire_routing_and_sticky_origin`, four `property_4_recovery_*` properties and `queue_home_delivery_exploration_sticky_split_home`; all five sticky wire scenarios | 14 × 100 |
+| 5 | Six `property_5_*` tests in `broker::admission_tests`; `queue_home_delivery_exploration_retirement_without_discovery` adds 100 deterministic schedules; wire retirement/replacement scenario | 6 × 100 |
+| 6 | `property_6_prepared_read_budget`, `property_6_prepared_bindings_and_envelope`, `property_6_prepared_state_and_policy_changes`, `property_6_prepared_lane_uses_captured_routing`, `property_6_prepared_lane_refuses_changed_decision`, `property_6_offer_sources_carry_execution_home`; socket and in-process matrices each add eight cases, lane routing gate adds two | 6 × 100 |
+| 7 | Eight runtime sender/admission scheduling properties, two edge sink properties, `generated_peer_policy`, `generated_material_agreement`, `generated_bounded_file_loading`, `generated_wire_shapes`, `generated_bounds_and_handler_saturation`; wire policy/capacity scenario | 15 × 100 |
+| 8 | Nine `property_8_*` recovery/repair properties and `queue_home_delivery_sticky_pages_memory` | 10 × 100 |
+| 9 | `property_9_local_delivery_priority`, `property_9_eager_and_reserved`, `property_9_speculative_updates`, `property_9_timeout_reconstruction_and_repair`, `property_9_query_update_and_reply_routing` | 5 × 100 |
+| 10 | `generated_renewal_and_rotation`, `generated_peer_file_restart_rotation`, `generated_upgrade_bootstrap`, `generated_no_peer_startup`, `generated_durable_peer_exemption`; expiry/renewal wire and gate examples | 5 × 100 |
+
+The connected normal and sticky exploration properties pass. Their explicit disconnected-sender negative controls
+fail the desired delivery assertion, and accept only the expected reason and the shrunk one-publication trace
+with ChaCha seed `[17; 32]`; these are expected-failure controls, not 100 passing cases. Retirement exploration
+passes with discovery stopped. Reader gates, commit/transport barriers and receipts synchronize the new races.
+
+Adjacent tracked `.proptest-regressions` files retain the generated fixture counterexamples. The corrected fixture
+assumptions concern request-ID deduplication, a cache warmed by preceding refusals, transient retry history and
+consistent clock stamping. They do not identify production defects. The only production change in this part is
+the shared peer clock; there is no new main-first defect claim. The earlier executed main-first regressions
+for lost sticky recovery and start-read budgets remain listed with their counterexamples above.
+
+
+### Validation
+
+All requested commands complete successfully:
+
+| Command | Result |
+| --- | --- |
+| `cargo nextest run -p tokeira-runtime -p tokeira-storage -p tokeira-edge -p tokeira-engine -p tokeira-proto --locked --offline --no-fail-fast` | 2,523 passed, one existing ignored measurement; 103.114 seconds of test execution. |
+| `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | Passed. |
+| `cargo clippy -p tokeira-storage -p tokeira-runtime -p tokeira-engine -p tokeira-edge -p tokeira-projection --features dsql-integration --all-targets --locked --offline -- -D warnings` | Passed, including compilation of the live fencing/movement variant. |
+| `cargo +nightly fmt --all -- --check` | Passed after `cargo +nightly fmt --all`. |
+| `git diff --check` | Passed. |
+| `cargo nextest run -p tokeira-auth -p tokeira-config --locked --offline --no-fail-fast -E 'test(peer)'` | Eight passed; 2.497 seconds. |
+| `cargo nextest run -p tokeira-engine -p tokeira-edge --lib --locked --offline --no-fail-fast -E 'test(peer::delivery_tests) \| test(property_9_) \| test(peer_clock_expiry)'` | Twelve passed; 4.193 seconds. |
+
+The affected contract suites executed in the full run include storage `memory::workflow_dispatch_tests` and
+`workflow_dispatch::tests`; runtime `broker::admission_tests`, `workflow_offers::tests`, `workflow_delivery` routing,
+sender and sweep tests, `runtime::repair_tests`, completion eager/inline/heartbeat tests, prepared-start and sticky
+recovery tests, and `runtime_query`, `runtime_update` and `runtime_admitted_updates_after_restart`; edge
+`grpc::workflow_dispatch` read/prepared/attachment tests, `grpc::workflow_offer` gate/delivery tests and workflow
+service contracts; engine `peer::tests`, `embedded_dsql_tests` and the new wire harness; and the proto suite.
+`generated_no_peer_startup` and `generated_durable_peer_exemption` each pass 100 cases. The existing ignored test is
+`outbound::bug_condition_exploration_tests::child_fan_out_starts_every_child`, an opt-in measurement.
+
+Disk space is checked before every build and remains above 12 GiB (93 GiB at the final checks). Logs are under
+the configured target directory. Live DSQL is not run, no
+changelog fragment is added, and git operations are read-only.

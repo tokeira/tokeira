@@ -757,29 +757,62 @@ mod tests {
         assert_eq!(decoded.queries, decorations.queries);
     }
 
+    #[derive(Debug)]
+    struct AttachmentClock(time::OffsetDateTime);
+    impl tokeira_clock::Clock for AttachmentClock {
+        fn now(&self) -> time::OffsetDateTime {
+            self.0
+        }
+    }
+
     #[tokio::test]
     async fn forwarded_start_and_replies_use_owner_waiters_and_reauthenticate() {
-        let store = Arc::new(InMemoryStore::default());
-        let runtime = Arc::new(TokeiraRuntime::new(
+        forwarded_start_and_replies_case(2 * 1024 * 1024 - 1024, b"query-input".to_vec()).await;
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(100))]
+        // Feature: queue-home-delivery, Property 9: binary query/update attachments retain owner waiters and completion/failure forwarding semantics.
+        #[test]
+        fn property_9_query_update_and_reply_routing(update_bytes in 0usize..4096, query_bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256)) {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+                .block_on(forwarded_start_and_replies_case(update_bytes, query_bytes));
+        }
+    }
+
+    async fn forwarded_start_and_replies_case(update_bytes: usize, query_bytes: Vec<u8>) {
+        let clock: Arc<dyn tokeira_clock::Clock> = Arc::new(AttachmentClock(
+            time::OffsetDateTime::from_unix_timestamp(2_000_000_000).unwrap(),
+        ));
+        let store = Arc::new(InMemoryStore::default().with_clock(clock.clone()));
+        let runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
             store.clone(),
             1,
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Arc::new(tokeira_runtime::NoopNexusHttpClient),
+            Default::default(),
+            1,
+            "attachment-owner".into(),
+            "127.0.0.1:0".into(),
+            true,
+            None,
+            clock.clone(),
         ));
         let context = EdgeContext {
             request_id: crate::request_id::RequestId::new("forwarded-start"),
             claims: None,
             auth_principal: None,
             namespace: None,
-            received_at: time::OffsetDateTime::now_utc(),
+            received_at: clock.now(),
             is_long_poll: false,
         };
-        let request = crate::translate::to_internal::start_request(
-            start_dto(),
-            &context,
-            time::OffsetDateTime::now_utc(),
-        );
+        let request =
+            crate::translate::to_internal::start_request(start_dto(), &context, clock.now());
         let key = request.run_key;
         let queue = QueueKey {
             namespace_id: request.namespace_id,
@@ -799,12 +832,8 @@ mod tests {
                 execution.clone(),
                 "owner-update".into(),
                 "update-handler".into(),
-                tokeira_types::Payloads(vec![tokeira_types::Payload::new(vec![
-                    255;
-                    2 * 1024 * 1024
-                        - 1024
-                ])]),
-                tokeira_types::RequestContext::unattributed(time::OffsetDateTime::now_utc()),
+                tokeira_types::Payloads(vec![tokeira_types::Payload::new(vec![255; update_bytes])]),
+                tokeira_types::RequestContext::unattributed(clock.now()),
                 time::Duration::seconds(30),
                 tokeira_runtime::UpdateWaitPolicy::Admitted,
                 64,
@@ -823,18 +852,17 @@ mod tests {
             result = &mut update_reply => panic!("update completed before the worker replied: {result:?}"),
             () = std::future::ready(()) => {},
         }
-        let query_reply = buffer_query(&runtime, key, 0, b"query-input".to_vec());
+        let query_reply = buffer_query(&runtime, key, 0, query_bytes.clone());
         let namespaces = Arc::new(InMemoryNamespaceCache::new());
         namespaces
             .insert(ResolvedNamespace::active("default"))
             .await
             .unwrap();
         let auth = Arc::new(WorkerAuth(AtomicUsize::new(0)));
-        let interceptors = Arc::new(EdgeInterceptors::configured(
-            namespaces.clone(),
-            auth.clone(),
-            false,
-        ));
+        let interceptors = Arc::new(
+            EdgeInterceptors::configured(namespaces.clone(), auth.clone(), false)
+                .with_clock(clock.clone()),
+        );
         let pending = crate::PendingQueryStore::default();
         let workflow_service = WorkflowService::new_with_buffered_queries_and_history_wait_registry(
             Arc::new(crate::grpc::runtime_adapter::RuntimeAdapter::new(
@@ -1006,7 +1034,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             update_wire.input.unwrap().args.unwrap().payloads[0].data,
-            vec![255; 2 * 1024 * 1024 - 1024]
+            vec![255; update_bytes]
         );
         assert!(runtime.pending_update_transports(key, false).is_empty());
         assert!(
@@ -1016,7 +1044,7 @@ mod tests {
         );
         assert_eq!(decorations.queries.len(), 1);
         let (query_id, query) = decorations.queries.into_iter().next().unwrap();
-        assert_eq!(query.query_args.0[0].data, b"query-input");
+        assert_eq!(query.query_args.0[0].data, query_bytes);
         assert!(
             runtime.buffered_queries().has_buffered(key),
             "delivery must retain the query until answered"
@@ -1034,7 +1062,7 @@ mod tests {
         assert!(stale.is::<WorkflowOfferRejected>());
         assert_eq!(store.snapshot().await.unwrap(), committed);
         assert_eq!(auth.0.load(Ordering::SeqCst), 5);
-        let queue_runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_shards(
+        let queue_runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
             store.clone(),
             1,
             LaneConfig::default(),
@@ -1047,7 +1075,10 @@ mod tests {
             Default::default(),
             1,
             "queue-owner".into(),
+            "127.0.0.1:0".into(),
             false,
+            None,
+            clock.clone(),
         ));
         let queue_service = WorkflowService::new_with_buffered_queries_and_history_wait_registry(
             Arc::new(crate::grpc::runtime_adapter::RuntimeAdapter::new(
@@ -1127,11 +1158,8 @@ mod tests {
         );
         let mut future_dto = start_dto();
         future_dto.workflow_id = "future-query-barrier".into();
-        let future_request = crate::translate::to_internal::start_request(
-            future_dto,
-            &context,
-            time::OffsetDateTime::now_utc(),
-        );
+        let future_request =
+            crate::translate::to_internal::start_request(future_dto, &context, clock.now());
         let future_key = future_request.run_key;
         runtime.start_workflow(future_request).await.unwrap();
         let _future_reply = buffer_query(&runtime, future_key, i64::MAX, Vec::new());
@@ -1179,11 +1207,8 @@ mod tests {
         )));
         let mut large_dto = start_dto();
         large_dto.workflow_id = "oversized-attachments".into();
-        let large_request = crate::translate::to_internal::start_request(
-            large_dto,
-            &context,
-            time::OffsetDateTime::now_utc(),
-        );
+        let large_request =
+            crate::translate::to_internal::start_request(large_dto, &context, clock.now());
         let large_key = large_request.run_key;
         runtime.start_workflow(large_request).await.unwrap();
         let _large_reply = buffer_query(&runtime, large_key, 0, vec![255; 1_100_000]);
@@ -1344,7 +1369,7 @@ mod tests {
                     query_args: tokeira_types::Payloads(vec![tokeira_types::Payload::new(data)]),
                     required_barrier: barrier,
                     enqueued_at: std::time::Instant::now(),
-                    deadline: time::OffsetDateTime::now_utc() + time::Duration::minutes(1),
+                    deadline: runtime.clock().now() + time::Duration::minutes(1),
                     response_tx,
                 },
             )
@@ -1383,7 +1408,7 @@ mod tests {
             cron_schedule: None,
             run_key: None,
             run_id: None,
-            now: Some(time::OffsetDateTime::now_utc()),
+            now: None,
         }
     }
 }

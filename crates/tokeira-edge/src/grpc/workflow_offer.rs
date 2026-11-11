@@ -12,7 +12,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use http::{HeaderMap, Request, Response};
@@ -46,6 +46,7 @@ pub const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Validated bootstrap capability. Construction is restricted to peer startup.
 pub struct PeerOfferEndpoint {
     verifier: PeerVerifier,
+    clock: Arc<dyn tokeira_clock::Clock>,
     // Only a validated endpoint can supply the sender's purpose-specific signer.
     signer: PeerSigner,
     handlers: Arc<Semaphore>,
@@ -64,11 +65,25 @@ impl PeerOfferEndpoint {
     pub fn new(verifier: PeerVerifier, signer: PeerSigner) -> Self {
         Self {
             verifier,
+            clock: tokeira_clock::system_clock(),
             signer,
             handlers: Arc::new(Semaphore::new(MAX_OFFER_HANDLERS)),
             outbound_handlers: Arc::new(Semaphore::new(32)),
             activity_start_handlers: Arc::new(Semaphore::new(32)),
         }
+    }
+
+    /// Share the runtime's wall clock so dispatch deadlines and token validity
+    /// advance together, including when the node runs on simulated time.
+    pub fn with_clock(mut self, clock: Arc<dyn tokeira_clock::Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Unix seconds for every peer signing and verification purpose.
+    /// A clock before the Unix epoch fails closed instead of wrapping.
+    pub fn unix_seconds(&self) -> Result<u64, std::num::TryFromIntError> {
+        self.clock.now().unix_timestamp().try_into()
     }
 
     /// Validated local signer; each internal purpose uses its distinct audience.
@@ -222,12 +237,9 @@ where
             } else {
                 OFFER_TIMEOUT
             };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|v| v.as_secs());
-        let entered = match (&self.peer, now) {
-            (None, _) => Err(Status::unimplemented("unknown method")),
-            (Some(peer), Ok(now)) => {
+        let entered = match self.peer.as_ref().map(|peer| (peer, peer.unix_seconds())) {
+            None => Err(Status::unimplemented("unknown method")),
+            Some((peer, Ok(now))) => {
                 if activity_start {
                     peer.enter_activity_start(request.headers(), now)
                 } else if outbound {
@@ -462,6 +474,11 @@ pub fn validate_response(value: &OfferWorkflowTaskResponse) -> Result<(), Status
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        sync::atomic::{AtomicI64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use bytes::Bytes;
     use http_body_util::{BodyExt, Full};
     use proptest::prelude::*;
@@ -472,6 +489,64 @@ mod tests {
     };
 
     struct WireFixture;
+
+    #[derive(Debug)]
+    struct TokenClock(AtomicI64);
+
+    impl tokeira_clock::Clock for TokenClock {
+        fn now(&self) -> time::OffsetDateTime {
+            time::OffsetDateTime::from_unix_timestamp(self.0.load(Ordering::SeqCst)).unwrap()
+        }
+    }
+
+    // Feature: queue-home-delivery, Property 10: renewal and verification share the node clock.
+    #[tokio::test]
+    async fn peer_clock_expiry_and_renewal_through_gate() {
+        let clock = Arc::new(TokenClock(AtomicI64::new(10_000)));
+        let peer = Arc::new(endpoint().with_clock(clock.clone()));
+        let first = peer
+            .signer()
+            .token_at(peer.unix_seconds().unwrap())
+            .unwrap();
+        let server = WorkflowTaskDispatchServer::new(WireFixture);
+        let mut gate = OfferGate::new(server, Some(peer.clone()));
+        for (now, renew, expected) in [
+            (10_000, false, "14"),
+            (10_240, true, "14"),
+            (10_241, true, "14"),
+            (10_329, false, "14"),
+            (10_330, false, "16"),
+            (10_331, false, "16"),
+            (10_331, true, "14"),
+        ] {
+            clock.0.store(now, Ordering::SeqCst);
+            let token = if renew {
+                peer.signer()
+                    .token_at(peer.unix_seconds().unwrap())
+                    .unwrap()
+            } else {
+                first.clone()
+            };
+            if renew {
+                assert_eq!(
+                    token.authorization() == first.authorization(),
+                    now == 10_240
+                );
+            }
+            let request = Request::builder()
+                .uri(OFFER_PATH)
+                .header("content-type", "application/grpc")
+                .header("authorization", token.authorization())
+                .body(framed(request().encode_to_vec()))
+                .unwrap();
+            let response = gate.call(request).await.unwrap();
+            // Unavailable is the fixture handler's reply, proving the real
+            // gate verified the signature and policy before reaching it.
+            assert_eq!(response.headers()["grpc-status"], expected);
+        }
+        clock.0.store(-1, Ordering::SeqCst);
+        assert!(peer.unix_seconds().is_err());
+    }
 
     #[tonic::async_trait]
     impl WorkflowTaskDispatch for WireFixture {

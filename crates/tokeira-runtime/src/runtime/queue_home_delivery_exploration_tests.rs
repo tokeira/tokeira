@@ -1,9 +1,6 @@
-//! Generated counterexamples for delivery before the push implementation lands.
-//!
-//! Each property asserts the desired contract. The outer harness accepts only
-//! its named invariant failure, retaining a deterministic seed and the shrunk
-//! schedule. A panic, rejection, or unexpected pass is a test failure. Remove
-//! the expected-failure wrapper as each corresponding fix lands.
+//! Publication exploration and explicit disconnected-sender negative controls.
+//! The same stored intent reaches split homes only when the sender is wired;
+//! no discovery loop participates, and receipts synchronize every attempt.
 
 use super::*;
 use crate::{
@@ -17,6 +14,17 @@ use proptest::{
 };
 use tokeira_storage::{InMemoryStore, WriteFence};
 use tokeira_types::{StickyAffinity, bundle_for_partition, workflow_queue_partition};
+
+#[derive(Debug)]
+struct ExplorationClock;
+impl Clock for ExplorationClock {
+    fn now(&self) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(2_000_000_000).unwrap()
+    }
+}
+fn exploration_clock() -> Arc<dyn Clock> {
+    Arc::new(ExplorationClock)
+}
 
 const SEED: [u8; 32] = [17; 32];
 
@@ -70,7 +78,10 @@ fn broker(home: ShardId) -> (InMemoryBroker, Arc<PlacementQueueHomes>) {
         owner: Arc::new(RwLock::new(owner)),
         counts: RwLock::new((8, 8)),
     });
-    (InMemoryBroker::with_discovery(homes.clone()), homes)
+    (
+        InMemoryBroker::with_discovery(homes.clone()).with_clock(exploration_clock()),
+        homes,
+    )
 }
 
 fn publisher(
@@ -95,7 +106,7 @@ fn publisher(
     )
 }
 
-async fn publication(copies: u32, sticky: bool, colocated: bool) -> bool {
+async fn publication(copies: u32, sticky: bool, colocated: bool, connected: bool) -> bool {
     let repo = Arc::new(InMemoryStore::with_shard_count(8));
     let normal = queue("normal");
     let sticky_queue = (0..100)
@@ -131,7 +142,7 @@ async fn publication(copies: u32, sticky: bool, colocated: bool) -> bool {
             .pending_workflow_task
             .as_mut()
             .unwrap()
-            .schedule_to_start_deadline = Some(OffsetDateTime::now_utc() + Duration::seconds(30));
+            .schedule_to_start_deadline = Some(exploration_clock().now() + Duration::seconds(30));
     }
     let logical_seq = item
         .next_state
@@ -142,18 +153,44 @@ async fn publication(copies: u32, sticky: bool, colocated: bool) -> bool {
     repo.commit_transition(key, item, WriteFence::Unfenced)
         .await
         .unwrap();
-    let (destination, _) = broker(home(selected));
+    let (destination, destination_homes) = broker(home(selected));
     // A completed recent poll is enough; there need not be a parked waiter.
     destination
         .poll_workflow_task(selected, &worker, std::time::Duration::ZERO)
         .await
         .unwrap();
-    let source = if colocated {
-        destination.clone()
+    let (source, source_homes) = if colocated {
+        (destination.clone(), destination_homes.clone())
     } else {
-        broker(execution).0
+        broker(execution)
     };
-    let publisher = publisher(source, repo.clone());
+    let mut publisher = publisher(source.clone(), repo.clone());
+    let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let receiver_shutdown = RuntimeShutdownHandle::new();
+    let sender_shutdown = RuntimeShutdownHandle::new();
+    let receiver = crate::workflow_delivery::WorkflowDelivery::new(
+        repo.clone(),
+        Arc::new(RwLock::new(None)),
+        destination.clone(),
+        destination_homes,
+        receiver_shutdown.clone(),
+        exploration_clock(),
+    );
+    let delivery = crate::workflow_delivery::WorkflowDelivery::new(
+        repo.clone(),
+        Arc::new(RwLock::new(None)),
+        source,
+        source_homes,
+        sender_shutdown.clone(),
+        exploration_clock(),
+    );
+    if connected && !colocated {
+        delivery.install_sender(Arc::new(DirectSink {
+            receiver: receiver.clone(),
+            sent,
+        }));
+        publisher = publisher.with_workflow_delivery(delivery.clone());
+    }
     for _ in 0..copies {
         publisher
             .publish(
@@ -170,46 +207,63 @@ async fn publication(copies: u32, sticky: bool, colocated: bool) -> bool {
             )
             .await
             .unwrap();
+        if connected && !colocated {
+            assert!(matches!(
+                received.recv().await.unwrap(),
+                crate::WorkflowOfferOutcome::Admitted | crate::WorkflowOfferOutcome::Known
+            ));
+        }
     }
     // No discovery scheduler is driven in this fixture. It isolates prompt
     // publication; recovery tests must independently drive the correct reader.
-    destination
+    let delivered = destination
         .try_claim_workflow_task_for_worker(selected, key, Some(&worker))
         .await
-        .is_some()
+        .is_some();
+    sender_shutdown.begin_shutdown();
+    receiver_shutdown.begin_shutdown();
+    sender_shutdown
+        .wait(std::time::Instant::now() + std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
+    receiver_shutdown
+        .wait(std::time::Instant::now() + std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
+    delivered
 }
 
 // Feature: queue-home-delivery, Property 1: Prompt push and eventual delivery.
 #[test]
-fn queue_home_delivery_exploration_normal_split_home() {
+fn queue_home_delivery_negative_control_disconnected_normal() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     assert!(
-        rt.block_on(publication(1, false, true)),
+        rt.block_on(publication(1, false, true, true)),
         "local positive control"
     );
     expected_failure(
         "normal publication did not reach the queue home",
-        |copies| rt.block_on(publication(copies, false, false)),
+        |copies| rt.block_on(publication(copies, false, false, false)),
     );
 }
 
 // Feature: queue-home-delivery, Property 4: Sticky routing and deadline preservation.
 #[test]
-fn queue_home_delivery_exploration_sticky_split_home() {
+fn queue_home_delivery_negative_control_disconnected_sticky() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     assert!(
-        rt.block_on(publication(1, true, true)),
+        rt.block_on(publication(1, true, true, true)),
         "recent-poller positive control"
     );
     expected_failure(
         "sticky publication did not reach the recent poller's home",
-        |copies| rt.block_on(publication(copies, true, false)),
+        |copies| rt.block_on(publication(copies, true, false, false)),
     );
 }
 
@@ -246,5 +300,43 @@ fn queue_home_delivery_exploration_retirement_without_discovery() {
                 broker.try_claim_workflow_task(&queue, key).await.is_none()
             })
         });
+    }
+}
+
+#[derive(Debug)]
+struct DirectSink {
+    receiver: Arc<crate::workflow_delivery::WorkflowDelivery<InMemoryStore>>,
+    sent: tokio::sync::mpsc::UnboundedSender<crate::WorkflowOfferOutcome>,
+}
+#[async_trait::async_trait]
+impl crate::RemoteWorkflowOfferSink for DirectSink {
+    async fn offer(
+        &self,
+        offer: &crate::WorkflowOffer,
+        home: ShardId,
+        _: bool,
+    ) -> std::result::Result<crate::WorkflowOfferOutcome, crate::WorkflowOfferError> {
+        let outcome = self
+            .receiver
+            .receive(offer, home, crate::workflow_offers::OfferSource::Pushed)
+            .await?;
+        self.sent.send(outcome).unwrap();
+        Ok(outcome)
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+    // Feature: queue-home-delivery, Property 1: normal publication reaches a split home without discovery.
+    #[test]
+    fn queue_home_delivery_exploration_normal_split_home(copies in 1u32..8) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        prop_assert!(rt.block_on(publication(copies, false, false, true)));
+    }
+    // Feature: queue-home-delivery, Property 4: sticky publication reaches the recent poller's split home without timeout.
+    #[test]
+    fn queue_home_delivery_exploration_sticky_split_home(copies in 1u32..8) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        prop_assert!(rt.block_on(publication(copies, true, false, true)));
     }
 }

@@ -3215,7 +3215,7 @@ async fn build_dsql_stack(
     dsql_store: DsqlStore,
     endpoint: String,
     extensions: ChasmExtensions,
-    peer: Option<Arc<tokeira_edge::grpc::workflow_offer::PeerOfferEndpoint>>,
+    peer: Option<tokeira_edge::grpc::workflow_offer::PeerOfferEndpoint>,
 ) -> Result<ConstructedStack> {
     let (director, run_repository, projection_log, worker_deployment_repository, _migration_runner) =
         dsql_store.into_parts();
@@ -3307,7 +3307,7 @@ async fn build_in_memory_stack(
     store: InMemoryStore,
     recover_self_assigned_shard: bool,
     extensions: ChasmExtensions,
-    peer: Option<Arc<tokeira_edge::grpc::workflow_offer::PeerOfferEndpoint>>,
+    peer: Option<tokeira_edge::grpc::workflow_offer::PeerOfferEndpoint>,
     clock: Arc<dyn Clock>,
 ) -> Result<ConstructedStack> {
     // Every handle on the store below is cloned from this one, so the store
@@ -3526,7 +3526,7 @@ async fn build_service_stack_with_storage<R, L, S, V, F>(
     recover_self_assigned_shard: bool,
     budget_applier: Arc<dyn ConnectionBudgetApplier>,
     extensions: ChasmExtensions,
-    peer: Option<Arc<tokeira_edge::grpc::workflow_offer::PeerOfferEndpoint>>,
+    peer: Option<tokeira_edge::grpc::workflow_offer::PeerOfferEndpoint>,
     clock: Arc<dyn Clock>,
 ) -> Result<ConstructedStack>
 where
@@ -3780,6 +3780,8 @@ where
     ));
     runtime.ready().await?;
     let runtime = Arc::new(runtime);
+    // Every sender and verifier judges token freshness on this runtime's clock.
+    let peer = peer.map(|peer| Arc::new(peer.with_clock(runtime.clock().clone())));
     let runtime_tasks = runtime.shutdown_handle();
     let engine_tasks = RuntimeShutdownHandle::new();
     let mut startup_guard = StackStartupGuard::new(runtime_tasks.clone(), engine_tasks.clone());

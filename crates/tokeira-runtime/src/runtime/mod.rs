@@ -133,6 +133,9 @@ mod query;
 mod queue_home_delivery_exploration_tests;
 #[cfg(test)]
 mod queue_home_preservation_tests;
+mod ramp;
+#[cfg(test)]
+mod ramp_tests;
 #[cfg(test)]
 pub(crate) mod repair_tests;
 mod reset;

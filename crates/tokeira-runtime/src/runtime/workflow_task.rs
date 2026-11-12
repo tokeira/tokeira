@@ -355,16 +355,16 @@ pub(crate) fn resolve_workflow_task_target_version(
 /// deployment's routing config, splitting by ramp percentage.
 ///
 /// A nil current version means the deployment routes this traffic to
-/// unversioned workers (returns None). When a ramping version is set with a
-/// non-zero percentage, a deterministic fraction of workflow ids route to it;
-/// the rest stay on current. The split is keyed on workflow id (not random) so
-/// the same run always resolves to the same version across polls, which is
-/// required for replay determinism.
+/// unversioned workers (returns None). A configured ramp can likewise target
+/// unversioned workers. The split is keyed on workflow ID so sending, receiving,
+/// and task-start nodes agree for the same routing config.
 ///
-/// Bucketing: `deterministic_bucket` returns `[0, 9999]`, so the ramp
-/// percentage P is scaled to `P * 100` buckets — e.g. P=50 sends ids with
-/// bucket `< 5000` (half) to the ramping version. This gives 1/100-percent
-/// resolution matching the `float` percentage field.
+/// Selection follows `common/worker_versioning/worker_versioning.go @ v1.31.0`:
+/// nonpositive percentages select current, exactly 100 selects ramping, and
+/// otherwise the f64 threshold `100 * (Fingerprint32(id) / 2^32)` selects ramping
+/// when it is <= the f32 percentage widened to f64 (divide before multiplying).
+/// Fingerprint32 is go-farm v0.0.0-20240924180020-3414d57e47da's portable Hash32;
+/// [`super::ramp`] computes the threshold without storing it.
 pub(crate) fn routing_config_target(
     routing_config: &StoredRoutingConfig,
     workflow_id: &WorkflowId,
@@ -387,9 +387,7 @@ fn routing_config_target_with_revision(
     let ramping_is_configured =
         routing_config.ramping_version.is_some() || routing_config.ramping_to_unversioned;
     if ramping_is_configured
-        && routing_config.ramping_version_percentage > 0.0
-        && deterministic_bucket(&workflow_id.0)
-            < (f64::from(routing_config.ramping_version_percentage) * 100.0) as u64
+        && super::ramp::selects_ramping(&workflow_id.0, routing_config.ramping_version_percentage)
     {
         return (
             routing_config
@@ -590,7 +588,7 @@ fn state_after_wft_completion_versioning(
 /// source in that one case prevents bounce-back while task-queue routing
 /// converges (`chooseTargetQueueByFlag`,
 /// `task_queue_partition_manager.go:2061-2078 @ v1.31.0`).
-/// `USE_RAMPING_VERSION` bypasses percentage bucketing only until the first
+/// `USE_RAMPING_VERSION` bypasses percentage selection only until the first
 /// successful WFT (and therefore across its failed retries); afterward normal
 /// Current/Ramping routing resumes (`GetShouldUseRampingVersion`,
 /// `mutable_state_impl.go:9122-9141 @ v1.31.0`).
@@ -729,17 +727,6 @@ pub(crate) async fn route_activity_task_queue(
         }
     }
     Ok((queue, routing.revision_number))
-}
-
-/// Stable per-workflow-id bucket in `[0, 9999]` for ramp splits.
-fn deterministic_bucket(value: &str) -> u64 {
-    // FNV-1a is stable across processes, unlike DefaultHasher's seeded state.
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash % 10_000
 }
 
 fn version_key_to_ref(version: &WorkerDeploymentVersionKey) -> WorkerDeploymentVersionRef {
@@ -3765,7 +3752,10 @@ pub(crate) mod tests {
     #[test]
     fn partial_ramp_from_unversioned_can_select_the_ramping_version() {
         let routing = routing_config(None, Some(version_key("deployment", "ramping")), 25.0);
-        let state = open_state("workflow-0".into(), None);
+        // go-farm v0.0.0-20240924180020-3414d57e47da fingerprints "a" as
+        // 0x3c973d4d, whose threshold is <25 under calcRampThreshold
+        // (`common/worker_versioning/worker_versioning.go @ v1.31.0`).
+        let state = open_state("a".into(), None);
 
         // A nil Current target is the unversioned side of a ramp, not a reason
         // to bypass the ramp. v1.31.0 explicitly covers partial ramping from

@@ -5,7 +5,10 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use proptest::prelude::*;
 use prost::Message;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    sync::atomic::{AtomicUsize, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokeira_auth::peer::{PeerMaterial, PeerVerifier};
 use tonic::{body::Body, codegen::Service};
 

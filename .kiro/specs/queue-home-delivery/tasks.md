@@ -44,7 +44,7 @@ bar belongs to the code PRs.
     - **Property 8: Complete bounded sticky traversal** (storage portion; runtime portion in 6.2)
     - **Validates: Requirements 2.8, 2.9, 2.15, 3.2, 3.5.**
 
-- [ ] 3. Internal offer RPC, protected credential files and dedicated peer policy
+- [x] 3. Internal offer RPC, protected credential files and dedicated peer policy
   - [x] 3.1 Extend the Tokeira internal proto/service with `OfferWorkflowTask` and its typed outcomes. Implement the
     field-policy table, unknown-enum/shape validation, request/response bounds and handler concurrency cap. Preserve
     the existing start method and its larger response limit; do not modify upstream Temporal protos.
@@ -100,35 +100,46 @@ bar belongs to the code PRs.
     - **Validates: Requirements 2.2, 2.3, 2.10, 2.14, 3.5.**
     - DONE — All thirteen generated properties for Properties 2 and 5 pass at 100 cases each, covering source races, retention, delayed results, both bounds, colocated homes, retargeting, locked admission checks, deadlines and replacement acquisitions. Cancellation/dequeue and colocated-home properties first failed against the unchanged implementation; see implementation-evidence.md for case counts and validation.
 
-- [ ] 5. Bounded push and all sticky fallback conditions
-  - [ ] 5.1 Add the post-commit sender queue and provider-agnostic sink, wire the edge client to trusted placement and
+- [x] 5. Bounded push and reachable sticky fallback conditions
+  - [x] 5.1 Add the post-commit sender queue and provider-agnostic sink, wire the edge client to trusted placement and
     pooled channels, and connect local/remote admission. Keep all network waits outside the publishing lane and
     acknowledge admission independently of a start. Implement bounded coalescing, fairness, cancellation, deadline,
     refresh/retry and outcome diagnostics.
     - _Requirements: 2.1, 2.4, 2.13, 2.14, 2.16_
-  - [ ] 5.2 Evaluate sticky availability at its home and preserve all Temporal v1.31.0 fallbacks: recent poller,
-    deployment change, redirect and compatible-version-set default change. Route normal fallback to its home,
-    preserving the absolute deadline and affinity. Test an unknown compatible-set build as a non-fallback control.
+    - DONE — Runtime-owned bounded scheduling, the provider-agnostic sink, authenticated handler and peer-gated engine wiring are active. Local admission reuses committed routing; remote attempts run off the lane, with finite outcome and saturation diagnostics.
+  - [x] 5.2 Evaluate sticky availability at its home for the two reachable Temporal v1.31.0 conditions: no recent
+    poller and deployment change. Route normal fallback to its home, preserving the absolute deadline and affinity.
+    Test pinned directives and directives with an assigned build as deployment non-fallback controls, following
+    the [worker-versioning decision](../worker-deployments/reference/v1-v2-conformance-decision.md).
     Preserve the existing publisher deployment fallback while repairing its lost deadline.
     - _Requirements: 2.5, 2.6, 2.7, 3.4_
-  - [ ] 5.3 Generate interleavings of push, duplicate discovery, unavailable/full/moving homes and lost replies.
+    - DONE — The sticky home checks the recent poller before deployment routing, using the same current/ramping selection as Tokeira's start path. Normal fallback keeps its origin and absolute deadline, resolves its own home, and can retarget a retained sticky offer only with the receiver's decision. Pinned and assigned-build controls remain.
+  - [x] 5.3 Generate interleavings of push, duplicate discovery, unavailable/full/moving homes and lost replies.
     Pause the publishing lane until the admission response is received to detect an acknowledgement/start cycle.
-    Test every sticky cause independently and in combinations, including recent completed polls without a waiter,
+    Test both reachable sticky causes independently and together, including recent completed polls without a waiter,
     unavailable routing data, shutdown workers, repeated fallback and deadline-versus-start races.
     - **Property 4: Sticky routing and deadline preservation** (routing portion; recovery portion in 6.2)
     - **Property 7: Authorized, bounded and non-blocking hints** (scheduling portion)
     - **Validates: Requirements 2.5, 2.6, 2.7, 2.8, 2.13, 2.14, 2.16, 3.2, 3.4.**
-  - [ ] 5.4 Checkpoint: focused storage, runtime, edge and auth checks pass; no authoritative write depends on push
+    - DONE — Nineteen generated properties cover routing and scheduling at 100 cases each, including a paused publishing lane, separate homes, lost replies, saturation, acquisition loss, poller/routing failures and local publication without run reloads. Regression and command evidence is recorded in implementation-evidence.md.
+  - [x] 5.4 Checkpoint: focused storage, runtime, edge and auth checks pass; no authoritative write depends on push
     admission, and neither activity nor speculative delivery has acquired an unsupported remote path.
     - _Requirements: 3.2, 3.3_
+    - DONE — All nineteen generated routing/scheduling properties pass. Both warning-denied clippy commands, nightly formatting and diff checks pass. The four-crate suite passes: 2,472 tests, one skipped. No durable writes or unsupported activity/speculative paths were added.
 
-- [ ] 6. Complete sticky recovery and liveness
-  - [ ] 6.1 Start a fair bounded sticky sweep after execution-home activation, using the new repository operation.
+- [x] 6. Complete sticky recovery and liveness
+  - **DONE:** Acquisition-scoped recovery, read reuse and its generated liveness evidence are recorded in
+    [Part 5: sticky recovery](implementation-evidence.md#part-5-sticky-recovery).
+  - [x] 6.1 Start a fair bounded sticky sweep after execution-home activation, using the new repository operation.
     Validate candidates against current state and republish through task 5. Advance skipped/refused candidates,
     wrap at exhaustion, retry incomplete reads, restart on acquisition, and cancel on loss. Leave ordinary normal
     discovery and the authoritative sticky timeout transition intact.
     - _Requirements: 2.8, 2.9, 2.15, 3.2, 3.4, 3.5_
-  - [ ] 6.2 Generate lost sticky and lost normal-fallback pushes separately, with no useful sticky poll demand,
+    - **DONE:** All activation modes start one tracked sweep after repair, with 64-row pages, eight fair node
+      slots, per-home pacing, read validation, row-by-row cursor retry/wrap and acquisition cancellation. Expired
+      and recent rows skip hydration; local fallback reuses the hydrated run. Recovery shares task 5's sender
+      and uses the same local policy without a sender; it writes no durable state.
+  - [x] 6.2 Generate lost sticky and lost normal-fallback pushes separately, with no useful sticky poll demand,
     process restart, queue-home movement, rows inserted behind the cursor, saturation and deadline expiry. Include
     affinity-cleared non-sticky rows covered by normal discovery and finite faults followed by a fair suffix.
     Drive the appropriate recovery reader independently: normal discovery for non-sticky rows, the sticky sweep
@@ -137,72 +148,125 @@ bar belongs to the code PRs.
     - **Property 4: Sticky routing and deadline preservation** (recovery portion)
     - **Property 8: Complete bounded sticky traversal** (runtime portion)
     - **Validates: Requirements 2.1, 2.5, 2.6, 2.7, 2.8, 2.9, 2.15, 3.2, 3.4, 3.5.**
+    - **DONE:** Fifteen generated properties run 100 cases each, with independent sticky/normal recovery readers,
+      finite fault prefixes, refusal and wrap, restart/movement, stale rows, repair gates and replacement isolation.
+      Load and offer counts prove that middle-row failures preserve completed progress, recent/expired rows incur
+      no hydration, recent rows recover on a later pass, and local fallback uses one run load per pass.
+      The lost-sticky-row property failed on main before the fix; Part 5 retains its shrunk counterexample.
 
-- [ ] 7. Consolidate remote start reads under unchanged authorization
-  - [ ] 7.1 Route from the hint's execution home without a queue-home run load. At the owner, reuse one local
+- [x] 7. Consolidate remote start reads under unchanged authorization
+  - **DONE:** owner preparation, synchronous lane revalidation and the per-phase memory matrix are implemented
+    with the wire contract unchanged; evidence and external gRPC follow-up are recorded in
+    [Part 6: start reads](implementation-evidence.md#part-6-start-reads).
+  - [x] 7.1 Route from the hint's execution home without a queue-home run load. At the owner, reuse one local
     state/statistics preparation across namespace/queue/version binding, authoritative sticky authorization,
     metadata and attachment checks, and runtime target resolution. Invalidate affected preparation if state changes;
     retain serving/incarnation/lease checks, fresh OCC reloads and owner-held attachments/waiters.
+    - **DONE:** volatile broker metadata carries every production source's execution home. One owner-local
+      state/statistics preparation supplies authorization, sizing and routing. Registry and stored routing inputs
+      are captured before submission; the lane performs no routing I/O. It re-derives queue/sticky/version/transition
+      decisions from its own state, accepts unrelated transitions and retains prepared history size. Run identity,
+      kernel incarnation, serving/fence checks and fresh OCC reloads remain mandatory. The start wire contract,
+      durable task format, storage and migrations are unchanged.
     - _Requirements: 2.11, 2.12, 3.1, 3.3_
-  - [ ] 7.2 Re-run the baseline matrix with counted retries. Generate forged execution-home, namespace, normal/sticky
+  - [x] 7.2 Re-run the baseline matrix with counted retries. Generate forged execution-home, namespace, normal/sticky
     queue, worker and version coordinates; concurrent policy/state changes; exact and over-limit attachments; and
     cold/admission cache misses. Account for all moved or newly introduced reads explicitly.
+    - **DONE:** the eight-case in-process memory matrix meets 0 queue-home and 1 warm / 2 cold owner loads,
+      plus one per conflict. Six generated properties pass 100 cases each, including unrelated signals, changed
+      sticky/version decisions, captured routing and wrong-owner refusal without a wire home field. A gated
+      deployment repository checks that starts and another run on the same lane commit without routing reads.
+      The extended 100-case sweep property checks its home hint too. The budget assertion failed on archived main
+      first. Socket and live DSQL matrices have updated expectations; socket execution is sandbox-blocked and
+      live DSQL remains task 9.
     - **Property 6: Fewer reads without weakened start checks**
     - **Validates: Requirements 2.11, 2.12, 3.1, 3.3.**
 
-- [ ] 8. Fencing, preservation and real multi-runtime integration
-  - [ ] 8.1 Generate duplicate and obsolete incarnations, execution-owner loss before/during a start and queue-home
+- [x] 8. Fencing, preservation and real multi-runtime integration
+  - **DONE:** Fencing, preservation, authenticated multi-runtime scenarios and the executable property inventory
+    are recorded in [Part 7](implementation-evidence.md#part-7-fencing-preservation-and-multi-runtime-integration).
+  - [x] 8.1 Generate duplicate and obsolete incarnations, execution-owner loss before/during a start and queue-home
     movement mid-push. Include a delayed former publisher's still-current hint accepted by the current writer.
     Drive real memory-store transitions and retain the live DSQL variants for task 9.
+    - **DONE:** Two generated properties run 100 cases each against real memory transitions and authenticated
+      internal gRPC. Commit and transport barriers cover ownership loss, duplicate/obsolete incarnations,
+      delayed current hints and queue movement. The same helpers have a compiled, unrun live DSQL variant.
     - **Property 3: Only a current writer and incarnation start**
     - **Validates: Requirements 2.3, 2.4, 3.2.**
-  - [ ] 8.2 Write preservation properties for local delivery, priority, eager/reserved tasks, speculative tasks,
+  - [x] 8.2 Write preservation properties for local delivery, priority, eager/reserved tasks, speculative tasks,
     query/update attachments and completion/failure routing, timeout reconstruction and repair. Re-run the existing
     affected contract suites, including no-peer startup without credentials; do not change the deferred paths to
     simplify a test.
+    - **DONE:** Five generated preservation properties run 100 cases each. The affected storage, runtime,
+      edge, engine and proto suites pass, including the 100-case no-peer startup and durable exemption tests.
+      Auth/config peer contracts also pass; deferred delivery behavior is unchanged.
     - **Property 9: Preservation outside the defect**
     - **Validates: Requirements 2.19, 3.1, 3.2, 3.3, 3.4.**
-  - [ ] 8.3 Exercise actual internal gRPC with at least two runtimes for normal push and remote start, then three with
+  - [x] 8.3 Exercise actual internal gRPC with at least two runtimes for normal push and remote start, then three with
     distinct execution/sticky/normal homes for all sticky fallbacks. Prove push with discovery paused; separately
     drop sticky push, normal fallback and acknowledgement. Use the credential file and path configuration emitted by
     the daemon generator, and keep it running past initial token expiry.
     Check peer-policy failures, saturation, takeover, prompt retirement, reply statuses and warm/cold read counters,
     without bypassing the wire authorization path or depending on an external identity provider.
+    - **DONE:** Real two/three-runtime scenarios cover both sticky causes, independent message/acknowledgement
+      loss, the correct recovery reader, wire policy and reply statuses, handler/broker saturation, takeover,
+      immediate retirement and warm/cold reads. Generated-file credentials renew across injected expiry on
+      running nodes. Socket scenarios execute locally and finish in seconds.
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14, 2.16, 2.17, 2.18, 3.5_
-  - [ ] 8.4 Checkpoint: exploration tests now pass, negative controls fail for the intended reason, and all ten
+  - [x] 8.4 Checkpoint: exploration tests now pass, negative controls fail for the intended reason, and all ten
     properties have executable coverage with deterministic synchronization and useful shrunk counterexamples.
+    - **DONE:** Connected exploration passes; disconnected controls accept only their intended failure and
+      retained one-publication counterexample. All ten properties have executed coverage, with case counts,
+      injected clocks/barriers and retained generated fixture counterexamples documented in the evidence.
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14, 2.15, 2.16, 2.17, 2.18, 2.19, 2.20_
 
-- [ ] 9. Live DSQL contracts and plans
-  - [ ] 9.1 Under [the live-suite runbook](../../../docs/testing/dsql-live-suites.md), create and clean up an ephemeral
+- [x] 9. Live DSQL contracts and plans
+  - [x] 9.1 Under [the live-suite runbook](../../../docs/testing/dsql-live-suites.md), create and clean up an ephemeral
     Aurora DSQL cluster. Verify schema/index readiness and run generated sticky page contracts, including large
     unrelated homes and long continuations. `EXPLAIN` the exact first/continuation repository SQL; confirm a bounded
     sticky-home index seek and bounded payload fetch. Do not infer a good plan from an equivalent handwritten query.
+    - **DONE:** On one ephemeral cluster, after migration and index readiness, all 100 generated sticky-page cases
+      passed. The exact first and continuation plans seek the sticky-home index with the cursor in the index
+      condition and fetch at most 64 payloads by primary key. The cluster was deleted and its absence confirmed.
     - **Property 8: Complete bounded sticky traversal** (DSQL execution)
     - **Validates: Requirements 2.8, 2.9, 2.15, 3.2, 3.5.**
-  - [ ] 9.2 Run competing-start, stale-incarnation and takeover schedules against real DSQL with the existing fence.
+  - [x] 9.2 Run competing-start, stale-incarnation and takeover schedules against real DSQL with the existing fence.
     Run a split-home runtime case using the real repository and internal RPC, plus affected live regression suites.
     Account for schema bootstrap and fixture isolation; inspect gates to prove each intended live body ran.
+    - **DONE:** 100 generated fencing schedules and 100 queue-home movements passed through real gRPC on DSQL. The
+      sixteen split-home remote starts measured the expected reads exactly, and the acquisition-hook regression
+      passed. Durations, executed reports and written plans show that every live body ran.
     - **Property 3: Only a current writer and incarnation start** (DSQL execution)
     - _Requirements: 2.1, 2.3, 2.4, 2.8, 2.9, 3.2_
-  - [ ] 9.3 Add executable suite entries, isolation/ordering rules and evidence of what ran and its outcome. Preserve
+  - [x] 9.3 Add executable suite entries, isolation/ordering rules and evidence of what ran and its outcome. Preserve
     the placement-before-live-leases order. Clean owned fixtures so unrelated suites do not multiply recovery work;
     do not raise time limits to hide shared-cluster contamination. No PostgreSQL substitute or URL-gated early-return
     pass counts as live DSQL evidence.
+    - **DONE:** The runbook adds the fenced-starts entry, its order and command after the read baseline, and the
+      current migration time. Fixtures remove their own runs, keys and leases; no time limit was raised. What ran
+      and its outcome are in implementation-evidence.md, Part 8.
     - _Requirements: 2.15, 3.2_
 
-- [ ] 10. Align documentation and finish the code PRs
-  - [ ] 10.1 Align workflow-dispatch's sticky recovery, offer lifecycle and start-read descriptions, configuration
+- [x] 10. Align documentation and finish the code PRs
+  - [x] 10.1 Align workflow-dispatch's sticky recovery, offer lifecycle and start-read descriptions, configuration
     and credential-file docs and the suite runbook with the implemented contract. Record measured
     baseline/result counts, query plans, limitations and outcomes without cluster identifiers, live-run dates/times
     or Region. Preserve the one-line stopped-node upgrade instruction and the explicit activity/speculative/security
     deferrals. Add the controller-managed upgrade's generate/install/configure step to rollout documentation and
     an implementation `changed` fragment; every node must be stopped during installation before any restarts.
     State that no-peer single-node/embedded upgrades need no credential file.
+    - **DONE:** The workflow-dispatch design, the peer wire contract and the runbook describe push, the execution
+      home's sticky sweep and one-read owner starts. Counts, plans, limitations and outcomes are recorded without
+      cluster identifiers, dates, times or Region. The `changed` fragment keeps the stopped-node upgrade line; the
+      credential step and no-peer exemption already stand in the operations guide and the 0.7.0 notes.
     - _Requirements: 2.8, 2.10, 2.11, 2.13, 2.15, 2.16, 2.17, 2.18, 2.19, 2.20, 3.3_
-  - [ ] 10.2 Run the full root AGENTS.md §10.4 bar for each code PR, plus its applicable focused/live checks and
+  - [x] 10.2 Run the full root AGENTS.md §10.4 bar for each code PR, plus its applicable focused/live checks and
     offline links/fragment validation. Report every omission and why; tick only work actually completed. Rebase at
     the PR boundary and follow the repository's attribution, review and exact-head merge protocol.
+    - **DONE:** The full bar, the five-crate `dsql-integration` clippy, dependency checks, offline links, the changie
+      dry run and a clean tree pass at the Part 8 commit. The one `tkr` test that cannot pass under a private
+      target directory passed alone without it. No rebase was needed; review and the exact-head merge follow with
+      this PR. See implementation-evidence.md, Finish bar.
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14, 2.15, 2.16, 2.17, 2.18, 2.19, 2.20, 3.1, 3.2, 3.3, 3.4, 3.5_
 
 ## Task Dependency Graph

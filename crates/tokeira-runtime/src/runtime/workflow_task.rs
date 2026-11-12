@@ -63,6 +63,76 @@ struct PolledWorkflowTaskTarget {
     history_size_bytes: i64,
 }
 
+/// One owner-local state/statistics read used by remote-start policy and sizing.
+/// It cannot be deserialized or constructed by a caller. The lane never installs
+/// this image: its own state and the commit fence remain authoritative.
+#[derive(Debug)]
+pub struct PreparedWorkflowStart {
+    state: WorkflowState,
+    history_size_bytes: i64,
+}
+
+impl PreparedWorkflowStart {
+    /// Authoritative image for namespace, normal/sticky policy and envelope binding.
+    pub fn state(&self) -> &WorkflowState {
+        &self.state
+    }
+}
+
+/// Routing is read before submission, as on the ordinary start path. Keeping
+/// values rather than repositories makes lane revalidation synchronous: one
+/// start must not hold up unrelated runs waiting for deployment storage.
+#[derive(Clone)]
+struct WorkflowStartRouting {
+    registry: Option<StoredRoutingConfig>,
+    stored: StoredRoutingConfig,
+}
+
+/// Re-derive prepared decisions from the lane's state on every OCC attempt.
+/// Unrelated transitions can advance the image without invalidating the start.
+#[derive(Clone)]
+pub(crate) struct WorkflowStartCheck {
+    run_id: RunId,
+    normal_queue: TaskQueueName,
+    offered: DispatchableWorkflowTask,
+    target: PolledWorkflowTaskTarget,
+    routing: WorkflowStartRouting,
+}
+
+impl WorkflowStartCheck {
+    /// Refuse stale preparation before the kernel can apply it to the lane image.
+    pub(crate) fn validate(&self, loaded: &LoadedRun) -> Result<()> {
+        let LoadedRun::Existing(state) = loaded else {
+            return Err(crate::WorkflowOfferRejected.into());
+        };
+        if state.run_id != self.run_id
+            || state.run_key != self.offered.run_key
+            || state.task_queue != self.normal_queue
+        {
+            return Err(crate::WorkflowOfferRejected.into());
+        }
+        // Signals, activity completions and update admissions do not by
+        // themselves stale an offer. The kernel fences the scheduled task's
+        // incarnation; only changed binding/routing decisions stale preparation.
+        // RecordWorkflowTaskStarted checks scheduled event/stamp and started
+        // state, not a mutable-state sequence (service/history/api/
+        // recordworkflowtaskstarted/api.go @ v1.31.0).
+        // History size stays the pre-submit operand, as on the ordinary path.
+        let current = resolve_start_target(
+            state,
+            self.target.history_size_bytes,
+            self.target.home,
+            &self.offered,
+            true,
+            &self.routing,
+        )?;
+        if current != self.target {
+            return Err(crate::WorkflowOfferRejected.into());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(not(feature = "conformance"))]
 fn target_version_changed_enabled() -> bool {
     true
@@ -965,96 +1035,77 @@ where
         )
     }
 
-    async fn resolve_polled_workflow_task_target(
+    /// Load owner-local authority once; callers must authenticate before preparing.
+    pub async fn prepare_workflow_start(&self, run_key: RunKey) -> Result<PreparedWorkflowStart> {
+        self.prepare_workflow_start_scoped(run_key, "execution-owner/preparation")
+            .await
+    }
+
+    async fn prepare_workflow_start_scoped(
         &self,
-        offered: &DispatchableWorkflowTask,
-        forwarded: bool,
-    ) -> Result<PolledWorkflowTaskTarget> {
-        // One round trip returns the state and its History Size (Requirement 1.8);
-        // the statistic read here is the one the start transition records.
-        let (loaded, stats) = tokeira_storage::read_probe::scope(
-            if forwarded {
-                "execution-owner/resolve"
-            } else {
-                "queue-home/resolve"
-            },
-            self.repo.load_run_with_stats(offered.run_key),
-        )
-        .await?;
+        run_key: RunKey,
+        purpose: &'static str,
+    ) -> Result<PreparedWorkflowStart> {
+        let (loaded, stats) =
+            tokeira_storage::read_probe::scope(purpose, self.repo.load_run_with_stats(run_key))
+                .await?;
         let LoadedRun::Existing(state) = loaded else {
             return Err(crate::lane::KernelRejected(tokeira_kernel::Reject::MissingRun).into());
         };
-        anyhow::ensure!(
-            state.namespace_id == offered.queue.namespace_id,
-            "offered workflow namespace differs from run identity"
-        );
-        if forwarded {
-            // The internal endpoint is reachable by authenticated workers too.
-            // An asserted offer cannot authorize another run's queue or version.
-            // Queue identity is immutable within a run; the start command fences
-            // a concurrent pending-task replacement by its incarnation.
-            let sticky_match = state.sticky.as_ref().is_some_and(|sticky| {
-                sticky.sticky_queue == offered.queue.task_queue
-                    && offered.sticky_preferred.as_ref() == Some(&sticky.worker_identity)
-            });
-            if offered.queue.task_kind != TaskKind::Workflow
-                || (state.task_queue != offered.queue.task_queue && !sticky_match)
-            {
-                return Err(crate::WorkflowOfferRejected.into());
-            }
-            let (deployment, build_id) = if state.deployment.is_some() {
-                (state.deployment.clone(), state.build_id.clone())
-            } else {
-                let registry = self
-                    .worker_deployment_registry
-                    .read()
-                    .expect("deployment registry lock poisoned")
-                    .clone();
-                let version = if let Some(registry) = registry {
-                    let preferred = state
-                        .effective_deployment()
-                        .map(|version| version.deployment_name.as_str())
-                        .or(state.worker_deployment_name.as_deref());
-                    let config = registry
+        Ok(PreparedWorkflowStart {
+            state,
+            history_size_bytes: stats.history_size_bytes,
+        })
+    }
+
+    async fn resolve_prepared_start(
+        &self,
+        prepared: &PreparedWorkflowStart,
+        offered: &DispatchableWorkflowTask,
+        forwarded: bool,
+    ) -> Result<(PolledWorkflowTaskTarget, WorkflowStartRouting)> {
+        let state = &prepared.state;
+        let registry = self
+            .worker_deployment_registry
+            .read()
+            .expect("deployment registry lock poisoned")
+            .clone();
+        let registry = if forwarded && state.deployment.is_none() {
+            if let Some(registry) = registry {
+                let preferred = state
+                    .effective_deployment()
+                    .map(|version| version.deployment_name.as_str())
+                    .or(state.worker_deployment_name.as_deref());
+                Some(
+                    registry
                         .workflow_task_routing_config(
                             state.namespace_id,
                             &state.task_queue.0,
                             preferred,
                         )
-                        .await?;
-                    resolve_workflow_task_target_version(&config, &state).deployment_version
-                } else {
-                    None
-                };
-                (
-                    version
-                        .as_ref()
-                        .map(|v| DeploymentId(v.deployment_name.clone())),
-                    version.map(|v| BuildId(v.build_id)),
+                        .await?,
                 )
-            };
-            if offered.queue.deployment != deployment || offered.queue.build_id != build_id {
-                return Err(crate::WorkflowOfferRejected.into());
+            } else {
+                None
             }
-        }
-        let routing_config = self
-            .load_worker_deployment_routing_config(&state, &offered.queue)
-            .await?;
-        let resolved = resolve_workflow_task_target_version(&routing_config, &state);
-        let routing_target = routing_config_target(&routing_config, &state.workflow_id);
-        let speculative = state.pending_workflow_task.as_ref().is_some_and(|pending| {
-            pending.logical_seq == offered.logical_seq
-                && pending.task_type == tokeira_kernel::WorkflowTaskType::Speculative
-        });
-        let deployment_transition =
-            transition_for_polled_workflow_task(&state, &resolved, &offered.queue, speculative);
-        Ok(PolledWorkflowTaskTarget {
-            home: self.execution_home(&state),
-            resolved,
-            deployment_transition,
-            routing_target,
-            history_size_bytes: stats.history_size_bytes,
-        })
+        } else {
+            None
+        };
+        let routing = WorkflowStartRouting {
+            registry,
+            stored: self
+                .load_worker_deployment_routing_config(state, &offered.queue)
+                .await?,
+        };
+        let target = resolve_start_target(
+            &prepared.state,
+            prepared.history_size_bytes,
+            self.execution_home(&prepared.state),
+            offered,
+            forwarded,
+            &routing,
+        )?;
+        Ok((target, routing))
     }
 
     pub(super) async fn load_worker_deployment_routing_config(
@@ -1062,21 +1113,7 @@ where
         state: &WorkflowState,
         queue: &QueueKey,
     ) -> Result<StoredRoutingConfig> {
-        let Some(repository) = &self.worker_deployment_repository else {
-            return Ok(StoredRoutingConfig::default());
-        };
-        let Some(deployment_name) = routing_deployment_name(state, queue) else {
-            return Ok(StoredRoutingConfig::default());
-        };
-        let key = DeploymentKey {
-            namespace_id: state.namespace_id,
-            deployment_name,
-        };
-        Ok(repository
-            .load_deployment(&key)
-            .await?
-            .map(|record| record.routing_config)
-            .unwrap_or_default())
+        load_start_routing_config(self.worker_deployment_repository.as_deref(), state, queue).await
     }
 
     async fn prepare_continue_as_new_versioning(
@@ -1858,9 +1895,14 @@ where
             // acquisition. Racing retirement here can discard a committed start
             // and strand the task until its timeout (service/matching/matching_engine.go
             // @ v1.31.0, recordWorkflowTaskStarted).
-            self.route_polled_workflow_task(offered, entered_at, worker_identity)
-                .instrument(span.clone())
-                .await
+            self.route_polled_workflow_task(
+                offered,
+                stamp.execution_home,
+                entered_at,
+                worker_identity,
+            )
+            .instrument(span.clone())
+            .await
         };
         // Ambiguous failures and cancelled futures keep only the bounded lease.
         // A late outcome cannot remove a replacement admitted after that lease.
@@ -1882,12 +1924,45 @@ where
     async fn route_polled_workflow_task(
         &self,
         offered: DispatchableWorkflowTask,
+        execution_home: Option<ShardId>,
         entered_at: tokio::time::Instant,
         worker: WorkerIdentity,
     ) -> Result<StartedWorkflowTask> {
-        let target = self
-            .resolve_polled_workflow_task_target(&offered, false)
+        // Normal offers carry a volatile home from committed publication or the
+        // dispatch row. Legacy/speculative callers retain their existing resolver.
+        if let Some(home) = execution_home {
+            let local = self
+                .shard_owner
+                .read()
+                .expect("shard owner lock poisoned")
+                .is_active(home);
+            if !local {
+                let starter = self
+                    .task_starter
+                    .read()
+                    .expect("workflow starter lock poisoned")
+                    .clone();
+                if let Some(starter) = starter {
+                    return starter.start(home, offered, worker).await;
+                }
+            }
+        }
+        let prepared = self
+            .prepare_workflow_start_scoped(
+                offered.run_key,
+                if execution_home.is_some() {
+                    "execution-owner/preparation"
+                } else {
+                    "queue-home/resolve"
+                },
+            )
             .await?;
+        let (target, _) = self
+            .resolve_prepared_start(&prepared, &offered, false)
+            .await?;
+        if execution_home.is_some_and(|home| home != target.home) {
+            return Err(crate::WorkflowOfferRejected.into());
+        }
         let local = self
             .shard_owner
             .read()
@@ -1903,7 +1978,7 @@ where
                 return starter.start(target.home, offered, worker).await;
             }
         }
-        self.start_polled_workflow_task_inner(offered, entered_at, worker, target)
+        self.start_polled_workflow_task_inner(offered, entered_at, worker, target, None)
             .await
     }
 
@@ -1915,12 +1990,42 @@ where
         offered: DispatchableWorkflowTask,
         worker: WorkerIdentity,
     ) -> Result<StartedWorkflowTask> {
-        self.ready().await?;
-        let target = self
-            .resolve_polled_workflow_task_target(&offered, true)
-            .await?;
-        self.start_polled_workflow_task_inner(offered, tokio::time::Instant::now(), worker, target)
+        let prepared = self.prepare_workflow_start(offered.run_key).await?;
+        self.start_prepared_workflow_task(prepared, offered, worker)
             .await
+    }
+
+    /// Consume the owner-local image after edge authorization and envelope checks.
+    /// The serving gate checks the state-derived home; the lane revalidates queue
+    /// and version decisions using routing inputs captured before submission.
+    pub async fn start_prepared_workflow_task(
+        &self,
+        prepared: PreparedWorkflowStart,
+        offered: DispatchableWorkflowTask,
+        worker: WorkerIdentity,
+    ) -> Result<StartedWorkflowTask> {
+        self.ready().await?;
+        if prepared.state.run_key != offered.run_key {
+            return Err(crate::WorkflowOfferRejected.into());
+        }
+        let (target, routing) = self
+            .resolve_prepared_start(&prepared, &offered, true)
+            .await?;
+        let check = WorkflowStartCheck {
+            run_id: prepared.state.run_id,
+            normal_queue: prepared.state.task_queue,
+            offered: offered.clone(),
+            target: target.clone(),
+            routing,
+        };
+        self.start_polled_workflow_task_inner(
+            offered,
+            tokio::time::Instant::now(),
+            worker,
+            target,
+            Some(check),
+        )
+        .await
     }
 
     async fn start_polled_workflow_task_inner(
@@ -1929,6 +2034,7 @@ where
         entered_at: tokio::time::Instant,
         worker_identity: WorkerIdentity,
         target: PolledWorkflowTaskTarget,
+        check: Option<WorkflowStartCheck>,
     ) -> Result<StartedWorkflowTask> {
         tracing::debug!(
             run_key = %offered.run_key.0,
@@ -1973,7 +2079,11 @@ where
             now,
         };
         let result = match self
-            .submit(offered.run_key, Command::WorkflowTaskStarted(request))
+            .submit_workflow_task_start(
+                offered.run_key,
+                Command::WorkflowTaskStarted(request),
+                check,
+            )
             .await
         {
             Ok(result) => result,
@@ -2078,6 +2188,89 @@ where
         let shard_epoch = self.current_shard_epoch(state).await?;
         started_workflow_task(state, is_sticky_match, worker_identity, shard_epoch)
     }
+}
+
+// Pure revalidation uses the same captured routing inputs on every OCC attempt.
+fn resolve_start_target(
+    state: &WorkflowState,
+    history_size_bytes: i64,
+    home: ShardId,
+    offered: &DispatchableWorkflowTask,
+    forwarded: bool,
+    routing: &WorkflowStartRouting,
+) -> Result<PolledWorkflowTaskTarget> {
+    anyhow::ensure!(
+        state.namespace_id == offered.queue.namespace_id,
+        "offered workflow namespace differs from run identity"
+    );
+    if forwarded {
+        // The internal endpoint is reachable by authenticated workers too.
+        // An asserted offer cannot authorize another run's queue or version.
+        // Queue identity is immutable within a run; the start command fences
+        // a concurrent pending-task replacement by its incarnation.
+        let sticky_match = state.sticky.as_ref().is_some_and(|sticky| {
+            sticky.sticky_queue == offered.queue.task_queue
+                && offered.sticky_preferred.as_ref() == Some(&sticky.worker_identity)
+        });
+        if offered.queue.task_kind != TaskKind::Workflow
+            || (state.task_queue != offered.queue.task_queue && !sticky_match)
+        {
+            return Err(crate::WorkflowOfferRejected.into());
+        }
+        let (deployment, build_id) = if state.deployment.is_some() {
+            (state.deployment.clone(), state.build_id.clone())
+        } else {
+            let version = routing.registry.as_ref().and_then(|config| {
+                resolve_workflow_task_target_version(config, state).deployment_version
+            });
+            (
+                version
+                    .as_ref()
+                    .map(|v| DeploymentId(v.deployment_name.clone())),
+                version.map(|v| BuildId(v.build_id)),
+            )
+        };
+        if offered.queue.deployment != deployment || offered.queue.build_id != build_id {
+            return Err(crate::WorkflowOfferRejected.into());
+        }
+    }
+    let resolved = resolve_workflow_task_target_version(&routing.stored, state);
+    let routing_target = routing_config_target(&routing.stored, &state.workflow_id);
+    let speculative = state.pending_workflow_task.as_ref().is_some_and(|pending| {
+        pending.logical_seq == offered.logical_seq
+            && pending.task_type == tokeira_kernel::WorkflowTaskType::Speculative
+    });
+    let deployment_transition =
+        transition_for_polled_workflow_task(state, &resolved, &offered.queue, speculative);
+    Ok(PolledWorkflowTaskTarget {
+        home,
+        resolved,
+        deployment_transition,
+        routing_target,
+        history_size_bytes,
+    })
+}
+
+async fn load_start_routing_config(
+    repository: Option<&dyn WorkerDeploymentRepository>,
+    state: &WorkflowState,
+    queue: &QueueKey,
+) -> Result<StoredRoutingConfig> {
+    let Some(repository) = repository else {
+        return Ok(StoredRoutingConfig::default());
+    };
+    let Some(deployment_name) = routing_deployment_name(state, queue) else {
+        return Ok(StoredRoutingConfig::default());
+    };
+    let key = DeploymentKey {
+        namespace_id: state.namespace_id,
+        deployment_name,
+    };
+    Ok(repository
+        .load_deployment(&key)
+        .await?
+        .map(|record| record.routing_config)
+        .unwrap_or_default())
 }
 
 /// The workflow task `state` holds, started for `worker_identity`, as the poll it was started for
@@ -3912,3 +4105,7 @@ pub(crate) mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "workflow_start_prepared_tests.rs"]
+mod prepared_tests;

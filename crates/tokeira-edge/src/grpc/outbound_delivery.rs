@@ -2,11 +2,7 @@
 //! Wire validation lives here; runtime alone hydrates and validates workflow
 //! relationships. Responses contain no payloads, credentials or redirect URLs.
 
-use std::{
-    fmt,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{fmt, sync::Arc};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -128,7 +124,7 @@ impl OutboundDeliveryTransport for RemoteOutboundDelivery {
             .lookup_node_endpoint(owner.node_id)
             .ok_or_else(|| anyhow!("outbound destination has no endpoint"))?;
         let channel = self.channels.get(&endpoint.as_authority())?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let now = self.peer.unix_seconds()?;
         let token = self.peer.signer().outbound_token_at(now)?;
         let wire = encode_reference(&reference)?;
         let mut request = Request::new(wire);

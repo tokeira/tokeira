@@ -332,6 +332,30 @@ impl WorkflowOffers {
     }
 }
 
+/// Count retained envelope bytes consistently for sender and admission budgets.
+pub(crate) fn serialized_hint_bytes(value: &impl serde::Serialize, limit: usize) -> usize {
+    struct ByteCount(usize, usize);
+    impl std::io::Write for ByteCount {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            if self.0 > self.1 {
+                return Err(std::io::Error::other("offer byte budget exceeded"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    // Count the complete serialized envelope without allocating another copy of
+    // an oversized local hint. The aggregate budget covers ready and in-flight hints.
+    let mut count = ByteCount(0, limit);
+    if serde_json::to_writer(&mut count, value).is_err() {
+        return usize::MAX;
+    }
+    count.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -15,6 +15,7 @@ use crate::{
     publisher::RuntimeDispatchPublisher,
     worker_registry::WorkerRegistry,
 };
+use metrics_util::debugging::DebuggingRecorder;
 use tokeira_kernel::VersioningBehavior;
 use tokeira_storage::{
     BuildId as StoredBuildId, DeploymentName, DeploymentTaskQueueType, InMemoryStore,
@@ -76,8 +77,16 @@ fn publisher(
     repo: &MockRepo,
     registry: &Arc<RwLock<Option<DeploymentRegistry>>>,
 ) -> (RuntimeDispatchPublisher<MockRepo>, Brokers) {
+    publisher_with_workflow_broker(repo, registry, InMemoryBroker::default())
+}
+
+fn publisher_with_workflow_broker(
+    repo: &MockRepo,
+    registry: &Arc<RwLock<Option<DeploymentRegistry>>>,
+    workflow: InMemoryBroker,
+) -> (RuntimeDispatchPublisher<MockRepo>, Brokers) {
     let brokers = Brokers {
-        workflow: InMemoryBroker::default(),
+        workflow,
         activity: InMemoryActivityBroker::default(),
     };
     let publisher = RuntimeDispatchPublisher::new(
@@ -342,4 +351,133 @@ async fn lane_publish_routes_an_activity_task_from_committed_state() {
     assert_eq!(committed_reads, vec![0]);
     assert_eq!(reload_reads, 1);
     assert_eq!((lane_runnable, reload_runnable), (true, true));
+}
+
+#[derive(Debug)]
+struct PublicationClock(OffsetDateTime);
+impl Clock for PublicationClock {
+    fn now(&self) -> OffsetDateTime {
+        self.0
+    }
+}
+
+#[derive(Clone)]
+struct PausedOfferPublisher {
+    inner: RuntimeDispatchPublisher<MockRepo>,
+    release: Arc<Notify>,
+}
+#[async_trait]
+impl DispatchPublisher for PausedOfferPublisher {
+    async fn publish(&self, run: RunKey, home: ShardId, ops: &[DispatchOp]) -> Result<()> {
+        self.inner.publish(run, home, ops).await
+    }
+    async fn publish_committed(
+        &self,
+        state: &WorkflowState,
+        home: ShardId,
+        ops: &[DispatchOp],
+    ) -> Result<()> {
+        self.inner.publish_committed(state, home, ops).await?;
+        self.release.notified().await;
+        Ok(())
+    }
+    async fn submit_to_run(&self, run: RunKey, command: Command) -> Result<CommitResult> {
+        self.inner.submit_to_run(run, command).await
+    }
+}
+#[derive(Debug)]
+struct AdmissionReceiptSink {
+    receiver: Arc<crate::workflow_delivery::WorkflowDelivery<MockRepo>>,
+    replies: tokio::sync::mpsc::UnboundedSender<crate::WorkflowOfferOutcome>,
+}
+#[async_trait]
+impl crate::RemoteWorkflowOfferSink for AdmissionReceiptSink {
+    async fn offer(
+        &self,
+        offer: &crate::WorkflowOffer,
+        destination: ShardId,
+        _: bool,
+    ) -> Result<crate::WorkflowOfferOutcome, crate::WorkflowOfferError> {
+        let outcome = self
+            .receiver
+            .receive(
+                offer,
+                destination,
+                crate::workflow_offers::OfferSource::Pushed,
+            )
+            .await?;
+        self.replies.send(outcome).unwrap();
+        Ok(outcome)
+    }
+}
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+    // Feature: queue-home-delivery, Property 7: a real lane stays paused in post-commit publication until its remote receipt arrives.
+    #[test]
+    fn property_7_publishing_lane_paused_until_receipt(index in 0u32..100) {
+        tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap().block_on(async {
+            let mut state = sample_state(RunKey::new());
+            state.task_queue = (index..index+100).map(|i| TaskQueueName(format!("receipt-{i}"))).find(|name| {
+                tokeira_types::bundle_for_partition(tokeira_types::workflow_queue_partition(state.namespace_id, &name.0, 8), 8) != ShardId(0)
+            }).unwrap();
+            let queue = QueueKey { namespace_id: state.namespace_id, task_queue: state.task_queue.clone(), task_kind: TaskKind::Workflow, deployment: None, build_id: None };
+            let repo = MockRepo::new(LoadedRun::Existing(state.clone()), Vec::new());
+            let registry = Arc::new(RwLock::new(None));
+            let (inner, _) = publisher(&repo, &registry);
+            let owner = test_shard_owner();
+            let source_homes = Arc::new(crate::discovery::PlacementQueueHomes { owner: owner.clone(), counts: RwLock::new((8, 8)) });
+            let source = crate::workflow_delivery::WorkflowDelivery::new(Arc::new(repo.clone()), registry.clone(), InMemoryBroker::with_discovery(source_homes.clone()), source_homes, crate::RuntimeShutdownHandle::new(), system_clock());
+            let mut target_owner = ShardOwner::new(8);
+            for id in 0..8 { target_owner.record_acquired(ShardId(id), ShardEpoch::ZERO); target_owner.mark_active(ShardId(id)); }
+            let target_homes = Arc::new(crate::discovery::PlacementQueueHomes { owner: Arc::new(RwLock::new(target_owner)), counts: RwLock::new((8, 8)) });
+            let receiver = crate::workflow_delivery::WorkflowDelivery::new(Arc::new(repo.clone()), registry, InMemoryBroker::with_discovery(target_homes.clone()), target_homes, crate::RuntimeShutdownHandle::new(), system_clock());
+            let (replies, mut acknowledgements) = tokio::sync::mpsc::unbounded_channel();
+            source.install_sender(Arc::new(AdmissionReceiptSink { receiver, replies }));
+            let release = Arc::new(Notify::new());
+            let publisher = PausedOfferPublisher { inner: inner.with_workflow_delivery(source), release: release.clone() };
+            let lane = spawn_lane(MockKernel::new(smallvec![DispatchOp::EnqueueWorkflowTask { queue, logical_seq: LogicalTaskSeq::ONE, sticky_preferred: None, normal_task_queue: None, speculative: false, priority: None }]), repo, publisher, owner,
+                ActivityTrackingState::default(), crate::timeout::WorkflowTimeoutTrackingState::default(), crate::wft_timeout::WftTimeoutTrackingState::default(), NexusTimeoutTrackingState::default(), UpdateRegistry::new(), LaneConfig::default());
+            let submitted = tokio::spawn(async move { lane.submit(state.run_key, sample_command("publish")).await });
+            let acknowledged = tokio::time::timeout(StdDuration::from_secs(1), acknowledgements.recv()).await.unwrap().unwrap();
+            prop_assert_eq!(acknowledged, crate::WorkflowOfferOutcome::Admitted);
+            prop_assert!(!submitted.is_finished());
+            release.notify_one();
+            prop_assert!(matches!(submitted.await.unwrap().unwrap(), CommitResult::Applied { .. }), "lane commits after receipt");
+            Ok(())
+        })?;
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+    // Feature: queue-home-delivery, Property 4: committed local fallback needs no run reload, even when every load fails.
+    #[test]
+    fn property_4_local_fallback_with_failed_run_loads(index in 0u32..100) {
+        let recorder = DebuggingRecorder::new();
+        metrics::with_local_recorder(&recorder, || tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap().block_on(async {
+            let clock: Arc<dyn Clock> = Arc::new(PublicationClock(OffsetDateTime::UNIX_EPOCH + time::Duration::days(20_000)));
+            let (base, registry) = versioned_run().await;
+            let normal = QueueKey { namespace_id: base.namespace_id, task_queue: base.task_queue, task_kind: TaskKind::Workflow, deployment: None, build_id: None };
+            let mut state = crate::discovery::tests::transition(&normal, index as usize).next_state;
+            state.versioning_info = base.versioning_info;
+            state.worker_deployment_name = base.worker_deployment_name;
+            let sticky = QueueKey { task_queue: TaskQueueName(format!("sticky-{index}")), ..normal.clone() };
+            let deadline = clock.now() + time::Duration::seconds(30);
+            state.pending_workflow_task.as_mut().unwrap().schedule_to_start_deadline = Some(deadline);
+            state.sticky = Some(tokeira_types::StickyAffinity { sticky_queue: sticky.task_queue.clone(), worker_identity: WorkerIdentity(STICKY_WORKER.into()), schedule_to_start_timeout: time::Duration::seconds(30) });
+            let repo = MockRepo::new(LoadedRun::Existing(state.clone()), Vec::new());
+            repo.state.lock().await.fail_loads = true;
+            let homes = Arc::new(crate::discovery::PlacementQueueHomes { owner: test_shard_owner(), counts: RwLock::new((1, 1)) });
+            let (publisher, brokers) = publisher_with_workflow_broker(&repo, &registry, InMemoryBroker::with_discovery(homes.clone()).with_clock(clock.clone()));
+            let delivery = crate::workflow_delivery::WorkflowDelivery::new(Arc::new(repo.clone()), registry, brokers.workflow.clone(), homes, crate::RuntimeShutdownHandle::new(), clock.clone());
+            let publisher = publisher.with_workflow_delivery(delivery).with_clock(clock);
+            let seq = state.pending_workflow_task.as_ref().unwrap().logical_seq;
+            publisher.publish_committed(&state, ShardId(0), &[DispatchOp::EnqueueWorkflowTask { queue: sticky, logical_seq: seq, sticky_preferred: Some(WorkerIdentity(STICKY_WORKER.into())), normal_task_queue: Some(normal.task_queue.clone()), speculative: false, priority: None }]).await.unwrap();
+            prop_assert!(brokers.workflow.has_runnable_backlog(&routed(normal.clone())).await, "normal fallback must be retained; metrics={:?}", recorder.snapshotter().snapshot().into_vec());
+            let (task, _) = brokers.workflow.try_claim_workflow_task(&routed(normal), state.run_key).await.unwrap();
+            prop_assert_eq!(task.sticky_deadline, Some(deadline));
+            prop_assert_eq!(repo.snapshot().await.0, 0);
+            Ok(())
+        }))?;
+    }
 }

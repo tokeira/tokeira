@@ -132,6 +132,8 @@ mod query;
 #[cfg(test)]
 mod queue_home_delivery_exploration_tests;
 #[cfg(test)]
+mod queue_home_preservation_tests;
+#[cfg(test)]
 pub(crate) mod repair_tests;
 mod reset;
 #[cfg(test)]
@@ -142,7 +144,7 @@ mod successor_semantics_tests;
 mod timer_deadline_tests;
 pub(crate) mod workflow_task;
 
-pub use workflow_task::continue_as_new_advice_policy;
+pub use workflow_task::{PreparedWorkflowStart, continue_as_new_advice_policy};
 
 pub(crate) use activity::{
     ActivityRetryDeps, ActivityRetryTarget, activity_dispatch_task, commit_activity_retry,
@@ -287,6 +289,7 @@ pub struct PartitionHome {
 /// See `docs/crates/runtime.md` for the full
 /// orchestration flow and module map.
 pub struct TokeiraRuntime<R> {
+    workflow_delivery: Arc<crate::workflow_delivery::WorkflowDelivery<R>>,
     /// Shared handle to the durable run repository.
     repo: Arc<R>,
     /// Shared publisher for atomic reset completion and durable recovery wakeups.
@@ -851,6 +854,15 @@ where
         let buffered_queries = BufferedQueryRegistry::default();
         let worker_registry = WorkerRegistry::default();
         let worker_deployment_registry = Arc::new(RwLock::new(None));
+        let runtime_shutdown = RuntimeShutdownHandle::new();
+        let workflow_delivery = crate::workflow_delivery::WorkflowDelivery::new(
+            repo.clone(),
+            worker_deployment_registry.clone(),
+            broker.clone(),
+            discovery.1.clone(),
+            runtime_shutdown.clone(),
+            clock.clone(),
+        );
         let heartbeat_store: Arc<dyn HeartbeatStore> = Arc::new(InMemoryHeartbeatStore::new());
         let delivery_metrics = DeliveryMetrics::new();
         let worker_compute_queue_metrics = crate::WorkerComputeQueueMetrics::default();
@@ -913,6 +925,7 @@ where
                     activity_tracking.clone(),
                     delivery_metrics.clone(),
                 )
+                .with_workflow_delivery(workflow_delivery.clone())
                 .with_outbound_wake(outbound_wake.clone())
                 .with_namespace_resolver(namespace_resolver.clone())
                 .with_worker_deployment_registry(worker_deployment_registry.clone())
@@ -951,8 +964,10 @@ where
             let shard_id = ShardId(0);
             let _ = owner.record_acquired(shard_id, ShardEpoch::ZERO);
             owner.mark_active(shard_id);
+            let acquisition = owner.acquisition(shard_id).expect("seeded acquisition");
+            drop(owner);
+            workflow_delivery.start_sticky_sweep(acquisition);
         }
-        let runtime_shutdown = RuntimeShutdownHandle::new();
         completion_callback_tracking.set_shutdown(runtime_shutdown.clone());
         let timer_scanner_cancel = CancellationToken::new();
         runtime_shutdown.register_cancellation(timer_scanner_cancel.clone());
@@ -1064,6 +1079,7 @@ where
             activity_tracking.clone(),
             delivery_metrics.clone(),
         )
+        .with_workflow_delivery(workflow_delivery.clone())
         .with_outbound_wake(outbound_wake.clone())
         .with_namespace_resolver(namespace_resolver.clone())
         .with_worker_deployment_registry(worker_deployment_registry.clone())
@@ -1183,6 +1199,7 @@ where
             runtime_shutdown,
             worker_deployment_repository: None,
             worker_deployment_registry,
+            workflow_delivery,
             purger,
             clock,
         };
@@ -2248,6 +2265,32 @@ fn add_dispatch_stat(
     band.oldest_age = band.oldest_age.max(age);
 }
 
+impl<R: RunRepository + 'static> TokeiraRuntime<R> {
+    /// Install bounded offer delivery after peer bootstrap validation. Exclusive
+    /// modes never call this and construct no sender or remote client.
+    pub fn set_workflow_offer_sink(&self, sink: Arc<dyn crate::RemoteWorkflowOfferSink>) {
+        self.workflow_delivery.install_sender(sink);
+    }
+
+    /// Admit a peer hint without a lane message, start, or authoritative write.
+    pub async fn admit_pushed_workflow_offer(
+        &self,
+        offer: &crate::WorkflowOffer,
+        destination: ShardId,
+    ) -> Result<crate::WorkflowOfferOutcome, crate::WorkflowOfferError> {
+        let result = self
+            .workflow_delivery
+            .receive(
+                offer,
+                destination,
+                crate::workflow_offers::OfferSource::Pushed,
+            )
+            .await;
+        crate::workflow_delivery::record_received(&result);
+        result
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::{
@@ -3296,6 +3339,22 @@ pub(crate) mod tests {
             }),
         );
         state.worker_deployment_name = Some("deployment".to_string());
+        let deadline = OffsetDateTime::now_utc() + Duration::seconds(30);
+        let queue = QueueKey {
+            namespace_id: state.namespace_id,
+            task_queue: state.task_queue.clone(),
+            task_kind: TaskKind::Workflow,
+            deployment: None,
+            build_id: None,
+        };
+        state.pending_workflow_task = crate::discovery::tests::transition(&queue, 0)
+            .next_state
+            .pending_workflow_task;
+        state
+            .pending_workflow_task
+            .as_mut()
+            .unwrap()
+            .schedule_to_start_deadline = Some(deadline);
         let run_key = state.run_key;
         let namespace_id = state.namespace_id;
         let normal_task_queue = state.task_queue.clone();
@@ -3455,6 +3514,16 @@ pub(crate) mod tests {
             0
         );
         assert_eq!(workflow_broker.backlog_stats(&routed_normal).await.count, 1);
+        let fallback = workflow_broker
+            .try_claim_workflow_task(&routed_normal, run_key)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            fallback.sticky_deadline,
+            Some(deadline),
+            "deployment fallback lost its absolute sticky deadline"
+        );
     }
 
     #[test]
@@ -4690,3 +4759,6 @@ pub(crate) mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod sticky_recovery_tests;

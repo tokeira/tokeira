@@ -60,8 +60,10 @@ Names below specify responsibility; implementation may follow local naming conve
 | Peer dispatch credential/verifier adapters | Edge/auth boundary, with server configuration owned by `tokeira-config`; local token signing and verification are independent of the request-local public poll context. |
 | Peer credential generator | `tokeirad peer-credential generate --out <path>` creates an operator-supplied protected file with fresh ES256 material and its public profile; prints only path configuration. Provisioning belongs to deployment tooling outside this repository. |
 
-The kernel stays pure. Publisher and recovery may hydrate hints after commit, but neither changes state to reflect
-delivery. Keep these loads separately observable from start-path loads. Existing placement determines queue and
+The kernel stays pure. Local publication derives hints and fallback targets from committed state without a run
+reload or a second deployment lookup. The sender may reload off the lane to resolve a later fallback; its run load
+is attributed to `publication-fallback`, separately from start-path loads. Neither path changes state to reflect
+delivery. Existing placement determines queue and
 execution homes; this design neither changes placement counts nor permits currently rejected unequal counts.
 
 ### Publication, admission and acknowledgement
@@ -71,9 +73,10 @@ execution homes; this design neither changes placement counts nor permits curren
 2. Resolve current queue-home placement. A receiver derives the queue home from the full queue identity and checks
    that the addressed home is locally serving. It captures its own acquisition generation; no caller-provided
    generation authorizes admission. Recheck that generation and cancellation under the broker's admission lock.
-3. For sticky delivery, evaluate recent poller availability and current version-routing conditions before admission.
-   The publisher may already establish a version fallback from its routing snapshot; the receiver also checks for
-   newer routing. Policy lookup failure is transient failure, not evidence of sticky unavailability.
+3. At the sticky home, check recent poller availability before deployment routing. No recent poller is unavailable
+   even if routing data cannot be read; with a poller present, a routing lookup failure is transient. Immediate local
+   publication reuses the publisher's deployment decision and normal target from committed state, checking only the
+   poller. Pushed offers and later sender attempts recheck deployment policy using the receiver's registry view.
 4. A positive acknowledgement means only that the hint is retained or already known in this acquisition. It must
    not await a poll, a start RPC or a lane message. A polling task may independently start immediately afterwards.
 5. If the queue home moved, return `NotHome`; the sender refreshes placement once from its trusted routing source.
@@ -106,7 +109,8 @@ Existing `StartWorkflowTask` request/response behaviour and limits remain unchan
 | `execution_home` | Home ID carried from publication/dispatch row; route directly, then owner compares with the home derived from loaded authority. | Invalid shape rejected; stale/wrong hint cannot authorize a start. |
 | `destination_home` | Expected queue-home ID, recomputed from queue placement by the receiver. | `NotHome` on mismatch or non-serving acquisition. |
 | `namespace_id`, selected queue name, queue kind | Full coordinates, workflow tasks only; no digest-only identity check. | `InvalidArgument` for malformed/unknown kind; final namespace/queue binding at start. |
-| Routing mode, deployment/build coordinates and version directive | Preserve absent versus present values; carry enough source routing information to evaluate deployment, redirect and compatible-set fallback. Re-resolve live policy; never freeze it in durable intent. | Malformed/inconsistent combinations rejected; lookup errors are transient. |
+| Routing mode, deployment/build coordinates and version directive | Preserve absent versus present values; carry the source directive for deployment fallback. Redirect and compatible-set conditions are unreachable under the [worker-versioning decision](../worker-deployments/reference/v1-v2-conformance-decision.md). Re-resolve live policy; never freeze it in durable intent. | Malformed/inconsistent combinations rejected; lookup errors are transient. |
+| `workflow_id`, `use_ramping_version` | Non-empty workflow identity and the source initial ramping choice; re-evaluate the same current/ramping selection as Tokeira's start path at the receiver using these inputs. | Malformed identity rejected; no durable write. |
 | Original `scheduled_at`, priority | Preserve committed scheduling order and existing priority semantics; bounded serialization. | Malformed value rejected; no new schedule time on retry. |
 | Optional `sticky_origin` | Original sticky queue, original normal queue, worker identity and original absolute deadline. Required for sticky delivery and retained on its normal fallback. Selected normal delivery clears sticky preference, not this origin/deadline. | Missing/inconsistent origin rejected; elapsed deadline returns `Expired`. |
 
@@ -117,7 +121,7 @@ combinations are rejected. A peer-authenticated hint still cannot bypass worker 
 | Response/outcome | Sender action |
 | --- | --- |
 | `Admitted`, `Known` | Finish this volatile attempt; durable intent remains until an authoritative transition changes it. |
-| `StickyUnavailable(reason)` | Resolve the original normal queue under current version routing and attempt normal delivery, retaining the deadline. Reasons distinguish recent-poller absence, deployment change, redirect and compatible-set default change. |
+| `StickyUnavailable(reason)` | Resolve the original normal queue under current version routing and attempt normal delivery, retaining the deadline. Reasons distinguish recent-poller absence and deployment change. Wire reasons 3 and 4 remain reserved and are not produced. |
 | `NotHome` | Refresh trusted placement and retry once within the overall attempt budget. |
 | `Full` | Drop the acceleration attempt; durable recovery will retry. |
 | `Expired` | Drop this hint; the execution owner's existing timeout machinery performs the transition. |
@@ -235,13 +239,18 @@ budgets count all sources, including discovered/local hints, and clean up droppe
 
 Recent availability is a physical sticky-queue observation at its home, including recently completed polls, not
 just an outstanding long poll. Preserve worker shutdown handling and use the ten-second Temporal window. Version
-checks use current registry data and the task's directive. Check all of these cases independently:
+checks use current registry data and the task's directive, with the same current/ramping selection as Tokeira's
+start path. Check the poller first (`AddWorkflowTask`, `service/matching/matching_engine.go @ v1.31.0`), then the
+deployment when a poller is present. Test both causes independently and together:
 
 1. Missing partition or no recent poller.
-2. Current deployment changed for this task's routing policy.
-3. Redirect changes the assigned build id.
-4. The assigned known build is no longer the default of its compatible version set. An unknown build alone is not
-   a negative availability result (`checkVersionForStickyAdd @ v1.31.0`).
+2. The current/ramping target deployment exists and differs from the directive's deployment, unless the task is
+   pinned or its directive has an assigned build (`getPhysicalQueuesForAdd`,
+   `service/matching/task_queue_partition_manager.go @ v1.31.0`).
+
+Redirect and compatible-set default changes cannot arise under the
+[worker-versioning decision](../worker-deployments/reference/v1-v2-conformance-decision.md).
+Wire reasons 3 and 4 remain reserved; neither is produced.
 
 The original normal queue is carried with the sticky origin, not substituted from an unrelated poll. On fallback,
 re-resolve that queue's current version target and route to **its** home, including when execution, sticky and normal
@@ -279,9 +288,12 @@ rescan. The memory implementation must have identical candidate, cursor and exha
 
 Start only after this execution acquisition is Active and repair is complete. For each candidate, verify ownership
 and cancellation, hydrate current state/routing, and compare the derived incarnation/intent before enqueueing.
-Stale rows are skipped; this read path performs no repairs or cross-home writes. Advance by the last examined key,
-including skipped/refused rows. Keep the cursor on an incomplete read, then retry with backoff. After exhaustion,
-wrap to the beginning on the next scheduled pass. New rows behind the cursor are found on that next traversal.
+Stale rows are skipped. Rows whose deadline has passed, or which were scheduled less than the sender's total
+budget ago, are skipped before hydration; the next pass revisits the recent ones. This read path performs no
+repairs or cross-home writes. Advance after each examined row, including skipped/refused rows. On an incomplete
+read, retain the exclusive cursor before the failing row and retry that row with backoff without repeating the
+completed prefix. After the last row use the page's last examined key; exhaustion wraps to the beginning on the
+next scheduled pass. New rows behind the cursor are found on that next traversal.
 
 Do not persist a sweep cursor or a successful-delivery bit. A new acquisition restarts from the beginning. A lost
 sticky push leaves its sticky row; a lost normal-fallback push also leaves that row. Both are revisited through the
@@ -344,6 +356,7 @@ Also report physical SQL statements and their purpose; combining statistics does
 Record queue-home and execution-owner loads separately, including admission caches, lane cache misses, preparation
 refreshes and OCC reloads. Cache hits count zero. Exclude history/registry reads, publication hydration and discovery
 hydration from the start metric, but report them separately so work moved outside the span remains visible.
+Off-lane fallback reloads use the `publication-fallback` scope; immediate local publication performs no run reload.
 
 | Remote start | Static baseline before lane misses/retries | Provisional conflict-free target |
 | --- | --- | --- |
@@ -402,9 +415,11 @@ SHALL remain usable by a current writer. Offer admission SHALL confer no write a
 
 ### Property 4: Sticky routing and deadline preservation
 
-For any poll history, version policy and delivery fault schedule, fallback SHALL agree with all four cited Temporal
-conditions, retain the original deadline/affinity, and reach the normal home when selected. Unknown compatible-set
-builds alone SHALL not cause fallback. A lost sticky or fallback push SHALL remain recoverable from durable state.
+For any poll history, version policy and delivery fault schedule, fallback SHALL agree with the two reachable
+Temporal conditions (no recent poller and changed deployment), retain the original deadline/affinity, and reach
+the normal home when selected. Pinned directives and assigned builds SHALL NOT trigger deployment fallback.
+A lost sticky or fallback push SHALL remain recoverable from durable state. The excluded conditions follow the
+[worker-versioning decision](../worker-deployments/reference/v1-v2-conformance-decision.md).
 
 **Validates: Requirements 2.5, 2.6, 2.7, 2.8, 3.4.**
 

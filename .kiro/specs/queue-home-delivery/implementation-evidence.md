@@ -345,3 +345,491 @@ lookups. Every recorded inline/split read total matched the baseline matrix. Sha
 after each new suite and 31 / 28 after the existing ordered-page suite.
 The additional ephemeral Aurora DSQL cluster was deleted and its absence verified. The review devbox was
 expired and its absence from the active inventory verified.
+
+
+## Part 4: push and sticky fallbacks
+
+### Activated behavior
+
+Committed normal workflow tasks now reach their queue home by local admission or authenticated push. The runtime
+owns the bounded sender; the edge implements its provider-agnostic sink using trusted placement, pooled channels
+and peer tokens. The handler acknowledges retention or an incarnation already known in this acquisition, without
+starting work or waiting for a lane. Engine wiring installs the sender only with a validated peer endpoint.
+No-peer modes deliver locally without constructing a sender, sink or endpoint.
+
+The sticky home checks its ten-second recent-poller window first, including completed polls without a waiter and
+worker shutdown. With a poller present it checks deployment change, using the same current/ramping selection as
+Tokeira's start path. Pinned tasks and directives with an assigned build bypass deployment fallback; a nil target
+is not unavailability. The internal request adds workflow identity and the initial ramping choice. Upstream protos
+and the existing routing hash are unchanged. Only no recent poller and deployment change are produced, following
+the [worker-versioning decision](../worker-deployments/reference/v1-v2-conformance-decision.md); wire reasons 3 and
+4 remain reserved. Poller-first ordering follows `AddWorkflowTask`, `service/matching/matching_engine.go @ v1.31.0`.
+
+Local publication uses committed state and its existing deployment decision, with no run reload or second policy
+lookup. One state-based resolver supplies the normal fallback target to both publication and the off-lane sender.
+The sender's fallback reload is attributed to `publication-fallback`, separately from start reads. Routing read
+failure is transient only after an available poller; it cannot override `NoRecentPoller`.
+
+Fallback reaches the original normal queue's home and keeps the sticky origin and absolute deadline, including
+the publisher's deployment-change branch. Same-home retargeting requires the receiving home's own decision;
+arrival order alone answers `Known`. Obsolete incarnations have their own outcome, distinct from expiry.
+No hint outcome writes authoritative state. Activity, speculative, eager, query and start delivery are unchanged.
+
+### Bounds and recovery seam
+
+The sender retains at most 1,024 entries and 16 MiB per node, counting active work as well as queued work and
+coalescing by incarnation. Sender and broker use the same capped serialized-envelope byte counter. Up to 32
+attempts run per node, at most eight per destination; source alternation and round-robin homes share capacity
+between publication and recovery. Each attempt includes routing, credentials and RPC within 500 ms; residence,
+retries and fallback share one second. At most three delivery attempts use bounded jitter, with one trusted
+placement refresh after `NotHome`. Acquisition loss cancels queued and active work. Fallback re-enters scheduling
+for its second destination. Saturation and delivery counters use bounded outcome/source/reason labels.
+
+The recovery source is available to the subsequent sticky sweep. That sweep will traverse durable sticky intent
+and republish through this sender after lost publication or placement changes. It is not active here. Ordinary
+discovery's period and limits, acquisition-driven admission retirement, storage formats and migrations are unchanged.
+
+### Regression inventory
+
+All generated properties below configure 100 cases each: sixteen runtime properties and three edge properties,
+1,900 cases in total. They use injected time or synchronization barriers, with no sleeps.
+
+| Property | Generated tests |
+| --- | --- |
+| 4 | `off_home_sticky_never_selects_local_fallback`, `sticky_conditions_and_controls`, `same_home_fallback_and_absolute_deadline`, `distinct_homes_fallback_and_lost_reply` |
+| 4 | `receiver_ramping_and_recent_window`, `local_fallback_with_failed_run_loads`, `no_poller_precedes_routing_failure`, `local_publication_reuses_routing` |
+| 7 | `receipts_and_interleaved_discovery`, `publishing_lane_paused_until_receipt`, `full_sticky_home_never_selects_fallback` |
+| 7 | `sender_retention_bounds`, `sender_fairness_and_concurrency`, `sender_budgets_refresh_and_failures`, `sender_acquisition_loss`, `obsolete_fallback_outcome` |
+| 4 / 7 | Edge `wire_routing_and_sticky_origin`, `handler_and_sink_in_process`, `sink_placement_and_destination_cap` |
+
+Test names carry the corresponding `property_4_` or `property_7_` prefix. The edge tests call the real handler and
+sink preparation in-process; they do not claim multi-runtime socket integration. Routing properties include each
+sticky cause alone and together, pinned/assigned controls, completed polls, worker shutdown, unavailable policy,
+repeated fallback and deadline-versus-selection races. Durable snapshots remain unchanged by delivery outcomes.
+
+Before implementation, the off-home sticky property admitted at the wrong home and the existing
+`sticky_dispatch_moves_to_normal_queue_when_current_target_changes` test lost its deadline. Both failed against
+main before their fixes. Before the review corrections, local fallback was lost when every run load failed and
+no poller with failed routing returned `Routing` instead of `StickyUnavailable(NoRecentPoller)`.
+
+
+### Validation
+
+The four-crate nextest run (`-p tokeira-runtime -p tokeira-storage -p tokeira-edge -p tokeira-engine --locked
+--offline --no-fail-fast`) passes on macOS: 2,472 tests passed and one was skipped. All nineteen generated
+routing/scheduling properties passed at 100 cases each, including the paused lane, ramping window and full broker.
+The two main-first regressions also pass. In-process edge checks need no listener. Real multi-runtime gRPC and live
+DSQL verification are recorded in Parts 7 and 8.
+
+Warning-denied workspace/all-targets clippy and the five-crate `dsql-integration` clippy command pass with
+`--locked --offline`. Nightly formatting and `git diff --check` pass. There is no dependency change.
+
+## Part 5: sticky recovery
+
+### Acquisition lifecycle and bounds
+
+Every successfully repaired execution-home acquisition installs one continuing sticky sweep, after activation.
+Controller acquisition, self-assigned recovery, seeded recovery and empty-store startup all use the same hook.
+Duplicate installation for one generation is ignored. The runtime shutdown tracker owns each sweep; cancellation,
+lease deadline or runtime shutdown drops its pending read, permit and cursor. A delayed predecessor cannot install
+work for its replacement. Only volatile per-home query pacing survives a local reacquisition; traversal restarts
+at the beginning.
+
+The sweep reads `list_sticky_workflow_dispatch(home, after, 64)`. FIFO node-wide capacity admits at most eight
+pages concurrently, including their serial hydration, and releases capacity before a home's next period. Each
+home starts at most one query per second, including across replacement. Each completed row advances the cursor,
+including skipped and refused candidates. A failed page query preserves the cursor; a failed hydration leaves
+the exclusive cursor immediately before that row, retaining progress through the completed prefix. Retries use
+two-second exponential backoff capped at 32 seconds. Individual reads time out after one second; there is no
+whole-page timeout that could repeatedly prevent later rows from being examined. After the last row the page's
+last examined key is used; exhaustion wraps on the following pass. No cursor, delivery bit, repair or cross-home
+write is persisted.
+
+Before hydration, rows with an expired deadline are skipped as `expired`, and rows younger than the sender's
+one-second total budget are skipped as `recent`. Both advance the cursor; wrapping revisits recent rows after
+publication has had its retry budget. Eligible candidates are hydrated off-lane and compared with their freshly
+derived dispatch row, including incarnation and intent. Current candidates become `WorkflowOffer`s with
+`PublicationSource::Recovery`. The existing sender coalesces and bounds publication and recovery together:
+1,024 entries, 16 MiB, 32 active attempts and eight per
+destination, alternating sources and scheduling homes fairly. No-sender modes invoke the same local receiver and
+resolve normal fallback with `fallback_target` using the already hydrated state, with one run load per pass.
+Both paths re-decide sticky availability and deployment policy even after an earlier normal fallback, and
+retain the original absolute deadline. This preserves the fallback/TTL rule in
+`service/history/transfer_queue_active_task_executor.go @ v1.31.0` and recent-poller check in
+`service/matching/matching_engine.go @ v1.31.0`.
+
+Hydration loads use `sticky-recovery`; only the sender's later fallback reloads under `sticky-recovery-fallback`,
+separate from `publication-fallback` and start reads. The three `tokeira_runtime_workflow_offer_sweep_*_total` counters record
+examined candidates, retained/queued/coalesced offers, and skips/incomplete reads by bounded reason. They carry no
+run or queue labels. Ordinary normal discovery, timeout transitions, admission/retirement, other task kinds,
+storage and migrations are unchanged.
+
+### Generated runtime evidence
+
+Fifteen properties configure 100 cases each (1,500 generated cases), using paused clocks and channel barriers.
+They exercise real memory-store pages, delivery components and the runtime activation hooks. Remote attempts use
+an in-process fault sink; real multi-runtime gRPC and live DSQL execution are recorded in Parts 7 and 8.
+
+| Property | Tests and coverage |
+| --- | --- |
+| 1 | `property_1_lost_sticky_row_recovered_before_deadline`: a full runtime recovers a committed sticky row without publication or normal discovery demand, in empty-start and self-assigned modes. |
+| 1 | `property_1_recovery_finite_fault_prefix_fair_suffix`: finite page/load failures and full broker capacity followed by a fair suffix offer every pending task; durable snapshots are unchanged. |
+| 4 | `property_4_recovery_lost_sticky_push` and `property_4_recovery_lost_normal_fallback_push`: separately dropped transport attempts, sender restart over a memory snapshot, queue-home replacement and finite delivery faults. Normal fallback has no useful sticky demand. |
+| 4 | `property_4_recovery_expiry_and_cleared_affinity`: expiry leaves state unchanged; cleared affinity and an authoritative timeout successor are recovered by normal discovery alone. |
+| 4 | `property_4_recovery_local_fallback_reuses_hydration`: sticky-unavailable rows reach the normal queue without a sender, with exactly one run load per pass and the original deadline. |
+| 8 | `property_8_recovery_cursor_wrap_and_saturation`: multiple pages, saturated sender, strict continuation past refused rows, and insertion behind the cursor found after wrapping. |
+| 8 | `property_8_recovery_fair_bounded_scheduler`: 9–24 homes, duplicate activation notifications, FIFO progress, eight-query bound, one-second pacing and tracked shutdown. |
+| 8 | `property_8_recovery_incomplete_read_retries`: page failures preserve the continuation; middle-row hydration failures retry that row after backoff without loading or offering completed rows again. Load counts and offer counts cover the fair suffix. |
+| 8 | `property_8_recovery_recent_rows_skip_hydration`: recent rows cause no run loads, advance the cursor and recover on a later pass at the sender budget boundary. |
+| 8 | `property_8_recovery_expired_rows_skip_hydration`: expired rows cause no run loads or offers and leave durable state unchanged for timeout processing. |
+| 8 | `property_8_recovery_cancelled_acquisition`: cancellation/deadline during a held read cannot populate replacement delivery; replacement starts from the beginning. |
+| 8 | `property_8_recovery_stale_candidate`: incarnation and affinity changes after page selection are skipped while cursor progress and other candidates are preserved. |
+| 8 | `property_8_recovery_reacquisition_restarts_at_head`: replacing a continued traversal resets its cursor while preserving one-second home pacing. |
+| 8 | `property_8_sticky_sweep_waits_for_repair`: seeded and explicit repair barriers prevent premature reads; interrupted repair never starts a sweep. |
+
+The main-first regression was executed against an archived `origin/main` at
+`b62607d69cf744ad0095ceea4ad3a6cdee4f84fa`, with only the new test and its module declaration added.
+`property_1_lost_sticky_row_recovered_before_deadline` failed: no normal offer arrived within three seconds,
+before the original 30-second deadline. The shrunk counterexample was `index = 0, seeded = false`, with seed
+`c7ae6fa1d9a36b220f97d3f742f169ed03b2fe746d4ab89d0d7d2eab1fe82728`. It passes with the sweep.
+The other new tests are implementation coverage, not additional claims of execution against main.
+
+The existing `restart_preserves_wft_completion_routing_metadata` test passed on main but assumed cold sticky work
+remained unavailable until timeout. Its manual timeout could now leave an older recovery hint ahead of the
+replacement task, which its task-only polling helper reports as a stale-sequence error. The updated test shuts
+down the old runtime, polls through the public activation path and asserts normal fallback of the original
+incarnation before its deadline, with full-history delivery. Start and timeout implementations are unchanged.
+
+### Validation
+
+- `cargo nextest run -p tokeira-runtime -p tokeira-storage -p tokeira-edge -p tokeira-engine --locked --offline --no-fail-fast`: 2,487 passed and one skipped, including the socket tests. All fifteen generated recovery properties pass at 100 cases each, as does the updated restart test.
+- `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`: passed.
+- `cargo clippy -p tokeira-storage -p tokeira-runtime -p tokeira-engine -p tokeira-edge -p tokeira-projection --features dsql-integration --all-targets --locked --offline -- -D warnings`: passed; this is compile/lint coverage, not live DSQL execution.
+- `cargo +nightly fmt --all -- --check`: passed.
+- `git diff --check`: passed.
+
+No dependency, lockfile, storage or migration change is included.
+
+
+## Part 6: start reads
+
+### Owner preparation and the disposable route
+
+Publication, pushed admission, normal discovery, sticky fallback and sticky recovery carry the execution home
+through the broker's volatile `TimestampedWorkflowTask` and `WorkflowOfferStamp`. The queue home forwards from
+that hint without hydrating the run. `DispatchableWorkflowTask`, durable backlog encodings, storage and migrations
+are unchanged. Legacy in-process callers and speculative offers without the hint retain their resolver, still
+attributed to `queue-home/resolve`. The start wire contract is unchanged: the queue home uses its volatile home
+hint to choose a destination, and the owner's serving gate checks the home derived from authoritative state.
+A node that does not serve that home refuses the request; a request reaching the real owner can start regardless
+of the hint used to reach it. The binding inventory fixture now also records offer fields 13 and 14 from Part 4,
+which it omitted.
+
+The authenticated owner calls `load_run_with_stats` once under `execution-owner/preparation`. Its non-serializable
+`PreparedWorkflowStart` supplies namespace and authoritative normal-queue binding, repeated sticky worker policy,
+metadata bounds, history size and target/version resolution. Query and update snapshots are frozen before the
+start; metadata, attachment bytes and protobuf framing must all fit before submission. Refusal does not mark an
+update sent or consume a query waiter. Successful delivery marks only the frozen update selection and binds the
+frozen queries on the execution owner, preserving their waiters.
+
+The existing submit path retains its admission-cache lookup. The lane uses its own state, serving acquisition and
+commit fence; it never installs the prepared image. The check captures registry routing config and stored routing
+config before submission. On every attempt the lane synchronously re-derives queue/sticky binding, version target
+and deployment transition using its own state and those captured inputs, with no routing read or await. A changed
+run identity or decision is refused, while an unrelated signal, activity completion or update admission can advance
+the transition sequence without refusing the start. The started event records the prepared history size.
+
+`service/history/api/recordworkflowtaskstarted/api.go @ v1.31.0` checks that the run is running, then checks the task's
+scheduled event ID, stamp and whether it has already started; it does not reject every mutable-state version change.
+Tokeira retains the kernel's task-incarnation check and the execution component's serving/fence checks. Every OCC
+conflict still evicts and reloads, followed by synchronous decision revalidation against that fresh state. Routing
+changes after preparation are not caught in the lane, matching main's pre-submit routing lookup. Pair commits,
+successor construction and update reconciliation are unchanged.
+
+### Memory matrix and read accounting
+
+The baseline below is the previously executed two-runtime gRPC measurement. The new eight-case matrix runs the
+same two runtimes, repository and authenticated owner handler twice: with an in-process `WorkflowTaskStarter`, and
+over real gRPC in `queue_home_delivery_exploration_read_baseline`, with the same assertions.
+Each cell is **zero conflicts / one rejected commit**. The target has not changed.
+
+| Phase | Normal warm before → after | Normal cold before → after | Sticky warm before → after | Sticky cold before → after |
+| --- | --- | --- | --- | --- |
+| `queue-home/resolve` | 1/1 → 0/0 | 1/1 → 0/0 | 1/1 → 0/0 | 1/1 → 0/0 |
+| `execution-owner/sticky-binding` | 0/0 → 0/0 | 0/0 → 0/0 | 1/1 → 0/0 | 1/1 → 0/0 |
+| `execution-owner/metadata` | 1/1 → 0/0 | 1/1 → 0/0 | 1/1 → 0/0 | 1/1 → 0/0 |
+| `execution-owner/resolve` | 1/1 → 0/0 | 1/1 → 0/0 | 1/1 → 0/0 | 1/1 → 0/0 |
+| `execution-owner/preparation` | 0/0 → 1/1 | 0/0 → 1/1 | 0/0 → 1/1 | 0/0 → 1/1 |
+| `execution-owner/admission-cache` | 0/0 → 0/0 | 1/1 → 1/1 | 0/0 → 0/0 | 1/1 → 1/1 |
+| `execution-owner/lane-cache-or-retry` | 0/1 → 0/1 | 0/1 → 0/1 | 0/1 → 0/1 | 0/1 → 0/1 |
+| **All logical loads** | **3/4 → 1/2** | **4/5 → 2/3** | **4/5 → 1/2** | **5/6 → 2/3** |
+
+No run read moved to publication or hydration. Immediate local publication still uses committed state with zero
+run reloads; normal discovery's existing live-routing hydration is now explicitly scoped as `normal-discovery`
+(exact routing requires no hydration). Sticky sweep hydration remains `sticky-recovery`; later sender fallbacks
+remain `publication-fallback` or `sticky-recovery-fallback`. These scopes are excluded and separately visible in
+the reports. Unexpected scopes fail the per-phase assertions. Lane ownership-generation refreshes, previously
+unscoped, now also count as `execution-owner/lane-cache-or-retry`; concurrent acquisition changes are separate from
+the stable-cache matrix. Live registry/policy queries and history fetches remain outside the run-load metric.
+When configured, preparation performs the existing `workflow_task_routing_config` and `load_deployment` lookups
+before submission and captures their results. Lane revalidation performs zero registry/deployment reads, including
+on OCC retry; the mandatory fresh run reload is unchanged. No routing read moved into the lane or into an excluded
+hydration scope. The unversioned baseline has no configured deployment repository.
+
+The live DSQL variant's per-phase logical and SQL expectations use the new matrix.
+One inline load still means one fast hot-state SELECT; one split load still means that SELECT plus BEGIN,
+snapshot SELECT, value-parts SELECT and COMMIT. Consequently the expected SQL totals are 1/2 warm and 2/3 cold
+for inline state, or 5/10 warm and 10/15 cold for split state, for both normal and sticky starts. The live run
+in Part 8 measured exactly these totals.
+
+### Regression evidence
+
+`queue_home_delivery_prepared_reads_in_process` was executed against an archived `origin/main` at
+`b62607d69cf744ad0095ceea4ad3a6cdee4f84fa`, with only the new socket-free test harness added. It failed on the first
+cold normal case: `(queue loads, owner loads) = (1, 3)`, expected `(0, 2)`. The report attributed one each to queue
+resolution, owner metadata, owner resolution and owner admission cache. This is the executed main-first regression;
+the additional generated properties are implementation coverage, not claims of execution against main.
+
+Six Property 6 tests configure 100 cases each:
+
+- `property_6_prepared_read_budget`: normal/sticky, warm/cold and zero/one injected conflict, asserting every phase.
+- `property_6_prepared_bindings_and_envelope`: a misrouted request is refused by the non-owner's serving gate without
+  a home wire field; eight forged request coordinates per case; query and update attachments one byte over a bounded
+  limit and exactly at it; refusal before commit, retained query waiter and one-time update send.
+- `property_6_prepared_state_and_policy_changes`: a signal committed after preparation, through the lane or a
+  competing durable writer, still allows the pending task to start. Warm stale state reloads after the real OCC
+  conflict. Per-phase read counts stay unchanged and the start records the prepared history size. A barrier changes
+  worker policy before repeated sticky authorization, which must use the authoritative normal queue.
+- `property_6_prepared_lane_uses_captured_routing`: routing changes after target resolution and before lane execution;
+  normal and sticky starts retain their captured policy, matching main's off-lane lookup.
+- `property_6_prepared_lane_refuses_changed_decision`: a real sticky reset or versioning override between preparation
+  and execution still refuses the start, on warm/cold state and after competing writes requiring OCC reload.
+- `property_6_offer_sources_carry_execution_home`: local publication, pushed admission, discovery and sticky fallback
+  carry the original execution home through dequeue. The existing 100-case
+  `property_4_recovery_local_fallback_reuses_hydration` additionally checks the sweep's home hint through dequeue.
+
+`prepared_start_does_not_read_deployments_in_lane` covers both normal and sticky starts. After preparation, a gated
+repository proves that a deployment read blocks. While that gate stays closed, the prepared start and a signal on
+another run using the same one-lane runtime both commit; any additional deployment read fails the test.
+
+The first generated test run exposed two fixture errors, both corrected: reusing an empty signal request ID
+caused legitimate deduplication instead of a state change, and `snapshot_pending_updates` deliberately retains
+sent-but-unaccepted transport. The corrected tests use unique signal request IDs and assert that a second
+non-retry send selection is empty while the transport and waiter remain available.
+
+### Validation
+
+- `cargo nextest run -p tokeira-runtime -p tokeira-storage -p tokeira-edge -p tokeira-engine -p tokeira-proto --locked --offline --no-fail-fast`: 2,505 passed and one skipped, including the socket tests. The eight-case in-process and gRPC matrices, all six 100-case Property 6 tests, the two-scenario gated-repository test and the extended 100-case sweep property pass.
+- `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`: passed.
+- `cargo clippy -p tokeira-storage -p tokeira-runtime -p tokeira-engine -p tokeira-edge -p tokeira-projection --features dsql-integration --all-targets --locked --offline -- -D warnings`: passed; compile/lint coverage only.
+- `cargo +nightly fmt --all -- --check`: passed.
+- `git diff --check`: passed.
+- `cargo run -p proto-sync --locked --offline -- generate`: passed. `WIRE_PARITY_CAPTURE=1 cargo nextest run -p tokeira-proto --test binding_inventory --locked --offline` updated the inventory; rerunning without the capture flag passed its one test.
+
+The task-specific socket tests are
+`grpc::workflow_dispatch::read_baseline::queue_home_delivery_exploration_read_baseline` and
+`grpc::workflow_dispatch::tests::forwarded_start_and_replies_use_owner_waiters_and_reauthenticate` in
+`tokeira-edge`. `queue_home_delivery_live_read_baseline` has updated logical/SQL expectations; its live run is
+recorded in Part 8. No dependency, lockfile, durable storage format or migration changed.
+
+
+## Part 7: fencing, preservation and multi-runtime integration
+
+`PeerOfferEndpoint` owns a system-clock default and a clock builder; its Unix-seconds method supplies verification
+and all three peer signing purposes. Engine startup installs the runtime clock before sharing the endpoint, so
+runtime deadlines and peer credentials use the same time without changing the 300-second lifetime, renewal below
+60 seconds, 30-second leeway or verification policy.
+
+### Fencing and preservation
+
+The engine's `peer::delivery_tests` harness follows the authenticated runtime/placement setup in
+`workflow_dispatch_read_baseline`. Real memory repositories retain their transition and lease checks; a forwarding
+repository adds independent recovery-reader gates, counted loads and a one-shot commit barrier. The generated
+fencing case takes execution ownership before a start or while its commit is held, checks that the former writer
+cannot commit, replays its still-current hint through the peer gate and starts under the new epoch. It checks
+repeated starts, forged future sequences and an obsolete sequence after a real worker failure creates a successor.
+The successor is completed before counting durable history: transient retry starts materialize at completion
+(`service/history/workflow/workflow_task_state_machine.go @ v1.31.0`). The movement case holds an offer on the wire
+while its queue acquisition is retired, then delivers the same current hint to the replacement home.
+
+`queue_home_delivery_live_fenced_starts` runs those same two helpers with a real DSQL repository, 100 schedules
+per helper, behind `dsql-integration` and `TOKEIRA_DSQL_TEST_DATABASE_URL`. Placement is prepared before leases;
+owned runs are terminated and purged and owned leases are relinquished. Its live run is recorded in Part 8.
+
+Five generated preservation tests use committed memory state and injected clocks: local priority ordering,
+eager/reserved start suppression, speculative update transport and rejection, query/update owner attachments with
+completion/failure forwarding, and acquisition reconstruction of sticky timeout/dispatch state. The deferred
+production delivery paths are unchanged; activity and outbound senders only use the endpoint's time source.
+
+### Wire scenarios
+
+Each node loads the protected file produced by the daemon's `generate` function using the path configuration it
+prints. The runtimes, interceptors and peer endpoints share a controllable clock. Advancing it by 331 seconds
+makes the original token fail at the actual wire gate while renewed tokens continue delivering between the same
+running nodes; the credential file remains unchanged. Public polling and remote starts use a worker authenticator
+and real gRPC, without an external identity provider. Offer fault injection drops requests or replies outside the
+unchanged authorization gate; all delivered requests traverse that gate.
+
+The focused wire set, including the generated fencing and attachment cases and the token boundary test, passes
+in 4.193 seconds. Per-test wall times from that run are:
+
+| Test | Seconds | Evidence |
+| --- | ---: | --- |
+| `grpc_normal_push_remote_start_and_renewal` | 0.231 | Two runtimes, both recovery readers blocked, remote start with zero queue loads and one warm owner load, expiry and renewal. |
+| `grpc_three_homes_no_recent_poller` | 0.286 | Separate execution, sticky and normal homes; immediate normal fallback retains affinity and deadline. |
+| `grpc_three_homes_deployment_changed` | 0.294 | Recent sticky poll; a barrier changes deployment between send and receive; a versioned public poll remotely starts the current version. |
+| `grpc_dropped_sticky_push_recovered_by_sweep` | 0.325 | Sticky attempts are lost; only the execution-home reader is released; sticky delivery recovers. |
+| `grpc_dropped_fallback_push_recovered_by_sweep` | 0.391 | Normal fallback attempts are lost; the sticky reader re-evaluates and republishes the original durable intent. |
+| `grpc_dropped_acknowledgement_recovered_by_sweep` | 0.442 | Admitted normal fallback loses its replies and volatile offer; the sticky reader recovers it. |
+| `grpc_dropped_normal_push_recovered_by_discovery` | 0.263 | Only normal discovery is released after all normal attempts are lost. |
+| `grpc_peer_policy_capacity_statuses_and_retirement` | 0.432 | Unauthenticated, wrong-purpose, invalid shape and size refusals; admitted/known/full/expired/not-home replies; 64 held authenticated handlers plus immediate retirement and replacement admission. |
+| `property_3_fenced_starts_and_delayed_hints` | 4.119 | 100 generated fenced takeover/incarnation schedules through gRPC, including cold and warm owner load counters. |
+| `property_3_queue_movement_mid_push` | 2.960 | 100 generated queue-movement schedules through gRPC. |
+| `property_9_query_update_and_reply_routing` | 2.024 | 100 generated attachment and reply-routing cases through the existing authenticated owner service. |
+| `peer_clock_expiry_and_renewal_through_gate` | 0.060 | Seven validity/renewal boundary requests plus a negative-epoch refusal. |
+
+The normal/sticky, warm/cold, zero/one-conflict socket read matrix additionally checks zero queue-home loads,
+one warm or two cold owner loads, and one fresh owner load per conflict. Reader barriers isolate prompt-push
+claims; they are released explicitly for recovery claims. No test sleeps or waits for real token expiry.
+
+### Property coverage and checkpoint
+
+Every generated test below configures 100 cases. Names grouped by prefix refer only to queue-home-delivery tests
+in the indicated modules; other features' similarly numbered tests are not included. Additional example and matrix
+coverage is stated separately.
+
+| Property | Executable coverage | Generated cases |
+| --- | --- | ---: |
+| 1 | `property_1_lost_sticky_row_recovered_before_deadline`, `property_1_recovery_finite_fault_prefix_fair_suffix`, `queue_home_delivery_exploration_normal_split_home`; normal push and discovery wire scenarios above | 3 × 100 |
+| 2 | Seven `property_2_*` tests in `broker::admission_tests` and `workflow_offers::tests`; wire capacity/deduplication scenario | 7 × 100 |
+| 3 | `property_3_fenced_starts_and_delayed_hints`, `property_3_queue_movement_mid_push` | 2 × 100 |
+| 4 | Eight runtime routing properties, edge `property_4_wire_routing_and_sticky_origin`, four `property_4_recovery_*` properties and `queue_home_delivery_exploration_sticky_split_home`; all five sticky wire scenarios | 14 × 100 |
+| 5 | Six `property_5_*` tests in `broker::admission_tests`; `queue_home_delivery_exploration_retirement_without_discovery` adds 100 deterministic schedules; wire retirement/replacement scenario | 6 × 100 |
+| 6 | `property_6_prepared_read_budget`, `property_6_prepared_bindings_and_envelope`, `property_6_prepared_state_and_policy_changes`, `property_6_prepared_lane_uses_captured_routing`, `property_6_prepared_lane_refuses_changed_decision`, `property_6_offer_sources_carry_execution_home`; socket and in-process matrices each add eight cases, lane routing gate adds two | 6 × 100 |
+| 7 | Eight runtime sender/admission scheduling properties, two edge sink properties, `generated_peer_policy`, `generated_material_agreement`, `generated_bounded_file_loading`, `generated_wire_shapes`, `generated_bounds_and_handler_saturation`; wire policy/capacity scenario | 15 × 100 |
+| 8 | Nine `property_8_*` recovery/repair properties and `queue_home_delivery_sticky_pages_memory` | 10 × 100 |
+| 9 | `property_9_local_delivery_priority`, `property_9_eager_and_reserved`, `property_9_speculative_updates`, `property_9_timeout_reconstruction_and_repair`, `property_9_query_update_and_reply_routing` | 5 × 100 |
+| 10 | `generated_renewal_and_rotation`, `generated_peer_file_restart_rotation`, `generated_upgrade_bootstrap`, `generated_no_peer_startup`, `generated_durable_peer_exemption`; expiry/renewal wire and gate examples | 5 × 100 |
+
+The connected normal and sticky exploration properties pass. Their explicit disconnected-sender negative controls
+fail the desired delivery assertion, and accept only the expected reason and the shrunk one-publication trace
+with ChaCha seed `[17; 32]`; these are expected-failure controls, not 100 passing cases. Retirement exploration
+passes with discovery stopped. Reader gates, commit/transport barriers and receipts synchronize the new races.
+
+Adjacent tracked `.proptest-regressions` files retain the generated fixture counterexamples. The corrected fixture
+assumptions concern request-ID deduplication, a cache warmed by preceding refusals, transient retry history and
+consistent clock stamping. They do not identify production defects. The only production change in this part is
+the shared peer clock; there is no new main-first defect claim. The earlier executed main-first regressions
+for lost sticky recovery and start-read budgets remain listed with their counterexamples above.
+
+
+### Validation
+
+All requested commands complete successfully:
+
+| Command | Result |
+| --- | --- |
+| `cargo nextest run -p tokeira-runtime -p tokeira-storage -p tokeira-edge -p tokeira-engine -p tokeira-proto --locked --offline --no-fail-fast` | 2,523 passed, one existing ignored measurement; about 100 seconds of test execution. |
+| `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | Passed. |
+| `cargo clippy -p tokeira-storage -p tokeira-runtime -p tokeira-engine -p tokeira-edge -p tokeira-projection --features dsql-integration --all-targets --locked --offline -- -D warnings` | Passed, including compilation of the live fencing/movement variant. |
+| `cargo +nightly fmt --all -- --check` | Passed after `cargo +nightly fmt --all`. |
+| `git diff --check` | Passed. |
+| `cargo nextest run -p tokeira-auth -p tokeira-config --locked --offline --no-fail-fast -E 'test(peer)'` | Eight passed; 2.497 seconds. |
+| `cargo nextest run -p tokeira-engine -p tokeira-edge --lib --locked --offline --no-fail-fast -E 'test(peer::delivery_tests) \| test(property_9_) \| test(peer_clock_expiry)'` | Twelve passed; 4.193 seconds. |
+
+The affected contract suites executed in the full run include storage `memory::workflow_dispatch_tests` and
+`workflow_dispatch::tests`; runtime `broker::admission_tests`, `workflow_offers::tests`, `workflow_delivery` routing,
+sender and sweep tests, `runtime::repair_tests`, completion eager/inline/heartbeat tests, prepared-start and sticky
+recovery tests, and `runtime_query`, `runtime_update` and `runtime_admitted_updates_after_restart`; edge
+`grpc::workflow_dispatch` read/prepared/attachment tests, `grpc::workflow_offer` gate/delivery tests and workflow
+service contracts; engine `peer::tests`, `embedded_dsql_tests` and the new wire harness; and the proto suite.
+`generated_no_peer_startup` and `generated_durable_peer_exemption` each pass 100 cases. The existing ignored test is
+`outbound::bug_condition_exploration_tests::child_fan_out_starts_every_child`, an opt-in measurement. The live DSQL
+runs are recorded in Part 8.
+
+
+## Part 8: live DSQL
+
+### Run and outcomes
+
+The live suites ran from a nextest archive of `c5f8df3dac8f4b325f0e58162bdbb420c16e2b60`, the Part 7 commit, on
+one ephemeral Aurora DSQL cluster created for this run. Each step was a separate nextest process under the
+`dsql-live` profile, one test at a time, with the URL gate set. All five tests passed:
+
+| Step | Test | Seconds | Executed evidence |
+| --- | --- | ---: | --- |
+| 1 | Edge `queue_home_delivery_live_read_baseline` | 1,138.6 | Sixteen real two-runtime gRPC starts, each logging its executed report. The time includes migrating the new database, whose 44 asynchronous index builds took 1,042.8 seconds. |
+| 2 | Storage `queue_home_delivery_live_sticky_pages` | 54.6 | All 100 generated bounded traversal and cursor-mutation cases on reserved homes. |
+| 2 | Storage `queue_home_delivery_live_sticky_query_plans` | 14.0 | Exact-builder plans at offsets 0, 512 and 960 over 8,192 fixture rows, 1,024 of them sticky in the selected home, with 64-key page assertions. |
+| 3 | Runtime `workflow_dispatch_live_acquisition_rejects_superseded_tracker_installs` | 8.3 | The unchanged acquisition-hook regression: real lease acquisition, interrupted recovery and refused old-generation installs. This change starts the sticky sweep from that hook. |
+| 4 | Engine `queue_home_delivery_live_fenced_starts` | 590.0 | 100 generated fencing schedules and 100 queue-home movements through real gRPC between runtimes with peer credentials. |
+
+The durations, the sixteen executed reports and the written plans show that every live body ran; none returned
+at its gate. The read baseline ran first, on the new database, as the runbook's isolated check, and deleted each
+run and released both leases between scenarios. The sticky fixtures then wrote and removed only their own keys on
+reserved homes. The acquisition check and the fenced starts each prepared the same eight homes, which placement
+accepts only while no lease is live, and each relinquished its leases; the fenced starts terminated and purged
+every run they made. After the last step the cluster was deleted and its absence confirmed.
+
+The rest of the shared-cluster campaign was not rerun. This change alters no storage code, schema or migration,
+and the two storage suites above cover the only storage read the sweep uses.
+
+### Start reads
+
+All sixteen scenarios measured exactly the Part 6 expectations. Each cell gives zero conflicts / one rejected
+commit:
+
+| Start | Cache | Logical loads | Inline read SQL | Split read SQL |
+| --- | --- | ---: | ---: | ---: |
+| Normal | Warm | 1 / 2 | 1 / 2 | 5 / 10 |
+| Normal | Cold | 2 / 3 | 2 / 3 | 10 / 15 |
+| Sticky | Warm | 1 / 2 | 1 / 2 | 5 / 10 |
+| Sticky | Cold | 2 / 3 | 2 / 3 | 10 / 15 |
+
+Every load was the owner's: preparation once, the admission cache once when cold, and one lane reload per
+rejected commit. The queue home loaded nothing. Before this change the same matrix measured 3/4 to 5/6 logical
+loads ([start-read baseline](#start-read-baseline)). Reads outside the start were reported separately, as
+designed: each normal scenario recorded one `normal-discovery` hydration, and five of the eight sticky scenarios
+recorded one `sticky-recovery` hydration by the execution home's sweep, depending on when it reached the row.
+Neither fallback scope recorded a read.
+
+### Sticky plans
+
+The three plans have the shapes recorded under [sticky page contract](#sticky-page-contract). Each selects
+candidates with an Index Only Scan of `idx_workflow_dispatch_sticky_home` under the limit. The first page has
+`shard_id` alone as its index condition; both continuations add `run_key > cursor` to that index condition.
+Each candidate's payload comes from an Index Only Scan of `workflow_dispatch_pkey` on `run_key`, and the final
+sort holds only the bounded page. The planner chose a plain nested loop here, where the earlier run showed a
+batched join; either way at most 64 payloads are fetched by primary key.
+
+### Limitations
+
+Each suite ran once. The first migrating test used 1,138.6 of the profile's 1,200 seconds, almost all of it
+waiting for index builds; the runbook now records that margin. The read counts come from a two-runtime fixture
+with one injected conflict, not from competing writers under load.
+
+
+## Finish bar
+
+The root AGENTS.md §10.4 bar ran on macOS at `6a135153`, the Part 8 commit, with a private target directory:
+
+| Command | Result |
+| --- | --- |
+| `cargo +nightly fmt --all -- --check` | Passed. |
+| `cargo lint --locked --offline -- -D warnings` | Passed. |
+| `cargo clippy -p tokeira-storage -p tokeira-runtime -p tokeira-engine -p tokeira-edge -p tokeira-projection --features dsql-integration --all-targets --locked --offline -- -D warnings` | Passed. |
+| `cargo check --workspace --locked --offline` | Passed. |
+| `cargo nextest run --workspace --locked --offline --no-fail-fast` | 4,638 passed; the three existing opt-in tests were skipped. One `tkr` test failed, as described below. |
+| `cargo test --workspace --doc --locked --offline` | Passed. |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --offline` | Passed. |
+| `cargo deny check bans licenses sources` | Passed. |
+| Offline `lychee` over every Markdown file, as in CI, also excluding `.tokeira-build` | No errors. |
+| `changie batch minor --dry-run` in a scratch copy | The fragment renders under Changed. |
+| `git diff --exit-code` and `git status` | Clean. |
+
+`tkr`'s `discovered_selection_creates_and_checks_with_the_generated_compose_provisioner` builds a nested workspace
+and expects its binary in that workspace's default target directory; the private target directory put it
+elsewhere. `tkr` depends on `tokeira-proto`, which this change extends, so the same test binary was run again
+without the override and passed. The skipped tests are `sdk_echo_roundtrip_against_post_sync_tokeirad`,
+`sdk_scoped_worker_roundtrip_uses_production_authorization_bootstrap` and
+`child_fan_out_starts_every_child`.

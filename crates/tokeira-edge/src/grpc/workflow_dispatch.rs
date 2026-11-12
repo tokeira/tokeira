@@ -390,12 +390,20 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
         if self.peer.is_none() {
             return Err(Status::unimplemented("unknown method"));
         }
-        super::workflow_offer::validate_request(request.get_ref())?;
-        // Legacy publication deduplicates before checking ownership and clears
-        // sticky deadlines on fallback. It cannot back a positive acknowledgement.
-        Err(Status::unavailable(
-            "workflow offer admission is not active",
-        ))
+        let deadline = tokio::time::Instant::now() + super::workflow_offer::OFFER_TIMEOUT;
+        let destination = ShardId(request.get_ref().destination_home);
+        let offer = super::workflow_offer::delivery::decode(request.get_ref())?;
+        let outcome = tokio::time::timeout_at(
+            deadline,
+            self.runtime
+                .admit_pushed_workflow_offer(&offer, destination),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("workflow offer deadline exceeded"))?
+        .map_err(super::workflow_offer::delivery::status)?;
+        Ok(Response::new(super::workflow_offer::delivery::response(
+            outcome,
+        )))
     }
 
     async fn start_workflow_task(
@@ -433,23 +441,28 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
             uuid::Uuid::from_slice(&request.run_key)
                 .map_err(|_| Status::invalid_argument("run_key must be a UUID"))?,
         );
-        if request.sticky {
-            let tokeira_kernel::LoadedRun::Existing(state) = tokeira_storage::read_probe::scope(
-                "execution-owner/sticky-binding",
-                self.runtime.repo().load_run(run_key),
-            )
+        let prepared = self
+            .runtime
+            .prepare_workflow_start(run_key)
             .await
-            .map_err(|_| Status::unavailable("workflow state could not be loaded"))?
-            else {
-                return Err(stale_offer_status());
-            };
+            .map_err(|error| {
+                if error.is::<tokeira_runtime::KernelRejected>() {
+                    stale_offer_status()
+                } else {
+                    Status::unavailable("workflow state could not be loaded")
+                }
+            })?;
+        let state = prepared.state();
+        if state.namespace_id != namespace_id {
+            return Err(stale_offer_status());
+        }
+        if request.sticky {
             // Sticky policy uses the supplied normal queue. Bind that coordinate
             // to authority before trusting the authorization decision above.
-            if state.namespace_id != namespace_id
-                || request
-                    .normal_task_queue
-                    .as_deref()
-                    .is_some_and(|normal| normal != state.task_queue.0)
+            if request
+                .normal_task_queue
+                .as_deref()
+                .is_some_and(|normal| normal != state.task_queue.0)
             {
                 return Err(stale_offer_status());
             }
@@ -481,15 +494,6 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
         // this request. Six bytes per source byte bounds JSON escaping, with
         // repeated queue fields included. Refuse even malformed restored state
         // before starting, rather than trusting only public admission limits.
-        let tokeira_kernel::LoadedRun::Existing(state) = tokeira_storage::read_probe::scope(
-            "execution-owner/metadata",
-            self.runtime.repo().load_run(run_key),
-        )
-        .await
-        .map_err(|_| Status::unavailable("workflow metadata unavailable"))?
-        else {
-            return Err(stale_offer_status());
-        };
         let metadata_bound = request
             .encoded_len()
             .saturating_mul(6)
@@ -501,7 +505,6 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
                 "internal workflow-start metadata exceeds reserved envelope space",
             ));
         }
-        drop(state);
         let mut decorations = WorkflowTaskDecorations {
             queries: queries
                 .iter()
@@ -520,7 +523,15 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
                 .map(|update| update_message(update, i64::MAX))
                 .collect(),
         };
-        if decorations.encode_proto().len() > self.attachment_limit {
+        let attachment_bytes = decorations.encode_proto().len();
+        // Account for both protobuf byte fields and their length prefixes too.
+        // The metadata bound includes all JSON escaping and start-only fields.
+        if attachment_bytes > self.attachment_limit
+            || metadata_bound
+                .saturating_add(attachment_bytes)
+                .saturating_add(20)
+                > MAX_START_RESPONSE_BYTES
+        {
             return Err(Status::resource_exhausted(
                 "internal workflow-start attachments exceed the 128 MiB envelope",
             ));
@@ -544,7 +555,7 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
         };
         let started = self
             .runtime
-            .start_forwarded_workflow_task(task, worker)
+            .start_prepared_workflow_task(prepared, task, worker)
             .await
             .map_err(|error| {
                 if error.is::<WorkflowOfferRejected>() {
@@ -599,6 +610,10 @@ impl<R: RunRepository + 'static> WorkflowTaskDispatch for WorkflowTaskDispatchGr
 #[cfg(test)]
 #[path = "workflow_dispatch_read_baseline.rs"]
 mod read_baseline;
+
+#[cfg(test)]
+#[path = "workflow_dispatch_prepared_tests.rs"]
+mod prepared_tests;
 
 #[cfg(test)]
 mod tests {
@@ -742,29 +757,62 @@ mod tests {
         assert_eq!(decoded.queries, decorations.queries);
     }
 
+    #[derive(Debug)]
+    struct AttachmentClock(time::OffsetDateTime);
+    impl tokeira_clock::Clock for AttachmentClock {
+        fn now(&self) -> time::OffsetDateTime {
+            self.0
+        }
+    }
+
     #[tokio::test]
     async fn forwarded_start_and_replies_use_owner_waiters_and_reauthenticate() {
-        let store = Arc::new(InMemoryStore::default());
-        let runtime = Arc::new(TokeiraRuntime::new(
+        forwarded_start_and_replies_case(2 * 1024 * 1024 - 1024, b"query-input".to_vec()).await;
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(100))]
+        // Feature: queue-home-delivery, Property 9: binary query/update attachments retain owner waiters and completion/failure forwarding semantics.
+        #[test]
+        fn property_9_query_update_and_reply_routing(update_bytes in 0usize..4096, query_bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256)) {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+                .block_on(forwarded_start_and_replies_case(update_bytes, query_bytes));
+        }
+    }
+
+    async fn forwarded_start_and_replies_case(update_bytes: usize, query_bytes: Vec<u8>) {
+        let clock: Arc<dyn tokeira_clock::Clock> = Arc::new(AttachmentClock(
+            time::OffsetDateTime::from_unix_timestamp(2_000_000_000).unwrap(),
+        ));
+        let store = Arc::new(InMemoryStore::default().with_clock(clock.clone()));
+        let runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
             store.clone(),
             1,
             LaneConfig::default(),
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Arc::new(tokeira_runtime::NoopNexusHttpClient),
+            Default::default(),
+            1,
+            "attachment-owner".into(),
+            "127.0.0.1:0".into(),
+            true,
+            None,
+            clock.clone(),
         ));
         let context = EdgeContext {
             request_id: crate::request_id::RequestId::new("forwarded-start"),
             claims: None,
             auth_principal: None,
             namespace: None,
-            received_at: time::OffsetDateTime::now_utc(),
+            received_at: clock.now(),
             is_long_poll: false,
         };
-        let request = crate::translate::to_internal::start_request(
-            start_dto(),
-            &context,
-            time::OffsetDateTime::now_utc(),
-        );
+        let request =
+            crate::translate::to_internal::start_request(start_dto(), &context, clock.now());
         let key = request.run_key;
         let queue = QueueKey {
             namespace_id: request.namespace_id,
@@ -784,12 +832,8 @@ mod tests {
                 execution.clone(),
                 "owner-update".into(),
                 "update-handler".into(),
-                tokeira_types::Payloads(vec![tokeira_types::Payload::new(vec![
-                    255;
-                    2 * 1024 * 1024
-                        - 1024
-                ])]),
-                tokeira_types::RequestContext::unattributed(time::OffsetDateTime::now_utc()),
+                tokeira_types::Payloads(vec![tokeira_types::Payload::new(vec![255; update_bytes])]),
+                tokeira_types::RequestContext::unattributed(clock.now()),
                 time::Duration::seconds(30),
                 tokeira_runtime::UpdateWaitPolicy::Admitted,
                 64,
@@ -808,18 +852,17 @@ mod tests {
             result = &mut update_reply => panic!("update completed before the worker replied: {result:?}"),
             () = std::future::ready(()) => {},
         }
-        let query_reply = buffer_query(&runtime, key, 0, b"query-input".to_vec());
+        let query_reply = buffer_query(&runtime, key, 0, query_bytes.clone());
         let namespaces = Arc::new(InMemoryNamespaceCache::new());
         namespaces
             .insert(ResolvedNamespace::active("default"))
             .await
             .unwrap();
         let auth = Arc::new(WorkerAuth(AtomicUsize::new(0)));
-        let interceptors = Arc::new(EdgeInterceptors::configured(
-            namespaces.clone(),
-            auth.clone(),
-            false,
-        ));
+        let interceptors = Arc::new(
+            EdgeInterceptors::configured(namespaces.clone(), auth.clone(), false)
+                .with_clock(clock.clone()),
+        );
         let pending = crate::PendingQueryStore::default();
         let workflow_service = WorkflowService::new_with_buffered_queries_and_history_wait_registry(
             Arc::new(crate::grpc::runtime_adapter::RuntimeAdapter::new(
@@ -991,7 +1034,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             update_wire.input.unwrap().args.unwrap().payloads[0].data,
-            vec![255; 2 * 1024 * 1024 - 1024]
+            vec![255; update_bytes]
         );
         assert!(runtime.pending_update_transports(key, false).is_empty());
         assert!(
@@ -1001,7 +1044,7 @@ mod tests {
         );
         assert_eq!(decorations.queries.len(), 1);
         let (query_id, query) = decorations.queries.into_iter().next().unwrap();
-        assert_eq!(query.query_args.0[0].data, b"query-input");
+        assert_eq!(query.query_args.0[0].data, query_bytes);
         assert!(
             runtime.buffered_queries().has_buffered(key),
             "delivery must retain the query until answered"
@@ -1019,7 +1062,7 @@ mod tests {
         assert!(stale.is::<WorkflowOfferRejected>());
         assert_eq!(store.snapshot().await.unwrap(), committed);
         assert_eq!(auth.0.load(Ordering::SeqCst), 5);
-        let queue_runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_shards(
+        let queue_runtime = Arc::new(TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
             store.clone(),
             1,
             LaneConfig::default(),
@@ -1032,7 +1075,10 @@ mod tests {
             Default::default(),
             1,
             "queue-owner".into(),
+            "127.0.0.1:0".into(),
             false,
+            None,
+            clock.clone(),
         ));
         let queue_service = WorkflowService::new_with_buffered_queries_and_history_wait_registry(
             Arc::new(crate::grpc::runtime_adapter::RuntimeAdapter::new(
@@ -1112,11 +1158,8 @@ mod tests {
         );
         let mut future_dto = start_dto();
         future_dto.workflow_id = "future-query-barrier".into();
-        let future_request = crate::translate::to_internal::start_request(
-            future_dto,
-            &context,
-            time::OffsetDateTime::now_utc(),
-        );
+        let future_request =
+            crate::translate::to_internal::start_request(future_dto, &context, clock.now());
         let future_key = future_request.run_key;
         runtime.start_workflow(future_request).await.unwrap();
         let _future_reply = buffer_query(&runtime, future_key, i64::MAX, Vec::new());
@@ -1164,11 +1207,8 @@ mod tests {
         )));
         let mut large_dto = start_dto();
         large_dto.workflow_id = "oversized-attachments".into();
-        let large_request = crate::translate::to_internal::start_request(
-            large_dto,
-            &context,
-            time::OffsetDateTime::now_utc(),
-        );
+        let large_request =
+            crate::translate::to_internal::start_request(large_dto, &context, clock.now());
         let large_key = large_request.run_key;
         runtime.start_workflow(large_request).await.unwrap();
         let _large_reply = buffer_query(&runtime, large_key, 0, vec![255; 1_100_000]);
@@ -1234,7 +1274,7 @@ mod tests {
             .unwrap();
     }
 
-    fn authorized_reply<T>(value: T) -> Request<T> {
+    pub(super) fn authorized_reply<T>(value: T) -> Request<T> {
         let mut request = Request::new(value);
         request
             .metadata_mut()
@@ -1312,7 +1352,7 @@ mod tests {
         }
     }
 
-    fn buffer_query(
+    pub(super) fn buffer_query(
         runtime: &TokeiraRuntime<InMemoryStore>,
         key: RunKey,
         barrier: i64,
@@ -1329,7 +1369,7 @@ mod tests {
                     query_args: tokeira_types::Payloads(vec![tokeira_types::Payload::new(data)]),
                     required_barrier: barrier,
                     enqueued_at: std::time::Instant::now(),
-                    deadline: time::OffsetDateTime::now_utc() + time::Duration::minutes(1),
+                    deadline: runtime.clock().now() + time::Duration::minutes(1),
                     response_tx,
                 },
             )
@@ -1368,7 +1408,7 @@ mod tests {
             cron_schedule: None,
             run_key: None,
             run_id: None,
-            now: Some(time::OffsetDateTime::now_utc()),
+            now: None,
         }
     }
 }

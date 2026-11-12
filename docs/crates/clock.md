@@ -42,11 +42,14 @@ One node holds one clock, and everything below reads that clock.
   stamped the deadline it waits for.
 - **Edge.** `EdgeInterceptors::with_clock` sets the edge's clock. Every request
   stamps its `received_at` and its command times from it, and so does
-  `NexusHttpHandler::with_clock`.
+  `NexusHttpHandler::with_clock`. `PeerOfferEndpoint::with_clock` sets the
+  clock that peer tokens are signed and checked on.
 - **Engine.** `TokeiradHandle::start_in_memory_with_transport` takes a clock
   and gives it to the node's runtime, edge and store handle. The CHASM plane
   reads it too, unless an embedder sets `EngineBuilder::clock`. Every other
-  entry point uses `SystemClock`.
+  entry point uses `SystemClock`. Whatever the entry point, the node's peer
+  endpoint takes the runtime's clock: a sender signs a token on its node's
+  clock, and the receiver checks it on its own.
 
 ## What stays on the host's clock
 
@@ -57,7 +60,6 @@ stamped and judged on host clocks only, or never judged at all:
   with a deadline.
 - Membership budgets. The controller stamps `valid_until`, and the node judges
   it, each on its own host's clock.
-- Peer tokens. The signing and verifying nodes both read their host's clock.
 - Health `observed_at`, Nexus endpoint timestamps and task-queue config
   `update_time`, which are reported and never judged.
 - Cron schedule validation at the edge, and log throttling for run growth.

@@ -2,8 +2,9 @@
 //!
 //! The gate runs before decoding and shares its semaphore across connections.
 //! Public start forwarding retains its own authorization and response budget.
-//! Valid offers remain unavailable until acquisition-scoped broker admission can
-//! back an acknowledgement; this module must never call the legacy publisher.
+//! Valid offers enter acquisition-scoped runtime admission without starting work.
+
+pub mod delivery;
 
 use std::{
     fmt,
@@ -11,7 +12,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use http::{HeaderMap, Request, Response};
@@ -45,8 +46,8 @@ pub const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Validated bootstrap capability. Construction is restricted to peer startup.
 pub struct PeerOfferEndpoint {
     verifier: PeerVerifier,
-    // Retain validated signing material for the later bounded sender. No sender
-    // or renewal task is activated by installing the wire contract.
+    clock: Arc<dyn tokeira_clock::Clock>,
+    // Only a validated endpoint can supply the sender's purpose-specific signer.
     signer: PeerSigner,
     handlers: Arc<Semaphore>,
     outbound_handlers: Arc<Semaphore>,
@@ -64,11 +65,25 @@ impl PeerOfferEndpoint {
     pub fn new(verifier: PeerVerifier, signer: PeerSigner) -> Self {
         Self {
             verifier,
+            clock: tokeira_clock::system_clock(),
             signer,
             handlers: Arc::new(Semaphore::new(MAX_OFFER_HANDLERS)),
             outbound_handlers: Arc::new(Semaphore::new(32)),
             activity_start_handlers: Arc::new(Semaphore::new(32)),
         }
+    }
+
+    /// Share the runtime's wall clock so dispatch deadlines and token validity
+    /// advance together, including when the node runs on simulated time.
+    pub fn with_clock(mut self, clock: Arc<dyn tokeira_clock::Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Unix seconds for every peer signing and verification purpose.
+    /// A clock before the Unix epoch fails closed instead of wrapping.
+    pub fn unix_seconds(&self) -> Result<u64, std::num::TryFromIntError> {
+        self.clock.now().unix_timestamp().try_into()
     }
 
     /// Validated local signer; each internal purpose uses its distinct audience.
@@ -208,6 +223,7 @@ where
     }
 
     fn call(&mut self, request: Request<B>) -> Self::Future {
+        let offer = request.uri().path() == OFFER_PATH;
         let outbound = request.uri().path() == OUTBOUND_PATH;
         let activity_start = request.uri().path() == super::activity_dispatch::START_PATH;
         if request.uri().path() != OFFER_PATH && !outbound && !activity_start {
@@ -221,12 +237,9 @@ where
             } else {
                 OFFER_TIMEOUT
             };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|v| v.as_secs());
-        let entered = match (&self.peer, now) {
-            (None, _) => Err(Status::unimplemented("unknown method")),
-            (Some(peer), Ok(now)) => {
+        let entered = match self.peer.as_ref().map(|peer| (peer, peer.unix_seconds())) {
+            None => Err(Status::unimplemented("unknown method")),
+            Some((peer, Ok(now))) => {
                 if activity_start {
                     peer.enter_activity_start(request.headers(), now)
                 } else if outbound {
@@ -239,7 +252,12 @@ where
         };
         let permit = match entered {
             Ok(permit) => permit,
-            Err(status) => return Box::pin(async move { Ok(status.into_http()) }),
+            Err(status) => {
+                if offer {
+                    record_failure(&status);
+                }
+                return Box::pin(async move { Ok(status.into_http()) });
+            }
         };
         let response = self.inner.call(request);
         Box::pin(async move {
@@ -253,11 +271,19 @@ where
                 {
                     // Tonic's pre-decode message cap reports OutOfRange. Offer
                     // overload uses ResourceExhausted; Start keeps its mapping.
-                    Ok(Status::resource_exhausted("offer request limit exceeded").into_http())
+                    let status = Status::resource_exhausted("offer request limit exceeded");
+                    if offer {
+                        record_failure(&status);
+                    }
+                    Ok(status.into_http())
                 }
                 Ok(result) => result,
                 Err(_) => {
-                    Ok(Status::deadline_exceeded("offer attempt deadline exceeded").into_http())
+                    let status = Status::deadline_exceeded("offer attempt deadline exceeded");
+                    if offer {
+                        record_failure(&status);
+                    }
+                    Ok(status.into_http())
                 }
             }
         })
@@ -331,6 +357,14 @@ where
     }
 }
 
+pub(crate) fn record_failure(status: &Status) {
+    metrics::counter!(tokeira_runtime::metrics::WORKFLOW_OFFER_DELIVERY_TOTAL, "source" => "pushed", "outcome" => match status.code() {
+        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => "authentication",
+        tonic::Code::ResourceExhausted => "capacity", tonic::Code::DeadlineExceeded => "deadline",
+        tonic::Code::InvalidArgument => "invalid", _ => "transport",
+    }).increment(1);
+}
+
 fn invalid() -> Status {
     Status::invalid_argument("malformed workflow offer")
 }
@@ -365,7 +399,8 @@ pub fn validate_request(value: &OfferWorkflowTaskRequest) -> Result<(), Status> 
             return Err(invalid());
         }
     }
-    if value.logical_seq == 0 || value.logical_seq > i64::MAX as u64 {
+    if value.logical_seq == 0 || value.logical_seq > i64::MAX as u64 || value.workflow_id.is_empty()
+    {
         return Err(invalid());
     }
     let selected = queue(value.selected_queue.as_ref())?;
@@ -382,7 +417,7 @@ pub fn validate_request(value: &OfferWorkflowTaskRequest) -> Result<(), Status> 
     let directive = value.version_directive.as_ref().ok_or_else(invalid)?;
     let behavior = OfferVersionBehavior::try_from(directive.behavior).map_err(|_| invalid())?;
     if behavior == OfferVersionBehavior::Unspecified
-        || directive.build_id.is_some() && directive.deployment.is_none()
+        || directive.build_id.is_some() != directive.deployment.is_some()
         || behavior == OfferVersionBehavior::Pinned
             && (directive.deployment.is_none() || directive.build_id.is_none())
     {
@@ -439,6 +474,11 @@ pub fn validate_response(value: &OfferWorkflowTaskResponse) -> Result<(), Status
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        sync::atomic::{AtomicI64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use bytes::Bytes;
     use http_body_util::{BodyExt, Full};
     use proptest::prelude::*;
@@ -449,6 +489,64 @@ mod tests {
     };
 
     struct WireFixture;
+
+    #[derive(Debug)]
+    struct TokenClock(AtomicI64);
+
+    impl tokeira_clock::Clock for TokenClock {
+        fn now(&self) -> time::OffsetDateTime {
+            time::OffsetDateTime::from_unix_timestamp(self.0.load(Ordering::SeqCst)).unwrap()
+        }
+    }
+
+    // Feature: queue-home-delivery, Property 10: renewal and verification share the node clock.
+    #[tokio::test]
+    async fn peer_clock_expiry_and_renewal_through_gate() {
+        let clock = Arc::new(TokenClock(AtomicI64::new(10_000)));
+        let peer = Arc::new(endpoint().with_clock(clock.clone()));
+        let first = peer
+            .signer()
+            .token_at(peer.unix_seconds().unwrap())
+            .unwrap();
+        let server = WorkflowTaskDispatchServer::new(WireFixture);
+        let mut gate = OfferGate::new(server, Some(peer.clone()));
+        for (now, renew, expected) in [
+            (10_000, false, "14"),
+            (10_240, true, "14"),
+            (10_241, true, "14"),
+            (10_329, false, "14"),
+            (10_330, false, "16"),
+            (10_331, false, "16"),
+            (10_331, true, "14"),
+        ] {
+            clock.0.store(now, Ordering::SeqCst);
+            let token = if renew {
+                peer.signer()
+                    .token_at(peer.unix_seconds().unwrap())
+                    .unwrap()
+            } else {
+                first.clone()
+            };
+            if renew {
+                assert_eq!(
+                    token.authorization() == first.authorization(),
+                    now == 10_240
+                );
+            }
+            let request = Request::builder()
+                .uri(OFFER_PATH)
+                .header("content-type", "application/grpc")
+                .header("authorization", token.authorization())
+                .body(framed(request().encode_to_vec()))
+                .unwrap();
+            let response = gate.call(request).await.unwrap();
+            // Unavailable is the fixture handler's reply, proving the real
+            // gate verified the signature and policy before reaching it.
+            assert_eq!(response.headers()["grpc-status"], expected);
+        }
+        clock.0.store(-1, Ordering::SeqCst);
+        assert!(peer.unix_seconds().is_err());
+    }
 
     #[tonic::async_trait]
     impl WorkflowTaskDispatch for WireFixture {
@@ -670,6 +768,7 @@ mod tests {
 
     fn request() -> OfferWorkflowTaskRequest {
         OfferWorkflowTaskRequest {
+            workflow_id: "workflow".into(),
             run_key: Uuid::new_v4().as_bytes().to_vec(),
             namespace_id: Uuid::new_v4().as_bytes().to_vec(),
             logical_seq: 1,

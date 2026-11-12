@@ -6,6 +6,7 @@ mod read_counts;
 use std::{
     collections::BTreeMap,
     sync::atomic::{AtomicUsize, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use proptest::prelude::*;

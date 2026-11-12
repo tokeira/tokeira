@@ -29,7 +29,9 @@ impl std::io::Write for PlacementLogCapture {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Point {
+pub(crate) enum Point {
+    StickyPage,
+    StickyRead,
     Load,
     Loaded,
     StatsLoad,
@@ -69,14 +71,17 @@ pub(crate) enum OutboundRead {
 pub(crate) struct Repo {
     pub(crate) refuse_pair: AtomicBool,
     pub(crate) lose_publication_reply: AtomicBool,
-    pub(super) inner: InMemoryStore,
+    pub(crate) inner: InMemoryStore,
+    pub(crate) sticky_gate: Mutex<Option<Arc<StickyPageGate>>>,
+    pub(crate) observed_loads: Mutex<Option<Vec<RunKey>>>,
+    pub(crate) fail_run_load: Mutex<Option<RunKey>>,
     pub(crate) outbound_reads: Mutex<Vec<OutboundRead>>,
     pub(crate) timer_reads: Mutex<Vec<ShardId>>,
     pub(crate) timer_fixture: Mutex<Option<BTreeMap<ShardId, Vec<DueTimer>>>>,
     pub(crate) timer_deletes: Mutex<Vec<DueTimer>>,
     pub(crate) outbound_read: tokio::sync::Notify,
     pub(super) history_reads: AtomicUsize,
-    pub(super) fail: Mutex<Option<Point>>,
+    pub(crate) fail: Mutex<Option<Point>>,
     conflicts: AtomicUsize,
     repair_attempts: AtomicUsize,
     repair_fences: Mutex<Vec<WriteFence>>,
@@ -114,7 +119,7 @@ impl Repo {
         }
     }
 
-    pub(super) fn pause(&self, point: Point) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    pub(crate) fn pause(&self, point: Point) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (entered, observed) = oneshot::channel();
         let (resume, waiting) = oneshot::channel();
         *self.pause.lock().unwrap() = Some(Pause {
@@ -821,6 +826,12 @@ impl RunRepository for Repo {
 
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
         self.loads.fetch_add(1, Ordering::SeqCst);
+        if let Some(reads) = self.observed_loads.lock().unwrap().as_mut() {
+            reads.push(run_key);
+        }
+        if *self.fail_run_load.lock().unwrap() == Some(run_key) {
+            anyhow::bail!("injected run hydration failure");
+        }
         self.hit(Point::Load).await?;
         let result = self.inner.load_run(run_key).await?;
         self.hit(Point::Loaded).await?;
@@ -1089,6 +1100,26 @@ impl RunRepository for Repo {
             .list_activity_dispatch_home_page(home, after, limit)
             .await?;
         self.hit(Point::ActivityHomeFinished).await?;
+        Ok(page)
+    }
+
+    async fn list_sticky_workflow_dispatch(
+        &self,
+        home: ShardId,
+        after: Option<RunKey>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<StickyWorkflowDispatchPage> {
+        let gate = self.sticky_gate.lock().unwrap().clone();
+        let _guard = match gate {
+            Some(gate) => Some(gate.enter(home, after, limit.get()).await),
+            None => None,
+        };
+        self.hit(Point::StickyPage).await?;
+        let page = self
+            .inner
+            .list_sticky_workflow_dispatch(home, after, limit)
+            .await?;
+        self.hit(Point::StickyRead).await?;
         Ok(page)
     }
 
@@ -2198,4 +2229,39 @@ async fn completion_inline_scope_is_rechecked_after_occ_changes_target() {
     );
     assert_eq!(new_state.sticky.unwrap().sticky_queue.0, "a-cache");
     stop(&runtime).await;
+}
+
+#[derive(Debug)]
+pub(crate) struct StickyPageGate {
+    pub(crate) entered: tokio::sync::mpsc::UnboundedSender<(
+        ShardId,
+        Option<RunKey>,
+        u32,
+        tokio::time::Instant,
+        oneshot::Sender<()>,
+    )>,
+    pub(crate) active: AtomicUsize,
+}
+struct StickyPageGuard(Arc<StickyPageGate>);
+impl Drop for StickyPageGuard {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl StickyPageGate {
+    async fn enter(
+        self: &Arc<Self>,
+        home: ShardId,
+        after: Option<RunKey>,
+        limit: u32,
+    ) -> StickyPageGuard {
+        self.active.fetch_add(1, Ordering::SeqCst);
+        let guard = StickyPageGuard(self.clone());
+        let (resume, waiting) = oneshot::channel();
+        self.entered
+            .send((home, after, limit, tokio::time::Instant::now(), resume))
+            .unwrap();
+        let _ = waiting.await;
+        guard
+    }
 }

@@ -4,11 +4,7 @@
 //! commit. Native payload fields stay binary. A retry retains the match UUID;
 //! neither a reply nor its routing coordinates can authorize another task.
 
-use std::{
-    fmt,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{fmt, sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
@@ -250,7 +246,7 @@ impl ActivityTaskStarter for RemoteActivityTaskStarter {
         validate_request(&body)?;
         let mut headers = context.headers;
         headers.remove(PEER_HEADER);
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let now = self.peer.unix_seconds()?;
         let token = self.peer.signer().activity_start_token_at(now)?;
         headers.insert(PEER_HEADER, token.authorization().parse()?);
         let mut rpc = Request::new(body);

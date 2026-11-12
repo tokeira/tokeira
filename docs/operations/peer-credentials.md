@@ -64,9 +64,11 @@ fixed diagnostics.
 
 ## Internal wire contract
 
-`OfferWorkflowTask` is installed only for peer-capable daemons. Valid authenticated requests currently return
-`Unavailable`: the existing broker cannot yet back admission acknowledgements. No request calls its publisher or
-writes durable state. No outbound sender is activated by this change.
+`OfferWorkflowTask` is installed only for peer-capable daemons. A run's execution home pushes each workflow task it
+publishes to the task queue's home, which admits the task to its broker or refuses it with one of the outcomes
+below. Requests never write durable state. A sticky refusal sends the task to its normal queue's home with the
+original deadline, and a wrong home is retried once after a placement refresh. A full broker, or a lost request or
+reply, leaves the task to the execution home's sticky sweep or to the queue home's discovery.
 
 | Field | Shape policy |
 | --- | --- |
@@ -78,7 +80,8 @@ writes durable state. No outbound sender is activated by this change.
 | `version_directive` | Known behavior; pinned requires deployment/build. Assigned build remains optional source routing information. |
 | `scheduled_at`, `priority` | Valid protobuf timestamp; finite nonnegative fairness weight. Original scheduling time and priority are preserved. |
 | `sticky_origin` | Required for sticky delivery; both original queues, worker identity and valid deadline at or after scheduling are required. Sticky selection matches the original sticky queue; normal fallback retains the original normal name and deadline. |
-| Outcome | Known `Admitted`, `Known`, `StickyUnavailable`, `NotHome`, `Full` or `Expired`; a known reason is present exactly for `StickyUnavailable`. No outcome is emitted before admission is activated. |
+| `workflow_id`, `use_ramping_version` | Nonempty workflow ID and the version directive's ramping flag: inputs to the receiver's own current or ramping version selection. |
+| Outcome | Known `Admitted`, `Known`, `StickyUnavailable`, `NotHome`, `Full` or `Expired`; a known reason is present exactly for `StickyUnavailable`. |
 
 Unknown enum values and inconsistent shapes are `InvalidArgument`. Unknown protobuf fields use normal protobuf
 compatibility rules but still count against the pre-decode frame bound. Offers have a 64 KiB request budget,

@@ -9,6 +9,7 @@ use crate::outbound_upgrade::{
     validate_write,
 };
 use anyhow::{Result, ensure};
+use std::sync::atomic::Ordering;
 use time::OffsetDateTime;
 
 pub(super) fn ready(store: &StoreState) -> bool {
@@ -35,6 +36,14 @@ fn live_leases(store: &StoreState, now: OffsetDateTime) -> u64 {
 }
 
 impl InMemoryStore {
+    /// Compute readiness under the lock that `store` came from, and record it
+    /// for the readiness check that doesn't wait for that lock.
+    pub(super) fn record_outbound_ready(&self, store: &StoreState) -> bool {
+        let outbound_ready = ready(store);
+        self.outbound_ready.store(outbound_ready, Ordering::Release);
+        outbound_ready
+    }
+
     pub(super) async fn memory_outbound_upgrade_status(&self) -> Result<OutboundUpgradeStatus> {
         let store = self.inner.lock().await;
         Ok(OutboundUpgradeStatus {
@@ -140,6 +149,7 @@ impl InMemoryStore {
             store.runs.insert(write.state.run_key, write.state);
         }
         store.outbound_upgrade = Some(next);
+        self.record_outbound_ready(&store);
         Ok(())
     }
 }

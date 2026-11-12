@@ -117,6 +117,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub struct InMemoryStore {
     inner: Arc<Mutex<StoreState>>,
     placement_ready: Arc<AtomicBool>,
+    /// Outbound readiness as last computed under `inner`'s lock. Runtime
+    /// construction checks readiness without waiting for that lock, so it reads
+    /// this while another task, such as a second runtime on the same store,
+    /// holds the lock. Construction seeds it, and each recovery page records it.
+    outbound_ready: Arc<AtomicBool>,
     /// How long a lease lasts, when the store grants leases for a duration as
     /// DSQL does (`bundle-lease-fence`). Without one a lease lasts until it is
     /// released.
@@ -656,9 +661,11 @@ impl InMemoryStore {
             shard_count,
             ..StoreState::default()
         };
+        let outbound_ready = outbound_upgrade::ready(&state);
         Self {
             inner: Arc::new(Mutex::new(state)),
             placement_ready: Arc::new(AtomicBool::new(true)),
+            outbound_ready: Arc::new(AtomicBool::new(outbound_ready)),
             lease_duration: None,
             clock: system_clock(),
             renewal_stall: Arc::new(watch::Sender::new(false)),
@@ -909,9 +916,11 @@ impl InMemoryStore {
                 derive_workflow_dispatch(run, home).map(|row| (run.run_key, row))
             })
             .collect();
+        let outbound_ready = outbound_upgrade::ready(&state);
         Ok(Self {
             inner: Arc::new(Mutex::new(state)),
             placement_ready: Arc::new(AtomicBool::new(false)),
+            outbound_ready: Arc::new(AtomicBool::new(outbound_ready)),
             lease_duration: None,
             clock: system_clock(),
             renewal_stall: Arc::new(watch::Sender::new(false)),
@@ -1506,13 +1515,16 @@ impl RunRepository for InMemoryStore {
     }
 
     fn outbound_ready(&self) -> bool {
-        self.inner
-            .try_lock()
-            .is_ok_and(|store| outbound_upgrade::ready(&store))
+        // Never wait: while another task holds the lock, the readiness last
+        // recorded under it answers.
+        match self.inner.try_lock() {
+            Ok(store) => self.record_outbound_ready(&store),
+            Err(_) => self.outbound_ready.load(AtomicOrdering::Acquire),
+        }
     }
     async fn ensure_outbound_prepared(&self) -> Result<()> {
         anyhow::ensure!(
-            outbound_upgrade::ready(&*self.inner.lock().await),
+            self.record_outbound_ready(&*self.inner.lock().await),
             "outbound recovery is unprepared; run tokeirad storage outbound-recovery plan/apply with every writer stopped"
         );
         Ok(())

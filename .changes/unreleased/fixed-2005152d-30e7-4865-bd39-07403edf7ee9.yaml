@@ -1,0 +1,5 @@
+kind: fixed
+body: A partly ramped worker deployment now sends the same workflows to its ramping version as Temporal does, so some auto-upgrade workflows change version once after the upgrade.
+time: 2026-11-12T00:00:00Z
+custom:
+    Slice: 2005152d-30e7-4865-bd39-07403edf7ee9

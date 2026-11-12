@@ -104,6 +104,33 @@ async fn legacy_source(repo: &InMemoryStore, index: u8, child: bool) -> Workflow
     source
 }
 
+async fn ready_while_busy(repo: &InMemoryStore) -> bool {
+    let _held = repo.inner.lock().await;
+    repo.outbound_ready()
+}
+
+// Runtime construction checks readiness without waiting for the store's lock,
+// and another runtime on the same store may be holding it at that moment.
+#[test]
+fn readiness_holds_while_another_task_has_the_store() {
+    block_on(async {
+        let fresh = InMemoryStore::default();
+        assert!(ready_while_busy(&fresh).await);
+        let restored = InMemoryStore::from_snapshot(&fresh.snapshot().await.unwrap()).unwrap();
+        assert!(ready_while_busy(&restored).await);
+
+        legacy_source(&fresh, 0, false).await;
+        let legacy = InMemoryStore::from_snapshot(&fresh.snapshot().await.unwrap()).unwrap();
+        assert!(!ready_while_busy(&legacy).await);
+        let plan = plan_outbound_recovery(&legacy, &[]).await.unwrap();
+        let done = apply_outbound_recovery(&legacy, &plan.digest, true, &[])
+            .await
+            .unwrap();
+        assert!(done.complete);
+        assert!(ready_while_busy(&legacy).await);
+    });
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 

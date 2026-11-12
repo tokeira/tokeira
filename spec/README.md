@@ -35,6 +35,10 @@ spec/
     42_outbound_discovery.tla
     42_outbound_discovery.cfg
     42_outbound_discovery_one_home.cfg
+    43_activity_timeouts.tla
+    43_activity_timeouts.cfg
+    43_activity_timeouts_no_replays.cfg
+    43_activity_timeouts_schedule_to_start.cfg
     negative/
       30_bundle_lease_*.cfg
       40_dispatch_handoff_*.cfg
@@ -44,6 +48,7 @@ spec/
       42_outbound_discovery_continue.cfg
       42_outbound_discovery_full_sweeps.cfg
       42_outbound_discovery_reset.cfg
+      43_activity_timeouts_*.cfg
 ```
 
 ### `refinement/kernel.md`
@@ -284,6 +289,91 @@ temporal violation identifies that property.
 | `negative/42_outbound_discovery_full_sweeps.cfg` | `FirstPickRotates` fails |
 | `negative/42_outbound_discovery_reset.cfg` | `BoundedWait` fails |
 
+### `tla/43_activity_timeouts.tla`
+
+This models how an activity's timeout deadlines are tracked in memory, and how the timeout scanner turns a due deadline into a commit.
+The run's committed state is the authority: every commit advances the run's transition sequence and is fenced by it.
+The tracking cache is derived from that state.
+Each entry keeps the anchors its deadline is computed from, and the sequence of the committed image they came from.
+
+The protocol it checks:
+
+- the start, heartbeat and retry paths update the cache after their commit, and each update carries the image its commit wrote;
+- an update applies unless the entry already holds a later image, and then takes that image's anchors, keeping a cached heartbeat at or after the image's start;
+- the scanner reloads an entry from its read of the run by the same rule;
+- a requested reload stays requested until the scanner takes the entry, and no update clears it;
+- a stale rejection keeps the entry and requests a reload;
+- a timeout's commit, a terminal resolution through the run's lane or a retry, rechecks the observed attempt and timeout against every image it loads, including after a conflict.
+
+The order is the transition sequence, not the attempt: a reset can set a started activity back to attempt 1, and a later schedule can reuse an activity ID, but every commit advances the sequence.
+
+Workers race the scanner, and each update can land long after its commit.
+A worker may act on a start it learned from a replayed start request, and a start's caller may lose the outcome of a commit that applied.
+That start makes no update, and the cache misses it until the full pass reloads the entry.
+
+It checks that an open activity with a started attempt keeps a tracking entry (`StartedAttemptTracked`).
+It checks that a started attempt's entry becomes due no later than the attempt's earliest committed deadline, unless that start's update is still pending, a reload is requested, the scanner is examining the entry, or a lost start awaits the next full pass (`StartedDeadlineTracked`).
+And it checks that a timeout commit applies only to the attempt it was computed for (`TimeoutForObservedAttempt`), and only while the observed timeout still holds for the committed anchors (`TimeoutStillDue`).
+
+Temporal evaluates an activity's timers from mutable state under the workflow lock and skips a timer of an earlier attempt (`service/history/timer_queue_active_task_executor.go @ v1.31.0`).
+Here the fenced commit and its recheck stand in for that lock.
+
+Shard ownership, pause, option updates, cancel requests, resets and eligibility are outside the model.
+So are writers that carry no image: the publisher's schedule record, the lane's own inserts and option resets, and recovery.
+A later image applies over what they write, and the full pass reloads what they leave stale.
+
+| Configuration | What it exercises | Expected |
+|---|---|---|
+| `43_activity_timeouts.cfg` | the protocol above: two attempts, one heartbeat, and workers that may act on a replayed start or lose a start's outcome | pass |
+| `43_activity_timeouts_no_replays.cfg` | workers that act only after their start reply | pass |
+| `43_activity_timeouts_schedule_to_start.cfg` | a schedule-to-start timeout that can race the start | pass |
+| `negative/43_activity_timeouts_no_attempt_check.cfg` | validation that ignores the attempt | `TimeoutForObservedAttempt` fails |
+| `negative/43_activity_timeouts_no_deadline_check.cfg` | validation that does not re-evaluate the observed timeout | `TimeoutStillDue` fails |
+| `negative/43_activity_timeouts_no_recheck.cfg` | validation on the first load only, not after a conflict | `TimeoutForObservedAttempt` fails |
+| `negative/43_activity_timeouts_stale_drops.cfg` | a stale rejection that drops the entry | `StartedAttemptTracked` fails |
+| `negative/43_activity_timeouts_late_worker_retry.cfg` | a worker retry's update that applies whenever the entry exists | `StartedDeadlineTracked` fails |
+| `negative/43_activity_timeouts_start_by_revision.cfg` | a start's update that applies only under the revision read after its load, and a heartbeat's update that sets only the heartbeat time | `StartedDeadlineTracked` fails |
+| `negative/43_activity_timeouts_start_by_revision_scanner_retry.cfg` | the same rules, with a scanner retry's update that applies only under its captured revision | `StartedDeadlineTracked` fails |
+| `negative/43_activity_timeouts_reload_by_revision.cfg` | a scanner reload that applies only under its captured revision | `StartedDeadlineTracked` fails |
+| `negative/43_activity_timeouts_updates_clear_refresh.cfg` | updates that clear a requested reload | `StartedDeadlineTracked` fails |
+
+The first four negative controls each drop a rule the code already follows.
+The last five are the tracking rules before updates carried their image, and each loses a started attempt's deadline:
+
+- `late_worker_retry`: a worker's failure update lands after the next attempt's start and resets the entry to an unstarted attempt;
+- `start_by_revision`: a heartbeat from a worker that learned of the start from a replayed request updates the entry first, and the start's own update is dropped;
+- `start_by_revision_scanner_retry`: the scanner's retry update lands after the next attempt's start has loaded, and that start's update is dropped;
+- `reload_by_revision` and `updates_clear_refresh`: after a start's outcome is lost and the full pass requests a reload, a late update of an earlier image cancels the scanner's reload, or clears the request before the scanner takes it.
+
+Code anchors below are in `crates/tokeira-runtime/src/` unless stated otherwise.
+
+| Action/property | Code and test anchor |
+|---|---|
+| `StartReplyTracks`, `BeatReplyLands`, `FailReplyLands`, `RetryReplyApplies` | `activity_timeout.rs::TrackedActivity::adopt`, through `record_started_at` and `record_committed` after the start, heartbeat and retry commits in `runtime/activity.rs`; the regressions in `runtime/activity_timeout_commit_tests.rs` for the first three update traces above, and `property_tracking_updates_apply_in_image_order` |
+| `StartReplyLost`, `FullPass` | `AcquisitionEntries::begin_full_pass`; `runtime/activity_tracking_order_tests.rs::full_pass_repairs_a_start_that_found_no_tracking_entry` |
+| `ScanSelect`, `ScanLoad`, `ScanReadNone`, `ScanReadRetry`, `ScanReadTerminal`, `Refreshed` | `scan_activity_timeouts_at`: `mark_attempted` takes a requested reload, and `refresh_scanned_if` reloads the entry through `adopt`; `activity_timeout_deadline_tests.rs::reload_replaces_superseded_attempt_cache` |
+| `UpdatesKeepRefresh` | `acquisition_tracking.rs`: `update` and `update_if` leave a requested reload, and `upsert_if` carries it over; `late_retry_update_keeps_a_requested_reload` |
+| `LaneStale`, `RetryStale`, `StartedAttemptTracked` | `request_refresh` after a stale rejection; the `final_timeout_rechecks_*` tests check that the entry stays and owes a reload |
+| `LaneLoad`, `LaneCommit`, `LaneConflict`, `TimeoutForObservedAttempt`, `TimeoutStillDue` | `ActivityTimeoutCheck::validate` on every image the lane loads; `final_timeout_rechecks_*` |
+| `RetryLoad`, `RetryCommit`, `RetryConflict`, `RetryWrongAttempt` | `runtime/activity.rs::commit_activity_retry`, which validates every load; `timeout_retry_rechecks_heartbeat_after_*` |
+
+TLC 1.7.4 and tla-rs 0.24.11 agree on every configuration.
+
+| Configuration | Both checkers |
+|---|---|
+| `43_activity_timeouts.cfg` | Pass; 1,395,400 distinct states |
+| `43_activity_timeouts_no_replays.cfg` | Pass; 455,993 distinct states |
+| `43_activity_timeouts_schedule_to_start.cfg` | Pass; 1,494,108 distinct states |
+| `negative/43_activity_timeouts_no_attempt_check.cfg` | `TimeoutForObservedAttempt` fails |
+| `negative/43_activity_timeouts_no_deadline_check.cfg` | `TimeoutStillDue` fails |
+| `negative/43_activity_timeouts_no_recheck.cfg` | `TimeoutForObservedAttempt` fails |
+| `negative/43_activity_timeouts_stale_drops.cfg` | `StartedAttemptTracked` fails |
+| `negative/43_activity_timeouts_late_worker_retry.cfg` | `StartedDeadlineTracked` fails |
+| `negative/43_activity_timeouts_start_by_revision.cfg` | `StartedDeadlineTracked` fails |
+| `negative/43_activity_timeouts_start_by_revision_scanner_retry.cfg` | `StartedDeadlineTracked` fails |
+| `negative/43_activity_timeouts_reload_by_revision.cfg` | `StartedDeadlineTracked` fails |
+| `negative/43_activity_timeouts_updates_clear_refresh.cfg` | `StartedDeadlineTracked` fails |
+
 ## What this first spec does **not** model
 
 This is just as important as what it *does* model.
@@ -400,14 +490,15 @@ Run every configuration of a module. Those at the top level must pass, and each 
 
 ```bash
 cd spec/tla
-for module in 30_bundle_lease 40_dispatch_handoff 41_dispatch_repair 42_outbound_discovery; do
+for module in 30_bundle_lease 40_dispatch_handoff 41_dispatch_repair 42_outbound_discovery 43_activity_timeouts; do
   for cfg in "$module"*.cfg negative/"$module"_*.cfg; do
     java -cp /path/to/tla2tools.jar tlc2.TLC -workers auto -metadir /tmp/tlc -config "$cfg" "$module.tla"
   done
 done
 ```
 
-The largest configurations, `40_dispatch_handoff.cfg` and `30_bundle_lease_for_update.cfg`, explore about 240,000 and 285,000 distinct states and take about a minute each; the others take seconds.
+The slowest configurations, `40_dispatch_handoff.cfg` and `30_bundle_lease_for_update.cfg`, explore about 240,000 and 285,000 distinct states and take about a minute each.
+The largest, `43_activity_timeouts.cfg` and `43_activity_timeouts_schedule_to_start.cfg`, explore about 1.4 and 1.5 million distinct states and take about 20 seconds each; the others take seconds.
 
 ### Option C: tla-rs
 
@@ -424,7 +515,7 @@ tla 40_dispatch_handoff.tla --config 40_dispatch_handoff.cfg --max-states 200000
 With 0.24.11, tla-rs and TLC 1.7.4 agree on every configuration of every module here: each positive configuration passes with the same number of distinct states, and each negative fails on its target.
 
 Its default limits (1,000,000 states and depth 100) are smaller than models like this may need, so set them explicitly.
-It runs on one thread, so the largest configurations take a few minutes.
+It runs on one thread, so the largest configurations take several minutes.
 
 If the two checkers disagree, TLC is the reference.
 Write each action as a flat conjunction, one action per outcome, rather than branching with `CASE` or `IF` over primed assignments.
@@ -454,7 +545,8 @@ As Tokeira evolves, the intended spec sequence is:
 5. `40_dispatch_handoff.tla`, written. It replaces the planned `40_broker_reservations.tla`: claiming a task writes nothing, so there are no broker reservations to model.
 6. `41_dispatch_repair.tla`, written.
 7. `42_outbound_discovery.tla`, written.
-8. `70_projection_prefix.tla`
+8. `43_activity_timeouts.tla`, written.
+9. `70_projection_prefix.tla`
 
 Each later spec should either:
 

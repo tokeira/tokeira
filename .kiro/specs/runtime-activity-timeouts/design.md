@@ -58,8 +58,18 @@ flowchart TD
 `ActivityState` carries the authoritative schedule, start and durable heartbeat
 anchors as well as timeout configuration. Runtime tracking adds volatile heartbeat
 updates and deadline planning; recovery rebuilds it from durable state. Reloaded
-anchors decide whether a timeout applies even if a scoped tracking callback lost a
-race.
+anchors decide whether a timeout applies even if the cache is stale.
+
+**Tracking updates are ordered by the image they carry.** A start, heartbeat or
+retry updates tracking after its commit, and that update can land long after the
+commit. Each update carries the committed image it was computed from, identified
+by the run's transition sequence, and the entry records the image it holds. An
+update applies unless the entry already holds a later image, so a late reply
+cannot undo a later commit's start, heartbeat or reset. The attempt number cannot
+order updates: a reset can return a started activity to attempt 1, and an activity
+ID can be scheduled again, while every commit advances the transition sequence.
+[43_activity_timeouts.tla](../../../spec/tla/43_activity_timeouts.tla) checks this
+order, the reload rule below and the timeout commit's recheck.
 
 **Heartbeat bookkeeping is runtime-owned.** `record_activity_heartbeat` validates
 the token, records progress durably and updates the volatile heartbeat timestamp.
@@ -230,7 +240,8 @@ started activities add start-to-close and heartbeat (the later of start and last
 heartbeat); unstarted activities add schedule-to-start. Saturated deadlines cannot
 expire. Publisher scheduling, committed state, ordinary starts and recovery supply
 the cache; re-anchoring preserves it. Every lane commit refreshes changed options
-and pause state of tracked activities without rearming unchanged entries.
+and pause state of tracked activities without rearming unchanged entries. A changed
+entry takes that commit's whole image, in the same order as other updates.
 
 Wake planning shares the workflow-task scanner's notification rule. During a scan,
 the planned wake is the scan's wake time, so future inserts do not trigger a rescan.
@@ -241,11 +252,12 @@ lost. A stale-early cache costs one reload and refresh; a stale-late cache is re
 by the full pass. These caches never authorize a timeout (Requirement 7.3).
 
 An early offer can commit a start before schedule tracking exists, or before a
-late schedule record clears its anchors. Every reload repairs a missing cached
-start from the authoritative activity's start time and durable last heartbeat,
-retaining any newer volatile heartbeat. The cache update uses the same captured
-revision and acquisition guard as configuration refresh, so a concurrent start
-or heartbeat cannot be overwritten by the reload. The full pass discovers a missing start even when the
+late schedule record clears its anchors, and a start's caller can lose the outcome
+of a commit that applied. Every reload repairs a missing cached start from the
+authoritative activity's start time and durable last heartbeat, retaining any newer
+volatile heartbeat of the same start. The reload takes its read's image in the same
+order as updates, under the captured acquisition, so a start or heartbeat whose
+update landed while the read was in flight is not overwritten. The full pass discovers a missing start even when the
 cache has no heartbeat or start-to-close deadline, so an expired heartbeat fires
 by that pass. Durable start/heartbeat anchors also drive Temporal's timers
 (`service/history/workflow/timer_sequence.go:298-355 @ v1.31.0`).
@@ -255,20 +267,20 @@ Authority: `service/history/workflow/timer_sequence.go:108-154` and
 
 ### Timeout evaluation (pure function)
 
-A retry's scoped tracking reset can lose its captured revision to a heartbeat while
-the retry commits. The resulting cache may still contain the previous attempt's
-start, heartbeat and dispatch time. Evaluation therefore reads startedness and the
+A writer that carries no image (a schedule record, recovery, or the lane's own
+inserts and option resets) can leave the previous attempt's start, heartbeat and
+dispatch time in the cache. Evaluation therefore reads startedness and the
 start time from the reloaded activity, and uses its current attempt's scheduled
 time for schedule-to-start (the original schedule if the current time is absent).
 Schedule-to-close uses the reloaded original schedule. Only a heartbeat at or after
 that start can extend a started attempt's deadline; the later durable or cached
 heartbeat wins. An unstarted attempt has no heartbeat or start-to-close deadline.
 
-The same reload reconciles the cache's schedule, start and heartbeat anchors under
-the existing revision guard. It clears the start and heartbeat for an unstarted
-retry, restores its dispatch time, and retains newer heartbeats for a started
-attempt. The scoped post-commit reset stays: a delayed retry reply must not clear a
-newer start. Thus the cache chooses wakes while the reloaded attempt decides which
+The same reload reconciles the cache's schedule, start and heartbeat anchors in
+image order. It clears the start and heartbeat for an unstarted retry, restores its
+dispatch time, and retains newer heartbeats for a started attempt. A retry's own
+update carries its image too, so a delayed retry reply cannot clear a newer start.
+Thus the cache chooses wakes while the reloaded attempt decides which
 timeouts apply. Temporal builds timers from mutable state under the workflow lock
 and skips earlier attempts (`service/history/timer_queue_active_task_executor.go:204-258,292-295`;
 `service/history/workflow/timer_sequence.go:229-257,291-355 @ v1.31.0`).
@@ -314,8 +326,10 @@ under its workflow lock and rejection of an earlier attempt's timer
 
 A typed stale rejection retains tracking and requests an immediate authoritative
 reload under the same acquisition, even if a newer start or heartbeat changed its
-revision. It changes no anchors. The next examination consumes that refresh request;
-load or commit failures still wait for the full pass. A resolved activity instead
+revision. It changes no anchors. Only the scanner's next examination consumes that
+request, or the full pass's request for every entry; no tracking update clears
+either, so a late update cannot cancel the reload of an entry that missed a start.
+Load or commit failures still wait for the full pass. A resolved activity instead
 removes only the captured revision and acquisition. Worker completions, failures and
 cancels carry no timeout observation and keep their existing handling.
 
@@ -342,10 +356,11 @@ The following existing methods are modified to update `ActivityTrackingState`:
 | Method | Hook |
 |--------|------|
 | `RuntimeDispatchPublisher::publish` (EnqueueActivityTask) | `activity_tracking.record_scheduled(...)` |
-| `start_activity_task` (on successful commit) | `activity_tracking.record_started(...)` |
+| `start_activity_task` (on successful commit) | `activity_tracking.record_started_at(...)`: take the start's committed image unless the entry holds a later one. |
+| `record_activity_heartbeat` (on successful commit) | Take the heartbeat's committed image unless the entry holds a later one. |
 | `complete_activity_task` (on success) | `activity_tracking.remove(...)` |
 | `fail_activity_task` (on terminal failure) | `activity_tracking.remove(...)` |
-| `fail_activity_task` (on retry) | Update `last_dispatched_at` to now, clear `started_at` and `last_heartbeat_at`. Do NOT overwrite `original_scheduled_at`. |
+| `fail_activity_task` (on retry) | Take the retry's committed image unless the entry holds a later one: `last_dispatched_at` becomes the next attempt's scheduled time, and `started_at` and `last_heartbeat_at` clear. `original_scheduled_at` keeps the first schedule. |
 
 The `cancel_requested` flag is set when the kernel commits an `ActivityTaskCancelRequested` history event. This requires a small hook in the lane's dispatch path: after a successful commit, if the transition's history events contain `ActivityTaskCancelRequested`, the runtime marks the activity in tracking state.
 
@@ -372,7 +387,11 @@ The `cancel_requested` flag is set when the kernel commits an `ActivityTaskCance
 
 ```
 ActivityTrackingState:
-  inner: HashMap<(RunKey, String), ActivityTrackingEntry>
+  inner: HashMap<(RunKey, String), TrackedActivity>
+
+TrackedActivity:
+  entry: ActivityTrackingEntry
+  image: Option<TransitionSeq>           // committed image last taken; None until one is
 
 ActivityTrackingEntry:
   run_key: RunKey

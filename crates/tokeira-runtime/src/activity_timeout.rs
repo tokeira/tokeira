@@ -21,9 +21,12 @@
 //! retry, at a cost of one read per tracked run.
 //! Reloaded attempt anchors select observations; each commit rechecks its captured
 //! attempt and deadline against the state it writes, including after OCC conflicts.
-//! Cache repairs are revision guarded and preserve heartbeats at or after the
-//! reloaded start. Retry
-//! eligibility shares the wake, and bounded passes retain unattempted due work.
+//! Start, heartbeat and retry updates, and the scanner's reload, each take the
+//! committed image they were computed from, in the run's transition order: an
+//! image applies unless the entry already holds a later one, and keeps cached
+//! heartbeats at or after the image's start. A requested reload stays requested
+//! until the scanner takes the entry. Retry eligibility shares the wake, and
+//! bounded passes retain unattempted due work.
 
 use tokeira_kernel::deadline_after;
 
@@ -44,7 +47,7 @@ use tokeira_proto::{
     public::temporal::api::{enums::v1 as enums_proto, failure::v1 as failure_proto},
 };
 use tokeira_storage::RunRepository;
-use tokeira_types::{Payload, Payloads, RunKey, ShardId};
+use tokeira_types::{Payload, Payloads, RunKey, ShardId, TransitionSeq};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -157,9 +160,9 @@ impl ActivityTrackingEntry {
 
     fn refresh_from_activity(&mut self, activity: &ActivityState) {
         self.timeouts = Some(ActivityTimeouts::from(activity));
-        // An early offer can lose a start, and a heartbeat racing a retry can
-        // stale its scoped reset. Reconcile both from authority under the scan's
-        // revision guard, so this reload cannot overwrite a concurrent update.
+        // Every image-carrying update and the scanner's reload take their
+        // anchors here, so a start whose update was lost is restored from
+        // authority, and a cached heartbeat of the same start survives.
         self.last_heartbeat_at = self.heartbeat_for_activity(activity);
         self.started_at = activity.started_at;
         self.original_scheduled_at = activity.scheduled_at;
@@ -167,6 +170,37 @@ impl ActivityTrackingEntry {
             .current_attempt_scheduled_at
             .unwrap_or(activity.scheduled_at);
     }
+}
+
+/// A tracking entry and the committed image it was last taken from.
+///
+/// Images are ordered by the run's transition sequence, which every commit
+/// advances. The attempt number cannot order them: a reset can return a
+/// started activity to attempt 1, and an activity ID can be scheduled again.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TrackedActivity {
+    pub(crate) entry: ActivityTrackingEntry,
+    /// The latest image taken, or `None` while only writers without an image
+    /// (schedule records, recovery and the lane's own inserts and resets) have
+    /// set the entry. Those writers never change it.
+    pub(crate) image: Option<TransitionSeq>,
+}
+
+impl TrackedActivity {
+    /// Take a committed image unless the entry already holds a later one.
+    /// Returns whether it applied.
+    pub(crate) fn adopt(&mut self, image: TransitionSeq, activity: &ActivityState) -> bool {
+        if self.image.is_some_and(|held| held > image) {
+            return false;
+        }
+        self.image = Some(image);
+        self.entry.refresh_from_activity(activity);
+        true
+    }
+}
+
+fn tracked_activity_due_at(tracked: &TrackedActivity) -> Option<OffsetDateTime> {
+    activity_timeout_due_at(&tracked.entry)
 }
 
 /// Shared in-memory tracking state for open activities.
@@ -179,7 +213,7 @@ pub struct ActivityTrackingState {
     pub(crate) wake: crate::deadline_wake::DeadlineWake,
     pub(crate) eligibility: crate::activity_eligibility::ActivityEligibility,
     pub(crate) inner:
-        crate::acquisition_tracking::AcquisitionEntries<(RunKey, String), ActivityTrackingEntry>,
+        crate::acquisition_tracking::AcquisitionEntries<(RunKey, String), TrackedActivity>,
 }
 
 impl Default for ActivityTrackingState {
@@ -189,7 +223,7 @@ impl Default for ActivityTrackingState {
             eligibility: crate::activity_eligibility::ActivityEligibility::with_wake(wake.clone()),
             inner: crate::acquisition_tracking::AcquisitionEntries::with_deadlines(
                 wake.clone(),
-                activity_timeout_due_at,
+                tracked_activity_due_at,
             ),
             wake,
         }
@@ -209,22 +243,26 @@ impl ActivityTrackingState {
         }
     }
 
+    /// Bind a start's eligibility removal to the obligation present before its
+    /// await. Its timeout tracking needs no such capture: the update carries
+    /// the image the start committed.
     pub(crate) fn for_activity(&self, run: RunKey, activity: &str) -> Self {
         Self {
             eligibility: self.eligibility.for_activity(run, activity),
-            inner: self.inner.for_key(&(run, activity.into())),
             ..self.clone()
         }
     }
 
     /// Insert a fully-formed entry, replacing any existing one for the same key.
-    /// Used by shard recovery to rebuild tracking from durable state.
+    /// Used by shard recovery to rebuild tracking from durable state. The entry
+    /// carries no image, so it keeps the image the key already holds.
     pub fn insert(&self, entry: ActivityTrackingEntry) {
-        self.inner.insert(
-            (entry.run_key, entry.activity_id.clone()),
-            entry.shard_id,
+        let key = (entry.run_key, entry.activity_id.clone());
+        let home = entry.shard_id;
+        self.inner.upsert(key, home, |previous| TrackedActivity {
             entry,
-        );
+            image: previous.and_then(|previous| previous.image),
+        });
     }
 
     /// Begin tracking a freshly scheduled activity, anchoring both the
@@ -258,22 +296,26 @@ impl ActivityTrackingState {
         let activity_id = activity_id.into();
         self.inner
             .upsert((run_key, activity_id.clone()), shard_id, |previous| {
-                let mut entry = previous.unwrap_or(ActivityTrackingEntry {
-                    timeouts: None,
-                    run_key,
-                    shard_id,
-                    activity_id,
-                    original_scheduled_at: now,
-                    last_dispatched_at: now,
-                    started_at: None,
-                    last_heartbeat_at: None,
-                    cancel_requested: false,
-                });
+                let image = previous.as_ref().and_then(|previous| previous.image);
+                let mut entry =
+                    previous
+                        .map(|previous| previous.entry)
+                        .unwrap_or(ActivityTrackingEntry {
+                            timeouts: None,
+                            run_key,
+                            shard_id,
+                            activity_id,
+                            original_scheduled_at: now,
+                            last_dispatched_at: now,
+                            started_at: None,
+                            last_heartbeat_at: None,
+                            cancel_requested: false,
+                        });
                 entry.timeouts = timeouts.or(entry.timeouts);
                 entry.last_dispatched_at = now;
                 entry.started_at = None;
                 entry.last_heartbeat_at = None;
-                entry
+                TrackedActivity { entry, image }
             });
     }
 
@@ -296,18 +338,21 @@ impl ActivityTrackingState {
                     (state.run_key, activity.activity_id.clone()),
                     home,
                     |previous| {
-                        previous.is_none().then(|| ActivityTrackingEntry {
-                            timeouts: Some(ActivityTimeouts::from(activity)),
-                            run_key: state.run_key,
-                            shard_id: home,
-                            activity_id: activity.activity_id.clone(),
-                            original_scheduled_at: activity.scheduled_at,
-                            last_dispatched_at: activity
-                                .current_attempt_scheduled_at
-                                .unwrap_or(activity.scheduled_at),
-                            started_at: None,
-                            last_heartbeat_at: activity.last_heartbeat_at,
-                            cancel_requested: activity.cancel_requested,
+                        previous.is_none().then(|| TrackedActivity {
+                            entry: ActivityTrackingEntry {
+                                timeouts: Some(ActivityTimeouts::from(activity)),
+                                run_key: state.run_key,
+                                shard_id: home,
+                                activity_id: activity.activity_id.clone(),
+                                original_scheduled_at: activity.scheduled_at,
+                                last_dispatched_at: activity
+                                    .current_attempt_scheduled_at
+                                    .unwrap_or(activity.scheduled_at),
+                                started_at: None,
+                                last_heartbeat_at: activity.last_heartbeat_at,
+                                cancel_requested: activity.cancel_requested,
+                            },
+                            image: Some(state.transition_seq),
                         })
                     },
                 );
@@ -317,25 +362,24 @@ impl ActivityTrackingState {
     }
 
     /// Refresh cached options without rearming unchanged, already attempted work.
+    /// A changed entry takes the commit's whole image, so an older update that
+    /// lands later cannot restore the options this commit replaced.
     pub(crate) fn refresh_timeouts(&self, state: &tokeira_kernel::WorkflowState) {
         for (activity_id, activity) in &state.activities {
-            let key = (state.run_key, activity_id.clone());
-            let Some(tracked) = self.inner.tracked(&key) else {
-                continue;
-            };
             let timeouts = Some(ActivityTimeouts::from(activity));
-            if tracked.value.timeouts != timeouts {
-                self.inner
-                    .for_entry(&tracked)
-                    .update(&key, |entry| entry.timeouts = timeouts);
-            }
+            self.inner
+                .update_if(&(state.run_key, activity_id.clone()), |tracked| {
+                    tracked.entry.timeouts != timeouts
+                        && tracked.adopt(state.transition_seq, activity)
+                });
         }
     }
 
     #[cfg(test)]
     pub(crate) fn set_timeouts(&self, run: RunKey, id: &str, timeouts: ActivityTimeouts) {
-        self.inner
-            .update(&(run, id.into()), |entry| entry.timeouts = Some(timeouts));
+        self.inner.update(&(run, id.into()), |tracked| {
+            tracked.entry.timeouts = Some(timeouts);
+        });
     }
 
     fn begin_full_pass(&self) {
@@ -370,7 +414,8 @@ impl ActivityTrackingState {
         timeouts: Option<ActivityTimeouts>,
     ) {
         self.inner
-            .update(&(run_key, activity_id.to_string()), |entry| {
+            .update(&(run_key, activity_id.to_string()), |tracked| {
+                let entry = &mut tracked.entry;
                 entry.timeouts = timeouts.or(entry.timeouts);
                 entry.last_dispatched_at = now;
                 entry.started_at = None;
@@ -394,10 +439,59 @@ impl ActivityTrackingState {
     ) {
         self.eligibility.remove(run_key, activity_id);
         self.inner
-            .update(&(run_key, activity_id.to_string()), |entry| {
+            .update(&(run_key, activity_id.to_string()), |tracked| {
+                let entry = &mut tracked.entry;
                 entry.timeouts = timeouts.or(entry.timeouts);
                 entry.started_at = Some(now);
                 entry.last_heartbeat_at = None;
+            });
+    }
+
+    /// Take the image a commit wrote for `activity`, unless the entry already
+    /// holds a later one. Starts, heartbeats and retries update tracking this
+    /// way, so a late update cannot undo a later commit's anchors. Returns
+    /// whether a cancel has been requested, or `None` if the activity is not
+    /// tracked in this scope.
+    pub(crate) fn record_committed(
+        &self,
+        run_key: RunKey,
+        image: TransitionSeq,
+        activity: &ActivityState,
+    ) -> Option<bool> {
+        let mut cancel_requested = None;
+        self.inner
+            .update_if(&(run_key, activity.activity_id.clone()), |tracked| {
+                let applied = tracked.adopt(image, activity);
+                cancel_requested = Some(tracked.entry.cancel_requested);
+                applied
+            });
+        cancel_requested
+    }
+
+    /// A start's committed image: its attempt leaves eligibility, and its
+    /// deadlines come from the image.
+    pub(crate) fn record_started_at(
+        &self,
+        run_key: RunKey,
+        image: TransitionSeq,
+        activity: &ActivityState,
+    ) {
+        self.eligibility.remove(run_key, &activity.activity_id);
+        self.record_committed(run_key, image, activity);
+    }
+
+    /// Stop tracking an activity that a commit parked, unless the entry
+    /// already holds a later image.
+    pub(crate) fn remove_committed(
+        &self,
+        run_key: RunKey,
+        activity_id: &str,
+        image: TransitionSeq,
+    ) {
+        self.eligibility.remove(run_key, activity_id);
+        self.inner
+            .remove_if(&(run_key, activity_id.to_string()), |tracked| {
+                tracked.image.is_none_or(|held| held <= image)
             });
     }
 
@@ -411,9 +505,9 @@ impl ActivityTrackingState {
         now: OffsetDateTime,
     ) -> Option<bool> {
         self.inner
-            .update(&(run_key, activity_id.to_string()), |entry| {
-                entry.last_heartbeat_at = Some(now);
-                entry.cancel_requested
+            .update(&(run_key, activity_id.to_string()), |tracked| {
+                tracked.entry.last_heartbeat_at = Some(now);
+                tracked.entry.cancel_requested
             })
     }
 
@@ -421,8 +515,8 @@ impl ActivityTrackingState {
     /// worker on its next heartbeat.
     pub fn mark_cancel_requested(&self, run_key: RunKey, activity_id: &str) {
         self.inner
-            .update(&(run_key, activity_id.to_string()), |entry| {
-                entry.cancel_requested = true;
+            .update(&(run_key, activity_id.to_string()), |tracked| {
+                tracked.entry.cancel_requested = true;
             });
     }
 
@@ -430,7 +524,7 @@ impl ActivityTrackingState {
     pub fn is_cancel_requested(&self, run_key: RunKey, activity_id: &str) -> Option<bool> {
         self.inner
             .get(&(run_key, activity_id.to_string()))
-            .map(|entry| entry.cancel_requested)
+            .map(|tracked| tracked.entry.cancel_requested)
     }
 
     /// Stop tracking an activity, called when it resolves so it is never scanned
@@ -450,7 +544,8 @@ impl ActivityTrackingState {
     /// durable state during its sweep.
     pub fn remove_all_for_shard(&self, shard_id: ShardId) {
         self.eligibility.remove_home(shard_id);
-        self.inner.retain(|_, entry| entry.shard_id != shard_id);
+        self.inner
+            .retain(|_, tracked| tracked.entry.shard_id != shard_id);
     }
 
     /// Snapshot all tracked entries; the scanner evaluates the copy without
@@ -459,7 +554,7 @@ impl ActivityTrackingState {
         self.inner
             .snapshot(None)
             .into_iter()
-            .map(|entry| entry.value)
+            .map(|tracked| tracked.value.entry)
             .collect()
     }
 
@@ -468,7 +563,7 @@ impl ActivityTrackingState {
         self.inner
             .snapshot(Some(shard_id))
             .into_iter()
-            .map(|entry| entry.value)
+            .map(|tracked| tracked.value.entry)
             .collect()
     }
 }
@@ -695,17 +790,17 @@ pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
     let tracking = &deps.tracking;
     let mut submitted = 0usize;
 
-    let mut entries = tracking.inner.select_active(shard_id, |entry| {
-        entry.refresh_pending
-            || (entry.deadline_pending
-                && activity_timeout_due_at(&entry.value).is_some_and(|due| due <= now))
+    let mut entries = tracking.inner.select_active(shard_id, |tracked| {
+        tracked.refresh_pending
+            || (tracked.deadline_pending
+                && tracked_activity_due_at(&tracked.value).is_some_and(|due| due <= now))
     });
-    entries.sort_by_key(|entry| {
+    entries.sort_by_key(|tracked| {
         (
-            activity_timeout_due_at(&entry.value)
+            tracked_activity_due_at(&tracked.value)
                 .unwrap_or(time::PrimitiveDateTime::MAX.assume_utc()),
-            entry.value.run_key,
-            entry.value.activity_id.clone(),
+            tracked.value.entry.run_key,
+            tracked.value.entry.activity_id.clone(),
         )
     });
 
@@ -721,7 +816,7 @@ pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
     let last_use: HashMap<RunKey, usize> = entries
         .iter()
         .enumerate()
-        .map(|(index, tracked)| (tracked.value.run_key, index))
+        .map(|(index, tracked)| (tracked.value.entry.run_key, index))
         .collect();
     let mut reads: HashMap<RunKey, PassRead> = HashMap::new();
 
@@ -729,7 +824,7 @@ pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
         if !tracking.inner.active(&tracked) {
             continue;
         }
-        let mut entry = tracked.value.clone();
+        let mut entry = tracked.value.entry.clone();
         if submitted >= config.max_timeouts_per_scan {
             break;
         }
@@ -808,14 +903,14 @@ pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
 
         // Full passes also reload entries whose missing start left them without
         // a heartbeat/start-to-close deadline. Repair before evaluating this pass.
+        // The reload takes this read's image unless an update landed a later
+        // one while the read was in flight.
         entry.refresh_from_activity(&activity);
-        tracking.inner.refresh_scanned(
+        tracking.inner.refresh_scanned_if(
             &(entry.run_key, entry.activity_id.clone()),
             &tracked,
             now,
-            |entry| {
-                entry.refresh_from_activity(&activity);
-            },
+            |cached| cached.adopt(state.transition_seq, &activity),
         );
 
         // Temporal suspends all four activity timers while an activity is paused:
@@ -877,17 +972,14 @@ pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
                     backoff,
                 } => {
                     // A retry's post-commit tracking belongs to the scan's
-                    // acquisition and submitted revision, even if its repository
-                    // reply arrives after another operation replaced the key.
+                    // acquisition. Its update carries the image the retry
+                    // committed, so a reply that arrives after a later start or
+                    // heartbeat reached the entry cannot undo them.
                     let mut retry_deps = deps.clone();
-                    let scoped_tracking = tracked.acquisition().map_or_else(
+                    retry_deps.tracking = tracked.acquisition().map_or_else(
                         || tracking.clone(),
                         |acquisition| tracking.for_acquisition(acquisition),
                     );
-                    retry_deps.tracking = ActivityTrackingState {
-                        inner: tracking.inner.for_entry(&tracked),
-                        ..scoped_tracking
-                    };
                     let result = commit_activity_retry(
                         &retry_deps,
                         ActivityRetryTarget {
@@ -1326,6 +1418,64 @@ mod tests {
                 evaluate_activity_timeout(&entry, &activity, now) == Some(TimeoutViolation::Heartbeat),
                 now - anchor > Duration::seconds(timeout_secs),
             );
+        }
+
+        // Committed images reach tracking in any order, and a full pass can
+        // request a reload between them. The entry ends with the latest
+        // image's start, keeps only heartbeats at or after it, and still owes
+        // the requested reload.
+        #[test]
+        fn property_tracking_updates_apply_in_image_order(
+            (images, order) in proptest::collection::vec(
+                (any::<bool>(), 0i64..60, proptest::option::of(0i64..60)),
+                1..8,
+            )
+            .prop_flat_map(|images| {
+                let order = Just((0..images.len()).collect::<Vec<_>>()).prop_shuffle();
+                (Just(images), order)
+            }),
+            pass_at in 0usize..8,
+        ) {
+            let base = OffsetDateTime::UNIX_EPOCH + Duration::days(20_000);
+            let tracking = ActivityTrackingState::default();
+            let run_key = RunKey::new();
+            tracking.record_scheduled(run_key, ShardId(0), "a", base);
+            // Image i is the run after its (i + 1)th commit: an unstarted
+            // attempt, or one started at `start` with an optional heartbeat
+            // `beat` seconds later.
+            let image = |(started, start, beat): (bool, i64, Option<i64>)| {
+                let mut activity = sample_activity();
+                activity.current_attempt_scheduled_at = Some(base);
+                if started {
+                    let at = base + Duration::seconds(start);
+                    activity.started_at = Some(at);
+                    activity.last_heartbeat_at = beat.map(|beat| at + Duration::seconds(beat));
+                }
+                activity
+            };
+            for (step, index) in order.iter().enumerate() {
+                if step == pass_at {
+                    tracking.inner.begin_full_pass(true);
+                }
+                let sequence = u64::try_from(*index).unwrap() + 1;
+                tracking.record_committed(run_key, TransitionSeq(sequence), &image(images[*index]));
+            }
+            let latest = image(*images.last().unwrap());
+            let tracked = tracking.inner.tracked(&(run_key, "a".into())).unwrap();
+            prop_assert_eq!(
+                tracked.value.image,
+                Some(TransitionSeq(u64::try_from(images.len()).unwrap()))
+            );
+            prop_assert_eq!(tracked.value.entry.started_at, latest.started_at);
+            let heartbeat = tracked.value.entry.last_heartbeat_at;
+            match latest.started_at {
+                None => prop_assert_eq!(heartbeat, None),
+                Some(started) => {
+                    prop_assert!(heartbeat.is_none_or(|at| at >= started));
+                    prop_assert!(heartbeat >= latest.last_heartbeat_at);
+                }
+            }
+            prop_assert_eq!(tracked.refresh_pending, pass_at < order.len());
         }
     }
 

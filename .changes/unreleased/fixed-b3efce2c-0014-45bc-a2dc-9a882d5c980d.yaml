@@ -1,0 +1,5 @@
+kind: fixed
+body: A started activity's start-to-close and heartbeat timeouts are no longer missed until a later full scan when its start, heartbeats and retries update tracking out of order.
+time: 2026-11-11T00:00:00Z
+custom:
+    Slice: b3efce2c-0014-45bc-a2dc-9a882d5c980d

@@ -898,16 +898,32 @@ where
             )
             .await?
             {
-                CommitResult::Applied { .. } | CommitResult::Duplicate => {
-                    // Reset the volatile heartbeat clock; the CANCEL signal
-                    // itself comes from the durable state loaded above — the
-                    // kernel's `cancel_requested` bit is the authority
+                committed @ (CommitResult::Applied { .. } | CommitResult::Duplicate) => {
+                    // Reset the volatile heartbeat clock with the image this
+                    // heartbeat committed, unless a later commit's image already
+                    // reached tracking; the CANCEL signal itself comes from the
+                    // durable state loaded above — the kernel's
+                    // `cancel_requested` bit is the authority
                     // (`cancelRequested = ai.CancelRequested`,
                     // recordactivitytaskheartbeat/api.go:83 @ v1.31.0; K4).
-                    let tracking_cancel = self
-                        .activity_tracking
-                        .record_heartbeat(token.run_key, &token.activity_id, now)
-                        .unwrap_or(false);
+                    let tracking_cancel = match &committed {
+                        CommitResult::Applied { new_state } => new_state
+                            .activities
+                            .get(&token.activity_id)
+                            .and_then(|activity| {
+                                self.activity_tracking.record_committed(
+                                    token.run_key,
+                                    new_state.transition_seq,
+                                    activity,
+                                )
+                            }),
+                        // Storage reports a duplicate only for a request dedupe
+                        // op, which a heartbeat never carries.
+                        _ => self
+                            .activity_tracking
+                            .is_cancel_requested(token.run_key, &token.activity_id),
+                    }
+                    .unwrap_or(false);
                     return Ok(ActivityHeartbeatOutcome {
                         cancel_requested: outcome.cancel_requested || tracking_cancel,
                         ..outcome
@@ -1106,15 +1122,13 @@ where
             {
                 CommitResult::Applied { new_state } => {
                     runtime_metrics::record_activity_task_started(OutcomeLabel::Success);
-                    self.activity_tracking.record_started_with_timeouts(
-                        run_key,
-                        activity_id,
-                        self.clock.now(),
-                        new_state
-                            .activities
-                            .get(activity_id)
-                            .map(crate::activity_timeout::ActivityTimeouts::from),
-                    );
+                    if let Some(activity) = new_state.activities.get(activity_id) {
+                        self.activity_tracking.record_started_at(
+                            run_key,
+                            new_state.transition_seq,
+                            activity,
+                        );
+                    }
                     return Ok(token);
                 }
                 CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
@@ -1700,20 +1714,22 @@ where
                 return Ok(ActivityStartOutcome::Stale);
             }
             match committed? {
-                CommitResult::Applied { .. } => {
+                CommitResult::Applied { new_state } => {
                     runtime_metrics::record_activity_task_started(OutcomeLabel::Success);
                     self.delivery_metrics
                         .record_latency(&task.queue, entered_at.elapsed());
                     // Callback authority stays with the acquisition that committed;
                     // a replacement owner must reconstruct its own timeout tracking.
-                    start_tracking.record_started_with_timeouts(
-                        task.run_key,
-                        &next_activity.activity_id,
-                        now,
-                        Some(crate::activity_timeout::ActivityTimeouts::from(
-                            &next_activity,
-                        )),
-                    );
+                    // The update carries this start's image: it applies unless a
+                    // later commit's image, which already holds the start,
+                    // reached tracking first.
+                    if let Some(activity) = new_state.activities.get(&task.activity_id) {
+                        start_tracking.record_started_at(
+                            task.run_key,
+                            new_state.transition_seq,
+                            activity,
+                        );
+                    }
                     return Ok(ActivityStartOutcome::Started(started));
                 }
                 CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
@@ -2221,18 +2237,15 @@ where
             CommitResult::Applied { new_state } => {
                 let tracking = deps.tracking.for_acquisition(acquisition);
                 if paused {
-                    tracking.remove(run_key, activity_id);
+                    tracking.remove_committed(run_key, activity_id, new_state.transition_seq);
                     return Ok(());
                 }
-                tracking.record_retry_with_timeouts(
-                    run_key,
-                    activity_id,
-                    dispatch_at,
-                    new_state
-                        .activities
-                        .get(activity_id)
-                        .map(crate::activity_timeout::ActivityTimeouts::from),
-                );
+                // The update carries the image this retry committed. A later
+                // start or heartbeat whose update already landed holds a later
+                // image, so this late reset cannot clear it.
+                if let Some(activity) = new_state.activities.get(activity_id) {
+                    tracking.record_committed(run_key, new_state.transition_seq, activity);
+                }
                 // Eligibility can wake a local poll immediately. Reset this
                 // attempt's anchors first, so its start cannot be cleared later.
                 tracking.refresh_eligibility(&new_state, bundle, deps.clock.now());
@@ -4307,8 +4320,12 @@ mod tests {
             TimerScannerConfig::default(),
             WorkflowTimeoutScannerConfig::default(),
         );
-        let (state, token, _queue) = seed_started_activity(&runtime, &repo, None).await;
-        let activity = &state.activities[&token.activity_id];
+        let (_state, token, _queue) = seed_started_activity(&runtime, &repo, None).await;
+        // The seeded start lies a second ahead, and tracking keeps only
+        // heartbeats at or after the start. Start the attempt now, as the
+        // start path does, so the heartbeat below follows it.
+        let token = start_current_attempt(&runtime, &repo, &token).await;
+        let activity = seeded_activity(&repo, &token).await;
         let deps = runtime.activity_retry_deps();
         deps.tracking.insert(ActivityTrackingEntry {
             timeouts: None,

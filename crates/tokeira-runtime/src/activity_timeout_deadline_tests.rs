@@ -302,14 +302,29 @@ fn reload_replaces_superseded_attempt_cache() {
     let key = (cached.run_key, cached.activity_id.clone());
     tracking.insert(cached.clone());
     let captured = tracking.inner.snapshot(None).pop().unwrap();
+    // A heartbeat lands while the scanner's read is in flight. The reload of
+    // the same start still applies, and keeps the later cached heartbeat.
     tracking.record_heartbeat(key.0, &key.1, base + Duration::seconds(24));
     tracking
         .inner
-        .refresh_scanned(&key, &captured, base, |entry| {
-            entry.refresh_from_activity(&activity)
+        .refresh_scanned_if(&key, &captured, base, |tracked| {
+            tracked.adopt(TransitionSeq(5), &activity)
         });
+    let reloaded = tracking.inner.get(&key).unwrap();
+    assert_eq!(reloaded.image, Some(TransitionSeq(5)));
+    assert_eq!(reloaded.entry.started_at, activity.started_at);
     assert_eq!(
-        tracking.inner.get(&key).unwrap().last_heartbeat_at,
+        reloaded.entry.last_heartbeat_at,
         Some(base + Duration::seconds(24))
     );
+    // A read of an earlier image, here the preceding attempt's, is refused.
+    let mut earlier = activity.clone();
+    earlier.started_at = None;
+    earlier.last_heartbeat_at = None;
+    tracking
+        .inner
+        .refresh_scanned_if(&key, &captured, base, |tracked| {
+            tracked.adopt(TransitionSeq(4), &earlier)
+        });
+    assert_eq!(tracking.inner.get(&key).unwrap(), reloaded);
 }

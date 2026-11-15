@@ -31,3 +31,7 @@ checkAllFeatures = false
 checkNoDefaultFeatures = false
 # tokeira-build-info's build script reads CI, and `tkr ci check` sets it too.
 cargoEnvironment = ["CI=1"]
+
+# Tokeira's own checks: the agent-file rules and the offline link check.
+[modules.ci]
+source = ".dagger/modules/ci"

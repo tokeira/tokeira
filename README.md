@@ -1,6 +1,7 @@
 # Tokeira
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![crates.io](https://img.shields.io/crates/v/tokeira-engine.svg)](https://crates.io/crates/tokeira-engine)
 
 <p align="center">
   <picture>
@@ -20,8 +21,9 @@ Rust application when a separate service is unnecessary.
 
 ## Quickstart
 
-Prerequisites: Rust ≥ 1.97; Docker for the service path. Protobuf compilation uses
-the pure-Rust `protox` compiler, so no system `protoc` installation is needed.
+Prerequisites: Rust ≥ 1.97; for the service path, Docker and, for now, an
+Apple-silicon Mac. Protobuf compilation uses the pure-Rust `protox` compiler,
+so no system `protoc` installation is needed.
 
 ### A durable workflow in one file
 
@@ -78,9 +80,10 @@ so SDK code generation does not require a system `protoc`.
 ### The service, with Compose
 
 The same engine as a service: `tokeirad` and its observability stack
-(Mimir · Loki · Grafana · Alloy) in Docker containers. From the clone —
-the install and the dev engine each build from source, so expect a few
-minutes each on first run:
+(Mimir · Loki · Grafana · Alloy) in Docker containers, deployed with `tkr`,
+Tokeira's operator CLI. `tkr` is under active development, so these steps
+may change. From the clone — the install and the dev engine each build from
+source, so expect a few minutes each on first run:
 
 ```console
 cd tokeira
@@ -91,9 +94,9 @@ tkr infra apply --yes
 tkr deploy apply --yes
 ```
 
-`tkr image build` builds the `tokeirad` container image from source in a
-hermetic, checksum-pinned build engine that it provisions itself — the one
-step here that downloads a sizeable artifact on first run.
+`tkr image build` builds the `tokeirad` container image from source with
+[Dagger](https://dagger.io), whose engine runs in Docker — the one step here
+that downloads a sizeable artifact on first run.
 
 `tokeirad` is now serving the Temporal gRPC surface on `localhost:7233`, and
 Grafana is on `localhost:3000` (`admin` / `admin`) with the provisioned
@@ -244,7 +247,8 @@ See
 **Release evidence.** Tokeira publishes the evidence behind compatibility
 claims rather than asking users to take them on trust. For v0.1.0, the ordered
 corpus replay against the exact release commit produced **1,261 passes and
-0 failures**, with every exclusion cited back to Temporal's source.
+0 failures**, with every exclusion cited back to Temporal's source. The latest
+release names this run as its evidence anchor.
 
 See [docs/readiness/corpus-evidence.md](docs/readiness/corpus-evidence.md).
 
@@ -313,13 +317,13 @@ The conformance corpus exercises this path over the real wire.
 
 Tokeira's operator surface is being built around `tkr`, with named
 deployments and an explicit **plan → confirm → apply** lifecycle. Platform
-definitions currently cover bare-host `local`, Docker Compose, ECS, and EKS;
-the Compose platform can provision the accompanying
-Mimir · Loki · Grafana · Alloy observability stack.
+definitions currently cover bare-host `local` and Docker Compose; the Compose
+platform can provision the accompanying Mimir · Loki · Grafana · Alloy
+observability stack.
 
 The service and its operational platform are the primary Tokeira deployment
-model. The operator lifecycle remains under active development and sits
-outside the v0.1.0 support claim while it hardens.
+model. The operator lifecycle remains under active development and, while it
+hardens, sits outside Tokeira's support claim: the engine, embedded and served.
 
 Explore [docs/platforms/](docs/platforms/README.md).
 
@@ -357,10 +361,9 @@ The engine is on crates.io:
 cargo add tokeira-engine
 ```
 
-The [`v0.1.1` release](https://github.com/tokeira/tokeira/releases/tag/v0.1.1)
-is the published tree; the conformance evidence names
-[`v0.1.0`](https://github.com/tokeira/tokeira/releases/tag/v0.1.0), which it
-packages.
+The [latest release](https://github.com/tokeira/tokeira/releases/latest)
+carries its notes and any upgrade steps, and [CHANGELOG.md](CHANGELOG.md)
+records every change.
 
 Building agents in Rust?
 [Tokeira Odori](https://github.com/tokeira/tokeira-odori) builds durable
@@ -403,8 +406,9 @@ The concurrency model and fleet mechanics are documented in
 ## Development
 
 Tokeira builds with standard Cargo on a pinned stable Rust toolchain, and the
-workspace test suite runs without AWS credentials or Docker. The development
-environment, quality gates, and repository conventions are documented in
+workspace test suite runs without AWS credentials or Docker. `dagger check`
+runs the whole quality bar in containers. The development environment,
+quality gates, and repository conventions are documented in
 [docs/development.md](docs/development.md).
 
 ## Contributing

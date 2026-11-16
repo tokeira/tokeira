@@ -1,0 +1,263 @@
+# The changelog check reads commits, as the history checks do: the fragments
+# at HEAD, and the change from where HEAD left the release branch. The config
+# itself, .changie.yaml and the header, is held to tokeira-build's
+# CANONICAL_CHANGELOG_CONFIG_SHA256 by the Rust tests.
+
+# The release of changie that the check runs: tokeira-build's CHANGIE_RELEASE.
+let ciChangieVersion: String! = "1.25.2"
+
+# The kinds a fragment may have, as .changie.yaml lists them.
+let ciFragmentKinds: [String!]! = [
+  "added", "changed", "deprecated", "removed", "fixed", "security", "internal",
+]
+
+# Check the changelog fragments. Every fragment at HEAD must be one that the
+# release train admits. Against the release branch, a change that adds
+# fragments must have each batch on its own; a release preparation, which
+# deletes fragments and adds a version file, must match what changie makes
+# of the release branch's fragments; and any other change needs a new
+# fragment, unless it touches only the changelog, manifests, Cargo.lock or
+# the release configuration.
+let ciChangelog(ws: Workspace!): Void {
+  let repo = ciHistory(ws)
+  ciAdmitFragments(repo)
+  let branch = ciReleaseBranch(repo)
+  let base = repo.withExec(["git", "merge-base", "HEAD", "origin/" + branch]).stdout.trimSpace
+  let changed = ciLines(repo.withExec(["git", "diff", "--name-only", base, "HEAD", "--"]).stdout)
+  if (changed.isEmpty == false) {
+    let fragments = ciChanges(repo, base, ".changes/unreleased")
+    let added = fragments
+      .filter { change => change[0]! == "A" and change[1]!.hasSuffix(".yaml") }
+      .map { change => change[1]! }
+    let deleted = fragments
+      .filter { change => change[0]! == "D" and change[1]!.hasSuffix(".yaml") }
+      .map { change => change[1]! }
+    let versions = ciChanges(repo, base, ".changes")
+      .filter { change =>
+        change[0]! == "A" and change[1]!.containsMatch(`^\.changes/[0-9]+\.[0-9]+\.[0-9]+\.md$`)
+      }
+      .map { change => change[1]! }
+    if (deleted.isEmpty == false and versions.isEmpty == false) {
+      ciReleasePreparation(repo, base, versions)
+    } else if (added.isEmpty == false) {
+      added.each { path => ciFragmentBatches(repo, path) }
+    } else if (changed.any { path => ciBookkeeping(path) == false }) {
+      raise "ci: the change against " + branch
+        + " adds no fragment to .changes/unreleased: add one with `tkr release fragment`"
+    }
+  }
+  null
+}
+
+# The paths a change may touch without a fragment: the changelog, the
+# manifests, Cargo.lock and the release configuration.
+let ciBookkeeping(path: String!): Boolean! {
+  path.containsMatch(
+    `^(\.changes/|CHANGELOG\.md$|(.*/)?Cargo\.toml$|Cargo\.lock$|\.tokeira-release\.toml$)`,
+  )
+}
+
+# git diff --name-status from base to HEAD under a path, as lists of a
+# status and its paths.
+let ciChanges(repo: Container!, base: String!, path: String!): [[String!]!]! {
+  ciLines(repo.withExec(["git", "diff", "--name-status", base, "HEAD", "--", path]).stdout)
+    .map { line => line.split("\t") }
+}
+
+# Check every fragment in .changes/unreleased at HEAD, and name each one
+# that the release train would refuse.
+let ciAdmitFragments(repo: Container!): Void {
+  let problems = ciLines(
+    repo.withExec(["git", "ls-tree", "--name-only", "HEAD", ".changes/unreleased/"]).stdout,
+  )
+    .filter { path => path.hasSuffix(".yaml") }
+    .map { path =>
+      let problem = ciFragmentProblem(path, ciShow(repo, "HEAD", path))
+      if (problem == "") { "" } else { path + ": " + problem }
+    }
+    .filter { problem => problem != "" }
+  if (problems.isEmpty == false) {
+    raise "ci: the release train would refuse these fragments:\n" + problems.join("\n")
+  }
+  null
+}
+
+# What the release train would refuse in a fragment, or "", tested in the
+# order of tokeira-build's parse_fragment: it admits one of the kinds, a body
+# that is one user-facing sentence (none for an internal fragment), a Slice
+# that is a lowercase UUID version 4, and the filename <kind>-<Slice>.yaml.
+let ciFragmentProblem(path: String!, text: String!): String! {
+  let lines = text.split("\n").map { line => line.trimSpace }
+  let kinds = ciFragmentField(lines, "kind:")
+  let bodies = ciFragmentField(lines, "body:").filter { body => body != "" }
+  let slices = ciFragmentField(lines, "Slice:")
+  let length = if (bodies.isEmpty) { 0 } else { bodies[0]!.length }
+  if (kinds.length > 1) {
+    "duplicate `kind`"
+  } else if (ciFragmentField(lines, "body:").length > 1) {
+    "duplicate `body`"
+  } else if (slices.length > 1) {
+    "duplicate custom `Slice`"
+  } else if (kinds.isEmpty) {
+    "missing `kind`"
+  } else if (ciFragmentKinds.contains(kinds[0]!) == false) {
+    "unknown fragment kind"
+  } else if (kinds[0]! == "internal" and bodies.isEmpty == false) {
+    "internal fragments must omit the skipped body field"
+  } else if (kinds[0]! != "internal" and (bodies.isEmpty or ciSentence(bodies[0]!) == false)) {
+    "non-internal body must be one 8 through 180 character user-facing sentence ("
+      + `${length}` + " characters)"
+  } else if (slices.isEmpty) {
+    "missing custom `Slice`"
+  } else if (slices[0]!.containsMatch(
+    `^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`,
+  ) == false) {
+    "Slice must be a lowercase UUID version 4"
+  } else if (path.split("/").takeLast(1)[0]! != kinds[0]! + "-" + slices[0]! + ".yaml") {
+    "filename must be `" + kinds[0]! + "-" + slices[0]! + ".yaml`"
+  } else {
+    ""
+  }
+}
+
+# A fragment field's values: each line that starts with the key, without the
+# key, trimmed and unquoted.
+let ciFragmentField(lines: [String!]!, key: String!): [String!]! {
+  lines
+    .filter { line => line.hasPrefix(key) }
+    .map { line => ciUnquote(line.trimPrefix(key).trimSpace) }
+}
+
+# A value without the double or single quotes around it.
+let ciUnquote(value: String!): String! {
+  if (value.length >= 2 and value.hasPrefix("\"") and value.hasSuffix("\"")) {
+    value.trimPrefix("\"").trimSuffix("\"")
+  } else if (value.length >= 2 and value.hasPrefix("'") and value.hasSuffix("'")) {
+    value.trimPrefix("'").trimSuffix("'")
+  } else {
+    value
+  }
+}
+
+# Whether a body is one user-facing sentence: 8 to 180 characters on one
+# line, ending in a full stop, a question mark or an exclamation mark.
+let ciSentence(body: String!): Boolean! {
+  body.length >= 8 and body.length <= 180 and body.contains("\r") == false
+    and body.containsMatch(`[.!?]$`)
+}
+
+# Check that changie batches a new fragment on its own, beside HEAD's
+# .changie.yaml and header.
+let ciFragmentBatches(repo: Container!, path: String!): Void {
+  let name = path.split("/").takeLast(1)[0]!
+  let alone = directory
+    .withNewFile(".changie.yaml", ciShow(repo, "HEAD", ".changie.yaml"))
+    .withNewFile(".changes/header.tpl.md", ciShow(repo, "HEAD", ".changes/header.tpl.md"))
+    .withNewFile(".changes/unreleased/" + name, ciShow(repo, "HEAD", path))
+  let ran = ciChangie(repo)
+    .withMountedDirectory("/fragment", alone)
+    .withWorkdir("/fragment")
+    .withExec(
+      ["changie", "batch", "999.999.999", "--dry-run", "--allow-no-changes=false"],
+      expect: ANY,
+    )
+  if (ran.exitCode != 0) {
+    raise "ci: changie cannot batch " + path + ":\n" + ran.stdout + ran.stderr
+  }
+  null
+}
+
+# Check a release preparation: changie, run over the release branch's
+# fragments, makes the same .changes and CHANGELOG.md as HEAD has, apart from
+# the dates of the version headings.
+let ciReleasePreparation(repo: Container!, base: String!, versions: [String!]!): Void {
+  if (versions.length != 1) {
+    raise "ci: a release preparation adds one version file, not " + versions.join(", ")
+  }
+  let file = versions[0]!.trimPrefix(".changes/")
+  let version = file.trimSuffix(".md")
+  let reference = ciChangie(ciTree(repo, base))
+    .withExec(["changie", "batch", version, "--allow-no-changes=false"])
+    .withExec(["changie", "merge"])
+  let actual = ciTree(repo, "HEAD")
+  let expected = reference.directory("/tree/.changes")
+  let found = actual.directory("/tree/.changes")
+  (expected.glob("**/*") + found.glob("**/*"))
+    .filter { path => path.hasSuffix("/") == false }
+    .uniq
+    .each { path =>
+      let same = if (path == file) {
+        ciUndated(ciContents(expected, path)) == ciUndated(ciContents(found, path))
+      } else {
+        ciContents(expected, path) == ciContents(found, path)
+      }
+      if (same == false) {
+        raise "ci: .changes/" + path + " is not what changie batches for " + version
+      }
+    }
+  let changelog = reference.file("/tree/CHANGELOG.md").contents
+  if (ciUndated(changelog) != ciUndated(actual.file("/tree/CHANGELOG.md").contents)) {
+    raise "ci: CHANGELOG.md is not what changie merges for " + version
+  }
+  null
+}
+
+# A revision's changelog files at /tree.
+let ciTree(repo: Container!, revision: String!): Container! {
+  repo
+    .withExec([
+      "git", "archive", "--format=tar", "--output=/tmp/tree.tar", revision,
+      ".changie.yaml", ".changes", "CHANGELOG.md",
+    ])
+    .withExec(["mkdir", "-p", "/tree"])
+    .withExec(["tar", "-x", "-f", "/tmp/tree.tar", "-C", "/tree"])
+    .withWorkdir("/tree")
+}
+
+# A file's contents, or "" when there is no such file, as diff -N reads it.
+let ciContents(dir: Directory!, path: String!): String! {
+  if (dir.exists(path, expectedType: ExistsType.REGULAR_TYPE)) {
+    dir.file(path).contents
+  } else {
+    ""
+  }
+}
+
+# Text without the dates of its version headings: "## 1.2.3 on 2026-11-16"
+# reads "## 1.2.3".
+let ciUndated(text: String!): String! {
+  text.replaceMatches(`(?m)^(## [0-9]+\.[0-9]+\.[0-9]+) on [0-9]{4}-[0-9]{2}-[0-9]{2}$`, "$1")
+}
+
+# A container with the pinned changie on its path.
+let ciChangie(ctr: Container!): Container! {
+  ctr.withFile("/usr/local/bin/changie", ciChangieBinary(ciPlatform(ctr)))
+}
+
+# A container's platform as os/arch.
+let ciPlatform(ctr: Container!): String! {
+  `${ctr.platform}`.split("/").takeFirst(2).join("/")
+}
+
+# The changie binary for a platform, from the project's release archive.
+# The engine checks the archive against the digest that tokeira-build's
+# CHANGIE_RELEASE pins, before it unpacks it.
+let ciChangieBinary(platform: String!): File! {
+  let arch = if (platform == "linux/amd64") {
+    "amd64"
+  } else if (platform == "linux/arm64") {
+    "arm64"
+  } else {
+    raise "ci: no pinned changie for " + platform
+  }
+  let digest = if (platform == "linux/amd64") {
+    "7489b5a6a595e5a9f8b0d392114b10c130634639ef1190fafb2f15a5cd9058cd"
+  } else {
+    "84c3f158906da24f9a4941518dcf55a2badf9524bfb9579c78b5e7876ae675fa"
+  }
+  http(
+    "https://github.com/miniscruff/changie/releases/download/v" + ciChangieVersion
+      + "/changie_" + ciChangieVersion + "_linux_" + arch + ".tar.gz",
+    checksum: "sha256:" + digest,
+  ).extract.file("changie")
+}

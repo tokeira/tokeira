@@ -44,8 +44,9 @@ use super::{
     apply::SUCCESS_COOLDOWN,
     atomic_git_push_arguments, cargo_package_arguments, cargo_package_arguments_for_names,
     classify_train_state, external_publish_dependencies, generate_release_notes,
-    gh_release_create_arguments, plan_release, publishable_packages, registry_observation_delays,
-    rewrite_workspace_manifests,
+    gh_release_create_arguments,
+    git_layout::GitLayout,
+    plan_release, publishable_packages, registry_observation_delays, rewrite_workspace_manifests,
     scripts::{
         HERMETIC_CHECKSUM_SCRIPT, OBSERVATION_DELAYS_ENV, REGISTRY_PUBLISH_SCRIPT,
         REGISTRY_VERIFY_SCRIPT, RELEASE_PREPARE_FRESH_SCRIPT, RELEASE_PREPARE_RESUME_SCRIPT,
@@ -54,7 +55,7 @@ use super::{
     },
     sha256_hex, verify_published_refs, verify_resume_refs,
 };
-use crate::pipelines::{build::builder_toolchain, ci::GitLayout};
+use crate::pipelines::build::builder_toolchain;
 
 const RELEASE_SOURCE_EXCLUDES: &[&str] = &[
     "target",

@@ -1,7 +1,11 @@
 # Tokeira
 
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![crates.io](https://img.shields.io/crates/v/tokeira-engine.svg)](https://crates.io/crates/tokeira-engine)
+[![CI](https://img.shields.io/github/checks-status/tokeira/tokeira/main?label=CI)](https://github.com/tokeira/tokeira/commits/main)
+[![crates.io](https://img.shields.io/crates/v/tokeira-engine)](https://crates.io/crates/tokeira-engine)
+[![docs.rs](https://img.shields.io/docsrs/tokeira-engine)](https://docs.rs/tokeira-engine)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![MSRV 1.97](https://img.shields.io/badge/MSRV-1.97-orange?logo=rust)](Cargo.toml)
+[![Built with Claude, Codex & Kiro](https://img.shields.io/badge/built%20with-Claude%2C%20Codex%20%26%20Kiro-blueviolet)](#built-with-claude-codex-and-kiro)
 
 <p align="center">
   <picture>

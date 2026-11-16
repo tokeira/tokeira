@@ -33,7 +33,6 @@ To advance the SDK: download the new release's two `.crate` artifacts and
 checksum file wholesale, re-append the `[workspace]` fence to both
 manifests, and update the release tag above. Retire the ZIP manifest patch once
 the replacement release includes the fix and the session APIs Tokeira needs.
-The engine + CLI pair are pinned per environment (see
-`spikes/dagger-rust-sdk/README.md` for the bring-up recipe); SDK and engine
-advance together — the SDK's compatibility validator refuses a mismatched
+The engine + CLI pair are pinned by `DAGGER_RELEASE` in
+`crates/tokeira-build`; SDK and engine advance together — the SDK's compatibility validator refuses a mismatched
 engine at connect.

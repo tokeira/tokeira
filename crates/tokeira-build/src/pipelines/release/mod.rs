@@ -12,6 +12,7 @@ mod apply;
 mod dagger;
 mod error;
 mod fragment;
+mod git_layout;
 mod graph;
 mod model;
 mod notes;

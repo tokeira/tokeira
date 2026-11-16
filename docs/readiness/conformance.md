@@ -166,7 +166,7 @@ live DSQL and embedded snapshot recovery are outside its evidence.
   reconciliation, report, CLI, CI wiring.
 - **`temporal-compatibility`** (tasks.md, 9 top-level tasks open): matrix-completeness properties (3),
   kernel `cfg_feature!` adoption (4), edge `dispatch_rpc` adoption (5), the Buffa/connect-rust
-  compatibility service (7), `tkr compat` (8) and `tkr ci` (9) CLIs, the Dagger compatibility module
+  compatibility service (7), the `tkr compat` CLI (8), the CI checks (9), the Dagger compatibility module
   (10) + versioned build/lockfile policy (11), final verification (14). Release-process aspects feed
   [`infra.md`](./infra.md).
 - **`temporal-compatibility-surface`**: ✅ complete — the queryable matrix spine both tiers consume.

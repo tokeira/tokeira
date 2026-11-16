@@ -1,10 +1,12 @@
 """
 Tokeira's own checks, beside the Rust bar that the rust module runs.
 
-They carry over the "Doc links" job of .github/workflows/ci.yml: the rules
-for the agent files, and the offline link check over the Markdown corpus.
-Neither reaches the network once lychee and its image are fetched, and
-neither reads Git history.
+The rules for the agent files and the offline link check over the Markdown
+corpus carry over the "Doc links" job of .github/workflows/ci.yml. The
+history checks hold the Temporal pins, the compatibility bump trailers and
+the changelog fragments to the release process. They read commits, not
+edits that are not committed, and fetch the release tags and the release
+branch from the public repository.
 """
 type Ci {
   """
@@ -51,6 +53,52 @@ type Ci {
     }
     null
   }
+
+  """
+  Check that TEMPORAL_PROTO_VERSION has not gone back since the last release.
+
+  The Temporal proto pin in pinned.rs may not be lower at HEAD than at the
+  latest release tag, unless HEAD, or a commit since the tag that changed
+  pinned.rs, has a Proto-Downgrade trailer.
+  """
+  protoMonotonicity(ws: Workspace!): Void @check {
+    ciMonotonic(ws, "TEMPORAL_PROTO_VERSION", "Proto-Downgrade")
+  }
+
+  """
+  Check that TEMPORAL_SERVER_COMPAT has not gone back since the last release.
+
+  The Temporal server compatibility pin in pinned.rs may not be lower at HEAD
+  than at the latest release tag, unless HEAD, or a commit since the tag that
+  changed pinned.rs, has a Server-Compat-Downgrade trailer.
+  """
+  serverCompatMonotonicity(ws: Workspace!): Void @check {
+    ciMonotonic(ws, "TEMPORAL_SERVER_COMPAT", "Server-Compat-Downgrade")
+  }
+
+  """
+  Check that each change to TEMPORAL_SERVER_COMPAT has a bump trailer.
+
+  Since the latest release tag, a commit that changes the pin has the trailer
+  "Server-Compat-Bump: <old> -> <new>, trigger: <1, 2 or 3>", with the
+  versions it changes the pin from and to.
+  """
+  bumpTrailer(ws: Workspace!): Void @check {
+    ciBumpTrailers(ws)
+  }
+
+  """
+  Check the changelog fragments against the release process.
+
+  Every fragment in .changes/unreleased must be one that the release train
+  admits. A change against the release branch adds a fragment that changie
+  can batch on its own, unless it touches only the changelog, manifests,
+  Cargo.lock or the release configuration. A release preparation must match
+  what changie makes of the release branch's fragments.
+  """
+  changelogFragments(ws: Workspace!): Void @check {
+    ciChangelog(ws)
+  }
 }
 
 let ciAgentsFile: String! = "AGENTS.md"
@@ -61,19 +109,18 @@ let ciClaudeFile: String! = "CLAUDE.md"
 let ciAgentsBudget: Int! = 32768
 
 # The release of lychee that the link check runs: the one that ci.yml's
-# lychee-action installs, and that `tkr ci check` pins as LYCHEE_VERSION.
+# lychee-action installs.
 let ciLycheeVersion: String! = "0.24.2"
 
-# lychee's arguments, as ci.yml and `tkr ci check` give them. The vendored
-# trees are left out because their relative links resolve only in their home
-# repositories. The pattern is lychee's own to expand: no shell reads it.
+# lychee's arguments, as ci.yml gives them. The vendored trees are left out
+# because their relative links resolve only in their home repositories. The
+# pattern is lychee's own to expand: no shell reads it.
 let ciLycheeArguments: [String!]! = [
   "--offline",
   "--no-progress",
   "--hidden",
   "--exclude-path", ".git",
   "--exclude-path", "target",
-  "--exclude-path", "spikes/dagger-rust-sdk/vendor",
   "--exclude-path", "vendor/dagger-sdk",
   "--exclude-path", "vendor/dagger-sdk-macros",
   "./**/*.md",

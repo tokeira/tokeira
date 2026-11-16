@@ -44,10 +44,6 @@ pub use discovery::{
 pub use error::BuildError;
 pub use pipelines::{
     build::{TokeiradBuildRequest, TokeiradBuildResult, build_tokeirad_image},
-    ci::{
-        CiBuildMode, CiBuildReport, CiBuildRequest, CiCheck, CiCheckReport, CiCheckRequest,
-        CiCheckResult, DaggerClient, run_ci_build, run_ci_checks, workspace_bar_commands,
-    },
     obtain::{ObtainedProvisioner, obtain_provisioner},
     provisioner::{ProvisionerBuildRequest, build_provisioner, engine_identity_for},
     release::{

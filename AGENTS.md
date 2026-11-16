@@ -565,8 +565,8 @@ classified in `FEATURE_MATRIX` (`crates/tokeira-compatibility/src/matrix.rs`); S
 claims update `SDK_MATRIX` (`crates/tokeira-compatibility/src/sdk.rs`) with evidence and
 verification state. Tokeira-owned compatibility metadata uses Buffa/connect-rust under
 `proto/tokeira/compatibility/v1/` — never add Tokeira extension fields to upstream
-Temporal protos. Run `tkr ci check` (pin monotonicity, bump trailers) and the focused
-matrix/CLI/edge tests in `.kiro/specs/temporal-compatibility/`.
+Temporal protos. Run `dagger check --module ci` (pin monotonicity, bump trailers) and
+the focused matrix/CLI/edge tests in `.kiro/specs/temporal-compatibility/`.
 
 #### Adding or Changing a DSQL Migration
 

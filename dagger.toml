@@ -29,7 +29,7 @@ wholeWorkspace = true
 # both off the lane runs `cargo check --workspace --locked`.
 checkAllFeatures = false
 checkNoDefaultFeatures = false
-# tokeira-build-info's build script reads CI, and `tkr ci check` sets it too.
+# tokeira-build-info's build script reads CI.
 cargoEnvironment = ["CI=1"]
 
 # Tokeira's own checks: the agent-file rules and the offline link check.

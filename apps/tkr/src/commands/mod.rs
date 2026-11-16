@@ -11,7 +11,6 @@
 //! 3. Wire up the dispatch arm in `main::main`.
 //! 4. Re-use `require_confirmation` for any destructive operation.
 
-pub(crate) mod ci;
 pub(crate) mod compat;
 pub(crate) mod config;
 pub(crate) mod deploy;

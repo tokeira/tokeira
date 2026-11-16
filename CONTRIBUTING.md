@@ -21,7 +21,7 @@ test loop, and the repository layout.
 
 ## Quality Bar
 
-Run before any push or PR — CI enforces the same set:
+Run before any push or PR:
 
 ```bash
 cargo +nightly fmt --all
@@ -31,10 +31,18 @@ cargo test --workspace --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 ```
 
-CI additionally runs `cargo-deny` (bans/licenses/sources), an offline link
-check over every Markdown file, and `git diff --exit-code` — builds must not
-modify checked-in files. Everything runs `--locked`: dependency movement is a
-reviewed change, never a CI side effect.
+`dagger check` runs the same bar in containers, on stock Dagger
+v1.0.0-beta.27 or later. It adds `cargo-deny` (bans/licenses/sources, and
+advisories as a check of their own), an offline link check over every Markdown
+file, and the AGENTS.md size limit. `dagger check -l` lists the checks;
+`dagger.toml` holds their settings.
+
+On GitHub, two jobs gate a merge: `cargo-deny` (bans/licenses/sources), and
+"Doc links", which runs the same link check and AGENTS.md rules. The format,
+lint and test jobs in `.github/workflows/ci.yml` are switched off, so nothing
+on GitHub compiles or tests a change: running the bar is the contributor's
+job. Everything runs `--locked`: dependency movement is a reviewed change,
+never a CI side effect.
 
 ## Pull Requests
 

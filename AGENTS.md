@@ -288,11 +288,12 @@ Every task follows one lifecycle:
 
 #### §10.4 Finish green — the Enforced Commands bar
 
-Run before any push or PR. The per-turn hook (`tkw hook stop` → `cargo check
---workspace`) is a compile gate, not this bar.
+Run before any push or PR. `dagger check` (stock Dagger v1.0.0-beta.27 or later; see
+`dagger.toml`) runs the same bar in containers. The per-turn hook (`tkw hook stop` →
+`cargo check --workspace`) is a compile gate, not this bar.
 
 ```bash
-cargo +nightly fmt --all                                  # CI verifies with --check
+cargo +nightly fmt --all
 cargo lint --locked                                       # clippy: workspace + all targets
 cargo check --workspace --locked
 cargo nextest run --workspace --locked                    # tests; see note
@@ -304,12 +305,11 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 - Tests run under nextest **by contract** — one process per test, so cross-test races on
   process-global state cannot exist (tracing-span-lifecycle-hygiene spec, Req 5). Plain
   `cargo test` is inner-loop only.
-- CI (`.github/workflows/ci.yml`) additionally enforces: `cargo-deny`
-  bans/licenses/sources (merge-gating; the advisories job is advisory-only, re-run
-  weekly), a lychee offline link check over every `*.md` including `.kiro/` (broken
-  relative links redden CI), and `git diff --exit-code` (builds must not dirty the
-  tree). Everything runs `--locked`: dependency movement is a reviewed change, never a
-  CI side effect.
+- `dagger check` adds `cargo-deny` (advisories as their own check), an offline lychee
+  link check over every `*.md` including `.kiro/`, and this file's byte budget. On
+  GitHub only `cargo-deny` bans/licenses/sources and those doc checks gate a merge:
+  nothing there compiles or tests.
+- All of it runs `--locked`: dependency movement is reviewed, never a CI side effect.
 
 #### §10.5 Rebase — or recommend
 
@@ -565,8 +565,8 @@ classified in `FEATURE_MATRIX` (`crates/tokeira-compatibility/src/matrix.rs`); S
 claims update `SDK_MATRIX` (`crates/tokeira-compatibility/src/sdk.rs`) with evidence and
 verification state. Tokeira-owned compatibility metadata uses Buffa/connect-rust under
 `proto/tokeira/compatibility/v1/` — never add Tokeira extension fields to upstream
-Temporal protos. Run `tkr ci check` once the Dagger compatibility module is available;
-until then, the focused matrix/CLI/edge tests in `.kiro/specs/temporal-compatibility/`.
+Temporal protos. Run `tkr ci check` (pin monotonicity, bump trailers) and the focused
+matrix/CLI/edge tests in `.kiro/specs/temporal-compatibility/`.
 
 #### Adding or Changing a DSQL Migration
 

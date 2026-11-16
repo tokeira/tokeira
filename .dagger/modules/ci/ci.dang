@@ -1,0 +1,138 @@
+"""
+Tokeira's own checks, beside the Rust bar that the rust module runs.
+
+They carry over the "Doc links" job of .github/workflows/ci.yml: the rules
+for the agent files, and the offline link check over the Markdown corpus.
+Neither reaches the network once lychee and its image are fetched, and
+neither reads Git history.
+"""
+type Ci {
+  """
+  Check that AGENTS.md is within its byte budget and CLAUDE.md is present.
+
+  AGENTS.md may be at most 32,768 bytes: every agent pays for every byte of
+  it in every session ("How to read this file"). CLAUDE.md is the import
+  that brings AGENTS.md into Claude Code (AGENTS.md §12.1), and must be a
+  file.
+  """
+  agentFiles(ws: Workspace!): Void @check {
+    let files = ws.directory("/", include: [ciAgentsFile, ciClaudeFile])
+    if (files.exists(ciAgentsFile, expectedType: ExistsType.REGULAR_TYPE) == false) {
+      raise "ci: " + ciAgentsFile + " is missing"
+    }
+    let size = files.file(ciAgentsFile).size
+    if (size > ciAgentsBudget) {
+      raise "ci: " + ciAgentsFile + " is " + `${size}` + " bytes, over its budget of "
+        + `${ciAgentsBudget}` + ": cut before you append"
+    }
+    if (files.exists(ciClaudeFile, expectedType: ExistsType.REGULAR_TYPE) == false) {
+      raise "ci: " + ciClaudeFile + " is missing: Claude Code reads " + ciAgentsFile
+        + " only through its import"
+    }
+    null
+  }
+
+  """
+  Check the relative links of every Markdown file, off the network.
+
+  lychee's offline mode checks that each relative link names a file or a
+  directory of the repository, and skips every URL. It reads the hidden
+  directories too, which reaches the specs under .kiro/. A run that finds
+  no link at all fails too: it means the check read the wrong files.
+  """
+  docLinks(ws: Workspace!): Void @check {
+    let ran = ciLycheeRun(ws)
+    let report = if (ran.exists(ciLycheeReport)) { ran.file(ciLycheeReport).contents } else { "" }
+    let command = (["lychee"] + ciLycheeArguments).join(" ")
+    if (ran.exitCode != 0) {
+      raise "ci: " + command + " failed:\n" + report + ran.stdout + ran.stderr
+    } else if (ciLycheeFoundNothing(report)) {
+      raise "ci: " + command + " found no link to check:\n" + report + ran.stdout + ran.stderr
+    }
+    null
+  }
+}
+
+let ciAgentsFile: String! = "AGENTS.md"
+
+let ciClaudeFile: String! = "CLAUDE.md"
+
+# The most bytes AGENTS.md may have: 32 KiB.
+let ciAgentsBudget: Int! = 32768
+
+# The release of lychee that the link check runs: the one that ci.yml's
+# lychee-action installs, and that `tkr ci check` pins as LYCHEE_VERSION.
+let ciLycheeVersion: String! = "0.24.2"
+
+# lychee's arguments, as ci.yml and `tkr ci check` give them. The vendored
+# trees are left out because their relative links resolve only in their home
+# repositories. The pattern is lychee's own to expand: no shell reads it.
+let ciLycheeArguments: [String!]! = [
+  "--offline",
+  "--no-progress",
+  "--hidden",
+  "--exclude-path", ".git",
+  "--exclude-path", "target",
+  "--exclude-path", "spikes/dagger-rust-sdk/vendor",
+  "--exclude-path", "vendor/dagger-sdk",
+  "--exclude-path", "vendor/dagger-sdk-macros",
+  "./**/*.md",
+]
+
+# Where lychee writes its report, as Markdown. ci.yml's lychee-action runs
+# lychee the same way, and reads the report for its own guard.
+let ciLycheeReport: String! = "/tmp/lychee-report.md"
+
+# Whether a report says that lychee found no link, by the test of
+# lychee-action v2.9.0, the release ci.yml uses: a Total of 0 in the
+# report's summary table. The action fails such a run unless failIfEmpty is
+# turned off, and ci.yml leaves it on. A run that left no report at all
+# found nothing either.
+let ciLycheeFoundNothing(report: String!): Boolean! {
+  report == "" or report.replaceMatches(`Total\s+\|\s+0`, "") != report
+}
+
+# The image the link check runs in, by the digest of its multi-platform
+# index. lychee loads the system's CA certificates when it starts, even
+# offline, and the image is there to supply them.
+let ciLycheeImage: String! = "alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf"
+
+# The lychee binary for a platform, from the project's release archive. The
+# engine checks the archive against the digest before it unpacks it, without
+# the directory that wraps its files. It is the musl build, which is linked
+# statically, so it runs in any image.
+let ciLycheeBinary(platform: String!): File! {
+  let triple = if (platform == "linux/amd64") {
+    "x86_64-unknown-linux-musl"
+  } else if (platform == "linux/arm64") {
+    "aarch64-unknown-linux-musl"
+  } else {
+    raise "ci: no pinned lychee for " + platform
+  }
+  let digest = if (platform == "linux/amd64") {
+    "73657a111819a30c47c08352896796f23d64e4eb2b3ed39b6d32149241566fc5"
+  } else {
+    "5d0b0e3aeab240f41920c633a6eaf97599be6eedda034b36e858ede7dba5e535"
+  }
+  http(
+    "https://github.com/lycheeverse/lychee/releases/download/lychee-v" + ciLycheeVersion
+      + "/lychee-" + triple + ".tar.gz",
+    checksum: "sha256:" + digest,
+  ).extract(stripComponents: 1).file("lychee")
+}
+
+# The link check's step: lychee over the repository's files, without those
+# that .gitignore ignores, as a fresh checkout has them. A link may name any
+# file, so the step reads them all, and runs again after any edit. It
+# reaches no network.
+let ciLycheeRun(ws: Workspace!): Container! {
+  let base = container.from(ciLycheeImage)
+  base
+    .withFile("/usr/local/bin/lychee", ciLycheeBinary(`${base.platform}`))
+    .withMountedDirectory("/repository", ws.directory("/", gitignore: true))
+    .withWorkdir("/repository")
+    .withExec(
+      ["lychee", "--format", "markdown", "--output", ciLycheeReport] + ciLycheeArguments,
+      expect: ANY,
+    )
+}

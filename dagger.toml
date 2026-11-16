@@ -1,2 +1,37 @@
-# Tokeira CI uses the pinned in-process SDK session; this workspace file exists
-# solely to anchor Dagger's reviewed dependency lock at the repository root.
+# Dagger workspace for Tokeira. `dagger check`, on stock Dagger
+# v1.0.0-beta.27 or later, runs the checks of the modules below.
+
+# The Rust bar: rustfmt, clippy, cargo check, tests and doctests, rustdoc and
+# cargo-deny. The Rust toolchain itself comes from rust-toolchain.toml.
+[modules.rust]
+source = "github.com/tokeira/dagger-rust-toolchain@v0.2.0"
+
+[modules.rust.settings]
+# rustfmt.toml uses nightly-only options. Advance this together with
+# NIGHTLY_FMT_TOOLCHAIN in .github/workflows/ci.yml and CI_FMT_NIGHTLY in
+# crates/tokeira-build.
+fmtToolchain = "nightly-2026-06-16"
+# aws-lc-sys, ring and libmimalloc-sys build C code. The toolchain image
+# already has a C compiler and make, so cmake is the one package to add. No
+# protoc: the protos compile with protox.
+systemPackages = ["cmake"]
+# The root workspace only. vendor/, spikes/, examples/, scenarios/ and
+# tools/simulation hold Cargo workspaces of their own, which are not checked.
+workspaceRoots = ["."]
+# One fmt, one clippy and one test check for the whole workspace, so the
+# check names stay the same as crates come and go. The tests then run
+# together over a writable copy of the repository: many read files of other
+# crates, and one builds a generated provisioner in the tree.
+wholeWorkspace = true
+# The check lane's --all-features and --no-default-features builds are off:
+# --all-features turns on the live-service features (dsql-integration,
+# integration-test, conformance), which the bar has never compiled. With
+# both off the lane runs `cargo check --workspace --locked`.
+checkAllFeatures = false
+checkNoDefaultFeatures = false
+# tokeira-build-info's build script reads CI, and `tkr ci check` sets it too.
+cargoEnvironment = ["CI=1"]
+
+# Tokeira's own checks: the agent-file rules and the offline link check.
+[modules.ci]
+source = ".dagger/modules/ci"

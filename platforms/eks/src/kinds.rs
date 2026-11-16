@@ -283,7 +283,7 @@ pub fn namespace() -> AuthoringNamespace {
 #[cfg(test)]
 mod tests {
     use tokeira_iac::Resource as _;
-    use tokeira_platform::{author::ValueShape, kind::Kind as _};
+    use tokeira_platform::author::ValueShape;
 
     use super::*;
 

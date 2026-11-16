@@ -483,8 +483,6 @@ pub fn proto_conversion_status(err: ProtoConversionError) -> Status {
 
 #[cfg(test)]
 mod tests {
-    use prost::Message as _;
-
     use super::*;
     use tonic::Code;
 

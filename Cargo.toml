@@ -74,7 +74,7 @@ exclude = [
 [workspace.package]
 version = "0.7.0"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.99"
 license = "Apache-2.0"
 authors = ["The Tokeira Authors"]
 repository = "https://github.com/tokeira/tokeira"

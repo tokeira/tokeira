@@ -21,4 +21,4 @@ pub const TEMPORAL_SERVER_COMPAT: &str = "1.31.0";
 /// `rust-toolchain.toml` for builds of the published crate, which carry no
 /// workspace and no toolchain pin. A parity test fails the workspace build
 /// when the two drift.
-pub const PINNED_RUST_TOOLCHAIN: &str = "1.97.1";
+pub const PINNED_RUST_TOOLCHAIN: &str = "1.99.1";

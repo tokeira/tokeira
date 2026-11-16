@@ -52,9 +52,9 @@ pub fn generate_release_notes(
     if !notes.is_empty() {
         notes.push_str("\n\n");
     }
-    // The requirements pin this sentence while 1.97 remains the workspace contract; the
+    // The requirements pin this sentence while 1.99 remains the workspace contract; the
     // package gate separately refuses any crate without a `rust-version` field.
-    notes.push_str("Requires Rust 1.97 or newer.\n\n");
+    notes.push_str("Requires Rust 1.99 or newer.\n\n");
     notes.push_str("| Package | Version | SHA-256 | crates.io | README |\n");
     notes.push_str("|---|---:|---|---|---|\n");
     for package in packages {
@@ -141,7 +141,7 @@ mod tests {
 
             prop_assert_eq!(first, second);
             prop_assert!(text.starts_with(body.trim_end()));
-            prop_assert!(text.contains("Rust 1.97 or newer"));
+            prop_assert!(text.contains("Rust 1.99 or newer"));
             let mut previous = 0;
             for name in names {
                 let position = text.find(&format!("`{name}`")).expect("package row");

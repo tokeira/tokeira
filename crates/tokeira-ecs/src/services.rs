@@ -947,7 +947,7 @@ fn alloy_containers(
         command: vec![
             "run".into(),
             "--server.http.listen-addr=0.0.0.0:12345".into(),
-            format!("--stability.level=generally-available"),
+            "--stability.level=generally-available".into(),
             format!("--storage.path=/tmp/alloy-{metrics_port}"),
             "/etc/alloy/config.alloy".into(),
         ],

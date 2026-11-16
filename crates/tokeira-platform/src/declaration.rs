@@ -68,12 +68,11 @@ pub struct DeploymentRef {
 
 /// One platform-declared image shown by the generic provisioner shell.
 ///
-/// Repository names deliberately exclude a registry host. The owning
-/// platform selects and authenticates its registry only for a mutating image
-/// operation, so a read-only inventory never loads provider credentials.
+/// Repository names deliberately exclude a registry host, so the read-only
+/// inventory never loads provider credentials.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeclaredImage {
-    /// Stable logical name used by `--image` selection and reports.
+    /// Stable logical name used in reports.
     pub name: String,
     /// Whether the artifact is built locally, mirrored, or pulled through.
     pub source_type: ImageSourceType,
@@ -86,53 +85,15 @@ pub struct DeclaredImage {
     pub upstream_ref: Option<String>,
 }
 
-/// The operator-facing result of one image publication.
-///
-/// Secret registry credentials never cross this boundary. The platform
-/// returns only public image coordinates for the generic shell to render.
-/// Deployment-state persistence remains exclusively in the deployment engine.
-#[derive(Debug, Clone)]
-pub struct PublishedImage {
-    /// Stable logical image name.
-    pub name: String,
-    /// Tagged registry reference selected by the operation.
-    pub resolved_ref: String,
-    /// Registry-returned immutable digest.
-    pub digest: String,
-    /// Every tagged reference published by the operation.
-    pub published_refs: Vec<String>,
-    /// Whether an already-resolved destination made provider publication
-    /// unnecessary.
-    pub skipped: bool,
-}
-
 /// Optional image lifecycle owned by a definition-backed platform.
 ///
-/// Implementations own interpretation of image declarations, provider
-/// credentials, registry preparation, and the publication engine. This
-/// capability deliberately has no state-store surface: the existing
-/// deployment engine remains the sole owner of deployment-state persistence.
-#[async_trait::async_trait]
+/// Implementations own interpretation of image declarations. This capability
+/// deliberately has no state-store surface: the existing deployment engine
+/// remains the sole owner of deployment-state persistence.
 pub trait ImageOperations: Send + Sync + fmt::Debug {
     /// Resolve the platform's image inventory without loading credentials or
     /// touching provider state.
     fn list(&self, deployment: &DeploymentRef) -> anyhow::Result<Vec<DeclaredImage>>;
-
-    /// Publish selected locally built images and return their public results.
-    async fn push(
-        &self,
-        deployment: &DeploymentRef,
-        image: Option<&str>,
-        tag: &str,
-    ) -> anyhow::Result<Vec<PublishedImage>>;
-
-    /// Mirror selected authored upstream images and return their public
-    /// results.
-    async fn mirror(
-        &self,
-        deployment: &DeploymentRef,
-        image: Option<&str>,
-    ) -> anyhow::Result<Vec<PublishedImage>>;
 }
 
 /// Result of running one platform's observability checks for a deployment.

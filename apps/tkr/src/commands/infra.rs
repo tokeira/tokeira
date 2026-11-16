@@ -141,9 +141,9 @@ pub(crate) fn read_tokeirad_config(path: &Path) -> Result<tokeira_config::Tokeir
 ///
 /// The engine collects writeback requests during apply (DSQL endpoint,
 /// OpenSearch URL, ECR registry host, etc.). Rather than making operators
-/// copy-paste these by hand, we patch them into `tokeirad.toml` using the
-/// same dotted-key writer the `image push/mirror` commands use. A later
-/// `tkr deploy apply` picks them up transparently.
+/// copy-paste these by hand, we patch them into `tokeirad.toml` with
+/// `tokeira_iac`'s dotted-key writer. A later `tkr deploy apply` picks them up
+/// transparently.
 pub(crate) fn write_tokeirad_writeback(
     deployment_path: &Path,
     values: Vec<(String, String)>,

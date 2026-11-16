@@ -639,7 +639,7 @@ fn provider_error(
 ///
 /// Operational capabilities share this entry point so frontend selection,
 /// companion resolution, metadata admission, and full kind validation cannot
-/// drift between logs/exec coordinates and image publication.
+/// drift between logs/exec coordinates and the image inventory.
 pub(crate) fn evaluated_configuration(deployment: &DeploymentRef) -> Result<LocatedValue> {
     let metadata_path = deployment.dir.join(METADATA_JSON);
     let metadata: DeploymentBindingMetadata = serde_json::from_slice(

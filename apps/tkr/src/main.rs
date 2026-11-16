@@ -339,11 +339,11 @@ async fn run(cli: Cli) -> Result<()> {
 ///
 /// The guarded set is the lifecycle mutations that change a deployment's
 /// infrastructure/services or its registry entry: `infra apply|destroy`,
-/// `deploy apply|destroy`, `image push|mirror`, `schema setup`, `scale
-/// up|down`, `deployment destroy`, and the forwarded `deployment
-/// apply|upgrade|rollback`. Plans, statuses, `describe`, `list`, `version`,
-/// image builds, and registry/selection verbs (`create`/`use`/`lock`/`unlock`)
-/// are never blocked.
+/// `deploy apply|destroy`, `schema setup`, `scale up|down`, `deployment
+/// destroy`, and the forwarded `deployment apply|upgrade|rollback`. Plans,
+/// statuses, `describe`, `list`, `version`, image commands, and
+/// registry/selection verbs (`create`/`use`/`lock`/`unlock`) are never
+/// blocked.
 fn mutation_target(command: &Command, selected: Option<&str>) -> Option<Option<String>> {
     let selected = || selected.map(str::to_string);
     match command {
@@ -359,10 +359,7 @@ fn mutation_target(command: &Command, selected: Option<&str>) -> Option<Option<S
         | Command::Scale {
             action: ScaleAction::Up { .. } | ScaleAction::Down { .. },
         }
-        | Command::Admin { .. }
-        | Command::Image(cli::ImageArgs {
-            command: cli::ImageCommand::Push { .. } | cli::ImageCommand::Mirror { .. },
-        }) => Some(selected()),
+        | Command::Admin { .. } => Some(selected()),
         Command::Deployment { action } => match action {
             DeploymentAction::Destroy { name, .. } => Some(Some(name.clone())),
             DeploymentAction::Apply { .. }
@@ -392,26 +389,6 @@ fn forwarded_image_verb(command: &cli::ImageCommand) -> (&'static [&'static str]
                 ]
             });
             (&["image", "list"], extra)
-        }
-        cli::ImageCommand::Push { tag, image, yes } => {
-            let mut extra = vec!["--tag".to_string(), tag.clone()];
-            if let Some(image) = image {
-                extra.extend(["--image".to_string(), image.clone()]);
-            }
-            if *yes {
-                extra.push("--yes".to_string());
-            }
-            (&["image", "push"], extra)
-        }
-        cli::ImageCommand::Mirror { image, yes } => {
-            let mut extra = Vec::new();
-            if let Some(image) = image {
-                extra.extend(["--image".to_string(), image.clone()]);
-            }
-            if *yes {
-                extra.push("--yes".to_string());
-            }
-            (&["image", "mirror"], extra)
         }
         cli::ImageCommand::Build { .. } => {
             unreachable!("deployment-independent builds are handled in-process")
@@ -841,8 +818,6 @@ mod tests {
             vec!["tkr", "deployment", "apply"],
             vec!["tkr", "deployment", "upgrade"],
             vec!["tkr", "deployment", "rollback"],
-            vec!["tkr", "image", "push", "--yes"],
-            vec!["tkr", "image", "mirror", "--yes"],
         ] {
             assert!(
                 mutation_target(&parse(&args), Some("prod")).is_some(),

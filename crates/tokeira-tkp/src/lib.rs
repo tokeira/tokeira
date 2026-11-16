@@ -164,7 +164,7 @@ pub(crate) type DesiredSnapshot =
 /// as the surface platforms speak.
 pub use tokeira_platform::declaration::{
     DeclaredImage, DeploymentRef, ImageOperations, PlatformDeclaration, PlatformExecution,
-    PlatformIntegration, PublishedImage,
+    PlatformIntegration,
 };
 pub use tokeira_platform::{definition::Namespace, kind, ops::Ops};
 

@@ -1,4 +1,4 @@
-//! Build, source-assembly, publish, and mirror pipelines.
+//! Build and source-assembly pipelines.
 //!
 //! The crate is intentionally platform-independent. Platform crates decide
 //! which images exist and what remote references they should use.
@@ -48,10 +48,8 @@ pub use pipelines::{
         CiBuildMode, CiBuildReport, CiBuildRequest, CiCheck, CiCheckReport, CiCheckRequest,
         CiCheckResult, DaggerClient, run_ci_build, run_ci_checks, workspace_bar_commands,
     },
-    mirror::{MirrorRequest, MirroredReference, mirror_image},
     obtain::{ObtainedProvisioner, obtain_provisioner},
     provisioner::{ProvisionerBuildRequest, build_provisioner, engine_identity_for},
-    publish::{PublishRequest, PublishResult, PublishedReference, RegistryPassword, publish_image},
     release::{
         AdmittedFragment, CANONICAL_CHANGELOG_CONFIG_SHA256, ChangieIdentity, ExternalTkrPin,
         ExtraVersionField, FragmentIdentity, GitObservation, ObservedGitRef, ObservedReleaseInputs,

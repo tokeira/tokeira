@@ -72,8 +72,7 @@ class GeneratedPasswordJson:
 
 def config() -> Ecs:
     # This is the operator-editable surface. Image versions are immutable
-    # pins; image mirror/push writes deployment-local registry references
-    # before the deploy plane is admitted.
+    # pins.
     return Ecs(
         environment="dev",
         aws=Aws(region="eu-west-2"),

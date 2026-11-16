@@ -4,7 +4,7 @@
 [![crates.io](https://img.shields.io/crates/v/tokeira-engine)](https://crates.io/crates/tokeira-engine)
 [![docs.rs](https://img.shields.io/docsrs/tokeira-engine)](https://docs.rs/tokeira-engine)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![MSRV 1.97](https://img.shields.io/badge/MSRV-1.97-orange?logo=rust)](Cargo.toml)
+[![MSRV 1.99](https://img.shields.io/badge/MSRV-1.99-orange?logo=rust)](Cargo.toml)
 [![Built with Claude, Codex & Kiro](https://img.shields.io/badge/built%20with-Claude%2C%20Codex%20%26%20Kiro-blueviolet)](#built-with-claude-codex-and-kiro)
 
 <p align="center">
@@ -25,7 +25,7 @@ Rust application when a separate service is unnecessary.
 
 ## Quickstart
 
-Prerequisites: Rust ≥ 1.97; for the service path, Docker and, for now, an
+Prerequisites: Rust ≥ 1.99; for the service path, Docker and, for now, an
 Apple-silicon Mac. Protobuf compilation uses the pure-Rust `protox` compiler,
 so no system `protoc` installation is needed.
 

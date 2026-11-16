@@ -140,7 +140,7 @@ impl Repo {
             self.repair_attempts.fetch_add(1, Ordering::SeqCst);
             if self
                 .conflicts
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
                 return Err(WorkflowDispatchRepairConflict.into());
@@ -797,7 +797,7 @@ impl RunRepository for Repo {
         self.preparation_attempts.fetch_add(1, Ordering::SeqCst);
         if self
             .preparation_retries
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
             return Ok(PlacementPage::Retry {

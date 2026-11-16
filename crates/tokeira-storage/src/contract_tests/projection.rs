@@ -1,8 +1,6 @@
 //! Projection contracts compare a fixture-authored ordered image map. Decoy
 //! scopes are seeded explicitly; images in the scope under test come from commits.
 
-use proptest::prelude::*;
-
 use super::*;
 use crate::{
     ProjectionImageKey, ProjectionRecord, memory::projection_accumulator_tests::following,

@@ -3,7 +3,6 @@
 
 use std::{num::NonZeroU32, sync::Arc};
 
-use proptest::prelude::*;
 use time::Duration;
 use tokeira_kernel::{
     ActivityOp, ChildWorkflowState, DispatchOp, HistoryEventKind, OperationKind, ParentClosePolicy,

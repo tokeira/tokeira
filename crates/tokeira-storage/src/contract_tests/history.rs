@@ -1,6 +1,5 @@
 //! History slices are expected from authored vectors, never from another reader.
 
-use proptest::prelude::*;
 use tokeira_kernel::HistoryEvent;
 use tokeira_types::EventPrincipal;
 

@@ -1,6 +1,5 @@
 //! Recovery expectations use fixture eligibility, independent of recovery predicates.
 
-use proptest::prelude::*;
 use time::Duration;
 
 use super::*;

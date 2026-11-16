@@ -305,7 +305,7 @@ impl ChasmNodeRepository for ConflictingStore {
     ) -> anyhow::Result<NodePersistOutcome> {
         if self
             .conflicts
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                 count.checked_sub(1)
             })
             .is_ok()
@@ -326,7 +326,7 @@ impl ChasmNodeRepository for ConflictingStore {
     ) -> anyhow::Result<NodePersistOutcome> {
         if self
             .create_conflicts
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                 count.checked_sub(1)
             })
             .is_ok()

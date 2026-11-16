@@ -413,11 +413,13 @@ async fn republish_activity_queue_after_restart_restores_pollability() -> Result
         "waking discovery performs no synchronous publication"
     );
 
+    // After the restart only a discovery pass republishes the activity, so the
+    // poll window must cover the pass.
     let started = restarted
         .poll_activity_task(
             activity_queue(namespace_id),
             WorkerIdentity("worker-a".to_string()),
-            tokio::time::Duration::from_millis(5),
+            tokio::time::Duration::from_secs(5),
         )
         .await?;
     assert!(started.is_some());

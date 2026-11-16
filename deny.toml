@@ -1,6 +1,8 @@
 # cargo-deny — Tokeira supply-chain and license posture.
 #
-# Run locally with `cargo deny check`; enforced in CI (.github/workflows/ci.yml).
+# Run locally with `cargo deny check`. `dagger check` runs bans, licenses and
+# sources as one check, which gates merges, and advisories as another, which
+# doesn't: a new RustSec entry can fail a tree that hasn't changed.
 # Schema reference: https://embarkstudios.github.io/cargo-deny/
 #
 # Tokeira is a from-scratch durable-execution engine specialised for Aurora DSQL.

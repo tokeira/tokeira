@@ -306,9 +306,9 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
   process-global state cannot exist (tracing-span-lifecycle-hygiene spec, Req 5). Plain
   `cargo test` is inner-loop only.
 - `dagger check` adds `cargo-deny` (advisories as their own check), an offline lychee
-  link check over every `*.md` including `.kiro/`, and this file's byte budget. On
-  GitHub only `cargo-deny` bans/licenses/sources and those doc checks gate a merge:
-  nothing there compiles or tests.
+  link check over every `*.md` including `.kiro/`, and this file's byte budget. Dagger
+  Cloud runs it on every push; a merge to `main` needs every check green except
+  advisories.
 - All of it runs `--locked`: dependency movement is reviewed, never a CI side effect.
 
 #### §10.5 Rebase — or recommend

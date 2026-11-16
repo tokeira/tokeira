@@ -17,18 +17,6 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 filter = 'test(=tests::discovered_selection_creates_and_checks_with_the_generated_compose_provisioner)'
 slow-timeout = { period = "120s", terminate-after = 10 }
 
-[profile.ci]
-retries = 0        # a flaky test is a bug to fix, not to hide
-fail-fast = false  # report every failure in one run
-slow-timeout = { period = "60s", terminate-after = 3 }
-
-[[profile.ci.overrides]]
-filter = 'test(=tests::discovered_selection_creates_and_checks_with_the_generated_compose_provisioner)'
-slow-timeout = { period = "120s", terminate-after = 10 }
-
-[profile.ci.junit]
-path = "junit.xml"
-
 # The live DSQL suites (docs/testing/dsql-live-suites.md). On a new cluster the
 # first test that migrates applies the whole corpus and waits for every ASYNC
 # index build, about ten minutes, and the generated suites run hundreds of

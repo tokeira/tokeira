@@ -199,9 +199,9 @@ EOF
   login profiles; `tkw devbox` sources the cargo env itself.
 - Protobuf compilation uses `protox`, including the Temporal SDK's build scripts;
   no system `protoc` is needed. cmake + clang cover aws-lc-sys, ring, zstd-sys, mimalloc.
-- The fmt nightly must match CI's `NIGHTLY_FMT_TOOLCHAIN` pin exactly; `tkw devbox
+- The fmt nightly must match `fmtToolchain` in `dagger.toml` exactly; `tkw devbox
   bar` uses whichever dated nightly is installed on the box, keeping the pin's home
-  in CI config.
+  in `dagger.toml`.
 
 ## Boundaries and rules
 

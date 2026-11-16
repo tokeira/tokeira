@@ -11,9 +11,10 @@ engineering rules (lint wall, kernel purity, documentation standards), see
   `rust-toolchain.toml` and picked up automatically. Formatting uses
   nightly-only rustfmt options, so also install a nightly toolchain
   (`rustup toolchain install nightly`).
+- **cargo-nextest** — the test runner (`cargo install cargo-nextest --locked`).
 - **Docker** — only for the compose platform and container image work; the
   default test suite does not need it.
-- **Dagger 0.20+** — only for `tkr image build`.
+- **Dagger v1.0.0-beta.27 or later** — only for `dagger check`.
 
 The default test suite requires no live AWS credentials and no Docker.
 
@@ -21,7 +22,8 @@ The default test suite requires no live AWS credentials and no Docker.
 
 ```bash
 cargo build                          # build all crates
-cargo test --workspace               # unit + integration tests
+cargo nextest run --workspace        # unit + integration tests
+cargo test --workspace --doc         # doctests
 cargo lint                           # alias for: clippy --workspace --all-targets
 cargo +nightly fmt --all             # format (nightly-only options)
 cargo doc --workspace --no-deps      # API docs

@@ -8,8 +8,7 @@ source = "github.com/tokeira/dagger-rust-toolchain@v0.2.0"
 
 [modules.rust.settings]
 # rustfmt.toml uses nightly-only options. Advance this together with
-# NIGHTLY_FMT_TOOLCHAIN in .github/workflows/ci.yml and CI_FMT_NIGHTLY in
-# crates/tokeira-build.
+# CI_FMT_NIGHTLY in crates/tokeira-build.
 fmtToolchain = "nightly-2026-06-16"
 # `cargo lint` passes with zero warnings (AGENTS.md), so any warning fails
 # the clippy check.
@@ -35,6 +34,7 @@ checkNoDefaultFeatures = false
 # tokeira-build-info's build script reads CI.
 cargoEnvironment = ["CI=1"]
 
-# Tokeira's own checks: the agent-file rules and the offline link check.
+# Tokeira's own checks: the agent-file rules, the offline link check, the
+# Temporal pins, the bump trailers and the changelog fragments.
 [modules.ci]
 source = ".dagger/modules/ci"

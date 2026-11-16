@@ -66,24 +66,12 @@ is done in these places:
   test suite.
 - Generated-code freshness: `tools/proto-sync/tests/reproducible.rs`, also in the
   default suite, regenerates the committed Temporal bindings and compares them.
-- Proto and server compatibility pin monotonicity: `tkr ci check`.
-- Deterministic versioned-build manifests: `tkr ci build --versioned` derives
-  the manifest twice and requires the two to be identical, then checks that the
-  built `tokeirad` reports every field of it.
-- The source-tree hash: the same build, as the SHA-256 of `git archive HEAD`.
-- Frozen lock mode: `tkr ci check` and `tkr ci build`.
+- Proto and server compatibility pin monotonicity, and the bump trailers: the
+  `proto-monotonicity`, `server-compat-monotonicity` and `bump-trailer` checks
+  of the `ci` Dagger module.
 
-`tkr ci check`, `tkr ci build`, and `tkr ci lock-update` are implemented. They
-open an in-process session on the Dagger engine release that `tkr` pins, and run
-locally: no hosted CI runs them. `tkr ci check` runs thirteen checks: the
-proto and server-compatibility pin monotonicity checks and the bump-trailer
-check, the Rust bar, the offline link check, and the changelog-fragment and
-package dry-run release gates. Checks and builds run with `dagger.lock` frozen;
-`tkr ci lock-update` refreshes it.
-
-`dagger check`, on stock Dagger, runs the Rust bar and the documentation checks
-from `dagger.toml` without `tkr`. It does not run the pin monotonicity,
-bump-trailer or release-gate checks, which stay with `tkr ci check`.
+`dagger check`, on stock Dagger, runs these from `dagger.toml`, beside the Rust
+bar, the documentation checks and the changelog-fragment check.
 
 Versioned builds pass `TOKEIRA_BUILD_MANIFEST_PATH` to Cargo. The manifest
 contains every field embedded by `tokeira-build-info`. Local dev builds omit the

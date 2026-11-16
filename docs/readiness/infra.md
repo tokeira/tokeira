@@ -41,16 +41,16 @@ Three independent, compile-time pins; the startup log, the `GetSystemInfo` hands
 | Edge `dispatch_rpc` adoption (all handlers) | ⬜ | task 5. |
 | Compatibility service (Buffa + connect-rust) | ⬜ | task 7. |
 | `tkr compat show / diff` | ⬜ | task 8. |
-| `tkr ci check / build` (Dagger) | ⬜ | task 9. |
+| Pin monotonicity + bump-trailer checks (`ci` Dagger module) | ✅ | `dagger check`. |
 | Dagger compatibility module | ⬜ | task 10. |
 | Dagger versioned build + lockfile policy | ⬜ | task 11. |
 | `tkr compat bump` (server-compat bump protocol) | ⬜ | design only (see below). |
 
 ## Proto-version monotonicity gate (direction)
 
-A Dagger-backed check, invoked via `tkr ci check`, compares `TEMPORAL_PROTO_VERSION` between the tip
-commit and the last tagged tokeira release. A semver downgrade **fails** unless the commit carries an
-explicit `Proto-Downgrade: <reason>` trailer. A proto-bump PR must include regenerated types + an
+The `ci` Dagger module's `proto-monotonicity` check compares `TEMPORAL_PROTO_VERSION` at HEAD with the
+last tagged tokeira release. A semver downgrade **fails** unless HEAD, or a commit since the tag that
+changed `pinned.rs`, carries an explicit `Proto-Downgrade: <reason>` trailer. A proto-bump PR must include regenerated types + an
 updated matrix covering any new RPCs; removing a previously-defined RPC is flagged as a breaking wire
 change. A proto bump does **not** require a `TEMPORAL_SERVER_COMPAT` bump (the two move independently).
 
@@ -63,7 +63,7 @@ A phased engine (`crates/tokeira-build/src/compat_bump/`) drives a `TEMPORAL_SER
 - **Evidence** — enumerate upstream releases between the old and new claim (GitHub API via `octocrab`),
   build the **Upstream Releases table** (one row per release: release-notes link + a verbatim one-line
   quote) and the matrix delta.
-- **Mutate** — branch; edit `pinned.rs`; commit with a `Server-Compat-Bump:` trailer; run `tkr ci check`.
+- **Mutate** — branch; edit `pinned.rs`; commit with a `Server-Compat-Bump:` trailer; run `dagger check`.
 - **Publish** — push; open a PR (octocrab) with the templated body.
 
 **Bump triggers** (when to raise the claim): (1) a matrix row moved to `Implemented` unblocking a claim;
@@ -71,13 +71,10 @@ A phased engine (`crates/tokeira-build/src/compat_bump/`) drives a `TEMPORAL_SER
 `Stubbed`/`Unsupported` features; — the `FEATURE_MATRIX`, not `TEMPORAL_SERVER_COMPAT`, is authoritative
 for what tokeira actually does.
 
-## CI substrate + handoff
+## CI substrate
 
-`tkr ci check` connects its own in-process Dagger session (the vendored `dagger-sdk`; no wrapper
-process, no session environment variables) and calls `run_ci_checks(request, client) -> CiCheckReport`
-(serde-serializable). Remote-trigger wiring (GitHub Actions, nightly) is **out of scope** here and owned
-by the `pipeline-foundation` spec, which will call the same `run_ci_checks` so local and remote verdicts
-never diverge.
+`dagger check` runs these checks from `dagger.toml`, through the `ci` module in `.dagger/modules/ci`,
+on stock Dagger. Local runs and Dagger Cloud run the same module, so their verdicts never diverge.
 
 ## Source
 

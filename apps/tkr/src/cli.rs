@@ -111,7 +111,6 @@ pub(crate) enum Command {
         action: ConfigAction,
     },
     Compat(CompatArgs),
-    Ci(CiArgs),
     Release(ReleaseArgs),
     Observability {
         #[command(subcommand)]
@@ -323,12 +322,6 @@ pub(crate) struct CompatArgs {
 }
 
 #[derive(Args)]
-pub(crate) struct CiArgs {
-    #[command(subcommand)]
-    pub command: CiCommand,
-}
-
-#[derive(Args)]
 pub(crate) struct ReleaseArgs {
     #[command(subcommand)]
     pub command: ReleaseCommand,
@@ -396,46 +389,6 @@ pub(crate) enum CompatCommand {
         #[arg(long)]
         fail_on_incompatible: bool,
     },
-}
-
-#[derive(Subcommand)]
-pub(crate) enum CiCommand {
-    Check {
-        #[arg(long)]
-        json: bool,
-        #[arg(long)]
-        update_lock: bool,
-        /// Run only the named check; repeat to select more than one.
-        #[arg(long = "check", value_enum)]
-        checks: Vec<CliCiCheck>,
-    },
-    Build {
-        #[arg(long)]
-        versioned: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    LockUpdate {
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub(crate) enum CliCiCheck {
-    ProtoMonotonicity,
-    ServerCompatMonotonicity,
-    BumpTrailer,
-    Fmt,
-    Lint,
-    Check,
-    Nextest,
-    Doctests,
-    Rustdoc,
-    Deny,
-    Links,
-    ChangelogFragments,
-    PackageDryRun,
 }
 
 #[derive(Subcommand)]

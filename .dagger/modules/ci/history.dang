@@ -1,0 +1,184 @@
+# The history checks read commits: the Temporal pins at the latest release
+# tag and at HEAD, and the trailers of the commits since. They see what HEAD
+# records, not edits that are not committed. A checkout need not have the
+# release tags or the release branch, so the checks fetch both from the
+# public repository.
+
+# The repository that the release tags and the release branch come from.
+let ciRepositoryUrl: String! = "https://github.com/tokeira/tokeira"
+
+# Where the Temporal pins are declared.
+let ciPinnedFile: String! = "crates/tokeira-build-info/src/pinned.rs"
+
+# The pin that the bump trailers describe.
+let ciServerCompat: String! = "TEMPORAL_SERVER_COMPAT"
+
+# The image that git runs in: alpine/git 2.54.1, by the digest of its
+# multi-platform index.
+let ciGitImage: String! = "alpine/git:2.54.1@sha256:2306e2b05ee0ef99f5d25b0779f645b24ae9f91ba187107503592fcdfe78da3a"
+
+# HEAD's history at /repository, with every release tag and the release
+# branch fetched from the public repository. The working tree stays empty:
+# the checks read commits only.
+let ciHistory(ws: Workspace!): Container! {
+  let base = container
+    .from(ciGitImage)
+    .withEnvVariable("GIT_CONFIG_COUNT", "1")
+    .withEnvVariable("GIT_CONFIG_KEY_0", "safe.directory")
+    .withEnvVariable("GIT_CONFIG_VALUE_0", "*")
+    .withDirectory("/repository/.git", ws.git.directory)
+    .withWorkdir("/repository")
+  let branch = ciReleaseBranch(base)
+  base.withExec([
+    "git", "fetch", "--quiet", "--no-tags", ciRepositoryUrl,
+    "+refs/tags/v*:refs/tags/v*",
+    "+refs/heads/" + branch + ":refs/remotes/origin/" + branch,
+  ])
+}
+
+# The release branch, as HEAD's .tokeira-release.toml names it.
+let ciReleaseBranch(repo: Container!): String! {
+  let found = ciShow(repo, "HEAD", ".tokeira-release.toml")
+    .match(`(?m)^release_branch[ \t]*=[ \t]*"([^"]*)"[ \t]*$`)
+  if (found == null) {
+    raise "ci: .tokeira-release.toml names no release_branch"
+  }
+  let branch = found.captures[0]!
+  if (branch == "") {
+    raise "ci: .tokeira-release.toml names no release_branch"
+  }
+  branch
+}
+
+# A file's contents at a revision.
+let ciShow(repo: Container!, revision: String!, path: String!): String! {
+  repo.withExec(["git", "show", revision + ":" + path]).stdout
+}
+
+# The lines of a command's output that are not empty.
+let ciLines(output: String!): [String!]! {
+  output.split("\n").filter { line => line != "" }
+}
+
+# The latest release tag, in version order, or "" when there is none.
+let ciLatestTag(repo: Container!): String! {
+  let tags = ciLines(
+    repo.withExec(["git", "tag", "--list", "v[0-9]*", "--sort=-v:refname"]).stdout,
+  )
+  if (tags.isEmpty) { "" } else { tags[0]! }
+}
+
+# A pin's value in pinned.rs's source, or "" unless the source declares it
+# exactly once.
+let ciPin(source: String!, name: String!): String! {
+  let found = source
+    .matchAll(`(?m)^pub const ([A-Z_]+): &str = "([^"]*)";`)
+    .filter { m => m.captures[0] == name }
+  if (found.length == 1) { found[0]!.captures[1]! } else { "" }
+}
+
+# A pin's three numbers, or null unless the pin is X.Y.Z, without leading
+# zeros, after an optional "v".
+let ciVersion(pin: String!): [Int!] {
+  let found = pin.match(`^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
+  if (found == null) {
+    null
+  } else {
+    found.captures.map { part => JSON.decode(part) :: Int! }
+  }
+}
+
+# Whether version a is at least version b.
+let ciAtLeast(a: [Int!]!, b: [Int!]!): Boolean! {
+  if (a[0]! != b[0]!) {
+    a[0]! > b[0]!
+  } else if (a[1]! != b[1]!) {
+    a[1]! > b[1]!
+  } else {
+    a[2]! >= b[2]!
+  }
+}
+
+# The values of a trailer in the messages of the commits that git log's
+# arguments select, as git reads trailers.
+let ciTrailers(repo: Container!, key: String!, selection: [String!]!): [String!]! {
+  ciLines(
+    repo.withExec(
+      ["git", "log", "--format=%(trailers:key=" + key + ",valueonly,unfold)"] + selection,
+    ).stdout,
+  )
+}
+
+# Check that a pin at HEAD is not lower than at the latest release tag,
+# unless HEAD, or a commit since the tag that changed pinned.rs, has the
+# override trailer. With no release tag yet, there is nothing to compare.
+let ciMonotonic(ws: Workspace!, name: String!, override: String!): Void {
+  let repo = ciHistory(ws)
+  let tag = ciLatestTag(repo)
+  if (tag != "") {
+    let released = ciPin(ciShow(repo, tag, ciPinnedFile), name)
+    let tip = ciPin(ciShow(repo, "HEAD", ciPinnedFile), name)
+    let releasedVersion = ciVersion(released)
+    let tipVersion = ciVersion(tip)
+    if (releasedVersion == null or tipVersion == null) {
+      raise "ci: " + name + " is not an X.Y.Z version: \"" + released + "\" at " + tag
+        + ", \"" + tip + "\" at HEAD"
+    }
+    if (ciAtLeast(tipVersion, releasedVersion) == false) {
+      let reasons = ciTrailers(repo, override, ["-1", "HEAD"])
+        + ciTrailers(repo, override, [tag + "..HEAD", "--", ciPinnedFile])
+      if (reasons.isEmpty) {
+        raise "ci: " + name + " went back from " + released + " at " + tag + " to " + tip
+          + ", and neither HEAD nor a commit since " + tag + " that changed "
+          + ciPinnedFile + " has a " + override + " trailer"
+      }
+    }
+  }
+  null
+}
+
+# Check that each commit since the latest release tag that changes the
+# server compatibility pin has a Server-Compat-Bump trailer that names the
+# change.
+let ciBumpTrailers(ws: Workspace!): Void {
+  let repo = ciHistory(ws)
+  let tag = ciLatestTag(repo)
+  if (tag != "") {
+    let commits = ciLines(
+      repo.withExec(["git", "rev-list", "--reverse", tag + "..HEAD", "--", ciPinnedFile]).stdout,
+    )
+    commits.each { commit =>
+      let parent = repo.withExec(["git", "rev-parse", commit + "^"]).stdout.trimSpace
+      let before = ciPin(ciShow(repo, parent, ciPinnedFile), ciServerCompat)
+      let after = ciPin(ciShow(repo, commit, ciPinnedFile), ciServerCompat)
+      if (before != after) {
+        ciBumpTrailer(repo, commit, before, after)
+      }
+    }
+  }
+  null
+}
+
+# Check one commit's Server-Compat-Bump trailer: "Server-Compat-Bump: <old>
+# -> <new>, trigger: <1, 2 or 3>", with the versions the commit changes the
+# pin from and to. It is the format of tokeira-build's BumpTrailer.
+let ciBumpTrailer(repo: Container!, commit: String!, before: String!, after: String!): Void {
+  let trailers = ciTrailers(repo, "Server-Compat-Bump", ["-1", commit])
+  let claim = if (trailers.isEmpty) {
+    null
+  } else {
+    trailers[0]!.match(
+      `^((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)) -> ((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)), trigger: [123]$`,
+    )
+  }
+  if (claim == null or ciVersion(before) == null or ciVersion(after) == null) {
+    raise "ci: commit " + commit + " changes " + ciServerCompat + " from \"" + before
+      + "\" to \"" + after + "\" without an exact trailer: Server-Compat-Bump: "
+      + before.trimPrefix("v") + " -> " + after.trimPrefix("v") + ", trigger: 1, 2 or 3"
+  }
+  if (claim.captures[0]! != before.trimPrefix("v") or claim.captures[4]! != after.trimPrefix("v")) {
+    raise "ci: commit " + commit + " changes " + ciServerCompat + " from " + before + " to "
+      + after + ", but its trailer says " + claim.captures[0]! + " -> " + claim.captures[4]!
+  }
+  null
+}

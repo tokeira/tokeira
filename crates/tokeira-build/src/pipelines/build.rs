@@ -9,11 +9,8 @@ use crate::{Arch, BuildError, CI_FMT_NIGHTLY, rust_toolchain_version};
 
 pub(crate) const BUILDER_APT_LINE: &str = "apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates cmake clang git curl jq && rm -rf /var/lib/apt/lists/*";
 
-/// Construct the shared image/CI builder toolchain before source or caches are attached.
-///
-/// Source-dependent inputs stay outside this definition so CI cache names can be
-/// derived from the toolchain alone: editing Rust code must reuse warm registry
-/// and target volumes, while advancing the base image or fmt nightly re-keys them.
+/// Construct the shared image and release builder toolchain before source or caches
+/// are attached.
 pub(crate) fn builder_toolchain(query: &Query, toolchain: &str) -> Container {
     query
         .container()
@@ -43,12 +40,6 @@ pub(crate) fn builder_toolchain(query: &Query, toolchain: &str) -> Container {
         // nightly release cannot silently change formatting.
         .with_env_variable("NIGHTLY_FMT_TOOLCHAIN", CI_FMT_NIGHTLY)
         .with_env_variable("RUSTUP_TOOLCHAIN", toolchain)
-}
-
-pub(crate) fn builder_definition(toolchain: &str) -> String {
-    format!(
-        "rust:{toolchain}-slim-bookworm\n{BUILDER_APT_LINE}\nrustfmt:{CI_FMT_NIGHTLY}\nclippy:{toolchain}"
-    )
 }
 
 /// Paths excluded from the workspace upload that feeds the Dagger build.

@@ -298,7 +298,6 @@ async fn run(cli: Cli) -> Result<()> {
             action: ConfigAction::Show,
         } => commands::config::run_show(&deployments, selected),
         Command::Compat(args) => commands::compat::run(args.command, cli.json),
-        Command::Ci(args) => commands::ci::run(args.command, cli.json).await,
         Command::Release(args) => commands::release::run(args.command, cli.json).await,
         Command::Observability { action } => {
             let ObservabilityAction::Check {

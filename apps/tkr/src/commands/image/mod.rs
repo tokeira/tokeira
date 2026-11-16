@@ -5,16 +5,20 @@
 //!
 //! # The Dagger session
 //!
-//! Each build owns one SDK session. The SDK provisions and authenticates the
-//! CLI in-process — no `dagger run` wrapper or re-exec.
-//! On Apple Silicon, tkr realizes the checksum-pinned fork engine as a persistent
-//! local Docker runner. Tokeira isolates this owned session from ambient Dagger
-//! development configuration.
+//! Each build owns one SDK session. The SDK downloads its exact Dagger CLI
+//! release, checksum-verified, and the CLI provisions the engine — no
+//! `dagger run` wrapper or re-exec. tkr refuses to start inside another Dagger
+//! session, so every session it opens is its own.
+//!
+//! The CLI starts in the system's temporary directory, outside the repository.
+//! Started inside a Dagger workspace, stock Dagger leaves that workspace's
+//! `dagger.lock` out of host directories, and the release train's Git checks
+//! would read the lock as deleted. The pipelines pass absolute host paths, so
+//! nothing else depends on where the CLI starts.
 
-mod engine_bootstrap;
 mod progress;
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use tokeira_build::{TokeiradBuildRequest, build_tokeirad_image};
@@ -23,7 +27,13 @@ use crate::{cli::ImageCommand, output, tui::OutputFormat};
 
 use self::progress::ImageBuildProgress;
 
-const DAGGER_SESSION_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Variables through which an enclosing Dagger session, or another Dagger CLI
+/// or engine, would take over the SDK's choice of engine.
+const ENCLOSING_SESSION_VARIABLES: [&str; 3] = [
+    "DAGGER_SESSION_PORT",
+    "_EXPERIMENTAL_DAGGER_CLI_BIN",
+    "_EXPERIMENTAL_DAGGER_RUNNER_HOST",
+];
 
 pub(crate) async fn run(command: ImageCommand, format: OutputFormat) -> Result<()> {
     let ImageCommand::Build { arch, tag } = command else {
@@ -33,75 +43,49 @@ pub(crate) async fn run(command: ImageCommand, format: OutputFormat) -> Result<(
 }
 
 /// Connect one owned Dagger session for a verb.
-///
-/// The SDK owns CLI acquisition and authentication. On Apple Silicon, tkr first
-/// prepares the checksum-pinned fork engine and supplies its local runner URI. The
-/// exact SDK release and runner remain deterministic even inside a Dagger development
-/// shell, and startup is bounded independently of a potentially long image build.
 pub(crate) async fn dagger_session() -> Result<dagger_sdk::Client> {
-    dagger_session_inner(None).await
-}
-
-/// Connect CI to the already-running pinned engine with an explicit lock policy.
-///
-/// Unlike image bootstrap, this path performs no provisioning. A missing runner
-/// therefore fails with the remediation owned by the checksum-verified image flow.
-pub(crate) async fn ci_dagger_session(
-    workspace_root: &std::path::Path,
-    lock_mode: dagger_sdk::LockMode,
-) -> Result<dagger_sdk::Client> {
-    let runner_host = engine_bootstrap::running_runner_host().await?;
-    let config = dagger_sdk::ClientConfig::builder()
-        .isolated_cli_session()
-        .runner_host(runner_host)
-        .workdir(workspace_root)
-        .lock_mode(lock_mode)
-        .session_startup_timeout(DAGGER_SESSION_STARTUP_TIMEOUT)
-        .build()
-        .context("configure the pinned Dagger CI session")?;
-    dagger_sdk::connect_with(config)
-        .await
-        .context("failed to connect the pinned Dagger CI session")
+    connect(dagger_sdk::ClientConfig::builder()).await
 }
 
 async fn dagger_session_with_progress(
     progress: Arc<ImageBuildProgress>,
 ) -> Result<dagger_sdk::Client> {
-    dagger_session_inner(Some(progress)).await
-}
-
-async fn dagger_session_inner(
-    progress: Option<Arc<ImageBuildProgress>>,
-) -> Result<dagger_sdk::Client> {
-    let runner_host = engine_bootstrap::runner_host(progress.clone()).await?;
-    if let Some(progress) = &progress {
-        progress.start_phase("Connecting to Dagger");
-    }
-
-    let config = dagger_client_config(runner_host, progress.clone())?;
-    let client = dagger_sdk::connect_with(config)
-        .await
-        .context("failed to connect a Dagger session")?;
-    if let Some(progress) = &progress {
-        progress.finish_phase("Dagger session connected");
-    }
+    progress.start_phase("Connecting to Dagger");
+    let client =
+        connect(dagger_sdk::ClientConfig::builder().diagnostic_sink(progress.clone())).await?;
+    progress.finish_phase("Dagger session connected");
     Ok(client)
 }
 
-fn dagger_client_config(
-    runner_host: Option<String>,
-    progress: Option<Arc<ImageBuildProgress>>,
-) -> Result<dagger_sdk::ClientConfig> {
-    let mut config = dagger_sdk::ClientConfig::builder()
-        .isolated_cli_session()
-        .session_startup_timeout(DAGGER_SESSION_STARTUP_TIMEOUT);
-    if let Some(runner_host) = runner_host {
-        config = config.runner_host(runner_host);
+async fn connect(config: dagger_sdk::ClientConfigBuilder) -> Result<dagger_sdk::Client> {
+    refuse_enclosing_session(std::env::var_os)?;
+    dagger_sdk::connect_with(session_config(config)?)
+        .await
+        .context("failed to connect a Dagger session")
+}
+
+/// The configuration of a session tkr opens: its CLI starts in the system's
+/// temporary directory, outside the repository.
+fn session_config(config: dagger_sdk::ClientConfigBuilder) -> Result<dagger_sdk::ClientConfig> {
+    config
+        .workdir(std::env::temp_dir())
+        .build()
+        .context("configure the Dagger session")
+}
+
+/// Refuse to start while any of [`ENCLOSING_SESSION_VARIABLES`] is set.
+fn refuse_enclosing_session(variable: impl Fn(&'static str) -> Option<OsString>) -> Result<()> {
+    let set = ENCLOSING_SESSION_VARIABLES
+        .into_iter()
+        .filter(|&key| variable(key).is_some())
+        .collect::<Vec<_>>();
+    if set.is_empty() {
+        return Ok(());
     }
-    if let Some(progress) = progress {
-        config = config.diagnostic_sink(progress);
-    }
-    config.build().context("configure the Dagger session")
+    bail!(
+        "tkr starts its own Dagger session and does not run inside another one; unset {}",
+        set.join(", ")
+    )
 }
 
 pub(crate) async fn run_build(
@@ -219,19 +203,45 @@ mod tests {
     }
 
     #[test]
-    fn dagger_config_owns_source_selection_and_bounds_startup() {
-        let config =
-            dagger_client_config(Some("docker-container://tokeira-runner".to_owned()), None)
-                .expect("the owned Dagger configuration is valid");
+    fn sessions_start_outside_any_other_dagger_session() {
+        let unrelated = |key: &'static str| match key {
+            "DAGGER_CLOUD_TOKEN" | "DAGGER_SESSION_TOKEN" => Some(OsString::from("set")),
+            _ => None,
+        };
+        refuse_enclosing_session(unrelated).expect("no enclosing session variable is set");
+    }
 
-        assert!(config.uses_isolated_cli_session());
-        assert_eq!(
-            config.session_startup_timeout(),
-            DAGGER_SESSION_STARTUP_TIMEOUT
-        );
-        assert_eq!(
-            config.runner_host(),
-            Some("docker-container://tokeira-runner")
+    #[test]
+    fn sessions_start_their_cli_outside_the_repository() {
+        let config =
+            session_config(dagger_sdk::ClientConfig::builder()).expect("the session configures");
+        assert_eq!(config.workdir(), Some(std::env::temp_dir().as_path()));
+    }
+
+    #[test]
+    fn sessions_refuse_each_enclosing_session_variable() {
+        for variable in ENCLOSING_SESSION_VARIABLES {
+            let error = refuse_enclosing_session(|key| {
+                if key == variable {
+                    Some(OsString::new())
+                } else {
+                    None
+                }
+            })
+            .expect_err("an enclosing session variable is refused");
+            assert!(
+                error.to_string().ends_with(&format!("; unset {variable}")),
+                "{error}"
+            );
+        }
+
+        let error = refuse_enclosing_session(|_| Some(OsString::from("1")))
+            .expect_err("every enclosing session variable is refused");
+        assert!(
+            error
+                .to_string()
+                .ends_with("; unset DAGGER_SESSION_PORT, _EXPERIMENTAL_DAGGER_CLI_BIN, _EXPERIMENTAL_DAGGER_RUNNER_HOST"),
+            "{error}"
         );
     }
 }

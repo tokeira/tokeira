@@ -2196,44 +2196,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dagger-sdk"
-version = "1.0.0-beta.11.rust.3"
-dependencies = [
- "async-trait",
- "base64 0.21.7",
- "dagger-sdk-macros",
- "dirs 5.0.1",
- "flate2",
- "futures",
- "hex",
- "opentelemetry 0.32.0",
- "opentelemetry_sdk 0.32.1",
- "reqwest 0.12.28",
- "semver",
- "serde",
- "serde_graphql_input",
- "serde_json",
- "sha2 0.10.9",
- "tar",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-opentelemetry 0.33.0",
- "tracing-subscriber",
- "url",
- "zip",
-]
-
-[[package]]
-name = "dagger-sdk-macros"
-version = "1.0.0-beta.11.rust.3"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8443,7 +8405,6 @@ dependencies = [
  "chrono",
  "clap",
  "console 0.15.11",
- "dagger-sdk",
  "directories",
  "indicatif",
  "libc",
@@ -8459,6 +8420,7 @@ dependencies = [
  "tokeira-build-info",
  "tokeira-compatibility",
  "tokeira-config",
+ "tokeira-dagger-sdk",
  "tokeira-deploy-engine",
  "tokeira-deployment",
  "tokeira-eks-deployment",
@@ -8634,7 +8596,6 @@ version = "0.7.0"
 dependencies = [
  "async-trait",
  "cargo_metadata",
- "dagger-sdk",
  "eyre",
  "gix",
  "proptest",
@@ -8642,6 +8603,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokeira-dagger-sdk",
  "tokeira-deployment",
  "tokeira-orchestrator",
  "tokeira-platform",
@@ -8922,6 +8884,48 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "tokeira-dagger-sdk"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "902927196020dd7b1cf9024a9208f5611a40d6041b4ccc2b329ad2dc3f3a58e5"
+dependencies = [
+ "async-trait",
+ "base64 0.21.7",
+ "dirs 5.0.1",
+ "flate2",
+ "futures",
+ "hex",
+ "opentelemetry 0.32.0",
+ "opentelemetry_sdk 0.32.1",
+ "reqwest 0.12.28",
+ "semver",
+ "serde",
+ "serde_graphql_input",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "tokeira-dagger-sdk-macros",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry 0.33.0",
+ "tracing-subscriber",
+ "url",
+ "zip",
+]
+
+[[package]]
+name = "tokeira-dagger-sdk-macros"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "784a7d5ee371a57156982cc8211ba91b90b2c63ce2d469dc8d17c283384d3dae"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -11319,3 +11323,7 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[patch.unused]]
+name = "dagger-sdk-macros"
+version = "1.0.0-beta.11.rust.3"

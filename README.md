@@ -5,6 +5,7 @@
 [![docs.rs](https://img.shields.io/docsrs/tokeira-engine)](https://docs.rs/tokeira-engine)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![MSRV 1.99](https://img.shields.io/badge/MSRV-1.99-orange?logo=rust)](Cargo.toml)
+[![Dagger v1.0.0-beta.27 or later](https://img.shields.io/badge/Dagger-v1.0.0--beta.27%20or%20later-informational)](dagger.toml)
 [![Built with Claude, Codex & Kiro](https://img.shields.io/badge/built%20with-Claude%2C%20Codex%20%26%20Kiro-blueviolet)](#built-with-claude-codex-and-kiro)
 
 <p align="center">
@@ -25,9 +26,9 @@ Rust application when a separate service is unnecessary.
 
 ## Quickstart
 
-Prerequisites: Rust ≥ 1.99; for the service path, Docker and, for now, an
-Apple-silicon Mac. Protobuf compilation uses the pure-Rust `protox` compiler,
-so no system `protoc` installation is needed.
+Prerequisites: Rust ≥ 1.99; for the service path, Docker. Protobuf
+compilation uses the pure-Rust `protox` compiler, so no system `protoc`
+installation is needed.
 
 ### A durable workflow in one file
 

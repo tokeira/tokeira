@@ -1,0 +1,5 @@
+kind: added
+body: '`tkr image build` derives its build manifest twice and exports no image whose `tokeirad --version --json` differs from that manifest in any field.'
+time: 2026-11-16T21:33:25+00:00
+custom:
+    Slice: c03b8844-b98c-47ac-90d8-655556f0ff3d

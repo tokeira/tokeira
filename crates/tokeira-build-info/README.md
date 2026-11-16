@@ -9,8 +9,10 @@ adapter crates that consume `BuildInfo`.
 ## Metadata Sources
 
 Versioned builds set `TOKEIRA_BUILD_MANIFEST_PATH` before compiling. The manifest
-is a checked, deterministic key/value file produced by the Dagger versioned build
-pipeline. It must contain:
+is a checked, deterministic key/value file produced by the Dagger pipeline behind
+`tkr image build`, which derives it twice, refuses to build when the two
+derivations disagree, and checks that the built `tokeirad` reports every field. It
+must contain:
 
 ```text
 TOKEIRA_VERSION=...
@@ -48,6 +50,6 @@ The crate and its build script must not use wall-clock time. Build timestamps ar
 not part of the metadata model because they make byte-for-byte reproducibility
 harder and do not improve operator diagnosis.
 
-Versioned builds should use the Dagger pipeline once it is available. Dev builds
-remain ergonomic and deterministic enough for local work, but their placeholder
-hashes are not release provenance.
+Versioned builds come from that Dagger pipeline. Dev builds remain ergonomic and
+deterministic enough for local work, but their placeholder hashes are not release
+provenance.

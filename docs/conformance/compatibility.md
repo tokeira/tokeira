@@ -74,8 +74,11 @@ is done in these places:
 bar, the documentation checks and the changelog-fragment check.
 
 Versioned builds pass `TOKEIRA_BUILD_MANIFEST_PATH` to Cargo. The manifest
-contains every field embedded by `tokeira-build-info`. Local dev builds omit the
-manifest and use workspace-derived fallback metadata.
+contains every field embedded by `tokeira-build-info`. `tkr image build` derives
+it twice in its Dagger pipeline, requires the two derivations to agree, and
+exports no image whose `tokeirad --version --json` differs from the manifest in
+any field. Local dev builds omit the manifest and use workspace-derived fallback
+metadata.
 
 ## Compatibility Bump Checklists
 

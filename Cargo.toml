@@ -83,9 +83,9 @@ homepage = "https://tokeira.io"
 [workspace.dependencies]
 anyhow = "1.0.103"
 async-trait = "0.1"
-# The first-party Dagger Rust SDK, vendored from its release artifacts
-# (vendor/README.md carries the provenance and advance procedure).
-dagger-sdk = { path = "vendor/dagger-sdk" }
+# Tokeira's Dagger Rust SDK (github.com/tokeira/dagger-rust-sdk). Its library
+# is `dagger_sdk`, so the dependency keeps that name.
+dagger-sdk = { package = "tokeira-dagger-sdk", version = "0.7.1" }
 base64 = "0.22"
 bollard = "0.17"
 cargo_metadata = "0.23"

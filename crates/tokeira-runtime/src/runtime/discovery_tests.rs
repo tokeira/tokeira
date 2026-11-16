@@ -332,6 +332,78 @@ async fn stale_missing_closed_and_paused_offers_do_not_escape_the_poll() {
     }
 }
 
+/// A page that loaded the run before its task started admits a copy once the
+/// start finishes the offer; the workflow-task poll discards that copy.
+#[tokio::test]
+async fn a_copy_admitted_after_its_start_does_not_fail_the_next_poll() {
+    let clock: Arc<dyn Clock> = Arc::new(crate::test_clock::TestClock::new());
+    let repo = Arc::new(super::repair_tests::Repo::with_inner(
+        InMemoryStore::default().with_clock(clock.clone()),
+    ));
+    let runtime = super::timer_deadline_tests::fixture_on(repo.clone(), clock).await;
+    let request = super::timer_deadline_tests::start(&runtime, false);
+    let run_key = request.run_key;
+    let queue = QueueKey {
+        namespace_id: request.namespace_id,
+        task_queue: request.task_queue.clone(),
+        task_kind: TaskKind::Workflow,
+        deployment: None,
+        build_id: None,
+    };
+    let wait = std::time::Duration::from_secs(10);
+    runtime.ready().await.unwrap();
+    runtime.start_workflow(request).await.unwrap();
+    let (loaded, resume) = repo.pause(super::repair_tests::Point::Loaded);
+    let (registry, homes) = &runtime.discovery;
+    let queue_home =
+        crate::discovery::QueueHomeProvider::local_home(homes.as_ref(), &queue).unwrap();
+    let _demand = registry.register_poll(queue.clone(), queue_home, tokio::time::Instant::now());
+    tokio::time::timeout(wait, loaded)
+        .await
+        .expect("discovery loads the run")
+        .unwrap();
+    let worker = WorkerIdentity("worker".into());
+    let first = runtime
+        .poll_workflow_task(queue.clone(), worker.clone(), wait)
+        .await
+        .unwrap()
+        .unwrap();
+    let first_seq = first.token.logical_seq;
+    assert!(!runtime.broker.knows_offer((run_key, first_seq)).await);
+    resume.send(()).unwrap();
+    tokio::time::timeout(wait, async {
+        while !runtime.broker.knows_offer((run_key, first_seq)).await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("discovery admits its copy of the started task");
+    let now = runtime.clock.now();
+    runtime
+        .fail_workflow_task(
+            first.token,
+            tokeira_kernel::WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+            None,
+            worker.clone(),
+            RequestContext::unattributed(now),
+            now,
+        )
+        .await
+        .unwrap();
+    let next = runtime
+        .poll_workflow_task(queue, worker, wait)
+        .await
+        .expect("the stale copy is discarded, not surfaced")
+        .expect("the next workflow task starts");
+    assert_eq!(next.run_key, run_key);
+    assert!(next.token.logical_seq > first_seq);
+    assert!(
+        !runtime.broker.knows_offer((run_key, first_seq)).await,
+        "the poll took the copy first"
+    );
+    stop(&runtime).await;
+}
+
 #[derive(Debug)]
 struct ExecutionOwner(Arc<TokeiraRuntime<InMemoryStore>>);
 

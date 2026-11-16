@@ -817,6 +817,16 @@ impl<R> TokeiraRuntime<R>
 where
     R: RunRepository + 'static,
 {
+    /// Poll `queue` for a workflow task only, waiting up to `timeout_after`.
+    ///
+    /// A queued copy that the run's owner refuses as stale (its task already
+    /// started or superseded, its run paused, closed or gone) is discarded and
+    /// the poll waits on, as [`Self::poll_workflow_activation_within`] does.
+    /// Copies are expected: offers are disposable hints, and a discovery page
+    /// read before a start can admit its task once that start has released the
+    /// offer. Only the owner's fenced start decides. Temporal's matching likewise
+    /// drops a task that history refuses to start and keeps polling
+    /// (`PollWorkflowTaskQueue`, `service/matching/matching_engine.go @ v1.31.0`).
     pub async fn poll_workflow_task(
         &self,
         queue: QueueKey,
@@ -825,34 +835,52 @@ where
     ) -> Result<Option<StartedWorkflowTask>> {
         self.ready().await?;
         let _demand = self.register_workflow_poll(&queue);
-        let polled = match self
-            .broker
-            .poll_workflow_task(&queue, &worker_identity, timeout_after)
-            .await?
-        {
-            Some(polled) => {
-                self.delivery_metrics.record_poll_success(&queue);
-                polled
-            }
-            None => {
-                self.delivery_metrics.record_poll_timeout(&queue);
-                return Ok(None);
-            }
-        };
+        let deadline = tokio::time::Instant::now() + timeout_after;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let polled = match self
+                .broker
+                .poll_workflow_task(&queue, &worker_identity, remaining)
+                .await?
+            {
+                Some(polled) => {
+                    self.delivery_metrics.record_poll_success(&queue);
+                    polled
+                }
+                None => {
+                    self.delivery_metrics.record_poll_timeout(&queue);
+                    return Ok(None);
+                }
+            };
 
-        match polled {
-            WorkflowPollResult::Queued(offered, entered_at) => {
-                let started = self
-                    .start_polled_workflow_task(offered, entered_at, worker_identity)
-                    .await?;
-                Ok(Some(started))
+            match polled {
+                WorkflowPollResult::Queued(offered, entered_at) => {
+                    match self
+                        .start_polled_workflow_task(offered, entered_at, worker_identity.clone())
+                        .await
+                    {
+                        Ok(started) => return Ok(Some(started)),
+                        // The failed start has already finished the copy's offer.
+                        Err(error)
+                            if is_stale_workflow_task_start(&error)
+                                || is_withdrawn_workflow_task_start(&error) =>
+                        {
+                            tracing::debug!(
+                                ?error,
+                                "discarded superseded workflow task from broker; re-polling"
+                            );
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                WorkflowPollResult::Started(started) => return Ok(Some(started)),
+                // The workflow-task-only API calls the WFT-only broker method, so
+                // this arm is defensive. If a future refactor routes it through
+                // the unified poll, do not consume direct query work here: callers
+                // of this method are not prepared to register a query waiter.
+                WorkflowPollResult::Query(_) => return Ok(None),
             }
-            WorkflowPollResult::Started(started) => Ok(Some(started)),
-            // The workflow-task-only API calls the WFT-only broker method, so
-            // this arm is defensive. If a future refactor routes it through
-            // the unified poll, do not consume direct query work here: callers
-            // of this method are not prepared to register a query waiter.
-            WorkflowPollResult::Query(_) => Ok(None),
         }
     }
 

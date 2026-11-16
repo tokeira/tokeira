@@ -11,6 +11,9 @@ source = "github.com/tokeira/dagger-rust-toolchain@v0.2.0"
 # NIGHTLY_FMT_TOOLCHAIN in .github/workflows/ci.yml and CI_FMT_NIGHTLY in
 # crates/tokeira-build.
 fmtToolchain = "nightly-2026-06-16"
+# `cargo lint` passes with zero warnings (AGENTS.md), so any warning fails
+# the clippy check.
+clippyArgs = ["-D", "warnings"]
 # aws-lc-sys, ring and libmimalloc-sys build C code. The toolchain image
 # already has a C compiler and make, so cmake is the one package to add. No
 # protoc: the protos compile with protox.

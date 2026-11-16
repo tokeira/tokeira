@@ -1,12 +1,11 @@
 """
 Tokeira's own checks, beside the Rust bar that the rust module runs.
 
-The rules for the agent files and the offline link check over the Markdown
-corpus carry over the "Doc links" job of .github/workflows/ci.yml. The
-history checks hold the Temporal pins, the compatibility bump trailers and
-the changelog fragments to the release process. They read commits, not
-edits that are not committed, and fetch the release tags and the release
-branch from the public repository.
+The agent-file check and the offline link check over the Markdown corpus
+guard the documentation. The history checks hold the Temporal pins, the
+compatibility bump trailers and the changelog fragments to the release
+process. They read commits, not edits that are not committed, and fetch the
+release tags and the release branch from the public repository.
 """
 type Ci {
   """
@@ -108,13 +107,12 @@ let ciClaudeFile: String! = "CLAUDE.md"
 # The most bytes AGENTS.md may have: 32 KiB.
 let ciAgentsBudget: Int! = 32768
 
-# The release of lychee that the link check runs: the one that ci.yml's
-# lychee-action installs.
+# The release of lychee that the link check runs.
 let ciLycheeVersion: String! = "0.24.2"
 
-# lychee's arguments, as ci.yml gives them. The vendored trees are left out
-# because their relative links resolve only in their home repositories. The
-# pattern is lychee's own to expand: no shell reads it.
+# lychee's arguments. The vendored trees are left out because their relative
+# links resolve only in their home repositories. The pattern is lychee's own
+# to expand: no shell reads it.
 let ciLycheeArguments: [String!]! = [
   "--offline",
   "--no-progress",
@@ -126,15 +124,12 @@ let ciLycheeArguments: [String!]! = [
   "./**/*.md",
 ]
 
-# Where lychee writes its report, as Markdown. ci.yml's lychee-action runs
-# lychee the same way, and reads the report for its own guard.
+# Where lychee writes its report, as Markdown.
 let ciLycheeReport: String! = "/tmp/lychee-report.md"
 
-# Whether a report says that lychee found no link, by the test of
-# lychee-action v2.9.0, the release ci.yml uses: a Total of 0 in the
-# report's summary table. The action fails such a run unless failIfEmpty is
-# turned off, and ci.yml leaves it on. A run that left no report at all
-# found nothing either.
+# Whether a report says that lychee found no link: a Total of 0 in the
+# report's summary table. A run that left no report at all found nothing
+# either.
 let ciLycheeFoundNothing(report: String!): Boolean! {
   report == "" or report.replaceMatches(`Total\s+\|\s+0`, "") != report
 }

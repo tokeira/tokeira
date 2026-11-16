@@ -89,7 +89,7 @@ const LEASE_STALE_MINUTES: i64 = 240;
 /// `--check` form because the remote copy is a verification target, not the
 /// editable tree — formatting mutations belong on the local side.
 /// `{nightly}` is replaced with the dated nightly installed on the box, so the
-/// toolchain pin keeps a single home (CI's `NIGHTLY_FMT_TOOLCHAIN`) and the
+/// toolchain pin keeps a single home (`fmtToolchain` in `dagger.toml`) and the
 /// box simply mirrors it at provisioning time.
 const BAR_STEPS: &[(&str, &str)] = &[
     ("fmt", "cargo +{nightly} fmt --all -- --check"),

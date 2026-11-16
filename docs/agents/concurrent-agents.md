@@ -386,7 +386,7 @@ edges trimmed; it prints `kache stats` and a `df` so the reclaim is visible. Del
 ## Repo-specific notes
 
 - **Environment prerequisites:** toolchain via `rust-toolchain.toml` (stable 1.99.1); fmt
-  needs the dated nightly (`NIGHTLY_FMT_TOOLCHAIN` in ci.yml, currently
+  needs the dated nightly (`fmtToolchain` in `dagger.toml`, currently
   `nightly-2026-06-16` — advance with local dev); `gh` only at the §10.6 PR boundary
   (never Codex). Protobuf generation uses `protox`, including SDK build scripts;
   no system `protoc` is required.

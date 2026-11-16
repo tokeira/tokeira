@@ -1,10 +1,13 @@
 //! Shared Rust builder setup and its cache identity. The package-install command
 //! participates in that identity; resolved system package versions do not.
 
+mod manifest;
+
 use std::{fs, path::PathBuf, process::Command};
 
 use dagger_sdk::{Client, Container, HostDirectoryOpts, Query};
 
+use self::manifest::VersionedBuildManifest;
 use crate::{
     Arch, BuildError, CI_FMT_NIGHTLY,
     images::{RUST_BUILDER_IMAGE, TOKEIRAD_RUNTIME_IMAGE, require_builder_toolchain},
@@ -120,12 +123,16 @@ pub struct TokeiradBuildResult {
 /// recompiles only what changed — exactly where chef was weakest. The
 /// built binary is copied out of the cache mount before the image stage,
 /// because cache-mount contents do not survive into container layers.
+///
+/// The image carries a versioned build. Its build-metadata manifest is
+/// derived twice and the two derivations must agree; the binary in the
+/// runtime image must then report every field of that manifest before any
+/// image reaches the host.
 pub async fn build_tokeirad_image(
     request: &TokeiradBuildRequest,
     client: &Client,
 ) -> Result<TokeiradBuildResult, BuildError> {
     let toolchain = rust_toolchain_version(&request.workspace_root)?;
-    let provenance = image_build_provenance(&request.workspace_root)?;
     let query = client.query();
 
     // Upload only the sources needed to build `tokeirad`.
@@ -141,19 +148,28 @@ pub async fn build_tokeirad_image(
     let target_cache = query.cache_volume(format!("tokeira-build-target-{rust_target}"));
 
     let built_path = format!("target/{rust_target}/release/tokeirad");
-    let builder = builder_toolchain(&query, &toolchain)?
-        // The build script treats release+CI as the fail-closed provenance path. Resolve
-        // these values before `.git` is excluded from the Dagger source upload so the
-        // shipped binary identifies the exact host worktree that supplied its bytes.
-        .with_env_variable("CI", "true")
-        .with_env_variable("TOKEIRA_GIT_SHA", &provenance.git_sha)
-        .with_env_variable("TOKEIRA_SOURCE_REVISION", &provenance.source_revision)
-        .with_env_variable("TOKEIRA_SOURCE_TREE_HASH", &provenance.source_tree_hash)
+    let source = builder_toolchain(&query, &toolchain)?
         .with_exec(vec!["rustup", "target", "add", rust_target])
         .with_mounted_cache(registry_cache, "/usr/local/cargo/registry")
         .with_mounted_cache(target_cache, "/app/target")
         .with_directory("/app", workspace)
-        .with_workdir("/app")
+        .with_workdir("/app");
+
+    let manifest = VersionedBuildManifest::derive_twice(&request.workspace_root, &source).await?;
+    let manifest_text = manifest.render()?;
+    // The build script reruns when `TOKEIRA_BUILD_MANIFEST_PATH` changes, not
+    // when the file it names does. Naming the file by its content makes every
+    // manifest change rerun it, however warm the target cache.
+    let manifest_path = format!(
+        "/tmp/tokeira-build-manifest-{}",
+        tokeira_deployment::sha256_hex(manifest_text.as_bytes())
+    );
+    let builder = source
+        .with_new_file(manifest_text, manifest_path.as_str())
+        // The build script treats release+CI as the fail-closed provenance
+        // path; with a manifest, every embedded value comes from it.
+        .with_env_variable("CI", "true")
+        .with_env_variable("TOKEIRA_BUILD_MANIFEST_PATH", manifest_path.as_str())
         .with_exec(vec![
             "cargo",
             "build",
@@ -176,6 +192,13 @@ pub async fn build_tokeirad_image(
         .with_file("/usr/local/bin/tokeirad", builder.file("/tokeirad"))
         .with_user("nonroot")
         .with_entrypoint(vec!["/usr/local/bin/tokeirad"]);
+
+    // Ask the binary the image ships, in the image it ships in.
+    let report = runtime
+        .with_exec(vec!["/usr/local/bin/tokeirad", "--version", "--json"])
+        .stdout()
+        .await?;
+    manifest.require_reported(&report)?;
 
     let latest_tag = "tokeirad:latest".to_owned();
     runtime.export_image(&latest_tag).await?;
@@ -340,12 +363,16 @@ fn git_bytes(workspace_root: &std::path::Path, args: &[&str]) -> Result<Vec<u8>,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{images::RUST_BUILDER_TOOLCHAIN, testing::canned_client};
+    use crate::{
+        images::RUST_BUILDER_TOOLCHAIN,
+        testing::{CannedWire, canned_client},
+    };
 
     #[tokio::test]
     async fn build_tokeirad_image_issues_the_arm64_sequence() {
         let workspace = workspace_with_toolchain(RUST_BUILDER_TOOLCHAIN);
         let (client, wire) = canned_client().await;
+        script_versioned_build(&wire, workspace.path());
         let request = TokeiradBuildRequest {
             arch: Arch::Arm64,
             tag: None,
@@ -371,8 +398,7 @@ mod tests {
             "apt-get update",
             "tokeira-cargo-registry",
             "tokeira-build-target-aarch64-unknown-linux-gnu",
-            "TOKEIRA_GIT_SHA",
-            "TOKEIRA_SOURCE_TREE_HASH",
+            "TOKEIRA_BUILD_MANIFEST_PATH",
             "--locked",
             "rustup",
             "aarch64-unknown-linux-gnu",
@@ -392,6 +418,7 @@ mod tests {
     async fn build_tokeirad_image_starts_only_from_pinned_images() {
         let workspace = workspace_with_toolchain(RUST_BUILDER_TOOLCHAIN);
         let (client, wire) = canned_client().await;
+        script_versioned_build(&wire, workspace.path());
         let request = TokeiradBuildRequest {
             arch: Arch::Amd64,
             tag: Some("v1.2.3".to_owned()),
@@ -439,6 +466,7 @@ mod tests {
     async fn build_tokeirad_image_exports_extra_tag_after_latest() {
         let workspace = workspace_with_toolchain(RUST_BUILDER_TOOLCHAIN);
         let (client, wire) = canned_client().await;
+        script_versioned_build(&wire, workspace.path());
         let request = TokeiradBuildRequest {
             arch: Arch::Arm64,
             tag: Some("v1.2.3".to_owned()),
@@ -467,6 +495,7 @@ mod tests {
     async fn build_tokeirad_image_uses_amd64_target() {
         let workspace = workspace_with_toolchain(RUST_BUILDER_TOOLCHAIN);
         let (client, wire) = canned_client().await;
+        script_versioned_build(&wire, workspace.path());
         let request = TokeiradBuildRequest {
             arch: Arch::Amd64,
             tag: None,
@@ -486,6 +515,7 @@ mod tests {
     async fn build_tokeirad_image_excludes_build_outputs_from_workspace_upload() {
         let workspace = workspace_with_toolchain(RUST_BUILDER_TOOLCHAIN);
         let (client, wire) = canned_client().await;
+        script_versioned_build(&wire, workspace.path());
         let request = TokeiradBuildRequest {
             arch: Arch::Arm64,
             tag: None,
@@ -517,6 +547,181 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn build_tokeirad_image_compiles_in_the_manifest_it_derived_twice() {
+        let workspace = workspace_with_toolchain(RUST_BUILDER_TOOLCHAIN);
+        let (client, wire) = canned_client().await;
+        let manifest = script_versioned_build(&wire, workspace.path());
+        let request = TokeiradBuildRequest {
+            arch: Arch::Amd64,
+            tag: None,
+            workspace_root: workspace.path().to_path_buf(),
+        };
+
+        build_tokeirad_image(&request, &client)
+            .await
+            .expect("build pipeline");
+
+        let requests = wire.requests();
+        for derivation in ["\"first\"", "\"second\""] {
+            for command in ["\"metadata\"", "\"matrix_digests\""] {
+                let runs = requests
+                    .iter()
+                    .filter(|query| {
+                        query.contains(derivation)
+                            && query.contains(command)
+                            && query.contains("stdout")
+                    })
+                    .count();
+                assert_eq!(runs, 1, "the {derivation} derivation runs {command} once");
+            }
+        }
+
+        let text = manifest.render().expect("renders");
+        let path = format!(
+            "/tmp/tokeira-build-manifest-{}",
+            tokeira_deployment::sha256_hex(text.as_bytes())
+        );
+        let build = requests
+            .iter()
+            .find(|query| query.contains("\"--release\""))
+            .expect("the release build");
+        for line in text.lines() {
+            assert!(build.contains(line), "the build misses `{line}`:\n{build}");
+        }
+        assert!(build.contains(&path), "{build}");
+        assert!(
+            !build.contains("TOKEIRA_MANIFEST_DERIVATION"),
+            "the release build starts from the source, not from a derivation:\n{build}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|query| query.contains("\"--version\"")
+                    && query.contains(TOKEIRAD_RUNTIME_IMAGE)),
+            "the shipped binary is asked for its report in the runtime image"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_tokeirad_image_refuses_derivations_that_disagree() {
+        let workspace = workspace_with_toolchain(RUST_BUILDER_TOOLCHAIN);
+        let (client, wire) = canned_client().await;
+        wire.answer_stdout(
+            &["\"second\"", "\"matrix_digests\""],
+            &serde_json::json!({
+                "feature_matrix_digest": "0000000000000000",
+                "sdk_matrix_digest": SDK_DIGEST,
+            })
+            .to_string(),
+        );
+        script_versioned_build(&wire, workspace.path());
+        let request = TokeiradBuildRequest {
+            arch: Arch::Amd64,
+            tag: None,
+            workspace_root: workspace.path().to_path_buf(),
+        };
+
+        let error = build_tokeirad_image(&request, &client)
+            .await
+            .expect_err("disagreeing derivations are refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("disagree on FEATURE_MATRIX_DIGEST"),
+            "{error}"
+        );
+        assert!(
+            wire.requests()
+                .iter()
+                .all(|query| !query.contains("\"--release\"")),
+            "nothing is built from a manifest that did not derive twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_tokeirad_image_exports_nothing_when_the_binary_misreports_its_manifest() {
+        let workspace = workspace_with_toolchain(RUST_BUILDER_TOOLCHAIN);
+        let (client, wire) = canned_client().await;
+        let mut misreported = manifest::reported_by(&fixture_manifest(workspace.path()));
+        misreported["build_mode"] = serde_json::Value::String("dev".to_owned());
+        wire.answer_stdout(&["\"--version\""], &misreported.to_string());
+        script_versioned_build(&wire, workspace.path());
+        let request = TokeiradBuildRequest {
+            arch: Arch::Amd64,
+            tag: Some("v1.2.3".to_owned()),
+            workspace_root: workspace.path().to_path_buf(),
+        };
+
+        let error = build_tokeirad_image(&request, &client)
+            .await
+            .expect_err("a binary that misreports its manifest is refused");
+
+        assert!(error.to_string().contains("build_mode `dev`"), "{error}");
+        assert!(
+            wire.requests()
+                .iter()
+                .all(|query| !query.contains("exportImage")),
+            "no image reaches the host"
+        );
+    }
+
+    const FEATURE_DIGEST: &str = "0123456789abcdef";
+    const SDK_DIGEST: &str = "fedcba9876543210";
+
+    /// The manifest a versioned build of the `workspace` fixture derives.
+    fn fixture_manifest(workspace: &std::path::Path) -> VersionedBuildManifest {
+        let ImageBuildProvenance {
+            git_sha,
+            source_revision,
+            source_tree_hash,
+        } = image_build_provenance(workspace).expect("fixture provenance");
+        VersionedBuildManifest {
+            tokeira_version: "0.7.0".to_owned(),
+            git_sha,
+            source_revision,
+            temporal_proto_version: "v1.62.11".to_owned(),
+            temporal_server_compat: "1.31.0".to_owned(),
+            rust_toolchain: RUST_BUILDER_TOOLCHAIN.to_owned(),
+            source_tree_hash,
+            feature_matrix_digest: FEATURE_DIGEST.to_owned(),
+            sdk_matrix_digest: SDK_DIGEST.to_owned(),
+        }
+    }
+
+    /// Script what an engine answers for a versioned build of `workspace`:
+    /// the package list, the matrix digests and the built binary's report.
+    fn script_versioned_build(
+        wire: &CannedWire,
+        workspace: &std::path::Path,
+    ) -> VersionedBuildManifest {
+        let manifest = fixture_manifest(workspace);
+        wire.answer_stdout(
+            &["\"metadata\""],
+            &serde_json::json!({
+                "packages": [
+                    { "name": "tkr", "version": "0.1.0" },
+                    { "name": "tokeirad", "version": manifest.tokeira_version },
+                ],
+            })
+            .to_string(),
+        );
+        wire.answer_stdout(
+            &["\"matrix_digests\""],
+            &serde_json::json!({
+                "feature_matrix_digest": FEATURE_DIGEST,
+                "sdk_matrix_digest": SDK_DIGEST,
+            })
+            .to_string(),
+        );
+        wire.answer_stdout(
+            &["\"--version\""],
+            &manifest::reported_by(&manifest).to_string(),
+        );
+        manifest
+    }
+
     fn workspace_with_toolchain(version: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
@@ -524,8 +729,16 @@ mod tests {
             format!("[toolchain]\nchannel = \"{version}\"\n"),
         )
         .expect("write toolchain");
+        let pins = dir.path().join("crates/tokeira-build-info/src");
+        std::fs::create_dir_all(&pins).expect("create the pins directory");
+        std::fs::write(
+            pins.join("pinned.rs"),
+            "pub const TEMPORAL_PROTO_VERSION: &str = \"v1.62.11\";\n\
+             pub const TEMPORAL_SERVER_COMPAT: &str = \"1.31.0\";\n",
+        )
+        .expect("write pins");
         git(dir.path(), &["init", "-q", "-b", "main"]);
-        git(dir.path(), &["add", "rust-toolchain.toml"]);
+        git(dir.path(), &["add", "--all"]);
         git(
             dir.path(),
             &[

@@ -12,9 +12,11 @@ use std::sync::{Arc, Mutex};
 ///
 /// Leaf defaults: `id` leaves answer a unique canned identifier, `publish`
 /// echoes its address with a canned digest, `entries` answers an empty list,
-/// and everything else answers JSON null (which projects through any
-/// selection and satisfies Void-typed leaves). [`CannedWire::fail_next`]
-/// makes the next execution answer as a GraphQL error.
+/// `stdout` answers what [`CannedWire::answer_stdout`] scripted for the
+/// request (otherwise an empty string), and everything else answers JSON null
+/// (which projects through any selection and satisfies Void-typed leaves).
+/// [`CannedWire::fail_next`] makes the next execution answer as a GraphQL
+/// error.
 #[derive(Clone, Debug, Default)]
 pub struct CannedWire {
     wire_state: Arc<Mutex<CannedWireState>>,
@@ -25,6 +27,7 @@ struct CannedWireState {
     requests: Vec<String>,
     fail_next: Option<String>,
     ids_issued: usize,
+    stdout_answers: Vec<(Vec<String>, String)>,
 }
 
 impl CannedWire {
@@ -64,6 +67,31 @@ impl CannedWire {
         self.wire_state.lock().expect("canned wire lock").fail_next = Some(message.to_owned());
     }
 
+    /// Answer `stdout` with `output` for every request that contains each of
+    /// `markers`. The earliest matching registration wins, so a test can
+    /// register a specific answer before a general one.
+    pub fn answer_stdout(&self, markers: &[&str], output: &str) {
+        self.wire_state
+            .lock()
+            .expect("canned wire lock")
+            .stdout_answers
+            .push((
+                markers.iter().map(|marker| (*marker).to_owned()).collect(),
+                output.to_owned(),
+            ));
+    }
+
+    fn scripted_stdout(&self, query: &str) -> String {
+        self.wire_state
+            .lock()
+            .expect("canned wire lock")
+            .stdout_answers
+            .iter()
+            .find(|(markers, _)| markers.iter().all(|marker| query.contains(marker.as_str())))
+            .map(|(_, output)| output.clone())
+            .unwrap_or_default()
+    }
+
     fn answer(&self, query: &str) -> dagger_sdk::ResponseData {
         let path = selection_path(query);
         let leaf = match path.last().map(String::as_str) {
@@ -89,7 +117,8 @@ impl CannedWire {
                     .expect("canned export writes");
                 serde_json::Value::String(host_path)
             }
-            Some("stdout" | "stderr") => serde_json::Value::String(String::new()),
+            Some("stdout") => serde_json::Value::String(self.scripted_stdout(query)),
+            Some("stderr") => serde_json::Value::String(String::new()),
             Some("entries") => serde_json::Value::Array(Vec::new()),
             _ => serde_json::Value::Null,
         };

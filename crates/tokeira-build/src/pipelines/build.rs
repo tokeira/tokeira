@@ -5,16 +5,21 @@ use std::{fs, path::PathBuf, process::Command};
 
 use dagger_sdk::{Client, Container, HostDirectoryOpts, Query};
 
-use crate::{Arch, BuildError, CI_FMT_NIGHTLY, rust_toolchain_version};
+use crate::{
+    Arch, BuildError, CI_FMT_NIGHTLY,
+    images::{RUST_BUILDER_IMAGE, TOKEIRAD_RUNTIME_IMAGE, require_builder_toolchain},
+    rust_toolchain_version,
+};
 
 pub(crate) const BUILDER_APT_LINE: &str = "apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates cmake clang git curl jq && rm -rf /var/lib/apt/lists/*";
 
 /// Construct the shared image and release builder toolchain before source or caches
-/// are attached.
-pub(crate) fn builder_toolchain(query: &Query, toolchain: &str) -> Container {
-    query
+/// are attached. A toolchain other than the pinned builder image's is refused.
+pub(crate) fn builder_toolchain(query: &Query, toolchain: &str) -> Result<Container, BuildError> {
+    require_builder_toolchain(toolchain)?;
+    Ok(query
         .container()
-        .from(format!("rust:{toolchain}-slim-bookworm"))
+        .from(RUST_BUILDER_IMAGE)
         .with_exec(vec!["sh", "-c", BUILDER_APT_LINE])
         .with_exec(vec![
             "rustup",
@@ -39,15 +44,15 @@ pub(crate) fn builder_toolchain(query: &Query, toolchain: &str) -> Container {
         // spelling, while the Dagger command names this dated pin so a new
         // nightly release cannot silently change formatting.
         .with_env_variable("NIGHTLY_FMT_TOOLCHAIN", CI_FMT_NIGHTLY)
-        .with_env_variable("RUSTUP_TOOLCHAIN", toolchain)
+        .with_env_variable("RUSTUP_TOOLCHAIN", toolchain))
 }
 
 /// Paths excluded from the workspace upload that feeds the Dagger build.
 ///
 /// The exclude list is deliberately conservative: anything cargo might
-/// touch during `cargo build` stays in the upload — which is why the
-/// vendored SDK crates (`vendor/`) ship: the workspace manifest's path
-/// dependencies must resolve inside the engine. The removed directories
+/// touch during `cargo build` stays in the upload — which is why `vendor/`
+/// ships: every path the workspace manifest names, `[patch]` entries
+/// included, must resolve inside the engine. The removed directories
 /// are build outputs (`target/`), version control metadata, editor state,
 /// or documentation/spec sources the Rust toolchain never reads.
 ///
@@ -136,7 +141,7 @@ pub async fn build_tokeirad_image(
     let target_cache = query.cache_volume(format!("tokeira-build-target-{rust_target}"));
 
     let built_path = format!("target/{rust_target}/release/tokeirad");
-    let builder = builder_toolchain(&query, &toolchain)
+    let builder = builder_toolchain(&query, &toolchain)?
         // The build script treats release+CI as the fail-closed provenance path. Resolve
         // these values before `.git` is excluded from the Dagger source upload so the
         // shipped binary identifies the exact host worktree that supplied its bytes.
@@ -167,7 +172,7 @@ pub async fn build_tokeirad_image(
 
     let runtime = query
         .container()
-        .from("cgr.dev/chainguard/glibc-dynamic:latest")
+        .from(TOKEIRAD_RUNTIME_IMAGE)
         .with_file("/usr/local/bin/tokeirad", builder.file("/tokeirad"))
         .with_user("nonroot")
         .with_entrypoint(vec!["/usr/local/bin/tokeirad"]);
@@ -335,11 +340,11 @@ fn git_bytes(workspace_root: &std::path::Path, args: &[&str]) -> Result<Vec<u8>,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::canned_client;
+    use crate::{images::RUST_BUILDER_TOOLCHAIN, testing::canned_client};
 
     #[tokio::test]
     async fn build_tokeirad_image_issues_the_arm64_sequence() {
-        let workspace = workspace_with_toolchain("1.95");
+        let workspace = workspace_with_toolchain(RUST_BUILDER_TOOLCHAIN);
         let (client, wire) = canned_client().await;
         let request = TokeiradBuildRequest {
             arch: Arch::Arm64,
@@ -353,7 +358,7 @@ mod tests {
 
         assert_eq!(result.image_name, "tokeirad");
         assert_eq!(result.tags, vec!["tokeirad:latest"]);
-        assert_eq!(result.toolchain_version, "1.95");
+        assert_eq!(result.toolchain_version, RUST_BUILDER_TOOLCHAIN);
 
         // Lazy object arguments (the workspace directory, cache volumes, the
         // built binary) resolve through their own id requests, so the whole
@@ -362,7 +367,7 @@ mod tests {
         // full transcript.
         let transcript = wire.transcript();
         for fragment in [
-            "rust:1.95-slim-bookworm",
+            RUST_BUILDER_IMAGE,
             "apt-get update",
             "tokeira-cargo-registry",
             "tokeira-build-target-aarch64-unknown-linux-gnu",
@@ -371,7 +376,7 @@ mod tests {
             "--locked",
             "rustup",
             "aarch64-unknown-linux-gnu",
-            "cgr.dev/chainguard/glibc-dynamic:latest",
+            TOKEIRAD_RUNTIME_IMAGE,
             "nonroot",
             "exportImage",
             "tokeirad:latest",
@@ -384,8 +389,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_tokeirad_image_exports_extra_tag_after_latest() {
+    async fn build_tokeirad_image_starts_only_from_pinned_images() {
+        let workspace = workspace_with_toolchain(RUST_BUILDER_TOOLCHAIN);
+        let (client, wire) = canned_client().await;
+        let request = TokeiradBuildRequest {
+            arch: Arch::Amd64,
+            tag: Some("v1.2.3".to_owned()),
+            workspace_root: workspace.path().to_path_buf(),
+        };
+
+        build_tokeirad_image(&request, &client)
+            .await
+            .expect("build pipeline");
+
+        let addresses = wire.from_addresses();
+        for image in [RUST_BUILDER_IMAGE, TOKEIRAD_RUNTIME_IMAGE] {
+            assert!(
+                addresses.iter().any(|address| address == image),
+                "{image} missing from {addresses:?}"
+            );
+        }
+        assert!(
+            addresses
+                .iter()
+                .all(|address| address == RUST_BUILDER_IMAGE || address == TOKEIRAD_RUNTIME_IMAGE),
+            "the pipeline started from an unpinned image: {addresses:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_tokeirad_image_refuses_a_toolchain_the_builder_does_not_carry() {
         let workspace = workspace_with_toolchain("1.95");
+        let (client, wire) = canned_client().await;
+        let request = TokeiradBuildRequest {
+            arch: Arch::Arm64,
+            tag: None,
+            workspace_root: workspace.path().to_path_buf(),
+        };
+
+        let error = build_tokeirad_image(&request, &client)
+            .await
+            .expect_err("an unpinned toolchain is refused");
+
+        assert!(error.to_string().contains("RUST_BUILDER_IMAGE"), "{error}");
+        assert!(wire.from_addresses().is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_tokeirad_image_exports_extra_tag_after_latest() {
+        let workspace = workspace_with_toolchain(RUST_BUILDER_TOOLCHAIN);
         let (client, wire) = canned_client().await;
         let request = TokeiradBuildRequest {
             arch: Arch::Arm64,
@@ -413,7 +465,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_tokeirad_image_uses_amd64_target() {
-        let workspace = workspace_with_toolchain("1.95");
+        let workspace = workspace_with_toolchain(RUST_BUILDER_TOOLCHAIN);
         let (client, wire) = canned_client().await;
         let request = TokeiradBuildRequest {
             arch: Arch::Amd64,
@@ -432,7 +484,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_tokeirad_image_excludes_build_outputs_from_workspace_upload() {
-        let workspace = workspace_with_toolchain("1.95");
+        let workspace = workspace_with_toolchain(RUST_BUILDER_TOOLCHAIN);
         let (client, wire) = canned_client().await;
         let request = TokeiradBuildRequest {
             arch: Arch::Arm64,
@@ -451,8 +503,8 @@ mod tests {
             .expect("workspace upload with an exclude filter");
         // The key survival invariant: `target/` MUST be excluded or every
         // invocation ships multi-GB of Rust build output to the engine —
-        // and `vendor/` MUST NOT be, or the workspace's path dependencies
-        // cannot resolve inside it.
+        // and `vendor/` MUST NOT be, or the paths the workspace manifest
+        // names cannot resolve inside it.
         for fragment in ["target", ".git", "artifacts"] {
             assert!(
                 upload.contains(fragment),
@@ -461,7 +513,7 @@ mod tests {
         }
         assert!(
             !upload.contains("\"vendor\""),
-            "the vendored SDK must ship with the workspace:\n{upload}"
+            "vendor/ must ship with the workspace:\n{upload}"
         );
     }
 

@@ -31,7 +31,10 @@ use dagger_sdk::{
     Client, Container, ContainerWithExecOpts, Directory, HostDirectoryOpts, ReturnType,
 };
 
-use crate::{BuildError, CHANGIE_RELEASE, DAGGER_RELEASE, rust_toolchain_version};
+use crate::{
+    BuildError, CHANGIE_RELEASE, DAGGER_VERSION, github_cli_release::github_cli_acquisition_script,
+    images::OBSERVATION_IMAGE, rust_toolchain_version,
+};
 
 use super::{
     GitObservation, PackageIdentity, PackageOutcome, PackageResult, PlannedArtifact,
@@ -72,8 +75,6 @@ const RELEASE_SOURCE_EXCLUDES: &[&str] = &[
 const NONCE_ENV: &str = "TOKEIRA_RELEASE_INVOCATION";
 /// Where the operator's SSH agent socket is mounted inside Git-facing steps.
 const SSH_SOCKET_PATH: &str = "/run/tokeira-release-ssh-agent";
-const RELEASE_API_IMAGE: &str = "ghcr.io/cli/cli:2.65.0";
-const OBSERVATION_IMAGE: &str = "debian:bookworm-slim";
 const OBSERVATION_APT: &str = "apt-get update && apt-get install -y --no-install-recommends git curl jq ca-certificates && rm -rf /var/lib/apt/lists/*";
 
 /// Exact target-version planning evidence produced from one isolated source graph.
@@ -258,6 +259,7 @@ async fn execute_publish_and_parity(
     // Preparation: pinned changie batch and merge over the rewritten source, then a
     // proof that only release-owned paths changed. Local work, no agent, no secret.
     let workspace = builder_toolchain(&query, &plan.toolchain.rust)
+        .map_err(|source| executor_error(source.to_string()))?
         .with_mounted_cache(registry_cache, "/usr/local/cargo/registry")
         .with_directory("/workspace", prepared)
         .with_directory("/repo.git", git)
@@ -538,10 +540,12 @@ async fn execute_release_notes(
         "github_release_token",
         request.release_api_credential.expose(),
     );
+    let acquisition = github_cli_acquisition_script();
     let fetched = query
         .container()
-        .from(RELEASE_API_IMAGE)
-        .with_entrypoint(Vec::<String>::new())
+        .from(OBSERVATION_IMAGE)
+        .with_exec(vec!["sh", "-c", OBSERVATION_APT])
+        .with_exec(vec!["sh", "-c", &acquisition])
         .with_secret_variable("GH_TOKEN", secret)
         .with_env_variable(NONCE_ENV, invocation_nonce())
         .with_env_variable("RELEASE_TAG", tag)
@@ -670,6 +674,7 @@ async fn execute_verify(
         &rust_toolchain_version(&request.workspace_root)
             .map_err(|source| executor_error(source.to_string()))?,
     )
+    .map_err(|source| executor_error(source.to_string()))?
     .with_directory("/workspace", source)
     .with_directory("/repo.git", git)
     .with_new_file(&layout.worktree_pointer, "/workspace/.git")
@@ -1264,7 +1269,7 @@ pub async fn plan_release_with_dagger(
                     reason: source.to_string(),
                 }
             })?,
-            dagger: DAGGER_RELEASE.engine_version.to_owned(),
+            dagger: DAGGER_VERSION.to_owned(),
         },
     };
     plan_release(&request, &observations)
@@ -1504,7 +1509,7 @@ pub async fn observe_planned_artifacts(
         .iter()
         .map(|node| node.name.as_str())
         .collect::<Vec<_>>();
-    let execution = builder_toolchain(&query, &toolchain)
+    let execution = builder_toolchain(&query, &toolchain)?
         .with_mounted_cache(registry, "/usr/local/cargo/registry")
         .with_mounted_cache(target, "/workspace/target")
         .with_directory("/workspace", prepared)

@@ -45,6 +45,20 @@ impl CannedWire {
         self.requests().join("\n---\n")
     }
 
+    /// The `address` of every `from` in the executed requests, in order: the
+    /// images the pipelines started from.
+    pub fn from_addresses(&self) -> Vec<String> {
+        self.requests()
+            .iter()
+            .flat_map(|query| {
+                query
+                    .match_indices("from(")
+                    .filter_map(|(at, _)| string_argument(&query[at..], "from", "address"))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// Answer the next execution with a GraphQL error carrying `message`.
     pub fn fail_next(&self, message: &str) {
         self.wire_state.lock().expect("canned wire lock").fail_next = Some(message.to_owned());

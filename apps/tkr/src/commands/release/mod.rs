@@ -16,7 +16,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use dagger_sdk::LockMode;
 use tokeira_build::{
     PackageOutcome, PlannedRegistryState, RegistryCredential, ReleaseApiCredential, ReleaseConfig,
     ReleaseError, ReleaseNotesOutcome, ReleaseNotesRequest, ReleaseNotesResult, ReleasePlan,
@@ -28,7 +27,7 @@ use uuid::Uuid;
 
 use crate::cli::ReleaseCommand;
 
-use super::image::ci_dagger_session;
+use super::image::dagger_session;
 
 /// Dispatch one release sub-verb.
 pub(crate) async fn run(command: ReleaseCommand, global_json: bool) -> Result<()> {
@@ -124,7 +123,7 @@ async fn run_apply(
         }));
     }
     let repository = repository_identity(&root)?;
-    let client = ci_dagger_session(&root, LockMode::Frozen).await?;
+    let client = dagger_session().await?;
     let recomputed = plan_release_with_dagger(
         &root,
         &stored.target_version,
@@ -183,7 +182,7 @@ async fn run_apply(
         .await
         .context("close the publish-and-parity Dagger invocation")?;
 
-    let observation_client = ci_dagger_session(&root, LockMode::Frozen).await?;
+    let observation_client = dagger_session().await?;
     let existing = observe_release_object(
         &parity.train.repository.slug,
         &parity.tag.tag,
@@ -233,7 +232,7 @@ async fn run_apply(
         release_api_credential: ReleaseApiCredential::new(gh_value)
             .map_err(|error| anyhow::anyhow!(error))?,
     };
-    let notes_client = ci_dagger_session(&root, LockMode::Frozen).await?;
+    let notes_client = dagger_session().await?;
     let report = create_release_notes(&release_request, &notes_client)
         .await
         .map_err(|error| anyhow::anyhow!(error))?;
@@ -255,7 +254,7 @@ async fn run_verify(root: PathBuf, version: &str, output: Option<&Path>, json: b
         release_branch: config.release_branch,
         expected_plan_digest: None,
     };
-    let client = ci_dagger_session(&root, LockMode::Frozen).await?;
+    let client = dagger_session().await?;
     let outcome = verify_release(&request, &client).await;
     client
         .close()
@@ -322,7 +321,7 @@ async fn run_plan(
     json: bool,
 ) -> Result<()> {
     let repository = repository_identity(&root)?;
-    let client = ci_dagger_session(&root, LockMode::Frozen).await?;
+    let client = dagger_session().await?;
     let outcome = plan_release_with_dagger(&root, version, base_ref, repository, &client).await;
     client
         .close()

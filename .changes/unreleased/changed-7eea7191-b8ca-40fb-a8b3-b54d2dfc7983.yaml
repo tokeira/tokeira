@@ -1,0 +1,5 @@
+kind: changed
+body: '`tkr` refuses to open a Dagger session inside another one, and names the variables to unset.'
+time: 2026-11-16T21:33:25+00:00
+custom:
+    Slice: 7eea7191-b8ca-40fb-a8b3-b54d2dfc7983

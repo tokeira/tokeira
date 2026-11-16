@@ -11,6 +11,8 @@ mod composition;
 mod dagger_release;
 mod discovery;
 mod error;
+mod github_cli_release;
+mod images;
 mod snapshot;
 mod toolchain;
 
@@ -34,9 +36,7 @@ pub use composition::{
     GENERATED_ROOT_RELATIVE_PATH, SCOPED_WORKSPACE_RELATIVE_PATH, TKP_PACKAGE,
     assemble_bound_provisioner,
 };
-pub use dagger_release::{
-    CI_FMT_NIGHTLY, DAGGER_ENGINE_BOOTSTRAP_COMMAND, DAGGER_RELEASE, DaggerRelease,
-};
+pub use dagger_release::{CI_FMT_NIGHTLY, DAGGER_VERSION};
 pub use discovery::{
     DefinitionFrontendPackageDescriptor, DiscoveryError, PackageCoordinates,
     PlatformPackageDescriptor, WorkspaceDescriptors, discover_workspace_descriptors,

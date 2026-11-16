@@ -1,7 +1,7 @@
 //! Progress presentation for `tkr image build`.
 //!
-//! Bootstrap and Dagger remain independent headless operations. This module turns
-//! their coarse phases and the SDK's sanitized diagnostic stream into one bounded
+//! Dagger remains a headless operation. This module turns the build's coarse
+//! phases and the SDK's sanitized diagnostic stream into one bounded
 //! operator-facing status line. Progress always goes to stderr so the successful
 //! command result—and especially `--json` stdout—remains machine-readable.
 
@@ -25,9 +25,9 @@ struct ProgressState {
 
 /// Shared progress owner for one image build.
 ///
-/// The Dagger SDK can deliver diagnostics from background stream readers, while
-/// bootstrap phases run on Tokio's blocking pool. A single mutex keeps updates
-/// ordered and prevents competing terminal redraws.
+/// The Dagger SDK can deliver diagnostics from background stream readers while
+/// the build moves between phases. A single mutex keeps updates ordered and
+/// prevents competing terminal redraws.
 #[derive(Debug)]
 pub(super) struct ImageBuildProgress {
     is_terminal: bool,
@@ -71,13 +71,6 @@ impl ImageBuildProgress {
         } else {
             eprintln!("image build: {phase}...");
         }
-    }
-
-    pub(super) fn clear_phase(&self) {
-        let mut state = self.lock_state();
-        clear_bar(&mut state);
-        state.phase = None;
-        state.last_detail = None;
     }
 
     pub(super) fn finish_phase(&self, message: impl AsRef<str>) {

@@ -40,7 +40,7 @@ pub(crate) async fn place_bundle_provisioner_at(
 ) -> Result<()> {
     let client = crate::commands::image::dagger_session()
         .await
-        .context("`--bundle` needs a running Dagger engine")?;
+        .context("`--bundle` needs a Dagger session")?;
     let bound_source = assemble_bound_provisioner(workspace_root, platform, frontend)
         .context("failed to assemble the bound provisioner source")?;
     let snapshot = snapshot_source_closure(
@@ -71,6 +71,7 @@ pub(crate) async fn place_bundle_provisioner_at(
     );
     let obtained =
         obtain_provisioner(&request, &client, &cas, AuthorityTier::LocalDeveloper).await?;
+    client.close().await.context("close the Dagger session")?;
     let bytes = obtained.bytes_by_target.get(&host_target).ok_or_else(|| {
         anyhow!(
             "the bundle carries no artifact for host target {}",

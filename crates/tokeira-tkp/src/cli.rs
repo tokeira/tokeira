@@ -61,7 +61,7 @@ enum Command {
     /// these as the infra verbs.
     #[command(subcommand)]
     Deploy(DeployCommand),
-    /// Container images declared and published by this platform.
+    /// Container images declared by this platform.
     #[command(subcommand)]
     Image(ImageCommand),
     /// Tear down workloads and then infrastructure. The owning `tkr`
@@ -112,8 +112,6 @@ impl Command {
             Self::Infra(InfraCommand::Destroy(args)) => Some(&args.deployment_dir),
             Self::Deploy(DeployCommand::Destroy(args)) => Some(&args.deployment_dir),
             Self::Image(ImageCommand::List(args)) => Some(&args.deployment_dir),
-            Self::Image(ImageCommand::Push(args)) => Some(&args.deployment_dir),
-            Self::Image(ImageCommand::Mirror(args)) => Some(&args.deployment_dir),
             Self::Destroy(args) => Some(&args.deployment_dir),
             Self::Scale(args) => Some(&args.deployment_dir),
             Self::Logs(args) => Some(&args.deployment_dir),
@@ -132,10 +130,6 @@ impl Command {
 enum ImageCommand {
     /// List the images declared by the bound platform.
     List(ImageListArgs),
-    /// Publish a locally built image to the platform registry.
-    Push(ImagePushArgs),
-    /// Mirror authored upstream images into the platform registry.
-    Mirror(ImageMirrorArgs),
 }
 
 #[derive(Args)]
@@ -146,35 +140,6 @@ struct ImageListArgs {
     /// Limit the inventory to one source class.
     #[arg(long)]
     source_type: Option<ImageSourceFilter>,
-}
-
-#[derive(Args)]
-struct ImagePushArgs {
-    /// Deployment directory holding the definition and runtime state.
-    #[arg(long)]
-    deployment_dir: PathBuf,
-    /// Publish only this logical build image.
-    #[arg(long)]
-    image: Option<String>,
-    /// Additional deployment tag; `latest` is always published.
-    #[arg(long, default_value = "latest")]
-    tag: String,
-    /// Confirm ECR mutation.
-    #[arg(long)]
-    yes: bool,
-}
-
-#[derive(Args)]
-struct ImageMirrorArgs {
-    /// Deployment directory holding the definition and runtime state.
-    #[arg(long)]
-    deployment_dir: PathBuf,
-    /// Mirror only this logical upstream image.
-    #[arg(long)]
-    image: Option<String>,
-    /// Confirm ECR mutation.
-    #[arg(long)]
-    yes: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -653,29 +618,6 @@ pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::proces
             })
             .await
         }
-        Command::Image(ImageCommand::Push(args)) => {
-            if !args.yes {
-                anyhow::bail!("image push changes ECR; re-run with `--yes`");
-            }
-            let admitted = require(admitted);
-            let image = args.image;
-            let tag = args.tag;
-            lock::with_operation_lock(&admitted.state, "image-push", || {
-                crate::image::push(&engine, admitted, image.as_deref(), &tag, cli.json)
-            })
-            .await
-        }
-        Command::Image(ImageCommand::Mirror(args)) => {
-            if !args.yes {
-                anyhow::bail!("image mirror changes ECR; re-run with `--yes`");
-            }
-            let admitted = require(admitted);
-            let image = args.image;
-            lock::with_operation_lock(&admitted.state, "image-mirror", || {
-                crate::image::mirror(&engine, admitted, image.as_deref(), cli.json)
-            })
-            .await
-        }
         Command::Scale(args) => {
             let admitted = require(admitted);
             let specs = args.specs;
@@ -817,33 +759,6 @@ mod tests {
                 ..
             }))
         ));
-
-        assert!(
-            Cli::try_parse_from([
-                "tkp",
-                "image",
-                "push",
-                "--deployment-dir",
-                "/tmp/d",
-                "--tag",
-                "v1",
-                "--yes",
-            ])
-            .is_ok()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "tkp",
-                "image",
-                "mirror",
-                "--deployment-dir",
-                "/tmp/d",
-                "--image",
-                "grafana",
-                "--yes",
-            ])
-            .is_ok()
-        );
     }
 
     #[test]

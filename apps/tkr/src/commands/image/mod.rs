@@ -1,7 +1,7 @@
 //! `tkr image build` — deployment-independent runtime image construction.
 //!
-//! Image inventories and publication belong to definition-bound provisioners;
-//! `tkr` owns only the workspace-source build operation.
+//! Image inventories belong to definition-bound provisioners; `tkr` owns only
+//! the workspace-source build operation.
 //!
 //! # The Dagger session
 //!
@@ -199,27 +199,8 @@ mod tests {
             Cli::try_parse_from(["tkr", "image", "build", "--arch", "amd64", "--tag", "v1"])
                 .is_ok()
         );
-        assert!(Cli::try_parse_from(["tkr", "image", "push"]).is_ok());
-        assert!(Cli::try_parse_from(["tkr", "image", "mirror"]).is_ok());
         assert!(Cli::try_parse_from(["tkr", "image", "list"]).is_ok());
         assert!(Cli::try_parse_from(["tkr", "image", "list", "--source-type", "mirror"]).is_ok());
-        assert!(
-            Cli::try_parse_from([
-                "tkr", "image", "push", "--tag", "v1", "--image", "tokeirad", "--yes"
-            ])
-            .is_ok()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "tkr",
-                "image",
-                "mirror",
-                "--image",
-                "grafana-mimir",
-                "--yes"
-            ])
-            .is_ok()
-        );
     }
 
     #[test]

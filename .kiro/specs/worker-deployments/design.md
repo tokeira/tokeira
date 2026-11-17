@@ -650,11 +650,16 @@ At task-start, the runtime resolves the **target version** for the workflow's ta
 queue from the deployment registry's routing config:
 
 - compute the target version using the routing config: AUTO_UPGRADE / unversioned
-  traffic follows `current_deployment_version`, with the ramp split sending
-  `ramping_version_percentage`% (bucketed deterministically by workflow id, reusing
-  the `deterministic_bucket` FNV-1a approach already in
-  `crates/tokeira-runtime/src/versioning.rs`) to `ramping_deployment_version`; PINNED
-  runs resolve to their pinned version regardless of routing config;
+  traffic selects between `current_deployment_version` and the configured
+  `ramping_deployment_version` (which can be unversioned) using
+  `crates/tokeira-runtime/src/runtime/ramp.rs`: nonpositive percentages select
+  current, exactly 100 selects ramping, and otherwise ramping is selected when
+  `100 * (f64(Fingerprint32(workflow_id)) / (f64(u32::MAX) + 1))` is less than or
+  equal to the f32 percentage widened to f64, dividing before multiplying
+  (`common/worker_versioning/worker_versioning.go @ v1.31.0`). Fingerprint32 follows
+  go-farm v0.0.0-20240924180020-3414d57e47da's portable Hash32; empty IDs are also
+  hashed deterministically so every node agrees. PINNED runs resolve to their
+  pinned version regardless of routing config;
 - if the polling worker's deployment version differs from the workflow's effective
   version and the workflow is not pinned, call `start_version_transition` gated on the
   dispatch `revision_number` (the activity path additionally gates on

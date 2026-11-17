@@ -667,11 +667,13 @@ async fn restart_preserves_cron_state_before_terminal_successor() -> Result<()> 
 
     let runtime_after_restart = recovering_runtime_with_store(store.clone());
     runtime_after_restart.acquire_shard(ShardId(0)).await?;
+    // The reloaded runtime republishes the task asynchronously, so the poll
+    // window must cover that.
     let first_task = runtime_after_restart
         .poll_workflow_task(
             queue.clone(),
             WorkerIdentity("worker-a".to_string()),
-            tokio::time::Duration::from_millis(5),
+            tokio::time::Duration::from_secs(5),
         )
         .await?
         .expect("cron run should still have its first WFT after runtime reload");

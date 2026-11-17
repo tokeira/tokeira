@@ -53,11 +53,11 @@ pub(crate) fn builder_toolchain(query: &Query, toolchain: &str) -> Result<Contai
 /// Paths excluded from the workspace upload that feeds the Dagger build.
 ///
 /// The exclude list is deliberately conservative: anything cargo might
-/// touch during `cargo build` stays in the upload — which is why `vendor/`
-/// ships: every path the workspace manifest names, `[patch]` entries
-/// included, must resolve inside the engine. The removed directories
-/// are build outputs (`target/`), version control metadata, editor state,
-/// or documentation/spec sources the Rust toolchain never reads.
+/// touch during `cargo build` stays in the upload, since every path the
+/// workspace manifest names must resolve inside the engine. The removed
+/// directories are build outputs (`target/`), version control metadata,
+/// editor state, or documentation/spec sources the Rust toolchain never
+/// reads.
 ///
 /// Without this list, Dagger hashes and ships the full `target/` tree
 /// (regularly multi-gigabyte) on every invocation, dominating the cold
@@ -532,19 +532,13 @@ mod tests {
             .find(|query| query.contains("directory") && query.contains("exclude"))
             .expect("workspace upload with an exclude filter");
         // The key survival invariant: `target/` MUST be excluded or every
-        // invocation ships multi-GB of Rust build output to the engine —
-        // and `vendor/` MUST NOT be, or the paths the workspace manifest
-        // names cannot resolve inside it.
+        // invocation ships multi-GB of Rust build output to the engine.
         for fragment in ["target", ".git", "artifacts"] {
             assert!(
                 upload.contains(fragment),
                 "exclude filter missing `{fragment}`:\n{upload}"
             );
         }
-        assert!(
-            !upload.contains("\"vendor\""),
-            "vendor/ must ship with the workspace:\n{upload}"
-        );
     }
 
     #[tokio::test]

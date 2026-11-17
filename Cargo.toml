@@ -64,11 +64,6 @@ exclude = [
     "tools/simulation/engine",
     "tools/simulation/broker",
     "tools/simulation/placement",
-    # Vendored third-party crates: consumed as path dependencies, never as
-    # members — membership inference would otherwise lint/test the published
-    # artifacts, whose packaging rightly omits their repo-only test inputs.
-    "vendor/dagger-sdk",
-    "vendor/dagger-sdk-macros",
 ]
 
 [workspace.package]
@@ -243,8 +238,3 @@ panic = "abort"
 inherits = "release"
 lto = "fat"
 codegen-units = 1
-
-# The SDK's documented install requirement: its exact-version macro
-# companion must resolve to the vendored copy, never a registry lookup.
-[patch.crates-io]
-dagger-sdk-macros = { path = "vendor/dagger-sdk-macros" }

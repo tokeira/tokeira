@@ -17,7 +17,7 @@ clippyArgs = ["-D", "warnings"]
 # already has a C compiler and make, so cmake is the one package to add. No
 # protoc: the protos compile with protox.
 systemPackages = ["cmake"]
-# The root workspace only. vendor/, spikes/, examples/, scenarios/ and
+# The root workspace only. spikes/, examples/, scenarios/ and
 # tools/simulation hold Cargo workspaces of their own, which are not checked.
 workspaceRoots = ["."]
 # One fmt, one clippy and one test check for the whole workspace, so the

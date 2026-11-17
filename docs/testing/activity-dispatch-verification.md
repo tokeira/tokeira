@@ -234,7 +234,7 @@ exceptions are removed from `deny.toml`; no advisory exception is added.
 
 The Dagger SDK, engine and CLI remain on the existing release. The narrow vendor
 manifest patch and its retirement condition are recorded in
-[the vendoring notes](../../vendor/README.md). SDK Rust sources, application code,
+[the vendoring notes](https://github.com/tokeira/tokeira/blob/b7d38fcb04c165f402ecf6de477d84634fc9c7ed/vendor/README.md). SDK Rust sources, application code,
 reviewed activity specifications and the live DSQL paths are unchanged.
 
 The tested source archive is

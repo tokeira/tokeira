@@ -110,17 +110,14 @@ let ciAgentsBudget: Int! = 32768
 # The release of lychee that the link check runs.
 let ciLycheeVersion: String! = "0.24.2"
 
-# lychee's arguments. The vendored trees are left out because their relative
-# links resolve only in their home repositories. The pattern is lychee's own
-# to expand: no shell reads it.
+# lychee's arguments. The pattern is lychee's own to expand: no shell
+# reads it.
 let ciLycheeArguments: [String!]! = [
   "--offline",
   "--no-progress",
   "--hidden",
   "--exclude-path", ".git",
   "--exclude-path", "target",
-  "--exclude-path", "vendor/dagger-sdk",
-  "--exclude-path", "vendor/dagger-sdk-macros",
   "./**/*.md",
 ]
 

@@ -12,10 +12,9 @@
 
 [advisories]
 # RustSec advisory DB (default source). An active vulnerability fails the check.
-# The entries below are transitive advisories with no fix Tokeira can take yet; each
-# is a non-vulnerability (unmaintained crate, or a defect in code Tokeira does not
-# exercise) pulled in deep in the tree. Revisit when the upstream dependency
-# updates.
+# The entries below are advisories with no fix Tokeira can take yet; each is a
+# non-vulnerability (unmaintained crate, or a defect in code Tokeira does not
+# exercise). Revisit when the dependency updates or Tokeira moves off it.
 ignore = [
     # `atomic-polyfill` reaches the all-target graph only through heapless 0.7,
     # which only Postcard's `heapless-cas` default enables. Every workspace
@@ -42,6 +41,13 @@ ignore = [
     # lockfile still take `aws-smithy-http` 0.63, whose last release, 0.63.6, does.
     # Drop this entry when an SDK update takes the smithy crates off it.
     "RUSTSEC-2026-0441", # `pin-utils` unmaintained (transitive, via the AWS SDK)
+    # `chrono` and `chrono-tz` are unmaintained, and no release of either is safe
+    # to move to. Eleven workspace crates use chrono directly and tokeira-runtime
+    # uses chrono-tz; chrono also reaches the graph through the AWS SDK, the Monty
+    # fork, prost-wkt and Temporal's temporalio-common-wasm. Drop these entries
+    # when nothing in the graph uses them.
+    "RUSTSEC-2026-0543", # `chrono` unmaintained
+    "RUSTSEC-2026-0555", # `chrono-tz` unmaintained
 ]
 
 [licenses]

@@ -1,5 +1,5 @@
 kind: changed
-body: '`tkr image build`, the bundle build of `tkr deployment create` and the release train run on stock Dagger v1.0.0-beta.27 through tokeira-dagger-sdk 0.7.1.'
+body: '`tkr image build`, the bundle build of `tkr deployment create` and the release train run on stock Dagger v1.0.0-beta.27 through tokeira-dagger-sdk 0.9.0.'
 time: 2026-11-16T21:10:15+00:00
 custom:
     Slice: aece189c-4fbb-4b98-8de5-3ba5abd8b4f6

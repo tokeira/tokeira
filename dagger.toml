@@ -2,17 +2,16 @@
 # v1.0.0-beta.27 or later, runs the checks of the modules below.
 
 # The Rust bar: rustfmt, clippy, cargo check, tests and doctests, rustdoc and
-# cargo-deny. The Rust toolchain itself comes from rust-toolchain.toml.
+# cargo-deny. The Rust toolchain itself comes from rust-toolchain.toml. By
+# default the clippy check fails on any warning; `cargo lint` passes with
+# none (AGENTS.md).
 [modules.rust]
-source = "github.com/tokeira/dagger-rust-toolchain@v0.2.0"
+source = "github.com/tokeira/dagger-rust-toolchain@v0.3.1"
 
 [modules.rust.settings]
 # rustfmt.toml uses nightly-only options. Advance this together with
 # CI_FMT_NIGHTLY in crates/tokeira-build.
 fmtToolchain = "nightly-2026-06-16"
-# `cargo lint` passes with zero warnings (AGENTS.md), so any warning fails
-# the clippy check.
-clippyArgs = ["-D", "warnings"]
 # aws-lc-sys, ring and libmimalloc-sys build C code. The toolchain image
 # already has a C compiler and make, so cmake is the one package to add. No
 # protoc: the protos compile with protox.
@@ -25,11 +24,11 @@ workspaceRoots = ["."]
 # together over a writable copy of the repository: many read files of other
 # crates, and one builds a generated provisioner in the tree.
 wholeWorkspace = true
-# The check lane's --all-features and --no-default-features builds are off:
-# --all-features turns on the live-service features (dsql-integration,
-# integration-test, conformance), which the bar has never compiled. With
-# both off the lane runs `cargo check --workspace --locked`.
-checkAllFeatures = false
+# The check lane's --all-features build is off by default, and its
+# --no-default-features build is off here: --all-features would turn on the
+# live-service features (dsql-integration, integration-test, conformance),
+# which the bar has never compiled. With both off the lane runs
+# `cargo check --workspace --locked`.
 checkNoDefaultFeatures = false
 # tokeira-build-info's build script reads CI.
 cargoEnvironment = ["CI=1"]

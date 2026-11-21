@@ -163,6 +163,22 @@ async fn seed<R: RunRepository + 'static>(
     priority: i32,
     homes: u32,
 ) -> wire::StartActivityTaskRequest {
+    seed_with_reads(store, runtime, data, header, priority, homes)
+        .await
+        .0
+}
+
+async fn seed_with_reads<R: RunRepository + 'static>(
+    store: &R,
+    runtime: &TokeiraRuntime<R>,
+    data: Vec<u8>,
+    header: Vec<u8>,
+    priority: i32,
+    homes: u32,
+) -> (
+    wire::StartActivityTaskRequest,
+    tokeira_storage::read_probe::ReadReport,
+) {
     let start = super::super::translate::start_request_to_edge(
         workflowservice::StartWorkflowExecutionRequest {
             namespace: "default".into(),
@@ -186,6 +202,7 @@ async fn seed<R: RunRepository + 'static>(
     let start =
         crate::translate::to_internal::start_request(start, &context(), runtime.clock().now());
     let run = start.run_key;
+    let publication = tokeira_storage::read_probe::ReadProbe::start(run, "activity/publication");
     let namespace_id = start.namespace_id;
     let execution_home = tokeira_types::execution_home_bundle(
         namespace_id.0.as_bytes(),
@@ -295,7 +312,7 @@ async fn seed<R: RunRepository + 'static>(
         panic!("run");
     };
     let activity = &state.activities["activity-1"];
-    wire::StartActivityTaskRequest {
+    let request = wire::StartActivityTaskRequest {
         run_key: run.0.as_bytes().to_vec(),
         activity_id: activity.activity_id.clone(),
         schedule_event_id: activity.schedule_event_id,
@@ -309,7 +326,8 @@ async fn seed<R: RunRepository + 'static>(
         dispatch_revision: 0,
         worker_identity: "activity-worker".into(),
         scoped_versioned: false,
-    }
+    };
+    (request, publication.report())
 }
 
 struct Fixture<R = InMemoryStore> {

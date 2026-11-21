@@ -506,9 +506,7 @@ async fn queue_home_delivery_live_fenced_starts() -> Result<()> {
     let (director, repo, _, _, _) = store.into_parts();
     let repo = Arc::new(repo);
     for index in 0..100 {
-        let clock = Arc::new(TestClock(AtomicI64::new(
-            OffsetDateTime::now_utc().unix_timestamp(),
-        )));
+        let clock = TestClock::at(time::OffsetDateTime::now_utc());
         fencing_case(
             repo.clone(),
             clock.clone(),
@@ -521,6 +519,48 @@ async fn queue_home_delivery_live_fenced_starts() -> Result<()> {
     }
     director.shutdown().await?;
     Ok(())
+}
+
+// Isolated empty database after schema bootstrap, eight placement homes. These
+// serial selections may follow the activity read fixture on its cleaned database;
+// each prepares placement before taking leases and releases every case's leases.
+// Feature: activity-queue-home-delivery, Property 1: prompt delivery and durable recovery.
+#[cfg(feature = "dsql-integration")]
+#[test]
+#[ignore = "requires an isolated bootstrapped DSQL database and local gRPC sockets"]
+fn activity_queue_home_live_recovery() -> Result<()> {
+    super::activity_delivery_tests::live::run(super::activity_delivery_tests::live::Suite::Recovery)
+}
+
+// Isolated bootstrapped database, eight homes; placement precedes all live leases.
+// Feature: activity-queue-home-delivery, Property 3: isolated retirement under replacement and late deadlines.
+#[cfg(feature = "dsql-integration")]
+#[test]
+#[ignore = "requires an isolated bootstrapped DSQL database and local gRPC sockets"]
+fn activity_queue_home_live_retirement() -> Result<()> {
+    super::activity_delivery_tests::live::run(
+        super::activity_delivery_tests::live::Suite::Retirement,
+    )
+}
+
+// Isolated bootstrapped database, eight homes; placement precedes all live leases.
+// Feature: activity-queue-home-delivery, Property 5: competing starts commit once and only the winner replays.
+#[cfg(feature = "dsql-integration")]
+#[test]
+#[ignore = "requires an isolated bootstrapped DSQL database and local gRPC sockets"]
+fn activity_queue_home_live_competing_starts() -> Result<()> {
+    super::activity_delivery_tests::live::run(
+        super::activity_delivery_tests::live::Suite::Competing,
+    )
+}
+
+// Isolated bootstrapped database, eight homes; placement precedes all live leases.
+// Feature: activity-queue-home-delivery, Property 5: a superseded execution fence cannot commit a start.
+#[cfg(feature = "dsql-integration")]
+#[test]
+#[ignore = "requires an isolated bootstrapped DSQL database and local gRPC sockets"]
+fn activity_queue_home_live_takeover() -> Result<()> {
+    super::activity_delivery_tests::live::run(super::activity_delivery_tests::live::Suite::Takeover)
 }
 
 async fn set_version<R: RunRepository + 'static>(node: &Node<R>, queue: &QueueKey, build: &str) {

@@ -5,6 +5,8 @@
 //! real decoder and independent peer/worker authorization gates.
 
 mod controller;
+#[cfg(feature = "dsql-integration")]
+pub(super) mod live;
 
 use std::{
     sync::{Arc, atomic::Ordering},
@@ -39,8 +41,6 @@ use controller::Controller;
 
 const BOUND: Duration = Duration::from_secs(3);
 
-type MemoryNode = Node<InMemoryStore>;
-
 // Each command carries its own request id, so none is deduplicated as a
 // retry of another.
 fn fresh_request(now: time::OffsetDateTime) -> RequestContext {
@@ -50,9 +50,9 @@ fn fresh_request(now: time::OffsetDateTime) -> RequestContext {
     }
 }
 
-struct Cluster {
-    nodes: Vec<MemoryNode>,
-    store: Arc<InMemoryStore>,
+struct Cluster<R: RunRepository + 'static = InMemoryStore> {
+    nodes: Vec<Node<R>>,
+    store: Arc<R>,
     clock: Arc<TestClock>,
     controller: Controller,
     config: tokeira_config::peer::PeerConfig,
@@ -65,6 +65,11 @@ impl Cluster {
     async fn new(index: u32, count: usize) -> Self {
         let clock = TestClock::new();
         let store = Arc::new(InMemoryStore::with_shard_count(8).with_clock(clock.clone()));
+        Self::with_store(store, clock, index, count).await
+    }
+}
+impl<R: RunRepository + LeaseRepository + 'static> Cluster<R> {
+    async fn with_store(store: Arc<R>, clock: Arc<TestClock>, index: u32, count: usize) -> Self {
         let (credentials, config) = credential();
         let controller = Controller::new().await;
         let mut nodes = Vec::new();
@@ -340,8 +345,8 @@ async fn poll(address: std::net::SocketAddr, queue: &QueueKey) -> PollActivityTa
         .into_inner()
 }
 
-async fn parked(
-    node: &MemoryNode,
+async fn parked<R: RunRepository + 'static>(
+    node: &Node<R>,
     queue: &QueueKey,
 ) -> tokio::task::JoinHandle<PollActivityTaskQueueResponse> {
     let address = node.address;
@@ -399,14 +404,16 @@ fn offer_wire(receipt: &ActivityReceipt) -> wire::OfferActivityTaskRequest {
     }
 }
 
-async fn client(node: &MemoryNode) -> ActivityTaskDispatchClient<tonic::transport::Channel> {
+async fn client<R: RunRepository + 'static>(
+    node: &Node<R>,
+) -> ActivityTaskDispatchClient<tonic::transport::Channel> {
     ActivityTaskDispatchClient::connect(format!("http://{}", node.address))
         .await
         .expect("connect internal activity service")
 }
 
-fn authorized(
-    node: &MemoryNode,
+fn authorized<R: RunRepository + 'static>(
+    node: &Node<R>,
     offer: wire::OfferActivityTaskRequest,
 ) -> Request<wire::OfferActivityTaskRequest> {
     let token = node
@@ -565,7 +572,7 @@ async fn grpc_activity_ack_while_start_is_blocked() {
     c.stop().await;
 }
 
-async fn restart_owner(c: &mut Cluster) {
+async fn restart_owner<R: RunRepository + LeaseRepository + 'static>(c: &mut Cluster<R>) {
     let home = execution(&c.request);
     c.nodes[0].runtime.relinquish_shard(home).await;
     c.store
@@ -614,7 +621,11 @@ async fn grpc_activity_due_recovery_after_restart() {
     c.stop().await;
 }
 
-async fn recover_discovery(c: &Cluster, owner: usize, queue: usize) {
+async fn recover_discovery<R: RunRepository + LeaseRepository + 'static>(
+    c: &Cluster<R>,
+    owner: usize,
+    queue: usize,
+) {
     c.nodes[queue]
         .activity_faults
         .mode
@@ -888,7 +899,7 @@ async fn grpc_activity_handler_capacity_is_shared_with_workflows() {
     c.stop().await;
 }
 
-async fn wait_retired(node: &MemoryNode, queue: &QueueKey) {
+async fn wait_retired<R: RunRepository + 'static>(node: &Node<R>, queue: &QueueKey) {
     tokio::time::timeout(BOUND, async {
         while node
             .runtime
@@ -910,6 +921,14 @@ async fn wait_retired(node: &MemoryNode, queue: &QueueKey) {
 
 async fn queue_movement(index: u32, duplicates: usize) {
     let mut c = Cluster::new(index, 3).await;
+    queue_movement_oracle(&mut c, duplicates).await;
+    c.stop().await;
+}
+
+async fn queue_movement_oracle<R: RunRepository + LeaseRepository + 'static>(
+    c: &mut Cluster<R>,
+    duplicates: usize,
+) {
     c.schedule(false).await;
     let initial = c.admitted(0).await;
     c.nodes[1].activity_faults.mode.store(3, Ordering::SeqCst);
@@ -1028,11 +1047,19 @@ async fn queue_movement(index: u32, duplicates: usize) {
     );
     c.committed_starts(1);
     c.discovery_paused();
-    c.stop().await;
 }
 
 async fn execution_movement(index: u32, during: bool, duplicates: usize) {
     let mut c = Cluster::new(index, 3).await;
+    execution_movement_oracle(&mut c, during, duplicates).await;
+    c.stop().await;
+}
+
+async fn execution_movement_oracle<R: RunRepository + LeaseRepository + 'static>(
+    c: &mut Cluster<R>,
+    during: bool,
+    duplicates: usize,
+) {
     c.schedule(false).await;
     let receipt = c.admitted(0).await;
     let home = execution(&c.request);
@@ -1140,7 +1167,6 @@ async fn execution_movement(index: u32, during: bool, duplicates: usize) {
     }
     c.committed_starts(1);
     c.discovery_paused();
-    c.stop().await;
 }
 
 proptest! {
@@ -1166,7 +1192,7 @@ struct Reads {
     observations: Vec<usize>,
 }
 impl Reads {
-    fn at(c: &Cluster) -> Self {
+    fn at<R: RunRepository + LeaseRepository + 'static>(c: &Cluster<R>) -> Self {
         Self {
             loads: c
                 .nodes
@@ -1323,6 +1349,11 @@ async fn grpc_activity_reads_cold_conflict() {
 #[tokio::test]
 async fn grpc_activity_retirement_isolated_from_replacement_and_other_home() {
     let mut c = Cluster::new(51, 3).await;
+    retirement_oracle(&mut c).await;
+    c.stop().await;
+}
+
+async fn retirement_oracle<R: RunRepository + LeaseRepository + 'static>(c: &mut Cluster<R>) {
     let home = queue_home(&c.queue);
     let other = (0..1000)
         .map(|index| QueueKey {
@@ -1433,5 +1464,4 @@ async fn grpc_activity_retirement_isolated_from_replacement_and_other_home() {
         .await;
     c.committed_starts(1);
     c.discovery_paused();
-    c.stop().await;
 }

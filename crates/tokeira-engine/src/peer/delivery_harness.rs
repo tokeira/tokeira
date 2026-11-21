@@ -87,6 +87,10 @@ impl TestClock {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self(AtomicI64::new(2_000_000_000)))
     }
+    #[cfg(feature = "dsql-integration")]
+    pub(super) fn at(now: OffsetDateTime) -> Arc<Self> {
+        Arc::new(Self(AtomicI64::new(now.unix_timestamp())))
+    }
     pub(super) fn advance(&self, seconds: i64) {
         self.0.fetch_add(seconds, Ordering::SeqCst);
     }

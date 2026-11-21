@@ -37,8 +37,6 @@ fn assert_reads(report: &ReadReport, replay: bool, sql: bool) {
     let mut expected = BTreeMap::from([(("execution-owner/activity-start", "logical"), 1)]);
     if replay {
         expected.insert(("execution-owner/activity-replay", "logical"), 1);
-    } else {
-        expected.insert(("queue-home/activity-owner", "logical"), 1);
     }
     let scoped = report
         .counts
@@ -59,8 +57,6 @@ fn assert_reads(report: &ReadReport, replay: bool, sql: bool) {
             ] {
                 expected.insert(("execution-owner/activity-replay", operation), 1);
             }
-        } else {
-            expected.insert(("queue-home/activity-owner", "sql/hot-state-fast"), 1);
         }
     }
     assert_eq!(scoped, expected, "{report:?}");

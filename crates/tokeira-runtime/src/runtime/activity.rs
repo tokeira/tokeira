@@ -306,10 +306,11 @@ where
             let start_deadline =
                 super::polled_task_start_deadline(tokio::time::Instant::now(), caller_deadline);
             let mut outcome = None;
+            let mut execution_home = offer.execution_home;
             for attempt in 0..3 {
                 let result = tokio::time::timeout_at(
                     start_deadline,
-                    self.route_activity_start(request.clone(), start_deadline),
+                    self.route_activity_start(request.clone(), execution_home, start_deadline),
                 )
                 .await
                 .unwrap_or_else(|_| {
@@ -326,6 +327,11 @@ where
                             && attempt < 2
                             && tokio::time::Instant::now() < start_deadline =>
                     {
+                        // A remote ownership refusal is mapped to the same retryable
+                        // error as an ambiguous reply. Stop trusting the volatile hint
+                        // in either case; the next attempt derives the home from state
+                        // while retaining this request's identity and original budget.
+                        execution_home = None;
                         tokio::task::yield_now().await;
                     }
                     Err(error) => return Err(error),
@@ -343,20 +349,29 @@ where
     async fn route_activity_start(
         &self,
         request: ActivityTaskStartRequest,
+        execution_home: Option<ShardId>,
         deadline: tokio::time::Instant,
     ) -> Result<ActivityStartOutcome> {
-        let LoadedRun::Existing(state) = tokeira_storage::read_probe::scope(
-            "queue-home/activity-owner",
-            self.repo.load_run(request.offered.run_key),
-        )
-        .await?
-        else {
-            return Ok(ActivityStartOutcome::Stale);
+        // Zero is a real home. Only legacy publications and a refused hinted
+        // attempt need this routing read; the owner always reloads and validates
+        // the run's actual home, incarnation and fence before it can start.
+        let home = match execution_home {
+            Some(home) => home,
+            None => {
+                let LoadedRun::Existing(state) = tokeira_storage::read_probe::scope(
+                    "queue-home/activity-owner",
+                    self.repo.load_run(request.offered.run_key),
+                )
+                .await?
+                else {
+                    return Ok(ActivityStartOutcome::Stale);
+                };
+                if state.namespace_id != request.offered.queue.namespace_id {
+                    return Ok(ActivityStartOutcome::Stale);
+                }
+                self.execution_home(&state)
+            }
         };
-        if state.namespace_id != request.offered.queue.namespace_id {
-            return Ok(ActivityStartOutcome::Stale);
-        }
-        let home = self.execution_home(&state);
         let local = self
             .shard_owner
             .read()

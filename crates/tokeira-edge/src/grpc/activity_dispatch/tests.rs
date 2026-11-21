@@ -1,5 +1,6 @@
 //! Generated real-wire checks of owner admission and native activity replies.
 
+mod hinted_starts;
 mod limits;
 #[path = "../activity_dispatch_read_baseline.rs"]
 mod queue_home_read_baseline;
@@ -154,6 +155,163 @@ fn queue_home(namespace: NamespaceId, name: &str, homes: u32) -> ShardId {
     )
 }
 
+async fn seed<R: RunRepository + 'static>(
+    store: &R,
+    runtime: &TokeiraRuntime<R>,
+    data: Vec<u8>,
+    header: Vec<u8>,
+    priority: i32,
+    homes: u32,
+) -> wire::StartActivityTaskRequest {
+    let start = super::super::translate::start_request_to_edge(
+        workflowservice::StartWorkflowExecutionRequest {
+            namespace: "default".into(),
+            workflow_id: format!("activity-wire-{}", Uuid::new_v4()),
+            request_id: Uuid::new_v4().to_string(),
+            workflow_type: Some(common::WorkflowType {
+                name: "workflow-type".into(),
+            }),
+            task_queue: Some(TaskQueue {
+                name: "workflow-q".into(),
+                ..Default::default()
+            }),
+            workflow_task_timeout: Some(prost_types::Duration {
+                seconds: 60,
+                nanos: 0,
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let start =
+        crate::translate::to_internal::start_request(start, &context(), runtime.clock().now());
+    let run = start.run_key;
+    let namespace_id = start.namespace_id;
+    let execution_home = tokeira_types::execution_home_bundle(
+        namespace_id.0.as_bytes(),
+        start.workflow_id.0.as_bytes(),
+        homes,
+    );
+    let activity_queue = (0..128)
+        .map(|n| format!("activity-q-{n}"))
+        .find(|queue| homes == 1 || queue_home(namespace_id, queue, homes) != execution_home)
+        .unwrap();
+    let queue = QueueKey {
+        namespace_id,
+        task_queue: start.task_queue.clone(),
+        task_kind: TaskKind::Workflow,
+        deployment: None,
+        build_id: None,
+    };
+    runtime.start_workflow(start).await.unwrap();
+    let wft = runtime
+        .poll_workflow_task(
+            queue,
+            WorkerIdentity("workflow-worker".into()),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let payload = common::Payload {
+        metadata: BTreeMap::from([("encoding".into(), b"binary/plain".to_vec())]),
+        data,
+        external_payloads: Vec::new(),
+    };
+    let header = common::Header {
+        fields: BTreeMap::from([(
+            "trace".into(),
+            common::Payload {
+                metadata: BTreeMap::new(),
+                data: header,
+                external_payloads: Vec::new(),
+            },
+        )]),
+    };
+    let completion = super::super::translate::respond_completed_request_to_edge(
+        workflowservice::RespondWorkflowTaskCompletedRequest {
+            task_token: crate::task_token::encode(wft.token, namespace_id).unwrap(),
+            namespace: "default".into(),
+            identity: "workflow-worker".into(),
+            commands: vec![Command {
+                command_type: CommandType::ScheduleActivityTask as i32,
+                attributes: Some(Attributes::ScheduleActivityTaskCommandAttributes(
+                    ScheduleActivityTaskCommandAttributes {
+                        activity_id: "activity-1".into(),
+                        activity_type: Some(common::ActivityType {
+                            name: "activity-type".into(),
+                        }),
+                        task_queue: Some(TaskQueue {
+                            name: activity_queue.clone(),
+                            ..Default::default()
+                        }),
+                        input: Some(common::Payloads {
+                            payloads: vec![payload],
+                        }),
+                        header: Some(header),
+                        start_to_close_timeout: Some(prost_types::Duration {
+                            seconds: 60,
+                            nanos: 0,
+                        }),
+                        schedule_to_close_timeout: Some(prost_types::Duration {
+                            seconds: 300,
+                            nanos: 0,
+                        }),
+                        retry_policy: Some(common::RetryPolicy {
+                            initial_interval: Some(prost_types::Duration {
+                                seconds: 1,
+                                nanos: 0,
+                            }),
+                            backoff_coefficient: 2.0,
+                            maximum_attempts: 4,
+                            ..Default::default()
+                        }),
+                        priority: Some(common::Priority {
+                            priority_key: priority,
+                            fairness_key: "fair".into(),
+                            fairness_weight: 1.5,
+                        }),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    runtime
+        .complete_workflow_task(
+            crate::translate::to_internal::workflow_task_completed_request(
+                completion,
+                &context(),
+                runtime.clock().now(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let LoadedRun::Existing(state) = store.load_run(run).await.unwrap() else {
+        panic!("run");
+    };
+    let activity = &state.activities["activity-1"];
+    wire::StartActivityTaskRequest {
+        run_key: run.0.as_bytes().to_vec(),
+        activity_id: activity.activity_id.clone(),
+        schedule_event_id: activity.schedule_event_id,
+        attempt: 1,
+        stamp: activity.stamp,
+        request_id: Uuid::new_v4().as_bytes().to_vec(),
+        namespace: "default".into(),
+        task_queue: activity_queue,
+        deployment: None,
+        build_id: None,
+        dispatch_revision: 0,
+        worker_identity: "activity-worker".into(),
+        scoped_versioned: false,
+    }
+}
+
 struct Fixture<R = InMemoryStore> {
     store: Arc<R>,
     runtime: Arc<TokeiraRuntime<R>>,
@@ -192,156 +350,7 @@ impl<R: RunRepository + tokeira_storage::LeaseRepository + 'static> Fixture<R> {
                 runtime.acquire_shard(ShardId(home)).await.unwrap();
             }
         }
-        let start = super::super::translate::start_request_to_edge(
-            workflowservice::StartWorkflowExecutionRequest {
-                namespace: "default".into(),
-                workflow_id: format!("activity-wire-{}", Uuid::new_v4()),
-                request_id: Uuid::new_v4().to_string(),
-                workflow_type: Some(common::WorkflowType {
-                    name: "workflow-type".into(),
-                }),
-                task_queue: Some(TaskQueue {
-                    name: "workflow-q".into(),
-                    ..Default::default()
-                }),
-                workflow_task_timeout: Some(prost_types::Duration {
-                    seconds: 60,
-                    nanos: 0,
-                }),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let start = crate::translate::to_internal::start_request(
-            start,
-            &context(),
-            time::OffsetDateTime::now_utc(),
-        );
-        let run = start.run_key;
-        let namespace_id = start.namespace_id;
-        let execution_home = tokeira_types::execution_home_bundle(
-            namespace_id.0.as_bytes(),
-            start.workflow_id.0.as_bytes(),
-            homes,
-        );
-        let activity_queue = (0..128)
-            .map(|n| format!("activity-q-{n}"))
-            .find(|queue| homes == 1 || queue_home(namespace_id, queue, homes) != execution_home)
-            .unwrap();
-        let queue = QueueKey {
-            namespace_id,
-            task_queue: start.task_queue.clone(),
-            task_kind: TaskKind::Workflow,
-            deployment: None,
-            build_id: None,
-        };
-        runtime.start_workflow(start).await.unwrap();
-        let wft = runtime
-            .poll_workflow_task(
-                queue,
-                WorkerIdentity("workflow-worker".into()),
-                Duration::from_secs(10),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let payload = common::Payload {
-            metadata: BTreeMap::from([("encoding".into(), b"binary/plain".to_vec())]),
-            data,
-            external_payloads: Vec::new(),
-        };
-        let header = common::Header {
-            fields: BTreeMap::from([(
-                "trace".into(),
-                common::Payload {
-                    metadata: BTreeMap::new(),
-                    data: header,
-                    external_payloads: Vec::new(),
-                },
-            )]),
-        };
-        let completion = super::super::translate::respond_completed_request_to_edge(
-            workflowservice::RespondWorkflowTaskCompletedRequest {
-                task_token: crate::task_token::encode(wft.token, namespace_id).unwrap(),
-                namespace: "default".into(),
-                identity: "workflow-worker".into(),
-                commands: vec![Command {
-                    command_type: CommandType::ScheduleActivityTask as i32,
-                    attributes: Some(Attributes::ScheduleActivityTaskCommandAttributes(
-                        ScheduleActivityTaskCommandAttributes {
-                            activity_id: "activity-1".into(),
-                            activity_type: Some(common::ActivityType {
-                                name: "activity-type".into(),
-                            }),
-                            task_queue: Some(TaskQueue {
-                                name: activity_queue.clone(),
-                                ..Default::default()
-                            }),
-                            input: Some(common::Payloads {
-                                payloads: vec![payload],
-                            }),
-                            header: Some(header),
-                            start_to_close_timeout: Some(prost_types::Duration {
-                                seconds: 60,
-                                nanos: 0,
-                            }),
-                            schedule_to_close_timeout: Some(prost_types::Duration {
-                                seconds: 300,
-                                nanos: 0,
-                            }),
-                            retry_policy: Some(common::RetryPolicy {
-                                initial_interval: Some(prost_types::Duration {
-                                    seconds: 1,
-                                    nanos: 0,
-                                }),
-                                backoff_coefficient: 2.0,
-                                maximum_attempts: 4,
-                                ..Default::default()
-                            }),
-                            priority: Some(common::Priority {
-                                priority_key: priority,
-                                fairness_key: "fair".into(),
-                                fairness_weight: 1.5,
-                            }),
-                            ..Default::default()
-                        },
-                    )),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        runtime
-            .complete_workflow_task(
-                crate::translate::to_internal::workflow_task_completed_request(
-                    completion,
-                    &context(),
-                    time::OffsetDateTime::now_utc(),
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        let LoadedRun::Existing(state) = store.load_run(run).await.unwrap() else {
-            panic!("run");
-        };
-        let activity = &state.activities["activity-1"];
-        let request = wire::StartActivityTaskRequest {
-            run_key: run.0.as_bytes().to_vec(),
-            activity_id: activity.activity_id.clone(),
-            schedule_event_id: activity.schedule_event_id,
-            attempt: 1,
-            stamp: activity.stamp,
-            request_id: Uuid::new_v4().as_bytes().to_vec(),
-            namespace: "default".into(),
-            task_queue: activity_queue,
-            deployment: None,
-            build_id: None,
-            dispatch_revision: 0,
-            worker_identity: "activity-worker".into(),
-            scoped_versioned: false,
-        };
+        let request = seed(store.as_ref(), &runtime, data, header, priority, homes).await;
         let namespaces = Arc::new(InMemoryNamespaceCache::new());
         namespaces
             .insert(ResolvedNamespace::active("default"))

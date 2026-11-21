@@ -99,6 +99,8 @@ mod activity_queue_home_delivery_exploration_tests;
 #[cfg(test)]
 mod activity_retirement_tests;
 #[cfg(test)]
+mod activity_start_preservation_tests;
+#[cfg(test)]
 mod activity_timeout_commit_tests;
 #[cfg(test)]
 mod activity_timeout_read_tests;

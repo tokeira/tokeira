@@ -26,7 +26,7 @@ impl Clock for StartClock {
     }
 }
 
-fn measured_runtime(
+pub(super) fn measured_runtime(
     repo: Arc<InMemoryStore>,
     identity: &str,
     clock: Arc<dyn Clock>,
@@ -54,7 +54,11 @@ fn measured_runtime(
     ))
 }
 
-async fn release(repo: &InMemoryStore, runtime: &TokeiraRuntime<InMemoryStore>, home: ShardId) {
+pub(super) async fn release(
+    repo: &InMemoryStore,
+    runtime: &TokeiraRuntime<InMemoryStore>,
+    home: ShardId,
+) {
     tokeira_runtime::membership::MembershipShardLifecycle::relinquish_shard(runtime, home)
         .await
         .unwrap();
@@ -71,7 +75,7 @@ async fn release(repo: &InMemoryStore, runtime: &TokeiraRuntime<InMemoryStore>, 
     }
 }
 
-async fn stop(runtime: &TokeiraRuntime<InMemoryStore>) {
+pub(super) async fn stop(runtime: &TokeiraRuntime<InMemoryStore>) {
     let shutdown = runtime.shutdown_handle();
     shutdown.begin_shutdown();
     shutdown
@@ -80,7 +84,7 @@ async fn stop(runtime: &TokeiraRuntime<InMemoryStore>) {
         .unwrap();
 }
 
-async fn case(warm: bool, conflict: bool, value: u8) -> ReadReport {
+async fn case(warm: bool, conflict: bool, value: u8, hinted: bool) -> ReadReport {
     let fixture = Fixture::with_homes(vec![value, 0, 255], vec![255, value], 3, 8).await;
     let repo = fixture.store.clone();
     let run = fixture.run();
@@ -171,7 +175,7 @@ async fn case(warm: bool, conflict: bool, value: u8) -> ReadReport {
             .await
             .unwrap();
     });
-    let queue_runtime = measured_runtime(repo.clone(), "activity-read-queue", clock);
+    let queue_runtime = measured_runtime(repo.clone(), "activity-read-queue", clock.clone());
     queue_runtime.acquire_shard(queue_home).await.unwrap();
     let placement = tokeira_types::PlacementConfig {
         shard_count: 8,
@@ -202,24 +206,65 @@ async fn case(warm: bool, conflict: bool, value: u8) -> ReadReport {
         fixture.peer.clone(),
     )));
     let activity = &before.activities["activity-1"];
-    queue_runtime
-        .activity_broker()
-        .publish_activity_task(
-            DispatchableActivityTask {
-                run_key: run,
-                queue: queue.clone(),
-                activity_id: activity.activity_id.clone(),
-                schedule_event_id: activity.schedule_event_id,
-                attempt: activity.attempt,
-                stamp: activity.stamp,
-                dispatch_revision: 0,
-                priority: None,
-                order: None,
-            },
-            None,
-        )
-        .await
-        .unwrap();
+    let task = DispatchableActivityTask {
+        run_key: run,
+        queue: queue.clone(),
+        activity_id: activity.activity_id.clone(),
+        schedule_event_id: activity.schedule_event_id,
+        attempt: activity.attempt,
+        stamp: activity.stamp,
+        dispatch_revision: 0,
+        priority: None,
+        order: None,
+    };
+    let publication = ReadProbe::start(run, "activity/publication");
+    if hinted {
+        let service = ActivityTaskDispatchGrpc::new(
+            queue_runtime.clone(),
+            Arc::new(EdgeInterceptors::permissive(Arc::new(
+                InMemoryNamespaceCache::new(),
+            ))),
+            Some(fixture.peer.clone()),
+        );
+        let mut client = ActivityTaskDispatchClient::new(service.into_service());
+        let offer = tokeira_runtime::ActivityQueueOffer {
+            task,
+            execution_home: execution,
+            dispatch_at: clock.now(),
+            expires_at: clock.now() + time::Duration::seconds(5),
+        };
+        let mut request = Request::new(super::super::offer::encode(&offer, queue_home));
+        request.metadata_mut().insert(
+            "authorization",
+            fixture
+                .peer
+                .signer()
+                .token_at(fixture.peer.unix_seconds().unwrap())
+                .unwrap()
+                .authorization()
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            super::super::offer::outcome(
+                client.offer_activity_task(request).await.unwrap().get_ref()
+            )
+            .unwrap(),
+            tokeira_runtime::ActivityOfferOutcome::Admitted,
+        );
+    } else {
+        queue_runtime
+            .activity_broker()
+            .publish_activity_task(task, None)
+            .await
+            .unwrap();
+    }
+    assert!(
+        publication.report().counts.is_empty(),
+        "offer admission must not hydrate the run: {:?}",
+        publication.report()
+    );
+    drop(publication);
     let probe = ReadProbe::start(
         run,
         format!("activity/warm={warm}/conflict={conflict}/value={value}"),
@@ -322,7 +367,7 @@ fn explore(warm: bool, conflict: bool) {
     let latest = std::cell::RefCell::new(None);
     runner
         .run(&any::<u8>(), |value| {
-            let report = rt.block_on(case(warm, conflict, value));
+            let report = rt.block_on(case(warm, conflict, value, true));
             let observed = loads(&report);
             if observed != (0, 1 + usize::from(conflict)) {
                 failures.set(failures.get() + 1);
@@ -355,7 +400,7 @@ fn explore(warm: bool, conflict: bool) {
         TestRng::from_seed(RngAlgorithm::ChaCha, &[37; 32]),
     );
     let failure = runner.run(&any::<u8>(), |value| {
-        let report = rt.block_on(case(warm, conflict, value));
+        let report = rt.block_on(case(warm, conflict, value, true));
         let (queue, owner) = loads(&report);
         if (queue, owner) == (0, 1 + usize::from(conflict)) { Ok(()) }
         else { Err(TestCaseError::fail(format!("queue-home route_activity_start/load_run={queue}, owner start_activity_task_inner/load_run={owner}; physical SQL=[] (in-memory); {report:?}"))) }
@@ -390,4 +435,29 @@ fn activity_queue_home_read_warm_conflict() {
 #[test]
 fn activity_queue_home_read_cold_conflict() {
     explore(false, true);
+}
+
+#[test]
+fn activity_queue_home_read_legacy_unhinted() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    drop(rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .expect("legacy read control requires local gRPC sockets; run outside the restricted sandbox"));
+    let mut runner = TestRunner::new(Config {
+        cases: 100,
+        source_file: Some(file!()),
+        ..Config::default()
+    });
+    runner
+        .run(
+            &(any::<bool>(), any::<bool>(), any::<u8>()),
+            |(warm, conflict, value)| {
+                let report = rt.block_on(case(warm, conflict, value, false));
+                prop_assert_eq!(loads(&report), (1, 1 + usize::from(conflict)));
+                Ok(())
+            },
+        )
+        .unwrap();
 }

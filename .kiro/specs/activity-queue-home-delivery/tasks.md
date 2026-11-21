@@ -27,7 +27,7 @@ exploration cases. [bugfix.md](bugfix.md) and [design.md](design.md) define the 
     - DONE — Thirteen defect cases and four read-target cases fail for their stated reasons. Local publication,
       discovery recovery, eager non-publication, replacement and colocated-home controls pass.
 
-- [ ] 2. Implement the correction with required generated properties
+- [x] 2. Implement the correction with required generated properties
   - [x] 2.1 Add the volatile envelope and `OfferActivityTask` messages/handler with the complete field policy.
     Thread execution-home metadata through local, discovered, pushed and rerouted offers. Reuse placement,
     `PeerChannels`, the existing push audience/credential lifecycle and bounded sender scheduling through an
@@ -37,15 +37,17 @@ exploration cases. [bugfix.md](bugfix.md) and [design.md](design.md) define the 
       through local, discovered, pushed and rerouted offers. `OfferActivityTask` follows the field table and
       response enum under the existing push purpose and limits; no-peer modes answer `UNIMPLEMENTED`. An activity
       instance of the bounded sender keeps its own accounting, and workflow delivery's tests pass unchanged.
-  - [ ] 2.2 Route publication and due eligibility through the shared delivery entry. Cover immediate direct retries,
+  - [x] 2.2 Route publication and due eligibility through the shared delivery entry. Cover immediate direct retries,
     restored due obligations and post-publication reset activation. Remove the two duplicate options-update broker
     branches. Add activity byte accounting, acquisition watchers and locked validity checks, then remove only the
     queue-home routing load from ordinary starts. Preserve every owner gate and fresh conflict reload.
     - _Requirements: 1.1, 1.2, 1.4, 1.6, 1.7, 1.8, 1.9, 2.1, 2.3, 2.4, 2.5, 2.7_
-    - Publication and retirement parts done — publication, retries (including any already due at registration),
-      recovery after activation and a staged reset after its barrier deliver through the shared entry, and timeout
-      tracking is unchanged. Options updates no longer publish directly. Activity byte accounting, acquisition
-      watchers and locked validity and serving-generation checks are in place. The start read remains.
+    - DONE — Publication, retries (including any already due at registration), recovery after activation and a staged
+      reset after its barrier deliver through the shared entry, and timeout tracking is unchanged. Options updates no
+      longer publish directly. Activity byte accounting, acquisition watchers and locked validity and
+      serving-generation checks are in place. A polled start routes from the offer's home hint, so the queue home
+      reads no run; a start without a hint, or whose hinted owner refuses it, derives the home as before. The owner
+      keeps its read, every gate and the fresh read after a conflict.
   - [x] 2.3 Required PBT — **Property 1: Prompt delivery with durable recovery**, at least 100 generated cases.
     Vary every inventory path, due-at-registration versus future time, finite message/ack loss, unavailable homes,
     restart and saturation. Assert push with discovery paused; separately assert recovery with discovery driven.
@@ -84,21 +86,34 @@ exploration cases. [bugfix.md](bugfix.md) and [design.md](design.md) define the 
       including handler saturation at 64. The sender keeps its entry, byte, concurrency and destination bounds, one
       trusted refresh and three attempts. Owner movement, cancellation and the no-peer bootstrap are covered, the
       publishing lane stays blocked until the acknowledgement, and diagnostics carry only bounded labels.
-  - [ ] 2.7 Required PBT — **Property 5: One authoritative start with fewer reads**, at least 100 generated cases.
+  - [x] 2.7 Required PBT — **Property 5: One authoritative start with fewer reads**, at least 100 generated cases.
     Generate forged home/namespace/queue/version coordinates, obsolete schedules/attempts/stamps, concurrent
     controls, competing starts, lost committed replies, warm/cold caches and OCC conflicts. Assert one committed
     start and unchanged replay/authorization/response limits. Attribute all reads, including retries and separate
     receipt observation; revise an unsupported target before removing checks. Place in runtime/edge.
     - _Requirements: 1.8, 2.3, 2.4_
-  - [ ] 2.8 Required PBT — **Property 6: Preservation outside the defect**, at least 100 generated cases.
+    - DONE — Generated cases cover valid, forged and missing home hints, forged coordinates and credentials, obsolete
+      incarnations, concurrent controls, competing starts, lost replies, warm and cold caches and conflicts. Each
+      commits one start and attributes every read. A hinted start reads the run once, at its owner, plus once per
+      conflict. A refused hint costs one extra owner read and then routes as before, and replay keeps its separate
+      observation. Over two runtimes, the queue home reads no run and the owner reads it once, or twice with a
+      conflict, warm or cold.
+  - [x] 2.8 Required PBT — **Property 6: Preservation outside the defect**, at least 100 generated cases.
     Cover all eight feature interactions, eager nonpublication (including lost completion response), exact input/
     header/heartbeat payloads, local priority/rates, scoped workers and no-peer modes. Re-run affected workflow
     delivery regressions to detect changes from shared-mechanism extraction. Place in runtime/edge/engine.
     - _Requirements: 1.9, 2.3, 2.5, 2.7, 2.8_
-  - [ ] 2.9 Checkpoint: focused checks pass; exploration cases now pass and deliberate disconnected controls still
+    - DONE — Generated cases cover the eight feature interactions, eager starts with a lost completion response, exact
+      input, header and heartbeat payloads, running and kept-paused resets, scoped workers and no-peer modes. Local
+      priority and rate tests and the workflow-delivery regressions pass unchanged.
+  - [x] 2.9 Checkpoint: focused checks pass; exploration cases now pass and deliberate disconnected controls still
     fail for the intended reason. All six properties have at least 100 executed cases with useful shrinking.
     Verify no durable/schema/public/credential/operator contract or workflow-delivery behavior changed.
     - _Requirements: 1.1, 1.4, 1.6, 1.8, 2.1, 2.7, 2.8_
+    - DONE — Every exploration case passes, the disconnected controls still deliver nothing, and all six properties
+      run at least 100 cases. Against the base commit, durable formats, schemas, public protos, credentials,
+      configuration, operator steps and workflow-task delivery are unchanged; the only proto addition is the internal
+      `OfferActivityTask` RPC.
 
 - [ ] 3. Exercise real multi-node internal RPCs
   - [ ] 3.1 Use at least two runtimes with separate execution/queue homes, real internal gRPC and the protected

@@ -221,12 +221,12 @@ cancel its work or undo its serving gate.
 
 ## Boundaries and deferred work
 
-Activities need a separate specification for the complete path. Today `publish_activity_task` in the broker and
-`reconcile_due_activity_dispatches_once` in
-[activity.rs](../../../crates/tokeira-runtime/src/runtime/activity.rs) refill the execution owner's local broker;
-activity polls enforce `ensure_local(route_task_queue(..., TaskKind::Activity))` in
-[workflow_service.rs](../../../crates/tokeira-edge/src/workflow_service.rs); activity start requires a local
-`owner.write_fence(bundle_id)`. Forwarding an activity offer alone cannot complete that start.
+[Activity dispatch](../activity-dispatch/design.md) provides canonical activity discovery at the queue home and
+remote execution-owner start through `RemoteActivityTaskStarter` and `ActivityTaskDispatch.StartActivityTask`;
+`start_forwarded_activity_task` in [activity.rs](../../../crates/tokeira-runtime/src/runtime/activity.rs) validates
+and commits under the owner's fence. `publish_activity_task` still admits only at a local queue home; other homes
+recover through `ActivitySource::resolve` and `publish_discovered`. Proactive push, activity retirement and start-read
+improvements belong to [activity queue-home delivery](../activity-queue-home-delivery/bugfix.md).
 
 Speculative remote delivery is deferred: `derive_workflow_dispatch` excludes speculative tasks, so this design's
 durable recovery cannot protect them. Eager/reserved and query paths remain as they are.

@@ -1,6 +1,8 @@
 //! Generated real-wire checks of owner admission and native activity replies.
 
 mod limits;
+#[path = "../activity_dispatch_read_baseline.rs"]
+mod queue_home_read_baseline;
 mod read_counts;
 
 use std::{

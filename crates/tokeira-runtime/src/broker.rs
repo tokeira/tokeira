@@ -236,6 +236,10 @@ struct ActivityBrokerState {
     rate_limits: DispatchRateLimits,
 }
 
+#[cfg(test)]
+#[path = "broker/activity_queue_home_retirement_tests.rs"]
+mod activity_queue_home_retirement_tests;
+
 /// Poll cancellation cannot await the broker lock. A counted guard releases
 /// demand synchronously; zero entries are pruned on the next registration.
 struct ActivityWaiter(Arc<AtomicUsize>);

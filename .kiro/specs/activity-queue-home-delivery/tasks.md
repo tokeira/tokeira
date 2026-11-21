@@ -3,19 +3,29 @@
 These tasks begin only after specification review. None is executed by this specification change, including the
 exploration cases. [bugfix.md](bugfix.md) and [design.md](design.md) define the correction and preservation contract.
 
-- [ ] 1. Reproduce on unchanged main before implementation
-  - [ ] 1.1 Write the bug-condition exploration property for separate execution/queue owners with discovery paused.
+- [x] 1. Reproduce on unchanged main before implementation
+  - [x] 1.1 Write the bug-condition exploration property for separate execution/queue owners with discovery paused.
     Exercise first schedule, retry/backoff including already-due registration, activity/workflow unpause, activity
     reset, options queue change, timeout retry, staged workflow reset and acquisition recovery. Assert prompt
     delivery and retain failing/shrunk cases before fixing the path.
     - _Requirements: 1.1, 1.2, 1.9, 2.1, 2.2_
-  - [ ] 1.2 Reproduce acquisition cancellation without discovery cleanup and deadline expiry without cancellation.
+    - DONE — Ten exploration properties, one per inventory path, ran 100 generated cases each on unchanged main and
+      failed as intended: committed, due activity state never reached the parked remote poll without discovery.
+      Each path has a disconnected variant, which passes. Shrunk counterexamples are kept.
+  - [x] 1.2 Reproduce acquisition cancellation without discovery cleanup and deadline expiry without cancellation.
     Add replacement-generation/colocated-home controls and warm/cold read counters from dequeue through committed
     remote start. Record each load caller, physical SQL purpose and conflicts separately.
     - _Requirements: 1.6, 1.7, 1.8, 2.4_
-  - [ ] 1.3 Checkpoint: confirm intended failures and passing preservation controls with clocks/barriers. If a
+    - DONE — On unchanged main, a waiting poll took an expired acquisition's offer; a cancelled acquisition kept its
+      ready and in-flight offers; a cancelled registration remained and a paused page's reservation stayed live.
+      The replacement and colocated-home controls pass. Over real two-runtime gRPC with in-memory storage, a
+      conflict-free remote start loaded the run once at the queue home and once at the owner, warm or cold; one
+      OCC conflict added one owner load. The zero-and-one target assertions fail as intended.
+  - [x] 1.3 Checkpoint: confirm intended failures and passing preservation controls with clocks/barriers. If a
     defect case unexpectedly passes, recheck its source premise before writing the correction. No sleeps.
     - _Requirements: 1.1, 1.6, 1.7, 1.8, 2.5, 2.7_
+    - DONE — Thirteen defect cases and four read-target cases fail for their stated reasons. Local publication,
+      discovery recovery, eager non-publication, replacement and colocated-home controls pass.
 
 - [ ] 2. Implement the correction with required generated properties
   - [ ] 2.1 Add the volatile envelope and `OfferActivityTask` messages/handler with the complete field policy.

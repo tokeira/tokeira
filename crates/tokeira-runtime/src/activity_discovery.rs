@@ -38,6 +38,9 @@ use crate::{
 const ACTIVE_CAPACITY: usize = 4_096;
 
 #[cfg(test)]
+#[path = "activity_discovery/activity_queue_home_retirement_tests.rs"]
+mod activity_queue_home_retirement_tests;
+#[cfg(test)]
 mod tests;
 
 /// A queue home has no permit for another active activity family. Existing

@@ -95,6 +95,8 @@ mod activity_backlog_tests;
 #[cfg(test)]
 mod activity_deadline_tests;
 #[cfg(test)]
+mod activity_queue_home_delivery_exploration_tests;
+#[cfg(test)]
 mod activity_retirement_tests;
 #[cfg(test)]
 mod activity_timeout_commit_tests;

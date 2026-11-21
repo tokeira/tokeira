@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use http::{HeaderMap, Request as HttpRequest, Response as HttpResponse};
 pub(super) use repository::Repository;
 use std::{
+    collections::BTreeMap,
     fmt,
     future::Future,
     pin::Pin,
@@ -131,7 +132,90 @@ pub(super) struct Faults {
     pub(super) held: AtomicUsize,
     pub(super) reached: Notify,
     pub(super) release: Notify,
+    inside: Mutex<WireCalls>,
+    drained: Notify,
 }
+
+#[derive(Debug, Default)]
+struct WireCalls {
+    generation: usize,
+    active: BTreeMap<usize, usize>,
+}
+
+#[derive(Debug)]
+struct WireCall {
+    faults: Arc<Faults>,
+    generation: usize,
+}
+
+impl Drop for WireCall {
+    fn drop(&mut self) {
+        let mut inside = self.faults.inside.lock().unwrap();
+        let count = inside.active.get_mut(&self.generation).unwrap();
+        *count -= 1;
+        if *count == 0 {
+            inside.active.remove(&self.generation);
+        }
+        self.faults.drained.notify_waiters();
+    }
+}
+
+impl Faults {
+    fn enter(self: &Arc<Self>) -> (WireCall, u8) {
+        let mut inside = self.inside.lock().unwrap();
+        let generation = inside.generation;
+        // Registration and mode selection share the barrier's lock: no call
+        // can read the old mode without being included in its drain.
+        *inside.active.entry(generation).or_default() += 1;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mode = self
+            .mode
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |mode| {
+                Some(if mode == 6 { 0 } else { mode })
+            })
+            .unwrap();
+        (
+            WireCall {
+                faults: self.clone(),
+                generation,
+            },
+            mode,
+        )
+    }
+
+    /// Switch modes and wait until every call that selected an earlier mode
+    /// completes or is dropped. Later calls cannot prolong this barrier.
+    ///
+    /// Use only with modes 0, 1, 2 and 5. Held modes 3 and 4 never drain until
+    /// explicitly released, so their schedules must use the release wakeup.
+    pub(super) async fn set_and_drain(&self, mode: u8) {
+        assert!(matches!(mode, 0 | 1 | 2 | 5), "barrier mode: {mode}");
+        let generation = {
+            let mut inside = self.inside.lock().unwrap();
+            self.mode.store(mode, Ordering::SeqCst);
+            inside.generation += 1;
+            inside.generation
+        };
+        loop {
+            let drained = self.drained.notified();
+            tokio::pin!(drained);
+            drained.as_mut().enable();
+            if self
+                .inside
+                .lock()
+                .unwrap()
+                .active
+                .range(..generation)
+                .next()
+                .is_none()
+            {
+                return;
+            }
+            drained.await;
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct FaultWire<S> {
     pub(super) inner: S,
@@ -158,17 +242,13 @@ where
         if request.uri().path() != self.path {
             return Box::pin(self.inner.call(request));
         }
-        self.faults.calls.fetch_add(1, Ordering::SeqCst);
-        let mode = self
-            .faults
-            .mode
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |mode| {
-                Some(if mode == 6 { 0 } else { mode })
-            })
-            .unwrap();
+        let (call, mode) = self.faults.enter();
         let faults = self.faults.clone();
         let mut inner = self.inner.clone();
         Box::pin(async move {
+            // Capture before polling so even an unpolled, cancelled request
+            // releases its registration when its future is dropped.
+            let _call = call;
             if mode == 5 {
                 faults.reached.notify_one();
                 return Ok(Status::unimplemented("unknown method").into_http());
@@ -785,4 +865,96 @@ pub(super) fn authorized_offer(
         .metadata_mut()
         .insert("authorization", token.authorization().parse().unwrap());
     request
+}
+
+#[cfg(test)]
+mod fault_barrier_tests {
+    //! Socket-free checks for mode selection, completion and cancellation at the wire boundary.
+
+    use super::*;
+    use std::{convert::Infallible, future::poll_fn};
+
+    #[tokio::test]
+    async fn fault_barrier_drains_earlier_calls_only() {
+        for mode in [0, 1, 2, 5] {
+            let faults = Arc::new(Faults::default());
+            faults.mode.store(mode, Ordering::SeqCst);
+            let mut wire = FaultWire {
+                inner: tower::service_fn(|_: HttpRequest<()>| async {
+                    Ok::<_, Infallible>(HttpResponse::new(Body::empty()))
+                }),
+                faults: faults.clone(),
+                path: ACTIVITY_OFFER_PATH,
+            };
+            let earlier = wire.call(
+                HttpRequest::builder()
+                    .uri(ACTIVITY_OFFER_PATH)
+                    .body(())
+                    .unwrap(),
+            );
+            let mut barrier = Box::pin(faults.set_and_drain(1));
+            let observed = poll_fn(|cx| Poll::Ready(barrier.as_mut().poll(cx))).await;
+            assert!(
+                observed.is_pending(),
+                "barrier before completion: {observed:?}"
+            );
+            let later = wire.call(
+                HttpRequest::builder()
+                    .uri(ACTIVITY_OFFER_PATH)
+                    .body(())
+                    .unwrap(),
+            );
+            earlier.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), barrier)
+                .await
+                .unwrap();
+            let active = faults.inside.lock().unwrap().active.clone();
+            assert_eq!(active, BTreeMap::from([(1, 1)]), "wire calls: {active:?}");
+            drop(later);
+            let active = faults.inside.lock().unwrap().active.clone();
+            assert!(
+                active.is_empty(),
+                "wire calls after unpolled cancellation: {active:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fault_barrier_tracks_calls_across_cancelled_waiters() {
+        let faults = Arc::new(Faults::default());
+        let mut wire = FaultWire {
+            inner: tower::service_fn(|_: HttpRequest<()>| {
+                std::future::pending::<Result<HttpResponse<Body>, Infallible>>()
+            }),
+            faults: faults.clone(),
+            path: ACTIVITY_OFFER_PATH,
+        };
+        let mut earlier = wire.call(
+            HttpRequest::builder()
+                .uri(ACTIVITY_OFFER_PATH)
+                .body(())
+                .unwrap(),
+        );
+        let observed = poll_fn(|cx| Poll::Ready(earlier.as_mut().poll(cx))).await;
+        assert!(
+            observed.is_pending(),
+            "wire before cancellation: {observed:?}"
+        );
+        let mut cancelled = Box::pin(faults.set_and_drain(2));
+        let observed = poll_fn(|cx| Poll::Ready(cancelled.as_mut().poll(cx))).await;
+        assert!(observed.is_pending(), "first barrier: {observed:?}");
+        drop(cancelled);
+        let mut barrier = Box::pin(faults.set_and_drain(1));
+        let observed = poll_fn(|cx| Poll::Ready(barrier.as_mut().poll(cx))).await;
+        assert!(observed.is_pending(), "replacement barrier: {observed:?}");
+        drop(earlier);
+        tokio::time::timeout(Duration::from_secs(1), barrier)
+            .await
+            .unwrap();
+        let active = faults.inside.lock().unwrap().active.clone();
+        assert!(
+            active.is_empty(),
+            "wire calls after cancellation: {active:?}"
+        );
+    }
 }

@@ -193,10 +193,7 @@ async fn recovery<R: RunRepository + LeaseRepository + 'static>(
             let response = poll(c.nodes[1].address, &c.queue).await;
             c.assert_started(0, &response).await;
             let token = serde_json::from_slice(&response.task_token).unwrap();
-            c.nodes[1]
-                .activity_faults
-                .mode
-                .store(fault, Ordering::SeqCst);
+            c.nodes[1].activity_faults.set_and_drain(fault).await;
             c.nodes[0]
                 .runtime
                 .fail_activity_task(
@@ -211,15 +208,12 @@ async fn recovery<R: RunRepository + LeaseRepository + 'static>(
                 .await
                 .unwrap();
         } else {
+            c.nodes[1].activity_faults.set_and_drain(fault).await;
             c.nodes[1]
                 .runtime
                 .activity_broker()
                 .remove_run(c.request.run_key)
                 .await;
-            c.nodes[1]
-                .activity_faults
-                .mode
-                .store(fault, Ordering::SeqCst);
             if path == 2 {
                 let now = c.clock.now();
                 c.nodes[0]
@@ -257,17 +251,16 @@ async fn recovery<R: RunRepository + LeaseRepository + 'static>(
             }
         }
     } else {
-        c.nodes[1]
-            .activity_faults
-            .mode
-            .store(fault, Ordering::SeqCst);
+        c.nodes[1].activity_faults.set_and_drain(fault).await;
         c.schedule(false).await;
     }
+    let current = current_incarnation(&c.state().await);
     let receipt = if fault == 0 {
-        Some(c.admitted(0).await)
+        Some(c.admitted_for(0, &current).await)
     } else {
+        let mut skipped = Vec::new();
         for _ in 0..if fault == 5 { 1 } else { 3 } {
-            let receipt = c.receipt(0).await;
+            let receipt = c.receipt_for(0, &current, &mut skipped).await;
             assert_eq!(
                 receipt.outcome,
                 Err(if fault == 5 {
@@ -275,7 +268,7 @@ async fn recovery<R: RunRepository + LeaseRepository + 'static>(
                 } else {
                     ActivityOfferError::Transport
                 }),
-                "faulted delivery receipt: {receipt:?}"
+                "faulted delivery receipt: {receipt:?}; current: {current:?}; skipped: {skipped:?}"
             );
         }
         None
@@ -312,6 +305,10 @@ async fn recovery<R: RunRepository + LeaseRepository + 'static>(
             "canonical rows: {observed:?}; before: {before:?}"
         );
     } else {
+        // Eligibility can publish after the first delivery finishes. Drain
+        // handlers that could still admit before discarding their hints, and
+        // keep later requests lost so only discovery can satisfy this suffix.
+        c.nodes[1].activity_faults.set_and_drain(1).await;
         c.nodes[1]
             .runtime
             .activity_broker()
@@ -322,7 +319,6 @@ async fn recovery<R: RunRepository + LeaseRepository + 'static>(
             observed, before,
             "canonical rows: {observed:?}; before: {before:?}"
         );
-        c.nodes[1].activity_faults.mode.store(0, Ordering::SeqCst);
         c.nodes[1].repo.activity.release();
     }
     c.assert_started(0, &poll(c.nodes[1].address, &c.queue).await)

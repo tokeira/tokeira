@@ -74,6 +74,17 @@ fn incarnation(receipt: &ActivityReceipt) -> ActivityIncarnation {
     }
 }
 
+fn current_incarnation(state: &WorkflowState) -> ActivityIncarnation {
+    let activity = &state.activities["activity"];
+    ActivityIncarnation {
+        run_key: state.run_key,
+        activity_id: "activity".into(),
+        schedule_event_id: activity.schedule_event_id,
+        attempt: activity.attempt,
+        stamp: activity.stamp,
+    }
+}
+
 // Each command carries its own request id, so none is deduplicated as a
 // retry of another.
 fn fresh_request(now: time::OffsetDateTime) -> RequestContext {
@@ -287,6 +298,57 @@ impl<R: RunRepository + LeaseRepository + 'static> Cluster<R> {
             receipt.outcome,
             Ok(ActivityOfferOutcome::Admitted),
             "push receipt: {receipt:?}"
+        );
+        receipt
+    }
+
+    async fn receipt_for(
+        &mut self,
+        owner: usize,
+        current: &ActivityIncarnation,
+        skipped: &mut Vec<ActivityReceipt>,
+    ) -> ActivityReceipt {
+        loop {
+            let received =
+                tokio::time::timeout(BOUND, self.nodes[owner].activity_receipts.recv()).await;
+            let receipt = match received {
+                Ok(Some(receipt)) => receipt,
+                other => panic!(
+                    "delivery receipt: {other:?}; current: {current:?}; skipped: {skipped:?}"
+                ),
+            };
+            let observed = incarnation(&receipt);
+            if observed != *current {
+                assert!(
+                    self.admitted.contains(&observed),
+                    "unexpected incarnation: {receipt:?}; current: {current:?}; skipped: {skipped:?}"
+                );
+                skipped.push(receipt);
+                continue;
+            }
+            if receipt.outcome == Ok(ActivityOfferOutcome::Admitted) {
+                self.admitted.insert(observed);
+            }
+            return receipt;
+        }
+    }
+
+    async fn admitted_for(
+        &mut self,
+        owner: usize,
+        current: &ActivityIncarnation,
+    ) -> ActivityReceipt {
+        let mut skipped = Vec::new();
+        let receipt = self.receipt_for(owner, current, &mut skipped).await;
+        assert_eq!(
+            receipt.destination,
+            queue_home(&self.queue),
+            "push receipt: {receipt:?}; current: {current:?}; skipped: {skipped:?}"
+        );
+        assert_eq!(
+            receipt.outcome,
+            Ok(ActivityOfferOutcome::Admitted),
+            "push receipt: {receipt:?}; current: {current:?}; skipped: {skipped:?}"
         );
         receipt
     }
@@ -519,7 +581,8 @@ async fn grpc_activity_first_retry_control_and_renewal() {
         )
         .await;
     assert!(failed.is_ok(), "failure transition: {failed:?}");
-    let retry = c.admitted(0).await;
+    let current = current_incarnation(&c.state().await);
+    let retry = c.admitted_for(0, &current).await;
     assert_eq!(retry.offer.task.attempt, 2, "retry push: {retry:?}");
     let response = poll(c.nodes[1].address, &c.queue).await;
     assert_eq!(response.attempt, 2, "retry poll: {response:?}");
@@ -571,7 +634,8 @@ async fn grpc_activity_first_retry_control_and_renewal() {
         )
         .await
         .expect("unpause activity");
-    c.admitted(0).await;
+    let current = current_incarnation(&c.state().await);
+    c.admitted_for(0, &current).await;
     c.assert_started(0, &pending.await.expect("control poll joined"))
         .await;
     let mut expired = Request::new(wire::OfferActivityTaskRequest::default());
@@ -683,10 +747,23 @@ async fn recover_discovery<R: RunRepository + LeaseRepository + 'static>(
     owner: usize,
     queue: usize,
 ) {
+    // Late eligibility publications must remain lost after discarding an
+    // ACK-loss hint, or they could satisfy the poll before discovery reads.
+    c.nodes[queue].activity_faults.set_and_drain(1).await;
     c.nodes[queue]
-        .activity_faults
-        .mode
-        .store(0, Ordering::SeqCst);
+        .runtime
+        .activity_broker()
+        .remove_run(c.request.run_key)
+        .await;
+    let retained = c.nodes[queue]
+        .runtime
+        .activity_broker()
+        .has_runnable_backlog(&c.queue)
+        .await;
+    assert!(
+        !retained,
+        "hint retained before discovery recovery: {retained}"
+    );
     c.nodes[queue].repo.activity.release();
     let response = poll(c.nodes[queue].address, &c.queue).await;
     c.assert_started(owner, &response).await;
@@ -700,10 +777,7 @@ async fn recover_discovery<R: RunRepository + LeaseRepository + 'static>(
 
 async fn loss(mode: u8) {
     let mut c = Cluster::new(21 + u32::from(mode), 3).await;
-    c.nodes[1]
-        .activity_faults
-        .mode
-        .store(mode, Ordering::SeqCst);
+    c.nodes[1].activity_faults.set_and_drain(mode).await;
     c.schedule(false).await;
     for attempt in 1..=3 {
         let receipt = c.receipt(0).await;
@@ -720,22 +794,6 @@ async fn loss(mode: u8) {
         before.activity_start_receipts
     );
     c.discovery_paused();
-    // An ACK loss can retain a hint. Discard only that volatile copy so the
-    // recovery assertion has to traverse canonical discovery, not the push.
-    c.nodes[1]
-        .runtime
-        .activity_broker()
-        .remove_run(c.request.run_key)
-        .await;
-    let retained = c.nodes[1]
-        .runtime
-        .activity_broker()
-        .has_runnable_backlog(&c.queue)
-        .await;
-    assert!(
-        !retained,
-        "hint retained before discovery recovery: {retained}"
-    );
     recover_discovery(&c, 0, 1).await;
     c.stop().await;
 }
@@ -1045,6 +1103,7 @@ async fn queue_movement_oracle<R: RunRepository + LeaseRepository + 'static>(
         )
         .await
         .unwrap();
+    let current = current_incarnation(&c.state().await);
     tokio::time::timeout(BOUND, c.nodes[1].activity_faults.reached.notified())
         .await
         .expect("push did not reach old queue transport");
@@ -1054,17 +1113,18 @@ async fn queue_movement_oracle<R: RunRepository + LeaseRepository + 'static>(
     c.nodes[1].activity_faults.release.notify_one();
     drop(renewals);
     drop(frozen);
-    let refused = c.receipt(0).await;
+    let mut skipped = Vec::new();
+    let refused = c.receipt_for(0, &current, &mut skipped).await;
     assert_eq!(
         refused.outcome,
         Ok(ActivityOfferOutcome::NotHome),
-        "old acquisition reply: {refused:?}"
+        "old acquisition reply: {refused:?}; current: {current:?}; skipped: {skipped:?}"
     );
     assert!(
         !refused.refresh,
-        "first attempt refreshed unexpectedly: {refused:?}"
+        "first attempt refreshed unexpectedly: {refused:?}; current: {current:?}; skipped: {skipped:?}"
     );
-    let refreshed = c.admitted(0).await;
+    let refreshed = c.admitted_for(0, &current).await;
     assert!(
         refreshed.refresh,
         "new home was not reached by trusted refresh: {refreshed:?}"

@@ -1,7 +1,7 @@
 //! Execution-owner retry/rule timers reconstructed from authoritative activities.
 //!
 //! This index never scans dispatch rows. Its evaluator offers eligible attempts
-//! locally only when their dispatch was deferred at registration, and consumes
+//! through the common delivery entry once due, and consumes
 //! only its captured revision. A small completed descriptor
 //! remains until the incarnation changes, preventing unrelated transitions from
 //! rearming an already evaluated timer; acquisition rebuilds every obligation.
@@ -18,6 +18,7 @@ use tokeira_types::{ExecutionStatus, RunKey, ShardId};
 
 use crate::{
     acquisition_tracking::AcquisitionEntries,
+    activity_delivery::ActivityDeliverySource,
     activity_offers::incarnation,
     outbound::driver::Attempt,
     runtime::{ActivityRetryDeps, activity_dispatch_task, evaluate_activity_eligibility},
@@ -33,15 +34,15 @@ struct Eligibility {
     home: ShardId,
     due: OffsetDateTime,
     evaluated: bool,
-    // Retain the registration decision across unrelated commits and later scans.
-    // Already-due attempts belong to commit publication (or discovery repair).
-    offer_locally: bool,
+    source: ActivityDeliverySource,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ActivityEligibility {
     entries: AcquisitionEntries<(RunKey, String), Eligibility>,
     cursors: Arc<Mutex<HashMap<(ShardId, u64), Position>>>,
+    wake: crate::deadline_wake::DeadlineWake,
+    source: ActivityDeliverySource,
     #[cfg(test)]
     refresh_pause: Arc<Mutex<Option<RefreshPause>>>,
 }
@@ -62,10 +63,12 @@ impl Default for ActivityEligibility {
 impl ActivityEligibility {
     pub(crate) fn with_wake(wake: crate::deadline_wake::DeadlineWake) -> Self {
         Self {
-            entries: AcquisitionEntries::with_deadlines(wake, |entry: &Eligibility| {
+            entries: AcquisitionEntries::with_deadlines(wake.clone(), |entry: &Eligibility| {
                 (!entry.evaluated).then_some(entry.due)
             }),
             cursors: Arc::default(),
+            wake,
+            source: ActivityDeliverySource::Eligibility,
             #[cfg(test)]
             refresh_pause: Arc::default(),
         }
@@ -93,6 +96,19 @@ impl ActivityEligibility {
             let _ = pause.installed.send(());
             let _ = pause.resume.await;
         }
+    }
+
+    pub(crate) fn recovery(&self) -> Self {
+        Self {
+            source: ActivityDeliverySource::Recovery,
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn activated(&self) {
+        self.wake
+            .changed(Some(time::PrimitiveDateTime::MIN.assume_utc()));
+        self.wake.notify.notify_one();
     }
 
     pub(crate) fn begin_full_pass(&self) {
@@ -166,7 +182,7 @@ impl ActivityEligibility {
         task: DispatchableActivityTask,
         home: ShardId,
         due: OffsetDateTime,
-        recorded_at: OffsetDateTime,
+        _recorded_at: OffsetDateTime,
     ) {
         self.entries
             .upsert_if((task.run_key, task.activity_id.clone()), home, |previous| {
@@ -189,18 +205,10 @@ impl ActivityEligibility {
                         home,
                         due,
                         evaluated: false,
-                        offer_locally: due > recorded_at,
+                        source: self.source,
                     })
                 }
             });
-    }
-
-    pub(crate) fn offers_locally(&self, task: &DispatchableActivityTask) -> bool {
-        self.entries
-            .get(&(task.run_key, task.activity_id.clone()))
-            .is_some_and(|entry| {
-                incarnation(&entry.task) == incarnation(task) && entry.offer_locally
-            })
     }
 
     pub(crate) fn remove(&self, run: RunKey, activity: &str) {
@@ -267,7 +275,15 @@ pub(crate) async fn scan_activity_eligibility_once<R: RunRepository + 'static>(
         last = Some((entry.value.due, incarnation(&entry.value.task)));
         let mut scoped = deps.clone();
         scoped.tracking = deps.tracking.for_acquisition(attempt.acquisition.clone());
-        match evaluate_activity_eligibility(&scoped, &entry.value.task, now, &attempt).await {
+        match evaluate_activity_eligibility(
+            &scoped,
+            &entry.value.task,
+            now,
+            &attempt,
+            entry.value.source,
+        )
+        .await
+        {
             Ok(true) => {
                 tracking.entries.for_entry(&entry).update(
                     &(

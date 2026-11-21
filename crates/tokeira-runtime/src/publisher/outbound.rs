@@ -23,6 +23,34 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
     /// original acquisition. Used before releasing the publication barrier and
     /// again after a lost publication reply; no new deadlines are calculated.
     pub(crate) fn track_published_outbound(&self, state: &WorkflowState, attempt: &Attempt) {
+        self.track_published_outbound_inner(state, attempt, true);
+    }
+
+    /// Restore tracking while reset publication still excludes authoritative starts.
+    /// Activity delivery is armed separately after that barrier is released.
+    pub(crate) fn track_prepared_outbound(&self, state: &WorkflowState, attempt: &Attempt) {
+        self.track_published_outbound_inner(state, attempt, false);
+    }
+
+    pub(crate) fn track_visible_activity_eligibility(
+        &self,
+        state: &WorkflowState,
+        attempt: &Attempt,
+    ) {
+        self.activity_tracking
+            .eligibility
+            .recovery()
+            .for_acquisition(attempt.acquisition.clone())
+            .refresh(state, attempt.acquisition.shard_id, self.clock.now());
+        self.activity_tracking.eligibility.activated();
+    }
+
+    fn track_published_outbound_inner(
+        &self,
+        state: &WorkflowState,
+        attempt: &Attempt,
+        deliver: bool,
+    ) {
         let entries = tokeira_storage::recovery_entries(state);
         let home = attempt.acquisition.shard_id;
         let activity = self
@@ -51,7 +79,9 @@ impl<R: RunRepository + 'static> RuntimeDispatchPublisher<R> {
                 cancel_requested,
             });
         }
-        activity.refresh_eligibility(state, home, self.clock.now());
+        if deliver {
+            activity.refresh_eligibility(state, home, self.clock.now());
+        }
         let nexus = self
             .nexus_timeout_tracking
             .for_acquisition(attempt.acquisition.clone());

@@ -59,7 +59,11 @@ pub mod retry;
 mod run_growth;
 pub mod runtime;
 pub use runtime::continue_as_new_advice_policy;
+mod activity_delivery;
 mod activity_discovery;
+pub use activity_delivery::{
+    ActivityOfferError, ActivityOfferOutcome, ActivityQueueOffer, RemoteActivityOfferSink,
+};
 mod activity_eligibility;
 mod activity_offers;
 pub mod deadline;

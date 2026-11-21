@@ -709,6 +709,7 @@ pub(crate) struct TimestampedWorkflowTask {
 
 #[derive(Clone, Debug)]
 pub(crate) struct TimestampedActivityTask {
+    execution_home: ShardId,
     pub(crate) task: DispatchableActivityTask,
     pub(crate) entered_at: Instant,
     token: Option<ActivityOfferToken>,
@@ -2557,14 +2558,6 @@ impl InMemoryActivityBroker {
         self.capacity_changed.notify_one();
     }
 
-    pub(crate) async fn publish_discovered(
-        &self,
-        task: DispatchableActivityTask,
-        reservation: &mut ActivityOfferReservation,
-    ) -> OfferAdmission {
-        self.publish_offer(task, None, Some(reservation)).await
-    }
-
     /// Share the process-local worker-compute observation sink with broker clones.
     ///
     /// Publications use only the sink's non-blocking method. Replacing or stopping
@@ -2704,15 +2697,25 @@ impl InMemoryActivityBroker {
             }
             return;
         }
-        for entry in moved.iter_mut() {
-            entry.task.queue = target.clone();
+        let mut kept = OrderedReady::default();
+        while let Some(mut entry) = moved.pop_front() {
+            let order = entry.task.order.expect("broker assigns activity order");
+            if inner
+                .offers
+                .reroute(&incarnation(&entry.task), entry.token, target)
+            {
+                entry.task.queue = target.clone();
+                inner
+                    .ready
+                    .entry(target.clone())
+                    .or_default()
+                    .insert(order, entry);
+            } else {
+                kept.insert(order, entry);
+            }
         }
-        inner
-            .ready
-            .entry(target.clone())
-            .or_default()
-            .append(&mut moved);
-        inner.ready.insert(source.clone(), moved);
+        kept.seen_priority_keys.extend(moved.seen_priority_keys);
+        inner.ready.insert(source.clone(), kept);
         Self::emit_queue_depth(&inner, &source);
         Self::emit_queue_depth(&inner, target);
         let wake = inner.wakes.entry(target.clone()).or_default().clone();
@@ -2782,7 +2785,11 @@ impl InMemoryActivityBroker {
                 entry.task.activity_id.clone(),
                 entry.task.attempt,
             );
-            if let Some(queue) = routes.get(&identity) {
+            if let Some(queue) = routes.get(&identity)
+                && inner
+                    .offers
+                    .reroute(&incarnation(&entry.task), entry.token, queue)
+            {
                 entry.task.queue = queue.clone();
                 destinations.insert(queue.clone());
                 inner
@@ -2866,6 +2873,7 @@ impl InMemoryActivityBroker {
         Some(crate::runtime::ActivityTaskOffer {
             request_id: uuid::Uuid::new_v4(),
             task: removed.task,
+            execution_home: removed.execution_home,
             entered_at: removed.entered_at,
             _lease: lease,
         })
@@ -2885,36 +2893,127 @@ impl InMemoryActivityBroker {
 
     async fn publish_offer(
         &self,
-        mut task: DispatchableActivityTask,
+        task: DispatchableActivityTask,
         metrics: Option<&DeliveryMetrics>,
         reservation: Option<&mut ActivityOfferReservation>,
     ) -> OfferAdmission {
+        let now = OffsetDateTime::now_utc();
+        let offer = crate::ActivityQueueOffer {
+            task,
+            execution_home: ShardId(0),
+            dispatch_at: now,
+            expires_at: now + time::Duration::seconds(5),
+        };
+        let result = self
+            .admit_activity_offer_inner(offer, None, now, reservation, metrics)
+            .await;
+        match result {
+            crate::ActivityOfferOutcome::Admitted => OfferAdmission::Admitted,
+            crate::ActivityOfferOutcome::Known => OfferAdmission::Known,
+            crate::ActivityOfferOutcome::NotHome => OfferAdmission::NotHome,
+            crate::ActivityOfferOutcome::Expired | crate::ActivityOfferOutcome::NotDue => {
+                OfferAdmission::Expired
+            }
+            crate::ActivityOfferOutcome::Full => OfferAdmission::Full,
+        }
+    }
+
+    pub(crate) async fn admit_activity_offer(
+        &self,
+        offer: crate::ActivityQueueOffer,
+        home: Option<&QueueHome>,
+        source: impl Into<crate::activity_delivery::ActivityAdmissionSource>,
+        now_wall: OffsetDateTime,
+        reservation: Option<&mut ActivityOfferReservation>,
+    ) -> crate::ActivityOfferOutcome {
+        let source = source.into();
+        let outcome = self
+            .admit_activity_offer_inner(offer, home, now_wall, reservation, None)
+            .await;
+        metrics::counter!(crate::metrics::ACTIVITY_OFFER_DELIVERY_TOTAL, "source" => source.label(), "outcome" => match outcome {
+            crate::ActivityOfferOutcome::Admitted => "admitted", crate::ActivityOfferOutcome::Known => "known",
+            crate::ActivityOfferOutcome::NotHome => "ownership", crate::ActivityOfferOutcome::Full => "capacity",
+            crate::ActivityOfferOutcome::Expired => "expired", crate::ActivityOfferOutcome::NotDue => "not_due",
+        }).increment(1);
+        outcome
+    }
+
+    async fn admit_activity_offer_inner(
+        &self,
+        offer: crate::ActivityQueueOffer,
+        captured: Option<&QueueHome>,
+        now_wall: OffsetDateTime,
+        reservation: Option<&mut ActivityOfferReservation>,
+        metrics: Option<&DeliveryMetrics>,
+    ) -> crate::ActivityOfferOutcome {
+        let observed = Instant::now();
+        let bytes = offer.retained_bytes();
+        let mut task = offer.task;
         runtime_metrics::record_broker_publish(&task.queue);
         let queue = task.queue.clone();
         let (mode, scope_generation, config) = self.policy.delivery_inputs(&task.queue).await;
         let mut inner = self.inner.lock().await;
         let now = Instant::now();
+        // Mutex/config-cache waits consume retention time too. Arrival cannot
+        // renew an absolute deadline merely by waiting behind another handler.
+        let now_wall = tokeira_kernel::deadline_after(
+            now_wall,
+            time::Duration::try_from(now - observed).unwrap_or(time::Duration::MAX),
+        );
         Self::expire_locked(&mut inner, now);
         inner.ordering.enter_scope(scope_generation);
+        let home = if let Some(homes) = &self.queue_homes {
+            let Some(home) = homes.local_home(&queue) else {
+                return crate::ActivityOfferOutcome::NotHome;
+            };
+            if home.cancel.is_cancelled()
+                || captured.is_some_and(|captured| {
+                    captured.id != home.id
+                        || captured.generation != home.generation
+                        || captured.cancel.is_cancelled()
+                })
+            {
+                return crate::ActivityOfferOutcome::NotHome;
+            }
+            home
+        } else {
+            QueueHome {
+                id: ShardId(0),
+                generation: 0,
+                cancel: Default::default(),
+                deadline: Default::default(),
+            }
+        };
+        if offer.dispatch_at > now_wall {
+            return crate::ActivityOfferOutcome::NotDue;
+        }
+        if offer.expires_at <= now_wall {
+            return crate::ActivityOfferOutcome::Expired;
+        }
         let dedupe_key = incarnation(&task);
         if inner.enqueued.contains(&dedupe_key) || inner.offers.contains(&dedupe_key) {
-            return OfferAdmission::Known;
+            return crate::ActivityOfferOutcome::Known;
         }
-        let token = if let Some(homes) = &self.queue_homes {
-            let Some(home) = homes.local_home(&queue) else {
-                return OfferAdmission::Full;
-            };
-            let (outcome, token) =
-                inner
-                    .offers
-                    .admit(dedupe_key.clone(), queue.clone(), &home, now, reservation);
-            if outcome != OfferAdmission::Admitted {
-                return outcome;
-            }
-            token
-        } else {
-            None
-        };
+        let deadline = now
+            + std::time::Duration::try_from(offer.expires_at - now_wall)
+                .unwrap_or_default()
+                .min(std::time::Duration::from_secs(5));
+        let (outcome, token) = inner.offers.admit_bounded(
+            dedupe_key.clone(),
+            queue.clone(),
+            &home,
+            now,
+            reservation,
+            bytes,
+            deadline,
+        );
+        match outcome {
+            OfferAdmission::Admitted => {}
+            OfferAdmission::Known => return crate::ActivityOfferOutcome::Known,
+            OfferAdmission::NotHome => return crate::ActivityOfferOutcome::NotHome,
+            OfferAdmission::Expired => return crate::ActivityOfferOutcome::Expired,
+            OfferAdmission::Full => return crate::ActivityOfferOutcome::Full,
+        }
         inner.enqueued.insert(dedupe_key);
         let order = match task.order {
             Some(order) => inner.ordering.preserve(order),
@@ -2944,6 +3043,7 @@ impl InMemoryActivityBroker {
         inner.ready.entry(task.queue.clone()).or_default().insert(
             order,
             TimestampedActivityTask {
+                execution_home: offer.execution_home,
                 task,
                 entered_at: now,
                 token,
@@ -2959,7 +3059,7 @@ impl InMemoryActivityBroker {
             let _ = self.policy.observation_sink().try_observe(observation);
         }
         wake.notify_waiters();
-        OfferAdmission::Admitted
+        crate::ActivityOfferOutcome::Admitted
     }
 
     /// Long-poll for an activity task on `queue`.
@@ -3188,6 +3288,7 @@ impl InMemoryActivityBroker {
             ActivityTakeOutcome::Ready(crate::runtime::ActivityTaskOffer {
                 request_id: uuid::Uuid::new_v4(),
                 task: task.task,
+                execution_home: task.execution_home,
                 entered_at: task.entered_at,
                 _lease: lease,
             })
@@ -5984,6 +6085,69 @@ mod tests {
                     left += 1;
                 }
                 prop_assert_eq!(left, published, "every task published meanwhile waits for another poll");
+                Ok(())
+            })?;
+        }
+    }
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+        // Feature: activity-queue-home-delivery, Property 2: mixed arrivals retain the local priority/fairness ordering and the original deadline.
+        #[test]
+        fn activity_common_admission_ordering(
+            items in prop::collection::vec((1i32..6, 0u8..3, 0u8..3), 2..45),
+            fairness in any::<bool>(), priority_enabled in any::<bool>(), versioned in any::<bool>(), rate_blocked in any::<bool>(),
+        ) {
+            tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap().block_on(async {
+                let mut queue = activity_queue("common-admission");
+                if versioned { queue.deployment = Some(DeploymentId("deployment".into())); queue.build_id = Some(BuildId(String::new())); }
+                let assignment = QueueHome { id: ShardId(0), generation: 1, cancel: Default::default(), deadline: Default::default() };
+                let mixed = InMemoryActivityBroker::with_discovery(Arc::new(PolicyHome(assignment.clone())));
+                let baseline = InMemoryActivityBroker::default();
+                let mode = DeliveryMode { priority_enabled, fairness_enabled: fairness, auto_enable: false };
+                for broker in [&mixed, &baseline] { set_activity_mode(broker, mode); }
+                let policy = Arc::new(crate::RepositoryBackedTaskQueueConfigStore::new(Arc::new(tokeira_storage::InMemoryStore::default())));
+                policy.hydrate().await.unwrap();
+                let metadata = || TaskQueueConfigMetadata { reason: "test".into(), update_identity: "test".into(), update_time: OffsetDateTime::UNIX_EPOCH };
+                if rate_blocked {
+                    policy.apply(activity_config_key(&queue), crate::TaskQueueConfigPatch { queue_rate_limit: crate::TaskQueueConfigFieldPatch::Set((Some(0.0), metadata())), ..Default::default() }, 1000).await.unwrap();
+                    for broker in [&mixed, &baseline] { broker.set_task_queue_config_store(policy.clone()); }
+                }
+                let wall = OffsetDateTime::UNIX_EPOCH;
+                for (index, (band, group, source)) in items.iter().enumerate() {
+                    let task = named_activity_task(&queue, index.to_string(), priority(*band, &format!("group-{group}"), f32::from(*group + 1)));
+                    baseline.publish_activity_task(task.clone(), None).await.unwrap();
+                    let offer = crate::ActivityQueueOffer { task, execution_home: ShardId(7), dispatch_at: wall, expires_at: wall + time::Duration::seconds(1) };
+                    let mut reservation = mixed.reserve_offers(&assignment, 1).await;
+                    let source = match source { 0 => OfferSource::Local, 1 => OfferSource::Pushed, _ => OfferSource::Discovered };
+                    let (a, b, c) = tokio::join!(
+                        mixed.admit_activity_offer(offer.clone(), Some(&assignment), source, wall, Some(&mut reservation)),
+                        mixed.admit_activity_offer(offer.clone(), Some(&assignment), OfferSource::Pushed, wall, None),
+                        mixed.admit_activity_offer(offer, Some(&assignment), OfferSource::Discovered, wall, None),
+                    );
+                    prop_assert_eq!([a, b, c].iter().filter(|outcome| **outcome == crate::ActivityOfferOutcome::Admitted).count(), 1);
+                    prop_assert_eq!([a, b, c].iter().filter(|outcome| **outcome == crate::ActivityOfferOutcome::Known).count(), 2);
+                }
+                if rate_blocked {
+                    for broker in [&mixed, &baseline] { prop_assert!(broker.poll_activity_task(&queue, Duration::ZERO).await.unwrap().is_none()); }
+                    policy.apply(activity_config_key(&queue), crate::TaskQueueConfigPatch { queue_rate_limit: crate::TaskQueueConfigFieldPatch::Set((None, metadata())), ..Default::default() }, 1000).await.unwrap();
+                }
+                for _ in 0..items.len() {
+                    let a = mixed.poll_activity_offer_for_worker(&queue, &WorkerIdentity(String::new()), Duration::ZERO).await.unwrap().unwrap();
+                    let b = baseline.poll_activity_task(&queue, Duration::ZERO).await.unwrap().unwrap().0;
+                    prop_assert_eq!(&a.task.activity_id, &b.activity_id);
+                    prop_assert_eq!(a.execution_home, ShardId(7));
+                }
+                let task = named_activity_task(&queue, "expires", priority(1, "", 0.0));
+                let mut offer = crate::ActivityQueueOffer { task, execution_home: ShardId(7), dispatch_at: wall, expires_at: wall + time::Duration::seconds(1) };
+                prop_assert_eq!(mixed.admit_activity_offer(offer.clone(), Some(&assignment), OfferSource::Local, wall, None).await, crate::ActivityOfferOutcome::Admitted);
+                tokio::time::advance(Duration::from_millis(500)).await;
+                offer.expires_at += time::Duration::seconds(4);
+                prop_assert_eq!(mixed.admit_activity_offer(offer.clone(), Some(&assignment), OfferSource::Discovered, wall + time::Duration::milliseconds(500), None).await, crate::ActivityOfferOutcome::Known);
+                tokio::time::advance(Duration::from_millis(500)).await;
+                prop_assert!(mixed.poll_activity_task(&queue, Duration::ZERO).await.unwrap().is_none());
+                prop_assert_eq!(mixed.admit_activity_offer(offer.clone(), Some(&assignment), OfferSource::Discovered, wall + time::Duration::seconds(1), None).await, crate::ActivityOfferOutcome::Admitted);
+                assignment.cancel.cancel();
+                prop_assert_eq!(mixed.admit_activity_offer(offer, Some(&assignment), OfferSource::Pushed, wall + time::Duration::seconds(1), None).await, crate::ActivityOfferOutcome::NotHome);
                 Ok(())
             })?;
         }

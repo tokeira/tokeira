@@ -38,6 +38,8 @@ use crate::{
     workflow_service::{resolved_namespace_id, scoped_worker_allows_task_origin},
 };
 
+pub mod offer;
+
 const MAX_REQUEST: usize = 64 * 1024;
 pub(super) const MAX_RESPONSE: usize = 128 * 1024 * 1024;
 pub(super) const START_PATH: &str =
@@ -333,6 +335,23 @@ impl<R: RunRepository + 'static> ActivityTaskDispatchGrpc<R> {
 
 #[tonic::async_trait]
 impl<R: RunRepository + 'static> ActivityTaskDispatch for ActivityTaskDispatchGrpc<R> {
+    async fn offer_activity_task(
+        &self,
+        request: Request<wire::OfferActivityTaskRequest>,
+    ) -> std::result::Result<Response<wire::OfferActivityTaskResponse>, Status> {
+        if self.peer.is_none() {
+            return Err(Status::unimplemented("unknown method"));
+        }
+        let offer = offer::decode(request.get_ref(), self.runtime.activity_offer_home_count())
+            .inspect_err(offer::record_failure)?;
+        let destination = ShardId(request.get_ref().destination_home);
+        Ok(Response::new(offer::response(
+            self.runtime
+                .receive_activity_offer(offer, destination)
+                .await,
+        )))
+    }
+
     async fn start_activity_task(
         &self,
         request: Request<wire::StartActivityTaskRequest>,
@@ -589,3 +608,7 @@ fn decode_response(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "activity_dispatch/offer_tests.rs"]
+mod offer_tests;

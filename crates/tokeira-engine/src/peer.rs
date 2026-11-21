@@ -62,6 +62,9 @@ pub(crate) fn generate(out: &Path) -> Result<String> {
 }
 
 #[cfg(test)]
+mod activity_offer_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;

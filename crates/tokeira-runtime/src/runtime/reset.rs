@@ -362,8 +362,9 @@ impl<R: RunRepository + 'static> TokeiraRuntime<R> {
                     });
                 }
                 crate::lane::track_committed_run(&state, &[], token.home, &workflow, &wft);
-                publisher.track_published_outbound(&state, &attempt);
+                publisher.track_prepared_outbound(&state, &attempt);
                 drop(exclusive);
+                publisher.track_visible_activity_eligibility(&state, &attempt);
                 repo.complete_run_preparation(token.clone(), attempt.fence)
                     .await?;
                 owner

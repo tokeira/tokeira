@@ -67,21 +67,71 @@ async fn state(repo: &InMemoryStore, run: RunKey) -> WorkflowState {
     state
 }
 
-// Both remote variants currently have no sender. Keep their configuration
-// separate so installing delivery cannot silently connect the negative control.
-async fn publication(
-    path: Path,
-    variant: u32,
-    local: bool,
-    _connected: bool,
-    discover: bool,
-) -> bool {
-    let clock: Arc<dyn Clock> = Arc::new(TestClock::new());
-    let repo = Arc::new(InMemoryStore::with_shard_count(8).with_clock(clock.clone()));
-    let eager = matches!(
-        path,
-        Path::FailureBackoff | Path::FailureDue | Path::Timeout
-    );
+// Independent sink installation keeps disconnected controls unable to push.
+#[derive(Debug)]
+struct ActivitySink {
+    fault: std::sync::atomic::AtomicU8,
+    broker: InMemoryActivityBroker,
+    homes: Arc<PlacementQueueHomes>,
+    clock: Arc<dyn Clock>,
+    acknowledgements: tokio::sync::mpsc::UnboundedSender<tokeira_storage::ActivityIncarnation>,
+}
+#[async_trait::async_trait]
+impl crate::RemoteActivityOfferSink for ActivitySink {
+    async fn offer(
+        &self,
+        offer: &crate::ActivityQueueOffer,
+        destination: ShardId,
+        _: bool,
+    ) -> std::result::Result<crate::ActivityOfferOutcome, crate::ActivityOfferError> {
+        let fault = self.fault.swap(0, std::sync::atomic::Ordering::SeqCst);
+        match fault {
+            1 => return Err(crate::ActivityOfferError::Transport),
+            3 | 4 => {
+                self.acknowledgements
+                    .send(crate::activity_offers::incarnation(&offer.task))
+                    .unwrap();
+                return if fault == 3 {
+                    Ok(crate::ActivityOfferOutcome::Full)
+                } else {
+                    Err(crate::ActivityOfferError::Unimplemented)
+                };
+            }
+            5 => return Ok(crate::ActivityOfferOutcome::NotHome),
+            _ => {}
+        }
+        assert_eq!(destination, home(&offer.task.queue));
+        let acquisition = self.homes.local_home(&offer.task.queue).unwrap();
+        let outcome = self
+            .broker
+            .admit_activity_offer(
+                offer.clone(),
+                Some(&acquisition),
+                crate::workflow_offers::OfferSource::Pushed,
+                self.clock.now(),
+                None,
+            )
+            .await;
+        if fault == 2 {
+            return Err(crate::ActivityOfferError::Transport);
+        }
+        if matches!(
+            outcome,
+            crate::ActivityOfferOutcome::Admitted | crate::ActivityOfferOutcome::Known
+        ) {
+            self.acknowledgements
+                .send(crate::activity_offers::incarnation(&offer.task))
+                .unwrap();
+        }
+        Ok(outcome)
+    }
+}
+
+async fn execution_owner(
+    repo: Arc<InMemoryStore>,
+    clock: Arc<dyn Clock>,
+    eager: bool,
+) -> TokeiraRuntime<InMemoryStore> {
     let mut owner = TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
         repo.clone(),
         1,
@@ -108,6 +158,34 @@ async fn publication(
     // No source-side discovery slice can supply the destination broker either.
     owner.activity_discovery.test_gate.arm();
     owner.activity_discovery.test_gate.completed();
+    owner
+}
+
+async fn publication(
+    path: Path,
+    variant: u32,
+    local: bool,
+    connected: bool,
+    discover: bool,
+) -> bool {
+    publication_with_fault(path, variant, local, connected, discover, 0).await
+}
+
+async fn publication_with_fault(
+    path: Path,
+    variant: u32,
+    local: bool,
+    connected: bool,
+    discover: bool,
+    fault: u8,
+) -> bool {
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::new());
+    let repo = Arc::new(InMemoryStore::with_shard_count(8).with_clock(clock.clone()));
+    let eager = matches!(
+        path,
+        Path::FailureBackoff | Path::FailureDue | Path::Timeout
+    );
+    let mut owner = execution_owner(repo.clone(), clock.clone(), eager).await;
     let mut start = timer_deadline_tests::start(&owner, false);
     start.workflow_id = WorkflowId(format!("activity-delivery-{variant}"));
     start.run_id = RunId(Uuid::from_u128(u128::from(variant) + 1));
@@ -199,7 +277,7 @@ async fn publication(
     let complete = |first: &StartedWorkflowTask| {
         let mut complete =
             completion_inline_tests::completion(first, matches!(path, Path::WorkflowReset));
-        complete.now = owner.clock.now();
+        complete.now = clock.now();
         complete.request.received_at = complete.now;
         complete.commands = vec![command.clone()];
         complete.force_new_workflow_task = matches!(path, Path::WorkflowReset);
@@ -251,8 +329,30 @@ async fn publication(
             .unwrap();
         assert_eq!(state(&repo, run).await.status, ExecutionStatus::Paused);
     }
+    let recovery_epoch = owner
+        .shard_owner
+        .read()
+        .unwrap()
+        .acquisition(execution)
+        .unwrap()
+        .epoch;
+    if fault == 6 {
+        discovery_tests::stop(&owner).await;
+        drop(owner);
+        owner = execution_owner(repo.clone(), clock.clone(), eager).await;
+    }
     // Remove fixture publications before parking the observation poll. The
     // subsequent lifecycle action must publish its own current incarnation.
+    let (acknowledgements, mut acknowledged) = tokio::sync::mpsc::unbounded_channel();
+    if connected && !local {
+        owner.set_activity_offer_sink(Arc::new(ActivitySink {
+            fault: std::sync::atomic::AtomicU8::new(fault),
+            broker: destination.clone(),
+            homes: destination_homes.clone(),
+            clock: owner.clock.clone(),
+            acknowledgements,
+        }));
+    }
     owner.activity_broker.remove_run(run).await;
     let worker = WorkerIdentity("activity-worker".into());
     let poll = destination.poll_activity_offer_for_worker(
@@ -423,15 +523,8 @@ async fn publication(
         // Task refresh reconstructs ordinary and retry work from pending state:
         // service/history/workflow/task_refresher.go @ v1.31.0.
         Path::Recovery => {
-            let epoch = owner
-                .shard_owner
-                .read()
-                .unwrap()
-                .acquisition(execution)
-                .unwrap()
-                .epoch;
             owner
-                .recover_self_assigned_shard(execution, epoch)
+                .recover_self_assigned_shard(execution, recovery_epoch)
                 .await
                 .unwrap();
         }
@@ -463,6 +556,21 @@ async fn publication(
             && row.incarnation.attempt == activity.attempt
             && row.incarnation.stamp == activity.stamp
     }));
+    if connected && !local {
+        loop {
+            let receipt =
+                tokio::time::timeout(std::time::Duration::from_secs(1), acknowledged.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if receipt.run_key == run
+                && receipt.attempt == activity.attempt
+                && receipt.stamp == activity.stamp
+            {
+                break;
+            }
+        }
+    }
     if discover {
         let source = crate::activity_discovery::ActivitySource {
             repo: repo.clone(),
@@ -475,14 +583,22 @@ async fn publication(
             .await;
         for candidate in &before.candidates {
             if let Some(task) = source
-                .resolve(candidate.row.as_ref().unwrap())
+                .resolve_offer(candidate.row.as_ref().unwrap(), owner.clock.now())
                 .await
                 .unwrap()
             {
-                assert_eq!(
-                    destination.publish_discovered(task, &mut reservation).await,
-                    crate::workflow_offers::OfferAdmission::Admitted
-                );
+                assert!(matches!(
+                    destination
+                        .admit_activity_offer(
+                            task,
+                            Some(&acquisition),
+                            crate::workflow_offers::OfferSource::Discovered,
+                            owner.clock.now(),
+                            Some(&mut reservation)
+                        )
+                        .await,
+                    crate::ActivityOfferOutcome::Admitted | crate::ActivityOfferOutcome::Known
+                ));
             }
         }
     }
@@ -705,5 +821,30 @@ proptest! {
             assert!(state(&repo, run).await.activities[&format!("eager-{variant}")].started_at.is_some());
             discovery_tests::stop(&owner).await;
         });
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+    // Feature: activity-queue-home-delivery, Property 1: finite request/reply loss and refusal preserve durable recovery across every publication path.
+    #[test]
+    fn activity_delivery_fault_prefix_recovery(path in 0u8..10, variant in 1u32..64, fault in 0u8..6) {
+        let path = match path {
+            0 => Path::Schedule, 1 => Path::FailureBackoff, 2 => Path::FailureDue, 3 => Path::Timeout,
+            4 => Path::ActivityUnpause, 5 => Path::ActivityReset, 6 => Path::WorkflowUnpause,
+            7 => Path::QueueMove, 8 => Path::WorkflowReset, _ => Path::Recovery,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
+        prop_assert!(runtime.block_on(publication_with_fault(path, variant, false, true, fault == 3 || fault == 4, fault)));
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+    // Feature: activity-queue-home-delivery, Property 1: a fresh execution owner rebuilds due work and pushes with destination discovery paused.
+    #[test]
+    fn activity_restarted_owner_pushes_without_discovery(variant in 1u32..64) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
+        prop_assert!(runtime.block_on(publication_with_fault(Path::Recovery, variant, false, true, false, 6)));
     }
 }

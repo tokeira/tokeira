@@ -187,7 +187,12 @@ async fn fixture(
     ActivityTaskStartRequest,
 ) {
     let (state, request) = seed_start(repo).await;
-    let runtime = runtime(repo.clone());
+    let mut runtime = runtime(repo.clone());
+    Arc::get_mut(&mut runtime)
+        .unwrap()
+        .shutdown_activity_timeout_scanner()
+        .await
+        .unwrap();
     runtime.ready().await.unwrap();
     (runtime, state, request)
 }

@@ -1900,6 +1900,7 @@ where
             controller_managed_placement: self.config.controller_managed_placement,
             max_occ_retries: self.config.max_occ_retries,
             broker: self.activity_broker.clone(),
+            delivery: Some(self.activity_delivery.clone()),
             delivery_metrics: self.delivery_metrics.clone(),
             tracking: self.activity_tracking.clone(),
             worker_deployment_registry: self.worker_deployment_registry.clone(),
@@ -1918,6 +1919,7 @@ pub(crate) struct ActivityRetryDeps<R> {
     pub controller_managed_placement: bool,
     pub max_occ_retries: u32,
     pub broker: InMemoryActivityBroker,
+    pub delivery: Option<Arc<crate::activity_delivery::ActivityDelivery>>,
     pub delivery_metrics: DeliveryMetrics,
     pub tracking: ActivityTrackingState,
     pub worker_deployment_registry: Arc<RwLock<Option<DeploymentRegistry>>>,
@@ -1936,6 +1938,7 @@ impl<R> Clone for ActivityRetryDeps<R> {
             controller_managed_placement: self.controller_managed_placement,
             max_occ_retries: self.max_occ_retries,
             broker: self.broker.clone(),
+            delivery: self.delivery.clone(),
             delivery_metrics: self.delivery_metrics.clone(),
             tracking: self.tracking.clone(),
             worker_deployment_registry: self.worker_deployment_registry.clone(),
@@ -2009,7 +2012,7 @@ pub(crate) struct ActivityRetryTarget<'a> {
 /// Commit an activity's next attempt and durable eligibility time.
 ///
 /// Canonical storage maintenance retains the future attempt's row; owner
-/// eligibility tracking evaluates rules and offers locally at the deadline; discovery
+/// eligibility tracking evaluates rules and routes delivery at the deadline; discovery
 /// reconstructs offers. The timeout scanner uses the same transition when a
 /// fired attempt timeout is retryable (`RetryActivity` →
 /// `UpdateActivityInfoForRetries`, mutable_state_impl.go + activity.go:63-97
@@ -2303,7 +2306,7 @@ pub(crate) fn activity_dispatch_task(
     }
 }
 
-/// Execution-owner eligibility outcome; only deferred attempts are offered locally.
+/// Execution-owner eligibility outcome, independent of local or remote delivery.
 #[derive(Debug)]
 pub(crate) enum ActivityDispatchPreparation {
     /// The due attempt passed owner rule evaluation.
@@ -2351,7 +2354,7 @@ pub(crate) fn activity_backoff_interval_seconds(
     Ok(Some((scheduled_at - completed_at).whole_seconds()))
 }
 
-/// Evaluate the captured execution-owner timer and offer deferred work locally.
+/// Evaluate the captured execution-owner obligation and route due work.
 /// A pause uses the captured fence and publishes nothing. Queue homes on another
 /// node still discover the durable attempt on their next pass, as for first starts.
 pub(crate) async fn evaluate_activity_eligibility<R: RunRepository + 'static>(
@@ -2359,9 +2362,10 @@ pub(crate) async fn evaluate_activity_eligibility<R: RunRepository + 'static>(
     task: &DispatchableActivityTask,
     now: OffsetDateTime,
     attempt: &crate::outbound::driver::Attempt,
+    source: crate::activity_delivery::ActivityDeliverySource,
 ) -> Result<bool> {
     Ok(!matches!(
-        prepare_activity_dispatch(deps, task, now, attempt).await?,
+        prepare_activity_dispatch(deps, task, now, attempt, source).await?,
         ActivityDispatchPreparation::NotYetDispatchable
     ))
 }
@@ -2371,6 +2375,7 @@ async fn prepare_activity_dispatch<R: RunRepository + 'static>(
     task: &DispatchableActivityTask,
     now: OffsetDateTime,
     captured: &crate::outbound::driver::Attempt,
+    source: crate::activity_delivery::ActivityDeliverySource,
 ) -> Result<ActivityDispatchPreparation> {
     use ActivityDispatchPreparation as Preparation;
     let mut attempts = 0u32;
@@ -2443,9 +2448,6 @@ async fn prepare_activity_dispatch<R: RunRepository + 'static>(
             if dispatch_at > deps.clock.now() {
                 return Ok(Preparation::NotYetDispatchable);
             }
-            if !deps.tracking.eligibility.offers_locally(task) {
-                return Ok(Preparation::Eligible);
-            }
             let registry = deps
                 .worker_deployment_registry
                 .read()
@@ -2465,9 +2467,23 @@ async fn prepare_activity_dispatch<R: RunRepository + 'static>(
             // (service/history/workflow/task_generator.go:567-577 @ v1.31.0).
             // Discovery remains the durable backstop; broker deduplication
             // tolerates either path arriving first.
-            deps.broker
-                .publish_activity_task(offer, Some(&deps.delivery_metrics))
-                .await?;
+            if let Some(delivery) = &deps.delivery {
+                if let Some(mut envelope) = crate::ActivityQueueOffer::from_state(
+                    &state,
+                    &current,
+                    captured.acquisition.shard_id,
+                    deps.clock.now(),
+                ) {
+                    envelope.task = offer;
+                    delivery
+                        .publish(envelope, captured.acquisition.clone(), source)
+                        .await;
+                }
+            } else {
+                deps.broker
+                    .publish_activity_task(offer, Some(&deps.delivery_metrics))
+                    .await?;
+            }
             return Ok(Preparation::Eligible);
         };
 
@@ -3234,7 +3250,7 @@ mod tests {
     async fn repair_defers_overdue_timers_and_activity_pause_rules_until_active() {
         for interrupted in [false, true] {
             let repo = Arc::new(InMemoryStore::default());
-            let runtime = Arc::new(TokeiraRuntime::new(
+            let mut runtime = TokeiraRuntime::new(
                 repo.clone(),
                 1,
                 LaneConfig::default(),
@@ -3243,7 +3259,9 @@ mod tests {
                     ..Default::default()
                 },
                 WorkflowTimeoutScannerConfig::default(),
-            ));
+            );
+            runtime.shutdown_activity_timeout_scanner().await.unwrap();
+            let runtime = Arc::new(runtime);
             let (state, _, task) = seed_scheduled_activity(&runtime, &repo).await;
             runtime.activity_broker.remove_run(state.run_key).await;
             repo.create_workflow_rule(
@@ -4087,6 +4105,7 @@ mod tests {
                                 ShardId(0)
                             )
                             .unwrap(),
+                            crate::activity_delivery::ActivityDeliverySource::Eligibility,
                         )
                         .await
                         .unwrap(),

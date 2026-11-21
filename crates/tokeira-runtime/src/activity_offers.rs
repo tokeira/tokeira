@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     discovery::QueueHome,
     workflow_offers::{
-        HOME_CAPACITY, OFFER_LEASE, OfferAdmission, QUEUE_CAPACITY, READY_RETENTION,
+        BYTE_CAPACITY, HOME_CAPACITY, OFFER_LEASE, OfferAdmission, QUEUE_CAPACITY, READY_RETENTION,
     },
 };
 
@@ -50,6 +50,7 @@ struct RetainedOffer {
     token: ActivityOfferToken,
     expires_at: Instant,
     in_flight: bool,
+    bytes: usize,
     released: Arc<AtomicBool>,
     source_cancel: Option<CancellationToken>,
 }
@@ -154,6 +155,7 @@ impl ActivityOffers {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn admit(
         &mut self,
         key: ActivityIncarnation,
@@ -162,6 +164,24 @@ impl ActivityOffers {
         now: Instant,
         reservation: Option<&mut ActivityOfferReservation>,
     ) -> (OfferAdmission, Option<ActivityOfferToken>) {
+        self.admit_bounded(key, queue, home, now, reservation, 0, now + READY_RETENTION)
+    }
+
+    pub(crate) fn admit_bounded(
+        &mut self,
+        key: ActivityIncarnation,
+        queue: QueueKey,
+        home: &QueueHome,
+        now: Instant,
+        reservation: Option<&mut ActivityOfferReservation>,
+        bytes: usize,
+        hint_deadline: Instant,
+    ) -> (OfferAdmission, Option<ActivityOfferToken>) {
+        // Ownership must precede duplicate acknowledgement: a cancelled
+        // acquisition cannot acknowledge a hint it no longer serves.
+        if home.cancel.is_cancelled() {
+            return (OfferAdmission::NotHome, None);
+        }
         if self.contains(&key) {
             return (OfferAdmission::Known, None);
         }
@@ -172,16 +192,31 @@ impl ActivityOffers {
                 && !r.cancel.is_cancelled()
                 && r.remaining > 0
         });
-        if home.cancel.is_cancelled()
-            || self
-                .retained
-                .values()
-                .filter(|entry| entry.queue == queue)
-                .count()
-                >= QUEUE_CAPACITY
-            || (reservation.is_some() && !reserved)
-            || (!reserved && self.available(home) == 0)
+        let bound = if self
+            .retained
+            .values()
+            .fold(0usize, |total, entry| total.saturating_add(entry.bytes))
+            .saturating_add(bytes)
+            > BYTE_CAPACITY
         {
+            Some("hint_bytes")
+        } else if self
+            .retained
+            .values()
+            .filter(|entry| entry.queue == queue)
+            .count()
+            >= QUEUE_CAPACITY
+        {
+            Some("queue_count")
+        } else if reservation.is_some() && !reserved {
+            Some("reservation")
+        } else if !reserved && self.available(home) == 0 {
+            Some("home_count")
+        } else {
+            None
+        };
+        if let Some(bound) = bound {
+            crate::metrics::record_activity_offer_saturation(bound);
             return (OfferAdmission::Full, None);
         }
         self.next_serial = self
@@ -202,13 +237,63 @@ impl ActivityOffers {
                 queue,
                 home: home.clone(),
                 token,
-                expires_at: now + READY_RETENTION,
+                expires_at: hint_deadline.min(now + READY_RETENTION),
+                bytes,
                 in_flight: false,
                 released: Arc::new(AtomicBool::new(false)),
                 source_cancel,
             },
         );
         (OfferAdmission::Admitted, Some(token))
+    }
+
+    /// Rekeying changes only volatile coordinates, but must still fit admission's budgets.
+    pub(crate) fn reroute(
+        &mut self,
+        key: &ActivityIncarnation,
+        token: Option<ActivityOfferToken>,
+        queue: &QueueKey,
+    ) -> bool {
+        let Some(entry) = self.retained.get(key) else {
+            return token.is_none();
+        };
+        if Some(entry.token) != token || entry.in_flight {
+            return false;
+        }
+        let queue_bytes = |q: &QueueKey| {
+            q.task_queue
+                .0
+                .len()
+                .saturating_add(q.deployment.as_ref().map_or(0, |v| v.0.len()))
+                .saturating_add(q.build_id.as_ref().map_or(0, |v| v.0.len()))
+                .saturating_mul(3)
+        };
+        let bytes = entry
+            .bytes
+            .saturating_sub(queue_bytes(&entry.queue))
+            .saturating_add(queue_bytes(queue));
+        let total = self
+            .retained
+            .values()
+            .fold(0usize, |sum, other| sum.saturating_add(other.bytes));
+        if total.saturating_sub(entry.bytes).saturating_add(bytes) > BYTE_CAPACITY
+            || (entry.queue != *queue
+                && self
+                    .retained
+                    .values()
+                    .filter(|other| other.queue == *queue)
+                    .count()
+                    >= QUEUE_CAPACITY)
+        {
+            return false;
+        }
+        let entry = self
+            .retained
+            .get_mut(key)
+            .expect("retained offer stays locked during rekey");
+        entry.bytes = bytes;
+        entry.queue = queue.clone();
+        true
     }
 
     pub(crate) fn take(

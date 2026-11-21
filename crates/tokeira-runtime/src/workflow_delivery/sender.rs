@@ -25,13 +25,13 @@ use crate::{
     workflow_offers::OfferSource,
 };
 
-pub(super) const ENTRIES: usize = 1_024;
-pub(super) const BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const ENTRIES: usize = 1_024;
+pub(crate) const BYTES: usize = 16 * 1024 * 1024;
 const CONCURRENCY: usize = 32;
 const PER_DESTINATION: usize = 8;
-pub(super) const ATTEMPT: Duration = Duration::from_millis(500);
-pub(super) const TOTAL: Duration = Duration::from_secs(1);
-const MAX_ATTEMPTS: u8 = 3;
+pub(crate) const ATTEMPT: Duration = Duration::from_millis(500);
+pub(crate) const TOTAL: Duration = Duration::from_secs(1);
+pub(crate) const MAX_ATTEMPTS: u8 = 3;
 type Key = (RunKey, LogicalTaskSeq);
 type Scope = (ShardId, u64);
 
@@ -45,7 +45,7 @@ pub(crate) enum PublicationSource {
     Recovery,
 }
 impl PublicationSource {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Publication => "publication",
             Self::Recovery => "recovery",
@@ -101,42 +101,55 @@ fn saturation(bound: &'static str) {
         .increment(1);
 }
 
-#[derive(Debug)]
-struct Work {
-    offer: WorkflowOffer,
-    acquisition: ShardAcquisition,
-    source: PublicationSource,
-    destination: ShardId,
-    bytes: usize,
-    deadline: Instant,
-    ready_at: Instant,
-    refresh: bool,
-    refreshed: bool,
-    attempts: u8,
-    fallback: bool,
+/// Payload policy for independent instances of the same bounded scheduler.
+pub(crate) trait SenderOffer: Send + 'static {
+    type Key: Eq + std::hash::Hash + Send + std::fmt::Debug;
+    fn sender_key(&self, acquisition: &ShardAcquisition) -> Self::Key;
+    fn record(&self, source: PublicationSource, outcome: &'static str);
 }
-impl Work {
-    fn key(&self) -> Key {
-        (
-            self.offer.hint.task.run_key,
-            self.offer.hint.task.logical_seq,
-        )
+impl SenderOffer for WorkflowOffer {
+    type Key = Key;
+    fn sender_key(&self, _acquisition: &ShardAcquisition) -> Key {
+        (self.hint.task.run_key, self.hint.task.logical_seq)
     }
-    fn scope(&self) -> Scope {
+    fn record(&self, source: PublicationSource, outcome: &'static str) {
+        record(source, outcome);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Work<O: SenderOffer = WorkflowOffer> {
+    pub(crate) offer: O,
+    pub(crate) acquisition: ShardAcquisition,
+    pub(crate) source: PublicationSource,
+    pub(crate) destination: ShardId,
+    pub(crate) bytes: usize,
+    pub(crate) deadline: Instant,
+    pub(crate) ready_at: Instant,
+    pub(crate) refresh: bool,
+    pub(crate) refreshed: bool,
+    pub(crate) attempts: u8,
+    pub(crate) fallback: bool,
+}
+impl<O: SenderOffer> Work<O> {
+    pub(crate) fn key(&self) -> O::Key {
+        self.offer.sender_key(&self.acquisition)
+    }
+    pub(crate) fn scope(&self) -> Scope {
         (self.acquisition.shard_id, self.acquisition.generation)
     }
 }
 #[derive(Debug)]
-struct State {
-    pending: BTreeMap<(PublicationSource, ShardId), VecDeque<Work>>,
-    keys: HashSet<Key>,
-    bytes: usize,
-    active: BTreeMap<ShardId, usize>,
-    acquisitions: BTreeMap<Scope, (ShardAcquisition, usize)>,
-    next_source: PublicationSource,
-    last_home: [Option<ShardId>; 2],
+pub(crate) struct State<O: SenderOffer = WorkflowOffer> {
+    pub(crate) pending: BTreeMap<(PublicationSource, ShardId), VecDeque<Work<O>>>,
+    pub(crate) keys: HashSet<O::Key>,
+    pub(crate) bytes: usize,
+    pub(crate) active: BTreeMap<ShardId, usize>,
+    pub(crate) acquisitions: BTreeMap<Scope, (ShardAcquisition, usize)>,
+    pub(crate) next_source: PublicationSource,
+    pub(crate) last_home: [Option<ShardId>; 2],
 }
-impl Default for State {
+impl<O: SenderOffer> Default for State<O> {
     fn default() -> Self {
         Self {
             pending: BTreeMap::new(),
@@ -149,14 +162,14 @@ impl Default for State {
         }
     }
 }
-impl State {
-    fn insert(&mut self, work: Work) {
+impl<O: SenderOffer> State<O> {
+    pub(crate) fn insert(&mut self, work: Work<O>) {
         self.pending
             .entry((work.source, work.destination))
             .or_default()
             .push_back(work);
     }
-    fn release(&mut self, work: &Work) {
+    pub(crate) fn release(&mut self, work: &Work<O>) {
         self.keys.remove(&work.key());
         self.bytes -= work.bytes;
         let scope = work.scope();
@@ -169,7 +182,7 @@ impl State {
             self.acquisitions.remove(&scope);
         }
     }
-    fn prune(&mut self, now: Instant) {
+    pub(crate) fn prune(&mut self, now: Instant) {
         let mut removed = Vec::new();
         for queue in self.pending.values_mut() {
             let mut keep = VecDeque::new();
@@ -184,7 +197,7 @@ impl State {
         }
         self.pending.retain(|_, queue| !queue.is_empty());
         for work in removed {
-            record(
+            work.offer.record(
                 work.source,
                 if work.acquisition.valid() {
                     "deadline"
@@ -195,7 +208,7 @@ impl State {
             self.release(&work);
         }
     }
-    fn take(&mut self, now: Instant) -> Option<Work> {
+    pub(crate) fn take(&mut self, now: Instant) -> Option<Work<O>> {
         if self.active.values().sum::<usize>() >= CONCURRENCY {
             return None;
         }
@@ -230,7 +243,7 @@ impl State {
         }
         None
     }
-    fn next_wake(&self) -> Option<Instant> {
+    pub(crate) fn next_wake(&self) -> Option<Instant> {
         let can_start = self.active.values().sum::<usize>() < CONCURRENCY;
         self.pending
             .iter()

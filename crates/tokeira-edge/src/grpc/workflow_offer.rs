@@ -223,10 +223,11 @@ where
     }
 
     fn call(&mut self, request: Request<B>) -> Self::Future {
+        let activity_offer = request.uri().path() == super::activity_dispatch::offer::OFFER_PATH;
         let offer = request.uri().path() == OFFER_PATH;
         let outbound = request.uri().path() == OUTBOUND_PATH;
         let activity_start = request.uri().path() == super::activity_dispatch::START_PATH;
-        if request.uri().path() != OFFER_PATH && !outbound && !activity_start {
+        if !offer && !activity_offer && !outbound && !activity_start {
             return Box::pin(self.inner.call(request));
         }
         let deadline = tokio::time::Instant::now()
@@ -255,6 +256,8 @@ where
             Err(status) => {
                 if offer {
                     record_failure(&status);
+                } else if activity_offer {
+                    super::activity_dispatch::offer::record_failure(&status);
                 }
                 return Box::pin(async move { Ok(status.into_http()) });
             }
@@ -274,6 +277,8 @@ where
                     let status = Status::resource_exhausted("offer request limit exceeded");
                     if offer {
                         record_failure(&status);
+                    } else if activity_offer {
+                        super::activity_dispatch::offer::record_failure(&status);
                     }
                     Ok(status.into_http())
                 }
@@ -282,6 +287,8 @@ where
                     let status = Status::deadline_exceeded("offer attempt deadline exceeded");
                     if offer {
                         record_failure(&status);
+                    } else if activity_offer {
+                        super::activity_dispatch::offer::record_failure(&status);
                     }
                     Ok(status.into_http())
                 }
@@ -329,7 +336,9 @@ where
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
         let budget = match request.uri().path() {
-            OFFER_PATH | OUTBOUND_PATH => Some(MAX_OFFER_RESPONSE_BYTES),
+            OFFER_PATH | OUTBOUND_PATH | super::activity_dispatch::offer::OFFER_PATH => {
+                Some(MAX_OFFER_RESPONSE_BYTES)
+            }
             super::activity_dispatch::START_PATH => Some(super::activity_dispatch::MAX_RESPONSE),
             _ => None,
         };

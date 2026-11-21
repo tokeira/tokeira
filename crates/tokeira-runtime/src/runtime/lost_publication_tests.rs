@@ -228,10 +228,11 @@ async fn activity_dispatch_lost_publication_offered_by_next_pass() {
 }
 
 async fn memory_lost_publication(kind: TaskKind) {
-    let runtime = super::discovery_tests::runtime(
+    let mut runtime = super::discovery_tests::runtime(
         Arc::new(InMemoryStore::with_shard_count(8)),
         crate::discovery::tests::home(0),
     );
+    runtime.shutdown_activity_timeout_scanner().await.unwrap();
     runtime.ready().await.unwrap();
     lost_publication(&runtime, request(), kind).await.unwrap();
     super::discovery_tests::stop(&runtime).await;

@@ -162,3 +162,66 @@ proptest! {
         assert_eq!(offers.admit(key(2, 1), queue(1), &current, now, None).0, OfferAdmission::Full);
     }
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+    // Feature: activity-queue-home-delivery, Property 2: bytes include in-flight entries and late releases cannot debit replacement records.
+    #[test]
+    fn activity_hint_byte_bound_includes_flight(bytes in 1usize..1024 * 1024, in_flight in any::<bool>()) {
+        let now = Instant::now();
+        let assignment = home(1);
+        let mut offers = ActivityOffers::default();
+        let limit = 64 * 1024 * 1024;
+        let (outcome, token) = offers.admit_bounded(key(0, 1), queue(0), &assignment, now, None, limit - bytes, now + Duration::from_secs(1));
+        prop_assert_eq!(outcome, OfferAdmission::Admitted);
+        let lease = in_flight.then(|| offers.take(&key(0, 1), token.unwrap(), now, Arc::new(Notify::new())).unwrap());
+        prop_assert_eq!(offers.admit_bounded(key(1, 1), queue(1), &assignment, now, None, bytes + 1, now + Duration::from_secs(1)).0, OfferAdmission::Full);
+        prop_assert_eq!(offers.admit_bounded(key(1, 1), queue(1), &assignment, now, None, bytes, now + Duration::from_secs(1)).0, OfferAdmission::Admitted);
+        prop_assert_eq!(offers.admit_bounded(key(1, 1), queue(1), &assignment, now, None, limit, now + Duration::from_secs(5)).0, OfferAdmission::Known);
+        prop_assert_eq!(offers.retained[&key(1, 1)].expires_at, now + Duration::from_secs(1));
+        offers.expire(now + Duration::from_secs(5));
+        prop_assert!(offers.retained.is_empty());
+        let later = now + Duration::from_secs(5);
+        prop_assert_eq!(offers.admit_bounded(key(0, 1), queue(0), &assignment, later, None, limit, later + Duration::from_secs(1)).0, OfferAdmission::Admitted);
+        drop(lease);
+        offers.expire(later);
+        prop_assert_eq!(offers.retained.len(), 1);
+    }
+}
+
+#[test]
+fn activity_home_count_bound_covers_all_queues() {
+    let now = Instant::now();
+    let assignment = home(1);
+    let mut offers = ActivityOffers::default();
+    for id in 0..8192u16 {
+        assert_eq!(
+            offers
+                .admit_bounded(
+                    key(id, 1),
+                    queue(id / 256),
+                    &assignment,
+                    now,
+                    None,
+                    1,
+                    now + Duration::from_secs(5)
+                )
+                .0,
+            OfferAdmission::Admitted
+        );
+    }
+    assert_eq!(
+        offers
+            .admit_bounded(
+                key(8192, 1),
+                queue(32),
+                &assignment,
+                now,
+                None,
+                1,
+                now + Duration::from_secs(5)
+            )
+            .0,
+        OfferAdmission::Full
+    );
+}

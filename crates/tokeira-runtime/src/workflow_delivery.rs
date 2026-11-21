@@ -32,7 +32,7 @@ use crate::{
     workflow_offers::{OfferAdmission, OfferSource},
 };
 
-mod sender;
+pub(crate) mod sender;
 mod sweep;
 #[cfg(test)]
 mod tests;

@@ -21,6 +21,16 @@ pub const WORKFLOW_OFFER_SATURATION_TOTAL: &str = "tokeira_runtime_workflow_offe
 /// Queue-home acquisition cleanup by cancellation, deadline or shutdown.
 pub const WORKFLOW_OFFER_RETIREMENTS_TOTAL: &str =
     "tokeira_runtime_workflow_offer_retirements_total";
+/// Disposable activity hint delivery, labelled only by source and finite outcome.
+pub const ACTIVITY_OFFER_DELIVERY_TOTAL: &str = "tokeira_runtime_activity_offer_delivery_total";
+
+/// Activity hint capacity refusals, with a finite bound label.
+pub const ACTIVITY_OFFER_SATURATION_TOTAL: &str = "tokeira_runtime_activity_offer_saturation_total";
+
+pub(crate) fn record_activity_offer_saturation(bound: &'static str) {
+    counter!(ACTIVITY_OFFER_SATURATION_TOTAL, "bound" => bound).increment(1);
+}
+
 /// Post-commit workflow delivery outcomes, with finite source and outcome labels.
 pub const WORKFLOW_OFFER_DELIVERY_TOTAL: &str = "tokeira_runtime_workflow_offer_delivery_total";
 /// Sticky semantic fallback decisions, labelled only by the supported reason.

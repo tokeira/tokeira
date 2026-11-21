@@ -295,6 +295,7 @@ pub struct PartitionHome {
 /// orchestration flow and module map.
 pub struct TokeiraRuntime<R> {
     workflow_delivery: Arc<crate::workflow_delivery::WorkflowDelivery<R>>,
+    activity_delivery: Arc<crate::activity_delivery::ActivityDelivery>,
     /// Shared handle to the durable run repository.
     repo: Arc<R>,
     /// Shared publisher for atomic reset completion and durable recovery wakeups.
@@ -868,6 +869,12 @@ where
             runtime_shutdown.clone(),
             clock.clone(),
         );
+        let activity_delivery = crate::activity_delivery::ActivityDelivery::new(
+            activity_broker.clone(),
+            discovery.1.clone(),
+            runtime_shutdown.clone(),
+            clock.clone(),
+        );
         let heartbeat_store: Arc<dyn HeartbeatStore> = Arc::new(InMemoryHeartbeatStore::new());
         let delivery_metrics = DeliveryMetrics::new();
         let worker_compute_queue_metrics = crate::WorkerComputeQueueMetrics::default();
@@ -931,6 +938,7 @@ where
                     delivery_metrics.clone(),
                 )
                 .with_workflow_delivery(workflow_delivery.clone())
+                .with_activity_delivery(activity_delivery.clone())
                 .with_outbound_wake(outbound_wake.clone())
                 .with_namespace_resolver(namespace_resolver.clone())
                 .with_worker_deployment_registry(worker_deployment_registry.clone())
@@ -1019,6 +1027,7 @@ where
                     controller_managed_placement: config.controller_managed_placement,
                     max_occ_retries: config.max_occ_retries,
                     broker: activity_broker.clone(),
+                    delivery: Some(activity_delivery.clone()),
                     delivery_metrics: delivery_metrics.clone(),
                     tracking: activity_tracking.clone(),
                     worker_deployment_registry: worker_deployment_registry.clone(),
@@ -1085,6 +1094,7 @@ where
             delivery_metrics.clone(),
         )
         .with_workflow_delivery(workflow_delivery.clone())
+        .with_activity_delivery(activity_delivery.clone())
         .with_outbound_wake(outbound_wake.clone())
         .with_namespace_resolver(namespace_resolver.clone())
         .with_worker_deployment_registry(worker_deployment_registry.clone())
@@ -1205,6 +1215,7 @@ where
             worker_deployment_repository: None,
             worker_deployment_registry,
             workflow_delivery,
+            activity_delivery,
             purger,
             clock,
         };
@@ -2113,6 +2124,8 @@ impl WorkflowActivation {
 /// into `StartedActivityTask`; dropping it leaves the activity unstarted.
 #[derive(Clone, Debug)]
 pub struct ActivityTaskOffer {
+    /// Volatile execution-home hint; start still validates authoritative ownership.
+    pub execution_home: ShardId,
     /// Stable identity for every owner attempt made for this poll's match.
     pub request_id: Uuid,
     /// Broker offer whose durable premise must still be checked before start.
@@ -2271,6 +2284,34 @@ fn add_dispatch_stat(
 }
 
 impl<R: RunRepository + 'static> TokeiraRuntime<R> {
+    /// Install bounded remote activity publication only in peer-enabled startup.
+    pub fn set_activity_offer_sink(&self, sink: Arc<dyn crate::RemoteActivityOfferSink>) {
+        self.activity_delivery.install_sender(sink);
+    }
+
+    /// Admit an authenticated hint without reading a run or acquiring an execution lane.
+    pub async fn receive_activity_offer(
+        &self,
+        offer: crate::ActivityQueueOffer,
+        destination: ShardId,
+    ) -> crate::ActivityOfferOutcome {
+        self.activity_delivery
+            .receive(
+                offer,
+                destination,
+                crate::workflow_offers::OfferSource::Pushed,
+            )
+            .await
+    }
+
+    /// Current configured home count, used to validate internal coordinates.
+    pub fn activity_offer_home_count(&self) -> u32 {
+        self.shard_owner
+            .read()
+            .expect("shard owner lock poisoned")
+            .shard_count()
+    }
+
     /// Install bounded offer delivery after peer bootstrap validation. Exclusive
     /// modes never call this and construct no sender or remote client.
     pub fn set_workflow_offer_sink(&self, sink: Arc<dyn crate::RemoteWorkflowOfferSink>) {

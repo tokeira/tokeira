@@ -28,16 +28,23 @@ exploration cases. [bugfix.md](bugfix.md) and [design.md](design.md) define the 
       discovery recovery, eager non-publication, replacement and colocated-home controls pass.
 
 - [ ] 2. Implement the correction with required generated properties
-  - [ ] 2.1 Add the volatile envelope and `OfferActivityTask` messages/handler with the complete field policy.
+  - [x] 2.1 Add the volatile envelope and `OfferActivityTask` messages/handler with the complete field policy.
     Thread execution-home metadata through local, discovered, pushed and rerouted offers. Reuse placement,
     `PeerChannels`, the existing push audience/credential lifecycle and bounded sender scheduling through an
     activity instance. Keep workflow sender behavior/budgets and the existing start messages unchanged.
     - _Requirements: 1.3, 1.5, 1.8, 1.10, 2.6, 2.8_
+    - DONE — `ActivityQueueOffer` carries the execution home, original eligibility and an absolute deadline
+      through local, discovered, pushed and rerouted offers. `OfferActivityTask` follows the field table and
+      response enum under the existing push purpose and limits; no-peer modes answer `UNIMPLEMENTED`. An activity
+      instance of the bounded sender keeps its own accounting, and workflow delivery's tests pass unchanged.
   - [ ] 2.2 Route publication and due eligibility through the shared delivery entry. Cover immediate direct retries,
     restored due obligations and post-publication reset activation. Remove the two duplicate options-update broker
     branches. Add activity byte accounting, acquisition watchers and locked validity checks, then remove only the
     queue-home routing load from ordinary starts. Preserve every owner gate and fresh conflict reload.
     - _Requirements: 1.1, 1.2, 1.4, 1.6, 1.7, 1.8, 1.9, 2.1, 2.3, 2.4, 2.5, 2.7_
+    - Publication part done — publication, retries (including any already due at registration), recovery after
+      activation and a staged reset after its barrier deliver through the shared entry, and timeout tracking is
+      unchanged. Options updates no longer publish directly. Watchers, locked checks and the start read remain.
   - [ ] 2.3 Required PBT — **Property 1: Prompt delivery with durable recovery**, at least 100 generated cases.
     Vary every inventory path, due-at-registration versus future time, finite message/ack loss, unavailable homes,
     restart and saturation. Assert push with discovery paused; separately assert recovery with discovery driven.

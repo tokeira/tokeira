@@ -363,7 +363,9 @@ where
                 });
                 result.activity_tracking_entries_reconstructed += 1;
             }
-            activity_tracking.refresh_eligibility(state, shard_id, clock.now());
+            let mut recovered = activity_tracking.clone();
+            recovered.eligibility = recovered.eligibility.recovery();
+            recovered.refresh_eligibility(state, shard_id, clock.now());
             for entry in entries.nexus_timeouts {
                 nexus_timeout_tracking.insert(NexusTimeoutEntry {
                     timeouts: state
@@ -693,6 +695,7 @@ mod tests {
             controller_managed_placement: false,
             max_occ_retries: 3,
             broker: activity_broker.clone(),
+            delivery: None,
             delivery_metrics: crate::DeliveryMetrics::new(),
             tracking: ActivityTrackingState::default(),
             worker_deployment_registry: Arc::new(RwLock::new(None)),

@@ -2,6 +2,39 @@
   "internal": {
     "enums": [
       {
+        "enum": "tokeira.internal.runtime.v1.ActivityOfferOutcome",
+        "values": [
+          {
+            "name": "ACTIVITY_OFFER_OUTCOME_UNSPECIFIED",
+            "number": 0
+          },
+          {
+            "name": "ACTIVITY_OFFER_OUTCOME_ADMITTED",
+            "number": 1
+          },
+          {
+            "name": "ACTIVITY_OFFER_OUTCOME_KNOWN",
+            "number": 2
+          },
+          {
+            "name": "ACTIVITY_OFFER_OUTCOME_NOT_HOME",
+            "number": 3
+          },
+          {
+            "name": "ACTIVITY_OFFER_OUTCOME_FULL",
+            "number": 4
+          },
+          {
+            "name": "ACTIVITY_OFFER_OUTCOME_EXPIRED",
+            "number": 5
+          },
+          {
+            "name": "ACTIVITY_OFFER_OUTCOME_NOT_DUE",
+            "number": 6
+          }
+        ]
+      },
+      {
         "enum": "temporal.api.enums.v1.ActivityExecutionStatus",
         "values": [
           {
@@ -2166,6 +2199,146 @@
       }
     ],
     "fields": [
+      {
+        "field": "run_key",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferActivityTaskRequest",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BYTES",
+        "type_name": ""
+      },
+      {
+        "field": "activity_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferActivityTaskRequest",
+        "number": 2,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_STRING",
+        "type_name": ""
+      },
+      {
+        "field": "schedule_event_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferActivityTaskRequest",
+        "number": 3,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_INT64",
+        "type_name": ""
+      },
+      {
+        "field": "attempt",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferActivityTaskRequest",
+        "number": 4,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_UINT32",
+        "type_name": ""
+      },
+      {
+        "field": "stamp",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferActivityTaskRequest",
+        "number": 5,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_UINT64",
+        "type_name": ""
+      },
+      {
+        "field": "execution_home",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferActivityTaskRequest",
+        "number": 6,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_UINT32",
+        "type_name": ""
+      },
+      {
+        "field": "destination_home",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferActivityTaskRequest",
+        "number": 7,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_UINT32",
+        "type_name": ""
+      },
+      {
+        "field": "namespace_id",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferActivityTaskRequest",
+        "number": 8,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_BYTES",
+        "type_name": ""
+      },
+      {
+        "field": "selected_queue",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferActivityTaskRequest",
+        "number": 9,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".tokeira.internal.runtime.v1.OfferQueue"
+      },
+      {
+        "field": "dispatch_revision",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferActivityTaskRequest",
+        "number": 10,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_INT64",
+        "type_name": ""
+      },
+      {
+        "field": "dispatch_at",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferActivityTaskRequest",
+        "number": 11,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.Timestamp"
+      },
+      {
+        "field": "priority",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferActivityTaskRequest",
+        "number": 12,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".tokeira.internal.runtime.v1.OfferPriority"
+      },
+      {
+        "field": "expires_at",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferActivityTaskRequest",
+        "number": 13,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_MESSAGE",
+        "type_name": ".google.protobuf.Timestamp"
+      },
+      {
+        "field": "outcome",
+        "label": "LABEL_OPTIONAL",
+        "message": "tokeira.internal.runtime.v1.OfferActivityTaskResponse",
+        "number": 1,
+        "oneof": null,
+        "proto3_optional": false,
+        "type": "TYPE_ENUM",
+        "type_name": ".tokeira.internal.runtime.v1.ActivityOfferOutcome"
+      },
       {
         "field": "accepted",
         "label": "LABEL_OPTIONAL",
@@ -29757,6 +29930,8 @@
       "tokeira/internal/runtime/v1/projection.proto"
     ],
     "messages": [
+      "tokeira.internal.runtime.v1.OfferActivityTaskRequest",
+      "tokeira.internal.runtime.v1.OfferActivityTaskResponse",
       "google.protobuf.Any",
       "google.protobuf.BoolValue",
       "google.protobuf.BytesValue",
@@ -30438,6 +30613,14 @@
       "tokeira.internal.runtime.v1.StartWorkflowTaskResponse"
     ],
     "services": [
+      {
+        "client_streaming": false,
+        "input": ".tokeira.internal.runtime.v1.OfferActivityTaskRequest",
+        "method": "OfferActivityTask",
+        "output": ".tokeira.internal.runtime.v1.OfferActivityTaskResponse",
+        "server_streaming": false,
+        "service": "tokeira.internal.runtime.v1.ActivityTaskDispatch"
+      },
       {
         "client_streaming": false,
         "input": ".tokeira.compatibility.v1.GetCompatibilityRequest",

@@ -481,3 +481,76 @@ proptest! {
         }))?;
     }
 }
+
+#[derive(Debug)]
+struct ActivityAdmissionReceiptSink {
+    receiver: Arc<crate::activity_delivery::ActivityDelivery>,
+    replies: tokio::sync::mpsc::UnboundedSender<crate::ActivityOfferOutcome>,
+}
+#[async_trait]
+impl crate::RemoteActivityOfferSink for ActivityAdmissionReceiptSink {
+    async fn offer(
+        &self,
+        offer: &crate::ActivityQueueOffer,
+        destination: ShardId,
+        _: bool,
+    ) -> std::result::Result<crate::ActivityOfferOutcome, crate::ActivityOfferError> {
+        let outcome = self
+            .receiver
+            .receive(
+                offer.clone(),
+                destination,
+                crate::workflow_offers::OfferSource::Pushed,
+            )
+            .await;
+        self.replies.send(outcome).unwrap();
+        Ok(outcome)
+    }
+}
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+    // Feature: activity-queue-home-delivery, Property 4: admission acknowledges while the actual publishing lane is blocked behind its publication barrier.
+    #[test]
+    fn activity_publishing_lane_waits_until_ack(index in 0u32..1000) {
+        tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap().block_on(async {
+            let clock: Arc<dyn Clock> = Arc::new(PublicationClock(OffsetDateTime::UNIX_EPOCH));
+            let mut state = sample_state(RunKey::new());
+            let queue = QueueKey { namespace_id: state.namespace_id, task_queue: (index..index + 100).map(|i| TaskQueueName(format!("activity-ack-{i}"))).find(|name| tokeira_types::bundle_for_partition(tokeira_types::workflow_queue_partition(state.namespace_id, &name.0, 8), 8) != ShardId(0)).unwrap(), task_kind: TaskKind::Activity, deployment: None, build_id: None };
+            state.activities.insert("activity".into(), tokeira_kernel::ActivityState {
+                activity_id: "activity".into(), activity_type: "activity".into(), schedule_event_id: 7, task_queue: queue.task_queue.clone(),
+                deployment: None, build_id: None, retired_input: Default::default(), retired_header: Default::default(),
+                attempt: 1, retry_policy: None, schedule_to_close_timeout: None, schedule_to_start_timeout: None,
+                start_to_close_timeout: None, heartbeat_timeout: None, scheduled_at: clock.now(), current_attempt_scheduled_at: Some(clock.now()),
+                started_at: None, started_event_id: None, last_failure: None, started_identity: None, retry_last_worker_identity: None,
+                heartbeat_details: None, cancel_requested: false, pause_info: None, stamp: 0, activity_reset: false,
+                reset_heartbeats: false, priority: None, last_attempt_complete_time: None, last_heartbeat_at: None,
+            });
+            let repo = MockRepo::new(LoadedRun::Existing(state.clone()), Vec::new());
+            let registry = Arc::new(RwLock::new(None));
+            let (inner, _) = publisher(&repo, &registry);
+            let owner = test_shard_owner();
+            let source_homes = Arc::new(crate::discovery::PlacementQueueHomes { owner: owner.clone(), counts: RwLock::new((8, 8)) });
+            let shutdown = crate::RuntimeShutdownHandle::new();
+            let source = crate::activity_delivery::ActivityDelivery::new(InMemoryActivityBroker::with_discovery(source_homes.clone()), source_homes, shutdown.clone(), clock.clone());
+            let mut target_owner = ShardOwner::new(8);
+            for id in 0..8 { target_owner.record_acquired(ShardId(id), ShardEpoch::ZERO); target_owner.mark_active(ShardId(id)); }
+            let target_homes = Arc::new(crate::discovery::PlacementQueueHomes { owner: Arc::new(RwLock::new(target_owner)), counts: RwLock::new((8, 8)) });
+            let receiver = crate::activity_delivery::ActivityDelivery::new(InMemoryActivityBroker::with_discovery(target_homes.clone()), target_homes, shutdown.clone(), clock.clone());
+            let (replies, mut acknowledgements) = tokio::sync::mpsc::unbounded_channel();
+            source.install_sender(Arc::new(ActivityAdmissionReceiptSink { receiver, replies }));
+            let release = Arc::new(Notify::new());
+            let publisher = PausedOfferPublisher { inner: inner.with_activity_delivery(source).with_clock(clock.clone()), release: release.clone() };
+            let lane = spawn_lane(MockKernel::new(smallvec![DispatchOp::EnqueueActivityTask {
+                queue, activity_id: "activity".into(), schedule_event_id: 7, attempt: 1, dispatch_revision: 0, stamp: 0, dispatch_at: clock.now(),
+                schedule_to_close_timeout: None, schedule_to_start_timeout: None, start_to_close_timeout: None, heartbeat_timeout: None, priority: None,
+            }]), repo, publisher, owner, ActivityTrackingState::default(), crate::timeout::WorkflowTimeoutTrackingState::default(), crate::wft_timeout::WftTimeoutTrackingState::default(), NexusTimeoutTrackingState::default(), UpdateRegistry::new(), LaneConfig::default());
+            let submitted = tokio::spawn(async move { lane.submit(state.run_key, sample_command("publish")).await });
+            prop_assert_eq!(tokio::time::timeout(StdDuration::from_secs(1), acknowledgements.recv()).await.unwrap().unwrap(), crate::ActivityOfferOutcome::Admitted);
+            prop_assert!(!submitted.is_finished());
+            release.notify_one();
+            prop_assert!(matches!(submitted.await.unwrap().unwrap(), CommitResult::Applied { .. }), "publication commits after acknowledgement");
+            shutdown.begin_shutdown();
+            Ok(())
+        })?;
+    }
+}

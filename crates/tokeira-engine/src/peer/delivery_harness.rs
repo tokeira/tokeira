@@ -357,7 +357,7 @@ pub(super) async fn node<R: RunRepository + 'static>(
     config: &tokeira_config::peer::PeerConfig,
     clock: Arc<TestClock>,
 ) -> Node<R> {
-    node_with_activity(store, identity, config, clock, None).await
+    node_with_activity(store, identity, config, clock, None, true).await
 }
 
 pub(super) async fn activity_node<R: RunRepository + 'static>(
@@ -367,7 +367,26 @@ pub(super) async fn activity_node<R: RunRepository + 'static>(
     clock: Arc<TestClock>,
     controller: &str,
 ) -> Node<R> {
-    node_with_activity(store, identity, config, clock, Some(controller)).await
+    node_with_activity(store, identity, config, clock, Some(controller), true).await
+}
+
+pub(super) async fn activity_node_with_scanner<R: RunRepository + 'static>(
+    store: Arc<R>,
+    identity: &str,
+    config: &tokeira_config::peer::PeerConfig,
+    clock: Arc<TestClock>,
+    controller: &str,
+    scan_activity: bool,
+) -> Node<R> {
+    node_with_activity(
+        store,
+        identity,
+        config,
+        clock,
+        Some(controller),
+        scan_activity,
+    )
+    .await
 }
 
 async fn node_with_activity<R: RunRepository + 'static>(
@@ -376,35 +395,40 @@ async fn node_with_activity<R: RunRepository + 'static>(
     config: &tokeira_config::peer::PeerConfig,
     clock: Arc<TestClock>,
     controller: Option<&str>,
+    scan_activity: bool,
 ) -> Node<R> {
     let repo = Arc::new(Repository::new(store));
     if controller.is_none() {
         repo.activity.release();
     }
-    let runtime = Arc::new(
-        TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
-            repo.clone(),
-            1,
-            LaneConfig {
-                controller_managed_placement: true,
-                ..Default::default()
-            },
-            TimerScannerConfig::default(),
-            WorkflowTimeoutScannerConfig::default(),
-            ActivityTimeoutScannerConfig::default(),
-            NexusTimeoutScannerConfig::default(),
-            NexusEndpointRegistry::default(),
-            Arc::new(NoopNexusHttpClient),
-            NexusCompletionDeps::default(),
-            8,
-            identity.into(),
-            "127.0.0.1:0".into(),
-            false,
-            None,
-            clock.clone(),
-        )
-        .with_worker_deployment_repository(Arc::new(InMemoryStore::default().with_clock(clock))),
-    );
+    let mut runtime = TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
+        repo.clone(),
+        1,
+        LaneConfig {
+            controller_managed_placement: true,
+            ..Default::default()
+        },
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        ActivityTimeoutScannerConfig::default(),
+        NexusTimeoutScannerConfig::default(),
+        NexusEndpointRegistry::default(),
+        Arc::new(NoopNexusHttpClient),
+        NexusCompletionDeps::default(),
+        8,
+        identity.into(),
+        "127.0.0.1:0".into(),
+        false,
+        None,
+        clock.clone(),
+    )
+    .with_worker_deployment_repository(Arc::new(InMemoryStore::default().with_clock(clock)));
+    if !scan_activity {
+        // Retirement isolates publication from due eligibility so no unrelated
+        // hint can cross the deliberate interval with no active queue owner.
+        runtime.shutdown_activity_timeout_scanner().await.unwrap();
+    }
+    let runtime = Arc::new(runtime);
     let peer = Arc::new(
         super::bootstrap(Some(config))
             .unwrap()

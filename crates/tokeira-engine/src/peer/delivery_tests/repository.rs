@@ -61,6 +61,8 @@ pub(in crate::peer) struct Repository<R: ?Sized> {
     pub(in crate::peer) history_reads: AtomicUsize,
     pub(in crate::peer) commits: AtomicUsize,
     pub(in crate::peer) applied_starts: AtomicUsize,
+    pub(in crate::peer) fenced_starts: AtomicUsize,
+    renewal: tokio::sync::RwLock<()>,
     pub(in crate::peer) lease_seconds: AtomicUsize,
     pub(in crate::peer) loads: AtomicUsize,
     pub(in crate::peer) start_loads: AtomicUsize,
@@ -79,6 +81,8 @@ impl<R> Repository<R> {
             history_reads: AtomicUsize::new(0),
             commits: AtomicUsize::new(0),
             applied_starts: AtomicUsize::new(0),
+            fenced_starts: AtomicUsize::new(0),
+            renewal: tokio::sync::RwLock::new(()),
             lease_seconds: AtomicUsize::new(0),
             loads: AtomicUsize::new(0),
             start_loads: AtomicUsize::new(0),
@@ -97,6 +101,12 @@ impl<R> Repository<R> {
             resume: wait,
         });
         (arrived, resume)
+    }
+
+    // Drain an in-flight renewal before moving the durable lease. Holding this
+    // guard delays loss observation, never the store's epoch check on writes.
+    pub(in crate::peer) async fn pause_renewals(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.renewal.write().await
     }
 }
 impl<R: ?Sized> Repository<R> {
@@ -474,6 +484,13 @@ where
             .commit_transition(run_key, transition, fence)
             .await;
         if START_READS.try_with(|()| ()).is_ok()
+            && result
+                .as_ref()
+                .is_err_and(|error| error.is::<LeaseFenceLost>())
+        {
+            self.fenced_starts.fetch_add(1, Ordering::SeqCst);
+        }
+        if START_READS.try_with(|()| ()).is_ok()
             && matches!(&result, Ok(CommitResult::Applied { .. }))
         {
             self.applied_starts.fetch_add(1, Ordering::SeqCst);
@@ -506,6 +523,13 @@ where
             .inner
             .commit_transition_for_bundle(run_key, execution_home_bundle, transition, fence)
             .await;
+        if START_READS.try_with(|()| ()).is_ok()
+            && result
+                .as_ref()
+                .is_err_and(|error| error.is::<LeaseFenceLost>())
+        {
+            self.fenced_starts.fetch_add(1, Ordering::SeqCst);
+        }
         if START_READS.try_with(|()| ()).is_ok()
             && matches!(&result, Ok(CommitResult::Applied { .. }))
         {
@@ -798,6 +822,7 @@ where
         epoch: ShardEpoch,
         node_endpoint: String,
     ) -> Result<LeaseOutcome> {
+        let _renewal = self.renewal.read().await;
         self.inner
             .renew_bundle(bundle, owner, epoch, node_endpoint)
             .await

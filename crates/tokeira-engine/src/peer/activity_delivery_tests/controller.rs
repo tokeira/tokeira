@@ -20,6 +20,7 @@ pub(super) struct Controller {
     pub(super) endpoint: String,
     pub(super) calls: Arc<AtomicUsize>,
     response: Arc<Mutex<RefreshBundleResponse>>,
+    unexpected: Arc<Mutex<Vec<RefreshBundleRequest>>>,
     cancel: CancellationToken,
     server: tokio::task::JoinHandle<()>,
 }
@@ -31,6 +32,8 @@ impl Controller {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let calls = Arc::new(AtomicUsize::new(0));
         let response = Arc::new(Mutex::new(RefreshBundleResponse::default()));
+        let unexpected = Arc::new(Mutex::new(Vec::new()));
+        let unexpected_requests = unexpected.clone();
         let cancel = CancellationToken::new();
         let shutdown = cancel.clone();
         let observed = calls.clone();
@@ -44,17 +47,22 @@ impl Controller {
                         let (stream, _) = accepted.expect("accept controller request");
                         let calls = observed.clone();
                         let response = selected.clone();
+                        let unexpected = unexpected_requests.clone();
                         connections.spawn(async move {
                             let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
                                 let calls = calls.clone();
                                 let response = response.clone();
+                                let unexpected = unexpected.clone();
                                 async move {
                                     assert!(request.uri().path().ends_with("/RefreshBundle"), "controller request path: {}", request.uri().path());
                                     let body = request.into_body().collect().await.expect("controller body").to_bytes();
                                     let request = RefreshBundleRequest::decode(body).expect("decode real refresh request");
                                     let response = response.lock().unwrap().clone();
-                                    assert_eq!(Some(request.bundle_id), response.bundle.as_ref().map(|b| b.bundle_id), "refresh request={request:?}, response={response:?}");
                                     calls.fetch_add(1, Ordering::SeqCst);
+                                    if Some(request.bundle_id) != response.bundle.as_ref().map(|b| b.bundle_id) {
+                                        unexpected.lock().unwrap().push(request);
+                                        return Ok::<_, std::convert::Infallible>(Response::builder().status(hyper::StatusCode::SERVICE_UNAVAILABLE).body(Full::new(bytes::Bytes::new())).unwrap());
+                                    }
                                     Ok::<_, std::convert::Infallible>(Response::builder().header("content-type", "application/proto").body(Full::new(bytes::Bytes::from(response.encode_to_vec()))).unwrap())
                                 }
                             });
@@ -70,6 +78,7 @@ impl Controller {
             endpoint,
             calls,
             response,
+            unexpected,
             cancel,
             server,
         }
@@ -101,8 +110,17 @@ impl Controller {
         };
     }
 
-    pub(super) async fn stop(self) {
+    pub(super) fn assert_no_unexpected_requests(&self) {
+        let requests = self.unexpected.lock().unwrap();
+        assert!(
+            requests.is_empty(),
+            "unexpected placement refresh requests: {requests:?}"
+        );
+    }
+
+    pub(super) async fn stop(mut self) {
         self.cancel.cancel();
-        self.server.await.expect("controller stopped");
+        (&mut self.server).await.expect("controller stopped");
+        self.assert_no_unexpected_requests();
     }
 }

@@ -5,10 +5,10 @@
 //! real decoder and independent peer/worker authorization gates.
 
 mod controller;
-#[cfg(feature = "dsql-integration")]
 pub(super) mod live;
 
 use std::{
+    collections::BTreeSet,
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
@@ -29,7 +29,7 @@ use tokeira_proto::{
     },
 };
 use tokeira_runtime::{ActivityOfferError, ActivityOfferOutcome, UnpauseActivitiesRequest};
-use tokeira_storage::{InMemoryStore, LeaseRepository, RunRepository};
+use tokeira_storage::{ActivityIncarnation, InMemoryStore, LeaseRepository, RunRepository};
 use tokeira_types::{
     ActivityTaskToken, Payload, Payloads, QueueKey, RequestContext, RetryPolicy, ShardEpoch,
     TaskKind, TaskQueueName, WorkerIdentity,
@@ -40,6 +40,39 @@ use super::delivery_harness::*;
 use controller::Controller;
 
 const BOUND: Duration = Duration::from_secs(3);
+
+// Keep monotonic lease/start deadlines fixed while real storage performs the
+// takeover. A runnable task prevents Tokio's idle-time auto-advance during I/O;
+// dropping the guard restores time even when an oracle panics. The store still
+// checks its real lease and epoch, including for the deliberately stale commit.
+struct FrozenTime(tokio::task::JoinHandle<()>);
+impl FrozenTime {
+    fn new() -> Self {
+        tokio::time::pause();
+        Self(tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        }))
+    }
+}
+impl Drop for FrozenTime {
+    fn drop(&mut self) {
+        self.0.abort();
+        tokio::time::resume();
+    }
+}
+
+fn incarnation(receipt: &ActivityReceipt) -> ActivityIncarnation {
+    let task = &receipt.offer.task;
+    ActivityIncarnation {
+        run_key: task.run_key,
+        activity_id: task.activity_id.clone(),
+        schedule_event_id: task.schedule_event_id,
+        attempt: task.attempt,
+        stamp: task.stamp,
+    }
+}
 
 // Each command carries its own request id, so none is deduplicated as a
 // retry of another.
@@ -60,27 +93,40 @@ struct Cluster<R: RunRepository + 'static = InMemoryStore> {
     request: StartRequest,
     queue: QueueKey,
     epochs: [ShardEpoch; 2],
+    admitted: BTreeSet<ActivityIncarnation>,
 }
 impl Cluster {
     async fn new(index: u32, count: usize) -> Self {
         let clock = TestClock::new();
         let store = Arc::new(InMemoryStore::with_shard_count(8).with_clock(clock.clone()));
-        Self::with_store(store, clock, index, count).await
+        Self::with_store(store, clock, index, count, true).await
+    }
+    async fn without_activity_scanner(index: u32, count: usize) -> Self {
+        let clock = TestClock::new();
+        let store = Arc::new(InMemoryStore::with_shard_count(8).with_clock(clock.clone()));
+        Self::with_store(store, clock, index, count, false).await
     }
 }
 impl<R: RunRepository + LeaseRepository + 'static> Cluster<R> {
-    async fn with_store(store: Arc<R>, clock: Arc<TestClock>, index: u32, count: usize) -> Self {
+    async fn with_store(
+        store: Arc<R>,
+        clock: Arc<TestClock>,
+        index: u32,
+        count: usize,
+        scan_activity: bool,
+    ) -> Self {
         let (credentials, config) = credential();
         let controller = Controller::new().await;
         let mut nodes = Vec::new();
         for index in 0..count {
             nodes.push(
-                activity_node(
+                activity_node_with_scanner(
                     store.clone(),
                     &format!("activity-node-{index}"),
                     &config,
                     clock.clone(),
                     &controller.endpoint,
+                    scan_activity,
                 )
                 .await,
             );
@@ -122,6 +168,7 @@ impl<R: RunRepository + LeaseRepository + 'static> Cluster<R> {
             request,
             queue,
             epochs,
+            admitted: BTreeSet::new(),
         };
         cluster.routes(0, 1);
         cluster
@@ -211,25 +258,37 @@ impl<R: RunRepository + LeaseRepository + 'static> Cluster<R> {
         );
     }
 
-    async fn admitted(&mut self, owner: usize) -> ActivityReceipt {
+    async fn receipt(&mut self, owner: usize) -> ActivityReceipt {
         loop {
             let receipt = self.nodes[owner].activity_receipt().await;
-            assert_eq!(
-                receipt.destination,
-                queue_home(&self.queue),
-                "push receipt: {receipt:?}"
-            );
-            assert!(
-                matches!(
-                    receipt.outcome,
-                    Ok(ActivityOfferOutcome::Admitted | ActivityOfferOutcome::Known)
-                ),
-                "push receipt: {receipt:?}"
-            );
-            if receipt.outcome == Ok(ActivityOfferOutcome::Admitted) {
-                return receipt;
+            let incarnation = incarnation(&receipt);
+            // Publication and due eligibility can finish in either order. Only
+            // a Known for an already observed admission is redundant evidence.
+            if receipt.outcome == Ok(ActivityOfferOutcome::Known)
+                && self.admitted.contains(&incarnation)
+            {
+                continue;
             }
+            if receipt.outcome == Ok(ActivityOfferOutcome::Admitted) {
+                self.admitted.insert(incarnation);
+            }
+            return receipt;
         }
+    }
+
+    async fn admitted(&mut self, owner: usize) -> ActivityReceipt {
+        let receipt = self.receipt(owner).await;
+        assert_eq!(
+            receipt.destination,
+            queue_home(&self.queue),
+            "push receipt: {receipt:?}"
+        );
+        assert_eq!(
+            receipt.outcome,
+            Ok(ActivityOfferOutcome::Admitted),
+            "push receipt: {receipt:?}"
+        );
+        receipt
     }
 
     async fn state(&self) -> WorkflowState {
@@ -289,8 +348,7 @@ impl<R: RunRepository + LeaseRepository + 'static> Cluster<R> {
         assert_eq!(
             response.input.as_ref().expect("activity input").payloads[0].data,
             [0, 255, 42],
-            "poll payload: {:?}",
-            response.input
+            "poll response: {response:?}"
         );
         let starts = self.nodes[owner].starts.lock().unwrap();
         assert!(
@@ -524,10 +582,9 @@ async fn grpc_activity_first_retry_control_and_renewal() {
         .await
         .offer_activity_task(expired)
         .await
-        .expect_err("expired peer token accepted")
-        .code();
+        .expect_err("expired peer token accepted");
     assert_eq!(
-        status,
+        status.code(),
         Code::Unauthenticated,
         "expired token status: {status:?}"
     );
@@ -604,7 +661,7 @@ async fn grpc_activity_due_recovery_after_restart() {
     let mut c = Cluster::new(13, 2).await;
     c.nodes[1].activity_faults.mode.store(5, Ordering::SeqCst);
     c.schedule(false).await;
-    let missed = c.nodes[0].activity_receipt().await;
+    let missed = c.receipt(0).await;
     assert_eq!(
         missed.outcome,
         Err(ActivityOfferError::Unimplemented),
@@ -649,7 +706,7 @@ async fn loss(mode: u8) {
         .store(mode, Ordering::SeqCst);
     c.schedule(false).await;
     for attempt in 1..=3 {
-        let receipt = c.nodes[0].activity_receipt().await;
+        let receipt = c.receipt(0).await;
         assert_eq!(
             receipt.outcome,
             Err(ActivityOfferError::Transport),
@@ -733,7 +790,7 @@ async fn refusal(kind: u8) {
     let mut c = Cluster::new(30 + u32::from(kind), 3).await;
     c.nodes[1].activity_faults.mode.store(5, Ordering::SeqCst);
     c.schedule(false).await;
-    let receipt = c.nodes[0].activity_receipt().await;
+    let receipt = c.receipt(0).await;
     assert_eq!(
         receipt.outcome,
         Err(ActivityOfferError::Unimplemented),
@@ -789,10 +846,10 @@ async fn refusal(kind: u8) {
         .await
         .offer_activity_task(rpc)
         .await
-        .expect_err("refused offer was accepted")
-        .code();
+        .expect_err("refused offer was accepted");
     assert_eq!(
-        status, expected,
+        status.code(),
+        expected,
         "credential/old-peer case={kind}, status={status:?}"
     );
     let retained = c.nodes[1]
@@ -864,7 +921,7 @@ async fn grpc_activity_handler_capacity_is_shared_with_workflows() {
         )
     });
     c.schedule(false).await;
-    let receipt = c.nodes[0].activity_receipt().await;
+    let receipt = c.receipt(0).await;
     assert_eq!(
         receipt.outcome,
         Err(ActivityOfferError::Capacity),
@@ -874,10 +931,9 @@ async fn grpc_activity_handler_capacity_is_shared_with_workflows() {
         .await
         .offer_activity_task(authorized(&c.nodes[0], offer_wire(&receipt)))
         .await
-        .expect_err("saturated activity push admitted")
-        .code();
+        .expect_err("saturated activity push admitted");
     assert_eq!(
-        status,
+        status.code(),
         Code::ResourceExhausted,
         "shared handler status={status:?}, held={}",
         c.nodes[1].faults.held.load(Ordering::SeqCst)
@@ -920,7 +976,7 @@ async fn wait_retired<R: RunRepository + 'static>(node: &Node<R>, queue: &QueueK
 }
 
 async fn queue_movement(index: u32, duplicates: usize) {
-    let mut c = Cluster::new(index, 3).await;
+    let mut c = Cluster::without_activity_scanner(index, 3).await;
     queue_movement_oracle(&mut c, duplicates).await;
     c.stop().await;
 }
@@ -931,6 +987,32 @@ async fn queue_movement_oracle<R: RunRepository + LeaseRepository + 'static>(
 ) {
     c.schedule(false).await;
     let initial = c.admitted(0).await;
+    let frozen = FrozenTime::new();
+    let old_repo = c.nodes[1].repo.clone();
+    let renewals = old_repo.pause_renewals().await;
+    let home = queue_home(&c.queue);
+    c.store
+        .relinquish_bundle(home, "activity-node-1".into(), c.epochs[1])
+        .await
+        .expect("release old queue lease");
+    let next = c.nodes[2]
+        .runtime
+        .acquire_shard(home)
+        .await
+        .expect("acquire replacement queue");
+    assert!(
+        next.0 > c.epochs[1].0,
+        "queue epochs: old={:?}, new={next:?}",
+        c.epochs[1]
+    );
+    assert!(
+        c.nodes[1].runtime.active_shards().contains(&home),
+        "old acquisition did not overlap: {:?}",
+        c.nodes[1].runtime.active_shards()
+    );
+    c.controller.point_to(home, 2, next, c.nodes[2].address);
+    // Lease I/O is complete before the sender starts its bounded attempt. Only
+    // local retirement and barrier release remain once the request is held.
     c.nodes[1].activity_faults.mode.store(3, Ordering::SeqCst);
     let now = c.clock.now();
     c.nodes[0]
@@ -966,32 +1048,13 @@ async fn queue_movement_oracle<R: RunRepository + LeaseRepository + 'static>(
     tokio::time::timeout(BOUND, c.nodes[1].activity_faults.reached.notified())
         .await
         .expect("push did not reach old queue transport");
-    let home = queue_home(&c.queue);
-    c.store
-        .relinquish_bundle(home, "activity-node-1".into(), c.epochs[1])
-        .await
-        .expect("release old queue lease");
-    let next = c.nodes[2]
-        .runtime
-        .acquire_shard(home)
-        .await
-        .expect("acquire replacement queue");
-    assert!(
-        next.0 > c.epochs[1].0,
-        "queue epochs: old={:?}, new={next:?}",
-        c.epochs[1]
-    );
-    assert!(
-        c.nodes[1].runtime.active_shards().contains(&home),
-        "old acquisition did not overlap: {:?}",
-        c.nodes[1].runtime.active_shards()
-    );
     c.nodes[1].runtime.relinquish_shard(home).await;
     wait_retired(&c.nodes[1], &c.queue).await;
-    c.controller.point_to(home, 2, next, c.nodes[2].address);
     c.nodes[1].activity_faults.mode.store(0, Ordering::SeqCst);
     c.nodes[1].activity_faults.release.notify_one();
-    let refused = c.nodes[0].activity_receipt().await;
+    drop(renewals);
+    drop(frozen);
+    let refused = c.receipt(0).await;
     assert_eq!(
         refused.outcome,
         Ok(ActivityOfferOutcome::NotHome),
@@ -1081,6 +1144,9 @@ async fn execution_movement_oracle<R: RunRepository + LeaseRepository + 'static>
         wire::ActivityOfferOutcome::Admitted as i32,
         "old execution home admission: {admitted:?}"
     );
+    let frozen = FrozenTime::new();
+    let old_repo = c.nodes[0].repo.clone();
+    let renewals = old_repo.pause_renewals().await;
     let mut held = None;
     if during {
         let (entered, resume) = c.nodes[0].repo.pause_commit(c.request.run_key);
@@ -1112,10 +1178,18 @@ async fn execution_movement_oracle<R: RunRepository + LeaseRepository + 'static>
         "old execution acquisition did not overlap: {:?}",
         c.nodes[0].runtime.active_shards()
     );
+    if !during {
+        let (entered, resume) = c.nodes[0].repo.pause_commit(c.request.run_key);
+        let address = c.nodes[1].address;
+        let queue = c.queue.clone();
+        let pending = tokio::spawn(async move { poll(address, &queue).await });
+        entered
+            .await
+            .expect("stale owner reached commit after takeover");
+        held = Some((pending, resume));
+    }
     c.epochs[0] = next;
     c.routes(2, 1);
-    c.nodes[0].runtime.relinquish_shard(home).await;
-    wait_retired(&c.nodes[0], &local_queue).await;
     let retained = c.nodes[1]
         .runtime
         .activity_broker()
@@ -1157,7 +1231,7 @@ async fn execution_movement_oracle<R: RunRepository + LeaseRepository + 'static>
         token.shard_epoch, next,
         "start token epoch: {token:?}, expected={next:?}"
     );
-    if during {
+    {
         let old = c.nodes[0].starts.lock().unwrap().clone();
         let new = c.nodes[2].starts.lock().unwrap().clone();
         assert_eq!(
@@ -1165,6 +1239,12 @@ async fn execution_movement_oracle<R: RunRepository + LeaseRepository + 'static>
             "takeover retry identity: old={old:?}, new={new:?}"
         );
     }
+    let fenced = c.nodes[0].repo.fenced_starts.load(Ordering::SeqCst);
+    assert_eq!(fenced, 1, "stale store-fenced starts: {fenced:?}");
+    c.nodes[0].runtime.relinquish_shard(home).await;
+    wait_retired(&c.nodes[0], &local_queue).await;
+    drop(renewals);
+    drop(frozen);
     c.committed_starts(1);
     c.discovery_paused();
 }
@@ -1348,12 +1428,13 @@ async fn grpc_activity_reads_cold_conflict() {
 // Feature: activity-queue-home-delivery, Property 3: cancellation and a late deadline preserve replacement and colocated homes without discovery.
 #[tokio::test]
 async fn grpc_activity_retirement_isolated_from_replacement_and_other_home() {
-    let mut c = Cluster::new(51, 3).await;
+    let mut c = Cluster::without_activity_scanner(51, 3).await;
     retirement_oracle(&mut c).await;
     c.stop().await;
 }
 
 async fn retirement_oracle<R: RunRepository + LeaseRepository + 'static>(c: &mut Cluster<R>) {
+    let frozen = FrozenTime::new();
     let home = queue_home(&c.queue);
     let other = (0..1000)
         .map(|index| QueueKey {
@@ -1431,10 +1512,8 @@ async fn retirement_oracle<R: RunRepository + LeaseRepository + 'static>(c: &mut
     );
     // Advance only after the socket work completes; no elapsed real-time sleep
     // or discovery tick is needed to cross the cancelled acquisition's deadline.
-    tokio::time::pause();
     c.clock.advance(4);
     tokio::time::advance(Duration::from_secs(4)).await;
-    tokio::time::resume();
     let replacement_retained = c.nodes[1]
         .runtime
         .activity_broker()
@@ -1462,6 +1541,7 @@ async fn retirement_oracle<R: RunRepository + LeaseRepository + 'static>(c: &mut
     );
     c.assert_started(0, &poll(c.nodes[1].address, &c.queue).await)
         .await;
+    drop(frozen);
     c.committed_starts(1);
     c.discovery_paused();
 }

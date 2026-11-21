@@ -1,20 +1,29 @@
-//! Generated DSQL schedules use the real authenticated transport and shared oracles.
-//! Each case retires its runtimes, purges its run and releases only its own leases.
+//! Shared authenticated schedule oracles for in-memory and live DSQL repositories.
+//! Each live case retires its runtimes, purges its run and releases only its own leases.
 
-use std::{cell::Cell, collections::BTreeSet, num::NonZeroU32};
+use std::num::NonZeroU32;
 
+#[cfg(feature = "dsql-integration")]
 use anyhow::{Context, Result};
+#[cfg(feature = "dsql-integration")]
 use proptest::test_runner::{Config, FileFailurePersistence, TestRunner};
+#[cfg(feature = "dsql-integration")]
+use std::cell::Cell;
+#[cfg(feature = "dsql-integration")]
 use tokeira_kernel::TerminateRequest;
+use tokeira_storage::{ActivityDiscoveryRange, ActivityDispatchRow};
+#[cfg(feature = "dsql-integration")]
 use tokeira_storage::{
-    ActivityDiscoveryRange, ActivityDispatchRow, LeaseOutcome,
+    LeaseOutcome,
     dsql::{DsqlPoolConfig, DsqlStore, MigrationConfig, ReservoirConfig},
 };
+#[cfg(feature = "dsql-integration")]
 use tokio::sync::Mutex;
 
 use super::*;
 
 #[derive(Clone, Copy, Debug)]
+#[cfg(feature = "dsql-integration")]
 pub(in crate::peer) enum Suite {
     Recovery,
     Retirement,
@@ -38,13 +47,14 @@ async fn rows<R: RunRepository + LeaseRepository + 'static>(
         )
         .await
         .expect("read canonical activity intent");
-    assert!(page.exhausted, "isolated fixture must fit one page");
+    assert!(page.exhausted, "isolated fixture page: {page:?}");
     page.candidates
         .into_iter()
         .map(|candidate| candidate.row.expect("canonical row"))
         .collect()
 }
 
+#[cfg(feature = "dsql-integration")]
 async fn cleanup<R: RunRepository + LeaseRepository + 'static>(c: Cluster<R>) {
     // A shrunk failure can stop at a transport barrier. Release only this
     // fixture's waiters before joining servers and relinquishing leases.
@@ -104,33 +114,36 @@ async fn cleanup<R: RunRepository + LeaseRepository + 'static>(c: Cluster<R>) {
             panic!("closed fixture")
         };
         let lease = leases.iter().find(|lease| lease.bundle_id == home).unwrap();
-        assert!(matches!(
-            c.store
-                .delete_run_for_bundle(
-                    c.request.run_key,
+        let deleted = c
+            .store
+            .delete_run_for_bundle(
+                c.request.run_key,
+                home,
+                tokeira_storage::DeleteRunRequest {
+                    expected_seq: closed.transition_seq,
+                    deleted_at: c.clock.now(),
+                },
+                tokeira_storage::WriteFence::Lease(tokeira_storage::ExecutionHomeFence {
                     home,
-                    tokeira_storage::DeleteRunRequest {
-                        expected_seq: closed.transition_seq,
-                        deleted_at: c.clock.now()
-                    },
-                    tokeira_storage::WriteFence::Lease(tokeira_storage::ExecutionHomeFence {
-                        home,
-                        owner: lease.owner_node_id.clone().unwrap(),
-                        epoch: lease.epoch
-                    }),
-                )
-                .await
-                .unwrap(),
-            tokeira_storage::DeleteRunResult::Deleted { .. }
-        ));
+                    owner: lease.owner_node_id.clone().unwrap(),
+                    epoch: lease.epoch,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(deleted, tokeira_storage::DeleteRunResult::Deleted { .. }),
+            "cleanup deletion: {deleted:?}"
+        );
         c.store
             .purge_run(c.request.run_key)
             .await
             .expect("purge fixture run");
-        assert!(matches!(
-            c.store.load_run(c.request.run_key).await.unwrap(),
-            LoadedRun::Absent
-        ));
+        let purged = c.store.load_run(c.request.run_key).await.unwrap();
+        assert!(
+            matches!(purged, LoadedRun::Absent),
+            "purged state: {purged:?}"
+        );
     }
     for node in &c.nodes {
         for home in node.runtime.active_shards() {
@@ -142,23 +155,25 @@ async fn cleanup<R: RunRepository + LeaseRepository + 'static>(c: Cluster<R>) {
         .filter(|lease| homes.contains(&lease.bundle_id))
     {
         if let Some(owner) = lease.owner_node_id {
-            assert!(matches!(
-                c.store
-                    .relinquish_bundle(lease.bundle_id, owner, lease.epoch)
-                    .await
-                    .expect("release fixture lease"),
-                LeaseOutcome::Acquired { .. }
-            ));
+            let released = c
+                .store
+                .relinquish_bundle(lease.bundle_id, owner, lease.epoch)
+                .await
+                .expect("release fixture lease");
+            assert!(
+                matches!(released, LeaseOutcome::Acquired { .. }),
+                "cleanup lease release: {released:?}"
+            );
         }
     }
+    let remaining = c.store.list_bundle_leases().await.unwrap();
+    let owned: Vec<_> = remaining
+        .iter()
+        .filter(|lease| homes.contains(&lease.bundle_id))
+        .collect();
     assert!(
-        c.store
-            .list_bundle_leases()
-            .await
-            .unwrap()
-            .iter()
-            .filter(|lease| homes.contains(&lease.bundle_id))
-            .all(|lease| lease.owner_node_id.is_none())
+        owned.iter().all(|lease| lease.owner_node_id.is_none()),
+        "cleanup leases: {owned:?}"
     );
     c.stop().await;
 }
@@ -252,56 +267,77 @@ async fn recovery<R: RunRepository + LeaseRepository + 'static>(
         Some(c.admitted(0).await)
     } else {
         for _ in 0..if fault == 5 { 1 } else { 3 } {
-            let receipt = c.nodes[0].activity_receipt().await;
+            let receipt = c.receipt(0).await;
             assert_eq!(
                 receipt.outcome,
                 Err(if fault == 5 {
                     ActivityOfferError::Unimplemented
                 } else {
                     ActivityOfferError::Transport
-                })
+                }),
+                "faulted delivery receipt: {receipt:?}"
             );
         }
         None
     };
     let before = rows(c).await;
-    assert_eq!(before.len(), 1);
-    assert_eq!(before[0].incarnation.run_key, c.request.run_key);
+    assert_eq!(before.len(), 1, "canonical rows: {before:?}");
+    assert_eq!(
+        before[0].incarnation.run_key, c.request.run_key,
+        "canonical rows: {before:?}"
+    );
     let state = c.state().await;
-    assert!(state.activities["activity"].started_at.is_none());
+    assert!(
+        state.activities["activity"].started_at.is_none(),
+        "durable state: {state:?}"
+    );
     c.discovery_paused();
     if let Some(receipt) = receipt {
         for _ in 0..duplicates {
+            let response = client(&c.nodes[1])
+                .await
+                .offer_activity_task(authorized(&c.nodes[0], offer_wire(&receipt)))
+                .await
+                .expect("duplicate offer response")
+                .into_inner();
             assert_eq!(
-                client(&c.nodes[1])
-                    .await
-                    .offer_activity_task(authorized(&c.nodes[0], offer_wire(&receipt)))
-                    .await
-                    .unwrap()
-                    .get_ref()
-                    .outcome,
-                wire::ActivityOfferOutcome::Known as i32
+                response.outcome,
+                wire::ActivityOfferOutcome::Known as i32,
+                "duplicate response: {response:?}; receipt: {receipt:?}"
             );
         }
-        assert_eq!(rows(c).await, before);
+        let observed = rows(c).await;
+        assert_eq!(
+            observed, before,
+            "canonical rows: {observed:?}; before: {before:?}"
+        );
     } else {
         c.nodes[1]
             .runtime
             .activity_broker()
             .remove_run(c.request.run_key)
             .await;
-        assert_eq!(rows(c).await, before);
+        let observed = rows(c).await;
+        assert_eq!(
+            observed, before,
+            "canonical rows: {observed:?}; before: {before:?}"
+        );
         c.nodes[1].activity_faults.mode.store(0, Ordering::SeqCst);
         c.nodes[1].repo.activity.release();
     }
     c.assert_started(0, &poll(c.nodes[1].address, &c.queue).await)
         .await;
     c.committed_starts(1 + usize::from(path == 1));
-    assert!(rows(c).await.is_empty());
+    let remaining = rows(c).await;
+    assert!(
+        remaining.is_empty(),
+        "remaining canonical rows: {remaining:?}"
+    );
     if fault == 0 {
         c.discovery_paused();
     } else {
-        assert!(c.nodes[1].repo.activity.reads.load(Ordering::SeqCst) > 0);
+        let reads = Reads::at(c);
+        assert!(reads.discovery[1] > 0, "discovery counts: {reads:?}");
     }
 }
 
@@ -381,13 +417,14 @@ async fn competing<R: RunRepository + LeaseRepository + 'static>(
         _ => obsolete_request.stamp += 1,
     }
     let mut rpc = client(&c.nodes[0]).await;
+    let obsolete_response = rpc
+        .start_activity_task(start_request(&c.nodes[1], obsolete_request))
+        .await
+        .unwrap()
+        .into_inner();
     assert!(
-        rpc.start_activity_task(start_request(&c.nodes[1], obsolete_request))
-            .await
-            .unwrap()
-            .get_ref()
-            .task
-            .is_none()
+        obsolete_response.task.is_none(),
+        "obsolete response: {obsolete_response:?}"
     );
     let before = c.state().await;
     let reads = Reads::at(c);
@@ -407,24 +444,43 @@ async fn competing<R: RunRepository + LeaseRepository + 'static>(
         .await
         .unwrap()
         .into_inner();
-    assert!(winner.task.is_some());
+    assert!(winner.task.is_some(), "winning response: {winner:?}");
+    assert!(!winner.replayed, "winning response: {winner:?}");
     resume.send(()).unwrap();
-    assert!(held.await.unwrap().unwrap().get_ref().task.is_none());
+    let loser = held.await.unwrap().unwrap().into_inner();
+    assert!(loser.task.is_none(), "losing response: {loser:?}");
     let start = Reads::at(c).since(&reads);
-    assert_eq!(start.starts, vec![3 + usize::from(conflict), 0, 0]);
-    assert_eq!(start.observations, vec![0, 0, 0]);
+    assert_eq!(
+        start.starts,
+        vec![3 + usize::from(conflict), 0, 0],
+        "start reads: {start:?}"
+    );
+    assert_eq!(start.observations, vec![0, 0, 0], "start reads: {start:?}");
     assert_eq!(
         c.nodes[0].repo.rejected.load(Ordering::SeqCst),
-        usize::from(conflict)
+        usize::from(conflict),
+        "rejected starts: {:?}",
+        c.nodes[0].repo.rejected.load(Ordering::SeqCst)
     );
     let after = c.state().await;
-    assert_eq!(after.transition_seq.0, before.transition_seq.0 + 1);
-    assert_eq!(after.activity_start_receipts.len(), 1);
+    assert_eq!(
+        after.transition_seq.0,
+        before.transition_seq.0 + 1,
+        "before={before:?}; after={after:?}"
+    );
+    assert_eq!(
+        after.activity_start_receipts.len(),
+        1,
+        "receipts: {:?}",
+        after.activity_start_receipts
+    );
     assert_eq!(
         after.activity_start_receipts["activity"]
             .request_id
             .as_bytes(),
-        winning.request_id.as_slice()
+        winning.request_id.as_slice(),
+        "committed receipts: {:?}; winner: {winning:?}",
+        after.activity_start_receipts
     );
     // Request identity governs repeated success and competing refusal:
     // service/history/api/recordactivitytaskstarted/api.go @ v1.31.0.
@@ -435,25 +491,50 @@ async fn competing<R: RunRepository + LeaseRepository + 'static>(
             .await
             .unwrap()
             .into_inner();
-        assert!(replay.replayed);
-        assert_eq!(replay.task, winner.task);
+        assert!(replay.replayed, "replay response: {replay:?}");
+        let mut expected = winner.clone();
+        expected.replayed = true;
+        let task = expected.task.as_mut().expect("winning task");
+        // The same-request branch omits execution metadata and retry/heartbeat
+        // details: service/history/api/recordactivitytaskstarted/api.go @ v1.31.0.
+        // Compare the complete response after changing only those four fields,
+        // retaining token, identity, attempt, times, origin and all other fields.
+        task.workflow_namespace.clear();
+        task.workflow_type = None;
+        task.retry_policy = None;
+        task.heartbeat_details = None;
+        assert_eq!(replay, expected, "replay={replay:?}; winner={winner:?}");
         let replay_reads = Reads::at(c).since(&reads);
-        assert_eq!(replay_reads.starts, vec![1, 0, 0]);
-        assert_eq!(replay_reads.observations, vec![1, 0, 0]);
+        assert_eq!(
+            replay_reads.starts,
+            vec![1, 0, 0],
+            "replay reads: {replay_reads:?}"
+        );
+        assert_eq!(
+            replay_reads.observations,
+            vec![1, 0, 0],
+            "replay reads: {replay_reads:?}"
+        );
     }
-    assert_eq!(c.state().await.transition_seq, after.transition_seq);
+    let replayed_state = c.state().await;
+    assert_eq!(
+        replayed_state.transition_seq, after.transition_seq,
+        "state after replay: {replayed_state:?}"
+    );
+    let losing_replay = rpc
+        .start_activity_task(start_request(&c.nodes[1], first))
+        .await
+        .unwrap()
+        .into_inner();
     assert!(
-        rpc.start_activity_task(start_request(&c.nodes[1], first))
-            .await
-            .unwrap()
-            .get_ref()
-            .task
-            .is_none()
+        losing_replay.task.is_none(),
+        "losing replay response: {losing_replay:?}"
     );
     c.committed_starts(1);
     c.discovery_paused();
 }
 
+#[cfg(feature = "dsql-integration")]
 pub(in crate::peer) fn run(suite: Suite) -> Result<()> {
     let url = std::env::var("TOKEIRA_DSQL_TEST_DATABASE_URL")
         .context("live activity schedules require an explicitly selected isolated DSQL database")?;
@@ -517,6 +598,7 @@ pub(in crate::peer) fn run(suite: Suite) -> Result<()> {
                         TestClock::at(time::OffsetDateTime::now_utc()),
                         index,
                         3,
+                        !matches!(suite, Suite::Retirement),
                     )
                     .await,
                 ));
@@ -554,6 +636,34 @@ pub(in crate::peer) fn run(suite: Suite) -> Result<()> {
     );
     runtime.block_on(director.shutdown())?;
     result.map_err(|error| anyhow::anyhow!("{error}"))?;
-    assert!(completed.get() >= 100);
+    assert!(
+        completed.get() >= 100,
+        "completed cases: {:?}",
+        completed.get()
+    );
     Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 100, failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::Direct(concat!(env!("CARGO_MANIFEST_DIR"), "/src/peer/activity_delivery_tests/live.proptest-regressions")))), ..ProptestConfig::default() })]
+
+    // Publication and eligibility share one admitted incarnation through finite faults.
+    #[test]
+    fn grpc_activity_recovery_schedules(index in 100u32..10000, fault in 0usize..4, path in 0u8..4, duplicates in 1usize..5) {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let mut c = Cluster::new(index, 3).await;
+            recovery(&mut c, [0, 1, 2, 5][fault], path, duplicates).await;
+            c.stop().await;
+        });
+    }
+
+    // Exactly one start commits; only its request identity can replay the receipt.
+    #[test]
+    fn grpc_activity_competing_schedules(index in 100u32..10000, warm in any::<bool>(), conflict in any::<bool>(), obsolete in 0u8..3, duplicates in 1usize..5) {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let mut c = Cluster::new(index, 3).await;
+            competing(&mut c, warm, conflict, obsolete, duplicates).await;
+            c.stop().await;
+        });
+    }
 }

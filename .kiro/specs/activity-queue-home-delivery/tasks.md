@@ -115,19 +115,35 @@ exploration cases. [bugfix.md](bugfix.md) and [design.md](design.md) define the 
       configuration, operator steps and workflow-task delivery are unchanged; the only proto addition is the internal
       `OfferActivityTask` RPC.
 
-- [ ] 3. Exercise real multi-node internal RPCs
-  - [ ] 3.1 Use at least two runtimes with separate execution/queue homes, real internal gRPC and the protected
+- [x] 3. Exercise real multi-node internal RPCs
+  - [x] 3.1 Use at least two runtimes with separate execution/queue homes, real internal gRPC and the protected
     credential file emitted by the existing daemon generator. Start without an external identity provider and
     continue across token renewal. Prove prompt first/retry/control/recovery delivery with discovery paused.
     Verify successful ACK while execution start is blocked, then complete the ordinary authenticated start.
     - _Requirements: 1.1, 1.2, 1.3, 1.5, 2.3, 2.6, 2.8_
-  - [ ] 3.2 Add a third runtime for queue/owner movement and old/new acquisition overlap. Independently drop push,
+    - DONE — Two runtimes over real internal gRPC, using the generated credential file and no external identity
+      provider, push and start a first attempt, a retry, an unpaused activity and due work recovered after a restart,
+      all with discovery paused. Pushes and starts continue after the token lifetime passes, an expired token is
+      refused and the credential file is unchanged. The queue home acknowledges a push while the owner's start is
+      held, and the start then completes once.
+  - [x] 3.2 Add a third runtime for queue/owner movement and old/new acquisition overlap. Independently drop push,
     ACK and start reply; exercise old-peer `UNIMPLEMENTED`, wrong-purpose/public credentials, saturation and prompt
     retirement. Resume discovery for recovery; retain stable start request identity on ambiguous starts. Repeat
     the warm/cold read matrix across actual transport, separating all background and publication reads.
     - _Requirements: 1.4, 1.6, 1.7, 1.8, 1.10, 2.2, 2.3, 2.4_
-  - [ ] 3.3 Checkpoint: real transport outcomes match property oracles and all affected focused suites pass.
+    - DONE — With a third runtime and overlapping acquisitions, a queue-home move retires the old home's offers and
+      reaches the new home after one trusted refresh, and an execution-home move keeps starts fenced with a stable
+      retry identity; each commits one start, at 100 generated cases each. A lost push or ACK is recovered once
+      discovery resumes, and a lost start reply is retried with the same request identity and replayed. An old peer
+      answers `UNIMPLEMENTED`, wrong-purpose credentials `PERMISSION_DENIED` and public credentials `UNAUTHENTICATED`;
+      with the 64 handler permits held by workflow pushes, an activity push gets `RESOURCE_EXHAUSTED`. None of them
+      admits anything, and discovery recovers each. Retirement is prompt and leaves a replacement and other homes
+      alone. Over real transport, warm or cold, the start reads no run at the queue home and reads it once at the
+      owner, or twice with a conflict; publication and background reads are counted separately.
+  - [x] 3.3 Checkpoint: real transport outcomes match property oracles and all affected focused suites pass.
     - _Requirements: 1.1, 1.3, 1.8, 2.3, 2.7_
+    - DONE — The transport outcomes match the properties' oracles, and the runtime, edge, engine and proto suites
+      pass, including the workflow push's transport tests, unchanged.
 
 - [ ] 4. Execute live DSQL verification
   - [ ] 4.1 Follow [live-suite isolation/ordering](../../../docs/testing/dsql-live-suites.md) and

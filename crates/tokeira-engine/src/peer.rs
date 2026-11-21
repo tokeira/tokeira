@@ -314,4 +314,8 @@ mod tests {
 }
 
 #[cfg(test)]
+mod activity_delivery_tests;
+#[cfg(test)]
+mod delivery_harness;
+#[cfg(test)]
 mod delivery_tests;

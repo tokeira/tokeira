@@ -243,6 +243,7 @@ async fn attempt(
 mod tests {
     use super::*;
     use crate::{discovery::PlacementQueueHomes, shard::ShardOwner};
+    use metrics_util::debugging::DebuggingRecorder;
     use proptest::prelude::*;
     use std::sync::RwLock;
     use tokeira_types::{NamespaceId, QueueKey, RunKey, ShardEpoch, TaskKind, TaskQueueName};
@@ -370,10 +371,11 @@ mod tests {
         }
         // Feature: activity-queue-home-delivery, Property 4: trusted refresh is used once; terminal outcomes never retry and no retry extends its budget.
         #[test]
-        fn activity_sender_retry_budget(kind in 0u8..7, lost in 0usize..3) {
-            tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap().block_on(async {
+        fn activity_sender_retry_budget(kind in 0u8..13, lost in 0usize..3) {
+            let recorder = DebuggingRecorder::new();
+            metrics::with_local_recorder(&recorder, || tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap().block_on(async {
                 let sender = ActivityOfferSender::default(); let acquisition = acquisition();
-                let terminal = match kind { 0 => Ok(ActivityOfferOutcome::Admitted), 1 => Ok(ActivityOfferOutcome::Known), 2 => Ok(ActivityOfferOutcome::Full), 3 => Ok(ActivityOfferOutcome::Expired), 4 => Ok(ActivityOfferOutcome::NotDue), 5 => Err(ActivityOfferError::Unimplemented), _ => Ok(ActivityOfferOutcome::NotHome) };
+                let terminal = match kind { 0 => Ok(ActivityOfferOutcome::Admitted), 1 => Ok(ActivityOfferOutcome::Known), 2 => Ok(ActivityOfferOutcome::Full), 3 => Ok(ActivityOfferOutcome::Expired), 4 => Ok(ActivityOfferOutcome::NotDue), 5 => Err(ActivityOfferError::Unimplemented), 6 => Ok(ActivityOfferOutcome::NotHome), 7 => Err(ActivityOfferError::Routing), 8 => Err(ActivityOfferError::Deadline), 9 => Err(ActivityOfferError::Authentication), 10 => Err(ActivityOfferError::Capacity), 11 => Err(ActivityOfferError::Invalid), _ => Err(ActivityOfferError::Transport) };
                 let script = Arc::new(Script { replies: Mutex::new(std::iter::repeat_n(Err(ActivityOfferError::Transport), lost).chain([terminal, terminal, terminal]).collect()), refreshes: Mutex::default() });
                 let homes = Arc::new(PlacementQueueHomes { owner: Arc::new(RwLock::new(ShardOwner::new(8))), counts: RwLock::new((8, 8)) });
                 let delivery = ActivityDelivery::new(crate::broker::InMemoryActivityBroker::with_discovery(homes.clone()), homes, crate::RuntimeShutdownHandle::new(), Arc::new(crate::test_clock::TestClock::new()));
@@ -388,9 +390,19 @@ mod tests {
                 }
                 let refreshes = script.refreshes.lock().unwrap();
                 prop_assert!(refreshes.len() <= 3); prop_assert!(refreshes.iter().filter(|v| **v).count() <= 1);
-                prop_assert_eq!(refreshes.len(), (lost + if kind == 6 { 2 } else { 1 }).min(3));
+                prop_assert_eq!(refreshes.len(), (lost + if matches!(kind, 7 | 8 | 12) { 3 } else if kind == 6 { 2 } else { 1 }).min(3));
                 Ok(())
-            })?;
+            }))?;
+            let snapshot = recorder.snapshotter().snapshot().into_vec();
+            prop_assert!(snapshot.iter().any(|(key, _, _, _)| key.key().name() == crate::metrics::ACTIVITY_OFFER_DELIVERY_TOTAL));
+            for (key, _, _, _) in snapshot {
+                if key.key().name() == crate::metrics::ACTIVITY_OFFER_DELIVERY_TOTAL {
+                    let labels = key.key().labels().map(|label| (label.key(), label.value())).collect::<Vec<_>>();
+                    prop_assert_eq!(labels.len(), 2);
+                    prop_assert!(labels.contains(&("source", "publication")));
+                    prop_assert!(labels.iter().any(|(name, value)| *name == "outcome" && ["admitted", "known", "capacity", "expired", "not_due", "ownership", "transport", "routing", "deadline", "authentication", "invalid", "unimplemented"].contains(value)));
+                }
+            }
         }
     }
 }

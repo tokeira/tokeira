@@ -77,9 +77,14 @@ impl ActivityQueueOffer {
 
     /// Conservative retained-memory accounting, including owned strings and index copies.
     pub(crate) fn retained_bytes(&self) -> usize {
-        let queue = &self.task.queue;
+        Self::task_retained_bytes(&self.task)
+    }
+
+    /// Account legacy local publications without inventing an execution-home hint.
+    pub(crate) fn task_retained_bytes(task: &DispatchableActivityTask) -> usize {
+        let queue = &task.queue;
         1024usize
-            .saturating_add(self.task.activity_id.len().saturating_mul(3))
+            .saturating_add(task.activity_id.len().saturating_mul(3))
             .saturating_add(queue.task_queue.0.len().saturating_mul(3))
             .saturating_add(
                 queue
@@ -96,8 +101,7 @@ impl ActivityQueueOffer {
                     .saturating_mul(3),
             )
             .saturating_add(
-                self.task
-                    .priority
+                task.priority
                     .as_ref()
                     .map_or(0, |p| p.fairness_key.len())
                     .saturating_mul(2),

@@ -1134,6 +1134,11 @@ where
                     .clone()
                     .run_retirement(registry.clone(), runtime_shutdown.cancellation_token()),
             );
+            let _activity_retirement_handle =
+                runtime_shutdown.spawn(activity_broker.clone().run_retirement(
+                    activity_discovery.clone(),
+                    runtime_shutdown.cancellation_token(),
+                ));
             let _discovery_handle = runtime_shutdown.spawn(crate::discovery::run_discovery(
                 crate::discovery::WorkflowSource {
                     repo: repo.clone(),
@@ -2125,7 +2130,8 @@ impl WorkflowActivation {
 #[derive(Clone, Debug)]
 pub struct ActivityTaskOffer {
     /// Volatile execution-home hint; start still validates authoritative ownership.
-    pub execution_home: ShardId,
+    /// Legacy local publications have no hint; `Some(ShardId(0))` is a real home.
+    pub execution_home: Option<ShardId>,
     /// Stable identity for every owner attempt made for this poll's match.
     pub request_id: Uuid,
     /// Broker offer whose durable premise must still be checked before start.

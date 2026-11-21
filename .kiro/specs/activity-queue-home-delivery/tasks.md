@@ -42,32 +42,48 @@ exploration cases. [bugfix.md](bugfix.md) and [design.md](design.md) define the 
     branches. Add activity byte accounting, acquisition watchers and locked validity checks, then remove only the
     queue-home routing load from ordinary starts. Preserve every owner gate and fresh conflict reload.
     - _Requirements: 1.1, 1.2, 1.4, 1.6, 1.7, 1.8, 1.9, 2.1, 2.3, 2.4, 2.5, 2.7_
-    - Publication part done — publication, retries (including any already due at registration), recovery after
-      activation and a staged reset after its barrier deliver through the shared entry, and timeout tracking is
-      unchanged. Options updates no longer publish directly. Watchers, locked checks and the start read remain.
-  - [ ] 2.3 Required PBT — **Property 1: Prompt delivery with durable recovery**, at least 100 generated cases.
+    - Publication and retirement parts done — publication, retries (including any already due at registration),
+      recovery after activation and a staged reset after its barrier deliver through the shared entry, and timeout
+      tracking is unchanged. Options updates no longer publish directly. Activity byte accounting, acquisition
+      watchers and locked validity and serving-generation checks are in place. The start read remains.
+  - [x] 2.3 Required PBT — **Property 1: Prompt delivery with durable recovery**, at least 100 generated cases.
     Vary every inventory path, due-at-registration versus future time, finite message/ack loss, unavailable homes,
     restart and saturation. Assert push with discovery paused; separately assert recovery with discovery driven.
     Check unchanged canonical rows on all offer-only outcomes and completed-obligation suppression on unrelated
     transitions. Place in runtime delivery/eligibility tests.
     - _Requirements: 1.1, 1.2, 2.1, 2.2_
-  - [ ] 2.4 Required PBT — **Property 2: Bounded common admission and ordering**, at least 100 generated cases.
+    - DONE — Each inventory path pushes with discovery paused, and its disconnected control still shows no delivery.
+      Generated fault prefixes cover loss before and after admission, refusal, `UNIMPLEMENTED`, `NotHome` and
+      restart, and recovery runs with discovery driven. Canonical rows are unchanged after every admission outcome
+      and sender error, and a signal does not rearm a completed obligation.
+  - [x] 2.4 Required PBT — **Property 2: Bounded common admission and ordering**, at least 100 generated cases.
     Race local/push/discovery, expiry and delayed callbacks; exhaust each count/byte limit. Compare selections with
     existing local broker ordering under generated priority/fairness/rate configuration and versioned queues.
     Cover options routing changes, unchanged duplicate deadlines and rediscovery after expiry. Place near the
     activity broker/offer index; do not change priority comparison semantics.
     - _Requirements: 1.4, 1.5, 1.9, 2.1, 2.4_
-  - [ ] 2.5 Required PBT — **Property 3: Prompt isolated retirement**, at least 100 generated cases.
+    - DONE — Racing local, pushed and discovered arrivals admit one incarnation and select in the same order as an
+      independent unmanaged broker, under generated priority, fairness, rate and versioned queues. The per-queue,
+      per-home and byte bounds each fill and refuse, in-flight work included. Rerouting stays within them, and a
+      duplicate never renews a deadline.
+  - [x] 2.5 Required PBT — **Property 3: Prompt isolated retirement**, at least 100 generated cases.
     Cancel/expire/renew acquisitions while paused at admission, page-read, take and cleanup barriers. Verify ready,
     in-flight and reserved accounting is isolated from replacement generations and other homes without a tick.
     Include push-only homes with no poll registration and late token/reservation drops. Place in runtime.
     - _Requirements: 1.6, 1.7, 2.4_
-  - [ ] 2.6 Required PBT — **Property 4: Authorized nonblocking hints**, at least 100 generated cases.
+    - DONE — Cancellation, expiry and renewal at the admission, reserve, take, page-read and cleanup barriers retire
+      the ended acquisition's ready, in-flight and reserved accounting without a tick. Replacements, colocated homes
+      and push-only homes keep their own, and late tokens and reservations change nothing.
+  - [x] 2.6 Required PBT — **Property 4: Authorized nonblocking hints**, at least 100 generated cases.
     Generate bounded wire/metadata mutations, wrong-purpose identities, unknown enums, handler/sender saturation,
     placement changes and cancellation. Hold the publishing lane behind a barrier until ACK to expose any
     admission/start dependency. Exercise no-peer bootstrap without a file and finite diagnostics. Place in edge
     and runtime sender tests; fixed unit cases assert exact statuses and absent-method behavior.
     - _Requirements: 1.3, 1.5, 1.10, 2.1, 2.6, 2.8_
+    - DONE — Generated wire, metadata and identity mutations meet the existing push policy with exact statuses,
+      including handler saturation at 64. The sender keeps its entry, byte, concurrency and destination bounds, one
+      trusted refresh and three attempts. Owner movement, cancellation and the no-peer bootstrap are covered, the
+      publishing lane stays blocked until the acknowledgement, and diagnostics carry only bounded labels.
   - [ ] 2.7 Required PBT — **Property 5: One authoritative start with fewer reads**, at least 100 generated cases.
     Generate forged home/namespace/queue/version coordinates, obsolete schedules/attempts/stamps, concurrent
     controls, competing starts, lost committed replies, warm/cold caches and OCC conflicts. Assert one committed

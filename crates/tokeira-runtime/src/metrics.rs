@@ -24,6 +24,10 @@ pub const WORKFLOW_OFFER_RETIREMENTS_TOTAL: &str =
 /// Disposable activity hint delivery, labelled only by source and finite outcome.
 pub const ACTIVITY_OFFER_DELIVERY_TOTAL: &str = "tokeira_runtime_activity_offer_delivery_total";
 
+/// Activity acquisition cleanup, labelled only by cancellation, deadline or shutdown.
+pub const ACTIVITY_OFFER_RETIREMENTS_TOTAL: &str =
+    "tokeira_runtime_activity_offer_retirements_total";
+
 /// Activity hint capacity refusals, with a finite bound label.
 pub const ACTIVITY_OFFER_SATURATION_TOTAL: &str = "tokeira_runtime_activity_offer_saturation_total";
 
@@ -201,6 +205,9 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (WORKFLOW_OFFER_SENDER_SATURATION_TOTAL, MetricType::Counter),
     (WORKFLOW_OFFER_SATURATION_TOTAL, MetricType::Counter),
     (WORKFLOW_OFFER_RETIREMENTS_TOTAL, MetricType::Counter),
+    (ACTIVITY_OFFER_DELIVERY_TOTAL, MetricType::Counter),
+    (ACTIVITY_OFFER_SATURATION_TOTAL, MetricType::Counter),
+    (ACTIVITY_OFFER_RETIREMENTS_TOTAL, MetricType::Counter),
     (WORKFLOW_DISPATCH_READS_TOTAL, MetricType::Counter),
     (WORKFLOW_DISPATCH_SKIPS_TOTAL, MetricType::Counter),
     (WORKFLOW_DISPATCH_ADMISSIONS_TOTAL, MetricType::Counter),

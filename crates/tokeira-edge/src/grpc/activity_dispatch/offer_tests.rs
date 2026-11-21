@@ -186,3 +186,29 @@ proptest! {
         })?;
     }
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+    // Feature: activity-queue-home-delivery, Property 4: an authenticated duplicate cannot acknowledge a retired receiver; replacement admission uses its own acquisition.
+    #[test]
+    fn activity_offer_authorized_owner_movement(index in 0u128..10000, stamp in any::<u64>(), replacement in any::<bool>()) {
+        tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap().block_on(async {
+            let node = node(); let peer = peer();
+            let mut client = ActivityTaskDispatchClient::new(OfferResponseLimit::new(service(node.clone(), Some(peer.clone())).into_service()));
+            let valid = body(index, stamp, 0);
+            prop_assert_eq!(outcome(client.offer_activity_task(authorized(valid.clone(), &peer)).await.unwrap().get_ref()).unwrap(), ActivityOfferOutcome::Admitted);
+            let delayed = authorized(valid.clone(), &peer);
+            node.relinquish_shard(ShardId(0)).await;
+            prop_assert_eq!(outcome(client.offer_activity_task(delayed).await.unwrap().get_ref()).unwrap(), ActivityOfferOutcome::NotHome);
+            if replacement {
+                node.recover_self_assigned_shard(ShardId(0), tokeira_types::ShardEpoch::ZERO).await.unwrap();
+                prop_assert_eq!(outcome(client.offer_activity_task(authorized(valid.clone(), &peer)).await.unwrap().get_ref()).unwrap(), ActivityOfferOutcome::Admitted);
+                prop_assert_eq!(outcome(client.offer_activity_task(authorized(valid, &peer)).await.unwrap().get_ref()).unwrap(), ActivityOfferOutcome::Known);
+            }
+            let shutdown = node.shutdown_handle();
+            shutdown.begin_shutdown();
+            shutdown.wait(std::time::Instant::now() + std::time::Duration::from_secs(1)).await.unwrap();
+            Ok(())
+        })?;
+    }
+}

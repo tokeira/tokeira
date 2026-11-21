@@ -106,14 +106,43 @@ impl Drop for ActivityOfferReservation {
     }
 }
 
+#[derive(Debug)]
+struct ReservationCounter {
+    count: Arc<AtomicUsize>,
+    cancel: CancellationToken,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ActivityOffers {
     retained: HashMap<ActivityIncarnation, RetainedOffer>,
-    reserved: HashMap<(ShardId, u64), Arc<AtomicUsize>>,
+    reserved: HashMap<(ShardId, u64), ReservationCounter>,
     next_serial: u64,
 }
 
 impl ActivityOffers {
+    #[cfg(test)]
+    pub(crate) fn accounting(&self, home: &QueueHome) -> (usize, usize, usize) {
+        let entries = self
+            .retained
+            .values()
+            .filter(|entry| entry.home.id == home.id && entry.home.generation == home.generation);
+        let (mut ready, mut flight) = (0, 0);
+        for entry in entries {
+            if entry.in_flight {
+                flight += 1;
+            } else {
+                ready += 1;
+            }
+        }
+        (
+            ready,
+            flight,
+            self.reserved
+                .get(&(home.id, home.generation))
+                .map_or(0, |n| n.count.load(Ordering::Relaxed)),
+        )
+    }
+
     pub(crate) fn contains(&self, key: &ActivityIncarnation) -> bool {
         self.retained.contains_key(key)
     }
@@ -127,7 +156,7 @@ impl ActivityOffers {
                 + self
                     .reserved
                     .get(&(home.id, home.generation))
-                    .map_or(0, |count| count.load(Ordering::Relaxed)),
+                    .map_or(0, |counter| counter.count.load(Ordering::Relaxed)),
         )
     }
 
@@ -136,20 +165,27 @@ impl ActivityOffers {
         home: &QueueHome,
         requested: usize,
     ) -> ActivityOfferReservation {
-        let remaining = if home.cancel.is_cancelled() {
+        let remaining = if !home.valid() {
             0
         } else {
             requested.min(self.available(home))
         };
-        let counter = self
-            .reserved
-            .entry((home.id, home.generation))
-            .or_default()
-            .clone();
+        let (counter, cancel) = if remaining == 0 {
+            (Arc::default(), home.cancel.child_token())
+        } else {
+            let counter = self
+                .reserved
+                .entry((home.id, home.generation))
+                .or_insert_with(|| ReservationCounter {
+                    count: Arc::default(),
+                    cancel: home.cancel.child_token(),
+                });
+            (counter.count.clone(), counter.cancel.clone())
+        };
         counter.fetch_add(remaining, Ordering::Relaxed);
         ActivityOfferReservation {
             home: home.clone(),
-            cancel: home.cancel.clone(),
+            cancel,
             remaining,
             counter,
         }
@@ -179,7 +215,7 @@ impl ActivityOffers {
     ) -> (OfferAdmission, Option<ActivityOfferToken>) {
         // Ownership must precede duplicate acknowledgement: a cancelled
         // acquisition cannot acknowledge a hint it no longer serves.
-        if home.cancel.is_cancelled() {
+        if !home.valid() {
             return (OfferAdmission::NotHome, None);
         }
         if self.contains(&key) {
@@ -188,7 +224,7 @@ impl ActivityOffers {
         let reserved = reservation.as_ref().is_some_and(|r| {
             r.home.id == home.id
                 && r.home.generation == home.generation
-                && !r.home.cancel.is_cancelled()
+                && r.home.valid()
                 && !r.cancel.is_cancelled()
                 && r.remaining > 0
         });
@@ -306,7 +342,7 @@ impl ActivityOffers {
         let entry = self.retained.get_mut(key)?;
         if entry.token != token
             || entry.in_flight
-            || entry.home.cancel.is_cancelled()
+            || !entry.home.valid()
             || now >= entry.expires_at
             || entry.released.load(Ordering::Acquire)
         {
@@ -322,11 +358,22 @@ impl ActivityOffers {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn expire(&mut self, now: Instant) -> Vec<ActivityIncarnation> {
+        self.expire_if_serving(now, |_, _| true)
+    }
+
+    /// The broker supplies its live provider check while holding the queue lock.
+    pub(crate) fn expire_if_serving(
+        &mut self,
+        now: Instant,
+        serving: impl Fn(&QueueHome, &QueueKey) -> bool,
+    ) -> Vec<ActivityIncarnation> {
         let mut removed = Vec::new();
         self.retained.retain(|key, entry| {
             let keep = now < entry.expires_at
-                && !entry.home.cancel.is_cancelled()
+                && entry.home.valid()
+                && serving(&entry.home, &entry.queue)
                 && (entry.in_flight
                     || !entry
                         .source_cancel
@@ -341,7 +388,7 @@ impl ActivityOffers {
         // A still-live reservation owns a separate Arc even after this map entry
         // is discarded. Keep active counters until they are actually returned.
         self.reserved
-            .retain(|_, count| count.load(Ordering::Relaxed) != 0);
+            .retain(|_, counter| counter.count.load(Ordering::Relaxed) != 0);
         removed.sort();
         removed
     }
@@ -355,7 +402,7 @@ impl ActivityOffers {
         self.retained.retain(|key, entry| {
             let remove = entry.home.id == home.id
                 && entry.home.generation == home.generation
-                && (home.cancel.is_cancelled()
+                && (!home.valid()
                     || (!entry.in_flight
                         && entry.queue.namespace_id == queue.namespace_id
                         && entry.queue.task_queue == queue.task_queue));
@@ -364,6 +411,23 @@ impl ActivityOffers {
             }
             !remove
         });
+        removed.sort();
+        removed
+    }
+
+    /// Detach acquisition counters; late guards still own only the old cells.
+    pub(crate) fn retire_home(&mut self, home: &QueueHome) -> Vec<ActivityIncarnation> {
+        let mut removed = Vec::new();
+        self.retained.retain(|key, entry| {
+            let remove = entry.home.id == home.id && entry.home.generation == home.generation;
+            if remove {
+                removed.push(key.clone());
+            }
+            !remove
+        });
+        if let Some(counter) = self.reserved.remove(&(home.id, home.generation)) {
+            counter.cancel.cancel();
+        }
         removed.sort();
         removed
     }

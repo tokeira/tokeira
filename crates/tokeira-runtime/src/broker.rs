@@ -144,13 +144,15 @@ impl std::fmt::Debug for InMemoryBroker {
 /// In-memory activity-task broker.
 ///
 /// Mirrors [`InMemoryBroker`] but for activity tasks.
-/// Deduplication includes the complete activity incarnation; takes retain capacity until release or expiry.
+/// Deduplication includes the complete activity incarnation. Queue-home instances
+/// count matched offers until release or expiry; unmanaged fixtures keep only ready tasks.
 #[derive(Clone)]
 pub struct InMemoryActivityBroker {
     inner: Arc<Mutex<ActivityBrokerState>>,
     policy: Arc<BrokerPolicy>,
     queue_homes: Option<Arc<dyn QueueHomeProvider>>,
     capacity_changed: Arc<Notify>,
+    retirement_changed: Arc<Notify>,
 }
 
 // Manual impl: summarizes without taking the interior lock — a `Debug` that
@@ -213,6 +215,7 @@ pub(crate) fn merge_priority_stats(
 }
 
 struct ActivityBrokerState {
+    acquisitions: BTreeMap<(ShardId, u64), QueueHome>,
     offers: ActivityOffers,
     ready: HashMap<QueueKey, OrderedReady<TimestampedActivityTask>>,
     enqueued: HashSet<tokeira_storage::ActivityIncarnation>,
@@ -253,6 +256,7 @@ impl Drop for ActivityWaiter {
 impl Default for ActivityBrokerState {
     fn default() -> Self {
         Self {
+            acquisitions: BTreeMap::new(),
             offers: ActivityOffers::default(),
             ready: HashMap::new(),
             enqueued: HashSet::new(),
@@ -457,6 +461,7 @@ impl Default for InMemoryActivityBroker {
             policy: Arc::new(BrokerPolicy::default()),
             queue_homes: None,
             capacity_changed: Arc::new(Notify::new()),
+            retirement_changed: Arc::new(Notify::new()),
         }
     }
 }
@@ -709,10 +714,18 @@ pub(crate) struct TimestampedWorkflowTask {
 
 #[derive(Clone, Debug)]
 pub(crate) struct TimestampedActivityTask {
-    execution_home: ShardId,
+    execution_home: Option<ShardId>,
     pub(crate) task: DispatchableActivityTask,
     pub(crate) entered_at: Instant,
     token: Option<ActivityOfferToken>,
+}
+
+/// Legacy local publications lack a routing hint; zero remains a valid home.
+struct ActivityAdmissionHint {
+    execution_home: Option<ShardId>,
+    dispatch_at: OffsetDateTime,
+    expires_at: OffsetDateTime,
+    bytes: usize,
 }
 
 enum ActivityTakeOutcome {
@@ -2507,11 +2520,123 @@ impl InMemoryBroker {
 }
 
 impl InMemoryActivityBroker {
+    /// Admission, take and cleanup share this lock; removing old tokens cannot
+    /// erase a replacement admitted after the acquisition ended. A handed-off
+    /// start retains its receipt identity and remains authoritative at the owner
+    /// (service/history/api/recordactivitytaskstarted/api.go @ v1.31.0).
+    pub(crate) async fn retire_acquisition(
+        &self,
+        registry: &crate::activity_discovery::ActivityDiscoveryRegistry,
+        home: &QueueHome,
+        reason: &'static str,
+    ) {
+        let mut inner = self.inner.lock().await;
+        // A deadline result can wait behind admission while renewal extends the
+        // shared deadline. Keep that acquisition and let the watcher loop rearm;
+        // cancellation is irreversible and shutdown still retires every scope.
+        if reason == "deadline" && home.valid() {
+            return;
+        }
+        let registered = registry.retire_acquisition(home);
+        let removed = inner.offers.retire_home(home);
+        Self::forget_offers(&mut inner, &removed);
+        if inner
+            .acquisitions
+            .remove(&(home.id, home.generation))
+            .is_some()
+            || registered
+        {
+            metrics::counter!(runtime_metrics::ACTIVITY_OFFER_RETIREMENTS_TOTAL, "reason" => reason).increment(1);
+        }
+        self.capacity_changed.notify_one();
+    }
+
+    fn watch_locked(&self, inner: &mut ActivityBrokerState, home: &QueueHome) {
+        inner
+            .acquisitions
+            .entry((home.id, home.generation))
+            .or_insert_with(|| {
+                self.retirement_changed.notify_one();
+                home.clone()
+            });
+    }
+
+    fn serving(&self, home: &QueueHome, queue: &QueueKey) -> bool {
+        home.valid()
+            && self
+                .queue_homes
+                .as_ref()
+                .and_then(|homes| homes.local_home(queue))
+                .is_some_and(|current| {
+                    current.id == home.id
+                        && current.generation == home.generation
+                        && current.valid()
+                })
+    }
+
+    /// Own and join cancellation/deadline watchers independently of discovery.
+    /// The runtime's shutdown tracker owns this loop and therefore its child work.
+    pub(crate) async fn run_retirement(
+        self,
+        registry: crate::activity_discovery::ActivityDiscoveryRegistry,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        let mut watchers = tokio::task::JoinSet::new();
+        let mut watching = HashSet::new();
+        loop {
+            // Register before inspecting acquisitions, so first admission cannot
+            // race the cleanup task into sleeping without its cancellation watcher.
+            let changed = self.retirement_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let registry_changed = registry.retirement_wake.notified();
+            tokio::pin!(registry_changed);
+            registry_changed.as_mut().enable();
+            let mut homes = self.inner.lock().await.acquisitions.clone();
+            for home in registry.acquisitions() {
+                homes.insert((home.id, home.generation), home);
+            }
+            for (scope, home) in homes {
+                if watching.insert(scope) {
+                    watchers.spawn(async move {
+                        let reason = home.retired().await;
+                        (home, reason)
+                    });
+                }
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = changed => {},
+                _ = registry_changed => {},
+                result = watchers.join_next(), if !watchers.is_empty() => {
+                    if let Some(Ok((home, reason))) = result {
+                        self.retire_acquisition(&registry, &home, reason).await;
+                        watching.remove(&(home.id, home.generation));
+                    }
+                }
+            }
+        }
+        watchers.abort_all();
+        while watchers.join_next().await.is_some() {}
+        let mut homes = self.inner.lock().await.acquisitions.clone();
+        for home in registry.acquisitions() {
+            homes.insert((home.id, home.generation), home);
+        }
+        for (_, home) in homes {
+            self.retire_acquisition(&registry, &home, "shutdown").await;
+        }
+    }
+
     pub(crate) fn with_discovery(queue_homes: Arc<dyn QueueHomeProvider>) -> Self {
         Self {
             queue_homes: Some(queue_homes),
             ..Self::default()
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn offer_accounting(&self, home: &QueueHome) -> (usize, usize, usize) {
+        self.inner.lock().await.offers.accounting(home)
     }
 
     fn forget_offers(
@@ -2528,22 +2653,29 @@ impl InMemoryActivityBroker {
         }
     }
 
-    fn expire_locked(inner: &mut ActivityBrokerState, now: Instant) {
-        let removed = inner.offers.expire(now);
+    fn expire_locked(&self, inner: &mut ActivityBrokerState, now: Instant) {
+        let removed = inner
+            .offers
+            .expire_if_serving(now, |home, queue| self.serving(home, queue));
         Self::forget_offers(inner, &removed);
     }
 
     pub(crate) async fn expire_offers(&self, now: Instant) {
-        Self::expire_locked(&mut *self.inner.lock().await, now);
+        self.expire_locked(&mut *self.inner.lock().await, now);
     }
 
     pub(crate) async fn reserve_offers(
         &self,
         home: &QueueHome,
+        queue: &QueueKey,
         count: usize,
     ) -> ActivityOfferReservation {
         let mut inner = self.inner.lock().await;
-        Self::expire_locked(&mut inner, Instant::now());
+        self.expire_locked(&mut inner, Instant::now());
+        let count = if self.serving(home, queue) { count } else { 0 };
+        if count > 0 {
+            self.watch_locked(&mut inner, home);
+        }
         inner.offers.reserve(home, count)
     }
 
@@ -2610,7 +2742,7 @@ impl InMemoryActivityBroker {
     /// following scan observes the missing key and performs the full durable check.
     pub async fn contains_activity_task(&self, task: &DispatchableActivityTask) -> bool {
         let mut inner = self.inner.lock().await;
-        Self::expire_locked(&mut inner, Instant::now());
+        self.expire_locked(&mut inner, Instant::now());
         let key = incarnation(task);
         inner.enqueued.contains(&key) || inner.offers.contains(&key)
     }
@@ -2843,7 +2975,7 @@ impl InMemoryActivityBroker {
         activity_id: &str,
     ) -> Option<crate::runtime::ActivityTaskOffer> {
         let mut inner = self.inner.lock().await;
-        Self::expire_locked(&mut inner, Instant::now());
+        self.expire_locked(&mut inner, Instant::now());
         let ready = inner.ready.get_mut(queue)?;
         let removed = ready.remove_where(|task| {
             task.task.run_key == run_key && task.task.activity_id == activity_id
@@ -2881,7 +3013,8 @@ impl InMemoryActivityBroker {
 
     /// Enqueue an activity task for delivery.
     ///
-    /// Duplicate complete incarnations are suppressed, including while a start is in flight.
+    /// Duplicate complete incarnations are suppressed. With queue-home ownership,
+    /// a match stays counted while its start is in flight.
     pub async fn publish_activity_task(
         &self,
         task: DispatchableActivityTask,
@@ -2897,15 +3030,27 @@ impl InMemoryActivityBroker {
         metrics: Option<&DeliveryMetrics>,
         reservation: Option<&mut ActivityOfferReservation>,
     ) -> OfferAdmission {
+        if self.queue_homes.is_none() {
+            let queue = task.queue.clone();
+            runtime_metrics::record_broker_publish(&queue);
+            let (mode, scope_generation, config) = self.policy.delivery_inputs(&queue).await;
+            let mut inner = self.inner.lock().await;
+            inner.ordering.enter_scope(scope_generation);
+            if !inner.enqueued.insert(incarnation(&task)) {
+                return OfferAdmission::Known;
+            }
+            self.enqueue_locked(inner, task, None, None, mode, config.as_ref(), metrics);
+            return OfferAdmission::Admitted;
+        }
         let now = OffsetDateTime::now_utc();
-        let offer = crate::ActivityQueueOffer {
-            task,
-            execution_home: ShardId(0),
+        let hint = ActivityAdmissionHint {
+            execution_home: None,
             dispatch_at: now,
             expires_at: now + time::Duration::seconds(5),
+            bytes: crate::ActivityQueueOffer::task_retained_bytes(&task),
         };
         let result = self
-            .admit_activity_offer_inner(offer, None, now, reservation, metrics)
+            .admit_activity_offer_inner(task, hint, None, now, reservation, metrics)
             .await;
         match result {
             crate::ActivityOfferOutcome::Admitted => OfferAdmission::Admitted,
@@ -2927,8 +3072,14 @@ impl InMemoryActivityBroker {
         reservation: Option<&mut ActivityOfferReservation>,
     ) -> crate::ActivityOfferOutcome {
         let source = source.into();
+        let hint = ActivityAdmissionHint {
+            execution_home: Some(offer.execution_home),
+            dispatch_at: offer.dispatch_at,
+            expires_at: offer.expires_at,
+            bytes: offer.retained_bytes(),
+        };
         let outcome = self
-            .admit_activity_offer_inner(offer, home, now_wall, reservation, None)
+            .admit_activity_offer_inner(offer.task, hint, home, now_wall, reservation, None)
             .await;
         metrics::counter!(crate::metrics::ACTIVITY_OFFER_DELIVERY_TOTAL, "source" => source.label(), "outcome" => match outcome {
             crate::ActivityOfferOutcome::Admitted => "admitted", crate::ActivityOfferOutcome::Known => "known",
@@ -2940,15 +3091,15 @@ impl InMemoryActivityBroker {
 
     async fn admit_activity_offer_inner(
         &self,
-        offer: crate::ActivityQueueOffer,
+        task: DispatchableActivityTask,
+        hint: ActivityAdmissionHint,
         captured: Option<&QueueHome>,
         now_wall: OffsetDateTime,
         reservation: Option<&mut ActivityOfferReservation>,
         metrics: Option<&DeliveryMetrics>,
     ) -> crate::ActivityOfferOutcome {
         let observed = Instant::now();
-        let bytes = offer.retained_bytes();
-        let mut task = offer.task;
+
         runtime_metrics::record_broker_publish(&task.queue);
         let queue = task.queue.clone();
         let (mode, scope_generation, config) = self.policy.delivery_inputs(&task.queue).await;
@@ -2960,34 +3111,29 @@ impl InMemoryActivityBroker {
             now_wall,
             time::Duration::try_from(now - observed).unwrap_or(time::Duration::MAX),
         );
-        Self::expire_locked(&mut inner, now);
+        self.expire_locked(&mut inner, now);
         inner.ordering.enter_scope(scope_generation);
         let home = if let Some(homes) = &self.queue_homes {
             let Some(home) = homes.local_home(&queue) else {
                 return crate::ActivityOfferOutcome::NotHome;
             };
-            if home.cancel.is_cancelled()
+            if !home.valid()
                 || captured.is_some_and(|captured| {
                     captured.id != home.id
                         || captured.generation != home.generation
-                        || captured.cancel.is_cancelled()
+                        || !captured.valid()
                 })
             {
                 return crate::ActivityOfferOutcome::NotHome;
             }
             home
         } else {
-            QueueHome {
-                id: ShardId(0),
-                generation: 0,
-                cancel: Default::default(),
-                deadline: Default::default(),
-            }
+            return crate::ActivityOfferOutcome::NotHome;
         };
-        if offer.dispatch_at > now_wall {
+        if hint.dispatch_at > now_wall {
             return crate::ActivityOfferOutcome::NotDue;
         }
-        if offer.expires_at <= now_wall {
+        if hint.expires_at <= now_wall {
             return crate::ActivityOfferOutcome::Expired;
         }
         let dedupe_key = incarnation(&task);
@@ -2995,7 +3141,7 @@ impl InMemoryActivityBroker {
             return crate::ActivityOfferOutcome::Known;
         }
         let deadline = now
-            + std::time::Duration::try_from(offer.expires_at - now_wall)
+            + std::time::Duration::try_from(hint.expires_at - now_wall)
                 .unwrap_or_default()
                 .min(std::time::Duration::from_secs(5));
         let (outcome, token) = inner.offers.admit_bounded(
@@ -3004,7 +3150,7 @@ impl InMemoryActivityBroker {
             &home,
             now,
             reservation,
-            bytes,
+            hint.bytes,
             deadline,
         );
         match outcome {
@@ -3014,16 +3160,38 @@ impl InMemoryActivityBroker {
             OfferAdmission::Expired => return crate::ActivityOfferOutcome::Expired,
             OfferAdmission::Full => return crate::ActivityOfferOutcome::Full,
         }
+        self.watch_locked(&mut inner, &home);
         inner.enqueued.insert(dedupe_key);
+        self.enqueue_locked(
+            inner,
+            task,
+            hint.execution_home,
+            token,
+            mode,
+            config.as_ref(),
+            metrics,
+        );
+        crate::ActivityOfferOutcome::Admitted
+    }
+
+    /// The unmanaged fixture path and bounded path retain the same ordering and
+    /// observation semantics, without sharing lifetime or admission accounting.
+    fn enqueue_locked(
+        &self,
+        mut inner: tokio::sync::MutexGuard<'_, ActivityBrokerState>,
+        mut task: DispatchableActivityTask,
+        execution_home: Option<ShardId>,
+        token: Option<ActivityOfferToken>,
+        mode: crate::DeliveryMode,
+        config: Option<&TaskQueueConfigEntry>,
+        metrics: Option<&DeliveryMetrics>,
+    ) {
+        let queue = task.queue.clone();
         let order = match task.order {
             Some(order) => inner.ordering.preserve(order),
-            None => inner.ordering.assign(
-                &task.queue,
-                task.priority.as_ref(),
-                false,
-                config.as_ref(),
-                mode,
-            ),
+            None => inner
+                .ordering
+                .assign(&task.queue, task.priority.as_ref(), false, config, mode),
         };
         task.order = Some(order);
         let has_waiter = inner
@@ -3043,9 +3211,9 @@ impl InMemoryActivityBroker {
         inner.ready.entry(task.queue.clone()).or_default().insert(
             order,
             TimestampedActivityTask {
-                execution_home: offer.execution_home,
+                execution_home,
                 task,
-                entered_at: now,
+                entered_at: Instant::now(),
                 token,
             },
         );
@@ -3059,7 +3227,6 @@ impl InMemoryActivityBroker {
             let _ = self.policy.observation_sink().try_observe(observation);
         }
         wake.notify_waiters();
-        crate::ActivityOfferOutcome::Admitted
     }
 
     /// Long-poll for an activity task on `queue`.
@@ -3239,7 +3406,7 @@ impl InMemoryActivityBroker {
             .await
             .expect("hydrated task-queue cache reads are infallible");
         let mut inner = self.inner.lock().await;
-        Self::expire_locked(&mut inner, Instant::now());
+        self.expire_locked(&mut inner, Instant::now());
         let Some(candidate) = inner.ready.get(queue).and_then(OrderedReady::front) else {
             Self::emit_queue_depth(&inner, queue);
             return Ok(ActivityTakeOutcome::Empty);
@@ -6117,7 +6284,7 @@ mod tests {
                     let task = named_activity_task(&queue, index.to_string(), priority(*band, &format!("group-{group}"), f32::from(*group + 1)));
                     baseline.publish_activity_task(task.clone(), None).await.unwrap();
                     let offer = crate::ActivityQueueOffer { task, execution_home: ShardId(7), dispatch_at: wall, expires_at: wall + time::Duration::seconds(1) };
-                    let mut reservation = mixed.reserve_offers(&assignment, 1).await;
+                    let mut reservation = mixed.reserve_offers(&assignment, &queue, 1).await;
                     let source = match source { 0 => OfferSource::Local, 1 => OfferSource::Pushed, _ => OfferSource::Discovered };
                     let (a, b, c) = tokio::join!(
                         mixed.admit_activity_offer(offer.clone(), Some(&assignment), source, wall, Some(&mut reservation)),
@@ -6135,7 +6302,7 @@ mod tests {
                     let a = mixed.poll_activity_offer_for_worker(&queue, &WorkerIdentity(String::new()), Duration::ZERO).await.unwrap().unwrap();
                     let b = baseline.poll_activity_task(&queue, Duration::ZERO).await.unwrap().unwrap().0;
                     prop_assert_eq!(&a.task.activity_id, &b.activity_id);
-                    prop_assert_eq!(a.execution_home, ShardId(7));
+                    prop_assert_eq!(a.execution_home, Some(ShardId(7)));
                 }
                 let task = named_activity_task(&queue, "expires", priority(1, "", 0.0));
                 let mut offer = crate::ActivityQueueOffer { task, execution_home: ShardId(7), dispatch_at: wall, expires_at: wall + time::Duration::seconds(1) };

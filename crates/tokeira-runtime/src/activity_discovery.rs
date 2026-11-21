@@ -5,7 +5,7 @@
 //! discovery scheduler owns the node's query slots, rather than one pool per kind.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     num::NonZeroU32,
     sync::{Arc, Mutex, RwLock},
 };
@@ -244,6 +244,7 @@ struct Registration {
 
 #[derive(Debug, Default)]
 struct RegistryState {
+    acquisitions: BTreeMap<(ShardId, u64), QueueHome>,
     ranges: HashMap<RangeKey, Registration>,
     turn: u64,
 }
@@ -254,6 +255,7 @@ pub(crate) struct ActivityDiscoveryRegistry {
     pub(crate) test_gate: Arc<crate::discovery::test_gate::TestPassGate>,
     state: Arc<Mutex<RegistryState>>,
     pub(crate) wake: Arc<Notify>,
+    pub(crate) retirement_wake: Arc<Notify>,
 }
 
 #[derive(Debug)]
@@ -313,6 +315,36 @@ impl Drop for ActivityPollDemand {
 }
 
 impl ActivityDiscoveryRegistry {
+    /// Include demand-only acquisitions even when no offer has been retained.
+    pub(crate) fn acquisitions(&self) -> Vec<QueueHome> {
+        self.state
+            .lock()
+            .expect("activity discovery lock poisoned")
+            .acquisitions
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Called under the broker lock so pages and offers lose admission together.
+    /// Registry operations release their lock before awaiting the broker, keeping
+    /// the broker-to-registry lock order free of a reverse dependency.
+    pub(crate) fn retire_acquisition(&self, home: &QueueHome) -> bool {
+        let mut state = self.state.lock().expect("activity discovery lock poisoned");
+        let removed = state
+            .acquisitions
+            .remove(&(home.id, home.generation))
+            .is_some();
+        state.ranges.retain(|key, entry| {
+            let remove = key.home == home.id && key.generation == home.generation;
+            if remove {
+                entry.cancel.cancel();
+            }
+            !remove
+        });
+        removed
+    }
+
     /// Coalesce registration changes and failed matches with the existing pass.
     /// Never reset its cursor: repeated notifications must not starve its tail.
     pub(crate) fn wake_family(&self, queue: &QueueKey, now: Instant) {
@@ -336,10 +368,6 @@ impl ActivityDiscoveryRegistry {
         home: QueueHome,
         now: Instant,
     ) -> Result<ActivityPollDemand> {
-        anyhow::ensure!(
-            !home.cancel.is_cancelled(),
-            "activity queue-home acquisition ended"
-        );
         let family = QueueKey {
             deployment: None,
             build_id: None,
@@ -351,6 +379,9 @@ impl ActivityDiscoveryRegistry {
             generation: home.generation,
         };
         let mut state = self.state.lock().expect("activity discovery lock poisoned");
+        // Retirement removes registrations under this mutex. Checking here keeps
+        // a poll that waited through cleanup from reinstalling the ended scope.
+        anyhow::ensure!(home.valid(), "activity queue-home acquisition ended");
         let already_active = state
             .ranges
             .get(&key)
@@ -367,6 +398,13 @@ impl ActivityDiscoveryRegistry {
         if !already_active && active >= ACTIVE_CAPACITY {
             return Err(ActivityDemandCapacity.into());
         }
+        state
+            .acquisitions
+            .entry((home.id, home.generation))
+            .or_insert_with(|| {
+                self.retirement_wake.notify_one();
+                home.clone()
+            });
         let turn = state.turn;
         state.turn = state
             .turn
@@ -412,9 +450,7 @@ impl ActivityDiscoveryRegistry {
             .ranges
             .get(key)
             .is_some_and(|entry| {
-                entry.id == registration
-                    && !entry.demands.is_empty()
-                    && !entry.home.cancel.is_cancelled()
+                entry.id == registration && !entry.demands.is_empty() && entry.home.valid()
             })
     }
 
@@ -425,9 +461,7 @@ impl ActivityDiscoveryRegistry {
             .ranges
             .get(key)
             .is_some_and(|entry| {
-                entry.id == registration
-                    && entry.demands.contains_key(queue)
-                    && !entry.home.cancel.is_cancelled()
+                entry.id == registration && entry.demands.contains_key(queue) && entry.home.valid()
             })
     }
 
@@ -447,7 +481,7 @@ impl ActivityDiscoveryRegistry {
             .filter(|(_, entry)| {
                 !entry.running
                     && !entry.demands.is_empty()
-                    && !entry.home.cancel.is_cancelled()
+                    && entry.home.valid()
                     && now >= entry.next_slice
             })
             .min_by_key(|(_, entry)| entry.turn)
@@ -540,7 +574,7 @@ impl ActivityDiscoveryRegistry {
         }
         let mut retired = Vec::new();
         state.ranges.retain(|key, entry| {
-            let remove = entry.home.cancel.is_cancelled()
+            let remove = !entry.home.valid()
                 || (entry.demands.is_empty()
                     && (now.duration_since(entry.last_used) >= IDLE_GRACE || evict.contains(key)));
             if remove {
@@ -570,7 +604,9 @@ pub(crate) async fn run_slice_at<S: ActivityDiscoverySource>(
     pass: &mut ActivityPass,
     clock: &dyn Clock,
 ) -> Result<SliceOutcome> {
-    let mut reservation = broker.reserve_offers(home, PASS_ADMISSIONS).await;
+    let mut reservation = broker
+        .reserve_offers(home, &key.family, PASS_ADMISSIONS)
+        .await;
     reservation.cancel = pass.cancel.clone();
     if reservation.remaining() == 0 {
         return Ok(SliceOutcome::Capacity);
@@ -588,7 +624,7 @@ pub(crate) async fn run_slice_at<S: ActivityDiscoverySource>(
         )
         .await?;
     for candidate in page.candidates {
-        if home.cancel.is_cancelled() || pass.cancel.is_cancelled() {
+        if !home.valid() || pass.cancel.is_cancelled() {
             return Ok(SliceOutcome::Cancelled);
         }
         if !registry.active(key, pass.registration) {
@@ -616,7 +652,7 @@ pub(crate) async fn run_slice_at<S: ActivityDiscoverySource>(
                 None
             }
         };
-        if home.cancel.is_cancelled() || pass.cancel.is_cancelled() {
+        if !home.valid() || pass.cancel.is_cancelled() {
             return Ok(SliceOutcome::Cancelled);
         }
         if !registry.active(key, pass.registration) {

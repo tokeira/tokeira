@@ -579,7 +579,7 @@ async fn publication_with_fault(
         };
         let acquisition = destination_homes.local_home(&selected).unwrap();
         let mut reservation = destination
-            .reserve_offers(&acquisition, before.candidates.len())
+            .reserve_offers(&acquisition, &selected, before.candidates.len())
             .await;
         for candidate in &before.candidates {
             if let Some(task) = source
@@ -846,5 +846,199 @@ proptest! {
     fn activity_restarted_owner_pushes_without_discovery(variant in 1u32..64) {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
         prop_assert!(runtime.block_on(publication_with_fault(Path::Recovery, variant, false, true, false, 6)));
+    }
+}
+
+async fn offer_fixture(
+    variant: u32,
+) -> (
+    TokeiraRuntime<InMemoryStore>,
+    crate::ActivityQueueOffer,
+    ExecutionRef,
+) {
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::new());
+    let repo = Arc::new(InMemoryStore::with_shard_count(8).with_clock(clock.clone()));
+    let owner = execution_owner(repo, clock.clone(), false).await;
+    let mut start = timer_deadline_tests::start(&owner, false);
+    start.workflow_id = WorkflowId(format!("offer-outcomes-{variant}"));
+    start.run_id = RunId(Uuid::from_u128(u128::from(variant) + 1));
+    start.run_key = RunKey::derive(start.namespace_id, &start.workflow_id, start.run_id);
+    let execution_home = execution_home_bundle(
+        start.namespace_id.0.as_bytes(),
+        start.workflow_id.0.as_bytes(),
+        8,
+    );
+    let queue = |local| {
+        (0..256)
+            .map(|i| QueueKey {
+                namespace_id: start.namespace_id,
+                task_queue: TaskQueueName(format!("offer-{variant}-{i}")),
+                task_kind: TaskKind::Activity,
+                deployment: None,
+                build_id: None,
+            })
+            .find(|q| (home(q) == execution_home) == local)
+            .unwrap()
+    };
+    let selected = queue(false);
+    let workflow = QueueKey {
+        task_kind: TaskKind::Workflow,
+        ..queue(true)
+    };
+    start.task_queue = workflow.task_queue.clone();
+    let execution = ExecutionRef {
+        namespace_id: start.namespace_id,
+        workflow_id: start.workflow_id.clone(),
+        run_id: Some(start.run_id),
+    };
+    let run = start.run_key;
+    owner.acquire_shard(execution_home).await.unwrap();
+    owner.start_workflow(start).await.unwrap();
+    let first = owner
+        .poll_workflow_task(
+            workflow,
+            WorkerIdentity("worker".into()),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let mut command = completion_eager_tests::schedule("activity", false);
+    if let WorkflowCommand::ScheduleActivity { task_queue, .. } = &mut command {
+        *task_queue = selected.task_queue.clone();
+    }
+    let mut completion = completion_inline_tests::completion(&first, false);
+    completion.now = clock.now();
+    completion.request.received_at = completion.now;
+    completion.commands = vec![command];
+    owner
+        .complete_workflow_task_with_result(completion)
+        .await
+        .unwrap();
+    let committed = state(owner.repo.as_ref(), run).await;
+    let offer = crate::ActivityQueueOffer::from_state(
+        &committed,
+        &committed.activities["activity"],
+        execution_home,
+        clock.now(),
+    )
+    .unwrap();
+    (owner, offer, execution)
+}
+
+async fn canonical_rows(
+    owner: &TokeiraRuntime<InMemoryStore>,
+    offer: &crate::ActivityQueueOffer,
+) -> Vec<tokeira_storage::ActivityDispatchRow> {
+    owner
+        .repo
+        .list_activity_dispatch_page(
+            &ActivityDiscoveryRange {
+                namespace_id: offer.task.queue.namespace_id,
+                queue_name: offer.task.queue.task_queue.clone(),
+            },
+            owner.clock.now(),
+            None,
+            NonZeroU32::new(64).unwrap(),
+        )
+        .await
+        .unwrap()
+        .candidates
+        .into_iter()
+        .map(|candidate| candidate.row.unwrap())
+        .collect()
+}
+
+#[derive(Debug)]
+struct FailureReceipt {
+    error: crate::ActivityOfferError,
+    observed: tokio::sync::Notify,
+}
+#[async_trait::async_trait]
+impl crate::RemoteActivityOfferSink for FailureReceipt {
+    async fn offer(
+        &self,
+        _: &crate::ActivityQueueOffer,
+        _: ShardId,
+        _: bool,
+    ) -> std::result::Result<crate::ActivityOfferOutcome, crate::ActivityOfferError> {
+        self.observed.notify_one();
+        Err(self.error)
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+    // Feature: activity-queue-home-delivery, Property 1: every offer-only outcome and sender error leaves canonical dispatch rows byte-for-byte equivalent.
+    #[test]
+    fn activity_offer_outcomes_preserve_canonical_rows(variant in 1u32..64) {
+        tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap().block_on(async {
+            let (owner, offer, _) = offer_fixture(variant).await;
+            let before = canonical_rows(&owner, &offer).await;
+            prop_assert_eq!(before.len(), 1);
+            for source in [crate::workflow_offers::OfferSource::Local, crate::workflow_offers::OfferSource::Pushed, crate::workflow_offers::OfferSource::Discovered] {
+                for expected in [crate::ActivityOfferOutcome::Admitted, crate::ActivityOfferOutcome::Known, crate::ActivityOfferOutcome::Full, crate::ActivityOfferOutcome::Expired, crate::ActivityOfferOutcome::NotDue, crate::ActivityOfferOutcome::NotHome] {
+                    let (broker, homes) = destination(&offer.task.queue);
+                    let acquisition = homes.local_home(&offer.task.queue).unwrap();
+                    let mut candidate = offer.clone();
+                    let mut reservation = None;
+                    match expected {
+                        crate::ActivityOfferOutcome::Known => {
+                            prop_assert_eq!(broker.admit_activity_offer(candidate.clone(), Some(&acquisition), source, owner.clock.now(), None).await, crate::ActivityOfferOutcome::Admitted);
+                            prop_assert_eq!(canonical_rows(&owner, &offer).await, before.clone());
+                        }
+                        crate::ActivityOfferOutcome::Full => { reservation = Some(broker.reserve_offers(&acquisition, &offer.task.queue, 8192).await); }
+                        crate::ActivityOfferOutcome::Expired => { candidate.expires_at = owner.clock.now(); }
+                        crate::ActivityOfferOutcome::NotDue => { candidate.dispatch_at = owner.clock.now() + Duration::seconds(1); }
+                        crate::ActivityOfferOutcome::NotHome => acquisition.cancel.cancel(),
+                        crate::ActivityOfferOutcome::Admitted => {}
+                    }
+                    prop_assert_eq!(broker.admit_activity_offer(candidate, Some(&acquisition), source, owner.clock.now(), None).await, expected);
+                    prop_assert_eq!(canonical_rows(&owner, &offer).await, before.clone());
+                    drop(reservation);
+                }
+            }
+            for error in [crate::ActivityOfferError::Routing, crate::ActivityOfferError::Authentication, crate::ActivityOfferError::Capacity, crate::ActivityOfferError::Transport, crate::ActivityOfferError::Deadline, crate::ActivityOfferError::Invalid, crate::ActivityOfferError::Unimplemented] {
+                let shutdown = crate::RuntimeShutdownHandle::new();
+                let homes = Arc::new(PlacementQueueHomes { owner: owner.shard_owner.clone(), counts: RwLock::new((8, 8)) });
+                let delivery = crate::activity_delivery::ActivityDelivery::new(InMemoryActivityBroker::with_discovery(homes.clone()), homes, shutdown.clone(), owner.clock.clone());
+                let sink = Arc::new(FailureReceipt { error, observed: tokio::sync::Notify::new() });
+                delivery.install_sender(sink.clone());
+                let acquisition = owner.shard_owner.read().unwrap().acquisition(offer.execution_home).unwrap();
+                delivery.publish(offer.clone(), acquisition, crate::activity_delivery::ActivityDeliverySource::Publication).await;
+                sink.observed.notified().await;
+                shutdown.begin_shutdown(); shutdown.close_registration(); shutdown.wait(std::time::Instant::now() + std::time::Duration::from_secs(1)).await.unwrap();
+                prop_assert_eq!(canonical_rows(&owner, &offer).await, before.clone(), "sender error {:?}", error);
+            }
+            discovery_tests::stop(&owner).await;
+            Ok(())
+        })?;
+    }
+
+    // Feature: activity-queue-home-delivery, Property 1: an actual signal refresh preserves the completed delivery descriptor for an unchanged incarnation.
+    #[test]
+    fn activity_signal_does_not_rearm_completed_delivery(variant in 1u32..64) {
+        tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap().block_on(async {
+            let (owner, offer, execution) = offer_fixture(variant).await;
+            let (broker, homes) = destination(&offer.task.queue);
+            let (acknowledgements, mut received) = tokio::sync::mpsc::unbounded_channel();
+            owner.set_activity_offer_sink(Arc::new(ActivitySink { fault: std::sync::atomic::AtomicU8::new(0), broker, homes, clock: owner.clock.clone(), acknowledgements }));
+            let deps = owner.activity_retry_deps();
+            scan_activity_eligibility_once(&deps, offer.execution_home, owner.clock.now()).await;
+            received.recv().await.unwrap();
+            let maximum = std::time::Duration::from_secs(60);
+            prop_assert_eq!(owner.activity_tracking.eligibility.deadline_delay(owner.clock.now(), maximum), maximum);
+            let before = canonical_rows(&owner, &offer).await;
+            let revision = state(owner.repo.as_ref(), offer.task.run_key).await.last_event_id;
+            owner.signal_workflow(execution, SignalRequest { signal_name: "unrelated".into(), input: Payloads::default(), header: None, links: Vec::new(), request: request_context(owner.clock.now()), now: owner.clock.now() }).await.unwrap();
+            prop_assert!(state(owner.repo.as_ref(), offer.task.run_key).await.last_event_id > revision);
+            owner.activity_tracking.eligibility.begin_full_pass();
+            prop_assert_eq!(owner.activity_tracking.eligibility.deadline_delay(owner.clock.now(), maximum), maximum, "signal must not reinstall a due obligation");
+            scan_activity_eligibility_once(&deps, offer.execution_home, owner.clock.now()).await;
+            prop_assert!(received.try_recv().is_err());
+            prop_assert_eq!(canonical_rows(&owner, &offer).await, before);
+            discovery_tests::stop(&owner).await;
+            Ok(())
+        })?;
     }
 }

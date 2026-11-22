@@ -194,20 +194,45 @@ exploration cases. [bugfix.md](bugfix.md) and [design.md](design.md) define the 
       - No credential, endpoint or run identifier is recorded, and every cluster was deleted and its absence
         confirmed.
 
-- [ ] 5. Align documents with implementation
-  - [ ] 5.1 Update [task-types.md](../../../docs/conformance/task-types.md)'s `ACTIVITY_TASK` row with prompt owner
+- [x] 5. Align documents with implementation
+  - [x] 5.1 Update [task-types.md](../../../docs/conformance/task-types.md)'s `ACTIVITY_TASK` row with prompt owner
     push, discovery backup, complete incarnation/start gates and Temporal's task-version check. Align its
     `ACTIVITY_RETRY_TIMER` row with due-time eligibility push. Update activity-dispatch's publication, retirement,
     recovery and start-read descriptions, the internal RPC contract, verification matrix and live-suite entries.
     Record measured counts and limitations; no new credential installation or rollout step.
     - _Requirements: 1.1, 1.2, 1.6, 1.8, 2.2, 2.8_
+    - DONE — The documents match the implementation.
+      - task-types.md: the `TRANSFER_ACTIVITY_TASK` row has the owner push, discovery backup, complete incarnation
+        and start gates and v1.31.0's `CheckTaskVersion`; the `ACTIVITY_RETRY_TIMER` row has due-time eligibility
+        push.
+      - activity-dispatch's design and verification inventory describe publication, retirement, recovery and the
+        hinted start read.
+      - peer-credentials.md gives the `OfferActivityTask` contract, limits and statuses.
+      - The verification doc and live-suite runbook give the selections and their order, the exact start and
+        replay counts with background reads kept separate, and the live receipt.
+      - This spec's design now ends ready retention at the hint deadline when that comes first, and separates
+        local sender failures from receiver statuses.
+      - Prompt push is recorded as a tested obligation, not a latency bound. No credential, installation or
+        rollout step is added.
 
-- [ ] 6. Run the full implementation checks
-  - [ ] 6.1 Run the repository enforced bar: nightly formatting, locked workspace lint/check/nextest, locked
+- [x] 6. Run the full implementation checks
+  - [x] 6.1 Run the repository enforced bar: nightly formatting, locked workspace lint/check/nextest, locked
     doctests and warning-denied workspace documentation. Run applicable focused/live checks and offline Markdown
     links/whitespace. Report exact selections, outcomes and omissions; complete the traceability/field-policy
     quality gate. This task is for implementation, not this document-only change.
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 1.10, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8_
+    - DONE — The local part of the bar passes; the rest runs in the required CI checks.
+      - Locally, at the implementation head: nightly formatting, `cargo lint --locked` with no warnings,
+        `cargo check --workspace --locked` and warning-denied workspace documentation.
+      - Clippy with `dsql-integration` on its five crates passes with no warnings.
+      - Workspace nextest and doctests run in the required CI checks on the pull request's head, which gate the
+        merge; local disk can't hold the workspace test build.
+      - Focused: the engine crate's 178 tests pass at the final test commit, including the multi-node gRPC
+        suites. Live: task 4.
+      - Offline links, whitespace and the changelog fragment's dry run pass.
+      - Quality gate: every criterion, 1.1–1.10 and 2.1–2.8, maps to a design property and a finished task, and
+        every property has tagged generated tests. The 13 request fields match the field policy, and each
+        validated field has a refusing case in the field-policy test.
 
 ## Task Dependency Graph
 

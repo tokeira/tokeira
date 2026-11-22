@@ -230,13 +230,13 @@ The companion inline workflow-task contract is in
 
 Retry eligibility shares the activity timeout scanner's earliest-deadline wake,
 including earlier-insert notifications and immediate continuation of unattempted
-capped work, so backoff expiry is evaluated at its due time. Each eligibility entry
-retains whether its dispatch time was strictly after registration time. Only those
-deferred entries offer locally after passing owner rules and the deps' clock check.
-The publisher uses the same registration time to offer already-due work, including
-first attempts. Unrelated refreshes preserve the decision for the same incarnation
-and due time; an already-due entry still evaluates rules but leaves delivery to the
-publisher or discovery. This separates schedule-time transfer from retry-time
+capped work, so backoff expiry is evaluated at its due time. Every eligibility
+entry, whether deferred or already due when registered, offers its attempt through
+the common activity delivery entry once due, after passing owner rules and the
+deps' clock check. The publisher also offers already-due work at registration,
+including first attempts; the two may race, and shared admission suppresses the
+duplicate. Unrelated refreshes don't rearm an evaluated entry for the same
+incarnation and due time. This separates schedule-time transfer from retry-time
 delivery (`service/history/workflow/task_generator.go:550-577 @ v1.31.0`).
 
 Timeout tracking is installed before eligibility registration. Retry and option
@@ -246,11 +246,11 @@ each attempt only after tracking it; the lane registers any remaining obligation
 after publication, installing missing tracking even if publication failed. Recovery
 and publication rebuilds likewise restore timeout tracking first.
 
-Eligible deferred attempts are routed from the already loaded run and deployment
-registry through `publish_activity_task`. A local waiting poll receives that offer
-without waiting for discovery; a remote queue home still finds it on its next
-discovery pass, as for a first attempt. Discovery remains the backstop and broker
-duplicate suppression handles racing offers.
+Eligible attempts are routed from the already loaded run and deployment registry
+through the common activity delivery entry. A local waiting poll receives the offer
+directly, and a remote queue home receives the execution owner's bounded
+`OfferActivityTask` push, as for a first attempt. Discovery remains the backstop and
+broker duplicate suppression handles racing offers.
 
 Split `prepare_activity_dispatch_publish` into read-only candidate inspection and
 execution-owner rule application. Discovery does not suppress an otherwise valid
@@ -619,8 +619,8 @@ the run sequence, and preserves logical-deletion/staged-publication semantics.
 | Existing path | Final treatment |
 |---|---|
 | `commit.rs` and memory transition activity/enqueue row writes | Shared desired-set maintenance, including global run policy changes. |
-| Publisher `EnqueueActivityTask` and delayed publication tasks | Install authoritative-time tracking; optional local bounded wake/offer only. Remove correctness dependence on spawned sleeps. |
-| Retry timer publication and `reconcile_due_activity_dispatches_once` | Owner eligibility/rule tracking plus queue-home discovery; remove the per-home dispatch range scan. |
+| Publisher `EnqueueActivityTask` and delayed publication tasks | Install authoritative-time tracking; bounded local admission or `OfferActivityTask` push to a remote queue home, never a correctness dependency. Remove correctness dependence on spawned sleeps. |
+| Retry timer publication and `reconcile_due_activity_dispatches_once` | Owner eligibility/rule tracking, which pushes each attempt when due, plus queue-home discovery; remove the per-home dispatch range scan. |
 | `backlog.rs` grace scanner and drain worker | Stop and remove runtime delivery use for both task kinds. |
 | `reprocess_unversioned_activity_backlog` and edge `absorb_unversioned_backlog` | Wake/coalesce demand for the family; keep any needed volatile rerouting, never drain durable copies. |
 | `republish_activity_queue` | Bounded discovery wake/slice through the same range state; no repeated unpaginated head refill. |

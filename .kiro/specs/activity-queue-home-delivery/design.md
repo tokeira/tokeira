@@ -170,8 +170,9 @@ Reuse `ActivityOffers` and its complete incarnation, generation/serial release g
 and 8,192-per-home limits. Add the missing 64 MiB activity hint-byte bound across all local/push/discovery records,
 including in-flight records; size refusal never rejects the durable schedule. Scope retention explicitly by home,
 acquisition and incarnation so old cleanup cannot affect a replacement or a different colocated home. `Known`
-does not extend expiry. Retention ends at the earlier of the existing five-second ready/offer lease and absolute
-hint deadline. Lease expiry permits another offer; this is not global exactly-once delivery.
+does not extend expiry. Ready retention ends at the earlier of five seconds and the absolute hint deadline; taking an
+offer starts the existing separate five-second in-flight lease. Lease expiry permits another offer; this is not global
+exactly-once delivery.
 
 Cancellation already makes `ActivityOffers::take`/`expire` refuse old tokens. What is missing is independent
 cleanup, deadline checks and serving-generation checks. Register activity-only watchers using `QueueHome::retired`;
@@ -297,14 +298,16 @@ behavior, payloads, workflow delivery and deployment contracts; no eager-started
 | Malformed request/enum/timestamp | Invalid / `INVALID_ARGUMENT` | No admission; fix sender. |
 | Missing, invalid or expired credential | Authentication / `UNAUTHENTICATED` | Existing local renewal/configuration contract; no public-auth fallback. |
 | Verified identity outside push policy | Authentication / `PERMISSION_DENIED` | No admission. |
-| Oversize metadata/message/reply or handler exhaustion | Capacity / `RESOURCE_EXHAUSTED` | No unbounded allocation; discovery remains available. |
+| Oversize metadata/message or handler exhaustion | Capacity / `RESOURCE_EXHAUSTED` | No unbounded allocation; discovery remains available. |
+| Oversize reply | Capacity, refused by the sender's own reply limit | End attempt; discovery remains available. |
 | Sender or broker byte/count exhaustion | Refused or `Full` | Drop acceleration only. |
 | Non-serving/wrong destination | `NotHome` | One trusted refresh in total budget. |
 | Hint expired or not yet due | `Expired` or `NotDue` | No admission; existing eligibility/discovery handles current work. |
-| Placement/signing/transport unavailable | Routing/authentication/transport / `UNAVAILABLE` | Bounded attempts, then discovery. |
-| RPC/total budget elapsed | Deadline / `DEADLINE_EXCEEDED` | Admission uncertain; safe duplicate or discovery. |
+| Placement or transport unavailable | Routing/transport, or `UNAVAILABLE` | Bounded attempts, then discovery. |
+| Local signing failure | Authentication, before any request | End attempt; discovery. |
+| RPC/total budget elapsed | Deadline / `DEADLINE_EXCEEDED`; queued work past its total budget is dropped locally, with no status | Admission uncertain; safe duplicate or discovery. |
 | Absent peer method | Unsupported / `UNIMPLEMENTED` | End attempt; discovery, no startup/configuration change. |
-| Malformed reply | Invalid / client error | Treat admission as uncertain; bounded attempt then discovery. |
+| Malformed reply | Unknown decoded outcome: Invalid; malformed frame: client `INTERNAL`, handled as transport | Admission uncertain; Invalid ends the attempt, transport retries within the budget, then discovery. |
 | Stale, suppressed, conflicting or unauthorized start | Existing `ActivityStartOutcome` / start status mapping | Preserve activity-dispatch start/replay behavior; never translate an offer ACK into start success. |
 
 Counters distinguish source (`publication`, `eligibility`, `recovery`, `discovery`, `pushed`), the finite outcomes

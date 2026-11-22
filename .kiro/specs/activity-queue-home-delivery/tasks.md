@@ -145,24 +145,54 @@ exploration cases. [bugfix.md](bugfix.md) and [design.md](design.md) define the 
     - DONE — The transport outcomes match the properties' oracles, and the runtime, edge, engine and proto suites
       pass, including the workflow push's transport tests, unchanged.
 
-- [ ] 4. Execute live DSQL verification
-  - [ ] 4.1 Follow [live-suite isolation/ordering](../../../docs/testing/dsql-live-suites.md) and
+- [x] 4. Execute live DSQL verification
+  - [x] 4.1 Follow [live-suite isolation/ordering](../../../docs/testing/dsql-live-suites.md) and
     [activity-dispatch selections](../../../docs/testing/activity-dispatch-verification.md#reproducible-selections).
     Run affected atomic/pair/staged/derivation, ordered/malformed-page, repair and replay-observation selections;
     retain exact production discovery-query plans to ensure fallback remains bounded. Run
     `activity_dispatch_live_acquisition_spans_recovery_pages` on its isolated empty database for restored due/future
     obligations. Preserve placement-before-live-leases ordering and existing physical limits.
     - _Requirements: 1.2, 2.1, 2.2, 2.3, 2.7, 2.8_
-  - [ ] 4.2 Extend `activity_dispatch_live_read_counts` on a separate isolated database for pushed/discovered
+    - DONE — Each selection ran from nextest archives on an ephemeral cluster, deleted afterwards.
+      - On a 4096-home database after the schema bootstrap:
+        - `activity_dispatch_live_acquisition_spans_recovery_pages` restored due and future obligations across
+          recovery pages;
+        - both `*_dispatch_live_lost_publication_offered_by_next_pass` entries passed, and the lost activity
+          publication reached its parked poll through discovery within the two-second bound;
+        - the backlog count passed.
+      - Placement preceded every live lease.
+      - The storage-only selections weren't rerun. This change leaves the storage crate, its queries and their
+        plans untouched, so the retained discovery-query plans still hold. Replay observations ran in the read
+        counts' replay rows.
+  - [x] 4.2 Extend `activity_dispatch_live_read_counts` on a separate isolated database for pushed/discovered
     starts, warm/cold runtimes, inline/split state, conflict and receipt replay. Add real-RPC activity-push
     competing-start/takeover cases using the existing DSQL fence and generated credentials; run at least 100
     generated schedules for Properties 1, 3 and 5 against DSQL. Run the affected `dsql_activity_inputs` and
     `activity_dispatch_live_lost_publication_offered_by_next_pass` regressions.
     - _Requirements: 1.1, 1.6, 1.7, 1.8, 2.2, 2.3, 2.4_
-  - [ ] 4.3 Checkpoint: prove every selected live body ran; retain query/read reports, failures/skips and cleanup
+    - DONE — `activity_dispatch_live_read_counts` ran on its own eight-home database.
+      - It covered pushed and discovered starts, warm and cold runtimes, inline and split state, one conflict and
+        both replays.
+      - In all 16 combinations the queue home read no run, and the owner read it once, or twice with the conflict.
+      - Four engine entries followed, at 100 generated schedules each, over real RPC with the DSQL fence and
+        generated credentials:
+        - recovery, for Property 1;
+        - retirement, for Property 3;
+        - competing starts and takeover, for Property 5.
+      - `dsql_activity_inputs` passed on a database of its own after placement, and so did the activity
+        lost-publication regression above.
+  - [x] 4.3 Checkpoint: prove every selected live body ran; retain query/read reports, failures/skips and cleanup
     evidence without credentials or live-run identifiers. A missing URL, skipped body or PostgreSQL run is no
     substitute. Clean owned fixtures/resources under the runbook.
     - _Requirements: 1.8, 1.10, 2.1, 2.2, 2.8_
+    - DONE — Every selected body ran against DSQL, with no skips.
+      - Failures before the final runs were in test code:
+        - four engine entries assumed in-memory timing;
+        - one recovery schedule raced a duplicate offer.
+      - Each was fixed in the tests and rerun.
+      - The measured read counts are in the verification receipt.
+      - No credential, endpoint or run identifier is recorded, and every cluster was deleted and its absence
+        confirmed.
 
 - [ ] 5. Align documents with implementation
   - [ ] 5.1 Update [task-types.md](../../../docs/conformance/task-types.md)'s `ACTIVITY_TASK` row with prompt owner

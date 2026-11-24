@@ -1,0 +1,5 @@
+kind: fixed
+body: With standalone activities on, an activity poll now serves whichever of a standalone or workflow activity arrives first, as Temporal does, instead of waiting out its timeout.
+time: 2026-11-24T00:00:00Z
+custom:
+    Slice: 3ad0d4eb-f90d-4941-b052-4574e226e04f

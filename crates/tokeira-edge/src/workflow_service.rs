@@ -74,6 +74,7 @@ use uuid::Uuid;
 
 use crate::{
     batch_engine::{resolve_reset_target_from_history, run_batch_operation},
+    chasm_activity::{ActivityBridge, PolledActivityTask},
     errors::{EdgeError, EdgeResult},
     grpc::tracing_interceptor,
     history_wait::HistoryWaitRegistry,
@@ -590,6 +591,13 @@ fn worker_cancellation_failure_outcome(
     NexusCancellationAttemptOutcome::NonRetryableFailure { failure }
 }
 
+/// A shared poll serves exactly one activity kind after its start has completed.
+#[derive(Debug)]
+pub(crate) enum ActivityPollResult {
+    Workflow(Option<PollActivityTaskQueueResponse>),
+    Standalone(PolledActivityTask),
+}
+
 #[async_trait]
 pub trait WorkflowRuntimeApi: Send + Sync + 'static {
     /// Start a workflow and return mutation metadata for callers that only
@@ -764,6 +772,22 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
     ) -> Result<Option<StartedActivityTask>> {
         let _ = caller_deadline;
         self.poll_activity_task(queue, worker_identity, timeout)
+            .await
+    }
+
+    /// As `poll_activity_task_within`, with a wake for an empty offer wait only.
+    /// Implementations must never cancel an acquired offer or a start in progress.
+    /// Runtimes without a separate offer wait retain their ordinary poll behavior.
+    async fn poll_activity_task_until_woken<'a>(
+        &'a self,
+        queue: tokeira_types::QueueKey,
+        worker_identity: tokeira_types::WorkerIdentity,
+        timeout: std::time::Duration,
+        caller_deadline: Option<tokio::time::Instant>,
+        wake: std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>,
+    ) -> Result<Option<StartedActivityTask>> {
+        drop(wake);
+        self.poll_activity_task_within(queue, worker_identity, timeout, caller_deadline)
             .await
     }
 
@@ -6842,8 +6866,13 @@ impl WorkflowService {
         headers: &HeaderMap,
         req: PollActivityTaskQueueRequest,
     ) -> EdgeResult<Option<PollActivityTaskQueueResponse>> {
-        self.poll_activity_task_queue_inner(headers, req, None)
-            .await
+        match self
+            .poll_activity_task_queue_inner(headers, req, None, None, None)
+            .await?
+        {
+            ActivityPollResult::Workflow(response) => Ok(response),
+            ActivityPollResult::Standalone(_) => unreachable!("no standalone bridge supplied"),
+        }
     }
 
     pub(crate) async fn admit_activity_task_queue_poll(
@@ -6904,9 +6933,17 @@ impl WorkflowService {
         headers: &HeaderMap,
         req: PollActivityTaskQueueRequest,
         context: EdgeContext,
-    ) -> EdgeResult<Option<PollActivityTaskQueueResponse>> {
-        self.poll_activity_task_queue_inner(headers, req, Some(context))
-            .await
+        standalone: Option<&ActivityBridge>,
+        deadline: tokio::time::Instant,
+    ) -> EdgeResult<ActivityPollResult> {
+        self.poll_activity_task_queue_inner(
+            headers,
+            req,
+            Some(context),
+            standalone,
+            standalone.map(|_| deadline),
+        )
+        .await
     }
 
     async fn poll_activity_task_queue_inner(
@@ -6914,7 +6951,9 @@ impl WorkflowService {
         headers: &HeaderMap,
         req: PollActivityTaskQueueRequest,
         admitted: Option<EdgeContext>,
-    ) -> EdgeResult<Option<PollActivityTaskQueueResponse>> {
+        standalone: Option<&ActivityBridge>,
+        poll_deadline: Option<tokio::time::Instant>,
+    ) -> EdgeResult<ActivityPollResult> {
         let namespace_label = req.namespace.clone();
         self.observe_edge_call(
             headers,
@@ -6926,6 +6965,26 @@ impl WorkflowService {
                     Some(context) => context,
                     None => self.admit_activity_task_queue_poll(headers, &req).await?,
                 };
+                let target = ctx
+                    .claims
+                    .as_ref()
+                    .and_then(|claims| claims.worker_scope.as_ref())
+                    .map(|scope| tokeira_chasm::DeploymentVersionTarget {
+                        deployment_name: scope.deployment_name().to_owned(),
+                        build_id: scope.build_id().to_owned(),
+                    });
+                // Both activity kinds use matching's activity queue, including a
+                // queue's first dispatch (chasm/lib/activity/activity_tasks.go:63-80
+                // and service/matching/matching_engine.go:610-646,945-982 @ v1.31.0).
+                // Preserve standalone priority when work is already queued. Pickup
+                // completes its durable start before any other claim is attempted.
+                if let Some(bridge) = standalone
+                    && let Some(task) = bridge
+                        .poll_activity_task(&req.task_queue, &req.worker_identity, target.as_ref())
+                        .await?
+                {
+                    return Ok(ActivityPollResult::Standalone(task));
+                }
                 let namespace_id = resolved_namespace_id(&ctx, &req.namespace)?;
                 let workflow_namespace = ctx
                     .namespace
@@ -6948,12 +7007,14 @@ impl WorkflowService {
                 // deadline error one it backs off from. v1.31.0 checks after admission and
                 // before registering the poller (`service/frontend/workflow_handler.go`,
                 // `contextNearDeadline` @ v1.31.0).
-                let Some(deadline) = crate::long_poll::task_poll_deadline(
-                    req.caller_deadline,
-                    tokio::time::Instant::now(),
-                    req.timeout,
-                ) else {
-                    return Ok(None);
+                let Some(deadline) = poll_deadline.or_else(|| {
+                    crate::long_poll::task_poll_deadline(
+                        req.caller_deadline,
+                        tokio::time::Instant::now(),
+                        req.timeout,
+                    )
+                }) else {
+                    return Ok(ActivityPollResult::Workflow(None));
                 };
                 let _permit = self.long_polls.acquire().await?;
                 let poller = self.poller_registry.register(
@@ -7045,7 +7106,7 @@ impl WorkflowService {
                             .await
                         {
                             poller.completed(self.clock().now());
-                            return Ok(None);
+                            return Ok(ActivityPollResult::Workflow(None));
                         }
                     } else {
                         self.task_queue_rate_limiter
@@ -7055,20 +7116,72 @@ impl WorkflowService {
                 }
                 // The runtime evaluates durable rules when the broker offer is about to become a
                 // Started transition. Poll admission deliberately carries no CRUD-gate decision.
-                let started = crate::grpc::activity_dispatch::FORWARDED_ACTIVITY_POLL
-                    .scope(
-                        forwarding,
-                        tokeira_runtime::scope_activity_start_response(
-                            preflight,
-                            self.runtime.poll_activity_task_within(
-                                internal.queue,
-                                internal.worker_identity,
-                                deadline.saturating_duration_since(tokio::time::Instant::now()),
-                                caller_deadline,
-                            ),
-                        ),
-                    )
-                    .await;
+                let started = loop {
+                    let mut wake_result = None;
+                    let poll = async {
+                        if let Some(bridge) = standalone {
+                            self.runtime
+                                .poll_activity_task_until_woken(
+                                    internal.queue.clone(),
+                                    internal.worker_identity.clone(),
+                                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                                    caller_deadline,
+                                    Box::pin(async {
+                                        wake_result = Some(
+                                            bridge
+                                                .wait_for_pollable_activity(
+                                                    &internal.queue.task_queue.0,
+                                                    target.as_ref(),
+                                                )
+                                                .await,
+                                        );
+                                    }),
+                                )
+                                .await
+                        } else {
+                            self.runtime
+                                .poll_activity_task_within(
+                                    internal.queue.clone(),
+                                    internal.worker_identity.clone(),
+                                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                                    caller_deadline,
+                                )
+                                .await
+                        }
+                    };
+                    let started = crate::grpc::activity_dispatch::FORWARDED_ACTIVITY_POLL
+                        .scope(
+                            forwarding.clone(),
+                            tokeira_runtime::scope_activity_start_response(preflight.clone(), poll),
+                        )
+                        .await;
+                    // The runtime observes the wake only with no offer held. A start
+                    // that wins must be served even if standalone work arrived meanwhile.
+                    if !matches!(started, Ok(None)) {
+                        break started;
+                    }
+                    let Some(wake_result) = wake_result else {
+                        break started;
+                    };
+                    wake_result?;
+                    if tokio::time::Instant::now() >= deadline {
+                        break Ok(None);
+                    }
+                    if let Some(bridge) = standalone
+                        && let Some(task) = bridge
+                            .poll_activity_task(
+                                &internal.queue.task_queue.0,
+                                &internal.worker_identity.0,
+                                target.as_ref(),
+                            )
+                            .await?
+                    {
+                        poller.completed(self.clock().now());
+                        return Ok(ActivityPollResult::Standalone(task));
+                    }
+                    // Another poller or a stale dispatch can consume the wake. Keep
+                    // this poll's original deadline, admission, rate slot and permit.
+                };
                 // A normal empty result is the long-poll timeout path and must
                 // refresh, while client cancellation drops the future before
                 // this explicit completion (`task_queue_partition_manager.go:
@@ -7102,9 +7215,9 @@ impl WorkflowService {
                             )
                             .await?;
                         }
-                        Ok(Some(response))
+                        Ok(ActivityPollResult::Workflow(Some(response)))
                     }
-                    None => Ok(None),
+                    None => Ok(ActivityPollResult::Workflow(None)),
                 }
             },
         )

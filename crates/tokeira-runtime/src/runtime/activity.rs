@@ -364,6 +364,29 @@ where
         timeout_after: tokio::time::Duration,
         caller_deadline: Option<tokio::time::Instant>,
     ) -> Result<Option<StartedActivityTask>> {
+        self.poll_activity_task_until_woken(
+            queue,
+            worker_identity,
+            timeout_after,
+            caller_deadline,
+            std::future::pending(),
+        )
+        .await
+    }
+
+    /// Poll with an additional wake that ends only an empty offer wait.
+    ///
+    /// Once an offer is acquired, its lease and start finish under the ordinary
+    /// start budget. The wake cannot cancel a claim or discard its response.
+    pub async fn poll_activity_task_until_woken(
+        &self,
+        queue: QueueKey,
+        worker_identity: WorkerIdentity,
+        timeout_after: tokio::time::Duration,
+        caller_deadline: Option<tokio::time::Instant>,
+        wake: impl std::future::Future<Output = ()> + Send,
+    ) -> Result<Option<StartedActivityTask>> {
+        tokio::pin!(wake);
         let deadline = tokio::time::Instant::now() + timeout_after;
         loop {
             let now = tokio::time::Instant::now();
@@ -371,7 +394,12 @@ where
                 return Ok(None);
             }
             let Some(offer) = self
-                .poll_activity_task_offer(queue.clone(), worker_identity.clone(), deadline - now)
+                .poll_activity_task_offer_until_woken(
+                    queue.clone(),
+                    worker_identity.clone(),
+                    deadline - now,
+                    wake.as_mut(),
+                )
                 .await?
             else {
                 return Ok(None);
@@ -484,6 +512,22 @@ where
         worker_identity: WorkerIdentity,
         timeout_after: tokio::time::Duration,
     ) -> Result<Option<ActivityTaskOffer>> {
+        self.poll_activity_task_offer_until_woken(
+            queue,
+            worker_identity,
+            timeout_after,
+            std::future::pending(),
+        )
+        .await
+    }
+
+    async fn poll_activity_task_offer_until_woken(
+        &self,
+        queue: QueueKey,
+        worker_identity: WorkerIdentity,
+        timeout_after: tokio::time::Duration,
+        wake: impl std::future::Future<Output = ()> + Send,
+    ) -> Result<Option<ActivityTaskOffer>> {
         self.ready().await?;
         let home =
             crate::discovery::QueueHomeProvider::local_home(self.discovery.1.as_ref(), &queue)
@@ -493,17 +537,26 @@ where
             home,
             tokio::time::Instant::now(),
         )?;
-        match self
+        // A wake ends the wait because other work became pollable, not because
+        // the poll timed out, so it records neither outcome.
+        let mut woken = false;
+        let wake = async {
+            wake.await;
+            woken = true;
+        };
+        let offer = self
             .activity_broker
-            .poll_activity_offer_for_worker(&queue, &worker_identity, timeout_after)
-            .await?
-        {
+            .poll_activity_offer_until_woken(&queue, &worker_identity, timeout_after, wake)
+            .await?;
+        match offer {
             Some(offer) => {
                 self.delivery_metrics.record_poll_success(&queue);
                 Ok(Some(offer))
             }
             None => {
-                self.delivery_metrics.record_poll_timeout(&queue);
+                if !woken {
+                    self.delivery_metrics.record_poll_timeout(&queue);
+                }
                 Ok(None)
             }
         }

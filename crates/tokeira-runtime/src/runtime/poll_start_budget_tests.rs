@@ -138,3 +138,65 @@ async fn workflow_task_start_never_runs_past_the_caller_deadline() {
     );
     assert_eq!(tokio::time::Instant::now(), caller_deadline);
 }
+
+#[tokio::test(start_paused = true)]
+async fn activity_empty_offer_wait_can_be_woken_without_a_claim() {
+    let (_, runtime, mut queue, _) = started_workflow().await;
+    queue.task_kind = TaskKind::Activity;
+    let wake = tokio::sync::Notify::new();
+    let entered = tokio::time::Instant::now();
+    let poll = runtime.poll_activity_task_until_woken(
+        queue.clone(),
+        WorkerIdentity("worker".into()),
+        WAIT,
+        None,
+        wake.notified(),
+    );
+    tokio::pin!(poll);
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(
+            std::future::Future::poll(poll.as_mut(), cx).is_pending()
+        ))
+        .await
+    );
+    wake.notify_one();
+    assert!(poll.await.unwrap().is_none());
+    assert_eq!(entered.elapsed(), std::time::Duration::ZERO);
+    // A woken wait is not a poll timeout: the queue's poll success rate keeps
+    // its no-evidence value rather than recording a failure.
+    let poll_success_rate = runtime
+        .delivery_metrics
+        .peek_snapshot()
+        .queues
+        .get(&queue)
+        .map_or(1.0, |metrics| metrics.poll_success_rate);
+    assert_eq!(poll_success_rate, 1.0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn activity_wake_during_start_keeps_the_acquired_offer() {
+    let (repo, runtime, queue) = scheduled_activity().await;
+    let (entered, release) = repo.pause(Point::Load);
+    let wake = tokio::sync::Notify::new();
+    let poll = runtime.poll_activity_task_until_woken(
+        queue.clone(),
+        WorkerIdentity("worker".into()),
+        WAIT,
+        None,
+        wake.notified(),
+    );
+    let arrival = async {
+        entered.await.unwrap();
+        wake.notify_one();
+        release.send(()).unwrap();
+    };
+    let (response, ()) = tokio::join!(poll, arrival);
+    assert_eq!(response.unwrap().unwrap().activity_id, "slow");
+    assert!(
+        runtime
+            .poll_activity_task(queue, WorkerIdentity("worker".into()), WAIT)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

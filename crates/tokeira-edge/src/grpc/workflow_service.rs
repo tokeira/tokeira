@@ -15,7 +15,6 @@ use tonic::{Request, Response, Status, codec::CompressionEncoding};
 use tracing::debug;
 
 use time::OffsetDateTime;
-use tokeira_chasm::DeploymentVersionTarget;
 use tokeira_projection::{STANDARD_SEARCH_ATTRIBUTES, SearchAttrType};
 use tokeira_proto::{
     enums::{IndexedValueType, TaskQueueType},
@@ -1291,19 +1290,9 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             .inner
             .admit_activity_task_queue_poll(&headers, &edge_req)
             .await?;
-        let admitted = context
-            .claims
-            .as_ref()
-            .and_then(|claims| claims.worker_scope.as_ref())
-            .map(|scope| DeploymentVersionTarget {
-                deployment_name: scope.deployment_name().to_owned(),
-                build_id: scope.build_id().to_owned(),
-            });
         // Answer empty at once when the caller's deadline leaves no more than the tail
-        // room, after admission as v1.31.0's frontend does (`PollActivityTaskQueue` in
-        // `service/frontend/workflow_handler.go @ v1.31.0`). The standalone wait below
-        // ends at the same deadline; the workflow-activity path derives its own from
-        // the same request.
+        // room, after admission (service/frontend/workflow_handler.go:1313-1315
+        // @ v1.31.0). Standalone availability and workflow offers share this deadline.
         let entered = tokio::time::Instant::now();
         let Some(poll_deadline) = crate::long_poll::task_poll_deadline(
             edge_req.caller_deadline,
@@ -1314,27 +1303,22 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 workflowservice::PollActivityTaskQueueResponse::default(),
             ));
         };
-        // CHASM-first: serve a queued standalone-activity task if one is waiting on
-        // this task queue, before falling through to the workflow-activity path
-        // (the two share this RPC). Only authenticated scope supplies an admitted
-        // version; unscoped poll fields cannot claim internally targeted work.
-        if let Some(bridge) = &self.chasm_activity
-            && bridge.is_enabled()
-        {
-            let task_queue = req
-                .task_queue
-                .as_ref()
-                .map(|q| q.name.clone())
-                .unwrap_or_default();
-            if let Some(task) = bridge
-                .poll_activity_task_waiting(
-                    &task_queue,
-                    &req.identity,
-                    admitted.as_ref(),
-                    poll_deadline,
-                )
-                .await?
-            {
+        let task_queue = edge_req.task_queue.clone();
+        let edge_resp = self
+            .inner
+            .poll_activity_task_queue_admitted(
+                &headers,
+                edge_req,
+                context.clone(),
+                self.chasm_activity
+                    .as_deref()
+                    .filter(|bridge| bridge.is_enabled()),
+                poll_deadline,
+            )
+            .await?;
+        let edge_resp = match edge_resp {
+            crate::workflow_service::ActivityPollResult::Workflow(response) => response,
+            crate::workflow_service::ActivityPollResult::Standalone(task) => {
                 if let Some(target) = &task.version_target {
                     let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
                     // Provenance is a storage lifetime judged on the node's clock: get()
@@ -1374,20 +1358,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                     task,
                 )));
             }
-            // A standalone wait that used up the poll's budget answers empty rather
-            // than starting a second wait on the workflow-activity path. A zero
-            // budget waited for nothing, so it still tries that path once.
-            if poll_deadline > entered && tokio::time::Instant::now() >= poll_deadline {
-                return Ok(Response::new(
-                    workflowservice::PollActivityTaskQueueResponse::default(),
-                ));
-            }
-        }
-        debug!(task_queue = %edge_req.task_queue, "poll_activity_task_queue");
-        let edge_resp = self
-            .inner
-            .poll_activity_task_queue_admitted(&headers, edge_req, context)
-            .await?;
+        };
 
         let has_task = edge_resp.is_some();
         debug!(has_task, "poll_activity_task_queue response");

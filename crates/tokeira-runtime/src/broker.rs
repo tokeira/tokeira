@@ -3263,6 +3263,21 @@ impl InMemoryActivityBroker {
         worker: &WorkerIdentity,
         wait_for: Duration,
     ) -> Result<Option<crate::runtime::ActivityTaskOffer>> {
+        self.poll_activity_offer_until_woken(queue, worker, wait_for, std::future::pending())
+            .await
+    }
+
+    /// End an empty offer wait when another activity source becomes pollable.
+    /// Acquiring an offer is never raced against the wake: `try_take` can reserve
+    /// a rate slot and lease, so it must finish before the wake is considered.
+    pub(crate) async fn poll_activity_offer_until_woken(
+        &self,
+        queue: &QueueKey,
+        worker: &WorkerIdentity,
+        wait_for: Duration,
+        wake_other: impl std::future::Future<Output = ()> + Send,
+    ) -> Result<Option<crate::runtime::ActivityTaskOffer>> {
+        tokio::pin!(wake_other);
         if self.is_denied(queue, worker).await {
             return Ok(None);
         }
@@ -3303,6 +3318,7 @@ impl InMemoryActivityBroker {
                 ActivityTakeOutcome::Blocked | ActivityTakeOutcome::Empty => remaining,
             };
             tokio::select! {
+                _ = &mut wake_other => break Ok(None),
                 _ = notified.as_mut() => {}
                 _ = changed.as_mut() => {}
                 _ = tokio::time::sleep(rate_wait.min(remaining)) => {}

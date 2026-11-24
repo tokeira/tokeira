@@ -53,10 +53,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     lane::LaneHandle,
     metrics as runtime_metrics,
-    retry::{RetryDecision, evaluate_activity_retry},
     runtime::{
-        ActivityRetryDeps, ActivityRetryTarget, commit_activity_retry,
-        exhausted_reason_to_retry_state,
+        ActivityRetryDecision, ActivityRetryDeps, ActivityRetryOutcome, ActivityRetryTarget,
+        activity_retry_decision, commit_activity_retry,
     },
     scanner::pick_lane_for_run_key,
 };
@@ -928,88 +927,73 @@ pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
             continue;
         };
 
-        // A firing timeout runs the retry machinery FIRST; only a terminal
-        // retry state resolves the activity to its workflow
-        // (`processSingleActivityTimeoutTask`,
-        // timer_queue_active_task_executor.go:281-362 @ v1.31.0).
-        // ScheduleToStart / ScheduleToClose are server-enforced deadlines and
-        // never retried — they short-circuit to RETRY_STATE_TIMEOUT — and a
-        // requested cancel likewise suppresses retry
-        // (RETRY_STATE_CANCEL_REQUESTED) (`RetryActivity`,
-        // mutable_state_impl.go:6235-6266 @ v1.31.0).
-        let mut exhausted_reason = None;
         let retry_policy = activity
             .retry_policy
             .clone()
             .or_else(|| state.retry_policy.clone());
-        if matches!(
-            violation,
-            TimeoutViolation::StartToClose | TimeoutViolation::Heartbeat
-        ) && !entry.cancel_requested
-            && let Some(policy) = retry_policy.as_ref()
-        {
-            // Retry-expiration anchor: the FIRST schedule + schedule-to-close
-            // (the deadline spans the whole retry chain;
-            // `retry.go:108-110 @ v1.31.0`).
-            let expiration = activity
-                .schedule_to_close_timeout
-                .filter(|timeout| !timeout.is_zero())
-                .map(|timeout| deadline_after(activity.scheduled_at, timeout));
-            // Timeout failures classify against the non-retryable list as
-            // "TemporalTimeout:<type>" (`isRetryable`, retry.go:124-133 +
-            // retrypolicy.TimeoutFailureTypePrefix @ v1.31.0).
-            let error_type = format!("TemporalTimeout:{}", timeout_type_name(violation));
-            match evaluate_activity_retry(
-                policy,
-                activity.attempt,
-                Some(&error_type),
-                false,
-                now,
-                expiration,
-            ) {
-                RetryDecision::Retry {
+        // A firing timeout runs the retry machinery FIRST; only a terminal
+        // retry state resolves the activity to its workflow
+        // (`processSingleActivityTimeoutTask`,
+        // timer_queue_active_task_executor.go:302-316 @ v1.31.0). The decision
+        // is the one worker failures use: it reads the activity's durable
+        // cancel bit, so a stale tracking flag cannot allow another attempt.
+        // Timeout failures classify against the non-retryable list as
+        // "TemporalTimeout:<type>" (`isRetryable`, retry.go:124-132 +
+        // retrypolicy.TimeoutFailureTypePrefix @ v1.31.0).
+        let error_type = format!("TemporalTimeout:{}", timeout_type_name(violation));
+        let retry_state = match activity_retry_decision(
+            &activity,
+            retry_policy.as_ref(),
+            Some(&error_type),
+            false,
+            matches!(
+                violation,
+                TimeoutViolation::ScheduleToStart | TimeoutViolation::ScheduleToClose
+            ),
+            now,
+        ) {
+            ActivityRetryDecision::Retry {
+                next_attempt,
+                backoff,
+            } => {
+                // A retry's post-commit tracking belongs to the scan's
+                // acquisition. Its update carries the image the retry
+                // committed, so a reply that arrives after a later start or
+                // heartbeat reached the entry cannot undo them.
+                let mut retry_deps = deps.clone();
+                retry_deps.tracking = tracked.acquisition().map_or_else(
+                    || tracking.clone(),
+                    |acquisition| tracking.for_acquisition(acquisition),
+                );
+                let result = commit_activity_retry(
+                    &retry_deps,
+                    ActivityRetryTarget {
+                        run_key: entry.run_key,
+                        activity_id: &entry.activity_id,
+                        expected_attempt: activity.attempt,
+                        expected_schedule_event_id: activity.schedule_event_id,
+                        timeout: Some(ActivityTimeoutCheck::new(
+                            &activity,
+                            violation,
+                            state.transition_seq,
+                            now,
+                        )),
+                    },
                     next_attempt,
                     backoff,
-                } => {
-                    // A retry's post-commit tracking belongs to the scan's
-                    // acquisition. Its update carries the image the retry
-                    // committed, so a reply that arrives after a later start or
-                    // heartbeat reached the entry cannot undo them.
-                    let mut retry_deps = deps.clone();
-                    retry_deps.tracking = tracked.acquisition().map_or_else(
-                        || tracking.clone(),
-                        |acquisition| tracking.for_acquisition(acquisition),
-                    );
-                    let result = commit_activity_retry(
-                        &retry_deps,
-                        ActivityRetryTarget {
-                            run_key: entry.run_key,
-                            activity_id: &entry.activity_id,
-                            expected_attempt: activity.attempt,
-                            expected_schedule_event_id: activity.schedule_event_id,
-                            timeout: Some(ActivityTimeoutCheck::new(
-                                &activity,
-                                violation,
-                                state.transition_seq,
-                                now,
-                            )),
-                        },
-                        next_attempt,
-                        backoff,
-                        // The timed-out attempt's failure becomes durable retry
-                        // bookkeeping (`RetryLastFailure`), surfaced by Describe
-                        // (`processSingleActivityTimeoutTask` builds it via
-                        // `failure.NewTimeoutFailure` @ v1.31.0).
-                        Some(timeout_failure_payload(violation)),
-                        // A timeout carries no worker progress.
-                        None,
-                    )
-                    .await;
-                    match result {
-                        Ok(()) => {
-                            runtime_metrics::record_activity_task_retry(OutcomeLabel::Success);
-                        }
-                        Err(error) => {
+                    // The timed-out attempt's failure becomes durable retry
+                    // bookkeeping (`RetryLastFailure`), surfaced by Describe
+                    // (`processSingleActivityTimeoutTask` builds it via
+                    // `failure.NewTimeoutFailure` @ v1.31.0).
+                    Some(timeout_failure_payload(violation)),
+                    // A timeout carries no worker progress.
+                    None,
+                )
+                .await;
+                match result {
+                    Ok(ActivityRetryOutcome::CancelRequested) => RetryState::CancelRequested,
+                    other => {
+                        if let Err(error) = other {
                             match error.downcast_ref::<ActivityTimeoutRejection>() {
                                 Some(ActivityTimeoutRejection::Stale) => {
                                     tracking.inner.request_refresh(
@@ -1034,40 +1018,19 @@ pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
                                 activity_id = entry.activity_id,
                                 "activity timeout scanner failed to commit retry"
                             );
+                        } else {
+                            runtime_metrics::record_activity_task_retry(OutcomeLabel::Success);
                         }
+                        runtime_metrics::record_scanner_dispatched(
+                            "activity_timeout",
+                            entry.shard_id.0,
+                        );
+                        submitted += 1;
+                        continue;
                     }
-                    runtime_metrics::record_scanner_dispatched(
-                        "activity_timeout",
-                        entry.shard_id.0,
-                    );
-                    submitted += 1;
-                    continue;
                 }
-                RetryDecision::Exhausted { reason } => exhausted_reason = Some(reason),
             }
-        }
-
-        // Why retries stopped, mirroring `RetryActivity`'s derivation order
-        // (mutable_state_impl.go:6243-6270 @ v1.31.0): no policy →
-        // RETRY_POLICY_NOT_SET; a requested cancel → CANCEL_REQUESTED; the
-        // server-deadline types → TIMEOUT; otherwise the exhaustion reason
-        // from `nextBackoffInterval` (retry.go:96-110).
-        let retry_state = if retry_policy.is_none() {
-            RetryState::RetryPolicyNotSet
-        } else if entry.cancel_requested {
-            RetryState::CancelRequested
-        } else if matches!(
-            violation,
-            TimeoutViolation::ScheduleToStart | TimeoutViolation::ScheduleToClose
-        ) {
-            RetryState::Timeout
-        } else {
-            match exhausted_reason {
-                Some(reason) => exhausted_reason_to_retry_state(reason),
-                // Unreachable in practice: a retryable violation with a policy
-                // and no cancel either retried (`continue` above) or exhausted.
-                None => RetryState::Timeout,
-            }
+            ActivityRetryDecision::Terminal(retry_state) => retry_state,
         };
         // Terminal: resolve as timed out. Whenever the retry state is TIMEOUT
         // ("no time for another attempt") the failure AND type convert to

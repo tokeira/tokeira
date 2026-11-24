@@ -60,6 +60,8 @@ flowchart TD
 
 **Retry evaluation in the runtime, not the kernel.** The kernel should only see terminal activity outcomes. Retry logic (max_attempts check, non_retryable_error_types check, backoff computation) lives in a pure function in the runtime crate. The retry policy is obtained from `ActivityState.retry_policy` (per-activity), falling back to `WorkflowState.retry_policy` (workflow-level) if no per-activity policy is set. This requires extending `ActivityState` with the `retry_policy` field as a prerequisite (Requirement 0). When retry is permitted, the runtime publishes a new activity task to the broker with an incremented attempt — no kernel command, no history event. When retry is exhausted, the runtime submits `Command::ActivityResolved` with a `Failed` resolution through the lane.
 
+Worker failures and timeout scanning share the retry decision: no policy returns `RETRY_POLICY_NOT_SET`; otherwise the loaded activity's durable `cancel_requested` bit returns `CANCEL_REQUESTED` before other retry conditions (`service/history/workflow/mutable_state_impl.go:6243-6248 @ v1.31.0`). The retry commit rechecks that bit after reloading and validating the attempt and schedule event on every OCC attempt. A typed cancellation outcome sends the original failure back through the caller's existing fenced terminal path, including timeout revalidation (`service/history/api/respondactivitytaskfailed/api.go:105-118 @ v1.31.0`). Cancellation retains the original timeout type; only `TIMEOUT` converts it to schedule-to-close (`service/history/timer_queue_active_task_executor.go:302-316 @ v1.31.0`). The tracking flag is only a heartbeat delivery aid.
+
 **Token validation before any mutation.** Every `complete_activity_task` and `fail_activity_task` call validates the `ActivityTaskToken` against the current `ActivityState` before doing anything. The three checks are: (1) `activity_id` exists in the run's activities map, (2) `attempt` matches the current attempt, (3) `shard_epoch` matches the current epoch. If any check fails, the request is rejected with an error. Note: until shard lease ownership is implemented (Feature 11), `shard_epoch` is always `ShardEpoch::ZERO` and the epoch check is a no-op.
 
 **Deduplication in the activity broker by `(run_key, activity_id, attempt)`.** This is the natural composite key because a single activity can have multiple attempts over its lifetime, and each attempt is a distinct deliverable unit. This differs from the workflow broker which deduplicates by `(run_key, logical_seq)`.
@@ -389,6 +391,12 @@ Input: ActivityTaskToken { run_key, activity_id, schedule_event_id, attempt, sha
 *For any* activity task published to the broker and a poller on the matching queue, when the activity-task-start transaction succeeds, the returned `StartedActivityTask` shall contain an `ActivityTaskToken` whose `run_key`, `activity_id`, `schedule_event_id`, `attempt`, and `shard_epoch` match the activity's current state.
 
 **Validates: Requirements 2.2, 2.4, 2.5**
+
+### Property 14: Cancellation stops retries
+
+*For any* activity failure or timeout, the shared retry decision shall check policy presence, then the activity's durable cancellation bit, before other retry conditions. Without a policy it shall return `RETRY_POLICY_NOT_SET`; with a policy and a cancellation request it shall return `CANCEL_REQUESTED`, whatever the failure's retryability, the attempt and expiration budgets, or the pause state (`service/history/workflow/mutable_state_impl.go:6243-6248 @ v1.31.0`). A cancellation that commits between the decision and the retry's commit shall likewise prevent the retry and produce exactly one terminal activity event through the caller's fenced resolution, keeping the original failure or timeout type. An unlimited attempt count shall not override cancellation or expiration.
+
+**Validates: Requirements 5.3, 5.6, 5.7, 5.8**
 
 ## Error Handling
 

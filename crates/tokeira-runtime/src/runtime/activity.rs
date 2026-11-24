@@ -198,6 +198,70 @@ pub(crate) fn exhausted_reason_to_retry_state(reason: RetryExhaustedReason) -> R
     }
 }
 
+/// Whether a failed or timed-out activity attempt retries, and if not, why.
+#[derive(Debug)]
+pub(crate) enum ActivityRetryDecision {
+    /// Prepare another attempt; the commit must revalidate its durable target.
+    Retry {
+        next_attempt: u32,
+        backoff: Duration,
+    },
+    /// Resolve through the caller's original failure or timeout path.
+    Terminal(RetryState),
+}
+
+/// The retry decision that worker failures and the timeout scan share.
+///
+/// It reads the loaded activity's durable `cancel_requested` bit, never the
+/// tracking entry's flag, which only helps deliver a cancel to a heartbeat.
+pub(crate) fn activity_retry_decision(
+    activity: &tokeira_kernel::ActivityState,
+    retry_policy: Option<&RetryPolicy>,
+    failure_error_type: Option<&str>,
+    is_non_retryable: bool,
+    server_deadline: bool,
+    now: OffsetDateTime,
+) -> ActivityRetryDecision {
+    // `RetryActivity`'s order: no policy → RETRY_POLICY_NOT_SET, then a
+    // requested cancel → CANCEL_REQUESTED, then the server-enforced
+    // schedule-to-start and schedule-to-close deadlines → TIMEOUT, all before
+    // retryability and the backoff (mutable_state_impl.go:6243-6266 @ v1.31.0).
+    let Some(policy) = retry_policy else {
+        return ActivityRetryDecision::Terminal(RetryState::RetryPolicyNotSet);
+    };
+    if activity.cancel_requested {
+        return ActivityRetryDecision::Terminal(RetryState::CancelRequested);
+    }
+    if server_deadline {
+        return ActivityRetryDecision::Terminal(RetryState::Timeout);
+    }
+    // Retry-expiration anchor: the FIRST schedule + schedule-to-close (the
+    // deadline spans the whole retry chain; `retry.go:109-111 @ v1.31.0`).
+    let expiration = activity
+        .schedule_to_close_timeout
+        .filter(|timeout| !timeout.is_zero())
+        .map(|timeout| deadline_after(activity.scheduled_at, timeout));
+    match evaluate_activity_retry(
+        policy,
+        activity.attempt,
+        failure_error_type,
+        is_non_retryable,
+        now,
+        expiration,
+    ) {
+        RetryDecision::Retry {
+            next_attempt,
+            backoff,
+        } => ActivityRetryDecision::Retry {
+            next_attempt,
+            backoff,
+        },
+        RetryDecision::Exhausted { reason } => {
+            ActivityRetryDecision::Terminal(exhausted_reason_to_retry_state(reason))
+        }
+    }
+}
+
 impl<R> TokeiraRuntime<R>
 where
     R: RunRepository + 'static,
@@ -635,59 +699,48 @@ where
         let activity_id = token.activity_id.clone();
         let retry_policy = activity.retry_policy.clone().or(workflow_retry_policy);
 
-        // Retry-expiration anchor: the FIRST schedule + schedule-to-close (the
-        // deadline spans the whole retry chain; `retry.go:108-110 @ v1.31.0`).
-        let now = self.clock.now();
-        let expiration = activity
-            .schedule_to_close_timeout
-            .filter(|timeout| !timeout.is_zero())
-            .map(|timeout| deadline_after(activity.scheduled_at, timeout));
-        let should_retry = retry_policy.as_ref().map(|policy| {
-            evaluate_activity_retry(
-                policy,
-                activity.attempt,
-                failure_error_type.as_deref(),
-                is_non_retryable,
-                now,
-                expiration,
-            )
-        });
+        let decision = activity_retry_decision(
+            &activity,
+            retry_policy.as_ref(),
+            failure_error_type.as_deref(),
+            is_non_retryable,
+            false,
+            self.clock.now(),
+        );
 
-        if let Some(RetryDecision::Retry {
-            next_attempt,
-            backoff,
-        }) = should_retry
-        {
-            match self
-                .retry_activity_task(
-                    &token,
-                    next_attempt,
-                    backoff,
-                    Some(failure.clone()),
-                    last_heartbeat_details,
-                )
-                .await
-            {
-                Ok(()) => runtime_metrics::record_activity_task_retry(OutcomeLabel::Success),
-                Err(error) => {
-                    runtime_metrics::record_activity_task_retry(OutcomeLabel::Failure);
-                    return Err(error);
+        let retry_state = match decision {
+            ActivityRetryDecision::Retry {
+                next_attempt,
+                backoff,
+            } => {
+                match self
+                    .retry_activity_task(
+                        &token,
+                        next_attempt,
+                        backoff,
+                        Some(failure.clone()),
+                        last_heartbeat_details,
+                    )
+                    .await
+                {
+                    Ok(ActivityRetryOutcome::Committed) => {
+                        runtime_metrics::record_activity_task_retry(OutcomeLabel::Success);
+                        return Ok(());
+                    }
+                    Ok(ActivityRetryOutcome::CancelRequested) => RetryState::CancelRequested,
+                    Err(error) => {
+                        runtime_metrics::record_activity_task_retry(OutcomeLabel::Failure);
+                        return Err(error);
+                    }
                 }
             }
-            return Ok(());
-        }
-
-        // Terminal failure: the resolution carries WHY retries stopped
-        // (`RetryActivity` → `AddActivityTaskFailedEvent(..., retryState)`,
-        // mutable_state_impl.go:6235-6320 @ v1.31.0). No policy →
-        // RETRY_POLICY_NOT_SET. CANCEL_REQUESTED lands with kernel raise K4
-        // (durable cancel_requested).
-        let retry_state = match should_retry {
-            None => RetryState::RetryPolicyNotSet,
-            Some(RetryDecision::Exhausted { reason }) => exhausted_reason_to_retry_state(reason),
-            // `Retry` returned above.
-            Some(RetryDecision::Retry { .. }) => unreachable!("retry path returns early"),
+            ActivityRetryDecision::Terminal(retry_state) => retry_state,
         };
+        // Terminal failure: the resolution carries why retries stopped
+        // (`RetryActivity` → `AddActivityTaskFailedEvent(..., retryState)`,
+        // respondactivitytaskfailed/api.go:105-118 @ v1.31.0). A cancel that
+        // committed before the retry could ends the attempt the same way, with
+        // the worker's failure, through the same fenced lane transition.
         let result = self
             .submit_for_owned_home(
                 token.run_key,
@@ -1887,7 +1940,7 @@ where
         backoff: time::Duration,
         failure: Option<Payload>,
         progress: Option<Payloads>,
-    ) -> Result<()> {
+    ) -> Result<ActivityRetryOutcome> {
         commit_activity_retry(
             &self.activity_retry_deps(),
             ActivityRetryTarget {
@@ -2024,6 +2077,15 @@ pub(crate) struct ActivityRetryTarget<'a> {
     pub timeout: Option<crate::activity_timeout::ActivityTimeoutCheck>,
 }
 
+/// Whether retry committed or a concurrent cancellation requires terminal resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActivityRetryOutcome {
+    /// The next attempt is durable.
+    Committed,
+    /// The matching attempt must resolve with the caller's original failure kind.
+    CancelRequested,
+}
+
 /// Commit an activity's next attempt and durable eligibility time.
 ///
 /// Canonical storage maintenance retains the future attempt's row; owner
@@ -2042,7 +2104,7 @@ pub(crate) async fn commit_activity_retry<R>(
     backoff: time::Duration,
     failure: Option<Payload>,
     progress: Option<Payloads>,
-) -> Result<()>
+) -> Result<ActivityRetryOutcome>
 where
     R: RunRepository + 'static,
 {
@@ -2075,6 +2137,14 @@ where
             || current.schedule_event_id != target.expected_schedule_event_id
         {
             return Err(anyhow!("stale activity token for retry"));
+        }
+        // Recheck on every OCC attempt: a workflow cancellation can commit
+        // after the caller decided to retry. The caller then resolves this
+        // attempt with its original failure kind, through its own terminal
+        // fence, instead of advancing it (`RetryActivity` checks the cancel
+        // first, mutable_state_impl.go:6246-6248 @ v1.31.0).
+        if current.cancel_requested {
+            return Ok(ActivityRetryOutcome::CancelRequested);
         }
 
         let mut next_state = state.clone();
@@ -2256,7 +2326,7 @@ where
                 let tracking = deps.tracking.for_acquisition(acquisition);
                 if paused {
                     tracking.remove_committed(run_key, activity_id, new_state.transition_seq);
-                    return Ok(());
+                    return Ok(ActivityRetryOutcome::Committed);
                 }
                 // The update carries the image this retry committed. A later
                 // start or heartbeat whose update already landed holds a later
@@ -2271,7 +2341,7 @@ where
                 tracking.eligibility.pause_after_refresh().await;
                 // The committed canonical row is discoverable independently of
                 // this callback; eligibility tracking applies later owner rules.
-                return Ok(());
+                return Ok(ActivityRetryOutcome::Committed);
             }
             CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
                 if attempts >= deps.max_occ_retries {
@@ -2279,7 +2349,7 @@ where
                 }
                 attempts += 1;
             }
-            CommitResult::Duplicate => return Ok(()),
+            CommitResult::Duplicate => return Ok(ActivityRetryOutcome::Committed),
         }
     }
 }

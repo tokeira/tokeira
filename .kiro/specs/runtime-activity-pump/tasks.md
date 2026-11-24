@@ -232,6 +232,21 @@ Add the activity task delivery pipeline to `tokeira-runtime`, completing the sec
 - [x] 15. Final checkpoint — Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
+- [x] 16. Stop retrying an activity once its cancellation is requested
+  - [x] 16.1 Share one retry decision between worker failures and the timeout scan
+    - `activity_retry_decision` in `runtime/activity.rs` returns `RETRY_POLICY_NOT_SET` without a policy, then `CANCEL_REQUESTED` when the loaded activity's durable `cancel_requested` bit is set, then the existing evaluation; `fail_activity_task_inner` and the timeout scan both use it, and the tracking flag stays a heartbeat delivery aid
+    - _Requirements: 5.3, 5.6, 5.7_
+  - [x] 16.2 Recheck cancellation when the retry commits
+    - `commit_activity_retry` returns `ActivityRetryOutcome::CancelRequested` when the reloaded activity's bit is set; the caller resolves the attempt through its existing fenced terminal path with `CANCEL_REQUESTED`, keeping the worker's failure or the timeout failure and its type
+    - _Requirements: 5.8_
+  - [x] 16.3 Write property test: Cancellation stops retries
+    - **Property 14: Cancellation stops retries**
+    - Generate at least 100 cases over policy presence, cancellation, failure retryability, attempt and expiration budgets, and pause state, and check each outcome against v1.31.0's order. Leave out a paused attempt that fails retryably with no budget left: v1.31.0 parks a paused attempt before checking its budget (`service/history/workflow/mutable_state_impl.go:6277-6297 @ v1.31.0`), and the runtime doesn't yet. Hold the retry's commit with a barrier while a cancellation commits, for a worker failure and for start-to-close and heartbeat timeouts, and check that exactly one terminal event follows, keeping the original failure or timeout type
+    - **Validates: Requirements 5.3, 5.6, 5.7, 5.8**
+  - [x] 16.4 Write integration tests through the worker-facing API
+    - Over gRPC, fail a cancel-requested activity by token and by id, and check that the waiting workflow gets the terminal activity event and then a workflow task
+    - _Requirements: 5.7_
+
 ## Notes
 
 - All property tests are required (not optional) — this is a correctness feature where the properties are the point.

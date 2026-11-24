@@ -992,6 +992,9 @@ pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
                 .await;
                 match result {
                     Ok(ActivityRetryOutcome::CancelRequested) => RetryState::CancelRequested,
+                    Ok(ActivityRetryOutcome::BudgetExhausted(reason)) => {
+                        crate::runtime::activity::exhausted_reason_to_retry_state(reason)
+                    }
                     other => {
                         if let Err(error) = other {
                             match error.downcast_ref::<ActivityTimeoutRejection>() {

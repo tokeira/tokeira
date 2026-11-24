@@ -1,0 +1,5 @@
+kind: fixed
+body: An activity that is paused when an attempt fails, or that a workflow rule pauses at that failure, now stays paused, as Temporal does, even when its retries are used up, instead of ending. Rules checked at a failure or timeout now see the attempt that failed.
+time: 2026-11-24T00:00:00Z
+custom:
+    Slice: 733d414b-0fe0-41bb-b677-eb898a1fb768

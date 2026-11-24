@@ -52,6 +52,8 @@
 //! | [`StartActivityTask::input`] | `temporal.api.common.v1.Payloads` |
 //! | [`StartActivityTask::header`] | `temporal.api.common.v1.Header` |
 //! | [`StartActivityTask::retry_policy`] | `temporal.api.common.v1.RetryPolicy`; empty selects the engine's defaults |
+//! | [`StartActivityTask::search_attributes`] | `temporal.api.common.v1.SearchAttributes`; empty means absent |
+//! | [`StartActivityTask::user_metadata`] | `temporal.api.sdk.v1.UserMetadata`; empty means absent |
 //! | [`TaskOutcome::Completed`] `payload` | `temporal.api.common.v1.Payloads` — the activity result |
 //! | [`TaskOutcome::Failed`] `failure` | `temporal.api.failure.v1.Failure` |
 //! | [`TaskOutcome::Canceled`] `details` | `temporal.api.common.v1.Payloads` — the worker's cancellation details |

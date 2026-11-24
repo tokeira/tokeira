@@ -6,20 +6,32 @@ use std::{
     collections::BTreeMap,
     sync::{
         Mutex,
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
 };
 use tokeira_chasm::{
     Component, Context, ContextMetadata, EngineComponent, FieldRegistry, Library, Lifecycle,
     LifecycleState, MutableContext, Registry, RootComponent, SearchAttributeProvider,
-    SearchAttributes, SideEffectTaskHandler, TaskKind, TaskValidity, TerminateReason,
-    VisibilityContributor, VisibilitySnapshot,
+    SearchAttributes as ComponentSearchAttributes, SideEffectTaskHandler, TaskKind, TaskValidity,
+    TerminateReason, VisibilityContributor, VisibilitySnapshot,
 };
 use tokeira_chasm_activity::{ActivityEvent, ActivityExecution, ActivityLibrary};
+use tokeira_projection::{
+    InMemoryVisibilityStore, VisibilityQueryService,
+    store::VisibilityStore,
+    types::SearchAttrType,
+    visibility_api::{
+        CountActivityExecutionsRequest, CountActivityExecutionsResponse,
+        CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse,
+        ListActivityExecutionsRequest, ListActivityExecutionsResponse,
+        ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse,
+    },
+};
 use tokeira_runtime::chasm::{CollectingVisibilitySink, DispatchMultiplexer, TypedEngine};
 use tokeira_storage::InMemoryChasmNodeStore;
 
 const SEC: i64 = 1_000_000_000;
+const NAMESPACE: &str = "00000000-0000-0000-0000-000000000001";
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct ParentData {
@@ -68,7 +80,7 @@ impl EngineComponent for Parent {
     }
 }
 impl SearchAttributeProvider for Parent {
-    fn search_attributes(&self) -> SearchAttributes {
+    fn search_attributes(&self) -> ComponentSearchAttributes {
         Vec::new()
     }
 }
@@ -234,7 +246,15 @@ impl Fixture {
         request: StartActivityTask,
         reject: bool,
     ) -> (ExecutionKey, ScheduledTask) {
-        let key = ExecutionKey::new("ns-id", "parent", "parent-run");
+        self.parent_in(NAMESPACE, request, reject).await
+    }
+    async fn parent_in(
+        &self,
+        namespace: &str,
+        request: StartActivityTask,
+        reject: bool,
+    ) -> (ExecutionKey, ScheduledTask) {
+        let key = ExecutionKey::new(namespace, "parent", "parent-run");
         TypedEngine::<Parent>::new(self.engine.clone())
             .start_with(
                 key.clone(),
@@ -280,7 +300,7 @@ impl Fixture {
         .unwrap()
     }
     async fn ready_callback(&self) -> (ExecutionKey, ScheduledTask) {
-        let key = ExecutionKey::new("ns-id", "activity", "run");
+        let key = ExecutionKey::new(NAMESPACE, "activity", "run");
         let data = ActivityState {
             activity_id: "activity".into(),
             task_queue: "queue".into(),
@@ -611,6 +631,18 @@ fn staged_request() -> StartActivityTask {
         schedule_to_close_nanos: 30 * SEC,
         start_to_close_nanos: 10 * SEC,
         heartbeat_nanos: SEC,
+        search_attributes: attributes(&[("ComponentId", b"\"parent\"".to_vec())]).encode_to_vec(),
+        user_metadata: UserMetadata {
+            summary: Some(tokeira_proto::common::Payload {
+                data: b"component activity".to_vec(),
+                ..Default::default()
+            }),
+            details: Some(tokeira_proto::common::Payload {
+                data: b"requested by parent".to_vec(),
+                ..Default::default()
+            }),
+        }
+        .encode_to_vec(),
         version_target: Some(tokeira_chasm::DeploymentVersionTarget {
             deployment_name: "deployment".into(),
             build_id: "build".into(),
@@ -631,17 +663,19 @@ async fn staged_start_is_idempotent_and_internal_delivery_resolves_parent_once()
     executor.execute(&parent, &task).await.unwrap();
     let run = fixture
         .bridge
-        .current_run("ns-id", "child")
+        .current_run(NAMESPACE, "child")
         .await
         .unwrap()
         .unwrap();
-    let key = ExecutionKey::new("ns-id", "child", run);
+    let key = ExecutionKey::new(NAMESPACE, "child", run);
     let before = fixture.state(&key).await;
     assert_eq!(before.activity_type, request.activity_type);
     assert_eq!(before.task_queue, request.task_queue);
     assert_eq!(before.input, request.input);
     assert_eq!(before.header, request.header);
     assert_eq!(before.retry_policy, request.retry_policy);
+    assert_eq!(before.search_attributes, request.search_attributes);
+    assert_eq!(before.user_metadata, request.user_metadata);
     assert_eq!(
         before.schedule_to_start_nanos,
         request.schedule_to_start_nanos
@@ -655,11 +689,7 @@ async fn staged_start_is_idempotent_and_internal_delivery_resolves_parent_once()
     assert_eq!(before.version_target, request.version_target);
     assert_eq!(before.maximum_attempts, 3);
     assert_eq!(before.retry_initial_interval_nanos, SEC);
-    assert!(
-        before.priority.is_empty()
-            && before.search_attributes.is_empty()
-            && before.user_metadata.is_empty()
-    );
+    assert!(before.priority.is_empty());
     executor.execute(&parent, &task).await.unwrap();
     assert_eq!(fixture.state(&key).await, before);
     assert_eq!(before.callbacks.len(), 1);
@@ -744,11 +774,11 @@ async fn internal_delivery_handles_already_applied_missing_and_rejected_targets(
         .await
         .unwrap();
         let key = ExecutionKey::new(
-            "ns-id",
+            NAMESPACE,
             "child",
             fixture
                 .bridge
-                .current_run("ns-id", "child")
+                .current_run(NAMESPACE, "child")
                 .await
                 .unwrap()
                 .unwrap(),
@@ -842,10 +872,258 @@ async fn invalid_start_reports_nonretryable_outcome_and_drops_staging_task() {
     assert!(
         fixture
             .bridge
-            .current_run("ns-id", "child")
+            .current_run(NAMESPACE, "child")
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+fn attributes(values: &[(&str, Vec<u8>)]) -> SearchAttributes {
+    SearchAttributes {
+        indexed_fields: values
+            .iter()
+            .map(|(name, data)| {
+                (
+                    (*name).to_owned(),
+                    tokeira_proto::common::Payload {
+                        metadata: [("encoding".to_owned(), b"json/plain".to_vec())].into(),
+                        data: data.clone(),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+struct RegistryFixture {
+    inner: VisibilityQueryService<InMemoryVisibilityStore>,
+    fail: AtomicBool,
+}
+
+impl RegistryFixture {
+    async fn new() -> Arc<Self> {
+        let store = InMemoryVisibilityStore::default();
+        store
+            .register_attr(
+                tokeira_types::NamespaceId(NAMESPACE.parse().unwrap()),
+                "ComponentId".into(),
+                SearchAttrType::Keyword,
+            )
+            .await
+            .unwrap();
+        Arc::new(Self {
+            inner: VisibilityQueryService::new(store),
+            fail: AtomicBool::new(false),
+        })
+    }
+}
+
+#[async_trait]
+impl VisibilityApi for RegistryFixture {
+    async fn list_workflows(
+        &self,
+        _: ListWorkflowExecutionsRequest,
+    ) -> anyhow::Result<ListWorkflowExecutionsResponse> {
+        unreachable!()
+    }
+    async fn count_workflows(
+        &self,
+        _: CountWorkflowExecutionsRequest,
+    ) -> anyhow::Result<CountWorkflowExecutionsResponse> {
+        unreachable!()
+    }
+    async fn list_activities(
+        &self,
+        _: tokeira_types::ArchetypeId,
+        _: ListActivityExecutionsRequest,
+    ) -> anyhow::Result<ListActivityExecutionsResponse> {
+        unreachable!()
+    }
+    async fn count_activities(
+        &self,
+        _: tokeira_types::ArchetypeId,
+        _: CountActivityExecutionsRequest,
+    ) -> anyhow::Result<CountActivityExecutionsResponse> {
+        unreachable!()
+    }
+    async fn apply_deletion(&self, _: tokeira_storage::ProjectionRecord) -> anyhow::Result<()> {
+        unreachable!()
+    }
+    async fn unknown_search_attribute(
+        &self,
+        namespace: tokeira_types::NamespaceId,
+        keys: &[String],
+    ) -> anyhow::Result<Option<String>> {
+        anyhow::ensure!(!self.fail.load(Ordering::SeqCst), "registry read failed");
+        self.inner.unknown_search_attribute(namespace, keys).await
+    }
+}
+
+async fn assert_metadata_rejection(request: StartActivityTask, cause: &str) {
+    assert_metadata_rejection_in(NAMESPACE, request, cause).await;
+}
+
+async fn assert_metadata_rejection_in(namespace: &str, request: StartActivityTask, cause: &str) {
+    let fixture = Fixture::new(None, false, Default::default());
+    let (parent, task) = fixture.parent_in(namespace, request, false).await;
+    let registry = RegistryFixture::new().await;
+    let config = ActivityConfig::default();
+    assert!(!config.enable_standalone);
+    StartActivityExecutor::new(Arc::downgrade(&fixture.engine), config, 1000)
+        .with_visibility(registry)
+        .execute(&parent, &task)
+        .await
+        .unwrap();
+    let root = fixture.engine.root_node(&parent).await.unwrap().unwrap();
+    assert!(root.metadata.outbox.side_effect_tasks.is_empty());
+    let data = ParentData::decode(root.data.unwrap().as_slice()).unwrap();
+    assert_eq!(data.outcomes.len(), 1);
+    let TaskOutcome::Failed { failure, retryable } =
+        serde_json::from_slice(&data.outcomes[0]).unwrap()
+    else {
+        panic!("rejection")
+    };
+    assert!(!retryable);
+    let failure = Failure::decode(failure.as_slice()).unwrap();
+    assert!(
+        failure
+            .message
+            .starts_with(&format!("cannot start activity child: {cause}")),
+        "{}",
+        failure.message
+    );
+    assert!(
+        matches!(failure.failure_info, Some(FailureInfo::ApplicationFailureInfo(info)) if info.non_retryable)
+    );
+    assert!(
+        fixture
+            .bridge
+            .current_run(namespace, "child")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn staged_start_rejects_a_namespace_id_the_registry_cannot_read() {
+    assert_metadata_rejection_in(
+        "ns-id",
+        staged_request(),
+        "namespace id ns-id is not a UUID:",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn staged_start_rejects_unregistered_key_before_sizes() {
+    let mut request = staged_request();
+    request.search_attributes = attributes(&[("Unknown", vec![b'x'; 3000])]).encode_to_vec();
+    assert_metadata_rejection(request, "search attribute Unknown is not defined").await;
+}
+
+#[tokio::test]
+async fn staged_start_rejects_key_count_before_registry() {
+    let mut request = staged_request();
+    let names: Vec<String> = (0..101).map(|i| format!("Unknown{i}")).collect();
+    request.search_attributes = attributes(
+        &names
+            .iter()
+            .map(|name| (name.as_str(), vec![b'x']))
+            .collect::<Vec<_>>(),
+    )
+    .encode_to_vec();
+    assert_metadata_rejection(request, "number of search attributes 101 exceeds limit 100").await;
+}
+
+#[tokio::test]
+async fn staged_start_rejects_oversized_attribute_value() {
+    let mut request = staged_request();
+    request.search_attributes = attributes(&[("ComponentId", vec![b'x'; 2049])]).encode_to_vec();
+    assert_metadata_rejection(
+        request,
+        "search attribute ComponentId value size 2049 exceeds size limit 2048",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn staged_start_rejects_oversized_attribute_total() {
+    let mut request = staged_request();
+    let mut attributes = attributes(&[("ComponentId", vec![b'x'])]);
+    attributes
+        .indexed_fields
+        .get_mut("ComponentId")
+        .unwrap()
+        .metadata
+        .insert("extra".into(), vec![b'x'; 40 * 1024]);
+    let total = attributes.encoded_len();
+    request.search_attributes = attributes.encode_to_vec();
+    assert_metadata_rejection(
+        request,
+        &format!("total size of search attributes {total} exceeds size limit 40960"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn staged_start_rejects_undecodable_search_attributes() {
+    let mut request = staged_request();
+    request.search_attributes = vec![0xff];
+    assert_metadata_rejection(request, "invalid search attributes:").await;
+}
+
+#[tokio::test]
+async fn staged_start_rejects_undecodable_user_metadata() {
+    let mut request = staged_request();
+    request.user_metadata = vec![0xff];
+    assert_metadata_rejection(request, "invalid user metadata:").await;
+}
+
+#[tokio::test]
+async fn staged_start_registry_failure_stays_pending_and_retries() {
+    let fixture = Fixture::new(None, false, Default::default());
+    let (parent, task) = fixture.parent(staged_request(), false).await;
+    let registry = RegistryFixture::new().await;
+    registry.fail.store(true, Ordering::SeqCst);
+    let executor = StartActivityExecutor::new(
+        Arc::downgrade(&fixture.engine),
+        ActivityConfig::default(),
+        1000,
+    )
+    .with_visibility(registry.clone());
+    let before = fixture.engine.root_node(&parent).await.unwrap().unwrap();
+    assert!(
+        executor
+            .execute(&parent, &task)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("registry read failed")
+    );
+    assert_eq!(
+        fixture.engine.root_node(&parent).await.unwrap().unwrap(),
+        before
+    );
+    assert!(
+        fixture
+            .bridge
+            .current_run(NAMESPACE, "child")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    registry.fail.store(false, Ordering::SeqCst);
+    executor.execute(&parent, &task).await.unwrap();
+    assert!(
+        fixture
+            .bridge
+            .current_run(NAMESPACE, "child")
+            .await
+            .unwrap()
+            .is_some()
     );
 }
 

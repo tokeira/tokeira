@@ -24,9 +24,11 @@ use tokeira_chasm_activity::{
     statemachine::terminal_outcome,
 };
 use tokeira_proto::{
+    common::SearchAttributes,
     conversions::common::{failure_to_payload, payload_to_domain},
     enums::CallbackState,
     failure::{ApplicationFailureInfo, Failure, failure::FailureInfo},
+    public::temporal::api::sdk::v1::UserMetadata,
 };
 use tokeira_runtime::{
     CompletionDeliveryOutcome, NexusCompletion, NexusCompletionClient, NexusCompletionFailureBody,
@@ -41,7 +43,9 @@ use crate::{
         retry_policy_fields, start_activity,
     },
     errors::EdgeError,
+    grpc::payload_limits,
     namespace_cache::NamespaceCache,
+    workflow_service::VisibilityApi,
 };
 
 /// Advertises committed activity attempts to matching. The root supplies the
@@ -392,11 +396,21 @@ impl SideEffectExecutor for ActivityDispatchExecutor {
 
 /// Starts activities staged by any registered component. The return address
 /// names the parent's held task, making completion independent of process lifetime.
-#[derive(Debug)]
 pub struct StartActivityExecutor {
     engine: Weak<ChasmEngine>,
     config: ActivityConfig,
     max_id_length: usize,
+    visibility: Option<Arc<dyn VisibilityApi>>,
+}
+
+impl std::fmt::Debug for StartActivityExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StartActivityExecutor")
+            .field("engine", &self.engine)
+            .field("config", &self.config)
+            .field("max_id_length", &self.max_id_length)
+            .finish_non_exhaustive()
+    }
 }
 
 impl StartActivityExecutor {
@@ -406,7 +420,71 @@ impl StartActivityExecutor {
             engine,
             config,
             max_id_length,
+            visibility: None,
         }
+    }
+
+    /// Use the public start's namespace registry for search-attribute admission.
+    /// Without a handle, registered-key checks are permissive; decoding and size
+    /// limits still apply. Registry read failures leave the staged task pending.
+    pub fn with_visibility(mut self, visibility: Arc<dyn VisibilityApi>) -> Self {
+        self.visibility = Some(visibility);
+        self
+    }
+
+    async fn validate_metadata(
+        &self,
+        key: &ExecutionKey,
+        request: &StartActivityTask,
+    ) -> Result<(), EdgeError> {
+        let attributes = if request.search_attributes.is_empty() {
+            None
+        } else {
+            Some(
+                SearchAttributes::decode(request.search_attributes.as_slice()).map_err(
+                    |error| EdgeError::BadRequest(format!("invalid search attributes: {error}")),
+                )?,
+            )
+        };
+        if !request.user_metadata.is_empty() {
+            UserMetadata::decode(request.user_metadata.as_slice()).map_err(|error| {
+                EdgeError::BadRequest(format!("invalid user metadata: {error}"))
+            })?;
+        }
+        // Staged starts bypass the public standalone-activity gate, so admission
+        // always runs. Preserve count → registry → sizes from
+        // common/searchattribute/validator.go:60-175 @ v1.31.0. User metadata has
+        // no semantic checks (chasm/lib/activity/validator.go:344-364 @ v1.31.0).
+        payload_limits::check_search_attribute_count(attributes.as_ref())
+            .map_err(EdgeError::BadRequest)?;
+        if let (Some(visibility), Some(attributes)) = (&self.visibility, &attributes)
+            && !attributes.indexed_fields.is_empty()
+        {
+            // A key's namespace id never changes, so one the registry cannot read
+            // is a permanent rejection rather than a task left pending forever.
+            let namespace_id = key
+                .namespace_id
+                .parse()
+                .map(tokeira_types::NamespaceId)
+                .map_err(|error| {
+                    EdgeError::BadRequest(format!(
+                        "namespace id {} is not a UUID: {error}",
+                        key.namespace_id
+                    ))
+                })?;
+            let keys: Vec<String> = attributes.indexed_fields.keys().cloned().collect();
+            if let Some(unknown) = visibility
+                .unknown_search_attribute(namespace_id, &keys)
+                .await
+                .map_err(|error| EdgeError::Internal(error.to_string()))?
+            {
+                return Err(EdgeError::BadRequest(format!(
+                    "search attribute {unknown} is not defined"
+                )));
+            }
+        }
+        payload_limits::check_search_attribute_sizes(attributes.as_ref())
+            .map_err(EdgeError::BadRequest)
     }
 }
 
@@ -492,44 +570,49 @@ impl SideEffectExecutor for StartActivityExecutor {
         let normalized = defaulted_retry_policy(retry.as_ref());
         let (initial, coefficient, maximum, attempts) = retry_policy_fields(&normalized);
         let activity_id = request.activity_id.clone();
-        let result = start_activity(
-            &engine,
-            &self.config,
-            self.max_id_length,
-            StartActivity {
-                namespace_id: key.namespace_id.clone(),
-                activity_id: request.activity_id,
-                run_id: uuid::Uuid::new_v4().to_string(),
-                activity_type: request.activity_type,
-                task_queue: request.task_queue,
-                input: request.input,
-                header: request.header,
-                schedule_to_start_nanos: request.schedule_to_start_nanos,
-                schedule_to_close_nanos: request.schedule_to_close_nanos,
-                start_to_close_nanos: request.start_to_close_nanos,
-                heartbeat_nanos: request.heartbeat_nanos,
-                run_timeout_nanos: 0,
-                request_id: Some(start_request_id(key, task.id)),
-                policy: BusinessIdPolicy::default(),
-                retry_policy: request.retry_policy,
-                retry_initial_interval_nanos: initial,
-                retry_backoff_coefficient: coefficient,
-                retry_maximum_interval_nanos: maximum,
-                maximum_attempts: attempts,
-                priority: Vec::new(),
-                search_attributes: Vec::new(),
-                user_metadata: Vec::new(),
-                version_target: request.version_target,
-                callbacks: vec![CallbackSpec {
-                    target: CallbackTarget::Internal {
-                        component_ref: parent,
-                        task_type_id: task.task_type_id,
-                        task_id: encode_task_id(task.id)?,
-                    },
-                    links: Vec::new(),
-                }],
-            },
-        )
+        let task_id = encode_task_id(task.id)?;
+        let result = async {
+            self.validate_metadata(key, &request).await?;
+            start_activity(
+                &engine,
+                &self.config,
+                self.max_id_length,
+                StartActivity {
+                    namespace_id: key.namespace_id.clone(),
+                    activity_id: request.activity_id,
+                    run_id: uuid::Uuid::new_v4().to_string(),
+                    activity_type: request.activity_type,
+                    task_queue: request.task_queue,
+                    input: request.input,
+                    header: request.header,
+                    schedule_to_start_nanos: request.schedule_to_start_nanos,
+                    schedule_to_close_nanos: request.schedule_to_close_nanos,
+                    start_to_close_nanos: request.start_to_close_nanos,
+                    heartbeat_nanos: request.heartbeat_nanos,
+                    run_timeout_nanos: 0,
+                    request_id: Some(start_request_id(key, task.id)),
+                    policy: BusinessIdPolicy::default(),
+                    retry_policy: request.retry_policy,
+                    retry_initial_interval_nanos: initial,
+                    retry_backoff_coefficient: coefficient,
+                    retry_maximum_interval_nanos: maximum,
+                    maximum_attempts: attempts,
+                    priority: Vec::new(),
+                    search_attributes: request.search_attributes,
+                    user_metadata: request.user_metadata,
+                    version_target: request.version_target,
+                    callbacks: vec![CallbackSpec {
+                        target: CallbackTarget::Internal {
+                            component_ref: parent,
+                            task_type_id: task.task_type_id,
+                            task_id,
+                        },
+                        links: Vec::new(),
+                    }],
+                },
+            )
+            .await
+        }
         .await;
         match result {
             Ok(_) => Ok(()), // The child's Internal callback eventually resolves the parent task.

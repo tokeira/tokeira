@@ -1,6 +1,7 @@
 //! Fixed-clock standalone wire replay, recorded before extension executors land.
 
 mod shared_poll;
+mod staged;
 
 use super::*;
 use crate::{
@@ -98,6 +99,9 @@ impl Harness {
         );
         let mut registry = Registry::builder();
         ActivityLibrary::register(&mut registry).unwrap();
+        registry
+            .register_side_effect_task("activity", staged::StagedActivityHandler)
+            .unwrap();
         let queue = Arc::new(ActivityDispatchQueue::new());
         let mux = Arc::new(DispatchMultiplexer::default());
         let clock = Arc::new(AtomicI64::new(1_000 * SEC));

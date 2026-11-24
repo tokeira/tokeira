@@ -61,6 +61,8 @@ runtime's multiplexer at bootstrap.
 `StartActivityExecutor` is generic. Its payload, `StartActivityTask`, is defined
 in the substrate, so any registered library can stage one and receive the
 activity's terminal outcome through its own `SideEffectTaskHandler`.
+The executor decodes optional search attributes and user metadata and validates them
+as a public start does; validation rejections permanently resolve the staging task.
 
 ## Versioned poll and task provenance
 

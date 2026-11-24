@@ -16,6 +16,7 @@ use tokeira_edge::{
     namespace_cache::InMemoryNamespaceCache,
 };
 use tokeira_engine::chasm::{Component, ComponentRef, DeploymentVersionTarget, TypedEngine};
+use tokeira_projection::{InMemoryVisibilityStore, VisibilityApi, VisibilityQueryService};
 use tokeira_proto::failure::{ApplicationFailureInfo, Failure, failure::FailureInfo};
 use tokeira_runtime::{
     chasm::{
@@ -105,6 +106,9 @@ impl Stack {
             clock,
             deliver_callbacks,
             Arc::new(CollectingVisibilitySink::default()),
+            Arc::new(VisibilityQueryService::new(
+                InMemoryVisibilityStore::default(),
+            )),
         )
     }
 
@@ -113,6 +117,7 @@ impl Stack {
         clock: &Clock,
         deliver_callbacks: bool,
         visibility: Arc<dyn VisibilitySink>,
+        visibility_api: Arc<dyn VisibilityApi>,
     ) -> Self {
         let mut registry = Registry::builder();
         registry
@@ -140,11 +145,10 @@ impl Stack {
             queue.clone(),
         ));
         mux.register(dispatch.clone()).unwrap();
-        mux.register(Arc::new(StartActivityExecutor::new(
-            Arc::downgrade(&engine),
-            config.clone(),
-            1000,
-        )))
+        mux.register(Arc::new(
+            StartActivityExecutor::new(Arc::downgrade(&engine), config.clone(), 1000)
+                .with_visibility(visibility_api),
+        ))
         .unwrap();
         if deliver_callbacks {
             mux.register(Arc::new(DeliverCallbackExecutor::new(

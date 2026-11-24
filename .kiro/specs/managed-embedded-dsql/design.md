@@ -123,7 +123,10 @@ flowchart LR
    `ACTIVE` before schema work.
 8. Bootstrap the idempotent control-lease table, acquire the schema-migration lease,
    assess compatibility, and apply the approved forward plan if policy is automatic.
-9. Acquire the separate embedded-owner lease and start its renewer.
+9. Acquire the separate embedded-owner lease and start its renewer, which runs through
+   an expired takeover's quiescence and the stack's recovery. The gate opens at the end
+   of quiescence only if every renewal until then was confirmed in time. A failed start
+   during quiescence leaves the claim to expire.
 10. Factor the current DSQL service-stack builder through `StackTransport::Embedded`,
     recover from authoritative DSQL state, and open in-process admission.
 11. Return an `Engine` with an immutable redacted startup report. Failure at any phase

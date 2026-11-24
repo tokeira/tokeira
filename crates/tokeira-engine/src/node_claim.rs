@@ -13,7 +13,9 @@
 //! The decisions are pure functions over a monotonic clock and the control-lease
 //! repository's outcomes, [`after_attempt`] and [`Hold`], so their properties
 //! run offline. [`acquire`] and the task [`AcquiredClaim::start`] spawns apply
-//! them to the repository and the director's admission gate.
+//! them to the repository and the director's admission gate. The embedded
+//! engine renews its `embedded-owner` claim through the same hold and task,
+//! from [`AcquiredClaim::for_guard`] (`.kiro/specs/managed-embedded-dsql`).
 
 use std::{
     sync::{Arc, Mutex},
@@ -501,6 +503,25 @@ pub(crate) async fn acquire(director: &DsqlConnectionDirector) -> Result<Acquire
 }
 
 impl AcquiredClaim {
+    /// The claim `guard` confirms, before its renewals start: its gate is
+    /// closed while an expired takeover's quiescence runs, open otherwise.
+    pub(crate) fn for_guard(
+        repository: ConnectionControlLeaseRepository,
+        guard: ControlLeaseGuard,
+    ) -> Self {
+        let gate = OwnershipAdmissionGate::for_guard(&guard);
+        let hold = Hold::acquired(
+            guard.local_admission_deadline(),
+            guard.quiescence_deadline(),
+        );
+        Self {
+            repository,
+            guard,
+            gate,
+            hold,
+        }
+    }
+
     /// The admission gate to install on the store's director: closed during
     /// an expired takeover's quiescence, open otherwise.
     pub(crate) fn gate(&self) -> OwnershipAdmissionGate {
@@ -537,7 +558,8 @@ impl AcquiredClaim {
 /// A held claim while its task renews it.
 ///
 /// The task stops and releases the claim when [`NodeClaim::shut_down`] runs or
-/// the handle drops. If the claim is lost, the task cancels the token given to
+/// the handle drops, unless [`NodeClaim::abandon`] aborts it without releasing.
+/// If the claim is lost, the task cancels the token given to
 /// [`NodeClaim::drain_on_loss`], which starts the node's drain.
 pub(crate) struct NodeClaim {
     gate: OwnershipAdmissionGate,
@@ -585,7 +607,6 @@ impl NodeClaim {
     }
 
     /// Wait until the claim is lost.
-    #[cfg(all(test, feature = "dsql-integration"))]
     pub(crate) async fn lost(&mut self) -> Loss {
         loop {
             if let Phase::Lost(loss) = *self.phase.borrow_and_update() {
@@ -619,27 +640,39 @@ impl NodeClaim {
     /// running or work is still out (2.7, 2.8). An error means the claim was
     /// lost.
     pub(crate) async fn shut_down(mut self) -> Result<()> {
-        self.stop.cancel();
-        let Some(task) = self.task.take() else {
-            return Ok(());
-        };
-        match task
-            .await
-            .context("the single-node claim's task panicked")?
-        {
+        match self.stop_and_wait().await? {
             Phase::Lost(loss) => Err(lost_error(loss)),
             _ => Ok(()),
         }
+    }
+
+    /// Stop through the shared hold and await its final phase. Retain the task
+    /// handle across cancellation so an embedded shutdown deadline can abort
+    /// it instead of leaving a detached task renewing or releasing the claim.
+    pub(crate) async fn stop_and_wait(&mut self) -> Result<Phase> {
+        self.stop.cancel();
+        let Some(task) = self.task.as_mut() else {
+            return Ok(self.phase());
+        };
+        let phase = task.await.context("the owner claim's task panicked")?;
+        self.task = None;
+        Ok(phase)
+    }
+
+    /// Stop renewal without releasing. Embedded drop is a crash, including
+    /// when startup or shutdown is cancelled before cleanup finishes.
+    pub(crate) fn abandon(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.gate.fence();
     }
 
     /// Simulate the process dying: stop renewing without a release, and admit
     /// nothing more.
     #[cfg(all(test, feature = "dsql-integration"))]
     pub(crate) fn crash(mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-        self.gate.fence();
+        self.abandon();
     }
 }
 
@@ -833,7 +866,11 @@ async fn run_claim(mut task: ClaimTask) -> Phase {
         task.apply(effect);
         match task.hold.phase() {
             Phase::Lost(loss) => {
-                error!(?loss, "tokeirad lost its single-node claim; draining");
+                error!(
+                    claim = task.guard.claim_name(),
+                    ?loss,
+                    "owner claim lost; draining"
+                );
                 task.start_drain_on_loss();
                 return task.hold.phase();
             }
@@ -862,8 +899,7 @@ async fn run_claim(mut task: ClaimTask) -> Phase {
                     }
                     StopStep::Abandon => {
                         warn!(
-                            "tokeirad stopped during its single-node claim's quiescence; \
-                             leaving the claim to expire"
+                            "owner stopped during claim quiescence; leaving the claim to expire"
                         );
                         task.publish();
                     }
@@ -875,7 +911,7 @@ async fn run_claim(mut task: ClaimTask) -> Phase {
                     ReleaseStep::Release => match task.release().await {
                         Ok(()) => {
                             task.hold.released();
-                            info!("released the DSQL cluster's single-node claim");
+                            info!("released the DSQL owner claim");
                         }
                         Err(RequestFailure::Fenced) => {
                             let effect = task.hold.fenced();
@@ -884,7 +920,7 @@ async fn run_claim(mut task: ClaimTask) -> Phase {
                         Err(RequestFailure::Other(error)) => {
                             warn!(
                                 error = %format!("{error:#}"),
-                                "failed to release the single-node claim; leaving it to expire"
+                                "failed to release the owner claim; leaving it to expire"
                             );
                             task.hold.release_failed();
                         }
@@ -899,8 +935,7 @@ async fn run_claim(mut task: ClaimTask) -> Phase {
                     if task.hold.drained(now, false) == ReleaseStep::Abandon {
                         warn!(
                             in_flight = task.gate.in_flight(),
-                            "admitted DSQL work outlasted the drain; leaving the single-node \
-                             claim to expire"
+                            "admitted DSQL work outlasted the drain; leaving the owner claim to expire"
                         );
                     }
                     task.publish();
@@ -920,7 +955,7 @@ async fn run_claim(mut task: ClaimTask) -> Phase {
                         Err(RequestFailure::Other(error)) => {
                             warn!(
                                 error = %format!("{error:#}"),
-                                "failed to renew the single-node claim; trying again"
+                                "failed to renew the owner claim; trying again"
                             );
                             next_renewal = Instant::now() + RENEW_RETRY_INTERVAL;
                         }
@@ -943,6 +978,92 @@ mod tests {
 
     fn at(base: Instant, millis: u64) -> Instant {
         base + StdDuration::from_millis(millis)
+    }
+
+    fn held_task(task: JoinHandle<Phase>, stop: CancellationToken, phase: Phase) -> NodeClaim {
+        let (_, phase) = watch::channel(phase);
+        NodeClaim {
+            gate: OwnershipAdmissionGate::new(OwnershipAdmissionState::Open),
+            phase,
+            stop,
+            drain_on_loss: Arc::new(Mutex::new(None)),
+            task: Some(task),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn embedded_drop_aborts_without_requesting_release() {
+        let stop = CancellationToken::new();
+        let stopping = stop.clone();
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            stopping.cancelled().await;
+            let _ = finished.send(());
+            Phase::Released
+        });
+        let claim = held_task(task, stop, Phase::Serving);
+        let gate = claim.gate.clone();
+        let ownership = crate::EmbeddedOwnership {
+            claim,
+            gate: gate.clone(),
+        };
+        tokio::task::yield_now().await;
+        drop(ownership);
+        assert!(completion.await.is_err());
+        assert_eq!(gate.state(), OwnershipAdmissionState::Fenced);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_embedded_stop_retains_the_task_for_abort() {
+        let stop = CancellationToken::new();
+        let stopping = stop.clone();
+        let (finished, completion) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _finished = finished;
+            stopping.cancelled().await;
+            std::future::pending::<Phase>().await
+        });
+        let claim = held_task(task, stop, Phase::Serving);
+        let gate = claim.gate.clone();
+        let mut ownership = crate::EmbeddedOwnership { claim, gate };
+        assert!(
+            tokio::time::timeout(StdDuration::from_secs(1), ownership.claim.stop_and_wait())
+                .await
+                .is_err()
+        );
+        assert!(ownership.claim.task.is_some());
+        drop(ownership);
+        assert!(completion.await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopping_reports_the_shared_tasks_final_phase() {
+        for phase in [Phase::Released, Phase::Abandoned, Phase::Lost(Loss::Fenced)] {
+            let stop = CancellationToken::new();
+            let stopping = stop.clone();
+            let task = tokio::spawn(async move {
+                stopping.cancelled().await;
+                phase
+            });
+            let mut claim = held_task(task, stop, Phase::Serving);
+            assert_eq!(claim.stop_and_wait().await.unwrap(), phase);
+            assert!(claim.task.is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loss_before_stack_wiring_is_observed() {
+        let task = tokio::spawn(std::future::pending());
+        let mut claim = held_task(
+            task,
+            CancellationToken::new(),
+            Phase::Lost(Loss::Unconfirmed),
+        );
+        let stack = CancellationToken::new();
+        claim.drain_on_loss(stack.clone());
+        assert!(stack.is_cancelled());
+        assert_eq!(claim.lost().await, Loss::Unconfirmed);
+        claim.abandon();
     }
 
     #[test]

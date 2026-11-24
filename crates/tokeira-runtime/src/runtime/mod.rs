@@ -93,6 +93,8 @@ mod activity_attempt_timeout_tests;
 #[cfg(test)]
 mod activity_backlog_tests;
 #[cfg(test)]
+mod activity_cancel_retry_tests;
+#[cfg(test)]
 mod activity_deadline_tests;
 #[cfg(test)]
 mod activity_queue_home_delivery_exploration_tests;
@@ -154,8 +156,9 @@ pub(crate) mod workflow_task;
 pub use workflow_task::{PreparedWorkflowStart, continue_as_new_advice_policy};
 
 pub(crate) use activity::{
-    ActivityRetryDeps, ActivityRetryTarget, activity_dispatch_task, commit_activity_retry,
-    evaluate_activity_eligibility, exhausted_reason_to_retry_state,
+    ActivityRetryDecision, ActivityRetryDeps, ActivityRetryOutcome, ActivityRetryTarget,
+    activity_dispatch_task, activity_retry_decision, commit_activity_retry,
+    evaluate_activity_eligibility,
 };
 
 /// v1.31.0 default number of consecutive workflow-task problems required

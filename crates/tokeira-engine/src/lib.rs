@@ -28,7 +28,7 @@ use std::{
         Arc, RwLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration as StdDuration, Instant},
+    time::{Duration as StdDuration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -105,6 +105,8 @@ pub use tokeira_config::{
     DsqlMigrationPolicy, EmbeddedEngineConfig, EmbeddedStorageConfig, SnapshotPolicyConfig,
     TokeiraConfig,
 };
+pub use tokeira_storage::dsql::{SchemaIncompatibility, SchemaIncompatibilityCategory};
+
 use tokeira_edge::{
     Authenticator, CacheBackedRouter, CallbackResponse, EdgeInterceptors, EdgeRoutingConfig,
     HistoryNotifyingRepository, HistoryWaitRegistry, HttpApiCatalog, HttpApiPolicy,
@@ -259,12 +261,13 @@ async fn build_authorization_stack(config: &TokeiraConfig) -> Result<Authorizati
 use tokeira_kernel::{Link, LoadedRun};
 use tokeira_managed_dsql::{
     AwsDsqlControlPlane, CanonicalClusterIdentity, ClusterAction, CreateOrRecoverRequest,
-    DsqlControlPlane, LifecycleEnvironment, LocalClusterDescriptorStore, ManagedDsqlLifecycle,
-    Readiness, ResolvedCluster, StartupDeadline, SystemLifecycleEnvironment,
+    DsqlControlPlane, LifecycleEnvironment, LocalClusterDescriptorStore, ManagedDsqlError,
+    ManagedDsqlLifecycle, Readiness, ResolvedCluster, StartupDeadline, SystemLifecycleEnvironment,
 };
 use tokeira_observability::{
     ClusterStatusLabel, DbClassLabel, EmbeddedOperationLabel, EmbeddedStorageModeLabel,
     ErrorClassLabel, OwnershipOutcomeLabel, SchemaOutcomeLabel, record_embedded_lifecycle,
+    redaction::redact_message,
 };
 use tokeira_projection::{
     DsqlVisibilityStore, InMemoryVisibilityStore, ProjectionSink, ProjectorHome,
@@ -291,12 +294,12 @@ use tokeira_storage::{
     WorkerComputeRepository, WorkerDeploymentRepository, WorkerTaskProvenanceStore,
     dsql::{
         ConnectionBudget, ConnectionControlLeaseRepository, ControlLeaseAcquireOutcome,
-        ControlLeaseAcquireRequest, ControlLeaseClusterIdentity, DsqlAuthConfig,
+        ControlLeaseAcquireRequest, ControlLeaseClusterIdentity, ControlLeaseError, DsqlAuthConfig,
         DsqlConnectionDirector, DsqlCoordinationConfig, DsqlPoolConfig, DsqlStore,
-        EmbeddedDsqlPoolConfig, MigrationRunner, OWNER_ADMISSION_MARGIN, OWNER_LEASE_DURATION,
-        OwnershipAdmissionGate, SCHEMA_MIGRATION_ADMISSION_MARGIN, SCHEMA_MIGRATION_LEASE_DURATION,
-        SchemaCompatibilityError, SchemaDecision, SchemaIncompatibilityCategory,
-        SchemaMigrationPolicy, WarmupDeadline,
+        EXPIRED_TAKEOVER_QUIESCENCE, EmbeddedDsqlPoolConfig, MigrationRunner,
+        OWNER_ADMISSION_MARGIN, OWNER_LEASE_DURATION, OwnershipAdmissionGate,
+        SCHEMA_MIGRATION_ADMISSION_MARGIN, SCHEMA_MIGRATION_LEASE_DURATION,
+        SchemaCompatibilityError, SchemaDecision, SchemaMigrationPolicy, WarmupDeadline,
     },
 };
 use tokeira_types::{
@@ -605,7 +608,12 @@ impl std::fmt::Display for EmbeddedStartupPhase {
 }
 
 /// Redacted failure from explicit embedded startup.
+///
+/// Lease contention, schema policy, and quiescence failures carry actionable
+/// diagnostics without a source chain. Other phase failures log their outermost
+/// cause once at error level after redaction. Hosts must allow for future variants.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum EmbeddedEngineStartError {
     /// A library or executor conflicts with the immutable registry.
     Registry(tokeira_chasm::ChasmError),
@@ -638,7 +646,38 @@ pub enum EmbeddedEngineStartError {
     },
     /// Configuration failed before any external resource was touched.
     InvalidConfiguration(tokeira_config::EmbeddedConfigError),
-    /// One startup phase failed; the nested cause is deliberately discarded.
+    /// Another live engine holds the exclusive embedded-owner claim.
+    OwnerLeaseHeld {
+        /// Non-secret incarnation of the current owner.
+        owner_id: String,
+        /// Database-time expiry; retry after release or expiry.
+        expires_at: SystemTime,
+    },
+    /// Another process holds the schema-migration claim.
+    SchemaMigrationLeaseHeld {
+        /// Non-secret incarnation of the migration holder.
+        owner_id: String,
+        /// Database-time expiry; retry after release or expiry.
+        expires_at: SystemTime,
+    },
+    /// Validate-only policy found a schema behind this release's target and left it unchanged.
+    SchemaMigrationRequired {
+        /// Observed version; zero means uninitialized.
+        current_version: u32,
+        /// Release-pinned migration target.
+        target_version: u32,
+    },
+    /// The stored schema is unsafe for this release; inspect the compatibility evidence.
+    SchemaIncompatible(SchemaIncompatibility),
+    /// An expired owner was taken over, but the quiescence that follows would
+    /// end after the startup deadline. The claim is left to expire rather than
+    /// released, so a retry takes it over again and waits a full quiescence.
+    OwnerQuiescenceExceedsDeadline {
+        /// Quiescence left when startup gave up.
+        remaining: StdDuration,
+    },
+    /// A phase failed; its outermost cause is logged once at error level, redacted.
+    /// The error itself retains no cause or source chain.
     Phase {
         /// Phase that did not complete.
         phase: EmbeddedStartupPhase,
@@ -685,6 +724,64 @@ impl std::fmt::Display for EmbeddedEngineStartError {
             Self::InvalidConfiguration(error) => {
                 write!(formatter, "invalid embedded engine configuration: {error}")
             }
+            Self::OwnerLeaseHeld {
+                owner_id,
+                expires_at,
+            } => write!(
+                formatter,
+                "embedded owner lease is held by {owner_id} until {}; retry after the owner releases it or it expires",
+                startup_expiry(*expires_at)?
+            ),
+            Self::SchemaMigrationLeaseHeld {
+                owner_id,
+                expires_at,
+            } => write!(
+                formatter,
+                "schema migration lease is held by {owner_id} until {}; retry after the holder releases it or it expires",
+                startup_expiry(*expires_at)?
+            ),
+            Self::SchemaMigrationRequired {
+                current_version,
+                target_version,
+            } => write!(
+                formatter,
+                "schema migration required from V{current_version} to V{target_version}; validate-only policy left the schema unchanged; migrate with automatic policy before retrying"
+            ),
+            Self::SchemaIncompatible(incompatibility) => {
+                // Ledger strings can contain arbitrary stored data. Name the
+                // category without echoing migration names, checksums or digests.
+                let category = match incompatibility.category {
+                    SchemaIncompatibilityCategory::LedgerOrdering { .. } => "LedgerOrdering",
+                    SchemaIncompatibilityCategory::UnknownMigration { .. } => "UnknownMigration",
+                    SchemaIncompatibilityCategory::MigrationNameMismatch { .. } => {
+                        "MigrationNameMismatch"
+                    }
+                    SchemaIncompatibilityCategory::ChecksumMismatch { .. } => "ChecksumMismatch",
+                    SchemaIncompatibilityCategory::DigestMismatch { .. } => "DigestMismatch",
+                    SchemaIncompatibilityCategory::MetadataVersionMismatch { .. } => {
+                        "MetadataVersionMismatch"
+                    }
+                    SchemaIncompatibilityCategory::BelowMinimum => "BelowMinimum",
+                    SchemaIncompatibilityCategory::FutureSchema => "FutureSchema",
+                };
+                let observed = incompatibility.observed_version.map_or_else(
+                    || "uninitialized".to_owned(),
+                    |version| format!("V{version}"),
+                );
+                write!(
+                    formatter,
+                    "schema incompatible: observed {observed}, allowed V{}..=V{}, target V{}, category {category}; use a compatible release or repair the schema before retrying",
+                    incompatibility.minimum_supported_version,
+                    incompatibility.maximum_readable_version,
+                    incompatibility.target_version,
+                )
+            }
+            Self::OwnerQuiescenceExceedsDeadline { remaining } => write!(
+                formatter,
+                "expired owner quiescence exceeds the startup deadline with {:.3} seconds remaining; the claim is left to expire and a retry waits the full {}-second quiescence again, so retry with a startup budget that covers it after the earlier phases",
+                remaining.as_secs_f64(),
+                EXPIRED_TAKEOVER_QUIESCENCE.whole_seconds()
+            ),
             Self::Phase { phase } => {
                 write!(formatter, "embedded engine startup failed during {phase}")
             }
@@ -699,6 +796,12 @@ impl std::fmt::Display for EmbeddedEngineStartError {
 }
 
 impl std::error::Error for EmbeddedEngineStartError {}
+
+fn startup_expiry(expires_at: SystemTime) -> Result<String, std::fmt::Error> {
+    time::OffsetDateTime::from(expires_at)
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|_| std::fmt::Error)
+}
 
 impl From<tokeira_config::EmbeddedConfigError> for EmbeddedEngineStartError {
     fn from(error: tokeira_config::EmbeddedConfigError) -> Self {
@@ -978,6 +1081,12 @@ impl Engine {
     /// The legacy [`Self::start`] and [`Self::start_with_config`] methods remain
     /// in-memory only. This is the sole engine boundary that may create or
     /// recover managed Aurora DSQL infrastructure.
+    ///
+    /// Failures distinguish held owner/migration leases, required migrations,
+    /// incompatible schemas, quiescence beyond the budget, and exhausted startup
+    /// deadlines. Other failures return [`EmbeddedEngineStartError::Phase`] and
+    /// log the outermost cause once at error level after redaction. No failed
+    /// start returns a service handle; hosts must handle future error variants.
     pub async fn start_with_embedded_config(
         config: EmbeddedEngineConfig,
     ) -> Result<Self, EmbeddedEngineStartError> {
@@ -991,9 +1100,10 @@ impl Engine {
         if !matches!(config.storage, EmbeddedStorageConfig::InMemory)
             && config.server.policy.snapshot.is_some()
         {
-            return Err(EmbeddedEngineStartError::Phase {
-                phase: EmbeddedStartupPhase::Configuration,
-            });
+            return Err(startup_phase_failure(
+                EmbeddedStartupPhase::Configuration,
+                "snapshot policy cannot be combined with durable embedded storage",
+            ));
         }
         config.validate()?;
         if matches!(config.storage, EmbeddedStorageConfig::InMemory) {
@@ -1236,14 +1346,12 @@ async fn start_embedded_dsql(
             return Err(error);
         }
     };
-    if director
-        .install_ownership_gate(ownership.gate.clone())
-        .is_err()
-    {
+    if let Err(error) = director.install_ownership_gate(ownership.gate.clone()) {
         rollback_embedded_dsql(&mut ownership, &director, deadline).await;
-        return Err(EmbeddedEngineStartError::Phase {
-            phase: EmbeddedStartupPhase::Ownership,
-        });
+        return Err(startup_phase_failure(
+            EmbeddedStartupPhase::Ownership,
+            error,
+        ));
     }
 
     if let Err(error) = startup_phase(
@@ -1261,9 +1369,10 @@ async fn start_embedded_dsql(
         match startup_infallible_phase(deadline, EmbeddedStartupPhase::RuntimeRestore, async {
             tokio::select! {
                 biased;
-                _ = ownership.claim.lost() => Err(EmbeddedEngineStartError::Phase {
-                    phase: EmbeddedStartupPhase::Ownership,
-                }),
+                _ = ownership.claim.lost() => Err(startup_phase_failure(
+                    EmbeddedStartupPhase::Ownership,
+                    "embedded ownership was lost during runtime restoration",
+                )),
                 result = build_dsql_stack(
                     StackTransport::Embedded,
                     Arc::new(server),
@@ -1280,9 +1389,10 @@ async fn start_embedded_dsql(
             Ok(ConstructedStack::Embedded(stack)) => stack,
             Ok(ConstructedStack::Network(_)) => {
                 rollback_embedded_dsql(&mut ownership, &director, deadline).await;
-                return Err(EmbeddedEngineStartError::Phase {
-                    phase: EmbeddedStartupPhase::RuntimeRestore,
-                });
+                return Err(startup_phase_failure(
+                    EmbeddedStartupPhase::RuntimeRestore,
+                    "runtime construction returned a network stack for an embedded engine",
+                ));
             }
             Err(error) => {
                 rollback_embedded_dsql(&mut ownership, &director, deadline).await;
@@ -1335,9 +1445,10 @@ async fn start_embedded_dsql(
         listeners: listener::ListenerRegistry::default(),
     };
     if engine.background_cancel.is_cancelled() {
-        return Err(EmbeddedEngineStartError::Phase {
-            phase: EmbeddedStartupPhase::Ownership,
-        });
+        return Err(startup_phase_failure(
+            EmbeddedStartupPhase::Ownership,
+            "embedded ownership was lost before startup completed",
+        ));
     }
     record_embedded_startup(&engine.startup_report);
     Ok(engine)
@@ -1403,8 +1514,8 @@ where
                 &existing.cluster_id,
                 &existing.cluster_arn,
             )
-            .map_err(|_| EmbeddedEngineStartError::Phase {
-                phase: EmbeddedStartupPhase::ClusterResolution,
+            .map_err(|error| {
+                startup_phase_failure(EmbeddedStartupPhase::ClusterResolution, error)
             })?;
             startup_phase(
                 deadline,
@@ -1447,9 +1558,7 @@ where
     server.infrastructure.dsql.region = Some(cluster.identity.region.clone());
     server
         .validate()
-        .map_err(|_| EmbeddedEngineStartError::Phase {
-            phase: EmbeddedStartupPhase::Configuration,
-        })?;
+        .map_err(|error| startup_phase_failure(EmbeddedStartupPhase::Configuration, error))?;
 
     let limits = match &config.storage {
         EmbeddedStorageConfig::ManagedDsql(managed) => &managed.limits,
@@ -1665,6 +1774,33 @@ fn schema_migration_policy(policy: DsqlMigrationPolicy) -> SchemaMigrationPolicy
     }
 }
 
+fn embedded_schema_outcome(decision: &SchemaDecision) -> Result<SchemaStartupOutcome> {
+    Ok(match decision {
+        SchemaDecision::Compatible {
+            legacy_backfill: false,
+            ..
+        } => SchemaStartupOutcome::Compatible,
+        SchemaDecision::Compatible {
+            legacy_backfill: true,
+            ..
+        } => SchemaStartupOutcome::MetadataBackfilled,
+        SchemaDecision::Initialize { .. } => SchemaStartupOutcome::Initialized,
+        SchemaDecision::Migrate { .. } => SchemaStartupOutcome::Migrated,
+        SchemaDecision::MigrationRequired { current, target } => {
+            return Err(EmbeddedEngineStartError::SchemaMigrationRequired {
+                current_version: *current,
+                target_version: *target,
+            }
+            .into());
+        }
+        SchemaDecision::Reject(incompatibility) => {
+            return Err(
+                EmbeddedEngineStartError::SchemaIncompatible(incompatibility.clone()).into(),
+            );
+        }
+    })
+}
+
 async fn apply_embedded_schema(
     director: Arc<DsqlConnectionDirector>,
     cluster: &ResolvedCluster,
@@ -1678,24 +1814,7 @@ async fn apply_embedded_schema(
     let decision = runner
         .assess_connection(permit.connection()?, &contract, policy)
         .await?;
-    let outcome = match &decision {
-        SchemaDecision::Compatible {
-            legacy_backfill: false,
-            ..
-        } => SchemaStartupOutcome::Compatible,
-        SchemaDecision::Compatible {
-            legacy_backfill: true,
-            ..
-        } => SchemaStartupOutcome::MetadataBackfilled,
-        SchemaDecision::Initialize { .. } => SchemaStartupOutcome::Initialized,
-        SchemaDecision::Migrate { .. } => SchemaStartupOutcome::Migrated,
-        SchemaDecision::MigrationRequired { current, target } => {
-            return Err(anyhow!(
-                "schema migration required from V{current} to V{target}"
-            ));
-        }
-        SchemaDecision::Reject(_) => return Err(anyhow!("schema compatibility rejected")),
-    };
+    let outcome = embedded_schema_outcome(&decision)?;
     if !matches!(outcome, SchemaStartupOutcome::Compatible) {
         runner
             .bootstrap_migration_coordination(permit.connection()?, &decision)
@@ -1713,7 +1832,8 @@ async fn apply_embedded_schema(
                     acquire_deadline: deadline,
                 },
             )
-            .await?;
+            .await
+            .map_err(schema_migration_acquire_error)?;
         let migration_gate = OwnershipAdmissionGate::for_guard(&migration_guard);
         let apply_result = runner
             .apply_decision(
@@ -1771,7 +1891,8 @@ async fn acquire_embedded_ownership(
                 acquire_deadline: deadline,
             },
         )
-        .await?;
+        .await
+        .map_err(owner_acquire_error)?;
     // Return the acquisition checkout before the independent claim task can
     // need the bounded Control budget, including while its gate is closed.
     drop(permit);
@@ -1787,14 +1908,60 @@ async fn acquire_embedded_ownership(
         gate,
     };
     if let Some(quiescence_deadline) = quiescence_deadline
-        && (Instant::now() >= deadline || quiescence_deadline > deadline)
+        && let Err(error) = check_owner_quiescence(quiescence_deadline, deadline)
     {
         // Hold abandons a stop during quiescence: releasing would let the next
         // owner skip the wait for the previous holder's transactions.
         let _ = ownership.claim.stop_and_wait().await;
-        return Err(anyhow!("expired owner quiescence exceeds startup deadline"));
+        return Err(error.into());
     }
     Ok((ownership, report))
+}
+
+fn schema_migration_acquire_error(error: ControlLeaseError) -> anyhow::Error {
+    match error {
+        ControlLeaseError::Busy {
+            owner_id,
+            expires_at,
+        } => EmbeddedEngineStartError::SchemaMigrationLeaseHeld {
+            owner_id,
+            expires_at: expires_at.into(),
+        }
+        .into(),
+        error => error.into(),
+    }
+}
+
+fn owner_acquire_error(error: ControlLeaseError) -> anyhow::Error {
+    match error {
+        ControlLeaseError::Busy {
+            owner_id,
+            expires_at,
+        } => EmbeddedEngineStartError::OwnerLeaseHeld {
+            owner_id,
+            expires_at: expires_at.into(),
+        }
+        .into(),
+        error => error.into(),
+    }
+}
+
+fn check_owner_quiescence(
+    quiescence_deadline: Instant,
+    deadline: Instant,
+) -> Result<(), EmbeddedEngineStartError> {
+    let now = Instant::now();
+    if now >= deadline {
+        Err(EmbeddedEngineStartError::DeadlineExceeded {
+            phase: EmbeddedStartupPhase::Ownership,
+        })
+    } else if quiescence_deadline > deadline {
+        Err(EmbeddedEngineStartError::OwnerQuiescenceExceedsDeadline {
+            remaining: quiescence_deadline.saturating_duration_since(now),
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn control_lease_identity(cluster: &ResolvedCluster) -> ControlLeaseClusterIdentity {
@@ -1836,6 +2003,7 @@ async fn startup_phase<T, E, F>(
 ) -> Result<T, EmbeddedEngineStartError>
 where
     F: Future<Output = Result<T, E>>,
+    E: Into<anyhow::Error>,
 {
     let now = Instant::now();
     if now >= deadline {
@@ -1843,9 +2011,42 @@ where
     }
     match tokio::time::timeout(deadline.saturating_duration_since(now), future).await {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(_)) => Err(EmbeddedEngineStartError::Phase { phase }),
+        Ok(Err(error)) => Err(embedded_startup_error(phase, error.into())),
         Err(_) => Err(EmbeddedEngineStartError::DeadlineExceeded { phase }),
     }
+}
+
+fn embedded_startup_error(
+    phase: EmbeddedStartupPhase,
+    error: anyhow::Error,
+) -> EmbeddedEngineStartError {
+    // Only deliberately public errors cross the host boundary. A Phase error
+    // has already been logged at its construction site and must not log twice.
+    let error = match error.downcast::<EmbeddedEngineStartError>() {
+        Ok(error) => return error,
+        Err(error) => error,
+    };
+    if matches!(
+        error.downcast_ref::<ControlLeaseError>(),
+        Some(ControlLeaseError::DeadlineElapsed)
+    ) || matches!(
+        error.downcast_ref::<ManagedDsqlError>(),
+        Some(ManagedDsqlError::DeadlineExceeded)
+    ) {
+        return EmbeddedEngineStartError::DeadlineExceeded { phase };
+    }
+    startup_phase_failure(phase, error)
+}
+
+fn startup_phase_failure(
+    phase: EmbeddedStartupPhase,
+    cause: impl std::fmt::Display,
+) -> EmbeddedEngineStartError {
+    // Alternate Display and Debug can expose nested SQL/AWS errors. Only the
+    // outer message is eligible for logging, and it is redacted as a whole.
+    let message = cause.to_string();
+    error!(phase = %phase, cause = %redact_message(&message), "embedded engine startup failed");
+    EmbeddedEngineStartError::Phase { phase }
 }
 
 async fn startup_infallible_phase<T, F>(

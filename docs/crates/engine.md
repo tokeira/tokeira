@@ -129,6 +129,12 @@ passes to `TokeiradHandle::start_in_memory_with_transport`.
   engine shutdown stops attached listeners before its own drain.
 - `Engine::start_with_embedded_config()` is the explicit boundary for managed
   or existing Aurora DSQL storage; durable modes do not silently downgrade.
+- A failed embedded start returns `EmbeddedEngineStartError`, which is
+  non-exhaustive. It names an owner or schema-migration lease another process
+  holds, with the holder and expiry; a migration the validate-only policy
+  requires; an incompatible schema; an expired owner's quiescence that would
+  outlast the startup budget; and a spent startup budget. Any other failure
+  returns `Phase` and logs its outermost cause once at error level, redacted.
 - Endpoint clones reject new calls after engine shutdown.
 - Graceful shutdown coordinates admission, runtime tasks, leases, ownership,
   connections, and any configured final in-memory snapshot.

@@ -1126,6 +1126,8 @@ per-run transition bytes SHALL be identical.
 Startup errors occur before a service handle exists and are returned as typed Rust errors.
 The existing `Engine::start*` compatibility methods adapt them into `anyhow::Error`.
 After ownership loss, calls through existing endpoint clones return gRPC `UNAVAILABLE`.
+`EmbeddedEngineStartError` is `#[non_exhaustive]`, so hosts must handle future variants.
+Other phase failures return `Phase { phase }` and log the outermost cause once at error level, redacted, without its source chain.
 
 | Condition | Internal error | External result |
 |---|---|---|
@@ -1142,14 +1144,16 @@ After ownership loss, calls through existing endpoint clones return gRPC `UNAVAI
 | Terminal or multi-Region-only cluster status | `ManagedDsqlError::UnsupportedStatus` | Startup error including status and canonical identity |
 | Wake or pool warmup timeout | `EmbeddedStorageError::WakeTimeout` | Startup error; pool closed |
 | Invalid build schema contract/baseline | Build-script failure | Compilation fails |
-| Schema too old/future/unknown/checksum/digest mismatch | `SchemaCompatibilityError::Incompatible` | Startup/schema-command error with observed/allowed/target/category |
-| Validate-only schema behind target | `SchemaCompatibilityError::MigrationRequired` | Startup/schema-command error; schema unchanged |
+| Schema too old/future/unknown/checksum/digest mismatch | `SchemaDecision::Reject(SchemaIncompatibility)` | `EmbeddedEngineStartError::SchemaIncompatible` with observed/allowed/target/category; no endpoint |
+| Validate-only schema behind target | `SchemaDecision::MigrationRequired` | `EmbeddedEngineStartError::SchemaMigrationRequired` with current/target versions; schema unchanged |
 | DSQL OCC during idempotent schema step | `SchemaCompatibilityError::OccConflict` | Bounded retry under migration claim |
-| Migration claim busy | `ControlLeaseError::Busy` | Startup/schema-command error with owner and expiry |
+| Migration claim busy | `ControlLeaseError::Busy` | `EmbeddedEngineStartError::SchemaMigrationLeaseHeld` with owner and expiry |
 | Migration fenced or async index invalid/failed | `SchemaCompatibilityError::{Fenced,IndexFailed}` | Startup fails; no service handle |
-| Embedded owner busy | `ControlLeaseError::Busy` | Startup error with redacted owner/expiry |
+| Embedded owner busy | `ControlLeaseError::Busy` | `EmbeddedEngineStartError::OwnerLeaseHeld` with non-secret owner incarnation and expiry |
+| Expired owner's quiescence would end after the startup deadline | Quiescence check after `ExpiredTakeover` | `EmbeddedEngineStartError::OwnerQuiescenceExceedsDeadline` with the remaining wait; the claim is left to expire, not released, so a retry waits a full quiescence again; an already elapsed deadline returns `DeadlineExceeded { phase: Ownership }` |
+| Control-lease acquisition or managed lifecycle exhausts startup budget | `ControlLeaseError::DeadlineElapsed` / `ManagedDsqlError::DeadlineExceeded` | `EmbeddedEngineStartError::DeadlineExceeded` with the active phase |
 | Embedded owner lost after startup | `ControlLeaseError::Fenced` | Admission closes; endpoint calls return `UNAVAILABLE` |
-| Startup phase failure after local resources exist | `EmbeddedEngineStartError::Phase` | Reverse unwind; no endpoint |
+| Other startup phase failure | `EmbeddedEngineStartError::Phase` | Cause logged once at error level, redacted (a fixed reason when there is no cause); reverse unwind; no endpoint |
 | In-process drain deadline | `EmbeddedEngineShutdownError::DrainTimeout` | Explicit shutdown returns error after cancellation; claim release/pool close still attempted |
 | Conditional claim release fails | `EmbeddedEngineShutdownError::OwnershipRelease` | Aggregated shutdown error; claim expires naturally |
 | Pool shutdown fails | `EmbeddedEngineShutdownError::Storage` | Aggregated shutdown error; no AWS delete/protection mutation |

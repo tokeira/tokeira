@@ -15,7 +15,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context as _, Result, bail, ensure};
@@ -28,8 +28,8 @@ use tokeira_config::{
     ExistingEmbeddedDsqlConfig, ManagedClusterIntent, ManagedEmbeddedDsqlConfig,
 };
 use tokeira_engine::{
-    EmbeddedEngineStartError, EmbeddedStartupPhase, Engine, InProcessGrpcRequest,
-    SchemaStartupOutcome, TemporalEndpoint, TokeiraConfig,
+    EmbeddedEngineStartError, Engine, InProcessGrpcRequest, SchemaStartupOutcome, TemporalEndpoint,
+    TokeiraConfig,
 };
 use tokeira_managed_dsql::{
     AdminDeadline, AwsDsqlControlPlane, ClusterDescriptorState, ClusterDescriptorStore,
@@ -262,9 +262,10 @@ async fn exercise_first_generation(
                 "a live embedded owner unexpectedly admitted a second engine"
             ))
         }
-        Err(EmbeddedEngineStartError::Phase {
-            phase: EmbeddedStartupPhase::Ownership,
-        }) => Ok(()),
+        Err(EmbeddedEngineStartError::OwnerLeaseHeld {
+            owner_id,
+            expires_at,
+        }) if !owner_id.is_empty() && expires_at > SystemTime::now() => Ok(()),
         Err(error) => Err(anyhow::anyhow!(
             "the competing engine must fail at ownership without mutating shared state: {error}"
         )),

@@ -245,3 +245,26 @@ cargo nextest run -p tokeira-storage --test dsql_schema_bootstrap --locked \
 This test leaves the database at the embedded target and performs no destructive
 cleanup. Use a new disposable V068 fixture for another run. Its evidence complements the full engine
 lifecycle test; it does not by itself exercise engine construction.
+
+## Embedded startup diagnostics
+
+`embedded_startup_errors_identify_schema_policy_and_held_claims` in
+`crates/tokeira-engine/tests/live_embedded_startup_errors.rs` requires a **new,
+empty disposable cluster with no other engine running**. It reads the same
+environment variables as `live_embedded_takeover`: `TOKEIRA_DSQL_TEST_DATABASE_URL`,
+`TOKEIRA_DSQL_TEST_CLUSTER_ID`, `TOKEIRA_DSQL_TEST_CLUSTER_ARN`,
+`TOKEIRA_DSQL_TEST_ENDPOINT`, and `TOKEIRA_DSQL_TEST_REGION`.
+
+The test verifies validate-only refusal without schema initialization, acquires
+a real schema-migration claim and checks the typed contention error, releases
+that claim, then migrates, serves a request, and shuts down. It next acquires a
+real embedded-owner claim and checks the typed owner contention error. Both
+claims use the supplied cluster identity and are conditionally released by
+their acquired guards, including when the competing startup result is unexpected.
+The test leaves the cluster initialized and does not delete it.
+
+```bash
+cargo nextest run -p tokeira-engine --test live_embedded_startup_errors --locked \
+  --features dsql-integration --profile dsql-live --run-ignored only \
+  -E 'test(=embedded_startup_errors_identify_schema_policy_and_held_claims)'
+```

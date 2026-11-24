@@ -6,8 +6,10 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    io::{self, Write},
     sync::{Arc, Mutex},
 };
+use tracing::instrument::WithSubscriber as _;
 
 use proptest::prelude::*;
 use tokeira_config::{
@@ -20,6 +22,299 @@ use tokeira_managed_dsql::{
 };
 
 use super::*;
+
+#[derive(Clone, Default)]
+struct StartupLog(Arc<Mutex<Vec<u8>>>);
+
+impl Write for StartupLog {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+async fn phase_error<E: Into<anyhow::Error>>(
+    phase: EmbeddedStartupPhase,
+    error: E,
+) -> EmbeddedEngineStartError {
+    startup_phase(Instant::now() + StdDuration::from_secs(30), phase, async {
+        Err::<(), _>(error)
+    })
+    .await
+    .unwrap_err()
+}
+
+fn incompatible_schema() -> SchemaIncompatibility {
+    SchemaIncompatibility {
+        observed_version: Some(12),
+        minimum_supported_version: 2,
+        target_version: 9,
+        maximum_readable_version: 10,
+        category: SchemaIncompatibilityCategory::FutureSchema,
+    }
+}
+
+#[tokio::test]
+async fn acquire_busy_errors_preserve_owner_and_expiry_through_phase() {
+    let expires_at = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+    let busy = || ControlLeaseError::Busy {
+        owner_id: "fake-owner-incarnation".to_owned(),
+        expires_at,
+    };
+    let schema = phase_error(
+        EmbeddedStartupPhase::Schema,
+        schema_migration_acquire_error(busy()),
+    )
+    .await;
+    assert!(matches!(schema,
+        EmbeddedEngineStartError::SchemaMigrationLeaseHeld { owner_id, expires_at: actual }
+        if owner_id == "fake-owner-incarnation" && actual == SystemTime::from(expires_at)));
+    let owner = phase_error(EmbeddedStartupPhase::Ownership, owner_acquire_error(busy())).await;
+    assert!(matches!(owner,
+        EmbeddedEngineStartError::OwnerLeaseHeld { owner_id, expires_at: actual }
+        if owner_id == "fake-owner-incarnation" && actual == SystemTime::from(expires_at)));
+}
+
+#[tokio::test]
+async fn schema_decisions_preserve_versions_and_incompatibility_through_phase() {
+    let required = embedded_schema_outcome(&SchemaDecision::MigrationRequired {
+        current: 3,
+        target: 9,
+    })
+    .unwrap_err();
+    assert!(matches!(
+        phase_error(EmbeddedStartupPhase::Schema, required).await,
+        EmbeddedEngineStartError::SchemaMigrationRequired {
+            current_version: 3,
+            target_version: 9
+        }
+    ));
+    let incompatible = incompatible_schema();
+    let rejected =
+        embedded_schema_outcome(&SchemaDecision::Reject(incompatible.clone())).unwrap_err();
+    assert!(
+        matches!(phase_error(EmbeddedStartupPhase::Schema, rejected).await,
+        EmbeddedEngineStartError::SchemaIncompatible(actual) if actual == incompatible)
+    );
+}
+
+#[tokio::test]
+async fn owner_quiescence_distinguishes_remaining_wait_from_elapsed_deadline() {
+    let now = Instant::now();
+    let wait = StdDuration::from_secs(60);
+    let error = check_owner_quiescence(now + wait, now + StdDuration::from_secs(30)).unwrap_err();
+    let error = phase_error(EmbeddedStartupPhase::Ownership, error).await;
+    let EmbeddedEngineStartError::OwnerQuiescenceExceedsDeadline { remaining } = error else {
+        panic!("expected the remaining quiescence wait");
+    };
+    assert!(remaining <= wait);
+    assert!(wait - remaining < StdDuration::from_millis(100));
+
+    let elapsed = check_owner_quiescence(now + wait, now - StdDuration::from_secs(1)).unwrap_err();
+    assert!(matches!(
+        phase_error(EmbeddedStartupPhase::Ownership, elapsed).await,
+        EmbeddedEngineStartError::DeadlineExceeded {
+            phase: EmbeddedStartupPhase::Ownership
+        }
+    ));
+    assert!(check_owner_quiescence(now + wait, now + wait).is_ok());
+}
+
+#[tokio::test]
+async fn deadline_causes_retain_the_active_phase() {
+    for phase in [
+        EmbeddedStartupPhase::Schema,
+        EmbeddedStartupPhase::Ownership,
+    ] {
+        let error = if phase == EmbeddedStartupPhase::Schema {
+            schema_migration_acquire_error(ControlLeaseError::DeadlineElapsed)
+        } else {
+            owner_acquire_error(ControlLeaseError::DeadlineElapsed)
+        };
+        assert!(matches!(phase_error(phase, error).await,
+            EmbeddedEngineStartError::DeadlineExceeded { phase: actual } if actual == phase));
+    }
+    for phase in [
+        EmbeddedStartupPhase::ClusterResolution,
+        EmbeddedStartupPhase::ConnectionWarmup,
+    ] {
+        assert!(
+            matches!(phase_error(phase, ManagedDsqlError::DeadlineExceeded).await,
+            EmbeddedEngineStartError::DeadlineExceeded { phase: actual } if actual == phase)
+        );
+    }
+}
+
+#[tokio::test]
+async fn phase_failures_log_once_and_redact_outer_messages() {
+    let canaries = [
+        "password=fake-password-canary",
+        "token=fake-token-canary",
+        "postgres://user:pass@host/db",
+    ];
+    for (error, expected) in [
+        (anyhow!("index build failed"), "index build failed"),
+        (anyhow!(canaries[0]), "[redacted]"),
+        (anyhow!(canaries[1]), "[redacted]"),
+        (anyhow!(canaries[2]), "[redacted]"),
+        (
+            anyhow!(canaries.join(" ")).context("outer operation failed"),
+            "outer operation failed",
+        ),
+    ] {
+        let log = StartupLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let error = phase_error(EmbeddedStartupPhase::Schema, error)
+            .with_subscriber(subscriber)
+            .await;
+        assert!(matches!(
+            error,
+            EmbeddedEngineStartError::Phase {
+                phase: EmbeddedStartupPhase::Schema
+            }
+        ));
+        let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        let events = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["level"], "ERROR");
+        assert_eq!(events[0]["fields"]["phase"], "schema compatibility");
+        assert_eq!(events[0]["fields"]["cause"], expected);
+        for canary in canaries {
+            assert!(!output.contains(canary));
+            assert!(!error.to_string().contains(canary));
+            assert!(!format!("{error:?}").contains(canary));
+        }
+        assert!(std::error::Error::source(&error).is_none());
+    }
+}
+
+#[tokio::test]
+async fn stack_and_fixed_reason_failures_log_once_across_phase_wrapping() {
+    for fixed_reason in [false, true] {
+        let log = StartupLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        async {
+            let error = if fixed_reason {
+                startup_phase_failure(EmbeddedStartupPhase::RuntimeRestore, "ownership lost")
+            } else {
+                embedded_stack_error(anyhow!("stack construction failed"))
+            };
+            let error = phase_error(EmbeddedStartupPhase::RuntimeRestore, error).await;
+            assert!(matches!(
+                error,
+                EmbeddedEngineStartError::Phase {
+                    phase: EmbeddedStartupPhase::RuntimeRestore
+                }
+            ));
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        let events = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["level"], "ERROR");
+        assert_eq!(events[0]["fields"]["phase"], "runtime restoration");
+        assert_eq!(
+            events[0]["fields"]["cause"],
+            if fixed_reason {
+                "ownership lost"
+            } else {
+                "stack construction failed"
+            }
+        );
+    }
+}
+
+#[test]
+fn startup_error_display_names_conditions_and_remedies() {
+    let expires_at = SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_800_000_000);
+    for (error, condition) in [
+        (
+            EmbeddedEngineStartError::OwnerLeaseHeld {
+                owner_id: "fake-owner".to_owned(),
+                expires_at,
+            },
+            "embedded owner lease",
+        ),
+        (
+            EmbeddedEngineStartError::SchemaMigrationLeaseHeld {
+                owner_id: "fake-owner".to_owned(),
+                expires_at,
+            },
+            "schema migration lease",
+        ),
+    ] {
+        let message = error.to_string();
+        for expected in [
+            condition,
+            "held by fake-owner",
+            "2027-01-15T08:00:00Z",
+            "retry after",
+        ] {
+            assert!(message.contains(expected), "missing {expected}");
+        }
+    }
+    let required = EmbeddedEngineStartError::SchemaMigrationRequired {
+        current_version: 3,
+        target_version: 9,
+    }
+    .to_string();
+    for expected in [
+        "migration required",
+        "V3",
+        "V9",
+        "validate-only",
+        "unchanged",
+        "automatic",
+    ] {
+        assert!(required.contains(expected), "missing {expected}");
+    }
+    let incompatible =
+        EmbeddedEngineStartError::SchemaIncompatible(incompatible_schema()).to_string();
+    for expected in [
+        "schema incompatible",
+        "observed V12",
+        "allowed V2..=V10",
+        "target V9",
+        "FutureSchema",
+        "compatible release",
+    ] {
+        assert!(incompatible.contains(expected), "missing {expected}");
+    }
+    let quiescence = EmbeddedEngineStartError::OwnerQuiescenceExceedsDeadline {
+        remaining: StdDuration::from_millis(1250),
+    }
+    .to_string();
+    for expected in [
+        "quiescence exceeds",
+        "1.250 seconds remaining",
+        "left to expire",
+        "full 300-second quiescence again",
+        "startup budget",
+    ] {
+        assert!(quiescence.contains(expected), "missing {expected}");
+    }
+}
 
 const ID: &str = "abcdefghijklmnopqrstuv1234";
 const ARN: &str = "arn:aws:dsql:eu-west-2:123456789012:cluster/abcdefghijklmnopqrstuv1234";

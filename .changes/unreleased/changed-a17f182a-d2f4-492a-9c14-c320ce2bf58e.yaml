@@ -1,0 +1,5 @@
+kind: changed
+body: Embedded DSQL startup now names a held owner or migration lease, a required or incompatible schema, or a too-long ownership wait, and `EmbeddedEngineStartError` is non-exhaustive.
+time: 2026-11-24T00:00:00+00:00
+custom:
+    Slice: a17f182a-d2f4-492a-9c14-c320ce2bf58e

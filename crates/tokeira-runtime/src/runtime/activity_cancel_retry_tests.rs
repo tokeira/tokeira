@@ -1,4 +1,4 @@
-//! Cancellation ends an in-flight attempt through its original failure path.
+//! Activity failure ordering preserves cancellation, pause, and retry budgets.
 
 use super::{
     repair_tests::{Point, Repo},
@@ -7,8 +7,13 @@ use super::{
 };
 use crate::{activity_timeout::scan_activity_timeouts_once, test_clock::TestClock};
 use proptest::prelude::*;
-use tokeira_proto::conversions::common::payload_to_failure;
+use tokeira_proto::{
+    conversions::common::{failure_to_payload, payload_to_failure},
+    enums::TimeoutType,
+    failure::{Failure, TimeoutFailureInfo, failure::FailureInfo},
+};
 use tokeira_storage::InMemoryStore;
+use tokeira_types::{WorkflowRuleAction, WorkflowRuleRecord, WorkflowRuleTrigger};
 
 struct Fixture {
     repo: Arc<Repo>,
@@ -83,6 +88,119 @@ impl Fixture {
             queue,
             token,
         }
+    }
+
+    async fn pause(&self) {
+        let now = self.runtime.clock.now();
+        self.runtime
+            .pause_activities(
+                self.token.run_key,
+                PauseActivityRequest {
+                    target: ActivityControlTarget::Id(self.token.activity_id.clone()),
+                    identity: "worker".into(),
+                    reason: "pause".into(),
+                    rule_id: None,
+                    request: RequestContext {
+                        request_id: RequestId("pause".into()),
+                        ..RequestContext::unattributed(now)
+                    },
+                    now,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn unpause(&self) {
+        let now = self.runtime.clock.now();
+        self.runtime
+            .unpause_activities(
+                self.token.run_key,
+                UnpauseActivitiesRequest {
+                    target: ActivityControlTarget::Id(self.token.activity_id.clone()),
+                    reset_attempts: false,
+                    reset_heartbeat: false,
+                    jitter: None,
+                    request: RequestContext {
+                        request_id: RequestId("unpause".into()),
+                        ..RequestContext::unattributed(now)
+                    },
+                    now,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn rule(&self, predicate: &str) {
+        self.repo
+            .create_workflow_rule(
+                self.queue.namespace_id,
+                WorkflowRuleRecord {
+                    id: "failure-pause".into(),
+                    create_time: self.runtime.clock.now(),
+                    created_by_identity: "worker".into(),
+                    description: "pause on failure".into(),
+                    trigger: WorkflowRuleTrigger::ActivityStart {
+                        predicate: predicate.into(),
+                    },
+                    visibility_query: String::new(),
+                    actions: vec![WorkflowRuleAction::ActivityPause],
+                    expiration_time: None,
+                },
+                10,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn terminal_events(&self) -> Vec<HistoryEventKind> {
+        self.repo
+            .read_history_to_end(self.token.run_key, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| {
+                matches!(
+                    event.kind,
+                    HistoryEventKind::ActivityTaskFailed { .. }
+                        | HistoryEventKind::ActivityTaskTimedOut { .. }
+                        | HistoryEventKind::ActivityTaskCanceled { .. }
+                        | HistoryEventKind::ActivityTaskCompleted { .. }
+                )
+                .then_some(event.kind)
+            })
+            .collect()
+    }
+
+    async fn assert_parked(&self, stamp: u64, failure: Payload) {
+        let state = self.state().await;
+        let activity = state
+            .activities
+            .get(&self.token.activity_id)
+            .expect("failed attempt must park");
+        assert_eq!(activity.attempt, self.token.attempt + 1);
+        assert_eq!(activity.stamp, stamp + 1);
+        assert!(activity.started_at.is_none());
+        assert!(activity.started_event_id.is_none());
+        assert!(activity.current_attempt_scheduled_at.is_none());
+        assert!(activity.pause_info.is_some());
+        assert_eq!(activity.last_failure, Some(failure));
+        assert!(self.terminal_events().await.is_empty());
+        assert!(
+            self.repo
+                .list_all_dispatchable_activity_tasks(
+                    &QueueKey {
+                        task_kind: TaskKind::Activity,
+                        task_queue: TaskQueueName("activities".into()),
+                        ..self.queue.clone()
+                    },
+                    100
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     async fn cancel(&self) {
@@ -440,20 +558,220 @@ async fn cancel_requested_during_heartbeat_retry_commit_ends_once() {
     retry_race(Some(true)).await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn paused_spent_attempt_parks_then_unpause_delivers_final_attempt() {
+    let mut retry = policy();
+    retry.maximum_attempts = 1;
+    let mut f = Fixture::new(Some(retry), false).await;
+    f.pause().await;
+    let stamp = f.state().await.activities[&f.token.activity_id].stamp;
+    f.fail(false, "retryable").await;
+    f.assert_parked(stamp, worker_failure()).await;
+    f.unpause().await;
+    f.next_attempt().await;
+    assert_eq!(f.token.attempt, 2);
+    f.fail(false, "retryable").await;
+    assert!(matches!(
+        f.terminal_events().await.as_slice(),
+        [HistoryEventKind::ActivityTaskFailed {
+            retry_state: RetryState::MaximumAttemptsReached,
+            ..
+        }]
+    ));
+    assert!(
+        !f.state()
+            .await
+            .activities
+            .contains_key(&f.token.activity_id)
+    );
+    discovery_tests::stop(&f.runtime).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn paused_expired_worker_failure_parks_then_unpause_times_out() {
+    let f = Fixture::new(Some(policy()), false).await;
+    f.pause().await;
+    let stamp = f.state().await.activities[&f.token.activity_id].stamp;
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    f.fail(false, "retryable").await;
+    f.assert_parked(stamp, worker_failure()).await;
+    f.unpause().await;
+    f.scan().await;
+    assert!(matches!(f.terminal_events().await.as_slice(),
+        [HistoryEventKind::ActivityTaskTimedOut { retry_state: RetryState::Timeout, timeout_type, .. }]
+        if timeout_type == "schedule_to_close"));
+    assert!(
+        !f.state()
+            .await
+            .activities
+            .contains_key(&f.token.activity_id)
+    );
+    discovery_tests::stop(&f.runtime).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn failure_rule_parks_spent_attempt() {
+    let mut retry = policy();
+    retry.maximum_attempts = 1;
+    let f = Fixture::new(Some(retry), false).await;
+    f.rule("Attempts = 1").await;
+    let stamp = f.state().await.activities[&f.token.activity_id].stamp;
+    f.fail(false, "retryable").await;
+    f.assert_parked(stamp, worker_failure()).await;
+    assert_eq!(
+        f.state().await.activities[&f.token.activity_id]
+            .pause_info
+            .as_ref()
+            .unwrap()
+            .rule_id
+            .as_deref(),
+        Some("failure-pause")
+    );
+    discovery_tests::stop(&f.runtime).await;
+}
+
+fn timeout_failure(heartbeat: bool) -> Payload {
+    let timeout_type = if heartbeat {
+        TimeoutType::Heartbeat
+    } else {
+        TimeoutType::StartToClose
+    };
+    failure_to_payload(&Failure {
+        message: format!(
+            "activity {} timeout",
+            if heartbeat {
+                "Heartbeat"
+            } else {
+                "StartToClose"
+            }
+        ),
+        failure_info: Some(FailureInfo::TimeoutFailureInfo(TimeoutFailureInfo {
+            timeout_type: timeout_type as i32,
+            ..Default::default()
+        })),
+        ..Default::default()
+    })
+}
+
+async fn timeout_rule_parks(heartbeat: bool, attempts_spent: bool) {
+    let mut retry = policy();
+    retry.maximum_attempts = if attempts_spent { 1 } else { 0 };
+    if !attempts_spent {
+        retry.initial_interval = Duration::seconds(30);
+    }
+    let f = Fixture::new(Some(retry), heartbeat).await;
+    f.rule("Attempts = 1").await;
+    let stamp = f.state().await.activities[&f.token.activity_id].stamp;
+    tokio::time::advance(std::time::Duration::from_nanos(1_000_000_001)).await;
+    f.scan().await;
+    f.assert_parked(stamp, timeout_failure(heartbeat)).await;
+    f.scan().await;
+    assert!(f.terminal_events().await.is_empty());
+    discovery_tests::stop(&f.runtime).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn start_to_close_rule_parks_spent_attempt() {
+    timeout_rule_parks(false, true).await;
+}
+#[tokio::test(start_paused = true)]
+async fn heartbeat_rule_parks_spent_attempt() {
+    timeout_rule_parks(true, true).await;
+}
+#[tokio::test(start_paused = true)]
+async fn start_to_close_rule_parks_spent_time_budget() {
+    timeout_rule_parks(false, false).await;
+}
+#[tokio::test(start_paused = true)]
+async fn heartbeat_rule_parks_spent_time_budget() {
+    timeout_rule_parks(true, false).await;
+}
+
+async fn failure_rule_attempt(predicate: &str, matches: bool) {
+    let f = Fixture::new(Some(policy()), false).await;
+    f.rule(predicate).await;
+    f.fail(false, "retryable").await;
+    let state = f.state().await;
+    let activity = &state.activities[&f.token.activity_id];
+    assert_eq!(activity.attempt, 2);
+    assert_eq!(activity.pause_info.is_some(), matches);
+    assert_eq!(activity.current_attempt_scheduled_at.is_none(), matches);
+    assert!(f.terminal_events().await.is_empty());
+    discovery_tests::stop(&f.runtime).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn failure_rule_matches_failed_attempt() {
+    failure_rule_attempt("Attempts = 1", true).await;
+}
+#[tokio::test(start_paused = true)]
+async fn failure_rule_does_not_match_next_attempt() {
+    failure_rule_attempt("Attempts = 2", false).await;
+}
+
+async fn failure_rule_fields(timeout: bool) {
+    let mut f = Fixture::new(Some(policy()), false).await;
+    f.fail(false, "retryable").await;
+    f.next_attempt().await;
+    f.rule(if timeout {
+        "Attempts = 2 AND BackoffInterval = 1 AND LastFailure contains 'retryable worker failure' AND Status = 'Started'"
+    } else {
+        "Attempts = 2 AND BackoffInterval = -1 AND LastFailure contains 'retryable worker failure' AND Status = 'Started'"
+    }).await;
+    let stamp = f.state().await.activities[&f.token.activity_id].stamp;
+    tokio::time::advance(std::time::Duration::from_nanos(1_000_000_001)).await;
+    let failure = if timeout {
+        f.scan().await;
+        timeout_failure(false)
+    } else {
+        let failure = Payload::new(b"current failure".to_vec());
+        f.runtime
+            .fail_activity_task(
+                f.token.clone(),
+                failure.clone(),
+                Some("retryable".into()),
+                false,
+                None,
+                None,
+                RequestContext::unattributed(f.runtime.clock.now()),
+            )
+            .await
+            .unwrap();
+        failure
+    };
+    f.assert_parked(stamp, failure).await;
+    discovery_tests::stop(&f.runtime).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn worker_failure_rule_sees_failed_attempt_fields() {
+    failure_rule_fields(false).await;
+}
+#[tokio::test(start_paused = true)]
+async fn timeout_rule_sees_failed_attempt_fields() {
+    failure_rule_fields(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn paused_activity_timeouts_fire_nothing() {
+    let f = Fixture::new(Some(policy()), true).await;
+    f.pause().await;
+    let before = f.state().await;
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    f.scan().await;
+    assert_eq!(f.state().await, before);
+    assert!(f.terminal_events().await.is_empty());
+    discovery_tests::stop(&f.runtime).await;
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 128, failure_persistence: None, ..ProptestConfig::default() })]
     // Feature: runtime-activity-pump, Property 14: Cancellation stops retries.
     #[test]
     fn cancel_requested_retry_order_matches_temporal(
         has_policy in any::<bool>(), cancel in any::<bool>(), failure_kind in 0u8..3,
-        attempt in 1u32..5, attempts_exhausted in any::<bool>(), expired in any::<bool>(), paused in any::<bool>(),
+        attempt in 1u32..5, attempts_exhausted in any::<bool>(), expired in any::<bool>(), paused in any::<bool>(), rule in 0u8..3,
     ) {
-        // Left out: a paused attempt that fails retryably with no attempts or
-        // time left. v1.31.0 parks a paused attempt before it checks the retry
-        // budget (mutable_state_impl.go:6277-6297 @ v1.31.0); the runtime
-        // checks the budget first and ends the activity. That is a pause
-        // difference, not a cancellation one, so this property doesn't cover it.
-        prop_assume!(!(has_policy && !cancel && failure_kind == 0 && paused && (attempts_exhausted || expired)));
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             tokio::time::pause();
             let mut retry = policy();
@@ -469,12 +787,13 @@ proptest! {
                     target: ActivityControlTarget::Id(f.token.activity_id.clone()), identity: "worker".into(), reason: "pause".into(), rule_id: None, request: RequestContext::unattributed(now), now,
                 }).await.unwrap();
             }
+            if rule != 0 { f.rule(if rule == 1 { "Attempts >= 1" } else { "Attempts > 100" }).await; }
             if expired { tokio::time::advance(std::time::Duration::from_secs(30)).await; }
             f.fail(failure_kind == 1, if failure_kind == 2 { "listed" } else { "retryable" }).await;
             let expected = if !has_policy { Some(RetryState::RetryPolicyNotSet) }
                 else if cancel { Some(RetryState::CancelRequested) }
                 else if failure_kind != 0 { Some(RetryState::NonRetryableFailure) }
-                else if paused { None }
+                else if paused || rule == 1 { None }
                 else if attempts_exhausted { Some(RetryState::MaximumAttemptsReached) }
                 else if expired { Some(RetryState::Timeout) } else { None };
             let history = f.repo.read_history_to_end(f.token.run_key, 0).await.unwrap();
@@ -482,7 +801,12 @@ proptest! {
             assert_eq!(actual, expected);
             let state = f.state().await;
             assert_eq!(state.activities.contains_key(&f.token.activity_id), expected.is_none());
-            if expected.is_none() { assert_eq!(state.activities[&f.token.activity_id].attempt, f.token.attempt + 1); }
+            if expected.is_none() {
+                let activity = &state.activities[&f.token.activity_id];
+                assert_eq!(activity.attempt, f.token.attempt + 1);
+                assert_eq!(activity.pause_info.is_some(), paused || rule == 1);
+                assert_eq!(activity.current_attempt_scheduled_at.is_none(), paused || rule == 1);
+            }
             discovery_tests::stop(&f.runtime).await;
         });
     }

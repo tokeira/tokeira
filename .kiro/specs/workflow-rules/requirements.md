@@ -182,8 +182,7 @@ policy applies before work starts and across retries.
    failing the workflow transition.
 8. WHEN a waiting activity poll receives an offer, THE runtime SHALL evaluate the current rule set
    at offer time regardless of the CRUD-gate value captured at poll admission.
-9. IF a failed activity will not receive another attempt, THEN retry-rule evaluation SHALL NOT
-   pause it as though a retry were pending.
+9. WHEN a failed attempt has a retry policy and no requested cancellation, is not a schedule-to-start or schedule-to-close timeout, and is retryable, THE runtime SHALL evaluate rules on the failed attempt before checking retry budgets, unless already paused. The view SHALL retain the previous failure and scheduled time; worker failure SHALL first update completion time, while timeout SHALL retain it. A matching rule SHALL park the attempt even with a spent budget (`service/history/workflow/mutable_state_impl.go:6243-6317`, `service/history/api/respondactivitytaskfailed/api.go:104-105`, `service/history/timer_queue_active_task_executor.go:300-302`, `service/history/workflow/matcher/activity_evaluator.go:240-260 @ v1.31.0`).
 10. WHEN a retry timer becomes eligible, THE runtime SHALL evaluate rules before enqueueing the
     retry task.
 11. WHEN an activity first starts eagerly inside a workflow-task completion, THE runtime SHALL

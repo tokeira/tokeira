@@ -201,13 +201,22 @@ pub(crate) fn exhausted_reason_to_retry_state(reason: RetryExhaustedReason) -> R
 /// Whether a failed or timed-out activity attempt retries, and if not, why.
 #[derive(Debug)]
 pub(crate) enum ActivityRetryDecision {
-    /// Prepare another attempt; the commit must revalidate its durable target.
+    /// Settle pause before the budget; the commit must revalidate its durable target.
     Retry {
         next_attempt: u32,
-        backoff: Duration,
+        backoff: ActivityRetryBackoff,
     },
     /// Resolve through the caller's original failure or timeout path.
     Terminal(RetryState),
+}
+
+/// A retry budget is provisional until failure-time pause rules have been evaluated.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ActivityRetryBackoff {
+    /// An unpaused attempt may retry after this delay.
+    Delay(Duration),
+    /// Only a paused attempt may advance; otherwise retain this terminal reason.
+    Exhausted(RetryExhaustedReason),
 }
 
 /// The retry decision that worker failures and the timeout scan share.
@@ -225,7 +234,8 @@ pub(crate) fn activity_retry_decision(
     // `RetryActivity`'s order: no policy → RETRY_POLICY_NOT_SET, then a
     // requested cancel → CANCEL_REQUESTED, then the server-enforced
     // schedule-to-start and schedule-to-close deadlines → TIMEOUT, all before
-    // retryability and the backoff (mutable_state_impl.go:6243-6266 @ v1.31.0).
+    // retryability and the backoff
+    // (service/history/workflow/mutable_state_impl.go:6243-6266 @ v1.31.0).
     let Some(policy) = retry_policy else {
         return ActivityRetryDecision::Terminal(RetryState::RetryPolicyNotSet);
     };
@@ -254,11 +264,19 @@ pub(crate) fn activity_retry_decision(
             backoff,
         } => ActivityRetryDecision::Retry {
             next_attempt,
-            backoff,
+            backoff: ActivityRetryBackoff::Delay(backoff),
         },
-        RetryDecision::Exhausted { reason } => {
-            ActivityRetryDecision::Terminal(exhausted_reason_to_retry_state(reason))
-        }
+        RetryDecision::Exhausted {
+            reason: RetryExhaustedReason::NonRetryableFailure,
+        } => ActivityRetryDecision::Terminal(RetryState::NonRetryableFailure),
+        // Rules need storage and must see the reloaded attempt under OCC. Budget
+        // exhaustion alone cannot end a retryable failure: pause precedes both
+        // budget checks (service/history/workflow/mutable_state_impl.go:6268-6317,
+        // service/history/workflow/retry.go:96-111 @ v1.31.0).
+        RetryDecision::Exhausted { reason } => ActivityRetryDecision::Retry {
+            next_attempt: activity.attempt.saturating_add(1),
+            backoff: ActivityRetryBackoff::Exhausted(reason),
+        },
     }
 }
 
@@ -728,6 +746,9 @@ where
                         return Ok(());
                     }
                     Ok(ActivityRetryOutcome::CancelRequested) => RetryState::CancelRequested,
+                    Ok(ActivityRetryOutcome::BudgetExhausted(reason)) => {
+                        exhausted_reason_to_retry_state(reason)
+                    }
                     Err(error) => {
                         runtime_metrics::record_activity_task_retry(OutcomeLabel::Failure);
                         return Err(error);
@@ -1937,7 +1958,7 @@ where
         &self,
         token: &ActivityTaskToken,
         next_attempt: u32,
-        backoff: time::Duration,
+        backoff: ActivityRetryBackoff,
         failure: Option<Payload>,
         progress: Option<Payloads>,
     ) -> Result<ActivityRetryOutcome> {
@@ -2077,23 +2098,25 @@ pub(crate) struct ActivityRetryTarget<'a> {
     pub timeout: Option<crate::activity_timeout::ActivityTimeoutCheck>,
 }
 
-/// Whether retry committed or a concurrent cancellation requires terminal resolution.
+/// Whether retry or park committed, or the original attempt needs terminal resolution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActivityRetryOutcome {
     /// The next attempt is durable.
     Committed,
     /// The matching attempt must resolve with the caller's original failure kind.
     CancelRequested,
+    /// No pause applies, so the caller must resolve with the exhausted budget.
+    BudgetExhausted(RetryExhaustedReason),
 }
 
-/// Commit an activity's next attempt and durable eligibility time.
+/// Commit an activity's next attempt, parking it if paused before applying its budget.
 ///
 /// Canonical storage maintenance retains the future attempt's row; owner
 /// eligibility tracking evaluates rules and routes delivery at the deadline; discovery
 /// reconstructs offers. The timeout scanner uses the same transition when a
 /// fired attempt timeout is retryable (`RetryActivity` →
-/// `UpdateActivityInfoForRetries`, mutable_state_impl.go + activity.go:63-97
-/// @ v1.31.0). The reload-and-recheck OCC loop guards against a concurrent
+/// `UpdateActivityInfoForRetries`, service/history/workflow/mutable_state_impl.go:6322-6333,
+/// service/history/workflow/activity.go:63-97 @ v1.31.0). The reload-and-recheck OCC loop guards against a concurrent
 /// resolution: if the target no longer matches the current `(attempt,
 /// schedule_event_id)` the retry is abandoned with an error, and a commit
 /// conflict is retried up to `max_occ_retries`.
@@ -2101,7 +2124,7 @@ pub(crate) async fn commit_activity_retry<R>(
     deps: &ActivityRetryDeps<R>,
     target: ActivityRetryTarget<'_>,
     next_attempt: u32,
-    backoff: time::Duration,
+    backoff: ActivityRetryBackoff,
     failure: Option<Payload>,
     progress: Option<Payloads>,
 ) -> Result<ActivityRetryOutcome>
@@ -2147,9 +2170,45 @@ where
             return Ok(ActivityRetryOutcome::CancelRequested);
         }
 
+        let completed_at = deps.clock.now();
+        let mut next_activity = current.clone();
+        // Failure-time rules see the failed attempt and its previous failure.
+        // Worker failure first records completion time; the timeout caller does
+        // not. Neither has advanced ScheduledTime or Attempt at this point
+        // (service/history/api/respondactivitytaskfailed/api.go:104-105,
+        // service/history/timer_queue_active_task_executor.go:300-302,
+        // service/history/workflow/matcher/activity_evaluator.go:240-260 @ v1.31.0).
+        if target.timeout.is_none() {
+            next_activity.last_attempt_complete_time = Some(completed_at);
+        }
+        if next_activity.pause_info.is_none() {
+            let rules = deps.repo.list_workflow_rules(state.namespace_id).await?;
+            let backoff_interval_seconds = activity_backoff_interval_seconds(&next_activity)?;
+            if let Some(rule) = matching_pause_rule(
+                &state,
+                &next_activity,
+                &rules,
+                completed_at,
+                backoff_interval_seconds,
+            ) {
+                next_activity.pause_info = Some(pause_info_for_rule(rule, completed_at));
+            }
+        }
+        let paused = next_activity.pause_info.is_some();
+        // A rule-induced pause and the park are one fenced transition. A spent
+        // budget can reach terminal resolution only after this reloaded state
+        // proves no pause applies; that path writes nothing here and uses the
+        // caller's original terminal fence, just as the cancellation recheck does
+        // (service/history/workflow/mutable_state_impl.go:6272-6319 @ v1.31.0).
+        let backoff = match backoff {
+            ActivityRetryBackoff::Delay(delay) => delay,
+            ActivityRetryBackoff::Exhausted(reason) if !paused => {
+                return Ok(ActivityRetryOutcome::BudgetExhausted(reason));
+            }
+            ActivityRetryBackoff::Exhausted(_) => Duration::ZERO,
+        };
         let mut next_state = state.clone();
         next_state.transition_seq = state.transition_seq.next();
-        let mut next_activity = current.clone();
         next_activity.attempt = next_attempt;
         // A retry is a new incarnation: the preceding start can no longer be
         // replayed even if its queue owner retries an ambiguous response.
@@ -2157,18 +2216,14 @@ where
         next_activity.stamp += 1;
         next_activity.started_at = None;
         next_activity.started_event_id = None;
-        // One timestamp per OCC attempt anchors BOTH durable retry-timing
-        // fields, so the attempt's backoff is derivable from durable state
-        // alone (`current_attempt_scheduled_at - last_attempt_complete_time`)
-        // — the way v1.31.0 stamps `LastAttemptCompleteTime` at retry and
-        // derives `BackoffInterval` from mutable state
-        // (mutable_state_impl.go:6338, matcher/activity_evaluator.go:251 @
-        // v1.31.0). The next attempt is scheduled AFTER the retry backoff —
-        // v1.31.0 advances ScheduledTime to now+backoff and dispatches on a
-        // durable retry timer, not immediately
-        // (`UpdateActivityInfoForRetries`, activity.go:74 +
-        // GenerateActivityRetryTasks @ v1.31.0).
-        let completed_at = deps.clock.now();
+        // Record the next attempt's scheduled time and the completion time its
+        // backoff is measured from, so later rule evaluations derive
+        // BackoffInterval from durable state
+        // (service/history/workflow/activity.go:63-97,
+        // service/history/workflow/matcher/activity_evaluator.go:245-252 @ v1.31.0).
+        // v1.31.0 records the completion time only for a worker failure
+        // (service/history/api/respondactivitytaskfailed/api.go:104 @ v1.31.0);
+        // this records it after a timeout as well.
         let dispatch_at = deadline_after(completed_at, backoff);
         next_activity.last_attempt_complete_time = Some(completed_at);
         next_activity.current_attempt_scheduled_at = Some(dispatch_at);
@@ -2204,30 +2259,8 @@ where
         }
         next_activity.activity_reset = false;
         next_activity.reset_heartbeats = false;
-        if next_activity.pause_info.is_none() {
-            let rules = deps.repo.list_workflow_rules(state.namespace_id).await?;
-            // The rule evaluator reads the durable interval the new attempt
-            // just recorded, so this evaluation and every later re-evaluation
-            // (delayed publish, reconciliation, start) see the same value.
-            let backoff_interval_seconds = activity_backoff_interval_seconds(&next_activity)?;
-            if let Some(rule) = matching_pause_rule(
-                &state,
-                &next_activity,
-                &rules,
-                completed_at,
-                backoff_interval_seconds,
-            ) {
-                // Retry preparation knows a next attempt exists, so this is the first retry-rule
-                // evaluation point. Terminal failures never enter this function
-                // (`mutable_state_impl.go:6274 @ v1.31.0`). Persisting the pause in the same
-                // transition prevents any retry dispatch from escaping between the decision and
-                // the state change.
-                next_activity.pause_info = Some(pause_info_for_rule(rule, completed_at));
-            }
-        }
-        let paused = next_activity.pause_info.is_some();
         // A paused park has no eligibility time; the unpause transition
-        // re-anchors it (`RetryActivity`, mutable_state_impl.go:6278-6289 @
+        // re-anchors it (service/history/workflow/mutable_state_impl.go:6278-6289 @
         // v1.31.0).
         if paused {
             next_activity.current_attempt_scheduled_at = None;
@@ -3584,7 +3617,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_rule_applies_only_when_failure_has_a_next_attempt() {
+    async fn failure_rule_applies_only_to_retryable_failures() {
         for retryable in [false, true] {
             let repo = Arc::new(InMemoryStore::default());
             let runtime = TokeiraRuntime::new(
@@ -3595,9 +3628,12 @@ mod tests {
                 WorkflowTimeoutScannerConfig::default(),
             );
             let (state, token, _queue) = seed_started_activity(&runtime, &repo, None).await;
+            // The rule matches the failed first attempt. A non-retryable
+            // failure ends the activity before rules are evaluated
+            // (service/history/workflow/mutable_state_impl.go:6268-6275 @ v1.31.0).
             repo.create_workflow_rule(
                 state.namespace_id,
-                pause_rule("retry-pause", "Attempts >= 2"),
+                pause_rule("retry-pause", "Attempts = 1"),
                 10,
             )
             .await
@@ -3694,7 +3730,7 @@ mod tests {
                 let deps = runtime.activity_retry_deps();
                 commit_activity_retry(&deps, ActivityRetryTarget { run_key: token.run_key, activity_id: &token.activity_id,
                     expected_attempt: token.attempt, expected_schedule_event_id: token.schedule_event_id, timeout: None },
-                    2, Duration::seconds(backoff_seconds), None, None).await.unwrap();
+                    2, ActivityRetryBackoff::Delay(Duration::seconds(backoff_seconds)), None, None).await.unwrap();
                 let LoadedRun::Existing(retried) = repo.load_run(token.run_key).await.unwrap() else { panic!("retry exists"); };
                 let due = retried.activities[&token.activity_id].current_attempt_scheduled_at.unwrap();
                 repo.create_workflow_rule(state.namespace_id, pause_rule("after-retry", if matches_rule { "Attempts >= 2" } else { "Attempts > 10" }), 10).await.unwrap();
@@ -3788,7 +3824,7 @@ mod tests {
                 timeout: None,
             },
             2,
-            backoff,
+            ActivityRetryBackoff::Delay(backoff),
             Some(payload(b"retryable")),
             None,
         )
@@ -4140,7 +4176,7 @@ mod tests {
                             timeout: None,
                         },
                         2,
-                        Duration::minutes(1),
+                        ActivityRetryBackoff::Delay(Duration::minutes(1)),
                         Some(payload(b"retryable")),
                         None,
                     )

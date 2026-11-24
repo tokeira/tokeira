@@ -167,7 +167,7 @@ rule while Describe/List retain it; only explicit Delete or capacity eviction ma
 
 *For any* activity and current rule set, ordinary first-start, retryable-failure and
 retry-timer paths SHALL evaluate the applicable rule set; an eager first start SHALL
-perform no evaluation. A terminal failure SHALL not apply retry-rule pause state.
+perform no evaluation. A failure ended by a missing retry policy, a requested cancellation, a schedule-to-start or schedule-to-close timeout, or a non-retryable failure SHALL not apply retry-rule pause state; a retryable failure SHALL evaluate rules on the failed attempt before retry budgets, so a match parks even with a spent budget (`service/history/workflow/mutable_state_impl.go:6243-6317 @ v1.31.0`).
 
 **Validates: Requirements 4.2, 4.3, 4.4, 4.9, 4.10, 4.11**
 
@@ -189,6 +189,6 @@ perform no evaluation. A terminal failure SHALL not apply retry-rule pause state
 - **Unit tests:** exact v1.31.0 messages, force-scan/request-id ignored behavior, unspecified List
   order, expiration selection and CRUD retention, and Trigger's fixed response.
 - **Integration tests:** gate-independent offer-time pause, ordinary pre-start pause, eager first-start bypass, pause after a
-  retryable but not terminal failure, retry-timer pause, and delete rule then explicit type-based
+  retryable failure with available or spent budgets, no pause for non-retryable failure, retry-timer pause, and delete rule then explicit type-based
   Unpause.
 - **Functional corpus:** two clean `TestActivityApiRulesClientTestSuite` runs in the rule-enabled mode.

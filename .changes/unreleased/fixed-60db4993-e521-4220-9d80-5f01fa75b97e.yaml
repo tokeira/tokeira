@@ -1,0 +1,5 @@
+kind: fixed
+body: An embedded engine on DSQL that takes over after an unclean stop now keeps renewing its ownership while it waits, instead of shutting itself down soon after it starts.
+time: 2026-11-24T00:00:00Z
+custom:
+    Slice: 60db4993-e521-4220-9d80-5f01fa75b97e

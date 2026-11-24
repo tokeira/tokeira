@@ -291,13 +291,12 @@ use tokeira_storage::{
     WorkerComputeRepository, WorkerDeploymentRepository, WorkerTaskProvenanceStore,
     dsql::{
         ConnectionBudget, ConnectionControlLeaseRepository, ControlLeaseAcquireOutcome,
-        ControlLeaseAcquireRequest, ControlLeaseClusterIdentity, ControlLeaseError,
-        ControlLeaseGuard, DsqlAuthConfig, DsqlConnectionDirector, DsqlCoordinationConfig,
-        DsqlPoolConfig, DsqlStore, EmbeddedDsqlPoolConfig, MigrationRunner, OWNER_ADMISSION_MARGIN,
-        OWNER_LEASE_DURATION, OWNER_RENEW_INTERVAL, OwnershipAdmissionGate,
-        OwnershipAdmissionState, SCHEMA_MIGRATION_ADMISSION_MARGIN,
-        SCHEMA_MIGRATION_LEASE_DURATION, SchemaCompatibilityError, SchemaDecision,
-        SchemaIncompatibilityCategory, SchemaMigrationPolicy, WarmupDeadline,
+        ControlLeaseAcquireRequest, ControlLeaseClusterIdentity, DsqlAuthConfig,
+        DsqlConnectionDirector, DsqlCoordinationConfig, DsqlPoolConfig, DsqlStore,
+        EmbeddedDsqlPoolConfig, MigrationRunner, OWNER_ADMISSION_MARGIN, OWNER_LEASE_DURATION,
+        OwnershipAdmissionGate, SCHEMA_MIGRATION_ADMISSION_MARGIN, SCHEMA_MIGRATION_LEASE_DURATION,
+        SchemaCompatibilityError, SchemaDecision, SchemaIncompatibilityCategory,
+        SchemaMigrationPolicy, WarmupDeadline,
     },
 };
 use tokeira_types::{
@@ -754,19 +753,17 @@ impl EmbeddedEngineShutdownError {
 type CleanupFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 type CleanupAction = Box<dyn FnOnce(Instant) -> CleanupFuture + Send>;
 
-#[derive(Clone)]
+#[derive(Debug)]
 struct EmbeddedOwnership {
-    repository: ConnectionControlLeaseRepository,
-    guard: Arc<tokio::sync::Mutex<Option<ControlLeaseGuard>>>,
+    claim: node_claim::NodeClaim,
     gate: OwnershipAdmissionGate,
 }
 
-impl std::fmt::Debug for EmbeddedOwnership {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("EmbeddedOwnership")
-            .field("gate", &self.gate)
-            .finish_non_exhaustive()
+impl Drop for EmbeddedOwnership {
+    fn drop(&mut self) {
+        // This handle outlives the stack's task groups during orderly shutdown,
+        // but dropping the engine must never turn a crash into a clean release.
+        self.claim.abandon();
     }
 }
 
@@ -1104,7 +1101,7 @@ impl EmbeddedShutdownCoordinator {
         if let Some(ownership) = &self.ownership {
             ownership.gate.begin_closing();
         }
-        if let (Some(ownership), Some(director)) = (&self.ownership, &self.director) {
+        if let Some(mut ownership) = self.ownership.take() {
             let now = Instant::now();
             let ownership_drained = now < deadline
                 && tokio::time::timeout(
@@ -1118,7 +1115,7 @@ impl EmbeddedShutdownCoordinator {
                 let release_result = if now < deadline {
                     tokio::time::timeout(
                         deadline.saturating_duration_since(now),
-                        release_embedded_ownership(ownership, director),
+                        release_embedded_ownership(&mut ownership),
                     )
                     .await
                     .map_err(|_| anyhow!("embedded ownership release deadline elapsed"))
@@ -1226,7 +1223,7 @@ async fn start_embedded_dsql(
         }
     };
 
-    let (ownership, ownership_report) = match startup_phase(
+    let (mut ownership, ownership_report) = match startup_phase(
         deadline,
         EmbeddedStartupPhase::Ownership,
         acquire_embedded_ownership(director.clone(), &cluster, deadline),
@@ -1243,47 +1240,69 @@ async fn start_embedded_dsql(
         .install_ownership_gate(ownership.gate.clone())
         .is_err()
     {
-        rollback_embedded_dsql(&ownership, &director, deadline).await;
+        rollback_embedded_dsql(&mut ownership, &director, deadline).await;
         return Err(EmbeddedEngineStartError::Phase {
             phase: EmbeddedStartupPhase::Ownership,
         });
     }
 
+    if let Err(error) = startup_phase(
+        deadline,
+        EmbeddedStartupPhase::Ownership,
+        ownership.claim.wait_until_serving(),
+    )
+    .await
+    {
+        rollback_embedded_dsql(&mut ownership, &director, deadline).await;
+        return Err(error);
+    }
+
     let stack =
         match startup_infallible_phase(deadline, EmbeddedStartupPhase::RuntimeRestore, async {
-            build_dsql_stack(
-                StackTransport::Embedded,
-                Arc::new(server),
-                dsql_store,
-                connection_endpoint.clone(),
-                extensions,
-                None,
-            )
-            .await
-            .map_err(embedded_stack_error)
+            tokio::select! {
+                biased;
+                _ = ownership.claim.lost() => Err(EmbeddedEngineStartError::Phase {
+                    phase: EmbeddedStartupPhase::Ownership,
+                }),
+                result = build_dsql_stack(
+                    StackTransport::Embedded,
+                    Arc::new(server),
+                    dsql_store,
+                    connection_endpoint.clone(),
+                    extensions,
+                    None,
+                ) => result.map_err(embedded_stack_error),
+            }
         })
         .await
         .and_then(|result| result)
         {
             Ok(ConstructedStack::Embedded(stack)) => stack,
             Ok(ConstructedStack::Network(_)) => {
-                rollback_embedded_dsql(&ownership, &director, deadline).await;
+                rollback_embedded_dsql(&mut ownership, &director, deadline).await;
                 return Err(EmbeddedEngineStartError::Phase {
                     phase: EmbeddedStartupPhase::RuntimeRestore,
                 });
             }
             Err(error) => {
-                rollback_embedded_dsql(&ownership, &director, deadline).await;
+                rollback_embedded_dsql(&mut ownership, &director, deadline).await;
                 return Err(error);
             }
         };
 
-    spawn_ownership_renewal(
-        &stack.engine_tasks,
-        director.clone(),
-        ownership.clone(),
-        stack.service.clone(),
-    );
+    // Registration checks the published phase too, so loss between recovery
+    // and this wiring cannot leave an endpoint serving without its claim.
+    ownership
+        .claim
+        .drain_on_loss(stack.background_cancel.clone());
+    let service = stack.service.clone();
+    let runtime_tasks = stack.runtime_tasks.clone();
+    let cancel = stack.background_cancel.clone();
+    let _admission = stack.engine_tasks.spawn(async move {
+        cancel.cancelled().await;
+        service.begin_shutdown();
+        runtime_tasks.begin_shutdown();
+    });
     stack.engine_tasks.close_registration();
     let report = EngineStartupReport {
         storage_mode,
@@ -1315,6 +1334,11 @@ async fn start_embedded_dsql(
         shutdown_coordinator: Some(coordinator),
         listeners: listener::ListenerRegistry::default(),
     };
+    if engine.background_cancel.is_cancelled() {
+        return Err(EmbeddedEngineStartError::Phase {
+            phase: EmbeddedStartupPhase::Ownership,
+        });
+    }
     record_embedded_startup(&engine.startup_report);
     Ok(engine)
 }
@@ -1748,83 +1772,29 @@ async fn acquire_embedded_ownership(
             },
         )
         .await?;
-    let gate = OwnershipAdmissionGate::for_guard(&guard);
-    if let Some(quiescence_deadline) = guard.quiescence_deadline() {
-        let now = Instant::now();
-        if now >= deadline || quiescence_deadline > deadline {
-            return Err(anyhow!("expired owner quiescence exceeds startup deadline"));
-        }
-        tokio::time::sleep_until(tokio::time::Instant::from_std(quiescence_deadline)).await;
-        gate.finish_quiescence(&guard, Instant::now())?;
-    }
+    // Return the acquisition checkout before the independent claim task can
+    // need the bounded Control budget, including while its gate is closed.
+    drop(permit);
+    let quiescence_deadline = guard.quiescence_deadline();
     let report = OwnershipStartupReport {
         outcome: guard.outcome(),
         fence_token: guard.fence_token(),
     };
-    Ok((
-        EmbeddedOwnership {
-            repository,
-            guard: Arc::new(tokio::sync::Mutex::new(Some(guard))),
-            gate,
-        },
-        report,
-    ))
-}
-
-fn spawn_ownership_renewal(
-    tasks: &RuntimeShutdownHandle,
-    director: Arc<DsqlConnectionDirector>,
-    ownership: EmbeddedOwnership,
-    service: InProcessGrpcService,
-) {
-    let cancel = tasks.cancellation_token();
-    let _renewal = tasks.spawn(async move {
-        let interval_duration =
-            StdDuration::try_from(OWNER_RENEW_INTERVAL).expect("positive owner renewal interval");
-        let mut interval = tokio::time::interval(interval_duration);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        interval.tick().await;
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = interval.tick() => {
-                    let mut guard_slot = ownership.guard.lock().await;
-                    let Some(guard) = guard_slot.as_mut() else {
-                        break;
-                    };
-                    let result = match director.acquire(DbClass::Control).await {
-                        Ok(mut permit) => match permit.connection() {
-                            Ok(connection) => ownership.repository.renew(
-                                    connection,
-                                    guard,
-                                    OWNER_LEASE_DURATION,
-                                    OWNER_ADMISSION_MARGIN,
-                                    &ownership.gate,
-                                )
-                                .await
-                                .map_err(anyhow::Error::from),
-                            Err(error) => Err(error),
-                        },
-                        Err(error) => Err(error),
-                    };
-                    if let Err(error) = result {
-                        if matches!(
-                            error.downcast_ref::<ControlLeaseError>(),
-                            Some(ControlLeaseError::Fenced)
-                        ) {
-                            ownership.gate.fence();
-                        } else {
-                            guard.enforce_admission_deadline(Instant::now(), &ownership.gate);
-                        }
-                    }
-                    if ownership.gate.state() != OwnershipAdmissionState::Open {
-                        service.begin_shutdown();
-                        break;
-                    }
-                }
-            }
-        }
-    });
+    let acquired = node_claim::AcquiredClaim::for_guard(repository, guard);
+    let gate = acquired.gate();
+    let mut ownership = EmbeddedOwnership {
+        claim: acquired.start(director),
+        gate,
+    };
+    if let Some(quiescence_deadline) = quiescence_deadline
+        && (Instant::now() >= deadline || quiescence_deadline > deadline)
+    {
+        // Hold abandons a stop during quiescence: releasing would let the next
+        // owner skip the wait for the previous holder's transactions.
+        let _ = ownership.claim.stop_and_wait().await;
+        return Err(anyhow!("expired owner quiescence exceeds startup deadline"));
+    }
+    Ok((ownership, report))
 }
 
 fn control_lease_identity(cluster: &ResolvedCluster) -> ControlLeaseClusterIdentity {
@@ -1835,7 +1805,7 @@ fn control_lease_identity(cluster: &ResolvedCluster) -> ControlLeaseClusterIdent
 }
 
 async fn rollback_embedded_dsql(
-    ownership: &EmbeddedOwnership,
+    ownership: &mut EmbeddedOwnership,
     director: &Arc<DsqlConnectionDirector>,
     deadline: Instant,
 ) {
@@ -1844,28 +1814,19 @@ async fn rollback_embedded_dsql(
     if now < deadline {
         let _ = tokio::time::timeout(
             deadline.saturating_duration_since(now),
-            release_embedded_ownership(ownership, director),
+            release_embedded_ownership(ownership),
         )
         .await;
     }
+    ownership.claim.abandon();
     let _ = director.shutdown_with_deadline(deadline).await;
 }
 
-async fn release_embedded_ownership(
-    ownership: &EmbeddedOwnership,
-    director: &Arc<DsqlConnectionDirector>,
-) -> Result<()> {
-    // Ordinary owner admission is closed here. This shutdown-only director
-    // seam still consumes the Control budget and one bounded physical slot.
-    let mut permit = director.acquire_shutdown_control().await?;
-    let mut guard = ownership.guard.lock().await;
-    if let Some(guard) = guard.take() {
-        ownership
-            .repository
-            .release(permit.connection()?, &guard, &ownership.gate)
-            .await?;
+async fn release_embedded_ownership(ownership: &mut EmbeddedOwnership) -> Result<()> {
+    match ownership.claim.stop_and_wait().await? {
+        node_claim::Phase::Released => Ok(()),
+        phase => Err(anyhow!("embedded ownership was not released: {phase:?}")),
     }
-    Ok(())
 }
 
 async fn startup_phase<T, E, F>(
@@ -5492,6 +5453,7 @@ mod tests {
         Pool,
         Schema,
         Ownership,
+        Quiescence,
         Runtime,
     }
 
@@ -5499,20 +5461,27 @@ mod tests {
     enum StartupModelEvent {
         Attempt(StartupModelPhase),
         Complete(StartupModelPhase),
+        StartRenewal,
         ReleaseOwnership,
+        AbandonOwnership,
+        StopRenewal,
         ClosePool,
         ReturnHandle,
     }
 
-    const STARTUP_MODEL_PHASES: [StartupModelPhase; 5] = [
+    const STARTUP_MODEL_PHASES: [StartupModelPhase; 6] = [
         StartupModelPhase::Cluster,
         StartupModelPhase::Pool,
         StartupModelPhase::Schema,
         StartupModelPhase::Ownership,
+        StartupModelPhase::Quiescence,
         StartupModelPhase::Runtime,
     ];
 
-    fn startup_model(failure_boundary: Option<usize>) -> Vec<StartupModelEvent> {
+    fn startup_model(
+        failure_boundary: Option<usize>,
+        expired_takeover: bool,
+    ) -> Vec<StartupModelEvent> {
         let mut events = Vec::new();
         let mut pool_open = false;
         let mut ownership_held = false;
@@ -5520,7 +5489,14 @@ mod tests {
             events.push(StartupModelEvent::Attempt(phase));
             if failure_boundary == Some(index) {
                 if ownership_held {
-                    events.push(StartupModelEvent::ReleaseOwnership);
+                    events.push(
+                        if expired_takeover && phase == StartupModelPhase::Quiescence {
+                            StartupModelEvent::AbandonOwnership
+                        } else {
+                            StartupModelEvent::ReleaseOwnership
+                        },
+                    );
+                    events.push(StartupModelEvent::StopRenewal);
                 }
                 if pool_open {
                     events.push(StartupModelEvent::ClosePool);
@@ -5530,6 +5506,9 @@ mod tests {
             events.push(StartupModelEvent::Complete(phase));
             pool_open |= phase == StartupModelPhase::Pool;
             ownership_held |= phase == StartupModelPhase::Ownership;
+            if phase == StartupModelPhase::Ownership {
+                events.push(StartupModelEvent::StartRenewal);
+            }
         }
         events.push(StartupModelEvent::ReturnHandle);
         events
@@ -5709,8 +5688,9 @@ mod tests {
         #[test]
         fn startup_is_prefix_safe_and_failure_atomic(
             failure_boundary in prop::option::of(0usize..STARTUP_MODEL_PHASES.len()),
+            expired_takeover in any::<bool>(),
         ) {
-            let events = startup_model(failure_boundary);
+            let events = startup_model(failure_boundary, expired_takeover);
             let attempted = events.iter().filter_map(|event| match event {
                 StartupModelEvent::Attempt(phase) => Some(*phase),
                 _ => None,
@@ -5722,17 +5702,32 @@ mod tests {
 
             prop_assert_eq!(attempted.as_slice(), &STARTUP_MODEL_PHASES[..attempted.len()]);
             prop_assert_eq!(completed.as_slice(), &STARTUP_MODEL_PHASES[..completed.len()]);
+            let acquired = events.iter().position(|event| *event ==
+                StartupModelEvent::Complete(StartupModelPhase::Ownership));
+            let renewing = events.iter().position(|event| *event == StartupModelEvent::StartRenewal);
+            prop_assert_eq!(renewing, acquired.map(|index| index + 1));
+            if events.contains(&StartupModelEvent::Attempt(StartupModelPhase::Runtime)) {
+                prop_assert!(renewing.is_some());
+                prop_assert!(renewing < events.iter().position(|event| *event ==
+                    StartupModelEvent::Complete(StartupModelPhase::Quiescence)));
+            }
             if let Some(boundary) = failure_boundary {
                 prop_assert!(!events.contains(&StartupModelEvent::ReturnHandle));
                 let rollback = events.iter().filter(|event| matches!(
                     event,
-                    StartupModelEvent::ReleaseOwnership | StartupModelEvent::ClosePool
+                    StartupModelEvent::ReleaseOwnership | StartupModelEvent::AbandonOwnership
+                        | StartupModelEvent::StopRenewal | StartupModelEvent::ClosePool
                 )).copied().collect::<Vec<_>>();
                 let expected = match boundary {
                     0 | 1 => Vec::new(),
                     2 | 3 => vec![StartupModelEvent::ClosePool],
                     _ => vec![
-                        StartupModelEvent::ReleaseOwnership,
+                        if boundary == 4 && expired_takeover {
+                            StartupModelEvent::AbandonOwnership
+                        } else {
+                            StartupModelEvent::ReleaseOwnership
+                        },
+                        StartupModelEvent::StopRenewal,
                         StartupModelEvent::ClosePool,
                     ],
                 };
@@ -5840,7 +5835,7 @@ mod tests {
     #[test]
     fn every_startup_failure_boundary_rolls_back_without_returning_a_handle() {
         for boundary in 0..STARTUP_MODEL_PHASES.len() {
-            let events = startup_model(Some(boundary));
+            let events = startup_model(Some(boundary), false);
             assert!(!events.contains(&StartupModelEvent::ReturnHandle));
         }
     }

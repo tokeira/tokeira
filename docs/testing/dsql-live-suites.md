@@ -549,6 +549,28 @@ The test removes the `tokeirad-owner` claim, then:
 The crash step waits out a full quiescence, so the test takes about seven minutes. It
 removes the claim when it ends.
 
+## Embedded takeover
+
+The ignored `live_embedded_takeover` suite uses the same environment as
+`live_embedded_attr_copy`: `TOKEIRA_DSQL_TEST_DATABASE_URL`,
+`TOKEIRA_DSQL_TEST_CLUSTER_ID`, `TOKEIRA_DSQL_TEST_CLUSTER_ARN`,
+`TOKEIRA_DSQL_TEST_ENDPOINT`, and `TOKEIRA_DSQL_TEST_REGION`. It returns without
+connecting when any is unset. Run it serially on a disposable cluster with no other
+engine running: it removes the `embedded-owner` claim before starting.
+
+```bash
+cargo nextest run -p tokeira-engine --features dsql-integration --locked --profile dsql-live \
+  --test live_embedded_takeover --test-threads 1 --run-ignored only
+```
+
+It starts an embedded engine with a clean claim, drops it without shutdown, and waits
+for its hold to expire on the database's clock. Its successor must report an expired
+takeover and wait out quiescence, then serve calls every few seconds for at least 65
+seconds. The claim must still name the successor with a future expiry, and shutdown
+must release it. This catches renewal starting too late to preserve the takeover
+claim. The suite takes about seven minutes on a migrated cluster; a new cluster's
+first migration takes additional time.
+
 ## Managed lifecycle
 
 The [managed embedded DSQL live-AWS runbook](managed-embedded-dsql-live-aws.md) covers the

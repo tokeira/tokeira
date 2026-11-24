@@ -513,7 +513,6 @@ pub struct ActivityDispatchQueue {
 struct DispatchQueueState {
     queues: HashMap<String, VecDeque<DispatchEntry>>,
     seen: HashSet<(ExecutionKey, i64)>,
-    seen_targets: HashMap<String, Vec<Option<DeploymentVersionTarget>>>,
 }
 
 impl ActivityDispatchQueue {
@@ -552,10 +551,6 @@ impl ActivityDispatchQueue {
             // the same committed attempt between the check and enqueue.
             if !state.seen.insert((entry.key.clone(), entry.stamp)) {
                 return;
-            }
-            let targets = state.seen_targets.entry(task_queue.clone()).or_default();
-            if !targets.contains(&entry.target) {
-                targets.push(entry.target.clone());
             }
             state.queues.entry(task_queue).or_default().push_back(entry);
             // A single wake can select the wrong release and strand matching work.
@@ -612,6 +607,21 @@ impl ActivityDispatchQueue {
         queue.remove(pos)
     }
 
+    fn has_pollable_activity(
+        &self,
+        task_queue: &str,
+        now: i64,
+        admitted: Option<&DeploymentVersionTarget>,
+    ) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state.queues.get(task_queue).is_some_and(|queue| {
+                queue.iter().any(|entry| {
+                    entry.target.as_ref() == admitted && entry.fire_at.is_none_or(|at| at <= now)
+                })
+            })
+        })
+    }
+
     /// Return the earliest delayed dispatch deadline on `task_queue`.
     fn next_due_at(
         &self,
@@ -626,15 +636,6 @@ impl ActivityDispatchQueue {
             .filter(|entry| entry.target.as_ref() == admitted)
             .filter_map(|entry| entry.fire_at)
             .min()
-    }
-
-    fn has_seen_queue(&self, task_queue: &str, admitted: Option<&DeploymentVersionTarget>) -> bool {
-        self.state.lock().is_ok_and(|state| {
-            state
-                .seen_targets
-                .get(task_queue)
-                .is_some_and(|targets| targets.iter().any(|target| target.as_ref() == admitted))
-        })
     }
 }
 
@@ -1055,9 +1056,9 @@ impl ActivityBridge {
     ///
     /// Stale entries are reaped, not dispatched: a queued dispatch whose attempt
     /// has advanced, that already left `Scheduled`, or whose execution was deleted
-    /// is skipped (validate-then-drop, Requirement 11.7). This MVP poll does not
-    /// long-poll — it drains what is already enqueued and returns; `start` enqueues
-    /// synchronously in its post-commit, so a poll after a start observes the task.
+    /// is skipped (validate-then-drop, Requirement 11.7). Pickup is awaited through
+    /// its durable start; callers must not race this future against another claim
+    /// or a wait deadline.
     pub async fn poll_activity_task(
         &self,
         task_queue: &str,
@@ -1153,19 +1154,16 @@ impl ActivityBridge {
         Ok(None)
     }
 
-    /// Poll a standalone activity, waiting when this queue has a delayed retry or a
-    /// started attempt whose timeout may produce one. A never-seen standalone queue
-    /// still returns immediately so the shared RPC can fall through to ordinary
-    /// workflow activities. Waiting ends empty at `until`, the poll's deadline; only
-    /// the waits are bounded, never a claim in progress, so a task is never claimed
-    /// and then dropped.
-    pub async fn poll_activity_task_waiting(
+    /// Wait for a due dispatch for this queue and admitted target without claiming it.
+    ///
+    /// The shared activity poll may cancel this wait, but never a pickup. Rechecking
+    /// after registration closes the empty-check/enqueue race, including a queue's
+    /// first dispatch. Delayed retries wake only at their CHASM release time.
+    pub(crate) async fn wait_for_pollable_activity(
         &self,
         task_queue: &str,
-        worker_identity: &str,
         admitted: Option<&DeploymentVersionTarget>,
-        until: tokio::time::Instant,
-    ) -> EdgeResult<Option<PolledActivityTask>> {
+    ) -> EdgeResult<()> {
         let queue = self
             .dispatch_executor
             .as_ref()
@@ -1174,39 +1172,25 @@ impl ActivityBridge {
                 EdgeError::Internal("activity dispatch queue not attached".to_owned())
             })?;
         loop {
-            // Register before the empty check so a racing notify_waiters includes
-            // this poller; unlike notify_one it does not retain a permit.
             let dispatch_available = queue.dispatch_available.notified();
             tokio::pin!(dispatch_available);
             dispatch_available.as_mut().enable();
-            if let Some(task) = self
-                .poll_activity_task(task_queue, worker_identity, admitted)
-                .await?
-            {
-                return Ok(Some(task));
+            if queue.has_pollable_activity(task_queue, self.engine.now(), admitted) {
+                return Ok(());
             }
             if let Some(due_at) = queue.next_due_at(task_queue, admitted) {
                 let remaining = due_at.saturating_sub(self.engine.now());
                 if remaining <= 0 {
-                    continue;
+                    return Ok(());
                 }
-                // A retry is committed before it is advertised to matching. Waiting
-                // for its release instant prevents an early empty response.
                 tokio::select! {
                     _ = &mut dispatch_available => {},
                     _ = tokio::time::sleep(std::time::Duration::from_nanos(
                         u64::try_from(remaining).unwrap_or(u64::MAX),
                     )) => {},
-                    _ = tokio::time::sleep_until(until) => return Ok(None),
-                }
-            } else if queue.has_seen_queue(task_queue, admitted) {
-                // A started attempt can time out and enqueue its retry later.
-                tokio::select! {
-                    _ = dispatch_available => {},
-                    _ = tokio::time::sleep_until(until) => return Ok(None),
                 }
             } else {
-                return Ok(None);
+                dispatch_available.await;
             }
         }
     }

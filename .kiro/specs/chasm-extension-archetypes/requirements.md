@@ -306,7 +306,7 @@ to v1.32.0; it is not adopted while the claim is v1.31.0.
 
 | Case | Target policy | Error if invalid | Persistence / side-effect impact |
 |---|---|---|---|
-| Scoped worker; queued standalone task carries no deployment-version target | Denied, unchanged (`scoped-worker-authorization` Req 10.4). | Poll returns no task from the bridge; falls through as today. | None. |
+| Scoped worker; queued standalone task carries no deployment-version target | Denied, unchanged (`scoped-worker-authorization` Req 10.4). | Poll returns no task from the bridge; it keeps waiting, until its deadline, for an admitted standalone task or a workflow activity, whichever comes first, whatever the queue served before (`chasm/lib/activity/activity_tasks.go:63-80`, `service/matching/matching_engine.go:610-646,945-982 @ v1.31.0`). | None. |
 | Scoped worker; target equals the worker's exact `(deployment_name, build_id)` | Served. | — | Task token records the target; start transition unchanged. |
 | Scoped worker; target differs | Not served; task stays queued for its version. | — | None. |
 | Unscoped worker; task carries a target | Not served (mirrors "unversioned poll must not consume exact-version work", `workflow_service.rs:7389`). | — | None. |

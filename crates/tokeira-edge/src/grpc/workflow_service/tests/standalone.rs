@@ -1,5 +1,7 @@
 //! Fixed-clock standalone wire replay, recorded before extension executors land.
 
+mod shared_poll;
+
 use super::*;
 use crate::{
     chasm_activity::{ActivityBridge, ActivityDispatchQueue, StartActivity},
@@ -10,7 +12,7 @@ use std::{
     fmt::Write as _,
     sync::atomic::{AtomicI64, Ordering},
 };
-use tokeira_chasm::{BusinessIdPolicy, ExecutionKey, Library, Registry};
+use tokeira_chasm::{BusinessIdPolicy, DeploymentVersionTarget, ExecutionKey, Library, Registry};
 use tokeira_chasm_activity::{ActivityConfig, ActivityExecution, ActivityLibrary, ActivityState};
 use tokeira_runtime::chasm::{
     ChasmEngine, ChasmTimerSweeper, CollectingVisibilitySink, DispatchMultiplexer, Engine,
@@ -26,6 +28,8 @@ struct Harness {
     bridge: Arc<ActivityBridge>,
     engine: Arc<ChasmEngine>,
     clock: Arc<AtomicI64>,
+    store: Arc<InMemoryChasmNodeStore>,
+    mux: Arc<DispatchMultiplexer>,
     namespace: String,
 }
 
@@ -45,9 +49,39 @@ impl Harness {
         config: ActivityConfig,
         visibility: Arc<dyn crate::workflow_service::VisibilityApi>,
     ) -> Self {
+        Self::with_runtime_store(
+            config,
+            visibility,
+            Arc::new(PollNoneRuntime),
+            Arc::new(InMemoryChasmNodeStore::new()),
+        )
+    }
+
+    fn with_runtime_store(
+        config: ActivityConfig,
+        visibility: Arc<dyn crate::workflow_service::VisibilityApi>,
+        runtime: Arc<dyn WorkflowRuntimeApi>,
+        store: Arc<InMemoryChasmNodeStore>,
+    ) -> Self {
+        Self::with_runtime_store_sink(
+            config,
+            visibility,
+            runtime,
+            store,
+            Arc::new(CollectingVisibilitySink::default()),
+        )
+    }
+
+    fn with_runtime_store_sink(
+        config: ActivityConfig,
+        visibility: Arc<dyn crate::workflow_service::VisibilityApi>,
+        runtime: Arc<dyn WorkflowRuntimeApi>,
+        store: Arc<InMemoryChasmNodeStore>,
+        sink: Arc<dyn tokeira_runtime::chasm::VisibilitySink>,
+    ) -> Self {
         let cache = Arc::new(StaticNamespaceCache);
         let service = WorkflowService::new_with_buffered_queries_and_history_wait_registry(
-            Arc::new(PollNoneRuntime),
+            runtime,
             Arc::new(NoopResolver),
             visibility,
             Arc::new(tokeira_storage::InMemoryStore::default()),
@@ -69,13 +103,8 @@ impl Harness {
         let clock = Arc::new(AtomicI64::new(1_000 * SEC));
         let read_clock = clock.clone();
         let engine = Arc::new(
-            ChasmEngine::new(
-                Arc::new(InMemoryChasmNodeStore::new()),
-                Arc::new(registry.build()),
-                mux.clone(),
-                Arc::new(CollectingVisibilitySink::default()),
-            )
-            .with_clock(Arc::new(move || read_clock.load(Ordering::SeqCst))),
+            ChasmEngine::new(store.clone(), Arc::new(registry.build()), mux.clone(), sink)
+                .with_clock(Arc::new(move || read_clock.load(Ordering::SeqCst))),
         );
         let executor = Arc::new(ActivityDispatchExecutor::new(
             Arc::downgrade(&engine),
@@ -90,6 +119,8 @@ impl Harness {
             bridge,
             engine,
             clock,
+            store,
+            mux,
             namespace: crate::translate::to_internal::namespace_id_for("default")
                 .0
                 .to_string(),
@@ -883,6 +914,15 @@ fn scoped_grpc(
     version: &DeploymentVersionTarget,
     provenance: Arc<tokeira_storage::InMemoryStore>,
 ) -> WorkflowServiceGrpc {
+    scoped_grpc_with_runtime(harness, version, provenance, Arc::new(PollNoneRuntime))
+}
+
+fn scoped_grpc_with_runtime(
+    harness: &Harness,
+    version: &DeploymentVersionTarget,
+    provenance: Arc<tokeira_storage::InMemoryStore>,
+    runtime: Arc<dyn WorkflowRuntimeApi>,
+) -> WorkflowServiceGrpc {
     let cache = Arc::new(StaticNamespaceCache);
     let scope = WorkerScope::try_new(
         "default".into(),
@@ -902,7 +942,7 @@ fn scoped_grpc(
         false,
     ));
     let service = WorkflowService::new_with_buffered_queries_and_history_wait_registry(
-        Arc::new(PollNoneRuntime),
+        runtime,
         Arc::new(NoopResolver),
         Arc::new(EmptyVisibilityApi),
         Arc::new(tokeira_storage::InMemoryStore::default()),

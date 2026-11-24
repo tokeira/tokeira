@@ -333,6 +333,19 @@ where
             .await
     }
 
+    async fn poll_activity_task_until_woken<'a>(
+        &'a self,
+        queue: tokeira_types::QueueKey,
+        worker_identity: tokeira_types::WorkerIdentity,
+        timeout: std::time::Duration,
+        caller_deadline: Option<tokio::time::Instant>,
+        wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>,
+    ) -> Result<Option<StartedActivityTask>> {
+        self.runtime
+            .poll_activity_task_until_woken(queue, worker_identity, timeout, caller_deadline, wake)
+            .await
+    }
+
     async fn poll_activity_task_offer(
         &self,
         queue: tokeira_types::QueueKey,

@@ -521,6 +521,7 @@ pub struct StartActivityTask {
     pub schedule_to_start_nanos: i64, pub schedule_to_close_nanos: i64,
     pub start_to_close_nanos: i64, pub heartbeat_nanos: i64,
     pub version_target: Option<DeploymentVersionTarget>,
+    pub search_attributes: Vec<u8>, pub user_metadata: Vec<u8>,
 }
 impl Task for StartActivityTask { const KIND: TaskKind = TaskKind::SideEffect; const FQN: &'static str = "chasm.start_activity"; fn fire_at(&self) -> Option<i64> { None } }
 pub struct DeploymentVersionTarget { pub deployment_name: String, pub build_id: String }
@@ -528,6 +529,10 @@ pub struct DeploymentVersionTarget { pub deployment_name: String, pub build_id: 
 
 A component that stages `StartActivityTask` registers a `SideEffectTaskHandler` for it;
 its `on_outcome` receives the activity's terminal `TaskOutcome`.
+The optional search attributes and user metadata are protobuf bytes (empty means absent),
+decoded and validated as for a public start, with validation rejections permanently
+resolving the parent's task (`chasm/lib/activity/validator.go:344-364 @ v1.31.0` and
+`common/searchattribute/validator.go:60-175 @ v1.31.0`).
 
 Executors hold `Weak<ChasmEngine>`; a stopped engine is a logged no-op. The multiplexer
 uses late-bound `register(&self, ...)` behind an `RwLock`, cloning the selected executor

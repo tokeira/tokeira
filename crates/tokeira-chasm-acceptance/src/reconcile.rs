@@ -68,6 +68,8 @@ pub fn stage_start(
         start_to_close_nanos: 30_000_000_000,
         heartbeat_nanos: 0,
         version_target: Some(state.target.clone()),
+        search_attributes: Vec::new(),
+        user_metadata: Vec::new(),
     };
     ctx.add_task(
         StartActivityTask::KIND,

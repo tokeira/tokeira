@@ -146,6 +146,14 @@ pub struct StartActivityTask {
     /// Optional exact worker release; absent means unversioned dispatch.
     #[prost(message, optional, tag = "11")]
     pub version_target: Option<DeploymentVersionTarget>,
+    /// Encoded `temporal.api.common.v1.SearchAttributes`; empty means none.
+    #[prost(bytes = "vec", tag = "12")]
+    #[serde(default)]
+    pub search_attributes: Vec<u8>,
+    /// Encoded `temporal.api.sdk.v1.UserMetadata`; empty means none.
+    #[prost(bytes = "vec", tag = "13")]
+    #[serde(default)]
+    pub user_metadata: Vec<u8>,
 }
 
 impl Task for StartActivityTask {
@@ -517,6 +525,91 @@ mod tests {
             TaskValidity::Drop
         );
     }
+
+    #[derive(Clone, PartialEq, Serialize, prost::Message)]
+    struct LegacyStartActivityTask {
+        #[prost(string, tag = "1")]
+        activity_id: String,
+        #[prost(string, tag = "2")]
+        activity_type: String,
+        #[prost(string, tag = "3")]
+        task_queue: String,
+        #[prost(bytes = "vec", tag = "4")]
+        input: Vec<u8>,
+        #[prost(bytes = "vec", tag = "5")]
+        header: Vec<u8>,
+        #[prost(bytes = "vec", tag = "6")]
+        retry_policy: Vec<u8>,
+        #[prost(int64, tag = "7")]
+        schedule_to_start_nanos: i64,
+        #[prost(int64, tag = "8")]
+        schedule_to_close_nanos: i64,
+        #[prost(int64, tag = "9")]
+        start_to_close_nanos: i64,
+        #[prost(int64, tag = "10")]
+        heartbeat_nanos: i64,
+        #[prost(message, optional, tag = "11")]
+        version_target: Option<DeploymentVersionTarget>,
+    }
+
+    fn legacy_start_activity_task() -> LegacyStartActivityTask {
+        LegacyStartActivityTask {
+            activity_id: "job".into(),
+            activity_type: "compile".into(),
+            task_queue: "queue".into(),
+            input: vec![0, 255],
+            header: vec![1, 2],
+            retry_policy: vec![3, 4],
+            schedule_to_start_nanos: 10,
+            schedule_to_close_nanos: 20,
+            start_to_close_nanos: 30,
+            heartbeat_nanos: 40,
+            version_target: Some(DeploymentVersionTarget {
+                deployment_name: "worker".into(),
+                build_id: "release".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn legacy_start_activity_task_decodes_with_empty_metadata() {
+        let legacy = legacy_start_activity_task();
+        let bytes = prost::Message::encode_to_vec(&legacy);
+        let task = <StartActivityTask as Task>::decode(&bytes).unwrap();
+        assert!(task.search_attributes.is_empty());
+        assert!(task.user_metadata.is_empty());
+        assert_eq!(Task::encode(&task).unwrap(), bytes);
+        assert_eq!(
+            serde_json::from_str::<StartActivityTask>(&serde_json::to_string(&legacy).unwrap())
+                .unwrap(),
+            task
+        );
+    }
+
+    #[test]
+    fn start_activity_task_without_metadata_keeps_legacy_bytes() {
+        let legacy = legacy_start_activity_task();
+        let task = StartActivityTask {
+            activity_id: legacy.activity_id.clone(),
+            activity_type: legacy.activity_type.clone(),
+            task_queue: legacy.task_queue.clone(),
+            input: legacy.input.clone(),
+            header: legacy.header.clone(),
+            retry_policy: legacy.retry_policy.clone(),
+            schedule_to_start_nanos: legacy.schedule_to_start_nanos,
+            schedule_to_close_nanos: legacy.schedule_to_close_nanos,
+            start_to_close_nanos: legacy.start_to_close_nanos,
+            heartbeat_nanos: legacy.heartbeat_nanos,
+            version_target: legacy.version_target.clone(),
+            search_attributes: Vec::new(),
+            user_metadata: Vec::new(),
+        };
+        assert_eq!(
+            Task::encode(&task).unwrap(),
+            prost::Message::encode_to_vec(&legacy)
+        );
+    }
+
     #[test]
     fn start_activity_task_preserves_all_fields_in_its_prost_codec() {
         let task = StartActivityTask {
@@ -530,6 +623,8 @@ mod tests {
             schedule_to_close_nanos: 20,
             start_to_close_nanos: 30,
             heartbeat_nanos: 40,
+            search_attributes: vec![5, 6],
+            user_metadata: vec![7, 8],
             version_target: Some(DeploymentVersionTarget {
                 deployment_name: "worker".into(),
                 build_id: "release".into(),

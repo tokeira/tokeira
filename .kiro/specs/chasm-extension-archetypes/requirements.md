@@ -407,8 +407,9 @@ is never the thing my correctness depends on.
     side-effect executor, with every existing standalone-activity behaviour preserved.
 12. THE runtime SHALL ship a second executor that starts a standalone activity on behalf of
     the staging component from the task's payload: activity id, type, task queue, input,
-    timeouts, retry policy, optional deployment-version target, and an internal completion
-    callback addressed to the staging component and task.
+    timeouts, retry policy, optional deployment-version target, optional search attributes
+    and user metadata validated as for a public start, and an internal completion callback
+    addressed to the staging component and task.
 13. THE dispatch sink SHALL route by task type across all registered executors.
 14. THE hard-coded single-task-id sink SHALL be removed.
 15. THE rebuild scan SHALL iterate executions in a deterministic order.

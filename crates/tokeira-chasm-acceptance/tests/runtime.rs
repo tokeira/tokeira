@@ -135,7 +135,15 @@ async fn typed_resource_attributes_are_queryable_through_the_real_projection_ada
         1,
     ));
     let nodes = Arc::new(InMemoryChasmNodeStore::new());
-    let stack = Stack::with_visibility(nodes.clone(), &Clock::new(100 * SECOND), true, adapter);
+    let stack = Stack::with_visibility(
+        nodes.clone(),
+        &Clock::new(100 * SECOND),
+        true,
+        adapter,
+        Arc::new(tokeira_projection::VisibilityQueryService::new(
+            visibility.clone(),
+        )),
+    );
     create_and_update(&stack).await;
     stack.complete(&stack.poll().await.unwrap(), false).await;
     commands::update(&stack.handle(), &reference(key()), 2, "desired-three")

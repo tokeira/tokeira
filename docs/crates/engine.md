@@ -78,7 +78,8 @@ path, a library reaching it through the engine declares
 `#[chasm(fqn = "...", crate = "::tokeira_engine::chasm")]`. The module's
 rustdoc states the wire encodings on the activity boundary: a staged
 `StartActivityTask` carries protobuf-encoded `temporal.api.common.v1`
-`Payloads`, `Header` and `RetryPolicy`, and a `TaskOutcome` delivered for an
+`Payloads`, `Header`, `RetryPolicy` and `SearchAttributes`, plus
+`temporal.api.sdk.v1.UserMetadata`, and a `TaskOutcome` delivered for an
 activity carries `Payloads` or a `temporal.api.failure.v1.Failure`. The engine's
 own compile check (`tests/chasm_embedder.rs`) is the model: a root component
 derived through the re-export, its library, one pure task, one side-effect task

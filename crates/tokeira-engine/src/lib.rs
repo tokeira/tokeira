@@ -4069,7 +4069,7 @@ where
         WorkflowService::new_with_stores_and_buffered_queries_and_history_wait_registry(
             runtime_adapter.clone(),
             resolver,
-            visibility,
+            visibility.clone(),
             repo.clone(),
             operator_api.clone(),
             namespaces.clone(),
@@ -4249,7 +4249,8 @@ where
                     Arc::downgrade(&chasm_engine),
                     activity_config,
                     DEFAULT_MAX_ID_LENGTH,
-                ),
+                )
+                .with_visibility(visibility.clone()),
             ))
             .map_err(registry_start_error)?;
         multiplexer

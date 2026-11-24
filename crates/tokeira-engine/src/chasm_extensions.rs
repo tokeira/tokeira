@@ -247,14 +247,10 @@ pub(crate) fn registry_start_error(error: ChasmError) -> EmbeddedEngineStartErro
     }
 }
 
-/// Preserve only the deliberately public CHASM diagnostics. All other stack
-/// failures retain the embedded boundary's existing phase-only redaction.
+/// Preserve deliberately public diagnostics and log redacted fallback causes
+/// through the same boundary as the other embedded startup phases.
 pub(crate) fn embedded_stack_error(error: anyhow::Error) -> EmbeddedEngineStartError {
-    error
-        .downcast::<EmbeddedEngineStartError>()
-        .unwrap_or(EmbeddedEngineStartError::Phase {
-            phase: EmbeddedStartupPhase::RuntimeRestore,
-        })
+    crate::embedded_startup_error(EmbeddedStartupPhase::RuntimeRestore, error)
 }
 
 #[cfg(test)]

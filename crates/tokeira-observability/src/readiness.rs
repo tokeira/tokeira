@@ -14,7 +14,7 @@ use std::{
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::ObservabilityError;
+use crate::{ObservabilityError, redaction::redact_message};
 
 /// Readiness state for one dependency or background loop.
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -226,14 +226,7 @@ fn duration_millis(duration: Duration) -> u64 {
 }
 
 fn sanitize_readiness_message(message: String) -> String {
-    let mut sanitized = message;
-    for marker in ["password", "token", "secret", "credential", "authorization"] {
-        if sanitized.to_lowercase().contains(marker) {
-            sanitized = "[redacted]".to_string();
-            break;
-        }
-    }
-    sanitized
+    redact_message(&message).to_owned()
 }
 
 #[cfg(test)]

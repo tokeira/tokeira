@@ -1,4 +1,4 @@
-//! Conservative redaction for config snapshots.
+//! Conservative redaction for config snapshots and diagnostic messages.
 //!
 //! This is structural redaction, not a full secret scanner. It is intentionally
 //! biased toward hiding too much when a key name looks sensitive or when a URL
@@ -54,16 +54,36 @@ pub fn is_sensitive_key(key: &str) -> bool {
         .any(|sensitive| lower.contains(sensitive))
 }
 
+/// Replace a diagnostic with `[redacted]` if it mentions credentials or a
+/// credentialed URL; otherwise return the message unchanged.
+///
+/// Matching is case-insensitive and deliberately hides the entire message.
+/// Callers formatting errors must supply only the outermost `Display`, never
+/// debug output or a source chain.
+pub fn redact_message(message: &str) -> &str {
+    let lower = message.to_lowercase();
+    if ["password", "token", "secret", "credential", "authorization"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || looks_like_credentialed_connection_string(message)
+    {
+        "[redacted]"
+    } else {
+        message
+    }
+}
+
 fn looks_like_credentialed_connection_string(value: &str) -> bool {
-    let Some(scheme_index) = value.find("://") else {
-        return false;
-    };
-    let authority_start = scheme_index + 3;
-    let authority = value[authority_start..]
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
-    authority.contains('@') && authority.contains(':')
+    value.match_indices("://").any(|(scheme_index, _)| {
+        let authority_start = scheme_index + 3;
+        let authority = value[authority_start..]
+            .split(|character: char| {
+                matches!(character, '/' | '?' | '#') || character.is_whitespace()
+            })
+            .next()
+            .unwrap_or_default();
+        authority.contains('@')
+    })
 }
 
 #[cfg(test)]
@@ -72,6 +92,29 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn redacts_sensitive_diagnostic_messages() {
+        for message in [
+            "password=fake-password-canary",
+            "TOKEN=fake-token-canary",
+            "a SECRET was supplied",
+            "Credential lookup failed",
+            "AUTHORIZATION rejected",
+            "failed postgres://user:pass@host/db",
+            "failed postgres://user@host/db",
+            "https://example.invalid/path then postgres://user:pass@host/db",
+        ] {
+            assert_eq!(redact_message(message), "[redacted]");
+        }
+        for message in [
+            "index build failed",
+            "https://example.invalid/path",
+            "https://example.invalid/path contact user@example.invalid",
+        ] {
+            assert_eq!(redact_message(message), message);
+        }
+    }
 
     #[test]
     fn redacts_sensitive_keys_recursively() {

@@ -74,6 +74,8 @@ prost = "0.14"
 tokio = { workspace = true, features = ["test-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tokeira-proto = { path = "../tokeira-proto" }
+# Start-read tests attribute each logical run load.
+tokeira-storage = { path = "../tokeira-storage", features = ["test-support"] }
 tokeira-types = { path = "../tokeira-types", features = ["test-support"] }
 tracing-subscriber.workspace = true
 uuid.workspace = true

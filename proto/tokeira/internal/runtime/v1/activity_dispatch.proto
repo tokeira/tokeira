@@ -2,11 +2,46 @@ syntax = "proto3";
 package tokeira.internal.runtime.v1;
 
 import "temporal/api/workflowservice/v1/request_response.proto";
+import "google/protobuf/timestamp.proto";
+import "tokeira/internal/runtime/v1/dispatch.proto";
 
 // A queue-home match asks the execution owner to start one exact incarnation.
 // Worker and peer admission are independent; the receiver never forwards.
 service ActivityTaskDispatch {
   rpc StartActivityTask(StartActivityTaskRequest) returns (StartActivityTaskResponse);
+  rpc OfferActivityTask(OfferActivityTaskRequest) returns (OfferActivityTaskResponse);
+}
+
+// Disposable queue-home metadata. Admission never starts an activity.
+message OfferActivityTaskRequest {
+  bytes run_key = 1;
+  string activity_id = 2;
+  int64 schedule_event_id = 3;
+  uint32 attempt = 4;
+  uint64 stamp = 5;
+  uint32 execution_home = 6;
+  uint32 destination_home = 7;
+  bytes namespace_id = 8;
+  OfferQueue selected_queue = 9;
+  int64 dispatch_revision = 10;
+  google.protobuf.Timestamp dispatch_at = 11;
+  OfferPriority priority = 12;
+  google.protobuf.Timestamp expires_at = 13;
+}
+
+// Acknowledges volatile retention only; no endpoint or start authority is returned.
+message OfferActivityTaskResponse {
+  ActivityOfferOutcome outcome = 1;
+}
+
+enum ActivityOfferOutcome {
+  ACTIVITY_OFFER_OUTCOME_UNSPECIFIED = 0;
+  ACTIVITY_OFFER_OUTCOME_ADMITTED = 1;
+  ACTIVITY_OFFER_OUTCOME_KNOWN = 2;
+  ACTIVITY_OFFER_OUTCOME_NOT_HOME = 3;
+  ACTIVITY_OFFER_OUTCOME_FULL = 4;
+  ACTIVITY_OFFER_OUTCOME_EXPIRED = 5;
+  ACTIVITY_OFFER_OUTCOME_NOT_DUE = 6;
 }
 
 // No user payloads or authority supplied by the caller are accepted here.

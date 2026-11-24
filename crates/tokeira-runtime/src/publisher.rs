@@ -168,6 +168,7 @@ pub struct RuntimeDispatchPublisher<R> {
     #[cfg(test)]
     pub(crate) publication_failure: Arc<Mutex<Option<tokeira_types::TaskKind>>>,
     workflow_delivery: Option<Arc<crate::workflow_delivery::WorkflowDelivery<R>>>,
+    activity_delivery: Option<Arc<crate::activity_delivery::ActivityDelivery>>,
     broker: InMemoryBroker,
     activity_broker: InMemoryActivityBroker,
     repo: Arc<R>,
@@ -210,6 +211,7 @@ impl<R> Clone for RuntimeDispatchPublisher<R> {
             #[cfg(test)]
             publication_failure: self.publication_failure.clone(),
             workflow_delivery: self.workflow_delivery.clone(),
+            activity_delivery: self.activity_delivery.clone(),
             broker: self.broker.clone(),
             activity_broker: self.activity_broker.clone(),
             repo: self.repo.clone(),
@@ -258,6 +260,7 @@ where
             #[cfg(test)]
             publication_failure: Arc::new(Mutex::new(None)),
             workflow_delivery: None,
+            activity_delivery: None,
             broker,
             activity_broker,
             repo,
@@ -288,6 +291,14 @@ where
             anyhow::bail!("injected broker publication failure");
         }
         Ok(())
+    }
+
+    pub(crate) fn with_activity_delivery(
+        mut self,
+        delivery: Arc<crate::activity_delivery::ActivityDelivery>,
+    ) -> Self {
+        self.activity_delivery = Some(delivery);
+        self
     }
 
     pub(crate) fn with_workflow_delivery(
@@ -1281,25 +1292,48 @@ where
                         ..
                     } = op
                     {
-                        let (queue, dispatch_revision) = self
+                        // An effect can precede another command in the same commit,
+                        // so delivery takes only an incarnation the final committed
+                        // image still wants. Tracking below keeps every scheduled
+                        // effect: the owner's eligibility gate rechecks the run.
+                        let wanted =
+                            self.activity_delivery
+                                .as_ref()
+                                .and(committed)
+                                .and_then(|state| {
+                                    let activity = state.activities.get(activity_id)?;
+                                    (activity.schedule_event_id == *schedule_event_id
+                                        && activity.attempt == *attempt
+                                        && activity.stamp == *stamp
+                                        && activity.started_at.is_none()
+                                        && activity.pause_info.is_none())
+                                    .then_some((state, activity))
+                                });
+                        let mut task = match wanted {
+                            // Routing and priority describe the final activity image.
+                            Some((state, activity)) => {
+                                crate::runtime::activity_dispatch_task(run_key, state, activity)
+                            }
+                            None => DispatchableActivityTask {
+                                run_key,
+                                queue: queue.clone(),
+                                activity_id: activity_id.clone(),
+                                schedule_event_id: *schedule_event_id,
+                                attempt: *attempt,
+                                dispatch_revision: *dispatch_revision,
+                                stamp: *stamp,
+                                priority: priority.clone(),
+                                order: None,
+                            },
+                        };
+                        (task.queue, task.dispatch_revision) = self
                             .route_activity_task_queue(
                                 run_key,
                                 committed,
-                                queue.clone(),
-                                *dispatch_revision,
+                                task.queue,
+                                task.dispatch_revision,
                             )
                             .await?;
-                        let task = DispatchableActivityTask {
-                            run_key,
-                            queue,
-                            activity_id: activity_id.clone(),
-                            schedule_event_id: *schedule_event_id,
-                            attempt: *attempt,
-                            dispatch_revision,
-                            stamp: *stamp,
-                            priority: priority.clone(),
-                            order: None,
-                        };
                         // Durable eligibility also anchors schedule-to-start after
                         // a delayed publication. Rehydration must not grant another
                         // timeout window merely because the owner recovered late.
@@ -1330,9 +1364,24 @@ where
                             && let Err(error) = async {
                                 #[cfg(test)]
                                 self.fail_publication(tokeira_types::TaskKind::Activity)?;
-                                self.activity_broker
-                                    .publish_activity_task(task, Some(&self.delivery_metrics))
-                                    .await
+                                if let Some(delivery) = &self.activity_delivery {
+                                    if let Some((state, activity)) = wanted
+                                        && let Some(mut offer) = crate::ActivityQueueOffer::from_state(state, activity, execution_home, recorded_at)
+                                        && crate::activity_offers::incarnation(&offer.task) == crate::activity_offers::incarnation(&task)
+                                    {
+                                        offer.task = task;
+                                        let acquisition = {
+                                            let owner = delivery.homes.owner.read().expect("shard owner lock poisoned");
+                                            owner.acquisition(execution_home).filter(|a| owner.acquisition_active(a))
+                                        };
+                                        if let Some(acquisition) = acquisition {
+                                            delivery.publish(offer, acquisition, crate::activity_delivery::ActivityDeliverySource::Publication).await;
+                                        }
+                                    }
+                                    Ok::<(), anyhow::Error>(())
+                                } else {
+                                    self.activity_broker.publish_activity_task(task, Some(&self.delivery_metrics)).await
+                                }
                             }
                             .await
                         {

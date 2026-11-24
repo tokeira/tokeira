@@ -1292,67 +1292,6 @@ where
             )
             .await?;
 
-        if let CommitResult::Applied { new_state } = &result {
-            for (activity_id, dispatch_at) in reschedule_at {
-                let Some(activity) = new_state.activities.get(&activity_id) else {
-                    continue;
-                };
-                if activity.started_at.is_some() || activity.pause_info.is_some() {
-                    continue;
-                }
-                let task = DispatchableActivityTask {
-                    run_key,
-                    queue: QueueKey {
-                        namespace_id: new_state.namespace_id,
-                        task_queue: activity.task_queue.clone(),
-                        task_kind: TaskKind::Activity,
-                        deployment: activity
-                            .deployment
-                            .clone()
-                            .or_else(|| new_state.deployment.clone()),
-                        build_id: activity
-                            .build_id
-                            .clone()
-                            .or_else(|| new_state.build_id.clone()),
-                    },
-                    activity_id: activity.activity_id.clone(),
-                    schedule_event_id: activity.schedule_event_id,
-                    attempt: activity.attempt,
-                    dispatch_revision: new_state
-                        .versioning_info
-                        .as_ref()
-                        .map(|info| info.revision_number)
-                        .unwrap_or_default(),
-                    // The options update bumped the activity stamp; the republish
-                    // carries the new stamp so any pre-update offer is fenced.
-                    stamp: activity.stamp,
-                    priority: merge_priority(
-                        new_state.priority.as_ref(),
-                        activity.priority.as_ref(),
-                    ),
-                    order: None,
-                };
-                let delay = dispatch_at - self.clock.now();
-                if delay.is_positive() {
-                    let broker = self.activity_broker.clone();
-                    let metrics = self.delivery_metrics.clone();
-                    let clock = self.clock.clone();
-                    tokio::spawn(async move {
-                        crate::deadline::sleep_until(clock.as_ref(), dispatch_at).await;
-                        if let Err(error) = broker.publish_activity_task(task, Some(&metrics)).await
-                        {
-                            tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish rescheduled activity after option update");
-                        }
-                    });
-                } else if let Err(error) = self
-                    .activity_broker
-                    .publish_activity_task(task, Some(&self.delivery_metrics))
-                    .await
-                {
-                    tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish rescheduled activity after option update");
-                }
-            }
-        }
         Ok(result)
     }
 

@@ -19,11 +19,12 @@ The [activity-dispatch verification matrix](activity-dispatch-verification.md)
 adds strict live selections: nine shared 100-case storage properties, three
 physical race/fence entries, one transaction-limit refusal and one production-shaped
 query-plan fixture. Its
-101-run acquisition and actual remote read-count fixture each require their own
-isolated database; do not mix their 4096-home and eight-home preparations with
-shared fixtures. The storage selection is `test(activity_dispatch_live_)`; use
-`--no-tests fail`, and `--run-ignored all` for runtime/edge selections. Missing
-configuration is a refusal, never a successful live check.
+101-run acquisition requires a separate 4096-home database. Activity read counts
+run first on one isolated eight-home database, followed serially by the four
+engine activity queue-home entries; do not mix either database with shared
+fixtures. The storage selection is `test(activity_dispatch_live_)`; use
+`--no-tests fail`, and `--run-ignored all` for runtime/edge and activity engine
+selections. Missing configuration is a refusal, never a successful live check.
 
 ## Shared-cluster order and isolation
 
@@ -66,6 +67,28 @@ homes, and deletes and purges every run it made; `--no-capture` shows its report
 ```bash
 cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --run-ignored all --test-threads 1 --no-capture -E 'test(child_fan_out_live_starts_every_child)'
 ```
+
+Run activity read counts against a **separate empty disposable database**, selected
+through `TOKEIRA_DSQL_TEST_DATABASE_URL`, followed by recovery, retirement,
+competing starts and takeover on that same database. Read counts bootstrap the
+schema and prepare eight homes before the first lease. Each engine entry requires
+that bootstrapped schema and prepares the same eight homes before taking any lease;
+each case purges its runs and releases its leases. Keep these commands serial and
+separate: a filter does not establish their order.
+
+```bash
+cargo nextest run -p tokeira-edge --features dsql-integration --locked --profile dsql-live --run-ignored all --no-tests fail -E 'test(activity_dispatch_live_read_counts)'
+cargo nextest run -p tokeira-engine --features dsql-integration --locked --profile dsql-live --run-ignored all --no-tests fail -E 'test(activity_queue_home_live_recovery)'
+cargo nextest run -p tokeira-engine --features dsql-integration --locked --profile dsql-live --run-ignored all --no-tests fail -E 'test(activity_queue_home_live_retirement)'
+cargo nextest run -p tokeira-engine --features dsql-integration --locked --profile dsql-live --run-ignored all --no-tests fail -E 'test(activity_queue_home_live_competing_starts)'
+cargo nextest run -p tokeira-engine --features dsql-integration --locked --profile dsql-live --run-ignored all --no-tests fail -E 'test(activity_queue_home_live_takeover)'
+```
+
+The read fixture asserts all 16 pushed/discovered, warm/cold, inline/split and
+zero/one-conflict combinations, plus same-request and handoff replay. It retains
+publication, acquisition, offer and discovery reads separately from start counts.
+Each engine entry executes 100 generated cases over authenticated internal gRPC.
+Prompt push and retirement are tested obligations, not proved latency bounds.
 
 Run the queue-home remote-start read baseline against a **separate freshly
 migrated disposable database**, selected through `TOKEIRA_DSQL_TEST_DATABASE_URL`.
@@ -213,6 +236,11 @@ point them at a database holding application data.
 | Storage `queue_home_delivery_live_sticky_query_plans` | 1 | Actual first and deep continuation SQL over 8,192 fixture rows: sticky partial-index bounds and bounded primary-key payload lookups; set `TOKEIRA_QUEUE_HOME_PLAN_OUTPUT` to save plans; `dsql-integration`, URL gate only |
 | Edge `queue_home_delivery_live_read_baseline` | 1 | 16 actual remote starts: normal/sticky, warm/cold, inline/split state, and one injected commit conflict or none, with logical run loads and physical read SQL attributed by node and phase; `dsql-integration`, URL gate only |
 | Engine `queue_home_delivery_live_fenced_starts` | 1 | Property 3 on DSQL: 100 generated takeover and stale-incarnation schedules, each refusing the former writer's commit and starting under the new epoch, and 100 queue-home movements with an offer held on the wire; real gRPC between runtimes with peer credentials; `dsql-integration`, URL gate only; run after the read baseline, as above |
+| Edge `activity_dispatch_live_read_counts` | 1 | 16 pushed/discovered, warm/cold, inline/split, zero/one-conflict combinations: queue owner 0 loads, execution owner 1 or 2 with a conflict; same-request and handoff replay each add a receipt observation. Exact start/replay SQL and separate background phases; `dsql-integration`, ignored, URL required; bootstraps an isolated eight-home database before the four engine entries |
+| Engine `activity_queue_home_live_recovery` | 1 | 100 generated publication, retry and recovery cases with finite request/reply loss or refusal and durable discovery recovery; `dsql-integration`, ignored, URL required; first after activity read counts on the same bootstrapped isolated eight-home database |
+| Engine `activity_queue_home_live_retirement` | 1 | 100 generated acquisition retirement and queue-home movement cases, including late results and replacement isolation; `dsql-integration`, ignored, URL required; follows recovery on the same database |
+| Engine `activity_queue_home_live_competing_starts` | 1 | 100 generated competing-start, conflict and receipt-replay cases; one committed start and only its request may replay; `dsql-integration`, ignored, URL required; follows retirement on the same database |
+| Engine `activity_queue_home_live_takeover` | 1 | 100 generated execution-owner takeover cases; the superseded fence cannot commit a start; `dsql-integration`, ignored, URL required; follows competing starts on the same database |
 | Storage `workflow_dispatch_live_reset_uses_execution_home` | 1 | Eight-shard reset placement of hot state, timers and dispatch before any follow-up commit, with execution home distinct from the successor run-hash shard; `dsql-integration`, URL gate only |
 | Storage `workflow_dispatch_live_generated_ordered_traversal` | 1 | Property 3: 100 generated ordered traversals, ties, multiple execution homes, read-only pages and mutations behind a cursor; `dsql-integration`, URL gate only |
 | Storage `workflow_dispatch_live_generated_sticky_recovery` | 1 | Property 7: 100 generated durable deadline, affinity-reset, paused, speculative, closed and legacy cases, with normal rediscovery after timeout; `dsql-integration`, URL gate only |

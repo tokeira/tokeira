@@ -1,7 +1,7 @@
 # Activity dispatch verification and rollout
 
-This change delivers the remaining activity dispatch work using the approved
-[activity-dispatch plan](../../.kiro/specs/activity-dispatch/tasks.md).
+Activity dispatch combines execution-owner push with durable queue-home discovery
+and an authoritative execution-owner start.
 The evidence below distinguishes implementation, memory/transport checks and
 physical DSQL checks. A compiled live test is not a completed live check.
 
@@ -9,20 +9,25 @@ physical DSQL checks. A compiled live test is not a completed live check.
 
 | Operation | Final authority and path | Executable coverage |
 |---|---|---|
-| Ordinary publication | Storage desired-set delta in the run transaction; notifications only wake/admit disposable offers | Shared atomic and derivation properties |
-| Pair/successor publication | Both authoritative runs and their wanted rows commit atomically | Shared pair and successor tests |
-| Staged reset/bulk publication | Existing staging barrier; complete canonical set before publication, bounded orphan removal | Shared staging property and bounded bulk contracts |
+| Ordinary publication | Storage desired-set delta commits with the run; the execution owner publishes each still-wanted due incarnation through local admission or bounded `OfferActivityTask` push | Shared atomic/derivation properties and authenticated publication/recovery cases |
+| Pair/successor publication | Both authoritative runs and their wanted rows commit atomically; publication uses each final committed image and its execution home | Shared pair/successor tests and publication cases |
+| Staged reset/bulk publication | Complete canonical set before the visibility barrier; bounded orphan removal; restored obligations push only after publication and Active ownership | Shared staging/bulk contracts and reset recovery cases |
 | Logical deletion/purge | Desired set becomes empty; existing run-key purge removes physical rows | Shared atomic/staging cases |
-| Retry eligibility/rules | Execution-owner tracker and fenced transitions; no detached delayed publication | Rule timing and routing properties |
-| Poll/discovery | Read-only queue-family pages and hydration; shared eight-query scheduler | Retained-prefix, cursor, scheduler and foreign-mutation audits |
-| Ordinary/eager/remote start | Common execution-owner start checks and receipt commit | Competing starts, real HTTP/2 and eager response properties |
+| Retry eligibility/rules | Execution-owner tracker pushes at the original due time, including already-due registrations, after current rule and deadline checks; no detached delayed publication | Rule timing/routing properties and retry recovery cases |
+| Poll/discovery | Read-only queue-family pages and hydration recover lost, refused or unanswered pushes; shared eight-query scheduler and local admission without another push | Retained-prefix, cursor, scheduler, loss recovery and foreign-mutation audits |
+| Ordinary/eager/remote start | Volatile execution-home hint routes ordinary polls without a queue-owner run load; owner reloads and checks admission, incarnation, routing, rules and fence before start/receipt commit. Eager start stays in completion and emits no offer | Competing starts, takeover, real HTTP/2, exact read counts and eager response properties |
 | Lost reply/replay | Same UUID and incarnation, read-only fenced observation | Runtime controlled races and physical observation race |
-| Acquisition | Candidate walk plus complete home-row walk before Active; generation-scoped repair and restored deadlines | Failed acquisition, multi-page repair and 101-run live fixture |
+| Acquisition | Candidate walk plus complete home-row walk before Active; generation-scoped repair restores obligations, waking due pushes after activation and future pushes at their original deadlines | Failed acquisition, multi-page repair, 101-run live fixture and recovery cases |
+| Queue-home retirement | Cancellation/deadline watchers retire ready/in-flight accounting, reservations and discovery work under the broker lock independently of discovery; serving-generation checks refuse old admission/takes and cleanup preserves replacements | Retirement and queue-movement cases with late deadlines and results |
 | Registration/republish | Wake discovery without resetting retained continuation | Routing properties and retired-call audit |
 | Legacy spill/drain | Removed runtime producers and consumers | Production source inventory and fail-on-call workload property |
 | Legacy disposal | At most 64 physical keys, delete only covered/absent authority; defer invalid copies | Shared disposal and physical replacement race |
 | Inspection/sampling | Compatibility repository reads remain non-authoritative | Canonical row/page adapter tests |
 | Repository adapters | Transparent trait forwarding, including HistoryWaitRepository | Compile bar and inventory's exact adapter exception |
+
+Prompt push and retirement are tested obligations, not proved latency bounds.
+An offer acknowledgement confers no start authority; a committed start and its
+receipt survive retirement of the queue-home hint.
 
 The production-source audit rejects legacy spill/drain and old due-scan calls in
 runtime/edge, with one exact transparent-adapter exception per method. Negative
@@ -34,16 +39,29 @@ code outside the scanned production sources.
 ## Reproducible selections
 
 Run the [live-suite preflight and isolation rules](dsql-live-suites.md) first.
-All `activity_dispatch_live_` entries fail when the dedicated test URL is absent.
+All `activity_dispatch_live_` and `activity_queue_home_live_` entries fail when
+the dedicated test URL is absent.
 Keep credentials out of command lines, saved logs and source archives.
 
 ```sh
 cargo nextest run -p tokeira-storage --features dsql-integration --locked --profile dsql-live --test-threads 1 --no-tests fail -E 'test(activity_dispatch_live_)'
-# Separate empty database, after schema bootstrap, before any lease/preparation test:
+# Separate empty database, after schema bootstrap and before any lease/preparation test; it prepares 4096 homes:
 cargo nextest run -p tokeira-runtime --features dsql-integration --locked --profile dsql-live --run-ignored all --no-tests fail -E 'test(activity_dispatch_live_acquisition_spans_recovery_pages)'
-# A third isolated empty database; this fixture bootstraps its schema:
+# Isolated empty eight-home database; read counts bootstrap schema and placement first:
 cargo nextest run -p tokeira-edge --features dsql-integration --locked --profile dsql-live --run-ignored all --no-tests fail -E 'test(activity_dispatch_live_read_counts)'
+# The same cleaned eight-home database, in this order; each prepares placement before any lease:
+cargo nextest run -p tokeira-engine --features dsql-integration --locked --profile dsql-live --run-ignored all --no-tests fail -E 'test(activity_queue_home_live_recovery)'
+cargo nextest run -p tokeira-engine --features dsql-integration --locked --profile dsql-live --run-ignored all --no-tests fail -E 'test(activity_queue_home_live_retirement)'
+cargo nextest run -p tokeira-engine --features dsql-integration --locked --profile dsql-live --run-ignored all --no-tests fail -E 'test(activity_queue_home_live_competing_starts)'
+cargo nextest run -p tokeira-engine --features dsql-integration --locked --profile dsql-live --run-ignored all --no-tests fail -E 'test(activity_queue_home_live_takeover)'
 ```
+
+Run these selections serially in separate commands; a filter does not establish
+order. The four engine entries require an already bootstrapped isolated database,
+prepare eight homes before taking leases, and purge their runs and release their
+leases after each case. Each executes 100 generated cases through authenticated
+internal gRPC. Keep this database separate from the 4096-home acquisition and
+shared storage fixtures.
 
 The shared storage entries execute 100 generated cases each for complete derivation, atomic commits,
 pairs, ordered and malformed traversal, repair, staging, observation and disposal.
@@ -65,17 +83,47 @@ Exact expected operations are asserted per phase in the executable fixture:
 
 | Phase | Logical state observations | Expected physical state-read statements |
 |---|---:|---|
-| Fresh start | Queue owner 1; execution owner 1 | One `hot-state-fast` per owner, 2 total |
-| Same-request replay | Owner preparation 1; receipt validation 1 | `hot-state-fast`, observation BEGIN, lease key-share read, hot-state `FOR UPDATE`, COMMIT: 5 total |
-| Replacement-owner replay | Owner preparation 1; receipt validation 1 | The same five operations, using the replacement's current lease |
-| Autonomous discovery | Retained separately, at least one hydration in this fixture | Every observed hydration's SQL remains attributed to discovery |
+| Fresh start, no conflict | Queue owner 0; `execution-owner/activity-start` 1 | Inline: 1 `hot-state-fast`; split: 5 (`begin-read-snapshot`, `hot-state-fast`, `hot-state-snapshot`, `value-parts`, `commit-read-snapshot`) |
+| Fresh start, one injected conflict | Queue owner 0; `execution-owner/activity-start` 2 | The same operations per load: inline 2; split 10 |
+| Same-request replay | `execution-owner/activity-start` 1; `execution-owner/activity-replay` receipt validation 1 | Inline: 5 total; split: 10 total |
+| Replacement-owner replay | `execution-owner/activity-start` 1; `execution-owner/activity-replay` receipt validation 1 | Inline: 5 total; split: 10 total, using the replacement's current lease |
+| Discovery hydration | `activity-discovery/resolve`: at least 1 for a discovered start; 1 measured | Inline: 1; split: 5, with the same load operations as fresh start; counted against discovery, not start |
 
-The isolated live fixture passes these exact counts. Its retained report also
-records one discovery hydration and two unscoped state reads during fresh start,
-and one unscoped state read during each replay phase. These background reads are
-additional to the phase totals above; the report does not erase them.
+The fixture asserts all 16 combinations of pushed/discovered delivery, warm/cold
+caches, inline/split state and zero/one injected conflict. Warm and cold starts
+have identical counts. Both replay paths run for every combination, without an
+injected replay conflict. Receipt validation uses `begin-activity-observation`,
+`activity-observation-state`, `activity-observation-fence` and
+`commit-activity-observation`, plus `value-parts` for split state; the owner load
+accounts for the remaining statements in each replay total.
+
+Three live runs produced identical read shapes. Their background phases remain
+separate from the start totals:
+
+| Background phase / scope | Logical reads | Inline SQL statements | Split SQL statements |
+|---|---:|---:|---:|
+| Publication / `execution-owner/lane-cache-or-retry` | 1 | 1 | 1 |
+| Publication / `execution-owner/preparation` | 1 | 1 | 1 |
+| Publication / `normal-discovery` | 1 | 1 | 1 |
+| Publication / `outside-start` | 2 | 2 | 2 |
+| Acquisition and offer / `outside-start`, discovered | 1 | 1 | 16 |
+| Acquisition and offer / `outside-start`, pushed | 2 | 2 | 21 |
+| Acquisition and offer / `execution-owner/admission-cache`, warm only | 1 | 1 | 5 |
+
+Publication is identical in all 16 combinations; each read is one `hot-state-fast`
+statement. During acquisition and offer, each split read adds
+`begin-read-snapshot`, `hot-state-snapshot` and `commit-read-snapshot` to
+`hot-state-fast`. Split state also adds one `value-parts` statement to the warm
+admission-cache read, and 12 to `outside-start` when discovered or 13 when pushed.
+Cold acquisition has no admission-cache read. These are measured background
+counts, additional to the asserted start/replay totals.
 
 ## Rollout and rollback
+
+Activity queue-home push adds no upgrade or rollback step: it uses the existing
+peer credentials and adds no migration, persisted format or installation step.
+An older peer answers `Unimplemented`, which ends the push attempt, and discovery
+covers the task. The steps below are unchanged.
 
 1. Stop every old runtime/edge node and retain a recoverable pre-upgrade database.
    Mixed-version serving is unsupported for this cutover.
@@ -265,3 +313,29 @@ Both disposable boxes used for this follow-up are deleted and fresh listings
 verify their absence. Logs, fixture lockfile and source manifests are retained.
 Only this receipt text was added after the archived run; executable inputs are
 unchanged.
+
+## Queue-home delivery verification receipt
+
+The following selections passed on DSQL. Acquisition and the lost-publication
+and backlog checks used a 4096-home database after schema bootstrap. Activity
+inputs used a separate eight-home database after schema bootstrap. Read counts
+bootstrapped an isolated eight-home database; the four engine selections followed
+on that database in the order below, with placement prepared before any lease.
+
+| Selection | Result | Cases |
+|---|---|---|
+| Schema bootstrap | Passed on the 4096-home and activity-input databases | 1 bootstrap test per database |
+| `activity_dispatch_live_acquisition_spans_recovery_pages` | Passed | 1 test: 101 runs, 229 slots, including a 129-slot run with split state |
+| `activity_dispatch_live_lost_publication_offered_by_next_pass` | Passed; discovery delivered to the parked poll within the asserted bound | 1 test |
+| `workflow_dispatch_live_lost_publication_offered_by_next_pass` | Passed; discovery delivered to the parked poll within the asserted bound | 1 test |
+| `activity_dispatch_live_backlog_counts_rows_without_pollers` | Passed | 1 test |
+| `dsql_activity_inputs` | Passed | All 3 tests |
+| `activity_dispatch_live_read_counts` | Passed; identical read shapes in all three runs | 16 combinations per run, each with fresh start, same-request replay and handoff replay |
+| `activity_queue_home_live_recovery` | Passed | 100 generated cases |
+| `activity_queue_home_live_retirement` | Passed | 100 generated cases |
+| `activity_queue_home_live_competing_starts` | Passed | 100 generated cases |
+| `activity_queue_home_live_takeover` | Passed | 100 generated cases |
+
+Prompt push and retirement are tested obligations, not proved latency bounds.
+Storage-only selections were not rerun because the storage implementation is
+unchanged; their existing receipt above remains separate evidence.

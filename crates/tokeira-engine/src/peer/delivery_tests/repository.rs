@@ -19,10 +19,12 @@ use tokeira_types::{
 use tokio::sync::{oneshot, watch};
 use uuid::Uuid;
 
+tokio::task_local! { pub(in crate::peer) static START_READS: (); }
+
 #[derive(Debug)]
-pub(super) struct Gate {
+pub(in crate::peer) struct Gate {
     open: watch::Sender<bool>,
-    pub(super) reads: AtomicUsize,
+    pub(in crate::peer) reads: AtomicUsize,
 }
 impl Gate {
     fn new() -> Self {
@@ -31,7 +33,7 @@ impl Gate {
             reads: AtomicUsize::new(0),
         }
     }
-    pub(super) fn release(&self) {
+    pub(in crate::peer) fn release(&self) {
         self.open.send_replace(true);
     }
     async fn pass(&self) {
@@ -48,24 +50,49 @@ struct CommitPause {
 }
 
 #[derive(Debug)]
-pub(super) struct Repository<R: ?Sized> {
-    pub(super) inner: Arc<R>,
-    pub(super) normal: Gate,
-    pub(super) sticky: Gate,
-    pub(super) loads: AtomicUsize,
+pub(in crate::peer) struct Repository<R: ?Sized> {
+    pub(in crate::peer) inner: Arc<R>,
+    pub(in crate::peer) normal: Gate,
+    pub(in crate::peer) sticky: Gate,
+    pub(in crate::peer) activity: Gate,
+    pub(in crate::peer) conflicts: AtomicUsize,
+    pub(in crate::peer) rejected: AtomicUsize,
+    pub(in crate::peer) observations: AtomicUsize,
+    pub(in crate::peer) history_reads: AtomicUsize,
+    pub(in crate::peer) commits: AtomicUsize,
+    pub(in crate::peer) applied_starts: AtomicUsize,
+    pub(in crate::peer) fenced_starts: AtomicUsize,
+    renewal: tokio::sync::RwLock<()>,
+    pub(in crate::peer) lease_seconds: AtomicUsize,
+    pub(in crate::peer) loads: AtomicUsize,
+    pub(in crate::peer) start_loads: AtomicUsize,
     commit: Mutex<Option<CommitPause>>,
 }
 impl<R> Repository<R> {
-    pub(super) fn new(inner: Arc<R>) -> Self {
+    pub(in crate::peer) fn new(inner: Arc<R>) -> Self {
         Self {
             inner,
             normal: Gate::new(),
             sticky: Gate::new(),
+            activity: Gate::new(),
+            conflicts: AtomicUsize::new(0),
+            rejected: AtomicUsize::new(0),
+            observations: AtomicUsize::new(0),
+            history_reads: AtomicUsize::new(0),
+            commits: AtomicUsize::new(0),
+            applied_starts: AtomicUsize::new(0),
+            fenced_starts: AtomicUsize::new(0),
+            renewal: tokio::sync::RwLock::new(()),
+            lease_seconds: AtomicUsize::new(0),
             loads: AtomicUsize::new(0),
+            start_loads: AtomicUsize::new(0),
             commit: Mutex::new(None),
         }
     }
-    pub(super) fn pause_commit(&self, run: RunKey) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    pub(in crate::peer) fn pause_commit(
+        &self,
+        run: RunKey,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (entered, arrived) = oneshot::channel();
         let (resume, wait) = oneshot::channel();
         *self.commit.lock().unwrap() = Some(CommitPause {
@@ -74,6 +101,12 @@ impl<R> Repository<R> {
             resume: wait,
         });
         (arrived, resume)
+    }
+
+    // Drain an in-flight renewal before moving the durable lease. Holding this
+    // guard delays loss observation, never the store's epoch check on writes.
+    pub(in crate::peer) async fn pause_renewals(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.renewal.write().await
     }
 }
 impl<R: ?Sized> Repository<R> {
@@ -310,6 +343,9 @@ where
 
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
         self.loads.fetch_add(1, Ordering::SeqCst);
+        if START_READS.try_with(|()| ()).is_ok() {
+            self.start_loads.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.load_run(run_key).await
     }
 
@@ -320,6 +356,7 @@ where
         home: ShardId,
         fence: WriteFence,
     ) -> Result<bool> {
+        self.observations.fetch_add(1, Ordering::SeqCst);
         self.inner
             .validate_activity_start_observation(observed, activity_id, home, fence)
             .await
@@ -327,6 +364,9 @@ where
 
     async fn load_run_with_stats(&self, run_key: RunKey) -> Result<(LoadedRun, RunHistoryStats)> {
         self.loads.fetch_add(1, Ordering::SeqCst);
+        if START_READS.try_with(|()| ()).is_ok() {
+            self.start_loads.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.load_run_with_stats(run_key).await
     }
 
@@ -346,6 +386,7 @@ where
         run_key: RunKey,
         event_id: i64,
     ) -> Result<Option<HistoryEvent>> {
+        self.history_reads.fetch_add(1, Ordering::SeqCst);
         self.inner.read_history_event(run_key, event_id).await
     }
 
@@ -425,9 +466,36 @@ where
         fence: WriteFence,
     ) -> Result<CommitResult> {
         self.before_commit(run_key).await;
-        self.inner
+        if self
+            .conflicts
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            self.rejected.fetch_add(1, Ordering::SeqCst);
+            return Ok(CommitResult::Conflict {
+                reason: "injected OCC conflict".into(),
+            });
+        }
+        self.commits.fetch_add(1, Ordering::SeqCst);
+        let result = self
+            .inner
             .commit_transition(run_key, transition, fence)
-            .await
+            .await;
+        if START_READS.try_with(|()| ()).is_ok()
+            && result
+                .as_ref()
+                .is_err_and(|error| error.is::<LeaseFenceLost>())
+        {
+            self.fenced_starts.fetch_add(1, Ordering::SeqCst);
+        }
+        if START_READS.try_with(|()| ()).is_ok()
+            && matches!(&result, Ok(CommitResult::Applied { .. }))
+        {
+            self.applied_starts.fetch_add(1, Ordering::SeqCst);
+        }
+        result
     }
 
     async fn commit_transition_for_bundle(
@@ -438,9 +506,36 @@ where
         fence: WriteFence,
     ) -> Result<CommitResult> {
         self.before_commit(run_key).await;
-        self.inner
+        if self
+            .conflicts
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            self.rejected.fetch_add(1, Ordering::SeqCst);
+            return Ok(CommitResult::Conflict {
+                reason: "injected OCC conflict".into(),
+            });
+        }
+        self.commits.fetch_add(1, Ordering::SeqCst);
+        let result = self
+            .inner
             .commit_transition_for_bundle(run_key, execution_home_bundle, transition, fence)
-            .await
+            .await;
+        if START_READS.try_with(|()| ()).is_ok()
+            && result
+                .as_ref()
+                .is_err_and(|error| error.is::<LeaseFenceLost>())
+        {
+            self.fenced_starts.fetch_add(1, Ordering::SeqCst);
+        }
+        if START_READS.try_with(|()| ()).is_ok()
+            && matches!(&result, Ok(CommitResult::Applied { .. }))
+        {
+            self.applied_starts.fetch_add(1, Ordering::SeqCst);
+        }
+        result
     }
 
     async fn delete_run_for_bundle(
@@ -537,6 +632,7 @@ where
         after: Option<tokeira_storage::ActivityDispatchPosition>,
         limit: std::num::NonZeroU32,
     ) -> Result<tokeira_storage::ActivityDispatchPage> {
+        self.activity.pass().await;
         self.inner
             .list_activity_dispatch_page(range, cutoff, after, limit)
             .await
@@ -702,7 +798,10 @@ where
     T: LeaseRepository + ?Sized,
 {
     fn bundle_lease_duration(&self) -> Option<time::Duration> {
-        self.inner.bundle_lease_duration()
+        match self.lease_seconds.load(Ordering::SeqCst) {
+            0 => self.inner.bundle_lease_duration(),
+            seconds => Some(time::Duration::seconds(seconds as i64)),
+        }
     }
 
     async fn try_acquire_bundle(
@@ -723,6 +822,7 @@ where
         epoch: ShardEpoch,
         node_endpoint: String,
     ) -> Result<LeaseOutcome> {
+        let _renewal = self.renewal.read().await;
         self.inner
             .renew_bundle(bundle, owner, epoch, node_endpoint)
             .await

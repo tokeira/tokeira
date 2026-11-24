@@ -91,7 +91,7 @@ async fn assert_heartbeat_timeout(store: &InMemoryStore, run: RunKey) {
 }
 
 #[tokio::test(start_paused = true)]
-async fn first_attempt_is_offered_only_by_publisher() {
+async fn first_attempt_eligibility_recovers_loss_and_deduplicates_publication() {
     for lost in [false, true] {
         let (_, runtime, run, queue) = scheduled(false, lost).await;
         let _publisher_offer = if lost {
@@ -105,13 +105,17 @@ async fn first_attempt_is_offered_only_by_publisher() {
             runtime.clock.now(),
         )
         .await;
+        let recovered = runtime
+            .activity_broker
+            .try_claim_activity_offer(&queue, run, "Heartbeat")
+            .await;
+        assert_eq!(recovered.is_some(), lost);
         assert!(
             runtime
                 .activity_broker
                 .try_claim_activity_offer(&queue, run, "Heartbeat")
                 .await
-                .is_none(),
-            "eligibility must not offer a first attempt already due at commit"
+                .is_none()
         );
         discovery_tests::stop(&runtime).await;
     }

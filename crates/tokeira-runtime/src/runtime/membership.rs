@@ -480,6 +480,7 @@ impl AcquisitionCleanup {
         {
             return Err(anyhow!("shard acquisition superseded before activation"));
         }
+        self.activity.eligibility.activated();
         Ok(())
     }
 

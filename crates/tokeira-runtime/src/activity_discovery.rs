@@ -5,7 +5,7 @@
 //! discovery scheduler owns the node's query slots, rather than one pool per kind.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     num::NonZeroU32,
     sync::{Arc, Mutex, RwLock},
 };
@@ -32,11 +32,13 @@ use crate::{
     },
     runtime::workflow_task::route_activity_task_queue,
     shard::ShardOwner,
-    workflow_offers::OfferAdmission,
 };
 
 const ACTIVE_CAPACITY: usize = 4_096;
 
+#[cfg(test)]
+#[path = "activity_discovery/activity_queue_home_retirement_tests.rs"]
+mod activity_queue_home_retirement_tests;
 #[cfg(test)]
 mod tests;
 
@@ -71,12 +73,13 @@ impl<R: RunRepository + 'static> ActivityDiscovery<R> {
         let broker = self.broker.clone();
         let cancel = cancel.clone();
         let retired = pass.cancel.clone();
+        let clock = self.clock.clone();
         slices.spawn(async move {
             let outcome = tokio::select! {
                 _ = cancel.cancelled() => SliceOutcome::Cancelled,
                 _ = retired.cancelled() => SliceOutcome::Cancelled,
                 _ = home.cancel.cancelled() => SliceOutcome::Cancelled,
-                result = run_slice(source.as_ref(), &registry, &broker, &key, &home, &mut pass) => match result {
+                result = run_slice_at(source.as_ref(), &registry, &broker, &key, &home, &mut pass, clock.as_ref()) => match result {
                     Ok(outcome) => outcome,
                     Err(error) => { tracing::warn!(?error, "activity discovery page failed; next pass starts at head"); SliceOutcome::Complete }
                 }
@@ -98,6 +101,21 @@ pub(crate) trait ActivityDiscoverySource: Send + Sync {
         limit: NonZeroU32,
     ) -> Result<ActivityDispatchPage>;
     async fn resolve(&self, row: &ActivityDispatchRow) -> Result<Option<DispatchableActivityTask>>;
+    async fn resolve_offer(
+        &self,
+        row: &ActivityDispatchRow,
+        now: OffsetDateTime,
+    ) -> Result<Option<crate::ActivityQueueOffer>> {
+        Ok(self
+            .resolve(row)
+            .await?
+            .map(|task| crate::ActivityQueueOffer {
+                task,
+                execution_home: row.execution_home,
+                dispatch_at: row.dispatch_at,
+                expires_at: tokeira_kernel::deadline_after(now, time::Duration::seconds(5)),
+            }))
+    }
 }
 
 pub(crate) struct ActivitySource<R> {
@@ -121,6 +139,35 @@ impl<R: RunRepository + 'static> ActivityDiscoverySource for ActivitySource<R> {
     }
 
     async fn resolve(&self, row: &ActivityDispatchRow) -> Result<Option<DispatchableActivityTask>> {
+        Ok(self.resolved(row).await?.map(|(_, task)| task))
+    }
+    async fn resolve_offer(
+        &self,
+        row: &ActivityDispatchRow,
+        now: OffsetDateTime,
+    ) -> Result<Option<crate::ActivityQueueOffer>> {
+        let Some((state, task)) = self.resolved(row).await? else {
+            return Ok(None);
+        };
+        let Some(activity) = state.activities.get(&task.activity_id) else {
+            return Ok(None);
+        };
+        Ok(
+            crate::ActivityQueueOffer::from_state(&state, activity, row.execution_home, now).map(
+                |mut offer| {
+                    offer.task = task;
+                    offer.dispatch_at = row.dispatch_at;
+                    offer
+                },
+            ),
+        )
+    }
+}
+impl<R: RunRepository + 'static> ActivitySource<R> {
+    async fn resolved(
+        &self,
+        row: &ActivityDispatchRow,
+    ) -> Result<Option<(tokeira_kernel::WorkflowState, DispatchableActivityTask)>> {
         let LoadedRun::Existing(state) = tokeira_storage::read_probe::scope(
             "activity-discovery/resolve",
             self.repo.load_run(row.incarnation.run_key),
@@ -157,11 +204,12 @@ impl<R: RunRepository + 'static> ActivityDiscoverySource for ActivitySource<R> {
         .await?;
         // Discovery never evaluates a mutating workflow rule. Even a newly
         // matching rule must reach the owner, whose fenced start applies it.
-        Ok(Some(DispatchableActivityTask {
+        let task = DispatchableActivityTask {
             queue,
             dispatch_revision,
             ..row.task()
-        }))
+        };
+        Ok(Some((state, task)))
     }
 }
 
@@ -196,6 +244,7 @@ struct Registration {
 
 #[derive(Debug, Default)]
 struct RegistryState {
+    acquisitions: BTreeMap<(ShardId, u64), QueueHome>,
     ranges: HashMap<RangeKey, Registration>,
     turn: u64,
 }
@@ -206,6 +255,7 @@ pub(crate) struct ActivityDiscoveryRegistry {
     pub(crate) test_gate: Arc<crate::discovery::test_gate::TestPassGate>,
     state: Arc<Mutex<RegistryState>>,
     pub(crate) wake: Arc<Notify>,
+    pub(crate) retirement_wake: Arc<Notify>,
 }
 
 #[derive(Debug)]
@@ -265,6 +315,36 @@ impl Drop for ActivityPollDemand {
 }
 
 impl ActivityDiscoveryRegistry {
+    /// Include demand-only acquisitions even when no offer has been retained.
+    pub(crate) fn acquisitions(&self) -> Vec<QueueHome> {
+        self.state
+            .lock()
+            .expect("activity discovery lock poisoned")
+            .acquisitions
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Called under the broker lock so pages and offers lose admission together.
+    /// Registry operations release their lock before awaiting the broker, keeping
+    /// the broker-to-registry lock order free of a reverse dependency.
+    pub(crate) fn retire_acquisition(&self, home: &QueueHome) -> bool {
+        let mut state = self.state.lock().expect("activity discovery lock poisoned");
+        let removed = state
+            .acquisitions
+            .remove(&(home.id, home.generation))
+            .is_some();
+        state.ranges.retain(|key, entry| {
+            let remove = key.home == home.id && key.generation == home.generation;
+            if remove {
+                entry.cancel.cancel();
+            }
+            !remove
+        });
+        removed
+    }
+
     /// Coalesce registration changes and failed matches with the existing pass.
     /// Never reset its cursor: repeated notifications must not starve its tail.
     pub(crate) fn wake_family(&self, queue: &QueueKey, now: Instant) {
@@ -288,10 +368,6 @@ impl ActivityDiscoveryRegistry {
         home: QueueHome,
         now: Instant,
     ) -> Result<ActivityPollDemand> {
-        anyhow::ensure!(
-            !home.cancel.is_cancelled(),
-            "activity queue-home acquisition ended"
-        );
         let family = QueueKey {
             deployment: None,
             build_id: None,
@@ -303,6 +379,9 @@ impl ActivityDiscoveryRegistry {
             generation: home.generation,
         };
         let mut state = self.state.lock().expect("activity discovery lock poisoned");
+        // Retirement removes registrations under this mutex. Checking here keeps
+        // a poll that waited through cleanup from reinstalling the ended scope.
+        anyhow::ensure!(home.valid(), "activity queue-home acquisition ended");
         let already_active = state
             .ranges
             .get(&key)
@@ -319,6 +398,13 @@ impl ActivityDiscoveryRegistry {
         if !already_active && active >= ACTIVE_CAPACITY {
             return Err(ActivityDemandCapacity.into());
         }
+        state
+            .acquisitions
+            .entry((home.id, home.generation))
+            .or_insert_with(|| {
+                self.retirement_wake.notify_one();
+                home.clone()
+            });
         let turn = state.turn;
         state.turn = state
             .turn
@@ -364,9 +450,7 @@ impl ActivityDiscoveryRegistry {
             .ranges
             .get(key)
             .is_some_and(|entry| {
-                entry.id == registration
-                    && !entry.demands.is_empty()
-                    && !entry.home.cancel.is_cancelled()
+                entry.id == registration && !entry.demands.is_empty() && entry.home.valid()
             })
     }
 
@@ -377,9 +461,7 @@ impl ActivityDiscoveryRegistry {
             .ranges
             .get(key)
             .is_some_and(|entry| {
-                entry.id == registration
-                    && entry.demands.contains_key(queue)
-                    && !entry.home.cancel.is_cancelled()
+                entry.id == registration && entry.demands.contains_key(queue) && entry.home.valid()
             })
     }
 
@@ -399,7 +481,7 @@ impl ActivityDiscoveryRegistry {
             .filter(|(_, entry)| {
                 !entry.running
                     && !entry.demands.is_empty()
-                    && !entry.home.cancel.is_cancelled()
+                    && entry.home.valid()
                     && now >= entry.next_slice
             })
             .min_by_key(|(_, entry)| entry.turn)
@@ -492,7 +574,7 @@ impl ActivityDiscoveryRegistry {
         }
         let mut retired = Vec::new();
         state.ranges.retain(|key, entry| {
-            let remove = entry.home.cancel.is_cancelled()
+            let remove = !entry.home.valid()
                 || (entry.demands.is_empty()
                     && (now.duration_since(entry.last_used) >= IDLE_GRACE || evict.contains(key)));
             if remove {
@@ -513,15 +595,18 @@ impl ActivityDiscoveryRegistry {
     }
 }
 
-pub(crate) async fn run_slice<S: ActivityDiscoverySource>(
+pub(crate) async fn run_slice_at<S: ActivityDiscoverySource>(
     source: &S,
     registry: &ActivityDiscoveryRegistry,
     broker: &InMemoryActivityBroker,
     key: &RangeKey,
     home: &QueueHome,
     pass: &mut ActivityPass,
+    clock: &dyn Clock,
 ) -> Result<SliceOutcome> {
-    let mut reservation = broker.reserve_offers(home, PASS_ADMISSIONS).await;
+    let mut reservation = broker
+        .reserve_offers(home, &key.family, PASS_ADMISSIONS)
+        .await;
     reservation.cancel = pass.cancel.clone();
     if reservation.remaining() == 0 {
         return Ok(SliceOutcome::Capacity);
@@ -539,7 +624,7 @@ pub(crate) async fn run_slice<S: ActivityDiscoverySource>(
         )
         .await?;
     for candidate in page.candidates {
-        if home.cancel.is_cancelled() || pass.cancel.is_cancelled() {
+        if !home.valid() || pass.cancel.is_cancelled() {
             return Ok(SliceOutcome::Cancelled);
         }
         if !registry.active(key, pass.registration) {
@@ -552,7 +637,7 @@ pub(crate) async fn run_slice<S: ActivityDiscoverySource>(
                 if broker.contains_activity_task(&row.task()).await {
                     None
                 } else {
-                    match source.resolve(&row).await {
+                    match source.resolve_offer(&row, clock.now()).await {
                         Ok(task) => task,
                         Err(error) => {
                             tracing::warn!(?error, "activity discovery candidate failed");
@@ -567,22 +652,31 @@ pub(crate) async fn run_slice<S: ActivityDiscoverySource>(
                 None
             }
         };
-        if home.cancel.is_cancelled() || pass.cancel.is_cancelled() {
+        if !home.valid() || pass.cancel.is_cancelled() {
             return Ok(SliceOutcome::Cancelled);
         }
         if !registry.active(key, pass.registration) {
             return Ok(SliceOutcome::Idle);
         }
         if let Some(task) = resolved
-            && registry.compatible(key, pass.registration, &task.queue)
+            && registry.compatible(key, pass.registration, &task.task.queue)
         {
-            match broker.publish_discovered(task, &mut reservation).await {
-                OfferAdmission::Full => return Ok(SliceOutcome::Capacity),
-                // These workflow-only outcomes cannot be produced by activity admission.
-                OfferAdmission::NotHome | OfferAdmission::Expired => {
-                    unreachable!("activity admission has no workflow ownership outcomes")
-                }
-                OfferAdmission::Admitted | OfferAdmission::Known => {}
+            match broker
+                .admit_activity_offer(
+                    task,
+                    Some(home),
+                    crate::workflow_offers::OfferSource::Discovered,
+                    clock.now(),
+                    Some(&mut reservation),
+                )
+                .await
+            {
+                crate::ActivityOfferOutcome::Full => return Ok(SliceOutcome::Capacity),
+                crate::ActivityOfferOutcome::NotHome => return Ok(SliceOutcome::Cancelled),
+                crate::ActivityOfferOutcome::Expired
+                | crate::ActivityOfferOutcome::NotDue
+                | crate::ActivityOfferOutcome::Admitted
+                | crate::ActivityOfferOutcome::Known => {}
             }
         }
         pass.after = Some(candidate.position);
@@ -596,4 +690,27 @@ pub(crate) async fn run_slice<S: ActivityDiscoverySource>(
     } else {
         SliceOutcome::Yield
     })
+}
+
+#[cfg(test)]
+pub(crate) async fn run_slice<S: ActivityDiscoverySource>(
+    source: &S,
+    registry: &ActivityDiscoveryRegistry,
+    broker: &InMemoryActivityBroker,
+    key: &RangeKey,
+    home: &QueueHome,
+    pass: &mut ActivityPass,
+) -> Result<SliceOutcome> {
+    let clock = FixedClock(pass.cutoff);
+    run_slice_at(source, registry, broker, key, home, pass, &clock).await
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct FixedClock(OffsetDateTime);
+#[cfg(test)]
+impl Clock for FixedClock {
+    fn now(&self) -> OffsetDateTime {
+        self.0
+    }
 }

@@ -224,6 +224,7 @@ async fn retry_delivery(pause: bool) {
             &offer,
             activity.current_attempt_scheduled_at.unwrap(),
             &attempt,
+            crate::activity_delivery::ActivityDeliverySource::Eligibility,
         )
         .await
         .unwrap()

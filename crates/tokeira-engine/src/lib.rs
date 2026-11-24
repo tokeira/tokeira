@@ -4029,12 +4029,20 @@ where
                     controller_endpoint.clone(),
                     peer.clone(),
                 );
+            let mut activity_offer_sink =
+                tokeira_edge::grpc::activity_dispatch::offer::PeerActivityOfferSink::new(
+                    routing_cache.clone(),
+                    controller_endpoint.clone(),
+                    peer.clone(),
+                );
             if let Some(connector) = &peer_connector {
                 offer_sink = offer_sink.with_peer_connector(connector.clone());
+                activity_offer_sink = activity_offer_sink.with_peer_connector(connector.clone());
                 activity_starter = activity_starter.with_peer_connector(connector.clone());
                 outbound_delivery = outbound_delivery.with_peer_connector(connector.clone());
             }
             runtime.set_workflow_offer_sink(Arc::new(offer_sink));
+            runtime.set_activity_offer_sink(Arc::new(activity_offer_sink));
             runtime.set_activity_task_starter(Arc::new(activity_starter));
             runtime.set_outbound_delivery_transport(Arc::new(outbound_delivery));
         }

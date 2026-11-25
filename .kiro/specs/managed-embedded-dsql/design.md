@@ -1154,9 +1154,9 @@ Other phase failures return `Phase { phase }` and log the outermost cause once a
 | Control-lease acquisition or managed lifecycle exhausts startup budget | `ControlLeaseError::DeadlineElapsed` / `ManagedDsqlError::DeadlineExceeded` | `EmbeddedEngineStartError::DeadlineExceeded` with the active phase |
 | Embedded owner lost after startup | `ControlLeaseError::Fenced` | Admission closes; endpoint calls return `UNAVAILABLE` |
 | Other startup phase failure | `EmbeddedEngineStartError::Phase` | Cause logged once at error level, redacted (a fixed reason when there is no cause); reverse unwind; no endpoint |
-| In-process drain deadline | `EmbeddedEngineShutdownError::DrainTimeout` | Explicit shutdown returns error after cancellation; claim release/pool close still attempted |
-| Conditional claim release fails | `EmbeddedEngineShutdownError::OwnershipRelease` | Aggregated shutdown error; claim expires naturally |
-| Pool shutdown fails | `EmbeddedEngineShutdownError::Storage` | Aggregated shutdown error; no AWS delete/protection mutation |
+| In-process drain deadline | `EmbeddedShutdownFailure::RpcDrain` | `EmbeddedEngineShutdownError` after cancellation, listing each failed stage; claim release/pool close still attempted |
+| Conditional claim release fails | `EmbeddedShutdownFailure::OwnershipRelease` | Listed in `EmbeddedEngineShutdownError`; claim expires naturally |
+| Pool shutdown fails | `EmbeddedShutdownFailure::Storage` | Listed in `EmbeddedEngineShutdownError`; no AWS delete/protection mutation |
 | Invalid/absent trace context | No error | New root span; Temporal operation proceeds |
 | Destruction lacks confirmation | `ManagedDsqlError::ConfirmationRequired` | No AWS mutation; presentation and confirmation policy are adapter-owned |
 | Destruction plan descriptor revision/identity changed | `ManagedDsqlError::StalePlan` | No AWS mutation; operator must re-plan |

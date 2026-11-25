@@ -1,0 +1,5 @@
+kind: fixed
+body: Shutdown now stops a running visibility repair pass rather than spending its whole deadline and leaving the embedded owner claim to expire, and its error names each failed stage.
+time: 2026-11-25T00:00:00+00:00
+custom:
+    Slice: 0a83cf4d-c7f5-48a3-aab4-7200e0a5f5eb

@@ -295,7 +295,7 @@ The `retry_policy` on the CAN event is the resolved policy: if the CAN command c
 
 **Edge inbound translation (`grpc/translate.rs`):**
 
-The `proto_command_to_workflow_command` function for `ContinueAsNewWorkflowExecutionCommandAttributes` needs to extract `retry_policy` from the proto command and pass it to the kernel command. The `control` field needs to be extracted from `SignalExternalWorkflowExecutionCommandAttributes` and `RequestCancelExternalWorkflowExecutionCommandAttributes`.
+The `proto_command_to_workflow_command` function for `ContinueAsNewWorkflowExecutionCommandAttributes` fills unset fields in a supplied `retry_policy` before passing it to the kernel command; an absent policy remains `None` (`service/history/api/command_attr_validator.go:442,516,566-578` and `common/retrypolicy/retry_policy.go:32-56 @ v1.31.0`). The `control` field needs to be extracted from `SignalExternalWorkflowExecutionCommandAttributes` and `RequestCancelExternalWorkflowExecutionCommandAttributes`.
 
 **Files changed:**
 - `crates/tokeira-kernel/src/transition.rs` — add `parent_run_id: RunId` and `parent_namespace_id: NamespaceId` to `DispatchOp::StartChildWorkflow`

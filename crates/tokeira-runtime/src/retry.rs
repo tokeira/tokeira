@@ -1,10 +1,44 @@
-//! Activity retry evaluation and backoff computation.
+//! Workflow retry-policy defaults and activity retry evaluation.
 //!
-//! Pure functions that decide whether a failed activity should be retried
-//! and how long to wait before the next attempt.
+//! Workflow admission shares defaults with schedule firing so persisted policies
+//! agree across entry points. Activity evaluation decides whether to retry and
+//! how long to wait; it does not use the workflow defaulting function.
 
 use time::Duration;
 use tokeira_types::RetryPolicy;
+
+/// Fill unset fields of a supplied workflow policy before creating a run.
+///
+/// Callers must preserve `None` policies. Zero attempts remain unlimited, and
+/// explicit nonzero fields are retained. Admission validates wire durations;
+/// this function does not validate policies or decide whether a failure retries.
+/// Defaults follow common/retrypolicy/retry_policy.go:32-56 @ v1.31.0. The derived
+/// maximum retains the admission cap (common/primitives/timestamp/duration.go:10-12,82-85
+/// @ v1.31.0), matching the workflow start translator.
+///
+/// Schedules retain unset fields at create/update and default a copy at firing:
+/// service/frontend/workflow_handler.go:3812-3861,4528-4532;
+/// service/worker/scheduler/activities.go:67-74 @ v1.31.0.
+pub fn workflow_retry_policy_with_defaults(mut policy: RetryPolicy) -> RetryPolicy {
+    if policy.initial_interval.is_zero() {
+        policy.initial_interval = Duration::seconds(1);
+    }
+    if policy.backoff_coefficient == 0.0 {
+        policy.backoff_coefficient = 2.0;
+    }
+    if policy
+        .maximum_interval
+        .is_none_or(|interval| interval.is_zero())
+    {
+        policy.maximum_interval = Some(
+            policy
+                .initial_interval
+                .saturating_mul(100)
+                .min(Duration::seconds(3_153_600_000)),
+        );
+    }
+    policy
+}
 
 /// Why a retry chain ended, mirroring the v1.31.0 `RetryState` derivation in
 /// `nextBackoffInterval` / `RetryActivity` (`service/history/workflow/retry.go:70-113`,

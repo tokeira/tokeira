@@ -80,7 +80,7 @@ Wire the runtime's `DispatchPublisher` to handle the three child workflow dispat
 
 - [x] 5. Implement `StartChildWorkflow` dispatch handling in publisher
   - [x] 5.1 Implement the `StartChildWorkflow` match arm in `RuntimeDispatchPublisher::publish`
-    - Construct a `StartRequest` for the child with: fresh `RunKey::new()` and `RunId::new()`, fields from the dispatch op (`namespace_id`, `child_workflow_id` as `workflow_id`, `workflow_type`, `task_queue`, `input`), `parent_run_key: Some(parent_run_key)`, `parent_workflow_id: Some(parent_workflow_id)`, `workflow_task_timeout: Duration::seconds(10)`, defaults for `memo`, `search_attributes`, `retry_policy` (None), `workflow_execution_timeout` (None), `workflow_run_timeout` (None), `attempt: 1`, `continued_execution_run_id: None`, `first_execution_run_id: None`
+    - Construct a `StartRequest` for the child with: fresh `RunKey::new()` and `RunId::new()`, fields from the dispatch op (`namespace_id`, `child_workflow_id` as `workflow_id`, `workflow_type`, `task_queue`, `input`), `parent_run_key: Some(parent_run_key)`, `parent_workflow_id: Some(parent_workflow_id)`, `workflow_task_timeout: Duration::seconds(10)`, the defaulted command `retry_policy` (or `None` when absent), defaults for `memo`, `search_attributes`, `workflow_execution_timeout` (None), `workflow_run_timeout` (None), `attempt: 1`, `continued_execution_run_id: None`, `first_execution_run_id: None`
     - Submit `Command::Start` to the child's lane via `self.pick_lane(child_run_key).submit(...)`
     - On `CommitResult::Applied`: build `ChildStartResult::Started { child_run_id, workflow_type }`
     - On `CommitResult::Conflict` or `Err`: build `ChildStartResult::Failed { cause }` with error description
@@ -93,7 +93,7 @@ Wire the runtime's `DispatchPublisher` to handle the three child workflow dispat
     - **Property 1: Child StartRequest construction**
     - Generate random `DispatchOp::StartChildWorkflow` values with random `namespace_id`, `workflow_type`, `task_queue`, `input`, `parent_run_key`, `parent_workflow_id`, and `initiated_event_id`
     - Use a mock lane that captures the `Command::Start` submitted to it
-    - Verify all field mappings: `workflow_id == child_workflow_id`, `namespace_id`, `workflow_type`, `task_queue`, `input` match, `parent_run_key == Some(parent_run_key)`, `parent_workflow_id == Some(parent_workflow_id)`, `run_key` and `run_id` are freshly generated (not equal to parent's), `workflow_task_timeout == 10s`, defaults for memo/search_attributes/retry_policy/timeouts, `attempt == 1`, `continued_execution_run_id == None`, `first_execution_run_id == None`
+    - Verify all field mappings: `workflow_id == child_workflow_id`, `namespace_id`, `workflow_type`, `task_queue`, `input` match, `parent_run_key == Some(parent_run_key)`, `parent_workflow_id == Some(parent_workflow_id)`, `run_key` and `run_id` are freshly generated (not equal to parent's), `workflow_task_timeout == 10s`, defaults for memo/search_attributes/timeouts, command retry-policy defaults preserved (`service/history/api/command_attr_validator.go:442,516,566-578` and `common/retrypolicy/retry_policy.go:32-56 @ v1.31.0`), `attempt == 1`, `continued_execution_run_id == None`, `first_execution_run_id == None`
     - **Validates: Requirements 1.1, 1.2, 1.3, 6.1, 8.1, 8.2, 8.3**
 
   - [x] 5.3 Write property test for successful child start confirmation (Property 2)

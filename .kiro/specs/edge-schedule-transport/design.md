@@ -163,6 +163,9 @@ pub struct StartWorkflowAction {
     pub workflow_execution_timeout: Option<std::time::Duration>,
     pub workflow_run_timeout: Option<std::time::Duration>,
     pub workflow_task_timeout: Option<std::time::Duration>,
+    // Retain zero fields during authoring; default a copy at workflow start.
+    // service/frontend/workflow_handler.go:3812-3861;
+    // service/worker/scheduler/activities.go:67-74 @ v1.31.0.
     pub retry_policy: Option<tokeira_types::RetryPolicy>,
     pub memo: Memo,
     pub search_attributes: SearchAttributes,

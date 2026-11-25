@@ -4170,7 +4170,12 @@ impl WorkflowService {
                 .start_workflow
                 .workflow_task_timeout
                 .unwrap_or(time::Duration::seconds(10)),
-            retry_policy: entry.action.start_workflow.retry_policy.clone(),
+            retry_policy: entry
+                .action
+                .start_workflow
+                .retry_policy
+                .clone()
+                .map(tokeira_runtime::workflow_retry_policy_with_defaults),
             conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
             reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
             // A Schedule action starts a fresh execution (Initiator UNSPECIFIED).
@@ -10038,6 +10043,7 @@ pub fn not_wired_runtime() -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    mod retry_defaults_tests;
     use std::{collections::BTreeMap, sync::Arc};
 
     use super::{

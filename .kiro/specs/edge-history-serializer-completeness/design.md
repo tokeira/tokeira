@@ -121,7 +121,7 @@ New fields must be added to `HistoryEventKind` variants in `crates/tokeira-kerne
 | `ActivityTaskFailed` | `identity: WorkerIdentity`, `retry_state: RetryState` | Worker + retry resolution |
 | `ActivityTaskTimedOut` | `retry_state: RetryState` | Retry resolution |
 | `ActivityTaskCanceled` | `identity: WorkerIdentity` | Worker that reported cancel |
-| `StartChildWorkflowExecutionInitiated` | `namespace: Option<String>`, `header: Option<Headers>`, `memo: Memo`, `search_attributes: SearchAttributes`, `workflow_execution_timeout: Option<Duration>`, `workflow_run_timeout: Option<Duration>`, `workflow_task_timeout: Duration`, `retry_policy: Option<RetryPolicy>`, `cron_schedule: Option<String>` | Child-start command after edge translation threads the SDK command attributes through `WorkflowCommand::StartChildWorkflow` |
+| `StartChildWorkflowExecutionInitiated` | `namespace: Option<String>`, `header: Option<Headers>`, `memo: Memo`, `search_attributes: SearchAttributes`, `workflow_execution_timeout: Option<Duration>`, `workflow_run_timeout: Option<Duration>`, `workflow_task_timeout: Duration`, `retry_policy: Option<RetryPolicy>`, `cron_schedule: Option<String>` | Child-start command translation fills unset retry-policy fields before threading the attributes through `WorkflowCommand::StartChildWorkflow` (`service/history/api/command_attr_validator.go:442,516,566-578` and `common/retrypolicy/retry_policy.go:32-56 @ v1.31.0`) |
 | `StartChildWorkflowExecutionFailed` | `initiated_event_id: i64`, `namespace: Option<String>`, `workflow_type: WorkflowType` | Failure context |
 | `ChildWorkflowExecutionCompleted` | `namespace: Option<String>`, `child_run_id: RunId` | Child metadata |
 | `ChildWorkflowExecutionFailed` | `namespace: Option<String>`, `child_run_id: RunId`, `retry_state: RetryState` | Child metadata |
@@ -295,7 +295,7 @@ Rationale:
 
 **File**: `crates/tokeira-edge/src/grpc/translate.rs`
 1. Preserve start headers from gRPC `StartWorkflowExecutionRequest` through `to_internal::start_request` into `StartRequest.header`
-2. Preserve child-start command attributes (header, memo, search attributes, timeouts, retry policy, cron schedule, namespace name) when translating SDK commands into `WorkflowCommand::StartChildWorkflow`
+2. Preserve child-start command attributes (header, memo, search attributes, timeouts, retry policy, cron schedule, namespace name) when translating SDK commands into `WorkflowCommand::StartChildWorkflow`; fill unset retry-policy fields first and preserve an absent policy (`service/history/api/command_attr_validator.go:442,516,566-578` and `common/retrypolicy/retry_policy.go:32-56 @ v1.31.0`)
 3. Preserve external signal/cancel namespace names and headers where the SDK command provides them
 4. Preserve activity completion/failure identity into runtime request DTOs
 5. Preserve workflow task completion `sdk_metadata` and worker version metadata through the edge DTO and internal `WorkflowTaskCompletedRequest`

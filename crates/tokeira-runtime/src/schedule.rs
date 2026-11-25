@@ -1349,7 +1349,12 @@ where
             .start_workflow
             .workflow_task_timeout
             .unwrap_or(Duration::seconds(10)),
-        retry_policy: entry.action.start_workflow.retry_policy.clone(),
+        retry_policy: entry
+            .action
+            .start_workflow
+            .retry_policy
+            .clone()
+            .map(crate::retry::workflow_retry_policy_with_defaults),
         conflict_policy: WorkflowIdConflictPolicy::Fail,
         reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
         // A Schedule action starts a fresh execution (Initiator UNSPECIFIED).

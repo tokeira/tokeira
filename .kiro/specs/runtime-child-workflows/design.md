@@ -176,7 +176,7 @@ impl<R: RunRepository> RuntimeDispatchPublisher<R> {
 
 ### DispatchPublisher::publish — child workflow handling
 
-The `publish` method gains three new match arms. The child start's retries live in `crates/tokeira-runtime/src/child_start.rs`: `start_child` and `confirm_child_start` reach lanes, storage and the clock through a `ChildStartIo` trait, which the publisher implements and tests script. The sketch below shows the same decisions inline.
+The `publish` method gains three new match arms. The child retry policy is carried from the command after filling unset fields (1s initial interval, 2.0 coefficient, maximum interval 100×initial, and zero attempts unlimited); an absent policy remains `None` (`service/history/api/command_attr_validator.go:442,516,566-578` and `common/retrypolicy/retry_policy.go:32-56 @ v1.31.0`). The child start's retries live in `crates/tokeira-runtime/src/child_start.rs`: `start_child` and `confirm_child_start` reach lanes, storage and the clock through a `ChildStartIo` trait, which the publisher implements and tests script. The sketch below shows the same decisions inline.
 
 ```rust
 DispatchOp::StartChildWorkflow {
@@ -185,6 +185,7 @@ DispatchOp::StartChildWorkflow {
     workflow_type,
     task_queue,
     input,
+    retry_policy,
     parent_run_key,
     parent_workflow_id,
     initiated_event_id,
@@ -207,7 +208,7 @@ DispatchOp::StartChildWorkflow {
         workflow_execution_timeout: None,
         workflow_run_timeout: None,
         workflow_task_timeout: Duration::seconds(10),
-        retry_policy: None,
+        retry_policy: retry_policy.clone(),
         attempt: 1,
         continued_execution_run_id: None,
         first_execution_run_id: None,
@@ -462,7 +463,8 @@ Parent run closes (complete, fail, cancel, terminate, timeout, reset, CAN)
 - `parent_workflow_id` equal to `Some(parent_workflow_id)` from the dispatch op
 - `run_key` and `run_id` that are freshly generated (non-equal to the parent's)
 - `workflow_task_timeout` equal to 10 seconds
-- `memo`, `search_attributes` set to defaults; `retry_policy`, `workflow_execution_timeout`, `workflow_run_timeout` set to `None`
+- `memo`, `search_attributes` set to defaults; `workflow_execution_timeout`, `workflow_run_timeout` set to `None`
+- `retry_policy` matches the defaulted command policy carried by the dispatch op; absence remains `None` (`service/history/api/command_attr_validator.go:442,516,566-578` and `common/retrypolicy/retry_policy.go:32-56 @ v1.31.0`)
 - `attempt` equal to 1; `continued_execution_run_id` and `first_execution_run_id` set to `None`
 
 **Validates: Requirements 1.1, 1.2, 1.3, 6.1, 8.1, 8.2, 8.3**

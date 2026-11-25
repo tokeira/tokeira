@@ -62,9 +62,11 @@ comments (AGENTS §8, §9). Verify with `cargo clippy -p tokeira-kernel -p tokei
 ## Phase 3 — Edge
 
 - [x] 3.1 Apply workflow retry-policy `EnsureDefaults` at the start leg (`workflow_retry_policy_with_defaults`
-  in edge translate, applied on both `StartWorkflowExecution` and `SignalWithStart`): 1s / coefficient
+  in edge translate, applied on `StartWorkflowExecution`, `SignalWithStart`, multi-operation start,
+  start-child and continue-as-new commands, with shared domain defaults at schedule firing): 1s / coefficient
   2.0 / max-interval 100× / max-attempts 0-unless-set, filling only unset subfields. Activity-side
-  defaults untouched. (Req 3.1)
+  defaults untouched. Verify child initiated and successor started history, the first retry delay,
+  absent and explicit policies, and both schedule firing paths. Sources: `service/history/api/command_attr_validator.go:442,516,566-578` and `common/retrypolicy/retry_policy.go:32-56 @ v1.31.0`. (Req 3.1)
 - [~] 3.2 CLOSE_EVENT chain-following: the edge already projects `new_execution_run_id` onto the Failed
   event (Phase 1), so the capable v1.31.0 corpus SDK follows the chain to the started successor — the
   hang was the absent successor (fixed in Phase 2), not a missing rewrite. The legacy-client

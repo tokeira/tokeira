@@ -1018,16 +1018,17 @@ pub struct ActivityState {
     /// (`service/history/api/updateactivityoptions/api.go @ v1.31.0`).
     #[serde(default)]
     pub priority: Option<Priority>,
-    /// When the previous attempt reached its retryable completion (failure or
-    /// retryable timeout), stamped by the runtime's retry commit.
+    /// When a worker most recently reported failure, recorded by the runtime's
+    /// retry commit. Timeouts retain this value, including absence before any
+    /// worker failure (`service/history/api/respondactivitytaskfailed/api.go:104`,
+    /// `service/history/workflow/mutable_state_impl.go:6336-6341`,
+    /// `service/history/timer_queue_active_task_executor.go:302 @ v1.31.0`).
     ///
     /// Together with `current_attempt_scheduled_at` this makes the attempt's
-    /// backoff derivable from durable state alone —
-    /// `ScheduledTime - LastAttemptCompleteTime`, exactly how v1.31.0 evaluates
-    /// `BackoffInterval` workflow rules from mutable state
-    /// (`RetryActivity` stamps it, mutable_state_impl.go:6338;
-    /// `matcher/activity_evaluator.go:245-253 @ v1.31.0`). `None` for the
-    /// first attempt.
+    /// `BackoffInterval` rule value derivable from durable state alone —
+    /// `ScheduledTime - LastAttemptCompleteTime`, with the Unix epoch for an
+    /// absent completion time. The first attempt never matches that predicate
+    /// (`service/history/workflow/matcher/activity_evaluator.go:245-253 @ v1.31.0`).
     ///
     /// Positional-postcard note: `state_data` rows written before this field
     /// do NOT decode — postcard cannot default missing trailing data (see the

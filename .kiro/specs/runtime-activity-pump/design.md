@@ -352,7 +352,7 @@ Input: ActivityTaskToken { run_key, activity_id, schedule_event_id, attempt, sha
 
 ### Property 7: Retry-or-resolve decision
 
-*For any* `RetryPolicy` and `(current_attempt, failure_error_type)` pair, `evaluate_activity_retry` shall return `Exhausted` if and only if either (a) `maximum_attempts > 0` and `current_attempt >= maximum_attempts`, or (b) `failure_error_type` matches any entry in `non_retryable_error_types`. In all other cases it shall return `Retry { next_attempt: current_attempt + 1 }`. When `maximum_attempts == 0`, retry is always permitted for retryable error types.
+*For any* `RetryPolicy` and `(current_attempt, failure_error_type)` pair, `evaluate_activity_retry` shall return `Exhausted` if and only if either (a) `maximum_attempts > 0` and `current_attempt >= maximum_attempts`, (b) `failure_error_type` matches any entry in `non_retryable_error_types`, or (c) the next attempt would start strictly after retry expiration, after capping the backoff at the maximum interval (`service/history/workflow/retry.go:105-112 @ v1.31.0`). Equality at expiration permits retry. In all other cases it shall return `Retry { next_attempt: current_attempt + 1 }`. When `maximum_attempts == 0`, retryable error types remain subject to the same expiration check.
 
 **Validates: Requirements 5.3, 5.4, 5.6, 6.2, 6.3**
 

@@ -70,8 +70,9 @@ Add the activity task delivery pipeline to `tokeira-runtime`, completing the sec
     - `evaluate_activity_retry(policy, current_attempt, failure_error_type) -> RetryDecision`
       - `Exhausted` when `maximum_attempts > 0 && current_attempt >= maximum_attempts`
       - `Exhausted` when `failure_error_type` matches any entry in `non_retryable_error_types`
+      - `Exhausted` with timeout reason when the capped next-attempt start is strictly after expiration; equality retries (`service/history/workflow/retry.go:105-112 @ v1.31.0`)
       - `Retry { next_attempt: current_attempt + 1 }` otherwise
-      - `maximum_attempts == 0` means unlimited retries for retryable errors
+      - `maximum_attempts == 0` removes the attempt limit but does not bypass expiration
     - `compute_retry_backoff(policy, attempt) -> Duration`
       - Formula: `initial_interval * backoff_coefficient^(attempt - 1)`, capped at `maximum_interval`
       - Defensive: clamp `backoff_coefficient` to `max(1.0, value)`, zero `initial_interval` produces zero backoff
@@ -79,7 +80,7 @@ Add the activity task delivery pipeline to `tokeira-runtime`, completing the sec
 
   - [x] 3.2 Write property test: Retry-or-resolve decision
     - **Property 7: Retry-or-resolve decision**
-    - For any `(RetryPolicy, current_attempt, failure_error_type)`, verify `Exhausted` iff `(maximum_attempts > 0 && current_attempt >= maximum_attempts)` or error type matches `non_retryable_error_types`; `Retry` with `next_attempt = current_attempt + 1` otherwise; `maximum_attempts == 0` always retries for retryable types
+    - For any `(RetryPolicy, current_attempt, failure_error_type)`, verify `Exhausted` iff `(maximum_attempts > 0 && current_attempt >= maximum_attempts)` or error type matches `non_retryable_error_types` or the capped next-attempt start is strictly after expiration; `Retry` with `next_attempt = current_attempt + 1` otherwise, including equality at expiration; `maximum_attempts == 0` does not bypass expiration (`service/history/workflow/retry.go:105-112 @ v1.31.0`)
     - **Validates: Requirements 5.3, 5.4, 5.6, 6.2, 6.3**
 
   - [x] 3.3 Write property test: Backoff computation

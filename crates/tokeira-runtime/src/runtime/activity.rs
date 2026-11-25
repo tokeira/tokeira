@@ -1676,7 +1676,7 @@ where
                 .activity_start_rule_command(
                     &state,
                     &current,
-                    activity_backoff_interval_seconds(&current)?,
+                    activity_backoff_interval_seconds(&current),
                 )
                 .await?
             {
@@ -2236,7 +2236,7 @@ where
         }
         if next_activity.pause_info.is_none() {
             let rules = deps.repo.list_workflow_rules(state.namespace_id).await?;
-            let backoff_interval_seconds = activity_backoff_interval_seconds(&next_activity)?;
+            let backoff_interval_seconds = activity_backoff_interval_seconds(&next_activity);
             if let Some(rule) = matching_pause_rule(
                 &state,
                 &next_activity,
@@ -2269,16 +2269,13 @@ where
         next_activity.stamp += 1;
         next_activity.started_at = None;
         next_activity.started_event_id = None;
-        // Record the next attempt's scheduled time and the completion time its
-        // backoff is measured from, so later rule evaluations derive
-        // BackoffInterval from durable state
-        // (service/history/workflow/activity.go:63-97,
-        // service/history/workflow/matcher/activity_evaluator.go:245-252 @ v1.31.0).
-        // v1.31.0 records the completion time only for a worker failure
-        // (service/history/api/respondactivitytaskfailed/api.go:104 @ v1.31.0);
-        // this records it after a timeout as well.
+        // Retry scheduling uses this failure's time, but a timeout must retain
+        // the last worker-reported completion, even if absent. BackoffInterval
+        // rules and options updates read that separate durable anchor
+        // (service/history/api/respondactivitytaskfailed/api.go:104,
+        // service/history/timer_queue_active_task_executor.go:302,
+        // service/history/workflow/activity.go:74,248 @ v1.31.0).
         let dispatch_at = deadline_after(completed_at, backoff);
-        next_activity.last_attempt_complete_time = Some(completed_at);
         next_activity.current_attempt_scheduled_at = Some(dispatch_at);
         // The failed attempt's failure is durable retry bookkeeping,
         // surfaced by Describe as LastFailure and by the next
@@ -2504,25 +2501,30 @@ pub(crate) enum ActivityDispatchPreparation {
 /// `ScheduledTime - LastAttemptCompleteTime`, exactly how v1.31.0 evaluates
 /// `BackoffInterval` rules from mutable state; the first attempt is a
 /// recognized-but-absent value (every `BackoffInterval` predicate is a clean
-/// non-match, `matchActivityBackoffInterval` returns `(false, nil)` before
-/// reading `LastAttemptCompleteTime`, matcher/activity_evaluator.go:245-253
+/// non-match, `compareBackoffInterval` returns `(false, nil)` before
+/// reading `LastAttemptCompleteTime`, service/history/workflow/matcher/activity_evaluator.go:245-253
 /// @ v1.31.0). NEVER substitute zero for `None`: `BackoffInterval = 0` would
-/// then incorrectly match. For attempts after the first, a missing durable
-/// timestamp is an invariant failure that prevents publication rather than a
-/// reason to skip the rule.
+/// then incorrectly match. Later attempts measure whole seconds from the last
+/// worker failure, or the Unix epoch when no worker has reported a failure:
+/// a timeout preserves the completion timestamp, and nil `AsTime()` is the epoch
+/// (service/history/timer_queue_active_task_executor.go:302,
+/// service/history/workflow/matcher/activity_evaluator.go:251 @ v1.31.0).
+/// The same nil-to-epoch conversion applies to the scheduled timestamp. This
+/// matcher does not validate whether the activity has enough state to dispatch;
+/// the storage dispatch derivation checks that independently.
 pub(crate) fn activity_backoff_interval_seconds(
     activity: &tokeira_kernel::ActivityState,
-) -> Result<Option<i64>> {
+) -> Option<i64> {
     if activity.attempt < 2 {
-        return Ok(None);
+        return None;
     }
     let scheduled_at = activity
         .current_attempt_scheduled_at
-        .ok_or_else(|| anyhow!("retry attempt is missing its scheduled time"))?;
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
     let completed_at = activity
         .last_attempt_complete_time
-        .ok_or_else(|| anyhow!("retry attempt is missing its prior completion time"))?;
-    Ok(Some((scheduled_at - completed_at).whole_seconds()))
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    Some((scheduled_at - completed_at).whole_seconds())
 }
 
 /// Evaluate the captured execution-owner obligation and route due work.
@@ -2612,7 +2614,7 @@ async fn prepare_activity_dispatch<R: RunRepository + 'static>(
 
         let rules = deps.repo.list_workflow_rules(state.namespace_id).await?;
         captured.validate(&deps.shard_owner)?;
-        let backoff_interval_seconds = activity_backoff_interval_seconds(&current)?;
+        let backoff_interval_seconds = activity_backoff_interval_seconds(&current);
         let Some(rule) =
             matching_pause_rule(&state, &current, &rules, now, backoff_interval_seconds)
         else {
@@ -3811,9 +3813,10 @@ mod tests {
         }
 
         // Feature: activity-dispatch, Property 10
-        // A failing due prefix larger than one quantum cannot hide later eligibility obligations.
+        // An epoch-based nonmatching prefix larger than one quantum cannot hide later eligibility obligations
+        // (service/history/workflow/matcher/activity_evaluator.go:251 @ v1.31.0).
         #[test]
-        fn activity_eligibility_failing_prefix_is_bounded(prefix in 65usize..90, tail in 1usize..15) {
+        fn activity_eligibility_absent_completion_prefix_is_bounded(prefix in 65usize..90, tail in 1usize..15) {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
                 let repo = Arc::new(InMemoryStore::default());
                 let runtime = TokeiraRuntime::new(repo.clone(), 1, LaneConfig::default(), TimerScannerConfig::default(), WorkflowTimeoutScannerConfig::default());
@@ -3839,7 +3842,7 @@ mod tests {
                     event_principals: SmallVec::new(), request_dedupe_ops: SmallVec::new(), activity_ops: SmallVec::new(), timer_ops: SmallVec::new(),
                     dispatch_ops: SmallVec::new(), events_numbered_at_close: 0, workflow_task_heartbeat_timed_out: false, growth_limits: None }, WriteFence::Unfenced).await.unwrap();
                 runtime.activity_tracking.refresh_eligibility(&state, ShardId(0), runtime.clock.now());
-                repo.create_workflow_rule(state.namespace_id, pause_rule("bounded", "Attempts >= 2"), 10).await.unwrap();
+                repo.create_workflow_rule(state.namespace_id, pause_rule("bounded", "BackoffInterval = 2"), 10).await.unwrap();
                 let deps = runtime.activity_retry_deps();
                 crate::activity_eligibility::scan_activity_eligibility_once(&deps, ShardId(0), due).await;
                 assert_eq!(repo.load_run(state.run_key).await.unwrap(), LoadedRun::Existing(state.clone()));
@@ -4891,27 +4894,29 @@ mod tests {
         // BackoffInterval predicate is a clean non-match — never zero
         // (matcher/activity_evaluator.go:245-253 @ v1.31.0).
         let first = backoff_fixture_activity(1);
-        assert_eq!(
-            activity_backoff_interval_seconds(&first).expect("first attempt"),
-            None
-        );
+        assert_eq!(activity_backoff_interval_seconds(&first), None);
 
         let mut retry = backoff_fixture_activity(2);
         retry.last_attempt_complete_time = Some(now());
         retry.current_attempt_scheduled_at = Some(now() + Duration::seconds(5));
-        assert_eq!(
-            activity_backoff_interval_seconds(&retry).expect("derivable retry"),
-            Some(5)
-        );
+        assert_eq!(activity_backoff_interval_seconds(&retry), Some(5));
 
-        // For attempts after the first, a missing durable timestamp is an
-        // invariant failure that blocks publication, never a skipped rule.
+        // A nil completion timestamp reads as the Unix epoch, including after
+        // a timeout (service/history/workflow/matcher/activity_evaluator.go:251 @ v1.31.0).
         let mut missing_completed = backoff_fixture_activity(2);
         missing_completed.current_attempt_scheduled_at = Some(now());
-        assert!(activity_backoff_interval_seconds(&missing_completed).is_err());
+        assert_eq!(
+            activity_backoff_interval_seconds(&missing_completed),
+            Some(now().unix_timestamp())
+        );
         let mut missing_scheduled = backoff_fixture_activity(2);
         missing_scheduled.last_attempt_complete_time = Some(now());
-        assert!(activity_backoff_interval_seconds(&missing_scheduled).is_err());
+        // Both timestamp operands use nil-safe AsTime(), so a nil ScheduledTime
+        // also means the epoch (service/history/workflow/matcher/activity_evaluator.go:251 @ v1.31.0).
+        assert_eq!(
+            activity_backoff_interval_seconds(&missing_scheduled),
+            Some(-now().unix_timestamp())
+        );
     }
 
     #[tokio::test]

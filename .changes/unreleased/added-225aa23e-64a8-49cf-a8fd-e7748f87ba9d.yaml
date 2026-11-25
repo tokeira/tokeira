@@ -1,0 +1,5 @@
+kind: added
+body: An application can serve its own CHASM components from nodes it builds with `NodeBuilder`, which starts, serves and drains as `tokeirad` does with its libraries registered.
+time: 2026-11-25T00:00:00+00:00
+custom:
+    Slice: 225aa23e-64a8-49cf-a8fd-e7748f87ba9d

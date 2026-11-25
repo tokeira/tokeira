@@ -100,6 +100,52 @@ impl EngineBuilder {
     }
 }
 
+/// A `tokeirad` node that also serves an application's own CHASM components.
+/// The application builds its own binary around it in place of `tokeirad`'s, and
+/// the node starts, serves and drains exactly as `tokeirad` does: in memory or on
+/// DSQL, under controller-managed placement too. Every node of a cluster registers
+/// the same libraries, since a node refuses a store holding a component it
+/// doesn't register, as an embedded engine does.
+#[cfg(feature = "chasm-extensions")]
+#[derive(Debug, Default)]
+pub struct NodeBuilder {
+    extensions: ChasmExtensions,
+}
+
+#[cfg(feature = "chasm-extensions")]
+impl NodeBuilder {
+    /// Start from the built-in libraries and executors that `tokeirad` serves.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a library after built-in registration is sealed. Reserved names and
+    /// colliding component/task identities fail startup without replacing them.
+    pub fn library<L: tokeira_chasm::Library>(mut self) -> Self {
+        self.extensions.libraries.push(L::register);
+        self
+    }
+
+    /// Add an executor before startup rebuild. A duplicate task type fails
+    /// startup; the executor must tolerate delivery of the same durable task again.
+    pub fn side_effect_executor(mut self, executor: Arc<dyn SideEffectExecutor>) -> Self {
+        self.extensions.executors.push(executor);
+        self
+    }
+
+    /// Parse the process's arguments as `tokeirad` does, then serve until ctrl-C
+    /// or SIGTERM and drain.
+    pub async fn run(self) -> anyhow::Result<()> {
+        self.run_from_cli(crate::__cli_parse()).await
+    }
+
+    /// Serve `cli` as [`run_from_cli`](crate::run_from_cli) does, with this
+    /// builder's libraries and executors on the node.
+    pub async fn run_from_cli(self, cli: tokeira_config::Cli) -> anyhow::Result<()> {
+        crate::run_from_cli_with_extensions(cli, self.extensions).await
+    }
+}
+
 /// Preserve storage order and counts so the first missing library is actionable.
 pub(crate) fn check_registered_archetypes(
     stored: &[(u32, u64)],
@@ -521,5 +567,66 @@ mod tests {
         assert!(error.to_string().contains("BuilderValue"));
         assert!(error.to_string().contains("Bool"));
         engine.shutdown().await.unwrap();
+    }
+
+    // A node serves through the listener-backed in-memory facade, which shares
+    // `tokeirad`'s bootstrap; it refuses and admits stored components as the
+    // embedded engine does.
+    async fn start_node(extensions: ChasmExtensions) -> anyhow::Result<crate::TokeiradHandle> {
+        crate::TokeiradHandle::start_in_memory_with_extensions(
+            "127.0.0.1:0".parse().expect("loopback addr"),
+            tokeira_config::TokeiraConfig::default(),
+            extensions,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_node_refuses_a_component_it_does_not_register() {
+        let repo = Arc::new(InMemoryChasmNodeStore::new());
+        persisted_root(&repo, Some(Data::default().encode_to_vec())).await;
+        let extensions = ChasmExtensions {
+            test_storage: Some((repo, InMemoryVisibilityStore::default())),
+            ..Default::default()
+        };
+        let error = match start_node(extensions).await {
+            Ok(_) => panic!("a node without the library must refuse the store"),
+            Err(error) => error,
+        };
+        let refusal = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<EmbeddedEngineStartError>());
+        assert!(
+            matches!(
+                refusal,
+                Some(EmbeddedEngineStartError::UnregisteredArchetype { archetype_id, executions: 1 })
+                    if *archetype_id == archetype_id_for_fqn(Root::<0>::FQN)
+            ),
+            "the refusal names the unregistered component: {error:#}"
+        );
+    }
+
+    #[cfg(feature = "chasm-extensions")]
+    #[tokio::test]
+    async fn a_node_serves_a_store_holding_its_builders_components() {
+        let store = InMemoryVisibilityStore::default();
+        let repo = Arc::new(InMemoryChasmNodeStore::new());
+        persisted_root(&repo, Some(Data::default().encode_to_vec())).await;
+        let mut builder = NodeBuilder::new().library::<TestLibrary<0>>();
+        builder.extensions.test_storage = Some((repo, store.clone()));
+        let node = start_node(builder.extensions)
+            .await
+            .expect("a node with the library serves the store");
+        // Startup seeds the library's declared attribute, so finding it proves the
+        // node registered the library over the store it was given, not an empty one.
+        assert_eq!(
+            store
+                .resolve_attr(namespace_id_for("default"), "BuilderValue")
+                .await
+                .unwrap()
+                .map(|attr| attr.attr_type),
+            Some(SearchAttrType::Int)
+        );
+        node.shutdown().await.expect("the node drains");
     }
 }

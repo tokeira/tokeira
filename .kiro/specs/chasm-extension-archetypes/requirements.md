@@ -298,6 +298,8 @@ to v1.32.0; it is not adopted while the claim is v1.31.0.
 | `.side_effect_executor(E)` | Registers a runtime executor for one task type. | Duplicate task type → build error. | None until a task of that type is staged. |
 | `.clock(Arc<dyn Fn() -> i64 + Send + Sync>)` | Replaces the CHASM plane's source of now. | — | Every CHASM deadline and delayed dispatch reads it. |
 | `.build().await` | Starts the engine as `start_with_embedded_config` does today. | Existing config errors; plus: storage holds an archetype id no registered library claims → refuse to start (fail closed). | Registry frozen. |
+| `NodeBuilder::new()` | Returns a node builder seeded with the built-in libraries and executors; `.library` and `.side_effect_executor` as above. | As above. | As above. |
+| `NodeBuilder::run()` / `.run_from_cli(cli)` | Serves the command line as `run_from_cli` does, with the builder's libraries on whichever stack it builds. | Existing startup errors; plus the same fail-closed archetype check. | Registry frozen. |
 | `engine.chasm::<C: RootComponent>()` | Returns `TypedEngine<C>` for a registered archetype. | Unregistered `C` → error naming the FQN. | None. |
 | `RegistryBuilder::register_pure_task::<H>` / `register_side_effect_task::<H>` | Registers a typed handler for `(component, task type)`. | Duplicate → `ChasmError` at build. | Task type ids become persisted in outboxes. |
 | `RegistryBuilder::register_search_attributes::<C>(defs)` | Declares the keys and types a component emits. | Reserved system field name, or type mismatch with an existing definition → build error. | Keys registered in every namespace's `sa_registry` at engine start. |
@@ -641,6 +643,29 @@ corpus exactly as they are, so that the compatibility bump to v1.32.0 inherits i
 7. Every new public item and module SHALL carry the documentation root `AGENTS.md §9`
    requires, with the upstream citations named in this document placed at the decision
    sites.
+
+### Requirement 11: Serving extension libraries from nodes
+
+**User Story:** As an application owner, I want to serve my library from `tokeirad` nodes I
+build myself, so that my components run on a cluster of nodes rather than in one embedded
+engine per store.
+
+This requirement is Tokeira-native: it concerns how an application's library reaches a
+node, not observable Temporal behaviour.
+
+#### Acceptance Criteria
+1. THE engine crate SHALL expose `NodeBuilder` behind the `chasm-extensions` feature, with
+   the same instability as `Engine::builder()`.
+2. THE node builder SHALL register the built-in libraries and executors unconditionally,
+   and SHALL accept extension libraries and side-effect executors with the policy and errors
+   of Requirement 8.
+3. WHEN the node builder serves a command line, THE node SHALL run the bootstrap
+   `run_from_cli` runs, and SHALL give its libraries and executors to whichever stack that
+   bootstrap builds: in memory, DSQL, and DSQL under controller-managed placement.
+4. IF storage holds a current-run pointer whose archetype id matches no library the node
+   registers, THEN THE node SHALL refuse to start with an error naming the archetype id and
+   the count of affected executions, as criterion 8.5 requires of the builder.
+5. THE `tokeirad` binary SHALL serve no extension library.
 
 ## Iteration and Feedback Notes
 

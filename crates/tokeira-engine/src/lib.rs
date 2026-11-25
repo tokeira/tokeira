@@ -61,13 +61,13 @@ use tracing::{error, info};
 #[cfg(feature = "chasm-extensions")]
 pub mod chasm;
 mod chasm_extensions;
-#[cfg(feature = "chasm-extensions")]
-pub use chasm_extensions::EngineBuilder;
 use chasm_extensions::{
     ChasmExtensions, check_rebuilt_outboxes, check_registered_archetypes,
     declared_search_attributes, embedded_stack_error, registry_start_error,
     seed_declared_search_attributes, seed_start_error,
 };
+#[cfg(feature = "chasm-extensions")]
+pub use chasm_extensions::{EngineBuilder, NodeBuilder};
 
 pub mod correlation_format;
 #[cfg(all(test, feature = "dsql-integration"))]
@@ -2480,7 +2480,17 @@ impl TokeiradHandle {
     /// policy are constructed exactly as they are by the binary.
     pub async fn start_in_memory_with_config(
         addr: SocketAddr,
+        config: TokeiraConfig,
+    ) -> Result<Self> {
+        Self::start_in_memory_with_extensions(addr, config, ChasmExtensions::default()).await
+    }
+
+    /// The facade above with extension libraries, so the stack a `NodeBuilder`
+    /// serves can be tested in-process.
+    pub(crate) async fn start_in_memory_with_extensions(
+        addr: SocketAddr,
         mut config: TokeiraConfig,
+        extensions: ChasmExtensions,
     ) -> Result<Self> {
         config.infrastructure.storage = ConfigStorageKind::InMemory;
         // Bind the inbound Nexus completion listener on an ephemeral loopback port so
@@ -2496,7 +2506,7 @@ impl TokeiradHandle {
             (server_task, bound_addr, shutdown_tx, background_cancel, log_broadcast, _recorder),
             snapshot_policy,
             _node_claim,
-        ) = build_and_serve(addr, effective_config).await?;
+        ) = build_and_serve(addr, effective_config, extensions).await?;
         Ok(Self {
             bound_addr,
             shutdown_tx: Some(shutdown_tx),
@@ -2742,9 +2752,18 @@ fn warn_retired_conn_lease_table(config: &TokeiraConfig) -> bool {
 /// or SIGTERM, then drains gracefully: in-flight requests finish, background
 /// work is cancelled, and (for in-memory storage with a snapshot policy) the
 /// final consistent cut is persisted before exit.
+pub async fn run_from_cli(cli: Cli) -> Result<()> {
+    run_from_cli_with_extensions(cli, ChasmExtensions::default()).await
+}
+
+/// One bootstrap for every node: `tokeirad` serves no extension libraries, and a
+/// binary an application builds around `NodeBuilder` serves its own through it.
 // CLI output is intentional for --version, --dump-config and generated path config.
 #[allow(clippy::print_stdout)]
-pub async fn run_from_cli(cli: Cli) -> Result<()> {
+pub(crate) async fn run_from_cli_with_extensions(
+    cli: Cli,
+    extensions: ChasmExtensions,
+) -> Result<()> {
     if let Some(command) = cli.command {
         return match command {
             CliCommand::PeerCredential {
@@ -2806,7 +2825,7 @@ pub async fn run_from_cli(cli: Cli) -> Result<()> {
         ),
         snapshot_policy,
         node_claim,
-    ) = build_and_serve(addr, effective_config).await?;
+    ) = build_and_serve(addr, effective_config, extensions).await?;
     readiness.mark_started();
     info!("tokeirad gRPC server listening on {bound_addr}");
 
@@ -3225,10 +3244,13 @@ fn distributed_schema_admission(decision: SchemaDecision) -> Result<u32> {
 ///
 /// Factored out so both the CLI entrypoint and the in-memory facade share one
 /// bootstrap path. Deliberately long and sequential: each block mirrors the
-/// startup dependency order.
+/// startup dependency order. Both stacks take `extensions`, so a node refuses a
+/// store holding a component its libraries don't register, as an embedded engine
+/// does.
 async fn build_and_serve(
     addr: SocketAddr,
     effective_config: Arc<TokeiraConfig>,
+    extensions: ChasmExtensions,
 ) -> Result<(
     ServerStack,
     Option<EngineSnapshotPolicy>,
@@ -3267,7 +3289,7 @@ async fn build_and_serve(
                 effective_config,
                 store,
                 restored,
-                ChasmExtensions::default(),
+                extensions,
                 peer,
                 system_clock(),
             )
@@ -3325,7 +3347,7 @@ async fn build_and_serve(
                 effective_config,
                 dsql_store,
                 endpoint,
-                ChasmExtensions::default(),
+                extensions,
                 peer,
             )
             .await
@@ -6361,6 +6383,7 @@ mod tests {
         let error = build_and_serve(
             "127.0.0.1:0".parse().expect("loopback addr"),
             Arc::new(config),
+            ChasmExtensions::default(),
         )
         .await
         .expect_err("snapshot policy over DSQL must be rejected before any I/O");
@@ -6386,6 +6409,7 @@ mod tests {
             let error = build_and_serve(
                 "127.0.0.1:0".parse().expect("loopback addr"),
                 Arc::new(config),
+                ChasmExtensions::default(),
             )
             .await
             .expect_err("no endpoint is configured");
@@ -6583,6 +6607,7 @@ mod tests {
         let error = build_and_serve(
             "127.0.0.1:0".parse().expect("loopback addr"),
             Arc::new(config),
+            ChasmExtensions::default(),
         )
         .await
         .expect_err("automatic must be refused before any I/O");

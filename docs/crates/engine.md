@@ -39,6 +39,7 @@ semantics.
 | `TokeiradHandle` | Listener-backed in-memory server handle used by integration hosts |
 | `run_from_cli` | Production daemon bootstrap from the shared CLI/config contracts |
 | `Engine::builder` / `EngineBuilder` | CHASM extension registration: `library`, `side_effect_executor`, `clock`, `build` |
+| `NodeBuilder` | A `tokeirad` node that also serves extension libraries: `library`, `side_effect_executor`, `run`, `run_from_cli` |
 | `Engine::chasm::<C>` | Typed handle on a registered root component: start, update, read, and `reference` by business id |
 | `Engine::chasm_visibility::<C>` | Read-only projected list/count for a registered root and namespace |
 | `tokeira_engine::chasm` | Everything an extension library names — the component and task contracts, the `Component` derive, `namespace_id_for` — so it depends on `tokeira-engine` alone |
@@ -57,6 +58,15 @@ identity fails the build; a duplicate executor task type fails the build; and
 storage holding unknown archetypes, incompatible attribute declarations or
 unserviceable outboxes is refused rather than served. Executors all register
 before persisted effects are rebuilt.
+
+An application can serve its components from `tokeirad` nodes instead, building
+its own binary around `NodeBuilder` in place of `tokeirad`'s. The builder takes
+the same libraries and executors; `run()` parses the command line and starts,
+serves and drains exactly as `tokeirad` does, in memory or on DSQL, under
+controller-managed placement too. The same checks run before admission, so every
+node of a cluster registers the same libraries: a node refuses a store holding a
+component it doesn't register. Rolling upgrades that change the libraries aren't
+covered yet, so stop every node before starting a build whose libraries differ.
 
 `Engine::chasm::<C>()` then returns a typed handle on a registered root
 component, in the same process as the caller — no client, no workflow start, and

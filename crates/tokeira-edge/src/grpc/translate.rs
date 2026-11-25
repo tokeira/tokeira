@@ -4567,11 +4567,9 @@ fn task_queue_partition_to_proto(
     }
 }
 
-// v1.62-sync: writes deprecated `PollerInfo.worker_version_capabilities` and
-// `DescribeTaskQueueResponse.task_queue_status` for wire-compat with v0.4-era
-// SDK readers. v1.62 replaces the former with `deployment_options` and the
-// latter with `stats` on `DescribeTaskQueueResponse`; migration is owned by
-// task 4.9 (wire-through additions) and `runtime-worker-versioning`.
+// Deployment-aware pollers populate deployment_options; legacy worker-version
+// capabilities remain unset. Queue statistics are also exposed through the
+// deprecated task_queue_status backlog hint for older SDK readers.
 #[allow(deprecated)]
 pub fn describe_task_queue_response_to_proto(
     resp: EdgeDescribeTaskQueueResponse,

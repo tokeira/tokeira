@@ -1,5 +1,5 @@
 //! The deterministic explanation model — Tokeira's account of what an
-//! operation will do or did, and (as later features land) why.
+//! operation will do or did, and why.
 //!
 //! This crate **models; it never decides**. Every fact in a
 //! [`DeploymentExplanation`] is computed by the engine and carried here
@@ -12,9 +12,8 @@
 //! establishes truth; the explanation layer establishes meaning; an agent
 //! only helps the operator navigate it.*
 //!
-//! Slots for later features (`semantics`, `cause`, `dependants`, `source`)
-//! exist from this crate's first version, carrying explicit not-determined
-//! defaults, so Features 2–4 populate data without reshaping the schema
+//! Optional evidence (`semantics`, `cause`, `dependants`, `source`) keeps explicit
+//! not-determined defaults so a partial observation cannot imply certainty
 //! (operator-explanation Req 1.3).
 
 pub mod artifact;

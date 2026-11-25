@@ -283,10 +283,8 @@ impl ExecutionRow {
 
     /// Mirror a workflow visibility snapshot into the legacy workflow query row.
     ///
-    /// During task 23 the storage contract moves to archetype-neutral
-    /// snapshots before the workflow edge is fully generalized. This conversion
-    /// is intentionally workflow-only: activity snapshots stay in the generic
-    /// snapshot index until task 25 adds their dedicated list/count surface.
+    /// Activity snapshots use the dedicated activity list/count surface. Reject
+    /// them here so workflow queries cannot expose another archetype's rows.
     pub fn from_workflow_snapshot(snapshot: &VisibilitySnapshot) -> Option<Self> {
         if snapshot.archetype_id != ArchetypeId::WORKFLOW {
             return None;

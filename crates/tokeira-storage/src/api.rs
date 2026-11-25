@@ -862,11 +862,10 @@ pub trait WorkerDeploymentRepository: Send + Sync {
 
 /// Durable request-dedupe record.
 ///
-/// Insight: the request id is stored at workflow scope here because the minimal
-/// workspace has not yet implemented continue-as-new chains or reuse policies.
-/// That is intentionally conservative: it prevents ambiguous duplicate handling
-/// now, and leaves a clear TODO for future refinement when execution-chain
-/// semantics become richer.
+/// Lookup keys include namespace, workflow id, and request id, so a retry can
+/// find the run that first committed it after the current-run pointer advances.
+/// An explicitly supplied run id must also match the stored run; workflow scope
+/// does not allow deduplication against a different requested run.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RequestRecord {
     /// Namespace that owns this workflow.
@@ -888,9 +887,10 @@ pub struct RequestRecord {
 
 /// Development/test view of one persisted transition.
 ///
-/// Production DSQL storage will likely materialize this information across
-/// multiple tables. The dev store keeps an audit-style record so semantic tests
-/// can verify that history and derived ops are all persisted together.
+/// The in-memory store retains history and derived operations together so
+/// semantic checks can inspect an entire transition. DSQL reconstructs history
+/// from persisted batches and returns empty derived-operation vectors; those
+/// vectors are not a production record of the work a transition produced.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TransitionAuditRecord {
     /// Durable storage key for the run.
@@ -1392,11 +1392,12 @@ pub trait RunRepository: Send + Sync {
         request_id: &RequestId,
     ) -> Result<Option<RequestRecord>>;
 
-    /// Read the persisted transition audit log for a run.
+    /// Read a run's persisted transitions for inspection.
     ///
-    /// TODO(storage): once a real DSQL backend lands, decide whether this stays
-    /// in the main trait, moves behind a test-only feature, or becomes an admin
-    /// API. It is extremely useful for semantic tests right now.
+    /// The in-memory store retains history and derived operations together for
+    /// semantic checks. DSQL reconstructs these records from history batches and
+    /// leaves the derived-operation vectors empty; callers must not treat those
+    /// empty vectors as proof that a transition produced no derived work.
     async fn read_transition_audit(&self, run_key: RunKey) -> Result<Vec<TransitionAuditRecord>>;
 
     /// Return whether any open execution is pinned to the given Worker
@@ -1908,9 +1909,8 @@ pub trait RunRepository: Send + Sync {
         reason: StaleTimer,
     ) -> Result<bool>;
 
-    // TODO(storage): add sweep methods for activity tasks, archival eligibility,
-    // namespace-scoped pagination, and explicit current-execution conflict
-    // policies (reuse, reject, allow-after-close, continue-as-new chains).
+    // TODO(storage): add archival-eligibility sweeps and namespace-scoped run
+    // pagination; list_runs_for_namespace still loads the whole namespace.
 }
 
 /// A workflow task that is ready for dispatch to a
@@ -3154,8 +3154,8 @@ pub enum LeaseOutcome {
     },
 }
 
-/// Database work classes used by the future connection
-/// director.
+/// Database work classes used by the connection director to separate admission
+/// budgets, keeping maintenance from consuming control-plane capacity.
 ///
 /// Priority order (highest first): `Control` >
 /// `Commit` > `Read` > `Projection` > `Maintenance`.
@@ -3174,12 +3174,11 @@ pub enum DbClass {
     Maintenance,
 }
 
-/// Small abstraction for future DSQL connection-budget
-/// control.
+/// Connection admission shared by repository implementations.
 ///
-/// In the dev store this is a no-op. A production
-/// implementation will enforce per-class connection
-/// limits and open-rate budgets.
+/// The in-memory director returns a no-op permit. The DSQL director enforces
+/// class admission and checks out a reservoir connection; its associated permit
+/// owns that connection until drop.
 #[async_trait]
 pub trait ConnectionDirector: Send + Sync {
     /// Permit type returned by this director.
@@ -3190,11 +3189,11 @@ pub trait ConnectionDirector: Send + Sync {
     async fn acquire(&self, class: DbClass) -> Result<Self::Permit>;
 }
 
-/// A held connection permit, scoped to a [`DbClass`].
+/// No-op connection permit used by the in-memory director.
 ///
-/// TODO(storage): replace this trivial type with a
-/// real session/lease wrapper in the DSQL-backed
-/// implementation.
+/// It retains the work class for the shared repository interface but owns no
+/// connection. DSQL uses its own permit type to hold the checked-out session
+/// and release its admission budget on drop.
 #[derive(Debug)]
 pub struct DbPermit {
     /// The work class this permit was issued for.

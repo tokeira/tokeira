@@ -3581,8 +3581,8 @@ fn projection_log_key(record: &ProjectionRecord) -> ProjectionLogKey {
 }
 
 fn partition_for(run_key: RunKey) -> u32 {
-    // TODO(perf): make projection partitioning configurable by the real storage
-    // implementation. For the dev store we keep it simple and deterministic.
+    // The in-memory store fixes the fanout at 16 for deterministic fixtures;
+    // DSQL uses its configured projection_partition_count.
     let raw = run_key.0.as_u128();
     (raw as u32) % 16
 }

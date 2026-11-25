@@ -697,8 +697,7 @@ mod tests {
         result
     }
 
-    /// Decode a postcard-encoded task payload (test-only; the runtime will use the
-    /// validators directly once wired).
+    /// Decode a scheduled task for assertions without executing its handler.
     fn decode_task<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, ChasmError> {
         postcard::from_bytes(bytes).map_err(|e| ChasmError::Validation(format!("decode task: {e}")))
     }

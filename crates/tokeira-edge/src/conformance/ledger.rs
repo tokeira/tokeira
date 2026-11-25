@@ -10,9 +10,9 @@
 //! ## Boundary
 //!
 //! This is the *data model only*. It deliberately contains no ledger parsing, no
-//! report join against the compatibility matrix, and no gate logic — those live in
-//! later report-side tasks (9.x/10.x) and would couple this shape to consumers it
-//! must stay independent of. Keeping the model free of behaviour lets both the Go
+//! report join against the compatibility matrix, and no gate logic. The sibling
+//! report and gate modules consume this shape without making the schema depend
+//! on their policy. Keeping the model free of behaviour lets both the Go
 //! fork (which may serialize ledger entries) and the Rust report (which consumes
 //! them) agree on one schema without sharing code.
 //!

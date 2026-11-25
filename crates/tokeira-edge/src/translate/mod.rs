@@ -1413,8 +1413,9 @@ pub struct UpdateActivityOptionsRequest {
 
 /// Edge DTO for `temporal.api.activity.v1.ActivityOptions`.
 ///
-/// Mirrors the v1.62 shape field-for-field; the runtime wiring and
-/// translator coverage for every field lands in task 9.2.
+/// Optional fields preserve presence so the update mask can distinguish an
+/// omitted setting from a requested change; translation validates selected
+/// values before the runtime applies the patch.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ActivityOptions {
     pub task_queue: Option<String>,

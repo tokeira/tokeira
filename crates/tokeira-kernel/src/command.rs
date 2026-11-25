@@ -2254,9 +2254,6 @@ pub struct ScheduleQueryTaskRequest {
 }
 
 /// Commands produced by workflow code when a workflow task completes.
-///
-/// TODO(correctness): add child workflows, updates, versioning markers, local
-/// activities, cancellation scopes, patch markers, and continue-as-new.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkflowCommand {
     /// Schedule an activity task for execution on a worker.

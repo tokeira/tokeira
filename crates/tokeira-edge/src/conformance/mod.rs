@@ -4,8 +4,8 @@
 //! wire against a running `tokeirad`, then interprets the outcomes in a report joined
 //! against the compatibility matrix (see
 //! `.kiro/specs/temporal-functional-conformance`). This module groups the serializable
-//! shapes that report consumes; behaviour (the recorder, the report join, the gates)
-//! lives in later tasks, not here.
+//! evidence, transport recorder, report joins, and gates so they share one outcome
+//! vocabulary.
 //!
 //! - [`record`] — the wire-coverage record: `(wire_method, status_code, count)` rows the
 //!   recorder emits over a run, each later resolved through

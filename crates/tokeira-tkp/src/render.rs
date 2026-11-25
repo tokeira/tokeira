@@ -379,11 +379,10 @@ fn service_identity(change: &ReportedServiceChange) -> String {
 /// apply, and it reads as one, `**Applied to {deployment}**` header
 /// included.
 ///
-/// The `## tkp` section gains the platform/engine version facts when the
-/// versioning model lands (tkdp frontend spec) — until then it states the
-/// replacement alone; the spec section for this document lands with that
-/// work too. `--json` emits the applied explanation model (one schema
-/// between artifact and flag).
+/// This report receives only the applied explanation, so its `## tkp` section
+/// states the replacement without before/after engine or platform versions.
+/// `--json` emits that same explanation model to keep the artifact and flag on
+/// one schema.
 #[derive(Debug)]
 pub(crate) struct UpgradeReport {
     pub(crate) explanation: DeploymentExplanation,
@@ -832,10 +831,9 @@ fn change_detail(explanation: &DeploymentExplanation, change: &ExplainedChange, 
             }
         }
     }
-    // Interim latitude until the platform-issue seam lands: an unreadable
-    // live read still states the diffs' provenance in place. The agreement's
-    // worlds never reach here (rule 1 turns unreachability into a Platform
-    // Issue); this line covers the transitional gap honestly.
+    // Unsupported describes leave refresh Unknown without confirming live
+    // state, so qualify the comparison's provenance. Typed platform failures
+    // block reconciliation before this renderer is reached.
     if matches!(change.refresh_status, Some(RefreshStatus::Unknown)) {
         if change.cause.value().is_none() && change.kind != ChangeKind::NoChange {
             out.push_str(

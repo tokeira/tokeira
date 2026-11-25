@@ -23,8 +23,9 @@
 //!    ([`IntegrityManifest::verify_artifact`]); a build result's checksum is a
 //!    claim, the bytes are the truth.
 //!
-//! Where the deny-list *lives* (S3 object, repo file) is open decision 4 of
-//! Proposal 005; this module models it as data so every store can carry one.
+//! Revocations are passed as data so admission does not depend on a storage
+//! backend. The bundle store loads its list from `revocations.json` and supplies
+//! it on every resolve, including cache hits.
 
 use std::collections::BTreeSet;
 

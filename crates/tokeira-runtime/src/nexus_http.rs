@@ -499,8 +499,8 @@ impl NexusCompletionClient for HttpNexusCompletionClient {
         token: &str,
         operation_token: &str,
         completion: NexusCompletion,
-        // Best-effort `Nexus-Link` headers are not essential to resolution (design.md
-        // §5); their encoder lands with the link producer in Wave 4/5.
+        // Completion resolution uses the token and body. Stored callback links
+        // are ignored here, so the POST carries no best-effort `Nexus-Link` metadata.
         _links: &[Link],
     ) -> Result<CompletionDeliveryOutcome> {
         let mut request = self

@@ -200,10 +200,9 @@ pub fn failed_request_to_edge(
     })
 }
 
-// v1.62-sync: writes deprecated `CancelOperationRequest.operation_id` for
-// wire-compat with v0.4-era Nexus clients. v1.62 renames to `operation_token`;
-// the code above populates both fields so new and old readers both work.
-// Migration to `operation_token`-only is task 4.7 / 8.1.
+// Allows the deprecated CancelOperationRequest.operation_id, which the cancel
+// arm still fills. The kernel sends a cancel only after the operation's async
+// start, so operation_token always holds the handler's token.
 #[allow(deprecated)]
 pub fn nexus_task_to_proto_request(
     task_request: &NexusTaskRequest,

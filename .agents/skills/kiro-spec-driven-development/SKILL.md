@@ -128,6 +128,13 @@ Produce an ordered checkbox list of coding tasks only (no deploy/marketing tasks
 - Insert **checkpoints** after coherent groups so progress is verifiable (build, lints,
   tests green).
 - Each task cites the requirement(s) it implements via `_Requirements: X.Y_`.
+- End the task list with a required **deferral sweep** task, just before the dependency
+  graph. Search code comments for the spec's name, its task numbers, the names it
+  introduces, and deferral phrases such as "lands with", "deferred to", "until",
+  "once … lands", "later change", and `TODO`. Rewrite stale comments to the delivered
+  behaviour or remove their deferrals. Keep remaining deferrals accurate and name the
+  work they await. List gaps this spec does not close in the tasks' `## Notes` for a
+  decision.
 - End with a **Task Dependency Graph** (the machine-readable ordering) and a `## Notes`
   section.
 
@@ -153,6 +160,7 @@ correction properties. Details and task-ordering rules: `references/bugfix-workf
   system's own behaviour with a citation.
 - Tasks are dependency-ordered, cite requirements, and include checkpoints + a
   dependency graph.
+- `tasks.md` ends its task list with the required deferral sweep task.
 - Document validates clean (run the editor/diagnostics check on each `.md`).
 
 ## Interaction protocol

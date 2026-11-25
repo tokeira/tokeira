@@ -24,6 +24,15 @@
   - Tag: `// Feature: <feature>, Property 5: <text>`
   - _Requirements: 3.1, 3.2, 3.3, 3.7, 3.8, 4.1, 4.2, 4.4, 4.8_
 
+- [ ] 5. Deferral sweep
+  - Search code comments for this spec's name, task numbers, introduced names, and
+    phrases such as "lands with", "deferred to", "until", "once … lands", "later
+    change", and `TODO`.
+  - Rewrite stale comments to the delivered behaviour or remove their deferrals.
+  - Keep remaining deferrals accurate and name the work they await.
+  - List gaps this spec does not close in `## Notes` for a decision.
+  - _Requirements: <requirements whose delivery the comments awaited>_
+
 ## Task Dependency Graph
 <Machine-readable ordering: which tasks unblock which. JSON or an explicit list.>
 
@@ -48,6 +57,10 @@ task line.>
   executable incrementally.
 - **Prerequisite gate.** Do not write tasks unless both `requirements.md` and `design.md`
   exist. If one is missing, create it first.
+- **Deferral sweep.** Make this the last required numbered task, before the dependency
+  graph. Search for the spec's name, task numbers, introduced names, and deferral
+  phrases. Rewrite stale comments or remove their deferrals. Keep pending comments
+  accurate and name what they await. List uncovered gaps in `## Notes` for a decision.
 - **Dependency graph + notes.** End with the machine-readable ordering and a `## Notes`
   section.
 

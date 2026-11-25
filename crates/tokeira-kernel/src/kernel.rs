@@ -2121,7 +2121,7 @@ impl BasicKernel {
                         committed: false,
                     });
                 // K7: updates admitted while this task ran still need a
-                // delivery vehicle — schedule a fresh speculative task. An
+                // delivery vehicle — schedule a follow-up task. An
                 // update its event delivers needs none: it reaches the worker
                 // in history (`needToSend`, `update/update.go:404-437 @
                 // v1.31.0`).
@@ -2387,14 +2387,11 @@ impl BasicKernel {
             builder.schedule_workflow_task();
         }
 
-        // Schedule a new WFT if events arrived while this WFT was in
-        // progress. Two sources: flushed buffered events (signals /
-        // cancel-requested, which no longer advance last_event_id before
-        // completion), and events still appended immediately during a started
-        // WFT in Phase 1 (activity/child/Nexus resolutions — Phase 2 buffers
-        // those too, at which point the numeric check becomes vestigial). The
-        // worker only saw history up to started_event_id; anything beyond
-        // needs a fresh WFT (spec: kernel-event-buffering Req 3.1.6).
+        // The worker saw history only through started_event_id. Flushed
+        // external events therefore need another task. The numeric guard also
+        // catches an input state with already-appended history beyond that
+        // window; it no longer stands in for unbuffered activity/child/Nexus
+        // resolutions (kernel-event-buffering Req 3.1.6).
         if builder.state.is_open()
             && builder.state.pending_workflow_task.is_none()
             && (flushed > 0 || pre_completion_last_event_id > started_event_id)
@@ -2405,11 +2402,12 @@ impl BasicKernel {
         // K7 (spec speculative-wft): updates admitted while this task ran
         // still need a delivery vehicle — v1.31.0 creates a SPECULATIVE task
         // once the running task completes when admitted updates remain
-        // unsent; buffered-event/heartbeat triggers above already produced a
-        // NORMAL task instead (respondworkflowtaskcompleted/api.go:512-541
-        // @ v1.31.0). An update its event delivers is never sent as a message
-        // (`needToSend`, `update/update.go:404-437 @ v1.31.0`), so it causes
-        // none.
+        // unsent, or a NORMAL one when the worker did not ask for the next
+        // task in its response; buffered-event/heartbeat triggers above
+        // already produced a NORMAL task instead
+        // (respondworkflowtaskcompleted/api.go:512-541 @ v1.31.0). An update
+        // its event delivers is never sent as a message (`needToSend`,
+        // `update/update.go:404-437 @ v1.31.0`), so it causes none.
         if builder.state.is_open()
             && builder.state.pending_workflow_task.is_none()
             && builder.state.has_admitted_update_to_send()
@@ -7121,10 +7119,9 @@ pub fn completed_update_ids<'a>(
 /// workflow state-change events, workflow-task events, and events generated
 /// directly from a worker command or protocol message are never buffered;
 /// other externally-originated events buffer while a WFT is *started* (a
-/// worker holds it and its history view is frozen). Phase 1 scopes the
-/// bufferable set to `WorkflowExecutionSignaled` and
-/// `WorkflowExecutionCancelRequested`; Phase 2 extends it to
-/// activity/child/Nexus completion-class events per the full predicate
+/// worker holds it and its history view is frozen). `is_externally_originated`
+/// classifies every event kind, including activity, child, and Nexus outcomes,
+/// so no new external event can bypass buffering by omission
 /// (spec: kernel-event-buffering Req 2.1).
 /// Sentinel event id stamped on a bufferable event that has not yet been
 /// flushed — mirrors v1.31.0's `common.BufferedEventID` (`-123`). A resolution
@@ -9387,9 +9384,6 @@ pub enum Reject {
     /// within the same task completion.
     #[error("commands after close at index {index}")]
     CommandsAfterClose { index: usize },
-    // TODO(correctness): add richer rejection reasons for
-    // updates, continue-as-new constraints, child workflow
-    // resolution mismatches, and cancellation races.
     /// Mutable state is inconsistent at the update call site: buffered
     /// events exist with no pending workflow task — "no pending WFT implies
     /// no buffered events"; v1.31.0 surfaces

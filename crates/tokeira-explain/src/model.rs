@@ -34,7 +34,9 @@ pub struct DeploymentExplanation {
     pub definition_ref: Option<String>,
     /// Exactly one entry per engine change, `NoChange` included (Req 1.3).
     pub changes: Vec<ExplainedChange>,
-    /// Derived from declared semantics — empty until Feature 2 supplies them.
+    /// Derived from declared semantics, with the engine's own floor: a delete
+    /// or replace counts as unavailability even when nothing is declared.
+    /// Causality adds dependency loss.
     pub impacts: Vec<OperationalImpact>,
     /// References into `changes`, derived from the engine's own
     /// classification (`ChangeKind::is_destructive`) — never from
@@ -140,10 +142,9 @@ pub struct ExplainedChange {
     pub source: Option<SourceLocation>,
 }
 
-/// Why a change is present. Populated by Feature 3's classification algebra;
-/// until then every change's cause is `Confidence::Unknown` (the
-/// `Undetermined` variant the original design carried was removed by the
-/// Feature 3 amendment — it duplicated what `Confidence::Unknown` says).
+/// Why a change is present, as established by the causality classifier.
+/// Indeterminate evidence is represented by the enclosing `Confidence::Unknown`
+/// rather than a second unknown state inside this enum.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Cause {
@@ -238,12 +239,9 @@ pub struct Uncertainty {
 
 /// Why something could not be determined.
 ///
-/// `SemanticsUndeclared` and `ProviderAssignedAtApply` are defined here and
-/// **not constructed by Feature 1**: with every semantics slot
-/// not-determined, the renderer states no semantics, so nothing is left
-/// unqualified — emitting them now would attach an uncertainty to every
-/// change in every plan and teach operators to skip the section. They
-/// activate with Feature 2.
+/// Missing declarations and provider-assigned values have separate reasons:
+/// one lacks a guarantee, while the other cannot have a value before apply.
+/// Consumers can therefore distinguish absent evidence from expected deferral.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UncertaintyReason {
@@ -255,11 +253,11 @@ pub enum UncertaintyReason {
     /// are known, field-level evidence is not (Proposal 002's ids-only
     /// audit).
     FieldEvidenceUnavailable,
-    /// Reserved for Feature 2's Phase 5 (activation is deliberate — emitting
-    /// it before any kind can declare would attach an uncertainty to every
-    /// change in every plan).
+    /// An applicable semantic field has no declaration. A missing declaration
+    /// stays explicit so the renderer cannot imply a guarantee.
     SemanticsUndeclared { field: String },
-    /// Reserved for Feature 2.
+    /// A declared value is assigned by the provider during apply, so its
+    /// absence beforehand is expected rather than missing evidence.
     ProviderAssignedAtApply { field: String },
     /// A deletion whose resource type no recoverer claims: the kind cannot
     /// be reached to declare what the delete does, and that absence is

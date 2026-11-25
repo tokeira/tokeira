@@ -9388,8 +9388,8 @@ fn speculative_start_persists_nothing() {
 // last_event_id unchanged, pending task cleared, the rejected update gone
 // from the admitted set (`skipWorkflowTaskCompletedEvent`,
 // workflow_task_state_machine.go:676-748 @ v1.31.0; Req 3.1). The follow-up
-// rule (K7) fires when OTHER admitted updates remain: a fresh SPECULATIVE
-// task is scheduled (respondworkflowtaskcompleted/api.go:512-541 @ v1.31.0;
+// rule (K7) fires when OTHER admitted updates remain: a fresh task is
+// scheduled (respondworkflowtaskcompleted/api.go:512-541 @ v1.31.0;
 // Req 8).
 #[test]
 fn speculative_rejection_only_completion_drops_without_trace() {

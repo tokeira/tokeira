@@ -16,21 +16,17 @@
 //!
 //! ## Lazy resolution and the two-state field
 //!
-//! A field does **not** own its value inline. Mirroring upstream CHASM's
-//! `fieldInternal` (`field.go`, `field_internal.go @ v1.31.0`), a [`Field`] is in
-//! one of two non-empty states: it either holds an **in-memory value** set during
-//! the current transition but not yet attached to a tree node, or it holds a
-//! **[`NodeHandle`]** linking it to the persisted child node, whose value is
-//! deserialized **lazily** against the live tree on access. This two-state shape is
-//! the structural reason loading a component does not eagerly materialize its whole
-//! subtree — only touched fields are resolved (Requirement 2.7; foundation §1).
+//! Mirroring upstream CHASM's `fieldInternal` (`field.go`,
+//! `field_internal.go @ v1.31.0`), a [`Field`] has two non-empty states: an
+//! **in-memory value** or a **[`NodeHandle`]** identifying a persisted child.
+//! Keeping the linkage separate from the value avoids requiring every child to
+//! be materialized when its owner is decoded (Requirement 2.7; foundation §1).
 //!
-//! The lazy read path (resolving a node-backed value through the active
-//! [`context`](crate::context)) is owned by the node tree and engine and lands with
-//! task 5.1 / task 2.1; this module models the field *shape* and the node linkage
-//! so component authors and the derive macro have a stable surface to target. Until
-//! the node tree exists, [`NodeHandle`] is a minimal placeholder carrying only the
-//! path segment that names the field's node — see its docs.
+//! This module preserves that shape but does not resolve node-backed values.
+//! [`Field::value`] returns `None` for a node link, and the
+//! [`context`](crate::context) traits expose no field-read operation. The node
+//! tree exists, but the runtime's typed component access materializes root data
+//! only. [`NodeHandle`] retains the field's path segment without loading it.
 //!
 //! Purity: these are plain value types. No I/O, no async, no storage
 //! (Requirement 1.1).
@@ -39,16 +35,15 @@ use std::{collections::BTreeMap, marker::PhantomData};
 
 use serde::{Deserialize, Serialize};
 
-/// A minimal stand-in for a field's linkage to its persisted tree node.
+/// A path-segment link to a field's persisted tree node.
 ///
 /// Upstream this is the `*Node` pointer inside `fieldInternal`
 /// (`field_internal.go @ v1.31.0`): an *attached* field does not store its value
 /// inline, it points at the child node and the value is deserialized lazily on
-/// access. The node tree itself is implemented by task 5.1 of the
-/// `chasm-foundation` spec; until then this handle carries only the **path
-/// segment** that names the field's node under its owning component — the stable
-/// identity the tree will key on. It is deliberately opaque so that fleshing out
-/// the tree does not change this module's public surface.
+/// access. This handle carries only the **path segment** naming the child under
+/// its owning component. It preserves that identity without retaining a tree or
+/// a cached value; neither the handle nor [`crate::context::Context`] resolves
+/// the child on access.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeHandle {
     /// Path segment naming this field's node relative to its owning component.
@@ -81,8 +76,8 @@ enum FieldState<T> {
     /// node. This is what `NewDataField`/`NewComponentField` produce upstream
     /// before `CloseTransaction` attaches them to the tree.
     Value(T),
-    /// A link to the persisted child node; the value is resolved lazily against
-    /// the tree on access (the read path lands with the node tree, task 5.1).
+    /// A persisted child-node link, retained without materializing `T`.
+    /// [`Field::value`] does not resolve this link.
     Node(NodeHandle),
     /// Neither a value nor a node — the field is unset (`fieldInternal.isEmpty`).
     Empty,
@@ -149,10 +144,9 @@ impl<T> Field<T> {
 
     /// The in-memory value if the field currently holds one.
     ///
-    /// Returns `None` when the field is node-backed — that value lives in the tree
-    /// and is resolved lazily through the active [`context`](crate::context) once
-    /// the node tree lands (task 5.1) — or when the field is empty. It never
-    /// performs I/O.
+    /// Returns `None` for node-backed and empty fields. A node handle retains
+    /// only the child's identity; this accessor has no tree context from which
+    /// to load its value and never performs I/O.
     pub fn value(&self) -> Option<&T> {
         match &self.state {
             FieldState::Value(value) => Some(value),

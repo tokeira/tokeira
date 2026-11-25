@@ -1907,8 +1907,8 @@ mod tests {
     // Feature: operator-explanation §Semantics, Property 1: the default declares nothing — and
     // Property 2: it is total. Over every ChangeKind, diff shape, and
     // state presence, a kind that does not override `change_semantics`
-    // returns all-Unknown, for every input, without panicking. Declaring
-    // kinds join this generator when Phase 4 lands them.
+    // returns all-Unknown, for every input, without panicking. Resource-specific
+    // declarations are exercised by their owning crates' tests.
     #[test]
     fn property_1_and_2_default_declaration_is_nothing_and_total() {
         use proptest::prelude::*;

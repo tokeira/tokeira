@@ -6,8 +6,8 @@
 //! operation lock, and the infra/runtime state heads under one revision. These
 //! are pure serde data models — the logic that *populates* them (provenance
 //! stamping, integrity verification, upgrade/rollback orchestration) lives in
-//! the provisioner binary and later tasks; this crate is the shared vocabulary
-//! those tasks read and write.
+//! provisioner operations and the admission helpers here. The shared vocabulary
+//! keeps the persisted envelope independent of command execution.
 //!
 //! Rollback is **definition-driven** (Proposal 002): the envelope carries no
 //! before-images. `checkpoint.from_config_ref` (the retained prior configuration

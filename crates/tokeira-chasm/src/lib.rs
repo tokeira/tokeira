@@ -31,9 +31,8 @@
 //!
 //! ## Module map
 //!
-//! The modules below are the substrate's surface; each carries its own contract
-//! in its `//!` doc. They are introduced as skeletons here (task 1.1 of the
-//! `chasm-foundation` spec) and filled in by later tasks:
+//! Each module owns a separate part of the pure substrate and documents its
+//! contract at the module boundary:
 //!
 //! - [`error`] — the [`ChasmError`] taxonomy returned across the substrate.
 //! - [`component`] — the component model and lifecycle.

@@ -91,11 +91,9 @@ pub(crate) async fn upgrade<F: DefinitionFrontend>(
 
     match evaluate_upgrade(&recorded, &running) {
         UpgradeDecision::Refuse(reason) => anyhow::bail!("`upgrade` refused: {reason}"),
-        // Proceeding decisions run one ceremony (transfer, migrations, apply,
-        // audit) and speak once, through the upgrade document at the end —
-        // no mid-ceremony narration. The decision's nuance (advance /
-        // promotion / dev refresh) joins the document's `## tkp` section
-        // with the versioning model (tkdp frontend spec).
+        // All proceeding decisions share transfer, migration, and apply. The
+        // final report receives only the applied explanation, so it does not
+        // distinguish a version advance, promotion, or development refresh.
         UpgradeDecision::VersionedAdvance
         | UpgradeDecision::Promotion
         | UpgradeDecision::DevRefresh => {}

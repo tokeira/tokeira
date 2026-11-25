@@ -91,8 +91,8 @@ fn grpc_status_code(headers: &tonic::codegen::http::HeaderMap) -> i32 {
 /// [`WireCoverageRecorder`].
 ///
 /// Constructed by `tokeirad` only under the conformance flag and mounted on the gRPC
-/// `Server`'s tower stack; the `Arc<WireCoverageRecorder>` it holds is the same recorder a
-/// later task snapshots and exports as JSON evidence. Cloning the layer (which tonic does
+/// `Server`'s tower stack; it shares the recorder the engine snapshots and exports as JSON
+/// evidence. Cloning the layer (which tonic does
 /// internally) clones the `Arc`, so all produced services feed one counter.
 #[derive(Debug, Clone)]
 pub struct WireCoverageLayer {

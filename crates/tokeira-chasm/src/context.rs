@@ -3,9 +3,10 @@
 //! Two object-safe traits gate what component code may do, mirroring upstream
 //! CHASM's `context.go @ v1.31.0`:
 //!
-//! - [`Context`] (read-only) — read execution metadata and (once the tree lands)
-//!   load components and read fields. It exposes neither field mutation nor task
-//!   scheduling (Requirement 6.3).
+//! - [`Context`] (read-only) — read execution metadata and logical time. It
+//!   exposes neither field mutation nor task scheduling (Requirement 6.3).
+//!   Component and lazy field reads are absent from this trait; the runtime
+//!   materializes root data before invoking component code.
 //! - [`MutableContext`] (read-write) — additionally permits field mutation and
 //!   [`add_task`](MutableContext::add_task). It is available **only inside a
 //!   transition** (`UpdateComponent`/`StartExecution`), never on a read path
@@ -28,11 +29,10 @@ use crate::{
 
 /// Read-only access available on every path (reads and transitions alike).
 ///
-/// At this layer it exposes the execution's identity, its summary
-/// [`ExecutionInfo`], and the engine's logical clock. Component/field *reads*
-/// resolve against the live node tree and are added with the runtime engine
-/// (Layer 2); the trait is introduced here so the pure contracts that consume it
-/// (lifecycle and task validation) have a stable, object-safe surface to name.
+/// Exposes execution identity, [`ExecutionInfo`], and logical time so lifecycle
+/// and task validation remain deterministic. It has no component or field-read
+/// method: the runtime supplies materialized root data separately, and this
+/// context cannot resolve a node-backed field.
 pub trait Context {
     /// The key identifying the execution this context operates on.
     fn execution_key(&self) -> &ExecutionKey;

@@ -1158,9 +1158,9 @@ pub fn commit_result_to_outcome(result: CommitResult) -> Result<WorkflowMutation
         CommitResult::CurrentExecutionConflict {
             existing_run_key, ..
         } => {
-            // Wave 2 maps this to a typed already-started EdgeError + the
-            // request-id detail; for now surface it as an error rather than
-            // silently dropping it.
+            // This generic mutation adapter preserves only the conflicting run
+            // key in an untyped error. Typed already-started details come from
+            // start_workflow_with_policy's separate conflict-resolution path.
             Err(anyhow!(
                 "current execution already exists: {existing_run_key:?}"
             ))

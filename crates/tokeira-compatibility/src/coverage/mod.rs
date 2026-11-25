@@ -4,8 +4,8 @@
 //! compatibility into a *queryable spine* that conformance tooling can join a stream of
 //! observed gRPC calls against. The matrix already classifies every WorkflowService and
 //! OperatorService RPC exactly once (state, capability field, dynamic-config key, evidence);
-//! what consumers lack is the small set of runtime query functions needed to map an observed
-//! wire method to a matrix-backed verdict. This module owns that query layer and nothing else.
+//! this module supplies the query functions that map an observed wire method to a
+//! matrix-backed verdict.
 //!
 //! It sits in `tokeira-compatibility` (not edge or runtime) on purpose: the matrix is the
 //! single source of truth for compatibility policy, the crate is pure (no I/O, no async), and
@@ -18,8 +18,7 @@
 //! [`normalize`] maps wire paths to/from rpc ids, [`index`] resolves an rpc id to its
 //! `FeatureEntry`, [`expected`] projects a feature's state to the wire outcome it implies, and
 //! this file owns the shared result types ([`ExpectedOutcome`], [`RpcClassification`]) plus the
-//! `resolve` entry point that composes the three. This task establishes only the skeleton and
-//! result types; the query functions are filled in by later tasks.
+//! [`resolve`] entry point that composes the three.
 
 pub mod expected;
 pub mod index;

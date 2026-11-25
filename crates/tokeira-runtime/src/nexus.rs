@@ -991,10 +991,9 @@ pub trait NexusCompletionClient: Send + Sync {
     /// application/json`. The `url` is always a resolved `http(s)://` address — the runtime
     /// resolves `SYSTEM_CALLBACK_URL` to the configured local listener before calling.
     ///
-    /// `links` are best-effort `Nexus-Link` headers and are **not essential to
-    /// resolution** (design.md §5). Wave 3 carries them in the signature but does not
-    /// yet emit the headers — link encoding lands with its producer (the firing handler
-    /// that builds the workflow-event start link from the close event) in Wave 4/5.
+    /// `links` carry best-effort completion metadata and are **not essential to
+    /// resolution** (design.md §5). The publisher passes stored callback links here,
+    /// but the HTTP implementation ignores them and emits no `Nexus-Link` headers.
     ///
     /// Returns the delivery outcome (never an `Err` for an HTTP/transport result — those
     /// are folded into `RetryableError`/`NonRetryableError`); the outer `Err` is
@@ -1033,8 +1032,8 @@ pub enum NexusTaskRequest {
         operation: String,
         operation_id: String,
         /// Handler-issued async operation token, sent as the wire `operation_token` so a
-        /// WorkflowRunOperation handler can unmarshal it. Falls back to `operation_id` when
-        /// the op never started (no handler token).
+        /// WorkflowRunOperation handler can unmarshal it. The kernel sends a cancel only
+        /// after the async start, so the token is always present.
         operation_token: String,
     },
     /// Caller-facing HTTP request admitted and normalized by the compatibility
@@ -2105,8 +2104,8 @@ impl NexusHttpClient for NoopNexusHttpClient {
 /// This is deliberately the opposite philosophy from [`NoopNexusHttpClient`] (which
 /// errors to surface a missing client loudly): it silently "succeeds". It is intended
 /// as an explicit **test** double — the production runtime must wire the real
-/// `HttpNexusCompletionClient`. The runtime-constructor default (loud-vs-silent) is
-/// decided when delivery is wired (Wave 4).
+/// `HttpNexusCompletionClient`. [`NexusCompletionDeps::default`] selects this
+/// no-I/O client; the engine bootstrap injects the HTTP client for delivery.
 #[derive(Debug)]
 pub struct NoopNexusCompletionClient;
 

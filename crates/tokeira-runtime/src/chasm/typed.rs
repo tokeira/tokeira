@@ -194,11 +194,11 @@ where
 
     /// Start-if-absent, then update in the same call (Requirement 6.1, 6.2).
     ///
-    /// If the execution already exists, the start is skipped (its business-id
-    /// reuse/conflict is treated as "already present") and the update runs against
-    /// the live state. MVP note: this is a two-phase start-then-update, not a
-    /// single fused transition; the fused form is a refinement once business-id
-    /// reuse policies are modelled (Requirement 6.2).
+    /// Start and update commit separately: a successful start remains durable
+    /// if the update fails. This helper uses the default business-id policy and
+    /// proceeds to update after success or `BusinessIdConflict`; other start
+    /// errors are returned. It does not provide an atomic create-and-update
+    /// operation or accept per-request reuse/conflict policy.
     pub async fn update_with_start<R>(
         &self,
         key: ExecutionKey,

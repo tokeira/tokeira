@@ -1,0 +1,5 @@
+kind: security
+body: kube 4.2.1 closes RUSTSEC-2026-0600.
+time: 2026-11-25T00:00:00Z
+custom:
+    Slice: 5aa303f3-c7bb-40f6-bbf1-1d2b450058e9

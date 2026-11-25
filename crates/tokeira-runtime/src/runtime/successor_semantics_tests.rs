@@ -860,3 +860,176 @@ async fn continue_as_new_records_capped_backoff_in_successor_history() {
         } if *recorded == backoff
     )));
 }
+
+fn retry_window_policy() -> RetryPolicy {
+    RetryPolicy {
+        initial_interval: Duration::seconds(2),
+        backoff_coefficient: 1.0,
+        maximum_interval: None,
+        maximum_attempts: 3,
+        non_retryable_error_types: Vec::new(),
+    }
+}
+
+async fn workflow_retry_window_outcome(
+    run_timeout: bool,
+    policy: RetryPolicy,
+    execution_timeout: Duration,
+    expected: RetryState,
+) {
+    let (_, runtime) = timer_deadline_tests::fixture().await;
+    let mut start = timer_deadline_tests::start(&runtime, false);
+    start.workflow_execution_timeout = Some(execution_timeout);
+    start.workflow_run_timeout = run_timeout.then_some(Duration::seconds(5));
+    start.workflow_task_timeout = Duration::minutes(1);
+    start.retry_policy = Some(policy);
+    runtime.start_workflow(start.clone()).await.unwrap();
+    let mut task = if run_timeout {
+        None
+    } else {
+        Some(completion(&runtime, &start).await)
+    };
+    tokio::time::advance(std::time::Duration::from_secs(10)).await;
+    let now = runtime.clock.now();
+    if run_timeout {
+        timeout_at(&runtime, &start, now, WorkflowTimeoutViolation::RunTimeout).await;
+    } else {
+        let mut task = task.take().unwrap();
+        task.now = now;
+        task.request.received_at = now;
+        runtime.complete_workflow_task(task).await.unwrap();
+    }
+    let history = runtime
+        .repo
+        .read_history_to_end(start.run_key, 0)
+        .await
+        .unwrap();
+    let (retry_state, next_run_id) = history
+        .iter()
+        .find_map(|event| match &event.kind {
+            HistoryEventKind::WorkflowExecutionFailed {
+                retry_state,
+                new_execution_run_id,
+                ..
+            } if !run_timeout => Some((retry_state, new_execution_run_id)),
+            HistoryEventKind::WorkflowExecutionTimedOut {
+                retry_state,
+                new_execution_run_id,
+                ..
+            } if run_timeout => Some((retry_state, new_execution_run_id)),
+            _ => None,
+        })
+        .expect("the predecessor must close through the selected path");
+    assert_eq!(retry_state, &expected);
+    let retrying = expected == RetryState::InProgress;
+    assert_eq!(next_run_id.is_some(), retrying);
+    let next = successor(&runtime, &start).await;
+    assert_eq!(next.is_some(), retrying);
+    if let Some((next, event)) = next {
+        assert_ne!(next.run_id, start.run_id);
+        assert_eq!(Some(next.run_id), *next_run_id);
+        assert_eq!(next.attempt, 2);
+        assert_eq!(next.first_run_started_at, Some(start.now));
+        assert!(matches!(
+            event.kind,
+            HistoryEventKind::WorkflowExecutionStartedV2 {
+                initiator: Some(tokeira_kernel::ContinueAsNewInitiator::Retry),
+                ..
+            }
+        ));
+    } else {
+        assert_eq!(
+            runtime
+                .repo
+                .list_runs_for_namespace(start.namespace_id)
+                .await
+                .unwrap(),
+            vec![start.run_key]
+        );
+    }
+    discovery_tests::stop(&runtime).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn workflow_failure_retry_at_expiration_starts_new_run() {
+    // The workflow failure caller uses the inclusive retry deadline
+    // (service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:779-805,
+    // service/history/workflow/mutable_state_impl.go:1638-1648,
+    // service/history/workflow/retry.go:109 @ v1.31.0).
+    workflow_retry_window_outcome(
+        false,
+        retry_window_policy(),
+        Duration::seconds(12),
+        RetryState::InProgress,
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn workflow_failure_retry_one_nanosecond_after_expiration_ends_chain() {
+    // Strictly later, even by one nanosecond, reports TIMEOUT
+    // (service/history/workflow/retry.go:109-110 @ v1.31.0).
+    workflow_retry_window_outcome(
+        false,
+        retry_window_policy(),
+        Duration::seconds(12) - Duration::nanoseconds(1),
+        RetryState::Timeout,
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn workflow_failure_retry_one_nanosecond_before_expiration_starts_new_run() {
+    // A next start before expiration remains retryable
+    // (service/history/workflow/retry.go:109-112 @ v1.31.0).
+    workflow_retry_window_outcome(
+        false,
+        retry_window_policy(),
+        Duration::seconds(12) + Duration::nanoseconds(1),
+        RetryState::InProgress,
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn run_timeout_retry_at_expiration_starts_new_run() {
+    // Expiration is still after now; the shared retry check admits equality
+    // for the next run (service/history/timer_queue_active_task_executor.go:685-705,
+    // service/history/workflow/mutable_state_impl.go:1638-1648,
+    // service/history/workflow/retry.go:109 @ v1.31.0).
+    workflow_retry_window_outcome(
+        true,
+        retry_window_policy(),
+        Duration::seconds(12),
+        RetryState::InProgress,
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn run_timeout_retry_one_nanosecond_after_expiration_ends_chain() {
+    // The timeout caller persists the helper's TIMEOUT result
+    // (service/history/timer_queue_active_task_executor.go:687-705,
+    // service/history/workflow/retry.go:109-110 @ v1.31.0).
+    workflow_retry_window_outcome(
+        true,
+        retry_window_policy(),
+        Duration::seconds(12) - Duration::nanoseconds(1),
+        RetryState::Timeout,
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn run_timeout_retry_one_nanosecond_before_expiration_starts_new_run() {
+    // The next run remains within the execution's retry window
+    // (service/history/timer_queue_active_task_executor.go:687-699,
+    // service/history/workflow/retry.go:109-112 @ v1.31.0).
+    workflow_retry_window_outcome(
+        true,
+        retry_window_policy(),
+        Duration::seconds(12) + Duration::nanoseconds(1),
+        RetryState::InProgress,
+    )
+    .await;
+}

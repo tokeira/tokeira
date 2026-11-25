@@ -811,3 +811,202 @@ proptest! {
         });
     }
 }
+
+async fn retry_after_timeout(
+    worker_failed_first: bool,
+    heartbeat: bool,
+) -> (Fixture, Option<OffsetDateTime>) {
+    let mut f = Fixture::new(Some(policy()), heartbeat).await;
+    let completed_at = if worker_failed_first {
+        let at = f.runtime.clock.now();
+        f.fail(false, "retryable").await;
+        f.next_attempt().await;
+        Some(at)
+    } else {
+        None
+    };
+    tokio::time::advance(std::time::Duration::from_nanos(1_000_000_001)).await;
+    f.scan().await;
+    (f, completed_at)
+}
+
+async fn timeout_preserves_completion(worker_failed_first: bool, heartbeat: bool) {
+    // Only worker failure records completion; timeout retry preserves it
+    // (service/history/api/respondactivitytaskfailed/api.go:104,
+    // service/history/workflow/mutable_state_impl.go:6336-6341,
+    // service/history/timer_queue_active_task_executor.go:302 @ v1.31.0).
+    let (mut f, completed_at) = retry_after_timeout(worker_failed_first, heartbeat).await;
+    let expected_attempt = if worker_failed_first { 3 } else { 2 };
+    let activity = &f.state().await.activities[&f.token.activity_id];
+    assert_eq!(activity.attempt, expected_attempt);
+    assert_eq!(activity.last_attempt_complete_time, completed_at);
+    f.next_attempt().await;
+    assert_eq!(f.token.attempt, expected_attempt);
+    let state = f.state().await;
+    let activity = &state.activities[&f.token.activity_id];
+    assert!(activity.started_at.is_some());
+    assert_eq!(activity.last_attempt_complete_time, completed_at);
+    discovery_tests::stop(&f.runtime).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn first_start_to_close_timeout_preserves_absent_completion_and_starts_retry() {
+    timeout_preserves_completion(false, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn first_heartbeat_timeout_preserves_absent_completion_and_starts_retry() {
+    timeout_preserves_completion(false, true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn start_to_close_timeout_preserves_worker_failure_completion_and_starts_retry() {
+    timeout_preserves_completion(true, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn heartbeat_timeout_preserves_worker_failure_completion_and_starts_retry() {
+    timeout_preserves_completion(true, true).await;
+}
+
+async fn timeout_backoff_rule(worker_failed_first: bool, at_start: bool) {
+    // BackoffInterval is ScheduledTime minus the last worker failure, or the
+    // Unix epoch when absent, truncated to seconds
+    // (service/history/workflow/matcher/activity_evaluator.go:245-253 @ v1.31.0).
+    let (f, completed_at) = retry_after_timeout(worker_failed_first, false).await;
+    let activity = &f.state().await.activities[&f.token.activity_id];
+    let scheduled = activity.current_attempt_scheduled_at.unwrap();
+    let interval = (scheduled - completed_at.unwrap_or(OffsetDateTime::UNIX_EPOCH)).whole_seconds();
+    let predicate = format!(
+        "Attempts = {} AND BackoffInterval = {interval}",
+        activity.attempt
+    );
+    tokio::time::advance(std::time::Duration::try_from(scheduled - f.runtime.clock.now()).unwrap())
+        .await;
+    if !at_start {
+        f.rule(&predicate).await;
+    }
+    crate::activity_eligibility::scan_activity_eligibility_once(
+        &f.runtime.activity_retry_deps(),
+        ShardId(0),
+        f.runtime.clock.now(),
+    )
+    .await;
+    if at_start {
+        f.rule(&predicate).await;
+        let queue = QueueKey {
+            task_kind: TaskKind::Activity,
+            task_queue: TaskQueueName("activities".into()),
+            ..f.queue.clone()
+        };
+        let offer = f
+            .runtime
+            .activity_broker
+            .try_claim_activity_offer(&queue, f.token.run_key, &f.token.activity_id)
+            .await
+            .expect("retry must be published before the rule is installed");
+        assert!(
+            f.runtime
+                .start_activity_task_offer(offer, WorkerIdentity("worker".into()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(
+        f.state().await.activities[&f.token.activity_id]
+            .pause_info
+            .is_some(),
+        "{predicate}"
+    );
+    discovery_tests::stop(&f.runtime).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn timeout_backoff_rule_uses_epoch_at_eligibility() {
+    timeout_backoff_rule(false, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn timeout_backoff_rule_uses_worker_failure_at_eligibility() {
+    timeout_backoff_rule(true, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn timeout_backoff_rule_uses_epoch_at_start() {
+    timeout_backoff_rule(false, true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn timeout_backoff_rule_uses_worker_failure_at_start() {
+    timeout_backoff_rule(true, true).await;
+}
+
+async fn update_retry_options(f: &Fixture, coefficient: f64) {
+    let now = f.runtime.clock.now();
+    f.runtime
+        .update_activity_options(
+            f.token.run_key,
+            UpdateActivitiesOptionsRequest {
+                target: ActivityControlTarget::Id(f.token.activity_id.clone()),
+                task_queue: FieldChange::Unchanged,
+                schedule_to_close_timeout: FieldChange::Unchanged,
+                schedule_to_start_timeout: FieldChange::Unchanged,
+                start_to_close_timeout: FieldChange::Unchanged,
+                heartbeat_timeout: FieldChange::Unchanged,
+                retry_policy: ActivityRetryPolicyPatch {
+                    initial_interval: FieldChange::Set(Duration::seconds(4)),
+                    backoff_coefficient: FieldChange::Set(coefficient),
+                    maximum_interval: FieldChange::Set(Some(Duration::seconds(5))),
+                    ..Default::default()
+                },
+                priority: tokeira_kernel::ActivityPriorityPatch::Unchanged,
+                restore_original_options: false,
+                request: RequestContext::unattributed(now),
+                now,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+async fn timeout_options_anchor(worker_failed_first: bool) {
+    // GetNextScheduledTime anchors retries on LastAttemptCompleteTime.AsTime(),
+    // including the Unix epoch when nil. Coefficient 1 isolates that anchor
+    // (service/history/workflow/activity.go:238-248,
+    // service/history/api/updateactivityoptions/api.go:401 @ v1.31.0).
+    let (f, completed_at) = retry_after_timeout(worker_failed_first, false).await;
+    update_retry_options(&f, 1.0).await;
+    assert_eq!(
+        f.state().await.activities[&f.token.activity_id].current_attempt_scheduled_at,
+        Some(completed_at.unwrap_or(OffsetDateTime::UNIX_EPOCH) + Duration::seconds(4))
+    );
+    discovery_tests::stop(&f.runtime).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn timeout_options_reschedule_from_epoch_without_worker_failure() {
+    timeout_options_anchor(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn timeout_options_reschedule_from_previous_worker_failure() {
+    timeout_options_anchor(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn options_reschedule_backoff_uses_current_attempt_exponent() {
+    // An options update at attempt 2 gives 4 * 2^(2 - 1), capped to 5 seconds,
+    // even though that attempt's original retry wait used the preceding exponent
+    // (service/history/workflow/activity.go:241-248,
+    // common/backoff/retry.go:183-185 @ v1.31.0).
+    let f = Fixture::new(Some(policy()), false).await;
+    let completed_at = f.runtime.clock.now();
+    f.fail(false, "retryable").await;
+    update_retry_options(&f, 2.0).await;
+    assert_eq!(
+        f.state().await.activities[&f.token.activity_id].current_attempt_scheduled_at,
+        Some(completed_at + Duration::seconds(5))
+    );
+    discovery_tests::stop(&f.runtime).await;
+}

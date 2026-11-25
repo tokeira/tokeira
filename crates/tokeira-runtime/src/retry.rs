@@ -3,8 +3,6 @@
 //! Pure functions that decide whether a failed activity should be retried
 //! and how long to wait before the next attempt.
 
-use tokeira_kernel::deadline_after;
-
 use time::Duration;
 use tokeira_types::RetryPolicy;
 
@@ -19,8 +17,8 @@ pub enum RetryExhaustedReason {
     NonRetryableFailure,
     /// `maximum_attempts` was reached (`retry.go:96-98`).
     MaximumAttemptsReached,
-    /// The next attempt could not begin before the retry-expiration deadline
-    /// (schedule-to-close anchor; `retry.go:108-110`).
+    /// The next attempt would begin strictly after the retry-expiration deadline
+    /// (schedule-to-close anchor; `service/history/workflow/retry.go:109 @ v1.31.0`).
     Timeout,
 }
 
@@ -76,8 +74,13 @@ pub fn evaluate_activity_retry(
     }
 
     let backoff = compute_retry_backoff(policy, current_attempt);
+    // Equality permits retry (service/history/workflow/retry.go:109 @ v1.31.0).
+    // Do not saturate this comparison: overflow past the latest stored date
+    // is still after expiration, not equality with that date.
     if let Some(expiration) = expiration
-        && deadline_after(now, backoff) >= expiration
+        && now
+            .checked_add(backoff)
+            .is_none_or(|next| next > expiration)
     {
         return RetryDecision::Exhausted {
             reason: RetryExhaustedReason::Timeout,
@@ -113,6 +116,72 @@ pub fn compute_retry_backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
 mod duration_tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn activity_retry_expiration_is_inclusive() {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let backoff = Duration::seconds(1);
+        let policy = RetryPolicy {
+            initial_interval: Duration::seconds(2),
+            backoff_coefficient: 1.0,
+            maximum_interval: Some(backoff),
+            maximum_attempts: 0,
+            non_retryable_error_types: Vec::new(),
+        };
+        let retry = RetryDecision::Retry {
+            next_attempt: 2,
+            backoff,
+        };
+        let exhausted = RetryDecision::Exhausted {
+            reason: RetryExhaustedReason::Timeout,
+        };
+        let latest = time::PrimitiveDateTime::MAX.assume_utc();
+        for (case, now, expiration, expected) in [
+            // service/history/workflow/retry.go:105-109 @ v1.31.0: cap before comparing; equality retries.
+            (
+                "exactly at expiration",
+                now,
+                Some(now + backoff),
+                retry.clone(),
+            ),
+            // service/history/workflow/retry.go:109 @ v1.31.0: one nanosecond after expires.
+            (
+                "one nanosecond after",
+                now,
+                Some(now + backoff - Duration::nanoseconds(1)),
+                exhausted.clone(),
+            ),
+            // service/history/workflow/retry.go:109 @ v1.31.0: one nanosecond before retries.
+            (
+                "one nanosecond before",
+                now,
+                Some(now + backoff + Duration::nanoseconds(1)),
+                retry.clone(),
+            ),
+            // service/history/workflow/retry.go:109 @ v1.31.0: nil expiration imposes no time limit.
+            ("no expiration", now, None, retry.clone()),
+            // service/history/workflow/retry.go:109 @ v1.31.0: equality also retries at the latest stored date.
+            (
+                "exactly at latest date",
+                latest - backoff,
+                Some(latest),
+                retry,
+            ),
+            // service/history/workflow/retry.go:109 @ v1.31.0: saturation must not turn a later time into equality.
+            (
+                "beyond latest date",
+                latest - backoff + Duration::nanoseconds(1),
+                Some(latest),
+                exhausted,
+            ),
+        ] {
+            assert_eq!(
+                evaluate_activity_retry(&policy, 1, None, false, now, expiration),
+                expected,
+                "{case}"
+            );
+        }
+    }
 
     proptest! {
         // Feature: runtime-activity-timeouts, Property 16: stored retry inputs never overflow.

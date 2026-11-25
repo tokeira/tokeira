@@ -1,0 +1,5 @@
+kind: fixed
+body: Activity and workflow retries now match v1.31.0 when the next attempt would start exactly at the expiration, after an activity timeout, and after an options update.
+time: 2026-11-25T00:00:00+00:00
+custom:
+    Slice: 59694e17-7aa6-4ae6-bca1-68e232300ce9

@@ -430,7 +430,7 @@ Each correctness property MUST be implemented by a SINGLE property-based test. P
 
 ### Property 9: Stored workflow deadlines
 
-For any wire seconds/nanos pair or stored duration in this feature, conversion and deadline arithmetic SHALL be total. Accepted values SHALL preserve the specified cap, and rejected command values SHALL retain their cause and message. Every unrepresentable deadline SHALL saturate at the latest representable date, including underflow from malformed negative stored durations.
+For any wire seconds/nanos pair or stored duration in this feature, conversion and deadline arithmetic SHALL be total. Accepted values SHALL preserve the specified cap, and rejected command values SHALL retain their cause and message. Every unrepresentable stored deadline SHALL saturate at the latest representable date, including underflow from malformed negative stored durations. Retry decisions SHALL allow a next start equal to execution expiration, but an unrepresentable later next start SHALL exhaust the retry window instead of saturating into equality (`service/history/workflow/retry.go:109-112 @ v1.31.0`).
 
 **Validates: Requirements 10.**
 

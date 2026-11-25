@@ -188,7 +188,7 @@ semantics, so the kernel stays pure and the decision is correct.
    invoked on a FailWorkflow completion.
 2. THE evaluation SHALL apply, per `retry.go:32-116` and `mutable_state_impl.go:1630-1649 @ v1.31.0`:
    non-retryable error-type match → `NonRetryableFailure`; `attempt >= MaximumAttempts` (when
-   `MaximumAttempts > 0`) → `MaximumAttemptsReached`; workflow-execution-expiration exceeded → terminal;
+   `MaximumAttempts > 0`) → `MaximumAttemptsReached`; a next-run start strictly after workflow-execution expiration → `Timeout`, while equality SHALL permit retry (`service/history/workflow/retry.go:109-112 @ v1.31.0`);
    otherwise retry with `backoff = InitialInterval × BackoffCoefficient^(attempt-1)`, capped by
    `MaximumInterval`.
 3. WHEN retry applies, THE runtime SHALL mint the successor `RunId` and pass it (with the computed

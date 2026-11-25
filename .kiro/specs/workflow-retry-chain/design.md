@@ -151,7 +151,7 @@ carries a `FailWorkflowExecution` command. Evaluates, per `retry.go:32-116` /
 
 1. failure type ∈ `NonRetryableErrorTypes` → `Terminal(NonRetryableFailure)`.
 2. `MaximumAttempts > 0 && attempt >= MaximumAttempts` → `Terminal(MaximumAttemptsReached)`.
-3. workflow-execution-expiration exceeded → `Terminal(_)` (per retry.go).
+3. next-run start strictly after workflow-execution expiration → `Terminal(Timeout)`; equality permits retry. An unrepresentable next start remains after any representable expiration, rather than saturating into equality (`service/history/workflow/retry.go:109-112 @ v1.31.0`).
 4. otherwise → `Retry { new_run_id: mint(), backoff: InitialInterval × Coefficient^(attempt-1) capped by
    MaximumInterval }`.
 

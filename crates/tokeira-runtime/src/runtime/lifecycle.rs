@@ -12,7 +12,7 @@
 //! decides whether to start fresh, reuse an existing run, terminate-then-start,
 //! or reject — matching Temporal's `WorkflowIdConflictPolicy` (against an
 //! *open* run) and `WorkflowIdReusePolicy` (against the *latest closed* run).
-use tokeira_kernel::{deadline_after, deadline_before};
+use tokeira_kernel::deadline_after;
 
 use super::*;
 
@@ -1231,32 +1231,22 @@ where
             .filter(|activity| request.target.matches(activity))
             .filter(|activity| activity.started_at.is_none())
         {
-            // Attempt 1 has never been through a retry, so it carries no backoff
-            // delay: its next schedule time is simply its current schedule time.
-            // Only genuine retries (attempt > 1) reproject eligibility from the
-            // policy — `GetNextScheduledTime` leaves attempt-1 unchanged
-            // (activity.go:231 @ v1.31.0). Applying `initial_interval` here (the
-            // saturating exponent-0 backoff) would shift a scheduled attempt-1
-            // activity's Describe time and spawn a spurious delayed publish.
+            // Attempt 1 keeps its schedule, including after an attempt reset:
+            // applying initial_interval would introduce a spurious delay
+            // (service/history/workflow/activity.go:238-239 @ v1.31.0).
             let backoff_for = |policy: Option<&tokeira_types::RetryPolicy>| -> Duration {
                 if activity.attempt <= 1 {
                     Duration::ZERO
                 } else {
+                    // Options updates recompute for the current attempt, one
+                    // exponential step beyond the delay that scheduled it
+                    // (service/history/workflow/activity.go:241,
+                    // common/backoff/retry.go:183-185 @ v1.31.0).
                     policy
-                        .map(|policy| {
-                            crate::retry::compute_retry_backoff(
-                                policy,
-                                activity.attempt.saturating_sub(1),
-                            )
-                        })
+                        .map(|policy| crate::retry::compute_retry_backoff(policy, activity.attempt))
                         .unwrap_or(Duration::ZERO)
                 }
             };
-            let old_backoff = backoff_for(activity.retry_policy.as_ref());
-            let anchor = activity
-                .current_attempt_scheduled_at
-                .map(|scheduled_at| deadline_before(scheduled_at, old_backoff))
-                .unwrap_or(request.now);
             let new_policy = if request.restore_original_options {
                 original_options
                     .get(&activity.activity_id)
@@ -1265,10 +1255,21 @@ where
                 patched_retry_policy(activity.retry_policy.clone(), &request.retry_policy)?
             };
             let new_backoff = backoff_for(new_policy.as_ref());
-            reschedule_at.insert(
-                activity.activity_id.clone(),
-                deadline_after(anchor, new_backoff),
-            );
+            // A timeout does not advance the completion timestamp, so undoing
+            // the previous backoff would recover the wrong anchor. Nil reads as
+            // the Unix epoch; attempt 1 and nonpositive intervals keep ScheduledTime
+            // (service/history/workflow/activity.go:238-251 @ v1.31.0).
+            let scheduled_at = if activity.attempt > 1 && new_backoff.is_positive() {
+                deadline_after(
+                    activity
+                        .last_attempt_complete_time
+                        .unwrap_or(OffsetDateTime::UNIX_EPOCH),
+                    new_backoff,
+                )
+            } else {
+                activity.current_attempt_scheduled_at.unwrap_or(request.now)
+            };
+            reschedule_at.insert(activity.activity_id.clone(), scheduled_at);
         }
 
         let result = self

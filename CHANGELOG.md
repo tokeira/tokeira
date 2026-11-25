@@ -2,6 +2,109 @@
 
 All notable user-facing changes to this project are documented here.
 
+## 0.8.0 on 2026-11-25
+
+### Added
+
+* Add `tokeira_dsql_operation_round_trips`, the round trips of each DSQL operation by cause and transaction outcome, and `tokeira_dsql_unattributed_statements_total`.
+* `tkr image build` derives its build manifest twice and exports no image whose `tokeirad --version --json` differs from that manifest in any field.
+* A component can set search attributes and user metadata on the standalone activities it starts, so a visibility query can find them.
+
+### Changed
+
+* Eager activity execution is now off by default. Set policy.compatibility.enable_activity_eager_execution to true to turn it on.
+* A completion is no longer limited to three eager activities.
+* A workflow task that only heartbeats now times out after 30 minutes without progress, and its worker receives NOT_FOUND.
+* DSQL connections now begin `application_name` with `tokeira/<version>`, so Aurora DSQL Database Insights attributes their load and plans to Tokeira.
+* DSQL refills now open up to eight connections at once, give up on a connection attempt after 30 seconds, and back off exponentially while connects fail.
+* DSQL connections now share AWS credentials until shortly before they expire, instead of fetching credentials for each connection.
+* DSQL connections now live 50 to 54 minutes instead of 10 to 12, so a fleet spends far less of the cluster's connection rate replacing them.
+* Nodes now share DSQL's connection rate through one DynamoDB item, and keep creating connections at their budget share while DynamoDB is unreachable.
+* A commit for a workflow that is not a child now makes one round trip fewer to Aurora DSQL.
+* A commit to Aurora DSQL makes up to three round trips fewer, as it skips the dispatch and operation rows its run holds none of; an activity heartbeat takes six instead of nine.
+* Due timers for runs on different lanes now fire concurrently, so a burst of due timers no longer fires one lane commit at a time.
+* A commit that dispatches a sticky workflow task, or a task routed by worker deployments, no longer reads the run back from storage to route it.
+* The activity timeout scanner reads each run once per reconciliation pass instead of once per open activity, so a run with many open activities costs one read per pass.
+* An overloaded lane or workflow run now answers RESOURCE_EXHAUSTED at once instead of making the caller wait for room.
+* Different runs on one lane now run concurrently, up to the node's commit capacity, and lanes report their in-flight activations and refusals.
+* Workflow tasks, sticky ones included, are pushed to their task queue's home when scheduled, and a lost sticky task is sent again at once. Upgrade with every node stopped.
+* Tokeira's crates now require Rust 1.99 or newer.
+* `tkr image build`, the bundle build of `tkr deployment create` and the release train run on stock Dagger v1.0.0-beta.27 through tokeira-dagger-sdk 0.9.0.
+* `tkr` refuses to open a Dagger session inside another one, and names the variables to unset.
+* Embedded DSQL startup now names a held owner or migration lease, a required or incompatible schema, or a too-long ownership wait, and `EmbeddedEngineStartError` is non-exhaustive.
+
+### Removed
+
+* Nodes no longer lease DSQL connection slots, and platforms no longer provision that table; `infrastructure.dsql.conn_lease_table` still loads and is ignored with a warning.
+* Remove `tokeira_runtime_lane_carry_overs_total`, which measures nothing now that runs on one lane run concurrently.
+* Remove `tkr image push` and `tkr image mirror`.
+* Remove `tkr ci`.
+
+### Fixed
+
+* On a node that owns many shards, outbound work, such as starting a child workflow, no longer waits many seconds to be picked up.
+* On a cluster of more than one node, activity polls now reach the node that serves their task queue.
+* The new workflow task that RespondWorkflowTaskCompleted returns is now started by the completion itself, so another worker's waiting poll can no longer take it first.
+* Eager activities that RespondWorkflowTaskCompleted returns are now started by the completion itself, so another worker's waiting poll can no longer take them first.
+* DescribeWorkflowExecution now includes the pending workflow task's original scheduled time.
+* After a workflow task fails or times out while its workflow is paused, unpausing now schedules a new task with the correct attempt and history.
+* When a workflow task is failed because too many events were buffered, its retry now takes the next attempt number, unless the task was on a sticky queue.
+* Workflow task timeouts now fire at their deadline rather than up to a second late.
+* Activity timeouts now fire at their deadline rather than up to a second late.
+* Nexus operation timeouts and retries, completion callback retries, and newly started workflows' timeouts now fire at their deadline rather than up to a second late.
+* Timers, start delays, standalone activity timeouts and activity retries now take effect at their time rather than up to a second late.
+* With in-memory storage, timers started before a reset point that are still pending now fire in the reset's new run.
+* A timer canceled and started again with the same id can no longer fire at the canceled timer's time.
+* An activity that a worker started before the server had recorded the attempt now still times out on its heartbeat and start-to-close deadlines.
+* An activity retried while its previous attempt was still heartbeating no longer times out before its new attempt starts.
+* An activity timeout no longer closes or retries an attempt that started or heartbeated just before the timeout was applied.
+* When no DSQL connection is free, requests now fail with `RESOURCE_EXHAUSTED`, which SDKs retry with backoff, instead of `INTERNAL`.
+* A DSQL connection broken by a network, TLS or protocol failure is now discarded instead of being handed to a later request.
+* Under load, requests no longer fail for want of a DSQL connection while an earlier request's connection is still on its way back to the reservoir.
+* A node now holds no more DSQL connections than its target while all of them are in use, rather than opening more as they are checked out.
+* A storage call now waits up to a second for a DSQL connection when none is ready, instead of failing at once with RESOURCE_EXHAUSTED.
+* A node now starts serving with the DSQL connections it holds after its 30-second warmup, rather than failing to start.
+* A node now keeps its last DSQL connection budget through a controller outage, instead of dropping to one connection when the budget expires.
+* An activity start on Aurora DSQL reads only the history batch that holds its input, not a hundred, as each history read checks its run's preparation once per statement.
+* Task polls now answer empty a second before the caller's deadline instead of running past it, and a task matched at the end of a poll still starts.
+* Under controller-managed placement, a node whose shard lease has lapsed now stops starting writes at its lease deadline, so it no longer holds back the node taking over.
+* Workflow task delivery now drops stale offers promptly when queue ownership changes and prevents one queue home from suppressing another's work.
+* A started activity's start-to-close and heartbeat timeouts are no longer missed until a later full scan when its start, heartbeats and retries update tracking out of order.
+* A partly ramped worker deployment now sends the same workflows to its ramping version as Temporal does, so some auto-upgrade workflows change version once after the upgrade.
+* The release train installs a checksum-verified GitHub CLI 2.65.0 for its release-notes step, in place of a container image that cannot be pulled.
+* An activity whose task queue is served by another node now reaches a polling worker promptly, instead of waiting for that node's next discovery pass.
+* An activity whose workflow has requested its cancellation now ends on its next failure or timeout, as Temporal does, instead of being retried.
+* Workflow rules checked when an activity attempt fails or times out now see that attempt, and a paused activity now stays paused when its retries are used up, as Temporal does.
+* With standalone activities on, an activity poll now serves whichever of a standalone or workflow activity arrives first, as Temporal does, instead of waiting out its timeout.
+* An embedded engine on DSQL that takes over after an unclean stop now keeps renewing its ownership while it waits, instead of shutting itself down soon after it starts.
+
+### Security
+
+* rustix 1.1.6 closes RUSTSEC-2026-0486.
+* url 2.5.9 closes RUSTSEC-2026-0592.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 ## 0.7.0 on 2026-11-04
 
 ### Changed

@@ -1,5 +1,0 @@
-kind: fixed
-body: An activity whose workflow has requested its cancellation now ends on its next failure or timeout, as Temporal does, instead of being retried.
-time: 2026-11-24T00:00:00Z
-custom:
-    Slice: 38f137db-d7a1-4a85-9981-a5a4c699ecdd

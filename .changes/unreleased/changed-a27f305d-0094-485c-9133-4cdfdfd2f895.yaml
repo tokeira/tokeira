@@ -1,5 +1,0 @@
-kind: changed
-body: A commit to Aurora DSQL makes up to three round trips fewer, as it skips the dispatch and operation rows its run holds none of; an activity heartbeat takes six instead of nine.
-time: 2026-11-07T01:37:18.750240+00:00
-custom:
-    Slice: a27f305d-0094-485c-9133-4cdfdfd2f895

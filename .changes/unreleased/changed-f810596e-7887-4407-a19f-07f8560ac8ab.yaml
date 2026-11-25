@@ -1,5 +1,0 @@
-kind: changed
-body: Tokeira's crates now require Rust 1.99 or newer.
-time: 2026-11-16T15:30:44+00:00
-custom:
-    Slice: f810596e-7887-4407-a19f-07f8560ac8ab

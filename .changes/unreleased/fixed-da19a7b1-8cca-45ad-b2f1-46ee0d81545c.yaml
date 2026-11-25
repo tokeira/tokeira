@@ -1,5 +1,0 @@
-kind: fixed
-body: The release train installs a checksum-verified GitHub CLI 2.65.0 for its release-notes step, in place of a container image that cannot be pulled.
-time: 2026-11-16T21:10:15+00:00
-custom:
-    Slice: da19a7b1-8cca-45ad-b2f1-46ee0d81545c

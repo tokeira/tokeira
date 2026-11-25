@@ -1,5 +1,0 @@
-kind: removed
-body: Remove `tkr image push` and `tkr image mirror`.
-time: 2026-11-16T13:25:32+00:00
-custom:
-    Slice: 46dd06a5-88f5-4882-87ec-0b68cbaec5a9

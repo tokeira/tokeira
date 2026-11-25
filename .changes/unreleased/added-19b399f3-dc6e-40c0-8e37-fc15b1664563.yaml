@@ -1,5 +1,0 @@
-kind: added
-body: A component can set search attributes and user metadata on the standalone activities it starts, so a visibility query can find them.
-time: 2026-11-24T00:00:00Z
-custom:
-    Slice: 19b399f3-dc6e-40c0-8e37-fc15b1664563

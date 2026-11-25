@@ -1,5 +1,0 @@
-kind: security
-body: url 2.5.9 closes RUSTSEC-2026-0592.
-time: 2026-11-24T00:00:00Z
-custom:
-    Slice: 5db7f3f9-4b28-4ca0-ab3c-a2578309efe5

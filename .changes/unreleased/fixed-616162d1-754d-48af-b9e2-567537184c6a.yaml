@@ -1,5 +1,0 @@
-kind: fixed
-body: An activity whose task queue is served by another node now reaches a polling worker promptly, instead of waiting for that node's next discovery pass.
-time: 2026-11-21T00:00:00Z
-custom:
-    Slice: 616162d1-754d-48af-b9e2-567537184c6a

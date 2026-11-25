@@ -1834,7 +1834,7 @@ where
     /// Mirrors `service/history/workflow/retry.go:32-116` +
     /// `mutable_state_impl.go:1630 @ v1.31.0`: a run with a retry policy retries on
     /// failure unless the failure is non-retryable, the maximum attempts are
-    /// reached, or the successor's first attempt would begin at/after the
+    /// reached, or the successor's first attempt would begin strictly after the
     /// workflow-execution deadline. The evaluation (failure decoding, wall clock,
     /// backoff) is a runtime concern; the kernel only records the outcome (Req 2.1).
     fn retry_continuation_for_completion(
@@ -1859,13 +1859,18 @@ where
                 retry_state: RetryState::MaximumAttemptsReached,
             });
         }
-        // Execution-expiration cap: if the next attempt could not begin before the
-        // workflow-execution deadline, the chain ends as Timeout (retry.go). The
-        // deadline is anchored on the first run's start so it spans the whole chain.
+        // The expiration is anchored on the first run's start, so it spans the
+        // whole chain. Equality permits retry (service/history/workflow/retry.go:109
+        // @ v1.31.0); checked addition keeps an overflowing next start after even
+        // the latest representable expiration instead of saturating into equality.
         let backoff = retry_backoff(policy, state.attempt);
         if let Some(execution_timeout) = state.workflow_execution_timeout {
             let anchor = state.first_run_started_at.unwrap_or(state.started_at);
-            if deadline_after(req.now, backoff) >= deadline_after(anchor, execution_timeout) {
+            if req
+                .now
+                .checked_add(backoff)
+                .is_none_or(|next| next > deadline_after(anchor, execution_timeout))
+            {
                 return Some(RetryContinuation::Terminal {
                     retry_state: RetryState::Timeout,
                 });

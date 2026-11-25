@@ -154,6 +154,6 @@ Execution expiration is chain-wide and run expiration uses execution time (start
 #### Acceptance Criteria
 
 1. WHEN a stored execution or run timeout or first-task delay exceeds the date range, THE Runtime SHALL compute deadlines with saturating arithmetic, using the latest representable date for every unrepresentable result.
-2. WHEN scanning, evaluating retries, or describing a run, THE Runtime SHALL preserve this overflow rule for both the first-run execution anchor and the current-run start plus delay.
+2. WHEN scanning, evaluating retries, or describing a run, THE Runtime SHALL preserve this overflow rule for both the first-run execution anchor and the current-run start plus delay. WHEN comparing a retry's next start against execution expiration, THE Runtime SHALL allow equality and reject a strictly later start, including a start beyond the representable date range (`service/history/workflow/retry.go:109-112`, `service/history/timer_queue_active_task_executor.go:687 @ v1.31.0`).
 3. WHEN a scanner chooses its next wake, THE Runtime SHALL bound the converted wait by the configured scan interval without overflowing the strict-comparison nanosecond adjustment.
 4. WHEN a run is recovered after acquisition, THE Runtime SHALL apply the same checked deadline calculation to the recovered durations without rewriting history.

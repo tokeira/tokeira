@@ -397,11 +397,16 @@ pub(crate) async fn submit_workflow_timeout<R: tokeira_storage::RunRepository + 
                 policy.maximum_attempts == 0 || state.attempt < policy.maximum_attempts;
             let backoff = crate::runtime::workflow_task::retry_backoff(policy, state.attempt);
             let within_deadline = state.workflow_execution_timeout.is_none_or(|timeout| {
-                deadline_after(now, backoff)
-                    < deadline_after(
+                // The timeout caller uses the same inclusive retry window as
+                // workflow failure (service/history/timer_queue_active_task_executor.go:687,
+                // service/history/workflow/retry.go:109 @ v1.31.0). An overflowing
+                // next start is after every representable expiration.
+                now.checked_add(backoff).is_some_and(|next| {
+                    next <= deadline_after(
                         state.first_run_started_at.unwrap_or(state.started_at),
                         timeout,
                     )
+                })
             });
             (attempts_ok && within_deadline).then_some(backoff)
         });

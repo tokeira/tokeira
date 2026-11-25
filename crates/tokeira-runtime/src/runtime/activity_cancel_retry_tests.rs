@@ -995,9 +995,9 @@ async fn timeout_options_reschedule_from_previous_worker_failure() {
 }
 
 #[tokio::test(start_paused = true)]
-#[ignore = "differs from v1.31.0: options-update backoff uses attempt minus two instead of attempt minus one"]
 async fn options_reschedule_backoff_uses_current_attempt_exponent() {
-    // Attempt 2 gives 4 * 2^(2 - 1), capped to 5 seconds
+    // An options update at attempt 2 gives 4 * 2^(2 - 1), capped to 5 seconds,
+    // even though that attempt's original retry wait used the preceding exponent
     // (service/history/workflow/activity.go:241-248,
     // common/backoff/retry.go:183-185 @ v1.31.0).
     let f = Fixture::new(Some(policy()), false).await;

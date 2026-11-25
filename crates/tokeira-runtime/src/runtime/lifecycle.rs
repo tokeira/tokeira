@@ -1238,13 +1238,12 @@ where
                 if activity.attempt <= 1 {
                     Duration::ZERO
                 } else {
+                    // Options updates recompute for the current attempt, one
+                    // exponential step beyond the delay that scheduled it
+                    // (service/history/workflow/activity.go:241,
+                    // common/backoff/retry.go:183-185 @ v1.31.0).
                     policy
-                        .map(|policy| {
-                            crate::retry::compute_retry_backoff(
-                                policy,
-                                activity.attempt.saturating_sub(1),
-                            )
-                        })
+                        .map(|policy| crate::retry::compute_retry_backoff(policy, activity.attempt))
                         .unwrap_or(Duration::ZERO)
                 }
             };

@@ -805,6 +805,25 @@ The feature gates the builder, typed handle and re-exports; seeding, fail-closed
 `Engine` fields `chasm_engine: Arc<ChasmEngine>` and `registry: Arc<Registry>` exist in
 every deployment.
 
+`NodeBuilder` is the same front for a `tokeirad` node (Requirement 11). It holds a
+`ChasmExtensions` without a clock, since a node's CHASM plane reads the node's clock as
+`tokeirad`'s does. Its `run_from_cli` hands the extensions to `run_from_cli_with_extensions`,
+the body the public `run_from_cli` delegates to, which passes them through
+`build_and_serve` to whichever stack that builds. `tokeirad` and
+`TokeiradHandle::start_in_memory_with_config` pass an empty value.
+
+```rust
+#[cfg(feature = "chasm-extensions")]
+pub struct NodeBuilder { extensions: ChasmExtensions }
+impl NodeBuilder {
+    pub fn new() -> Self;
+    pub fn library<L: Library>(self) -> Self;
+    pub fn side_effect_executor(self, executor: Arc<dyn SideEffectExecutor>) -> Self;
+    pub async fn run(self) -> anyhow::Result<()>;
+    pub async fn run_from_cli(self, cli: tokeira_config::Cli) -> anyhow::Result<()>;
+}
+```
+
 Within the shared bootstrap, register the activity library, `seal_built_ins`, register
 extensions and freeze. This pure registration precedes construction of the operator wrapper
 so it can retain the immutable declarations. The stateful CHASM block keeps this order:

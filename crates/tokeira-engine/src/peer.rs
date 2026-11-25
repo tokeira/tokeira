@@ -127,7 +127,12 @@ mod tests {
             rt.block_on(async {
                 let mut server = crate::TokeiraConfig::default();
                 server.infrastructure.placement.controller_endpoint = Some("http://controller.invalid:7240".into());
-                let error = crate::build_and_serve("127.0.0.1:0".parse().unwrap(), Arc::new(server)).await.unwrap_err();
+                let error = crate::build_and_serve(
+                    "127.0.0.1:0".parse().unwrap(),
+                    Arc::new(server),
+                    crate::ChasmExtensions::default(),
+                )
+                .await.unwrap_err();
                 assert_diagnostic(error, PeerError::MissingMaterial, &[]);
                 let temporary = tempfile::tempdir().unwrap();
                 let path = temporary.path().canonicalize().unwrap().join("peer.json");

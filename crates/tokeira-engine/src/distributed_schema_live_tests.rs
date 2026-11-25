@@ -64,6 +64,7 @@ impl Live {
         build_and_serve(
             SocketAddr::from(([127, 0, 0, 1], grpc)),
             Arc::new(self.config(nexus)),
+            ChasmExtensions::default(),
         )
         .await
     }

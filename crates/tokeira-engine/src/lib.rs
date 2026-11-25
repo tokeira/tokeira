@@ -828,7 +828,23 @@ pub enum EmbeddedShutdownFailure {
     ListenerDrain,
 }
 
-/// Aggregated explicit-shutdown failure.
+impl EmbeddedShutdownFailure {
+    /// How [`EmbeddedEngineShutdownError`]'s message names this stage.
+    fn stage(self) -> &'static str {
+        match self {
+            Self::RpcDrain => "in-process RPC drain",
+            Self::RuntimeTasks => "background task join",
+            Self::ShardRelease => "shard lease release",
+            Self::OwnershipRelease => "embedded-owner claim release",
+            Self::Storage => "DSQL connection close",
+            Self::Snapshot => "final snapshot",
+            Self::ListenerDrain => "listener stop",
+        }
+    }
+}
+
+/// Aggregated explicit-shutdown failure. Its message names each failed stage,
+/// in order.
 #[derive(Debug)]
 pub struct EmbeddedEngineShutdownError {
     failures: Vec<EmbeddedShutdownFailure>,
@@ -840,7 +856,12 @@ impl std::fmt::Display for EmbeddedEngineShutdownError {
             formatter,
             "embedded engine shutdown completed with {} cleanup failure(s)",
             self.failures.len()
-        )
+        )?;
+        for (index, failure) in self.failures.iter().enumerate() {
+            let separator = if index == 0 { ": " } else { ", " };
+            write!(formatter, "{separator}{}", failure.stage())?;
+        }
+        Ok(())
     }
 }
 
@@ -3596,6 +3617,18 @@ fn spawn_visibility_repair(
         });
     let scanner =
         tokeira_runtime::chasm::VisibilityRepairScanner::new(nodes, sink, rebuild, partition_count);
+    spawn_visibility_repair_scanner(tasks, scanner, cancel);
+}
+
+/// Run `scanner`'s repair pass immediately, then on an interval, until `cancel`
+/// fires. Cancellation also drops a pass under way: a pass visits every
+/// execution and can outlast the whole shutdown deadline, and each apply is
+/// version-keyed, so the next pass repairs whatever this one did not reach.
+fn spawn_visibility_repair_scanner(
+    tasks: &RuntimeShutdownHandle,
+    scanner: tokeira_runtime::chasm::VisibilityRepairScanner,
+    cancel: CancellationToken,
+) {
     let _repair = tasks.spawn(async move {
         let mut interval = tokio::time::interval(VISIBILITY_REPAIR_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3603,8 +3636,13 @@ fn spawn_visibility_repair(
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = interval.tick() => {
-                    if let Err(error) = scanner.repair_once().await {
-                        tracing::warn!(?error, "visibility repair pass failed");
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        result = scanner.repair_once() => {
+                            if let Err(error) = result {
+                                tracing::warn!(?error, "visibility repair pass failed");
+                            }
+                        }
                     }
                 }
             }
@@ -6079,6 +6117,104 @@ mod tests {
             .expect("explicit in-memory startup succeeds");
         assert_eq!(engine.startup_report(), &EngineStartupReport::in_memory());
         engine.shutdown().await.expect("tracked shutdown succeeds");
+    }
+
+    /// A projection sink whose apply never finishes, standing in for a repair
+    /// pass that is still writing when shutdown begins.
+    struct StalledProjectionSink {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl tokeira_projection::ProjectionSink for StalledProjectionSink {
+        async fn apply(
+            &self,
+            _record: &tokeira_storage::ProjectionRecord,
+            _partition_id: u32,
+        ) -> Result<tokeira_projection::ApplyOutcome> {
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_a_visibility_repair_pass_under_way() {
+        use tokeira_storage::ChasmNodeRepository as _;
+
+        let nodes = Arc::new(tokeira_storage::InMemoryChasmNodeStore::new());
+        let key = tokeira_chasm::ExecutionKey::new(
+            uuid::Uuid::from_u128(1).to_string(),
+            "repair-pass".to_owned(),
+            uuid::Uuid::from_u128(2).to_string(),
+        );
+        nodes
+            .persist_dirty(
+                &key,
+                vec![tokeira_storage::NodeWrite {
+                    encoded_path: Vec::new(),
+                    node: tokeira_chasm::ChasmNode {
+                        metadata: tokeira_chasm::NodeMetadata::new(
+                            1,
+                            Some(tokeira_chasm::LifecycleState::Running),
+                            tokeira_chasm::VersionedTransition::new(0, 1),
+                        ),
+                        data: Some(b"Running".to_vec()),
+                    },
+                    expected: tokeira_storage::ExpectedVersion::Absent,
+                }],
+            )
+            .await
+            .expect("seed one execution root");
+        let rebuild: tokeira_runtime::chasm::SnapshotRebuilder = Arc::new(|_, _| {
+            Some(tokeira_chasm::VisibilitySnapshot {
+                status_keyword: "Running".to_owned(),
+                lifecycle_state: tokeira_chasm::LifecycleState::Running,
+                execution_type: Some("Test".to_owned()),
+                task_queue: None,
+                start_time_unix_nanos: Some(1),
+                close_time_unix_nanos: None,
+                search_attributes: Default::default(),
+                memo: Default::default(),
+            })
+        });
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let sink = Arc::new(StalledProjectionSink {
+            entered: entered.clone(),
+        });
+        let scanner = tokeira_runtime::chasm::VisibilityRepairScanner::new(nodes, sink, rebuild, 1);
+        // As in the stack, the repair loop listens to its task group's own token.
+        let tasks = RuntimeShutdownHandle::new();
+        spawn_visibility_repair_scanner(&tasks, scanner, tasks.cancellation_token());
+
+        tokio::time::timeout(StdDuration::from_secs(5), entered.notified())
+            .await
+            .expect("the first pass reaches its first apply");
+        tasks.begin_shutdown();
+        tasks
+            .wait(Instant::now() + StdDuration::from_secs(5))
+            .await
+            .expect("shutdown joins the repair task while its pass is stalled");
+    }
+
+    #[test]
+    fn shutdown_error_names_each_failed_stage_in_order() {
+        let error = EmbeddedEngineShutdownError {
+            failures: vec![
+                EmbeddedShutdownFailure::ListenerDrain,
+                EmbeddedShutdownFailure::RpcDrain,
+                EmbeddedShutdownFailure::RuntimeTasks,
+                EmbeddedShutdownFailure::ShardRelease,
+                EmbeddedShutdownFailure::OwnershipRelease,
+                EmbeddedShutdownFailure::Storage,
+                EmbeddedShutdownFailure::Snapshot,
+            ],
+        };
+        assert_eq!(
+            error.to_string(),
+            "embedded engine shutdown completed with 7 cleanup failure(s): listener stop, \
+             in-process RPC drain, background task join, shard lease release, \
+             embedded-owner claim release, DSQL connection close, final snapshot"
+        );
     }
 
     #[test]

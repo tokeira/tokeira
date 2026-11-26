@@ -148,7 +148,7 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 #### Acceptance Criteria
 
 1. THE Runtime SHALL set the child's `workflow_task_timeout` to a sensible default (e.g. 10 seconds) when starting a child workflow, since the `DispatchOp::StartChildWorkflow` does not carry a workflow task timeout.
-2. THE Runtime SHALL set the child's `memo`, `search_attributes`, `retry_policy`, `workflow_execution_timeout`, and `workflow_run_timeout` to empty or None defaults when starting a child workflow, since the dispatch op does not carry these fields.
+2. THE Runtime SHALL set the child's `memo`, `search_attributes`, `workflow_execution_timeout`, and `workflow_run_timeout` to empty or None defaults when starting a child workflow, since the dispatch op does not carry these fields. THE Runtime SHALL carry the command's defaulted `retry_policy` through the initiated event into the child start; an absent policy SHALL remain `None` (`service/history/api/command_attr_validator.go:442,516,566-578` and `common/retrypolicy/retry_policy.go:32-56 @ v1.31.0`; `service/history/transfer_queue_active_task_executor.go:1630-1639 @ v1.31.0`).
 3. THE Runtime SHALL set the child's `attempt` to 1 and `continued_execution_run_id` and `first_execution_run_id` to None, since the child is a fresh execution.
 
 ---

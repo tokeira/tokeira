@@ -836,7 +836,11 @@ fn retry_policy_to_domain(value: &common::RetryPolicy) -> RetryPolicy {
             value.initial_interval.as_ref(),
         )
         .unwrap_or(Duration::ZERO),
-        backoff_coefficient: if value.backoff_coefficient > 0.0 {
+        // Schedule create/update does not default the action. Retain zero so
+        // firing can apply workflow defaults without changing the stored action
+        // (service/frontend/workflow_handler.go:3812-3861,4528-4532;
+        // service/worker/scheduler/activities.go:67-74 @ v1.31.0).
+        backoff_coefficient: if value.backoff_coefficient >= 0.0 {
             value.backoff_coefficient
         } else {
             1.0

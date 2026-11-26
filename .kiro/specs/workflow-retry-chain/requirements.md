@@ -221,12 +221,21 @@ backoff math matches v1.31.0 (the tests assert the 1s `InitialInterval` default)
 
 #### Acceptance Criteria
 
-1. WHEN `StartWorkflowExecution` (and the start leg of any start-like RPC) supplies a `RetryPolicy`
-   with unset fields, THE Edge SHALL apply the v1.31.0 workflow retry-policy defaults
-   (`EnsureDefaults`, `retry_policy.go:32-67 @ v1.31.0`): `InitialInterval` 1s, `BackoffCoefficient` 2.0,
+1. WHEN `StartWorkflowExecution`, signal-with-start, multi-operation start, a schedule firing,
+   or a start-child or continue-as-new command supplies a `RetryPolicy` with unset fields,
+   THE system SHALL apply the v1.31.0 workflow retry-policy defaults before storing the new
+   run or recording its started event (`service/history/api/command_attr_validator.go:442,516,566-578` and `common/retrypolicy/retry_policy.go:32-56 @ v1.31.0`): `InitialInterval` 1s, `BackoffCoefficient` 2.0,
    `MaximumInterval` 100×`InitialInterval`, `MaximumAttempts` 0 (unlimited) unless set.
 2. THE activity-side `EnsureDefaults` already landed SHALL NOT be regressed; this requirement adds the
    workflow-start-side application.
+3. WHEN a workflow command omits its retry policy, THE translation SHALL preserve `None`;
+   WHEN its policy has explicitly set valid fields, THE translation SHALL preserve their values
+   (`service/history/api/command_attr_validator.go:570-578` and
+   `common/retrypolicy/retry_policy.go:40-56 @ v1.31.0`).
+4. WHEN a schedule is created or updated, THE system SHALL retain unset retry fields in its action;
+   WHEN that action fires, THE system SHALL default the start policy without rewriting the action
+   (`service/frontend/workflow_handler.go:3812-3861,4528-4532` and
+   `service/worker/scheduler/activities.go:67-74 @ v1.31.0`).
 
 ### Requirement 3.2: CLOSE_EVENT-Filtered Reads Follow the Chain
 

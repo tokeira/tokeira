@@ -175,10 +175,14 @@ Idempotency (Req 5.1.3): the successor id is fixed by the predecessor's committe
 
 ### Edge: start-time `EnsureDefaults` (Req 3.1)
 
-Apply v1.31.0 workflow retry-policy defaults at the start leg (edge translate): `InitialInterval` 1s,
+Apply v1.31.0 workflow retry-policy defaults at the start leg, start-child and continue-as-new
+command translation, and both schedule firing paths: `InitialInterval` 1s,
 `BackoffCoefficient` 2.0, `MaximumInterval` 100×`InitialInterval`, `MaximumAttempts` 0 (unlimited) unless
-set (`retry_policy.go:32-67 @ v1.31.0`). Needed for the tests' backoff math. Activity-side `EnsureDefaults`
-already landed and is not regressed.
+set (`service/history/api/command_attr_validator.go:442,516,566-578` and `common/retrypolicy/retry_policy.go:32-56 @ v1.31.0`). Reuse the workflow translation helper for commands; its domain defaulting
+function is shared with schedule firing in the runtime. Child initiated history and successor started
+history carry the normalized policy. Schedule create/update retains zero fields until firing
+(`service/frontend/workflow_handler.go:3812-3861,4528-4532`;
+`service/worker/scheduler/activities.go:67-74 @ v1.31.0`). Activity defaults are unchanged.
 
 ### Edge: CLOSE_EVENT chain-following (Req 3.2)
 

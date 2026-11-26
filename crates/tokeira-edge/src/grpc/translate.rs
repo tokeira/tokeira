@@ -927,42 +927,30 @@ fn activity_retry_policy_with_defaults(
     }
 }
 
-/// Apply v1.31.0 workflow-start retry-policy `EnsureDefaults` to a
-/// client-supplied policy, filling only unset subfields: InitialInterval 1s,
-/// BackoffCoefficient 2.0, MaximumInterval 100×InitialInterval, MaximumAttempts 0
-/// (unlimited) (`common/retrypolicy/retry_policy.go` `EnsureDefaults`, applied at
-/// StartWorkflowExecution via `workflow_handler.go:6600 @ v1.31.0`). Only called
-/// when the client actually supplied a policy, so an absent policy still means
-/// "no retry" (unlike activities, which always carry one). The runtime's retry
-/// evaluation depends on these defaults (e.g. the 1s InitialInterval drives the
-/// backoff that `TestWorkflowRetry` asserts), so defaulting here — not the
-/// generic `retry_policy_to_domain`, which uses BackoffCoefficient 1.0 — is what
-/// makes the workflow retry chain match the release.
+/// Normalize a supplied workflow policy before history and runtime state consume it.
+/// Both client starts and commands default before recording the policy
+/// (service/frontend/workflow_handler.go:6594-6602;
+/// service/history/api/command_attr_validator.go:442,516,566-578 @ v1.31.0).
+/// Callers preserve an absent policy rather than creating one.
 fn workflow_retry_policy_with_defaults(proto: &tokeira_proto::common::RetryPolicy) -> RetryPolicy {
-    let initial_interval =
-        retry_duration_to_time(proto.initial_interval.as_ref(), proto.maximum_attempts)
-            .filter(|interval| !interval.is_zero())
-            .unwrap_or(time::Duration::seconds(1));
-    let backoff_coefficient = if proto.backoff_coefficient > 0.0 {
-        proto.backoff_coefficient
-    } else {
-        2.0
-    };
-    let maximum_interval =
-        retry_duration_to_time(proto.maximum_interval.as_ref(), proto.maximum_attempts)
-            .filter(|interval| !interval.is_zero())
-            .unwrap_or(
-                initial_interval
-                    .saturating_mul(100)
-                    .min(time::Duration::seconds(3_153_600_000)),
-            );
-    RetryPolicy {
-        initial_interval,
-        backoff_coefficient,
-        maximum_interval: Some(maximum_interval),
+    tokeira_runtime::workflow_retry_policy_with_defaults(RetryPolicy {
+        initial_interval: retry_duration_to_time(
+            proto.initial_interval.as_ref(),
+            proto.maximum_attempts,
+        )
+        .unwrap_or(time::Duration::ZERO),
+        backoff_coefficient: if proto.backoff_coefficient > 0.0 {
+            proto.backoff_coefficient
+        } else {
+            0.0
+        },
+        maximum_interval: retry_duration_to_time(
+            proto.maximum_interval.as_ref(),
+            proto.maximum_attempts,
+        ),
         maximum_attempts: proto.maximum_attempts.max(0) as u32,
         non_retryable_error_types: proto.non_retryable_error_types.clone(),
-    }
+    })
 }
 
 fn parent_close_policy_to_domain(value: i32) -> ParentClosePolicy {
@@ -5560,7 +5548,10 @@ pub fn proto_command_to_workflow_command(
                     attrs.workflow_task_timeout.as_ref(),
                 )
                 .unwrap_or(time::Duration::seconds(10)),
-                retry_policy: attrs.retry_policy.as_ref().map(retry_policy_to_domain),
+                retry_policy: attrs
+                    .retry_policy
+                    .as_ref()
+                    .map(workflow_retry_policy_with_defaults),
                 header: attrs.header.as_ref().map(headers_to_domain),
                 initial_versioning_behavior: continue_as_new_behavior_from_proto(
                     attrs.initial_versioning_behavior,
@@ -5630,7 +5621,10 @@ pub fn proto_command_to_workflow_command(
                     attrs.workflow_task_timeout.as_ref(),
                 )
                 .unwrap_or(time::Duration::seconds(10)),
-                retry_policy: attrs.retry_policy.as_ref().map(retry_policy_to_domain),
+                retry_policy: attrs
+                    .retry_policy
+                    .as_ref()
+                    .map(workflow_retry_policy_with_defaults),
                 cron_schedule: non_empty(attrs.cron_schedule),
                 parent_close_policy: parent_close_policy_to_domain(attrs.parent_close_policy),
                 reuse_policy: extract_reuse_policy(attrs.workflow_id_reuse_policy),

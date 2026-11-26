@@ -1,0 +1,5 @@
+kind: fixed
+body: Child workflows, continue-as-new runs and scheduled starts now fill unset retry policy fields with v1.31.0's defaults, so their retries back off as they do there.
+time: 2026-11-25T00:00:00+00:00
+custom:
+    Slice: d6546575-5cb9-4f85-aa15-302726a4f405

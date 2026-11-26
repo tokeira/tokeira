@@ -123,7 +123,7 @@ Fix the edge history serializer to emit authoritative data for all classified pr
     - _Requirements: 2.13, 2.14, 2.15, 2.16, 2.17_
 
   - [x] 5.4 Add enrichment fields to child workflow events in `event.rs`
-    - Extend `WorkflowCommand::StartChildWorkflow` and `StartChildWorkflowExecutionCommandAttributes` translation to carry SDK command attributes currently dropped by edge translation: header, memo, search attributes, workflow execution/run/task timeouts, retry policy, cron schedule, and human-readable namespace name when available
+    - Extend `WorkflowCommand::StartChildWorkflow` and `StartChildWorkflowExecutionCommandAttributes` translation to carry SDK command attributes currently dropped by edge translation: header, memo, search attributes, workflow execution/run/task timeouts, retry policy after filling unset fields (absence remains `None`; `service/history/api/command_attr_validator.go:442,516,566-578` and `common/retrypolicy/retry_policy.go:32-56 @ v1.31.0`), cron schedule, and human-readable namespace name when available
     - Add `namespace: Option<String>`, `header: Option<Headers>`, `memo: Memo`, `search_attributes: SearchAttributes`, `workflow_execution_timeout: Option<Duration>`, `workflow_run_timeout: Option<Duration>`, `workflow_task_timeout: Duration`, `retry_policy: Option<RetryPolicy>`, `cron_schedule: Option<String>` to `StartChildWorkflowExecutionInitiated`
     - Add `workflow_type: WorkflowType` to `ChildWorkflowState` and populate it when the child-start command creates the child state
     - Persist `child_run_id` in `ChildWorkflowState` when `ChildWorkflowExecutionStarted` is processed, then reuse it when emitting terminal child events

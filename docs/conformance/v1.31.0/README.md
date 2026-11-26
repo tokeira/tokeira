@@ -85,6 +85,13 @@ The discipline (`AGENTS.md` §8): *reading* Temporal source to determine the con
 *copying* its implementation is forbidden. The test of correctness is "does the response match what
 v1.31.0 would return for the same execution lineage?"
 
+Tier 1 [behavioural conformance](../../../.kiro/specs/conformance-harness/design.md)
+checks an independent model against recorded v1.31.0 runs, then checks Tokeira through
+direct service calls, generated interleavings, and invariants. Its planned ledger in
+`docs/conformance` records evidence per RPC, decision, and area. Tier 2 continues to
+run the Go functional suites over gRPC; recordings of those suites on v1.31.0 can
+also feed the Tier 1 corpus.
+
 ## Contents of this folder
 
 - [`supported.md`](./supported.md) — the v1.31.0 surface conformance targets (GA + Public Preview),

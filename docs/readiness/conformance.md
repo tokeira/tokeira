@@ -31,7 +31,7 @@ Implementer Mandate in FINDINGS — "a wrong guess behind a green check bakes in
 | Tier | What it proves | Owning spec | State |
 |------|----------------|-------------|:-----:|
 | Compatibility surface/metadata | The claim is explicit, queryable, pinned | `temporal-compatibility`, `temporal-compatibility-surface` | 🟡 |
-| Tier-1 in-process oracle | Responses + history match v1.31.0, RPC coverage gate | `conformance-harness` (`tokeira-conformance` crate) | ⬜ not built |
+| Tier-1 behavioural conformance | Independent model, recorded corpus, interleavings, invariants, and RPC coverage gate | [conformance-harness](../../.kiro/specs/conformance-harness/design.md) | ⬜ not built |
 | Tier-2 functional corpus | Temporal's own Go suites pass over gRPC | `temporal-functional-conformance` | 🟡 partial |
 
 ## Tier-2 functional corpus — cluster status
@@ -161,9 +161,12 @@ live DSQL and embedded snapshot recovery are outside its evidence.
 
 ## Tier-1 + compatibility infra — outstanding
 
-- **`conformance-harness`**: the `tokeira-conformance` crate is **not yet built** — TestCluster
-  fixture, WorkerPoller, ExpectedHistory matcher, the 121-RPC coverage manifest + gate, three-way
-  reconciliation, report, CLI, CI wiring.
+- **[Behavioural conformance](../../.kiro/specs/conformance-harness/design.md)** is **not yet built**.
+  Tier 1 uses direct service calls, a scripted worker, an independent model, recorded v1.31.0
+  cases, and invariants. The descriptor-derived manifest retains the 121-method target surface
+  and classifies newer wire methods separately. The state-aware gate and bounded Dagger runs
+  feed a planned behavioural ledger in `docs/conformance`. See the
+  [build tasks](../../.kiro/specs/conformance-harness/tasks.md). Tier 2 stays unchanged.
 - **`temporal-compatibility`** (tasks.md, 9 top-level tasks open): matrix-completeness properties (3),
   kernel `cfg_feature!` adoption (4), edge `dispatch_rpc` adoption (5), the Buffa/connect-rust
   compatibility service (7), the `tkr compat` CLI (8), the CI checks (9), the Dagger compatibility module

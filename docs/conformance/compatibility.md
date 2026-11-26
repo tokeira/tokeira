@@ -31,6 +31,12 @@ classified exactly once. Current states are:
 `tkr compat show` reads the local binary metadata and prints the matrix summary.
 `tkr compat show --json` emits a document suitable for `tkr compat diff`.
 
+Tier 1 [behavioural conformance](../../.kiro/specs/conformance-harness/design.md)
+consumes this matrix directly. Its descriptor-derived manifest covers the 121 target
+RPCs and classifies newer wire methods separately. An implemented RPC needs an
+executed, passing behavioural scenario. Model, corpus, and invariant evidence feed
+the planned behavioural ledger; Tier 2 keeps its existing suite classification.
+
 ## SDK Matrix
 
 `crates/tokeira-compatibility/src/sdk.rs` owns `SDK_MATRIX`. Each SDK entry

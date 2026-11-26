@@ -1,196 +1,312 @@
-# Requirements Document
+# Requirements Document: Behavioural Conformance
 
 ## Introduction
 
-The conformance harness (`crates/tokeira-conformance`) is an executable oracle for Tokeira's public
-gRPC surface. It boots the real in-process stack — tonic gRPC server over `tokeira-edge` over
-`TokeiraRuntime` over `InMemoryStore` with projection workers — drives RPCs through real
-`WorkflowServiceClient` / `OperatorServiceClient` connections, and asserts both the RPC response and the
-emitted `HistoryEvent` sequence against the behaviour of the targeted Temporal release
-(`TEMPORAL_SERVER_COMPAT` = v1.31.0; vendored API `TEMPORAL_PROTO_VERSION` = v1.62.11). It then emits a
-machine-checked conformance report and enforces a coverage gate over the full RPC surface so coverage
-cannot silently regress.
+These requirements derive from [the design](design.md). Behavioural conformance is
+Tier 1: independent decision oracles, generated interleavings, recorded differential
+cases, simulation faults, and optional TLA+ trace checks, in that order. The target is
+Temporal v1.31.0 behaviour on the vendored v1.62.11 wire API. The model is derived
+from source at the tag; recordings validate it before it judges Tokeira.
 
-These requirements are **derived from** the approved design document (`design.md`) and state WHAT the
-harness must do. The design states HOW. Because the harness is correctness-critical test infrastructure,
-its own "correctness" is that its verdicts are sound (it never reports green over an uncovered or
-divergent RPC) and its fixture is hermetic (no live AWS, Docker, or network dependency, and no leaked
-ports or background tasks). Every Correctness Property in the design maps to one or more acceptance
-criterion below.
+The planned crates are `tokeira-behaviour-model` and `tokeira-behaviour-harness`.
+The latter calls the real edge service objects directly in its deterministic fixture.
+Tier 2 remains the Go functional suites against `tokeirad` through the fork. Its
+Temporal recordings can contribute corpus evidence without moving the suites into
+Tier 1. The [conformance definition](../../../docs/conformance/v1.31.0/README.md)
+continues to define the public contract.
 
 ## Glossary
 
-- **Harness**: The `tokeira-conformance` crate as a whole (library + integration tests + CLI binary).
-- **TestCluster**: The fixture that boots the real in-process Tokeira stack and holds the connected
-  clients, the `InMemoryStore` handle, and the teardown guard.
-- **WorkerPoller**: The worker-side primitive that drives poll → respond loops for workflow tasks,
-  activity tasks, and heartbeats over real gRPC.
-- **History_Matcher**: The `ExpectedHistory` DSL and its matcher, which assert an expected
-  `HistoryEvent` sequence/shape against the actually emitted history.
-- **Coverage_Manifest**: The checked-in enumeration (`manifest.toml`) of every targeted RPC, each row
-  carrying an `RpcKey`, service, group, and status.
-- **Coverage_Gate**: The component that folds registered test tags against the `Coverage_Manifest` and
-  produces a coverage verdict.
-- **Reconciliation**: The three-way check between the served surface, the `Coverage_Manifest`, and the
-  tracker.
-- **Served_Surface**: The set of RPC keys derived at runtime from
-  `tokeira_proto::public::FILE_DESCRIPTOR_SET` — the authoritative wire shape.
-- **Tracker**: `.kiro/specs/api-conformance-tracker/tracker.md`, the human/Codex-maintained
-  field-threading plan.
-- **Tag_Registry**: The collection of per-test RPC tags (`RpcKey`s) gathered across the suite for the
-  `Coverage_Gate` to fold.
-- **Conformance_Report**: The first-class output artifact aggregating run metadata, per-RPC verdicts,
-  coverage summary, and reconciliation result; emitted as human text or JSON.
-- **Conformance_CLI**: The `tokeira-conformance` binary exposing `run`, `coverage`, `list-rpcs`, and
-  `verify-manifest`.
-- **CI_Pipeline**: The workspace CI workflow (`.github/workflows/ci.yml`) that runs the harness.
-- **RpcKey**: A stable RPC identity, the fully-qualified `service/method`
-  (e.g. `temporal.api.workflowservice.v1.WorkflowService/StartWorkflowExecution`).
-- **Deferred RPC**: An RPC whose tracker status is `Deferred`; exempt from the coverage requirement
-  until promoted.
+- **Model:** independent pure decisions and observable state machine for v1.31.0.
+- **Rule:** a model decision or transition with a source function, path, line range,
+  tag, and source digest.
+- **Scenario:** setup, workflow programs, and ordered or overlapping action data.
+- **Scripted Worker:** the harness's interpreter of workflow programs and task histories.
+- **Lifecycle Table:** legal states and event transitions for a command kind.
+- **Direct Cluster:** isolated real edge/runtime/kernel stack on in-memory storage.
+- **Scheduler:** seeded selection of tasks at store calls and notification sends.
+- **Pass:** one invocation of real background work without its periodic loop.
+- **Witness:** invocation/return boundaries, applied commit order, and read observation
+  points used to test a legal order of overlapping calls.
+- **Replay Case:** versioned scenario, seed, choices, fault choices, and failure identity.
+- **Corpus:** checked-in normalized recordings from Temporal built at v1.31.0.
+- **Calibration:** successful model and lifecycle-table comparison with the corpus.
+- **Source-only Rule:** a rule whose inputs no recording can reach, such as an exact
+  instant; it judges on its cited source alone, and its evidence carries that label.
+- **Quiescence:** bounded completion of due work and projection to a declared condition.
+- **RPC Key:** fully qualified service and method identity derived from descriptors.
+- **Manifest:** complete descriptor-derived RPC set with catalog annotations.
+- **Axis K:** Tokeira's implementation state in the existing `FEATURE_MATRIX`.
+- **Behavioural Evidence:** an executed, checked, passing scenario using a calibrated or
+  source-only model rule, or the corpus, with observed RPCs and revision provenance.
+- **Sometimes Counter:** count of a declared multi-step situation that must occur.
+- **Ledger:** planned page with RPC, decision, and area evidence and verdicts.
+- **DSQL Campaign:** local sequential and concurrent cases on an ephemeral DSQL cluster.
+- **Fault Adapter:** mapping of scenario steps into the existing turmoil simulation.
+- **Trace Check:** finite abstract action validation against a repository TLA+ model.
+
+## Target State and evidence
+
+The full descriptor surface is accounted for. At the current pins it contains 129
+methods: 121 from the target release and eight newer wire methods. Newer methods
+remain separate from the target denominator. Model gaps remain invariants-only;
+coverage never implies that untested decisions agree.
+
+Current integration points are the service objects in
+`crates/tokeira-edge/src/grpc/`, the store pause fixture in
+`crates/tokeira-runtime/src/runtime/repair_tests.rs`, the crate-private clock and
+scanner passes in `crates/tokeira-runtime/src/`, and the existing compatibility
+catalog in `crates/tokeira-compatibility/src/matrix.rs`. Design §2 records these seams.
+Design §§3 and 10 contain the pinned source evidence for concrete behavioural rules.
+No expected result is derived from Tokeira's implementation.
+
+## Contract policy
+
+| Surface | Required policy | Invalid or missing input | Effect |
+|---|---|---|---|
+| Scenario and replay fields | Versioned, typed, state-valid, deterministic bindings | Reject dangling handles, invalid versions, or empty selections | No passing evidence |
+| Rule and lifecycle evidence | Tagged source ranges, and corpus calibration or a stated source-only reason | Reject missing citations, failed calibration, or a missing reason | Block affected behavioural verdicts |
+| Corpus records | Canonical header/response/event lines; explicit normalization | Reject malformed, unknown, or unproven records | No partial corpus acceptance |
+| Manifest annotations | Complete descriptor/catalog/adapter equality | List missing, stale, duplicate, or unknown keys | Gate fails |
+| Ledger records | Separate RPC, decision, and area data with provenance | Reject stale success claims and missing reasons | Preserve gaps and mismatches |
+| Budgets and progress | Finite steps, virtual horizon, fair-pass assumptions | Classify exhaustion or missing obligations as incomplete | Nonzero run outcome |
 
 ## Requirements
 
-### Requirement 1: In-process TestCluster fixture
+### Requirement 1: Architecture and direct fixture
 
-**User Story:** As a conformance-test author, I want a reusable fixture that boots the real Tokeira stack
-in-process and tears it down cleanly, so that I can drive RPCs over real gRPC without any external
-dependency and without leaking resources between tests.
+**User Story:** As a maintainer, I want one layered Tier 1 harness over the real stack,
+so that its evidence measures the implementation and complements Tier 2.
 
-#### Acceptance Criteria
-
-1. WHEN a test starts a cluster via `TestCluster::builder().start()` or `TestCluster::start_default()`, THE TestCluster SHALL, within 10 seconds, boot the in-process stack (tonic gRPC server, `tokeira-edge`, `TokeiraRuntime`, `InMemoryStore`, and projection workers) and return a `WorkflowServiceClient` and an `OperatorServiceClient` each able to complete at least one RPC without a transport-level connection error, plus an `InMemoryStore` handle.
-2. THE TestCluster SHALL use `InMemoryStore` persistence and a loopback (`127.0.0.1`) gRPC endpoint, with no AWS, Docker, or network dependency.
-3. WHEN two TestCluster instances run concurrently, THE TestCluster SHALL bind distinct ephemeral loopback ports and own distinct `InMemoryStore` instances, such that state mutated through one instance is not observable through the other.
-4. WHEN a test calls `TestCluster::shutdown`, THE TestCluster SHALL, within 5 seconds, release the bound port (such that the port is re-bindable) and cancel every projection worker (such that every projection `JoinHandle` has completed), such that no background task survives the fixture.
-5. IF a test panics while holding a TestCluster, THEN THE TestCluster SHALL signal shutdown and abort projection tasks on `Drop`, such that the bound port and background workers are released.
-6. THE TestClusterBuilder default configuration SHALL reproduce the existing `spawn_test_server` wiring: one `default` namespace, 16 visibility partitions, 4 runtime execution lanes, and `Default` values for the `LaneConfig`, `TimerScannerConfig`, `WorkflowTimeoutScannerConfig`, and `BacklogConfig` runtime configs.
-7. WHEN a test calls `fetch_history` for an existing execution, THE TestCluster SHALL return the full forward `HistoryEvent` sequence read from the authoritative transition log — ascending by `event_id` from 1, contiguous (no gaps), and untruncated — draining all history pages.
-8. IF cluster startup fails (for example a port bind failure), THEN THE TestCluster SHALL return `ConformanceError::Startup` rather than panicking.
-9. IF a test calls `fetch_history` for an execution that does not exist, THEN THE TestCluster SHALL return `ConformanceError::Rpc` carrying a not-found status rather than an empty sequence or a panic.
-
-### Requirement 2: Worker-poller primitive
-
-**User Story:** As a conformance-test author, I want a worker-poller that polls tasks and responds with
-commands, so that I can advance a workflow past `StartWorkflowExecution` and exercise behaviour that is
-otherwise unreachable.
+**Trace:** Design §§1–2, 5; Properties 7, 20.
 
 #### Acceptance Criteria
 
-1. WHEN a test polls a workflow task through the WorkerPoller and a task is available, THE WorkerPoller SHALL issue a real long-poll and return a `WorkflowTask` carrying a non-empty task token, a positive started event id, the attached decision history, and the workflow execution identifiers (workflow id and run id).
-2. WHEN a test responds to a polled workflow task with a command list, THE WorkerPoller SHALL submit `RespondWorkflowTaskCompleted` and return the response, including the case of an empty command list.
-3. WHEN a test responds to a polled workflow task with a failure cause, THE WorkerPoller SHALL submit `RespondWorkflowTaskFailed`.
-4. WHEN a test polls an activity task through the WorkerPoller and a task is available, THE WorkerPoller SHALL return an `ActivityTask` carrying its task token, activity id, activity type, and input.
-5. WHEN a test completes or fails a polled activity task through the WorkerPoller, THE WorkerPoller SHALL submit the corresponding `RespondActivityTaskCompleted` or `RespondActivityTaskFailed` and return success.
-6. WHEN a test records an activity heartbeat through the WorkerPoller, THE WorkerPoller SHALL submit `RecordActivityTaskHeartbeat` and return the response, including its cancel-requested flag.
-7. WHILE awaiting a task, THE WorkerPoller SHALL bound each long-poll by a configurable poll budget (default 10 seconds; any strictly positive `Duration`) and rely on long-poll plus bounded-retry synchronization rather than explicit sleeps.
-8. IF no task becomes available within the poll budget, THEN THE WorkerPoller SHALL return `None` from a `poll_*` call (or `ConformanceError::PollTimeout` from the ergonomic completion helper), distinguishing "no task available" from a hang.
-9. IF a poll or respond call fails at the transport layer or is rejected by the server (for example a malformed, unknown, or expired task token), THEN THE WorkerPoller SHALL return `ConformanceError::Transport` or `ConformanceError::Rpc` preserving the `tonic::Status` rather than panicking.
+1. WHEN the harness enables a layer, THE Harness SHALL require its predecessors in the order decision oracles, generated interleavings, differential runs, simulation faults, and optional trace checks.
+2. WHEN a deterministic fixture invokes an RPC, THE Direct Cluster SHALL call `WorkflowServiceGrpc` or `OperatorServiceGrpc` through its service trait without sockets or loopback gRPC.
+3. WHEN two fixtures execute, THE Direct Cluster SHALL isolate their stores, identities, and task ownership.
+4. WHEN a fixture ends normally or fails, THE Direct Cluster SHALL cancel and join all owned tasks before teardown completes.
+5. WHEN history is requested, THE Direct Cluster SHALL drain all pages and preserve the service response or status, including metadata and typed details.
+6. WHEN Tier 1 consumes Tier 2 evidence, THE Harness SHALL preserve suite provenance and the shared feature-matrix classification without changing Tier 2 execution or outcome rules.
 
-### Requirement 3: History-event assertions
+### Requirement 2: Independent reference model
 
-**User Story:** As a conformance-test author, I want to assert the emitted `HistoryEvent` sequence and
-shape against the v1.31.0 expected behaviour, so that conformance is proven at the history level and not
-only at the RPC response.
+**User Story:** As a maintainer, I want expectations derived independently from the
+target, so that an engine defect cannot validate itself.
+
+**Trace:** Design §§2–3, 7–8; Properties 4, 10, 13.
 
 #### Acceptance Criteria
 
-1. WHEN a test calls `ExpectedHistory::assert_matches` against emitted history, THE History_Matcher SHALL align expected events to actual `HistoryEvent`s positionally and in order under the active match mode, verify each expected event's `EventType` and any opt-in attribute or placement assertion, and return `Ok` when all expected events match.
-2. THE History_Matcher SHALL support match modes `Exact` (the script and the actual history have equal length and every position matches), `Prefix` (the script matches the actual history's leading events and the actual history is at least as long as the script), and `ContiguousSubsequence` (the script matches some contiguous run of actual events).
-3. IF the emitted history diverges from the script, THEN THE History_Matcher SHALL return `ConformanceError::HistoryMismatch` whose `step` is the zero-based script index of the first event that diverges in type or attribute and whose `reason` describes the divergence.
-4. WHERE an expected event carries a placement or attribute assertion closure (for example signal links on the outer `HistoryEvent.links`, field 302), THE History_Matcher SHALL evaluate the closure against the matched event and, IF the closure returns `Err`, SHALL treat that event's step as a divergence and surface the closure's error text in `reason`.
-5. WHERE an `ExpectedHistory` encodes a non-obvious expectation, THE History_Matcher SHALL carry a non-empty `ground_truth` citation string referencing a `proto/upstream/` path or Temporal server source at tag v1.31.0.
-6. THE History_Matcher SHALL derive its verdict solely from the emitted `HistoryEvent`s passed to it, reading no runtime, storage, or projection internals.
-7. IF the actual history is shorter than the script, or has unequal length under `Exact`, or contains no matching window under `ContiguousSubsequence`, THEN THE History_Matcher SHALL return `ConformanceError::HistoryMismatch` identifying the first unsatisfied script step rather than panicking or indexing out of bounds.
+1. WHEN a model rule is introduced, THE Model SHALL derive its behaviour from v1.31.0 source independently of Tokeira code and specifications, separately from engine fixes.
+2. WHEN model dependencies are checked, THE Model SHALL reject dependencies on Tokeira kernel, runtime, edge, storage, and compatibility policy.
+3. WHEN a rule catalog is validated, THE Model SHALL require each rule's source function, path, inclusive existing line range at v1.31.0, matching source digest, and evidence for every decision row.
+4. WHEN an action lacks a calibrated or source-only model rule, THE Harness SHALL mark that action's coverage as invariants-only rather than model agreement.
+5. WHEN a rule that a recording can reach is used for behavioural evidence, THE Harness SHALL require successful calibration against the recorded corpus first.
+6. WHEN no recording can reach a rule's inputs, such as an exact instant, THE Harness SHALL accept the rule's cited source alone, with the stated reason, and label that evidence source-only.
 
-### Requirement 4: Coverage manifest and gate
+### Requirement 3: Scenarios, generation, and shrinking
 
-**User Story:** As a harness maintainer, I want a checked-in manifest enumerating every RPC plus a gate
-that fails when a served RPC has no behavioural test, so that coverage cannot silently regress and the
-tracker's hand-maintained number is replaced with a machine-verified one.
+**User Story:** As a scenario author, I want generated interleavings that shrink to
+reproducible cases, so that a failure is small enough to explain.
 
-#### Acceptance Criteria
-
-1. THE Coverage_Manifest SHALL enumerate every RPC of the targeted surface (the 121 RPCs of the WorkflowService and OperatorService surfaces for Temporal v1.31.0 / API v1.62.11), each row carrying a unique `RpcKey` (no `RpcKey` appears twice), a service, a group, and a status drawn from `Implemented`, `Partial`, `Stubbed`, or `Deferred`.
-2. WHEN a behavioural test declares the RPC(s) it exercises by tag, THE Tag_Registry SHALL record those `RpcKey`s, including the case where a single test tags multiple RPCs.
-3. WHEN the Coverage_Gate folds the Tag_Registry against the Coverage_Manifest, THE Coverage_Gate SHALL pass only if every non-`Deferred` RPC has at least one tagged behavioural test.
-4. IF any non-`Deferred` RPC has zero tagged behavioural tests, THEN THE Coverage_Gate SHALL fail and SHALL enumerate every such uncovered RPC by `RpcKey`.
-5. THE Coverage_Gate SHALL compute the coverage percentage as the count of non-`Deferred` RPCs with at least one tagged test, divided by the total count of non-`Deferred` RPCs, multiplied by 100, expressed in the range 0.00–100.00 rounded to two decimal places.
-6. IF the Coverage_Manifest contains no non-`Deferred` RPC, THEN THE Coverage_Gate SHALL report a coverage percentage of 100.00 and pass.
-7. IF the Tag_Registry contains a tag whose `RpcKey` is absent from the Coverage_Manifest, THEN THE Coverage_Gate SHALL fail and SHALL identify that `RpcKey`.
-
-### Requirement 5: Three-way reconciliation
-
-**User Story:** As a harness maintainer, I want the served surface, the manifest, and the tracker
-reconciled, so that no RPC can drift between the wire, the executable artifact, and the planning ledger.
+**Trace:** Design §4; Property 2.
 
 #### Acceptance Criteria
 
-1. THE Reconciliation SHALL derive the Served_Surface as the set of RpcKeys, one per service method, enumerated from `tokeira_proto::public::FILE_DESCRIPTOR_SET`.
-2. IF the Served_Surface contains one or more RPCs absent from the Coverage_Manifest, THEN THE Reconciliation SHALL return an error listing every such RpcKey in `missing_from_manifest`.
-3. IF the Coverage_Manifest and the Tracker disagree on any RPC — an RpcKey present in one but not the other, or an RpcKey present in both with differing status — THEN THE Reconciliation SHALL return an error listing every such mismatch in `tracker_drift`.
-4. WHEN the Coverage_Manifest contains every RpcKey of the Served_Surface (equal or proper superset) and the Coverage_Manifest's RpcKey set and per-RPC status are identical to the Tracker's, THE Reconciliation SHALL succeed with both `missing_from_manifest` and `tracker_drift` empty.
-5. THE Reconciliation SHALL reconcile RPC identity and status only, parsing the Tracker's RPC tables without consuming the Tracker's field-level detail.
-6. IF the Tracker's RPC tables cannot be parsed into an RpcKey-and-status list, THEN THE Reconciliation SHALL return an error indicating the parse failure rather than reporting a clean reconciliation.
+1. WHEN a scenario is decoded, THE Harness SHALL support versioned setup, programs, client calls, polls, responses, heartbeats, advances, passes, overlaps, and bounded quiescence.
+2. WHEN scenarios are generated, THE Generator SHALL use `proptest-state-machine` with state-valid handles and explicit negative-request cases.
+3. WHEN a failure is shrunk, THE Shrinker SHALL simplify steps, arguments, programs, overlaps, and choices while retaining valid references and the same failure identity.
+4. WHEN a failing case is saved, THE Harness SHALL store the explicit scenario, seed, choice vector, fault choices, versions, fingerprints, mode, and failure identity defined in Design §4.
+5. WHEN a minimized artifact is replayed with its recorded versions, THE Harness SHALL reproduce its failure without depending on regeneration from the original seed.
 
-### Requirement 6: Conformance report
+### Requirement 4: Deterministic scheduling and time
 
-**User Story:** As a harness maintainer and CI consumer, I want a machine-checked conformance report,
-so that each run is auditable, diffable, and able to drive the build outcome.
+**User Story:** As a maintainer, I want explicit time and scheduling choices, so that
+internal interleavings can be repeated and simplified.
 
-#### Acceptance Criteria
-
-1. THE Conformance_Report SHALL include run metadata: `temporal_server_compat` (`1.31.0`), `temporal_proto_version` (`v1.62.11`), the `tokeira-conformance` crate version, and an RFC3339-formatted UTC timestamp recording when the run completed.
-2. THE Conformance_Report SHALL include (a) one per-RPC row for every RPC in the Coverage_Manifest, each carrying its `RpcKey`, group, status, the count of tagged behavioural tests (an integer of 0 or greater), and exactly one behavioural verdict drawn from `Pass`, `Fail`, `NotCovered`, or `Deferred`; (b) a coverage summary carrying the covered count, the total non-`Deferred` count, the coverage percentage, and a per-group breakdown of covered and total counts for each group; and (c) the reconciliation result.
-3. WHEN a Conformance_Report is serialized to JSON and subsequently deserialized, THE Conformance_Report SHALL produce a value equal to the original in every field, with no field omitted, added, or altered.
-4. THE Conformance_Report SHALL be emittable in a human-readable text form and in a JSON form, both conveying the same run metadata, per-RPC rows, coverage summary, and reconciliation result.
-5. THE `passed()` method of the Conformance_Report SHALL return true if and only if (a) every non-`Deferred` RPC row has verdict `Pass`, (b) every non-`Deferred` RPC has at least one tagged behavioural test (coverage percentage equals 100), and (c) the reconciliation result's `missing_from_manifest` and `tracker_drift` lists are both empty.
-6. WHEN the Conformance_Report assigns a row's behavioural verdict, THE Conformance_Report SHALL set it to `Deferred` if the RPC's status is `Deferred`; otherwise to `NotCovered` if the RPC has zero tagged behavioural tests; otherwise to `Fail` if at least one of its tagged behavioural cases failed; otherwise to `Pass`.
-7. IF an RPC's behavioural verdict is `Fail`, THEN THE Conformance_Report SHALL include in that row the name of the first failing behavioural case and a reason indicating the divergence that caused the failure.
-8. THE `passed()` result SHALL determine the Conformance_CLI exit code (0 when `passed()` is true, a non-zero code when false) and the gate `#[test]` outcome (passing when true, failing when false).
-
-### Requirement 7: CLI surface
-
-**User Story:** As an operator, I want `run`, `coverage`, `list-rpcs`, and `verify-manifest` commands
-with correct exit codes, so that I can execute conformance checks locally and in automation.
+**Trace:** Design §5; Properties 1, 11.
 
 #### Acceptance Criteria
 
-1. WHEN `run` is invoked without filters, THE Conformance_CLI SHALL boot a TestCluster, execute all tagged conformance cases, and emit a Conformance_Report.
-2. WHEN `coverage` is invoked, THE Conformance_CLI SHALL compute and print the coverage gate result by folding the Tag_Registry against the Coverage_Manifest, without re-running cases.
-3. WHEN `list-rpcs` is invoked, THE Conformance_CLI SHALL print the Coverage_Manifest.
-4. WHEN `verify-manifest` is invoked, THE Conformance_CLI SHALL run only the three-way Reconciliation.
-5. WHERE `--format json` is set, THE Conformance_CLI SHALL emit the report as JSON; otherwise (the default) THE Conformance_CLI SHALL emit the human-readable form.
-6. IF a produced report has `passed()` equal to false (a failed case, a coverage gap, or manifest drift), THEN THE Conformance_CLI SHALL exit with code 1; WHEN `passed()` is true, THE Conformance_CLI SHALL exit with code 0.
-7. WHEN `run` is invoked with `--group` and/or `--rpc` filters, THE Conformance_CLI SHALL execute only the cases matching the filter (the intersection when both are given) and emit a Conformance_Report scoped to them.
-8. IF a `run` filter matches zero cases, THEN THE Conformance_CLI SHALL exit with code 1 rather than emitting a passing report over an empty case set.
-9. IF the CLI cannot complete a command (for example cluster startup failure, an unparseable Coverage_Manifest or Tracker, or an invalid filter value), THEN THE Conformance_CLI SHALL surface an error indicating the cause and exit with code 1 rather than emitting a passing report.
+1. WHEN an L2 run executes, THE Scheduler SHALL use a current-thread runtime, paused time, an injected clock, seeded identities, and stable runnable ordering without implicit time advancement.
+2. WHEN any in-memory store operation or runtime notification send occurs, THE Scheduler SHALL observe it through the two test-only hooks and apply the recorded scheduling or delivery choice.
+3. WHEN a background step executes, THE Direct Cluster SHALL invoke the real single pass through test support with periodic loops disabled.
+4. WHEN a bounded case contains two or three overlapping calls on one run, THE Scheduler SHALL enumerate its relevant store schedules or report incomplete exploration if the declared bound is exceeded.
+5. WHEN a failed run is repeated, THE Harness SHALL require the same trace and classify any change as nondeterminism before trusting shrinking.
 
-### Requirement 8: CI integration
+### Requirement 5: Overlap witnesses and store faults
 
-**User Story:** As a harness maintainer, I want the coverage gate to run both as a `cargo test` and as a
-CLI step that publishes the JSON report, so that local runs catch regressions and CI publishes an
-auditable artifact.
+**User Story:** As a maintainer, I want overlapping results checked against a legal
+public call order, so that internal races cannot hide behind successful commits.
+
+**Trace:** Design §§5, 7; Properties 9, 12.
 
 #### Acceptance Criteria
 
-1. THE Coverage_Gate SHALL be implemented as a Rust `#[test]` located at `tests/coverage_gate.rs`, executable under `cargo test --workspace` using only the standard cargo toolchain and requiring no additional installed tooling.
-2. WHEN the CI_Pipeline runs the conformance step, THE CI_Pipeline SHALL invoke the Conformance_CLI `coverage --format json` command.
-3. IF any non-`Deferred` RPC has zero tagged behavioural tests, or the three-way Reconciliation reports drift between the Served_Surface, the Coverage_Manifest, and the Tracker, THEN THE CI_Pipeline SHALL fail the conformance step with a non-zero outcome.
-4. THE gate `#[test]` and the CLI `coverage` step SHALL read the identical checked-in Coverage_Manifest (`manifest.toml`) and the identical Tag_Registry, such that both yield the same coverage verdict for a given workspace state.
-5. IF any non-`Deferred` RPC has zero tagged behavioural tests, or the three-way Reconciliation reports drift, THEN THE Coverage_Gate `#[test]` SHALL fail, such that `cargo test --workspace` reports a non-zero result.
-6. WHEN the conformance step's `coverage --format json` command completes, THE CI_Pipeline SHALL publish the emitted JSON Conformance_Report as a downloadable build artifact, regardless of whether the coverage gate passed or failed.
-7. IF the `coverage` command cannot read the Coverage_Manifest or derive the Served_Surface, THEN THE CI_Pipeline SHALL fail the conformance step and surface an error indicating the cause.
+1. WHEN calls overlap, THE Harness SHALL record invocation/return boundaries, actual mutation commit order, and read or no-op observation points.
+2. WHEN a witness is accepted, THE Checker SHALL preserve completed-before-started order, actual commits, admissible read cuts, and the model's public atomicity contract.
+3. WHEN a serialization conflict or timeout-before-apply is injected, THE Checker SHALL require no applied transition from that failed store attempt.
+4. WHEN a reply is lost after apply, THE Checker SHALL retain applied or unapplied outcomes only as allowed by subsequent observations and SHALL detect duplicate effects on retry.
+5. WHEN notifications are dropped, THE Checker SHALL require discovery within the declared period once the relevant pass receives its fair turn.
+6. WHEN a stale outside-lane decision or competing remover acts, THE Checker SHALL require commit revalidation and the row's designated lifecycle authority.
 
-### Requirement 9: Maximal coverage intent and Deferred lifecycle
+### Requirement 6: Scripted worker and replay
 
-**User Story:** As a harness maintainer, I want the harness to target the full public RPC surface with
-`Deferred` RPCs exempt until promoted, so that the gate expresses maximal coverage intent while not
-blocking on RPCs that are not yet claimed for v1.31.0 behaviour.
+**User Story:** As a scenario author, I want one scripted worker for both systems,
+so that worker behaviour does not change the comparison.
+
+**Trace:** Design §§4, 6; Property 8.
 
 #### Acceptance Criteria
 
-1. THE Coverage_Manifest SHALL enumerate every RPC of the WorkflowService and OperatorService surfaces (all 121 RPCs of the v1.31.0 / v1.62.11 target) as a manifest row, with no RPC of those two services absent.
-2. WHERE an RPC has status `Deferred`, THE Coverage_Gate SHALL exempt that RPC from the coverage requirement: it requires no tagged behavioural test, it is excluded from the non-`Deferred` denominator, and the gate does not fail on its account.
-3. WHEN a `Deferred` RPC's status changes to any non-`Deferred` status in the Coverage_Manifest, THE Coverage_Gate SHALL require at least one tagged behavioural test for that RPC and SHALL include it in the non-`Deferred` denominator.
-4. IF a non-`Deferred` RPC has zero tagged behavioural tests, THEN THE Coverage_Gate SHALL fail and SHALL count that RPC as not covered while retaining it in the non-`Deferred` denominator.
+1. WHEN either target is driven, THE Scripted Worker SHALL interpret the same program data without embedding an SDK or external workload generator.
+2. WHEN a command or environment event is processed, THE Scripted Worker SHALL validate it against a cited lifecycle transition for its kind, including immediate commands and workflow tasks.
+3. WHEN a program waits, cancels, abandons, or responds to an activity or Nexus task, THE Scripted Worker SHALL implement the vocabulary and attempt outcomes in Design §4 while retaining abandoned command lifecycles.
+4. WHEN final history is replayed, THE Scripted Worker SHALL reproduce live accepted command batches and separately check discarded attempts from their observed task histories.
+5. WHEN the cache is dropped after every response, THE Scripted Worker SHALL produce the same commands and query/update responses as cached execution for the same observations.
+
+### Requirement 7: Behaviour and progress checks
+
+**User Story:** As a maintainer, I want checks on outcomes, durability, and progress,
+so that well-shaped histories cannot hide lost work or a stuck workflow.
+
+**Trace:** Design §7; Properties 10, 11, 12.
+
+#### Acceptance Criteria
+
+1. WHEN a step completes, THE Checker SHALL compare its response, status, and typed details against calibrated or source-only expectations and report the first semantic divergence.
+2. WHEN an L2 run ends, THE Checker SHALL compare complete model and engine histories exactly, including event attributes, IDs, references, and injected times.
+3. WHEN a commit becomes observable, THE Checker SHALL check history structure, command lifecycles, at-most-once effects, and Describe consistency with history plus history-free pending state.
+4. WHEN projection reaches bounded quiescence, THE Checker SHALL compare List and Count with the eligible run and deletion state.
+5. WHEN a finite-timeout execution is drained with advancing time, fair passes, and eventually ending faults, THE Checker SHALL require every run in its lineage to close and every scheduled task to be delivered or time out.
+6. WHEN eligible matching work exists for a live compatible poll, THE Checker SHALL fail if the poll remains blocked beyond the relevant discovery period and scheduled pass completion.
+7. WHEN a scenario executes in any area, THE Checker SHALL apply all applicable Design §7 invariants, including durability and durable discovery, even if model coverage is absent.
+
+### Requirement 8: Recorder and corpus
+
+**User Story:** As a maintainer, I want recordings from the exact target release,
+so that the model and worker are checked against actual server behaviour.
+
+**Trace:** Design §8; Properties 3, 13.
+
+#### Acceptance Criteria
+
+1. WHEN a corpus case is recorded, THE Recorder SHALL use Temporal built from v1.31.0 in the local fork with the tag's SQLite configuration and retain source/configuration provenance.
+2. WHEN a sequential scenario is recorded, THE Recorder SHALL use the same worker and explicit observable mappings for clock/pass steps, marking unmappable cases unrecordable without claiming corpus coverage.
+3. WHEN a recording is written, THE Recorder SHALL use the versioned UTF-8 line format in Design §8 with one history event per line and distinct header/response records.
+4. WHEN normalization runs, THE Recorder SHALL omit generated IDs, tokens, and absolute times only through the field-path allowlist while preserving order, logical relationships, durations, and other semantic data.
+5. WHEN corpus data is decoded, THE Corpus Reader SHALL round-trip supported normalized records exactly and reject malformed records, unknown fields, and unknown versions.
+6. WHEN a corpus case judges Tokeira, THE Harness SHALL first require the model and covered lifecycle tables to reproduce that case.
+7. WHEN CI or a Tier 2 import consumes corpus data, THE Harness SHALL use checked-in recordings with verified target provenance and SHALL reject Tokeira output as expected corpus data.
+
+### Requirement 9: Manifest and state-aware gate
+
+**User Story:** As a maintainer, I want executable evidence for the served surface,
+so that a declared implementation cannot pass without being exercised.
+
+**Trace:** Design §9; Properties 5, 6.
+
+#### Acceptance Criteria
+
+1. WHEN the manifest is built, THE Harness SHALL enumerate both public services from `FILE_DESCRIPTOR_SET`, retaining all 129 current methods and the distinct 121-target/eight-newer partition.
+2. WHEN surface coverage is verified, THE Gate SHALL require complete unique catalog ownership and equality of descriptor, manifest, and callable-adapter method sets.
+3. WHEN an RPC is `Implemented` or `Partial`, THE Gate SHALL require at least one current executed passing calibrated behavioural scenario for that RPC while retaining its actual feature state.
+4. WHEN an RPC has another state or disposition, THE Gate SHALL enforce the corresponding mode-specific evidence obligation in Design §9 without treating declared rejection as proof of supported target behaviour.
+5. WHEN evidence is evaluated, THE Gate SHALL reject tags without observed checked calls, wrong modes, stale revisions, empty selections, failed cases, and invariants-only runs as behavioural coverage.
+6. WHEN GetSystemInfo is exercised, THE Gate SHALL require its capabilities to agree with the existing feature-matrix mapping in every applicable mode.
+
+### Requirement 10: Test strength
+
+**User Story:** As a maintainer, I want unvisited behaviours made visible, so that
+generator drift cannot quietly weaken the suite.
+
+**Trace:** Design §9; Property 14.
+
+#### Acceptance Criteria
+
+1. WHEN a lifecycle transition occurs, THE Harness SHALL count it by area and command kind and retain unvisited and uncalibrated rows.
+2. WHEN an area finishes its fixed budget, THE Harness SHALL fail if any required sometimes predicate has count zero.
+3. WHEN feature pairs occur in one execution lineage, THE Harness SHALL count them and list declared pairs never reached without equating pair coverage with order coverage.
+4. WHEN local mutation runs exercise decision modules, THE Harness SHALL retain surviving mutants as oracle gaps in area evidence.
+
+### Requirement 11: Behavioural ledger
+
+**User Story:** As a maintainer, I want evidence by RPC, decision, and area, so that
+coverage and unresolved findings remain distinct.
+
+**Trace:** Design §9; Property 15.
+
+#### Acceptance Criteria
+
+1. WHEN model implementation begins, THE Harness SHALL establish the planned `docs/conformance/behavioural-ledger.md` page with the three row kinds and fields in Design §9.
+2. WHEN decision evidence is rendered, THE Ledger SHALL retain the target function/path/lines, Tokeira counterpart, test, provenance, any source-only label, and one of the four defined decision verdicts.
+3. WHEN a mismatch is resolved per area, THE Ledger SHALL record a correction or precise ignored decision with its reason without converting a mismatch into passing behavioural evidence.
+4. WHEN identical evidence is rendered, THE Ledger SHALL produce identical sorted generated rows while preserving explanatory notes and separate scenario, model, corpus, and Tier 2 measures.
+
+### Requirement 12: Dagger and local execution
+
+**User Story:** As a maintainer, I want a bounded PR suite and replayable local runs,
+so that regular checks remain practical without concealing incomplete work.
+
+**Trace:** Design §11; Property 16.
+
+#### Acceptance Criteria
+
+1. WHEN a PR is checked, THE Harness SHALL run L1, fixed-budget L2, checked-in L3 replay, and the surface/coverage checks under Dagger using nextest and locked dependencies.
+2. WHEN the PR execution budget is configured, THE Harness SHALL allocate fixed per-area work within the initial 270-second warmed execution budget and treat exhaustion as incomplete failure.
+3. WHEN local run, replay, record, surface, or ledger operations execute, THE Runner SHALL use the same checks as CI and expose area/RPC/mode/seed selection without allowing a partial run to claim whole-surface success.
+4. WHEN an error in Design §11 occurs, THE Harness SHALL return the stated nonzero classification and retain available replay inputs and evidence.
+5. WHEN recording, mutation, long generation, DSQL, simulation faults, or TLA+ checks execute, THE Runner SHALL keep them local and outside the bounded PR service requirements.
+
+### Requirement 13: DSQL campaign
+
+**User Story:** As a maintainer, I want evidence on the reference backend, so that
+control from an in-memory store is not confused with DSQL fidelity.
+
+**Trace:** Design §11; Property 17.
+
+#### Acceptance Criteria
+
+1. WHEN the first corpus stage completes, THE Campaign SHALL run each active area's sequential cases and overlaps without the scheduler against an ephemeral DSQL cluster.
+2. WHEN three more areas or the final area complete, THE Campaign SHALL repeat the active-area cases using the shared worker, model, and invariants.
+3. WHEN campaign results are recorded, THE Ledger SHALL distinguish real backend evidence, observed scheduling, incomplete infrastructure outcomes, and teardown from deterministic in-memory results.
+
+### Requirement 14: Fault simulation
+
+**User Story:** As a maintainer, I want the same cases under crashes and ownership
+changes, so that acknowledgements and eventual progress survive faults.
+
+**Trace:** Design §§2, 11; Property 18.
+
+#### Acceptance Criteria
+
+1. WHEN L4 is enabled, THE Fault Adapter SHALL map the scenario language into the existing turmoil workspace while preserving its separate lock file.
+2. WHEN fault seeds are trusted, THE Fault Adapter SHALL first demonstrate stable repeated-seed replay and resolve replay instability.
+3. WHEN crashes, partitions, delivery holds, bounces, lease stalls, or ownership moves occur, THE Checker SHALL apply shared durability and progress invariants with explicit ambiguity and eventual-recovery assumptions.
+
+### Requirement 15: TLA+ traces
+
+**User Story:** As a maintainer, I want optional trace validation against existing
+models, so that internal execution can be checked against its design invariants.
+
+**Trace:** Design §11; Property 19.
+
+#### Acceptance Criteria
+
+1. WHEN L5 is selected after L4, THE Trace Adapter SHALL map L2/L4 observations to explicit actions and variables of the repository models listed in Design §11.
+2. WHEN a trace is checked, THE Trace Checker SHALL validate its initial state, every next or declared stutter step, and model invariants using TLC.
+3. WHEN a mapping is missing, a trace is truncated, or a transition is illegal, THE Trace Checker SHALL reject or mark the trace incomplete without claiming behavioural equivalence or liveness.
+
+### Requirement 16: Area progression
+
+**User Story:** As a maintainer, I want each area to extend the same evidence chain,
+so that coverage grows coherently.
+
+**Trace:** Design §§6, 10–11; Property 20.
+
+#### Acceptance Criteria
+
+1. WHEN the harness core is built, THE Harness SHALL begin with the seed scenarios for activities, workflow tasks, timers, and signals and the check that every workflow finishes.
+2. WHEN another area is added, THE Harness SHALL follow the eleven-area order in Design §10.
+3. WHEN an area claims completion, THE Harness SHALL include its cited model rules, decision cases, scenario vocabulary, calibrated corpus, lifecycle checks, invariants, and strength measures for the catalogue cases.

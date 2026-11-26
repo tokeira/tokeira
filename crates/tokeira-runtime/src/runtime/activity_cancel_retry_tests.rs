@@ -7,6 +7,10 @@ use super::{
 };
 use crate::{activity_timeout::scan_activity_timeouts_once, test_clock::TestClock};
 use proptest::prelude::*;
+use tokeira_behaviour_model::activity as model;
+
+#[path = "activity_model_tests.rs"]
+mod model_tests;
 use tokeira_proto::{
     conversions::common::{failure_to_payload, payload_to_failure},
     enums::TimeoutType,
@@ -776,7 +780,7 @@ proptest! {
             tokio::time::pause();
             let mut retry = policy();
             retry.maximum_attempts = if attempts_exhausted { attempt } else { attempt + 1 };
-            let mut f = Fixture::new(has_policy.then_some(retry), false).await;
+            let mut f = Fixture::new(has_policy.then_some(retry.clone()), false).await;
             if has_policy {
                 for _ in 1..attempt { f.fail(false, "retryable").await; f.next_attempt().await; }
             }
@@ -789,13 +793,21 @@ proptest! {
             }
             if rule != 0 { f.rule(if rule == 1 { "Attempts >= 1" } else { "Attempts > 100" }).await; }
             if expired { tokio::time::advance(std::time::Duration::from_secs(30)).await; }
+            let before = f.state().await.activities[&f.token.activity_id].clone();
+            let now = f.runtime.clock.now().unix_timestamp_nanos();
             f.fail(failure_kind == 1, if failure_kind == 2 { "listed" } else { "retryable" }).await;
-            let expected = if !has_policy { Some(RetryState::RetryPolicyNotSet) }
-                else if cancel { Some(RetryState::CancelRequested) }
-                else if failure_kind != 0 { Some(RetryState::NonRetryableFailure) }
-                else if paused || rule == 1 { None }
-                else if attempts_exhausted { Some(RetryState::MaximumAttemptsReached) }
-                else if expired { Some(RetryState::Timeout) } else { None };
+            let failure = model_tests::application_failure(failure_kind == 1, if failure_kind == 2 { "listed" } else { "retryable" }, None);
+            let expected = model::retry(&model::RetryInput {
+                policy: has_policy.then(|| model_tests::wire_policy(&retry)),
+                attempt: before.attempt as i32,
+                cancel_requested: before.cancel_requested,
+                paused: before.pause_info.is_some() || rule == 1,
+                expiration: before.schedule_to_close_timeout.map(|timeout| (before.scheduled_at + timeout).unix_timestamp_nanos()),
+            }, Some(&failure), now);
+            let expected = match expected {
+                model::RetryDecision::Stop(state) => Some(model_tests::kernel_retry_state(state)),
+                model::RetryDecision::Paused | model::RetryDecision::After(_) => None,
+            };
             let history = f.repo.read_history_to_end(f.token.run_key, 0).await.unwrap();
             let actual = history.iter().find_map(|event| match &event.kind { HistoryEventKind::ActivityTaskFailed { retry_state, .. } => Some(retry_state.clone()), _ => None });
             assert_eq!(actual, expected);
@@ -839,13 +851,31 @@ async fn timeout_preserves_completion(worker_failed_first: bool, heartbeat: bool
     let expected_attempt = if worker_failed_first { 3 } else { 2 };
     let activity = &f.state().await.activities[&f.token.activity_id];
     assert_eq!(activity.attempt, expected_attempt);
-    assert_eq!(activity.last_attempt_complete_time, completed_at);
+    assert_eq!(
+        activity
+            .last_attempt_complete_time
+            .map(|at| at.unix_timestamp_nanos()),
+        model::completion_time(
+            completed_at.map(|at| at.unix_timestamp_nanos()),
+            f.runtime.clock.now().unix_timestamp_nanos(),
+            model::CompletionOrigin::Timeout
+        )
+    );
     f.next_attempt().await;
     assert_eq!(f.token.attempt, expected_attempt);
     let state = f.state().await;
     let activity = &state.activities[&f.token.activity_id];
     assert!(activity.started_at.is_some());
-    assert_eq!(activity.last_attempt_complete_time, completed_at);
+    assert_eq!(
+        activity
+            .last_attempt_complete_time
+            .map(|at| at.unix_timestamp_nanos()),
+        model::completion_time(
+            completed_at.map(|at| at.unix_timestamp_nanos()),
+            f.runtime.clock.now().unix_timestamp_nanos(),
+            model::CompletionOrigin::Timeout
+        )
+    );
     discovery_tests::stop(&f.runtime).await;
 }
 

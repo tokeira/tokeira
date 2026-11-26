@@ -11216,3 +11216,7 @@ mod eager_sdk_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "activity_model_tests.rs"]
+mod activity_model_tests;

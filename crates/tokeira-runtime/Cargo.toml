@@ -64,6 +64,7 @@ dsql-integration = ["tokeira-storage/dsql-integration"]
 conformance = []
 
 [dev-dependencies]
+tokeira-behaviour-model = { path = "../tokeira-behaviour-model" }
 # Version-less on purpose: `cargo publish` strips path-only dev-dependencies,
 # so the never-published override registry stays test-only.
 tokeira-conformance = { path = "../tokeira-conformance" }

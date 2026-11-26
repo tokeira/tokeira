@@ -1,0 +1,24 @@
+[package]
+name = "tokeira-behaviour-model"
+description = "Independent source-derived Temporal activity decisions"
+publish = false
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+prost-types = "0.14"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokeira-proto = { path = "../tokeira-proto" }
+
+[dev-dependencies]
+proptest.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

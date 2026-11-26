@@ -9,6 +9,7 @@ members = [
     "crates/tokeira-compatibility-proto",
     "crates/tokeira-compatibility-service",
     "crates/tokeira-conformance",
+    "crates/tokeira-behaviour-model",
     "crates/tokeira-conformance-proto",
     "crates/tokeira-conformance-control",
     "crates/tokeira-auth",

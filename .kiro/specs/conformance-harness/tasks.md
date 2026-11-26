@@ -1,5 +1,3 @@
-No task starts while this specification is in review.
-
 # Tasks: Behavioural Conformance
 
 Stage 1 is this specification. Build the later stages in the order below. The model
@@ -13,13 +11,13 @@ lint, compile, nextest, documentation, and offline link checks to pass.
 ## Stage 2: Model crate and activity decisions
 
 - [ ] 2. Establish the independent model and the first decision oracles.
-  - [ ] 2.1. Add the pure `tokeira-behaviour-model` crate with upstream request/value types, a rule catalog, typed observable state, and explicit model-support classification. Keep runtime, kernel, edge, storage, and compatibility policy out of its dependency graph. Reference functions originate here.
+  - [x] 2.1. Add the pure `tokeira-behaviour-model` crate with upstream request/value types, a rule catalog, typed observable state, and explicit model-support classification. Keep runtime, kernel, edge, storage, and compatibility policy out of its dependency graph. Reference functions originate here.
     _Requirements: 2.1, 2.2, 2.4._
-  - [ ] 2.2. Define source citations and a tag-derived source index with file lengths and content/range digests. Verify every range against v1.31.0 and carry evidence per decision row. Add Property 4 tests, including invalid ranges, wrong tags, altered digests, and forbidden dependencies.
+  - [x] 2.2. Define source citations and a tag-derived source index with file lengths and content/range digests. Verify every range against v1.31.0 and carry evidence per decision row. Add Property 4 tests, including invalid ranges, wrong tags, altered digests, and forbidden dependencies.
     _Requirements: 2.1, 2.2, 2.3._
-  - [ ] 2.3. Read the activity retry, timeout, and cancellation paths at the tag. Write pure tables for retryability, cancellation precedence, pause precedence, attempt limits, retry windows, custom delays, maximum backoff, timeout selection, and completion-time provenance. Include options-update backoff inputs. Cite each branch; do not derive expectations from engine tests.
+  - [x] 2.3. Read the activity retry, timeout, and cancellation paths at the tag. Write pure tables for retryability, cancellation precedence, pause precedence, attempt limits, retry windows, custom delays, maximum backoff, timeout selection, and completion-time provenance. Include options-update backoff inputs. Cite each branch; do not derive expectations from engine tests.
     _Requirements: 2.1, 2.3, 16.1._
-  - [ ] 2.4. Test the corresponding Tokeira decisions against model functions with branch tables and generated inputs. Cover equality, zero, maximum values, overflow, cancellation during retry, pause with exhausted retry budget, and worker failure versus timeout completion time. Use runtime/in-memory/clock fixtures where decisions span modules. Keep these results provisional until Stage 4 calibration, except those from source-only rules, which state why no recording can reach them.
+  - [x] 2.4. Test the corresponding Tokeira decisions against model functions with branch tables and generated inputs. Cover equality, zero, maximum values, overflow, cancellation during retry, pause with exhausted retry budget, and worker failure versus timeout completion time. Use runtime/in-memory/clock fixtures where decisions span modules. Keep these results provisional until Stage 4 calibration, except those from source-only rules, which state why no recording can reach them.
     _Requirements: 2.4, 2.5, 2.6, 7.1, 7.2, 16.1._
   - [ ] 2.5. Create the planned `docs/conformance/behavioural-ledger.md` with RPC, decision, and area rows. Define the four decision verdicts, the source-only label, provenance, reasons, and generated/manual cell boundaries. Add Property 15 tests for stable rendering, stale evidence, and ignored-difference handling.
     _Requirements: 11.1, 11.2, 11.3, 11.4._

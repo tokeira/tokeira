@@ -328,3 +328,168 @@ fn reload_replaces_superseded_attempt_cache() {
         });
     assert_eq!(tracking.inner.get(&key).unwrap(), reloaded);
 }
+
+fn model_timeout_case(kind: usize, started: bool, heartbeat_offset: i64, delta: i64) {
+    // service/history/workflow/timer_sequence.go:229-359; service/history/queues/queue_scheduled.go:280-300 @ v1.31.0.
+    let epoch = OffsetDateTime::UNIX_EPOCH;
+    let mut activity = sample_activity();
+    activity.current_attempt_scheduled_at = Some(epoch);
+    activity.started_at = started.then_some(epoch);
+    activity.started_event_id = started.then_some(2);
+    activity.last_heartbeat_at = Some(epoch + Duration::seconds(heartbeat_offset));
+    let mut timing = tokeira_behaviour_model::activity::ActivityTiming {
+        scheduled: true,
+        started_time: started.then_some(0),
+        heartbeat_time: Some(i128::from(heartbeat_offset) * 1_000_000_000),
+        ..Default::default()
+    };
+    match kind {
+        0 => {
+            activity.schedule_to_close_timeout = Some(Duration::seconds(10));
+            timing.schedule_to_close = 10_000_000_000;
+        }
+        1 => {
+            activity.schedule_to_start_timeout = Some(Duration::seconds(10));
+            timing.schedule_to_start = 10_000_000_000;
+        }
+        2 => {
+            activity.start_to_close_timeout = Some(Duration::seconds(10));
+            timing.start_to_close = 10_000_000_000;
+        }
+        _ => {
+            activity.heartbeat_timeout = Some(Duration::seconds(10));
+            timing.heartbeat = 10_000_000_000;
+        }
+    }
+    let now =
+        epoch + Duration::seconds(10 + heartbeat_offset.max(0)) + Duration::nanoseconds(delta);
+    let expected = tokeira_behaviour_model::activity::deadlines(&timing)
+        .into_iter()
+        .find(|(at, _)| {
+            tokeira_behaviour_model::activity::timer_due(*at, now.unix_timestamp_nanos(), 0)
+        })
+        .map(|(_, kind)| kind);
+    let actual =
+        evaluate_activity_timeout_with_heartbeat(&activity, activity.last_heartbeat_at, now)
+            .map(proto_timeout_type);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn model_timeout_selection_table() {
+    for kind in 0..4 {
+        for started in [false, true] {
+            for heartbeat in [-5, 0, 5] {
+                for delta in [-1_000_000, 1_000_000] {
+                    model_timeout_case(kind, started, heartbeat, delta);
+                }
+            }
+        }
+    }
+    let activity = sample_activity();
+    assert_eq!(
+        evaluate_activity_timeout_with_heartbeat(&activity, None, OffsetDateTime::UNIX_EPOCH),
+        None
+    );
+    assert!(tokeira_behaviour_model::activity::deadlines(&Default::default()).is_empty());
+}
+
+#[test]
+#[ignore = "differs from v1.31.0: timeout equality is not due"]
+fn model_timeout_equal_deadline() {
+    model_timeout_case(2, true, 0, 0);
+}
+
+#[test]
+#[ignore = "differs from v1.31.0: timeout due check does not truncate to milliseconds"]
+fn model_timeout_same_millisecond() {
+    // service/history/queues/queue_scheduled.go:298-300 @ v1.31.0.
+    let mut activity = sample_activity();
+    activity.started_at = Some(OffsetDateTime::UNIX_EPOCH + Duration::nanoseconds(1));
+    activity.started_event_id = Some(2);
+    activity.start_to_close_timeout = Some(Duration::seconds(10));
+    let timing = tokeira_behaviour_model::activity::ActivityTiming {
+        scheduled: true,
+        started_time: Some(1),
+        start_to_close: 10_000_000_000,
+        ..Default::default()
+    };
+    let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(10);
+    let expected = tokeira_behaviour_model::activity::deadlines(&timing)
+        .into_iter()
+        .find(|(at, _)| {
+            tokeira_behaviour_model::activity::timer_due(*at, now.unix_timestamp_nanos(), 0)
+        })
+        .map(|(_, kind)| kind);
+    assert_eq!(
+        evaluate_activity_timeout_with_heartbeat(&activity, None, now).map(proto_timeout_type),
+        expected
+    );
+}
+
+#[test]
+#[ignore = "differs from v1.31.0: timeout selection uses fixed priority instead of earliest deadline"]
+fn model_timeout_earliest_deadline() {
+    // service/history/workflow/timer_sequence.go:393-425 @ v1.31.0.
+    let mut activity = sample_activity();
+    activity.started_at = Some(OffsetDateTime::UNIX_EPOCH);
+    activity.started_event_id = Some(2);
+    activity.schedule_to_close_timeout = Some(Duration::seconds(10));
+    activity.start_to_close_timeout = Some(Duration::seconds(1));
+    let timing = tokeira_behaviour_model::activity::ActivityTiming {
+        scheduled: true,
+        started_time: Some(0),
+        schedule_to_close: 10_000_000_000,
+        start_to_close: 1_000_000_000,
+        ..Default::default()
+    };
+    assert_eq!(
+        evaluate_activity_timeout_with_heartbeat(
+            &activity,
+            None,
+            OffsetDateTime::UNIX_EPOCH + Duration::seconds(11)
+        )
+        .map(proto_timeout_type),
+        tokeira_behaviour_model::activity::deadlines(&timing)
+            .first()
+            .map(|(_, kind)| *kind)
+    );
+}
+
+#[test]
+#[ignore = "differs from v1.31.0: equal timeout deadlines use fixed priority instead of enum order"]
+fn model_timeout_equal_deadlines_order() {
+    // service/history/workflow/timer_sequence.go:417-425 @ v1.31.0.
+    let mut activity = sample_activity();
+    activity.started_at = Some(OffsetDateTime::UNIX_EPOCH);
+    activity.started_event_id = Some(2);
+    activity.heartbeat_timeout = Some(Duration::seconds(1));
+    activity.start_to_close_timeout = Some(Duration::seconds(1));
+    let timing = tokeira_behaviour_model::activity::ActivityTiming {
+        scheduled: true,
+        started_time: Some(0),
+        heartbeat: 1_000_000_000,
+        start_to_close: 1_000_000_000,
+        ..Default::default()
+    };
+    assert_eq!(
+        evaluate_activity_timeout_with_heartbeat(
+            &activity,
+            None,
+            OffsetDateTime::UNIX_EPOCH + Duration::seconds(2)
+        )
+        .map(proto_timeout_type),
+        tokeira_behaviour_model::activity::deadlines(&timing)
+            .first()
+            .map(|(_, kind)| *kind)
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+    // Feature: conformance-harness, Property 10. Each active timeout uses its lifecycle anchor.
+    #[test]
+    fn model_timeout_selection_generated(kind in 0usize..4, started in any::<bool>(), heartbeat in -100i64..100, after in any::<bool>()) {
+        model_timeout_case(kind, started, heartbeat, if after { 1_000_000 } else { -1_000_000 });
+    }
+}

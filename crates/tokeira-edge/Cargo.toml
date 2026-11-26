@@ -92,6 +92,7 @@ dsql-integration = ["tokeira-storage/dsql-integration"]
 conformance = []
 
 [dev-dependencies]
+tokeira-behaviour-model = { path = "../tokeira-behaviour-model" }
 tokeira-runtime = { path = "../tokeira-runtime", features = ["conformance"] }
 tokeira-storage = { path = "../tokeira-storage", features = ["test-support"] }
 metrics-util.workspace = true

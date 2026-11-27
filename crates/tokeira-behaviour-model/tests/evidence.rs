@@ -106,14 +106,25 @@ fn dependency_graph_is_independent_and_production_does_not_use_model() {
                 .entry(name.into())
                 .or_default()
                 .push(dependency_name.into());
-            if dependency_name == "tokeira-behaviour-model" {
+            if matches!(
+                dependency_name,
+                "tokeira-behaviour-model" | "tokeira-behaviour-harness"
+            ) {
                 assert!(
                     dependency["dep_kinds"]
                         .as_array()
                         .unwrap()
                         .iter()
-                        .all(|kind| kind["kind"] == "dev"),
-                    "production dependency from {name}"
+                        .all(|kind| {
+                            kind["kind"] == "dev"
+                                // The unpublished harness consumes the pure model;
+                                // forbidding production edges into the harness keeps
+                                // this exception outside every production closure.
+                                || (dependency_name == "tokeira-behaviour-model"
+                                    && name == "tokeira-behaviour-harness"
+                                    && kind["kind"].is_null())
+                        }),
+                    "production dependency from {name} to {dependency_name}"
                 );
             }
         }

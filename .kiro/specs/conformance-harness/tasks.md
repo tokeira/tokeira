@@ -19,7 +19,7 @@ lint, compile, nextest, documentation, and offline link checks to pass.
     _Requirements: 2.1, 2.3, 16.1._
   - [x] 2.4. Test the corresponding Tokeira decisions against model functions with branch tables and generated inputs. Cover equality, zero, maximum values, overflow, cancellation during retry, pause with exhausted retry budget, and worker failure versus timeout completion time. Use runtime/in-memory/clock fixtures where decisions span modules. Keep these results provisional until Stage 4 calibration, except those from source-only rules, which state why no recording can reach them.
     _Requirements: 2.4, 2.5, 2.6, 7.1, 7.2, 16.1._
-  - [ ] 2.5. Create the planned `docs/conformance/behavioural-ledger.md` with RPC, decision, and area rows. Define the four decision verdicts, the source-only label, provenance, reasons, and generated/manual cell boundaries. Add Property 15 tests for stable rendering, stale evidence, and ignored-difference handling.
+  - [x] 2.5. Create the planned `docs/conformance/behavioural-ledger.md` with RPC, decision, and area rows. Define the four decision verdicts, the source-only label, provenance, reasons, and generated/manual cell boundaries. Add Property 15 tests for stable rendering, stale evidence, and ignored-difference handling.
     _Requirements: 11.1, 11.2, 11.3, 11.4._
   - [ ] 2.6. Add local mutation execution for the activity decision modules and retain surviving mutants as gaps. Keep model changes separate from engine corrections; record any resulting decision evidence in the ledger.
     _Requirements: 2.1, 10.4, 11.3._

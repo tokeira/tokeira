@@ -3,7 +3,9 @@
 This unpublished crate derives expectations from Temporal server v1.31.0. Its pure
 functions accept upstream failure/policy values and explicit time. They have no
 access to Tokeira's execution state or service implementations. Consumers use a
-path-only development dependency.
+path-only development dependency, except the unpublished behaviour harness, which
+alone has a normal dependency on the model. No production dependency chain may
+reach either crate.
 
 `src/activity.rs` owns retry precedence, retryability, backoff, retry windows,
 options rescheduling, completion-time provenance, timeout selection and outcomes,

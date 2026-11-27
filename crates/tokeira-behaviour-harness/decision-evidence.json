@@ -1,0 +1,678 @@
+{
+  "version": 1,
+  "decisions": [
+    {
+      "rule": "activity.cancel-command",
+      "counterparts": [
+        {
+          "path": "crates/tokeira-kernel/src/kernel.rs",
+          "item": "apply_workflow_command: RequestCancelActivity"
+        }
+      ],
+      "tests": [
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_cancel_command_generated"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_cancel_command_table"
+        }
+      ],
+      "rpcs": [
+        "/temporal.api.workflowservice.v1.WorkflowService/RespondWorkflowTaskCompleted"
+      ],
+      "verdict": "agrees",
+      "reason": "Tables compare missing, duplicate, buffered-finish, started and retry-backoff cancellation with ordered request/canceled events. No branch gap in the catalog decision table.",
+      "fix_commit": null,
+      "run": {
+        "rule_digest": "fc057f462e3b30db2a654640baebccac9c2ed57ab2ac76b30b8022ba8e506968",
+        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "tests": {
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_cancel_command_generated": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_cancel_command_table": "passed"
+        }
+      }
+    },
+    {
+      "rule": "activity.cancel-response",
+      "counterparts": [
+        {
+          "path": "crates/tokeira-runtime/src/runtime/activity.rs",
+          "item": "cancel_activity_task_inner"
+        }
+      ],
+      "tests": [
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_cancel_response_requires_request"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_heartbeat_and_cancel_response"
+        }
+      ],
+      "rpcs": [
+        "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskCanceled",
+        "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskCanceledById"
+      ],
+      "verdict": "differed and fixed",
+      "reason": "A worker cancellation response was accepted without a durable cancellation request. Gap: accepted-response event content and subsequent workflow-task scheduling are not directly compared.",
+      "fix_commit": "b68c7a86",
+      "run": {
+        "rule_digest": "0fea3147020f7c99305a5a36895aaefe7d36d13cc3f2b60ac6a46af0e7136a8f",
+        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "tests": {
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_cancel_response_requires_request": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_heartbeat_and_cancel_response": "passed"
+        }
+      }
+    },
+    {
+      "rule": "activity.completion-time",
+      "counterparts": [
+        {
+          "path": "crates/tokeira-runtime/src/activity_timeout.rs",
+          "item": "scan_activity_timeouts_once"
+        },
+        {
+          "path": "crates/tokeira-runtime/src/runtime/activity.rs",
+          "item": "fail_activity_task_inner"
+        }
+      ],
+      "tests": [
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_cancel_retry_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::first_heartbeat_timeout_preserves_absent_completion_and_starts_retry"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_cancel_retry_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::first_start_to_close_timeout_preserves_absent_completion_and_starts_retry"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_cancel_retry_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::heartbeat_timeout_preserves_worker_failure_completion_and_starts_retry"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_completion_generated"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_completion_provenance_table"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_cancel_retry_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::start_to_close_timeout_preserves_worker_failure_completion_and_starts_retry"
+        }
+      ],
+      "rpcs": [
+        "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskFailed",
+        "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskFailedById"
+      ],
+      "verdict": "agrees",
+      "reason": "Worker failure records completion; heartbeat and start-to-close timeout retries preserve absent or prior completion. Gap: terminal worker failure without retry is not compared for completion-time provenance.",
+      "fix_commit": null,
+      "run": {
+        "rule_digest": "2686ea56628f35d6b8b48518713a638d1e0c6b1686a22bfd0d6197ac5dbfb21f",
+        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "tests": {
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::first_heartbeat_timeout_preserves_absent_completion_and_starts_retry": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::first_start_to_close_timeout_preserves_absent_completion_and_starts_retry": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::heartbeat_timeout_preserves_worker_failure_completion_and_starts_retry": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_completion_generated": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_completion_provenance_table": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::start_to_close_timeout_preserves_worker_failure_completion_and_starts_retry": "passed"
+        }
+      }
+    },
+    {
+      "rule": "activity.exponential-interval",
+      "counterparts": [
+        {
+          "path": "crates/tokeira-runtime/src/retry.rs",
+          "item": "compute_retry_backoff"
+        }
+      ],
+      "tests": [
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_retry_branch_table"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_retry_interval_generated"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_retry_submillisecond"
+        }
+      ],
+      "rpcs": [
+        "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskFailed",
+        "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskFailedById",
+        "/temporal.api.workflowservice.v1.WorkflowService/UpdateActivityOptions"
+      ],
+      "verdict": "differed and fixed",
+      "reason": "Submillisecond retry intervals lost nanosecond precision. Gaps: generated coefficients are restricted to 1–3; negative/NaN coefficients and every overflow boundary are not directly compared.",
+      "fix_commit": "b68c7a86",
+      "run": {
+        "rule_digest": "b4871dac963ba8a5c2ecf5976c19384259a5ccdee17dd465d2e3dba27fa177c4",
+        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "tests": {
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_retry_branch_table": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_retry_interval_generated": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_retry_submillisecond": "passed"
+        }
+      }
+    },
+    {
+      "rule": "activity.heartbeat-cancel",
+      "counterparts": [
+        {
+          "path": "crates/tokeira-runtime/src/runtime/activity.rs",
+          "item": "record_activity_heartbeat_inner"
+        }
+      ],
+      "tests": [
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_heartbeat_and_cancel_response"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_heartbeat_generated"
+        }
+      ],
+      "rpcs": [
+        "/temporal.api.workflowservice.v1.WorkflowService/RecordActivityTaskHeartbeat",
+        "/temporal.api.workflowservice.v1.WorkflowService/RecordActivityTaskHeartbeatById"
+      ],
+      "verdict": "agrees",
+      "reason": "Heartbeat cancellation flags match both durable request states. Gap: pause/reset flags mentioned by the source branch are not compared; the model output is cancellation only.",
+      "fix_commit": null,
+      "run": {
+        "rule_digest": "9be07fbb228f050e65a279e9bafa7dee38a5eea8a95886438c5d918ffb5ff0e5",
+        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "tests": {
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_heartbeat_and_cancel_response": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_heartbeat_generated": "passed"
+        }
+      }
+    },
+    {
+      "rule": "activity.options-reschedule",
+      "counterparts": [
+        {
+          "path": "crates/tokeira-runtime/src/runtime/lifecycle.rs",
+          "item": "update_activity_options"
+        }
+      ],
+      "tests": [
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_options_generated"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_options_interval_fits_signed_nanoseconds"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_options_preserve_nanoseconds"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_options_reschedule_table"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_options_zero_interval_uses_maximum"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_options_zero_maximum_is_uncapped"
+        }
+      ],
+      "rpcs": [
+        "/temporal.api.workflowservice.v1.WorkflowService/UpdateActivityOptions"
+      ],
+      "verdict": "differed and fixed",
+      "reason": "Zero interval/cap semantics, nanosecond preservation and signed-duration bounds differed when rescheduling. Gaps: negative intervals and the full overflow domain are not directly compared.",
+      "fix_commit": "b68c7a86",
+      "run": {
+        "rule_digest": "51eed2011e2471cf8703cfc2b112d95fd0f719bdab5e8084e9aecaf5f7478fab",
+        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "tests": {
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_options_generated": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_options_interval_fits_signed_nanoseconds": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_options_preserve_nanoseconds": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_options_reschedule_table": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_options_zero_interval_uses_maximum": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_options_zero_maximum_is_uncapped": "passed"
+        }
+      }
+    },
+    {
+      "rule": "activity.policy-defaults",
+      "counterparts": [
+        {
+          "path": "crates/tokeira-edge/src/grpc/translate.rs",
+          "item": "activity_retry_policy_with_defaults"
+        }
+      ],
+      "tests": [
+        {
+          "crate_name": "tokeira-edge",
+          "file": "crates/tokeira-edge/src/grpc/activity_model_tests.rs",
+          "name": "grpc::translate::activity_model_tests::model_activity_policy_defaults_table"
+        },
+        {
+          "crate_name": "tokeira-edge",
+          "file": "crates/tokeira-edge/src/grpc/activity_model_tests.rs",
+          "name": "grpc::translate::activity_model_tests::model_policy_defaults_generated"
+        }
+      ],
+      "rpcs": [
+        "/temporal.api.workflowservice.v1.WorkflowService/RespondWorkflowTaskCompleted"
+      ],
+      "verdict": "agrees",
+      "reason": "Tables and generated inputs compare absent policy and zero/explicit admitted values. Gap: preservation of nonempty excluded-error lists is not directly compared.",
+      "fix_commit": null,
+      "run": {
+        "rule_digest": "c22d5ca7fbacc3988084e3917d30752bf9eddd86ccccf14e25811d7eb9b3642b",
+        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "tests": {
+          "tokeira-edge::grpc::translate::activity_model_tests::model_activity_policy_defaults_table": "passed",
+          "tokeira-edge::grpc::translate::activity_model_tests::model_policy_defaults_generated": "passed"
+        }
+      }
+    },
+    {
+      "rule": "activity.retry-delay",
+      "counterparts": [
+        {
+          "path": "crates/tokeira-runtime/src/retry.rs",
+          "item": "evaluate_activity_retry"
+        },
+        {
+          "path": "crates/tokeira-runtime/src/runtime/activity.rs",
+          "item": "fail_activity_task_inner"
+        }
+      ],
+      "tests": [
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_requested_delay_generated"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_requested_delay_overrides_policy_cap"
+        }
+      ],
+      "rpcs": [
+        "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskFailed",
+        "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskFailedById"
+      ],
+      "verdict": "differed and fixed",
+      "reason": "Requested worker delay was capped by policy instead of overriding the cap. Gaps: present-zero delay and non-application delay extraction are not directly compared.",
+      "fix_commit": "b68c7a86",
+      "run": {
+        "rule_digest": "8b7cf46b010954748cf87be15408c4ded46970c7ac47b3891271c0b46ad4f607",
+        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "tests": {
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_requested_delay_generated": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_requested_delay_overrides_policy_cap": "passed"
+        }
+      }
+    },
+    {
+      "rule": "activity.retry-expiration-equality",
+      "counterparts": [
+        {
+          "path": "crates/tokeira-runtime/src/retry.rs",
+          "item": "evaluate_activity_retry"
+        }
+      ],
+      "tests": [
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_retry_branch_table"
+        }
+      ],
+      "rpcs": [
+        "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskFailed",
+        "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskFailedById"
+      ],
+      "verdict": "agrees",
+      "reason": "The branch table compares a next start exactly at expiration and permits the retry. No branch gap in this one-row boundary rule.",
+      "fix_commit": null,
+      "run": {
+        "rule_digest": "071043cf0b05f5d2d3e86b04467e9433dba7c793a9c40f44c9fa61d1d900f466",
+        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "tests": {
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_retry_branch_table": "passed"
+        }
+      }
+    },
+    {
+      "rule": "activity.retry-precedence",
+      "counterparts": [
+        {
+          "path": "crates/tokeira-runtime/src/runtime/activity.rs",
+          "item": "activity_retry_decision"
+        }
+      ],
+      "tests": [
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_cancel_retry_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::cancel_requested_retry_order_matches_temporal"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_paused_spent_budget_and_timer_suppression"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_timeout_result_table"
+        }
+      ],
+      "rpcs": [
+        "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskFailed",
+        "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskFailedById"
+      ],
+      "verdict": "agrees",
+      "reason": "Worker failure comparisons cover policy, cancellation, non-retryability, pause and exhausted budgets. Gap: ScheduleToStart/Close versus cancellation or pause is not directly compared in this set.",
+      "fix_commit": null,
+      "run": {
+        "rule_digest": "875b24931a9712976fb50dfee817be028eed10ad71e259bcc724318107f87036",
+        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "tests": {
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::cancel_requested_retry_order_matches_temporal": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_paused_spent_budget_and_timer_suppression": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_timeout_result_table": "passed"
+        }
+      }
+    },
+    {
+      "rule": "activity.retry-window",
+      "counterparts": [
+        {
+          "path": "crates/tokeira-runtime/src/retry.rs",
+          "item": "evaluate_activity_retry"
+        }
+      ],
+      "tests": [
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_retry_branch_table"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_retry_generated"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_retry_negative_without_cap"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_retry_zero_interval_without_maximum"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_retry_zero_maximum"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_retry_zero_with_cap"
+        }
+      ],
+      "rpcs": [
+        "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskFailed",
+        "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskFailedById"
+      ],
+      "verdict": "differed and fixed",
+      "reason": "Nonpositive intervals and zero or positive maximum intervals differed in timeout/cap handling. Gaps: negative attempts are outside the unsigned implementation input; zero expiration is not pinned by an explicit example.",
+      "fix_commit": "b68c7a86",
+      "run": {
+        "rule_digest": "066a06ca10a05156f8369002ddc373e755f07b25d2468fcdcca686e2e937e2e7",
+        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "tests": {
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_retry_branch_table": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_retry_generated": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_retry_negative_without_cap": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_retry_zero_interval_without_maximum": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_retry_zero_maximum": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_retry_zero_with_cap": "passed"
+        }
+      }
+    },
+    {
+      "rule": "activity.retryability",
+      "counterparts": [
+        {
+          "path": "crates/tokeira-edge/src/grpc/translate.rs",
+          "item": "activity_retry_classification"
+        },
+        {
+          "path": "crates/tokeira-runtime/src/retry.rs",
+          "item": "ActivityFailure::is_retryable"
+        }
+      ],
+      "tests": [
+        {
+          "crate_name": "tokeira-edge",
+          "file": "crates/tokeira-edge/src/grpc/activity_model_tests.rs",
+          "name": "grpc::translate::activity_model_tests::model_failure_canceled_and_terminated"
+        },
+        {
+          "crate_name": "tokeira-edge",
+          "file": "crates/tokeira-edge/src/grpc/activity_model_tests.rs",
+          "name": "grpc::translate::activity_model_tests::model_failure_classification_generated"
+        },
+        {
+          "crate_name": "tokeira-edge",
+          "file": "crates/tokeira-edge/src/grpc/activity_model_tests.rs",
+          "name": "grpc::translate::activity_model_tests::model_failure_classification_table"
+        },
+        {
+          "crate_name": "tokeira-edge",
+          "file": "crates/tokeira-edge/src/grpc/activity_model_tests.rs",
+          "name": "grpc::translate::activity_model_tests::model_failure_does_not_classify_cause"
+        },
+        {
+          "crate_name": "tokeira-edge",
+          "file": "crates/tokeira-edge/src/grpc/activity_model_tests.rs",
+          "name": "grpc::translate::activity_model_tests::model_failure_empty_type_matches_exactly"
+        },
+        {
+          "crate_name": "tokeira-edge",
+          "file": "crates/tokeira-edge/src/grpc/activity_model_tests.rs",
+          "name": "grpc::translate::activity_model_tests::model_failure_timeout_types"
+        }
+      ],
+      "rpcs": [
+        "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskFailed",
+        "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskFailedById"
+      ],
+      "verdict": "differed and fixed",
+      "reason": "Canceled/terminated failures, timeout exclusions, top-level classification and empty type matching differed. Gaps: nil failure and every other failure variant are not directly compared.",
+      "fix_commit": "b68c7a86",
+      "run": {
+        "rule_digest": "4ace31b630acfa50ab435d9b2e98f0e4adf69e22c1deeac5daf6d0a0b927793b",
+        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "tests": {
+          "tokeira-edge::grpc::translate::activity_model_tests::model_failure_canceled_and_terminated": "passed",
+          "tokeira-edge::grpc::translate::activity_model_tests::model_failure_classification_generated": "passed",
+          "tokeira-edge::grpc::translate::activity_model_tests::model_failure_classification_table": "passed",
+          "tokeira-edge::grpc::translate::activity_model_tests::model_failure_does_not_classify_cause": "passed",
+          "tokeira-edge::grpc::translate::activity_model_tests::model_failure_empty_type_matches_exactly": "passed",
+          "tokeira-edge::grpc::translate::activity_model_tests::model_failure_timeout_types": "passed"
+        }
+      }
+    },
+    {
+      "rule": "activity.timeout-due",
+      "counterparts": [
+        {
+          "path": "crates/tokeira-runtime/src/activity_timeout.rs",
+          "item": "evaluate_activity_timeout_with_heartbeat"
+        }
+      ],
+      "tests": [
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/activity_timeout_deadline_tests.rs",
+          "name": "activity_timeout::deadline_tests::model_timeout_equal_deadline"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/activity_timeout_deadline_tests.rs",
+          "name": "activity_timeout::deadline_tests::model_timeout_same_millisecond"
+        }
+      ],
+      "rpcs": [],
+      "verdict": "differed and fixed",
+      "reason": "Exact deadline equality and same-millisecond expiry differed. Gaps: task-fire-time clock-skew floor and pre-epoch truncation are not compared by these model tests.",
+      "fix_commit": "b68c7a86",
+      "run": {
+        "rule_digest": "ea46c2100276cdd04a3d845a78cedb8b4f46e1b3b814ba6536cad3bf18266643",
+        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "tests": {
+          "tokeira-runtime::activity_timeout::deadline_tests::model_timeout_equal_deadline": "passed",
+          "tokeira-runtime::activity_timeout::deadline_tests::model_timeout_same_millisecond": "passed"
+        }
+      }
+    },
+    {
+      "rule": "activity.timeout-result",
+      "counterparts": [
+        {
+          "path": "crates/tokeira-runtime/src/activity_timeout.rs",
+          "item": "scan_activity_timeouts_once"
+        }
+      ],
+      "tests": [
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_schedule_to_start_close_tie_unpolled"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_timeout_result_generated"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_timeout_result_table"
+        }
+      ],
+      "rpcs": [],
+      "verdict": "differed and fixed",
+      "reason": "An unpolled ScheduleToStart/Close tie selected the wrong terminal timeout; the corrected event and single removal match the model. Gaps: older-attempt no-op, terminal heartbeat details and workflow-task scheduling are not directly compared.",
+      "fix_commit": "b68c7a86",
+      "run": {
+        "rule_digest": "c947c798463b81543168f4a53fff1e9f659e9bdac49190f7d3aaf1f9680abe7d",
+        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "tests": {
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_schedule_to_start_close_tie_unpolled": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_timeout_result_generated": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_timeout_result_table": "passed"
+        }
+      }
+    },
+    {
+      "rule": "activity.timeout-selection",
+      "counterparts": [
+        {
+          "path": "crates/tokeira-runtime/src/activity_timeout.rs",
+          "item": "evaluate_activity_timeout_with_heartbeat"
+        }
+      ],
+      "tests": [
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/activity_timeout_deadline_tests.rs",
+          "name": "activity_timeout::deadline_tests::model_timeout_earliest_deadline"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/activity_timeout_deadline_tests.rs",
+          "name": "activity_timeout::deadline_tests::model_timeout_equal_deadlines_order"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/activity_timeout_deadline_tests.rs",
+          "name": "activity_timeout::deadline_tests::model_timeout_selection_generated"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/activity_timeout_deadline_tests.rs",
+          "name": "activity_timeout::deadline_tests::model_timeout_selection_table"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_paused_spent_budget_and_timer_suppression"
+        },
+        {
+          "crate_name": "tokeira-runtime",
+          "file": "crates/tokeira-runtime/src/runtime/activity_model_tests.rs",
+          "name": "runtime::activity_cancel_retry_tests::model_tests::model_schedule_to_start_close_tie_unpolled"
+        }
+      ],
+      "rpcs": [],
+      "verdict": "differed and fixed",
+      "reason": "Earliest-deadline selection and equal-deadline timeout ordering differed, including the admission-created unpolled tie. Gaps: cross-activity scheduled-event-ID order and distinct first/current schedule anchors are not directly compared.",
+      "fix_commit": "b68c7a86",
+      "run": {
+        "rule_digest": "99d453e5e6d91960da074eaf7da97d5d0f655b9de08df8a27e9128dbc0b2025b",
+        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "tests": {
+          "tokeira-runtime::activity_timeout::deadline_tests::model_timeout_earliest_deadline": "passed",
+          "tokeira-runtime::activity_timeout::deadline_tests::model_timeout_equal_deadlines_order": "passed",
+          "tokeira-runtime::activity_timeout::deadline_tests::model_timeout_selection_generated": "passed",
+          "tokeira-runtime::activity_timeout::deadline_tests::model_timeout_selection_table": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_paused_spent_budget_and_timer_suppression": "passed",
+          "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_schedule_to_start_close_tie_unpolled": "passed"
+        }
+      }
+    }
+  ]
+}

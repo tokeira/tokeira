@@ -393,7 +393,8 @@ mod tests {
         );
         assert_eq!(
             tracking.scan_delay(now, maximum),
-            std::time::Duration::from_secs(5) + std::time::Duration::from_nanos(1)
+            // service/history/queues/queue_scheduled.go:298-300 @ v1.31.0.
+            std::time::Duration::from_secs(5)
         );
     }
 

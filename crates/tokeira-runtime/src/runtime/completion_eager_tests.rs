@@ -18,7 +18,8 @@ pub(super) fn schedule(id: &str, retry: bool) -> WorkflowCommand {
         request_eager_execution: true,
         use_workflow_build_id: false,
         retry_policy: retry.then(|| RetryPolicy {
-            initial_interval: Duration::ZERO,
+            // A nonpositive uncapped interval ends retries (service/history/workflow/retry.go:100-107 @ v1.31.0).
+            initial_interval: Duration::nanoseconds(1),
             backoff_coefficient: 1.0,
             maximum_interval: None,
             maximum_attempts: 3,
@@ -191,8 +192,7 @@ async fn rules_case(retry: bool, eager: bool) {
                 .fail_activity_task(
                     outcome.activity_tasks[0].token.clone(),
                     Payload::new(b"failure".to_vec()),
-                    None,
-                    false,
+                    crate::retry::ActivityFailure::Other,
                     None,
                     None,
                     RequestContext::unattributed(OffsetDateTime::now_utc()),

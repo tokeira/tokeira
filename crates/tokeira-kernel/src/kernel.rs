@@ -2484,6 +2484,16 @@ impl BasicKernel {
             .cloned()
             .ok_or_else(|| Reject::UnknownActivity(req.activity_id.clone()))?;
 
+        // Check the cancel bit on the transition's fenced base, before even
+        // materializing a transient start. A stale runtime read cannot authorize
+        // an unsolicited response (service/history/api/respondactivitytaskcanceled/api.go:81-88
+        // @ v1.31.0).
+        if matches!(req.resolution, ActivityResolution::Canceled { .. })
+            && !activity.cancel_requested
+        {
+            return Err(Reject::ActivityCancelNotRequested);
+        }
+
         let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         // Activities carrying a retry policy do not persist Started at poll time:
         // v1.31.0 keeps a transient start in mutable activity info and materializes
@@ -9139,6 +9149,10 @@ fn activity_id_not_started_details() -> Payloads {
 /// codes or internal retry decisions.
 #[derive(Debug, Error, PartialEq)]
 pub enum Reject {
+    /// A worker acknowledged cancellation without a durable cancellation request.
+    #[error("unable to mark activity as canceled without activity being request canceled first")]
+    ActivityCancelNotRequested,
+
     /// A workflow command carried invalid attributes. v1.31.0 FAILS THE
     /// WORKFLOW TASK with `cause` instead of rejecting the completion call
     /// (`failWorkflowTaskOnInvalidArgument`,

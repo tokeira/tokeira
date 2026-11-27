@@ -1677,7 +1677,13 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
             )
         }),
         arb_activity_resolution().prop_map(move |resolution| {
-            let state = with_activity(make_open_state(now), "activity-1");
+            let mut state = with_activity(make_open_state(now), "activity-1");
+            // Valid cancellation requires a request (service/history/api/respondactivitytaskcanceled/api.go:85-88 @ v1.31.0).
+            state
+                .activities
+                .get_mut("activity-1")
+                .unwrap()
+                .cancel_requested = matches!(resolution, ActivityResolution::Canceled { .. });
             let req = ActivityResolvedRequest {
                 activity_id: "activity-1".into(),
                 resolution,
@@ -2226,8 +2232,11 @@ proptest! {
     #[test]
     fn property_2_activity_resolution_event_matches_variant(resolution in arb_activity_resolution()) {
         let now = fixed_now();
+        let mut state = with_activity(make_open_state(now), "activity-1");
+        // service/history/api/respondactivitytaskcanceled/api.go:85-88 @ v1.31.0.
+        state.activities.get_mut("activity-1").unwrap().cancel_requested = matches!(resolution, ActivityResolution::Canceled { .. });
         let transition = kernel().apply(
-            LoadedRun::Existing(with_activity(make_open_state(now), "activity-1")),
+            LoadedRun::Existing(state),
             Command::ActivityResolved(ActivityResolvedRequest {
                 activity_id: "activity-1".into(),
                 resolution: resolution.clone(),

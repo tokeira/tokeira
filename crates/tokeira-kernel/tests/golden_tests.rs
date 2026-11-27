@@ -4058,7 +4058,13 @@ fn activity_resolved_timed_out_schedules_wft() {
 
 #[test]
 fn activity_resolved_canceled_schedules_wft() {
-    let state = make_open_state_with_activity("activity-1");
+    let mut state = make_open_state_with_activity("activity-1");
+    // service/history/api/respondactivitytaskcanceled/api.go:85-88 @ v1.31.0.
+    state
+        .activities
+        .get_mut("activity-1")
+        .unwrap()
+        .cancel_requested = true;
     let transition = kernel()
         .apply(
             LoadedRun::Existing(state),

@@ -226,7 +226,8 @@ async fn skipped_reset_schedule_to_start_uses_the_new_attempt_deadline() {
     let LoadedRun::Existing(at_deadline) = repo.load_run(run).await.unwrap() else {
         panic!("run")
     };
-    assert_eq!(at_deadline.activities["retry"].attempt, 2);
+    // Equality is due (service/history/queues/queue_scheduled.go:298-300 @ v1.31.0).
+    assert!(!at_deadline.activities.contains_key("retry"));
     tokio::time::advance(std::time::Duration::from_nanos(1)).await;
     scan(&runtime).await;
     let history = repo.read_history_to_end(run, 0).await.unwrap();

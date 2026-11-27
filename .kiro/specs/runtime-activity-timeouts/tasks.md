@@ -32,29 +32,29 @@ All code lives in `tokeira-runtime`, in a new `activity_timeout.rs` module (foll
   - [x] 1.4 Implement `TimeoutViolation` enum and `evaluate_activity_timeout` pure function
     - Define `TimeoutViolation` enum: `ScheduleToClose`, `ScheduleToStart`, `StartToClose`, `Heartbeat`
     - Implement `evaluate_activity_timeout(entry: &ActivityTrackingEntry, activity: &ActivityState, now: OffsetDateTime) -> Option<TimeoutViolation>`
-    - Follow precedence: schedule-to-close first, then heartbeat (started only), start-to-close (started only), schedule-to-start (unstarted only)
+    - Select the earliest exact deadline, breaking ties by timeout enum order: start-to-close, schedule-to-start, schedule-to-close, heartbeat (`service/history/workflow/timer_sequence.go:394-425 @ v1.31.0`); due comparisons use `floor_ms(deadline) <= floor_ms(now)`, flooring before the Unix epoch too (`service/history/queues/queue_scheduled.go:286-300`; `common/constants.go:46 @ v1.31.0`)
     - _Requirements: 3.1, 3.2, 3.3, 4.1, 4.2, 5.1, 5.2, 6.1, 6.2_
 
   - [x] 1.5 Write property tests for `evaluate_activity_timeout`
     - **Property 7: Heartbeat timeout fires for started activities with expired heartbeat**
     - **Validates: Requirements 3.1, 3.2, 3.3**
-    - Generate random `heartbeat_timeout`, `elapsed`, `has_heartbeat`, `has_started`; verify heartbeat timeout fires only when started and elapsed > timeout (unless schedule-to-close takes precedence); verify `started_at == None` never returns `Heartbeat`
+    - Generate random `heartbeat_timeout`, `elapsed`, `has_heartbeat`, `has_started`; verify heartbeat timeout fires only when started and the floored deadline is at or before floored now (unless an earlier deadline wins Property 11); verify `started_at == None` never returns `Heartbeat`
 
     - **Property 8: Schedule-to-start timeout fires only for unstarted activities**
     - **Validates: Requirements 4.1, 4.2**
-    - Generate random `schedule_to_start_timeout`, `elapsed`, `started_at`; verify fires only when `started_at == None` and elapsed > timeout (unless schedule-to-close takes precedence); verify `started_at == Some(_)` never returns `ScheduleToStart`
+    - Generate random `schedule_to_start_timeout`, `elapsed`, `started_at`; verify fires only when `started_at == None` and the floored deadline is at or before floored now (unless an earlier deadline wins Property 11); verify `started_at == Some(_)` never returns `ScheduleToStart`
 
     - **Property 9: Start-to-close timeout fires only for started activities**
     - **Validates: Requirements 5.1, 5.2**
-    - Generate random `start_to_close_timeout`, `elapsed`, `started_at`; verify fires only when `started_at == Some(_)` and elapsed > timeout (unless higher-precedence timeout fires); verify `started_at == None` never returns `StartToClose`
+    - Generate random `start_to_close_timeout`, `elapsed`, `started_at`; verify fires only when `started_at == Some(_)` and the floored deadline is at or before floored now (unless an earlier deadline wins Property 11); verify `started_at == None` never returns `StartToClose`
 
     - **Property 10: Schedule-to-close timeout fires regardless of start state**
     - **Validates: Requirements 6.1**
-    - Generate random `schedule_to_close_timeout`, `elapsed`, `started_at`; verify fires when elapsed > timeout regardless of start state
+    - Generate random `schedule_to_close_timeout`, `elapsed`, `started_at`; verify eligibility when the floored deadline is at or before floored now regardless of start state, subject to Property 11
 
-    - **Property 11: Schedule-to-close takes precedence over all other timeouts**
+    - **Property 11: Timeout selection follows deadline and enum order**
     - **Validates: Requirements 6.2**
-    - Generate entries where schedule-to-close fires AND at least one other timeout fires; verify result is always `ScheduleToClose`
+    - Generate entries where schedule-to-close fires AND at least one other timeout fires; verify the earliest exact deadline wins, with timeout enum ordering on ties (Property 11)
 
     - **Property 12: No timeout fires when no timeout is configured**
     - **Validates: Requirements 3.1, 4.1, 5.1, 6.1 (inverse)**
@@ -163,7 +163,7 @@ All code lives in `tokeira-runtime`, in a new `activity_timeout.rs` module (foll
     - Test heartbeat timeout: schedule activity, poll (start), wait without heartbeating, verify scanner submits heartbeat timeout producing `ActivityTaskTimedOut` history event
     - Test schedule-to-start timeout: schedule activity, do not poll, verify scanner submits schedule-to-start timeout
     - Test heartbeat then stop: schedule, poll, send heartbeats, stop heartbeating, verify heartbeat timeout fires
-    - Test schedule-to-close precedence: schedule with `schedule_to_close_timeout`, poll, verify schedule-to-close fires and takes precedence over start-to-close
+    - Test deadline ordering: schedule with `schedule_to_close_timeout`, poll, verify schedule-to-close wins only when its deadline precedes start-to-close (Property 11)
     - Test cancellation indicator: process `RequestCancelActivity` command, verify `record_activity_heartbeat` returns `true`
     - _Requirements: 1.3, 3.1, 4.1, 5.1, 6.1, 6.2_
 

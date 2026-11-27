@@ -143,8 +143,7 @@ async fn race(change: Change, point: Point, retrying_scanner: bool) {
                     .fail_activity_task(
                         token.unwrap(),
                         Payload::new(Vec::new()),
-                        None,
-                        false,
+                        crate::retry::ActivityFailure::Other,
                         None,
                         None,
                         RequestContext::unattributed(runtime.clock.now()),
@@ -367,6 +366,14 @@ async fn offer_current_attempt(
     let LoadedRun::Existing(state) = repo.load_run(run).await.unwrap() else {
         panic!("run")
     };
+    // Positive retry intervals must elapse before offering the new attempt
+    // (service/history/workflow/retry.go:100-112 @ v1.31.0).
+    if let Some(due) = state.activities[ORDERED].current_attempt_scheduled_at
+        && due > runtime.clock.now()
+    {
+        tokio::time::advance(std::time::Duration::try_from(due - runtime.clock.now()).unwrap())
+            .await;
+    }
     let task = activity_dispatch_task(run, &state, &state.activities[ORDERED]);
     runtime
         .activity_broker
@@ -416,8 +423,7 @@ async fn late_worker_retry_update_keeps_the_next_attempts_start() {
     let failing = runtime.fail_activity_task(
         first.token,
         Payload::new(Vec::new()),
-        None,
-        false,
+        crate::retry::ActivityFailure::Other,
         None,
         None,
         RequestContext::unattributed(runtime.clock.now()),
@@ -530,8 +536,7 @@ async fn late_retry_update_keeps_a_requested_reload() {
     let failing = runtime.fail_activity_task(
         first.token,
         Payload::new(Vec::new()),
-        None,
-        false,
+        crate::retry::ActivityFailure::Other,
         None,
         None,
         RequestContext::unattributed(runtime.clock.now()),

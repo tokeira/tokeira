@@ -226,14 +226,12 @@ pub(crate) enum ActivityRetryBackoff {
 pub(crate) fn activity_retry_decision(
     activity: &tokeira_kernel::ActivityState,
     retry_policy: Option<&RetryPolicy>,
-    failure_error_type: Option<&str>,
-    is_non_retryable: bool,
-    server_deadline: bool,
+    failure: &crate::retry::ActivityFailure,
     now: OffsetDateTime,
 ) -> ActivityRetryDecision {
     // `RetryActivity`'s order: no policy → RETRY_POLICY_NOT_SET, then a
-    // requested cancel → CANCEL_REQUESTED, then the server-enforced
-    // schedule-to-start and schedule-to-close deadlines → TIMEOUT, all before
+    // requested cancel → CANCEL_REQUESTED, then schedule-to-start and
+    // schedule-to-close timeout failures → TIMEOUT, all before
     // retryability and the backoff
     // (service/history/workflow/mutable_state_impl.go:6243-6266 @ v1.31.0).
     let Some(policy) = retry_policy else {
@@ -242,7 +240,7 @@ pub(crate) fn activity_retry_decision(
     if activity.cancel_requested {
         return ActivityRetryDecision::Terminal(RetryState::CancelRequested);
     }
-    if server_deadline {
+    if failure.is_schedule_timeout() {
         return ActivityRetryDecision::Terminal(RetryState::Timeout);
     }
     // Retry-expiration anchor: the FIRST schedule + schedule-to-close (the
@@ -251,14 +249,7 @@ pub(crate) fn activity_retry_decision(
         .schedule_to_close_timeout
         .filter(|timeout| !timeout.is_zero())
         .map(|timeout| deadline_after(activity.scheduled_at, timeout));
-    match evaluate_activity_retry(
-        policy,
-        activity.attempt,
-        failure_error_type,
-        is_non_retryable,
-        now,
-        expiration,
-    ) {
+    match evaluate_activity_retry(policy, activity.attempt, failure, now, expiration) {
         RetryDecision::Retry {
             next_attempt,
             backoff,
@@ -721,14 +712,15 @@ where
     /// failure. A retry records them, and their time, as a heartbeat does
     /// (respondactivitytaskfailed/api.go:87-94 @ v1.31.0); a terminal failure
     /// removes the activity, so they have nowhere to go.
+    /// `failure_classification` must describe the outer `failure`, including its
+    /// requested delay; causes never affect retryability (service/history/workflow/retry.go:56-68,115-151 @ v1.31.0).
     /// `RespondActivityTaskFailedById` passes `None`: v1.31.0's frontend drops
     /// them on that path (frontend/workflow_handler.go:1965-1969).
     pub async fn fail_activity_task(
         &self,
         token: ActivityTaskToken,
         failure: Payload,
-        failure_error_type: Option<String>,
-        is_non_retryable: bool,
+        failure_classification: crate::retry::ActivityFailure,
         last_heartbeat_details: Option<Payloads>,
         worker_identity: Option<WorkerIdentity>,
         request: RequestContext,
@@ -736,8 +728,7 @@ where
         Box::pin(self.fail_activity_task_inner(
             token,
             failure,
-            failure_error_type,
-            is_non_retryable,
+            failure_classification,
             last_heartbeat_details,
             worker_identity,
             request,
@@ -753,8 +744,7 @@ where
         &self,
         token: ActivityTaskToken,
         failure: Payload,
-        failure_error_type: Option<String>,
-        is_non_retryable: bool,
+        failure_classification: crate::retry::ActivityFailure,
         last_heartbeat_details: Option<Payloads>,
         worker_identity: Option<WorkerIdentity>,
         request: RequestContext,
@@ -773,9 +763,7 @@ where
         let decision = activity_retry_decision(
             &activity,
             retry_policy.as_ref(),
-            failure_error_type.as_deref(),
-            is_non_retryable,
-            false,
+            &failure_classification,
             self.clock.now(),
         );
 
@@ -849,6 +837,8 @@ where
 
     /// Resolve an activity as cancelled and notify the owning workflow.
     ///
+    /// Rejects an unsolicited response against the fenced durable cancel bit,
+    /// before recording any history (service/history/api/respondactivitytaskcanceled/api.go:81-95 @ v1.31.0).
     /// `details` are the worker-reported cancellation payloads recorded on the
     /// resolution. Like the other resolutions, the in-memory tracking entry is
     /// only removed once the kernel actually applies the transition (Applied or
@@ -3698,8 +3688,9 @@ mod tests {
                 .fail_activity_task(
                     token.clone(),
                     payload(b"failure"),
-                    None,
-                    !retryable,
+                    crate::retry::ActivityFailure::Server {
+                        non_retryable: !retryable,
+                    },
                     None,
                     None,
                     RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
@@ -3997,8 +3988,7 @@ mod tests {
             .fail_activity_task(
                 token.clone(),
                 payload(b"retryable"),
-                None,
-                false,
+                crate::retry::ActivityFailure::Other,
                 None,
                 None,
                 RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
@@ -4110,8 +4100,7 @@ mod tests {
             .fail_activity_task(
                 token,
                 payload(b"retryable"),
-                None,
-                false,
+                crate::retry::ActivityFailure::Other,
                 None,
                 None,
                 RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
@@ -4349,8 +4338,7 @@ mod tests {
             .fail_activity_task(
                 token.clone(),
                 payload(b"retryable"),
-                None,
-                false,
+                crate::retry::ActivityFailure::Other,
                 None,
                 None,
                 RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
@@ -4429,8 +4417,7 @@ mod tests {
             .fail_activity_task(
                 token.clone(),
                 payload(b"retryable"),
-                None,
-                false,
+                crate::retry::ActivityFailure::Other,
                 None,
                 None,
                 RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
@@ -4565,8 +4552,7 @@ mod tests {
             .fail_activity_task(
                 token.clone(),
                 payload(b"retryable"),
-                None,
-                false,
+                crate::retry::ActivityFailure::Other,
                 Some(reported.clone()),
                 None,
                 RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
@@ -4624,8 +4610,7 @@ mod tests {
             .fail_activity_task(
                 token.clone(),
                 payload(b"retryable"),
-                None,
-                false,
+                crate::retry::ActivityFailure::Other,
                 Some(payloads(b"reported-with-failure")),
                 None,
                 RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
@@ -4721,8 +4706,7 @@ mod tests {
                                 .fail_activity_task(
                                     token.clone(),
                                     payload(b"retryable"),
-                                    None,
-                                    false,
+                                    crate::retry::ActivityFailure::Other,
                                     with_details
                                         .then(|| payloads(format!("fail-{step}").as_bytes())),
                                     None,

@@ -198,7 +198,7 @@ The implementation is organized into 15 incremental features with explicit depen
 
 #### Acceptance Criteria
 
-1. WHEN an activity has a configured heartbeat_timeout and the elapsed time since the last heartbeat exceeds the timeout, THE Runtime SHALL submit an `ActivityResolved` command with a TimedOut resolution.
+1. WHEN an activity has a configured heartbeat_timeout and its heartbeat deadline is due, THE Runtime SHALL submit an `ActivityResolved` command with a TimedOut resolution.
 2. THE Runtime SHALL run a background scanner that periodically checks started activities for heartbeat timeout violations.
 3. THE heartbeat timeout scanner SHALL use configurable scan intervals.
 
@@ -208,7 +208,7 @@ The implementation is organized into 15 incremental features with explicit depen
 
 #### Acceptance Criteria
 
-1. WHEN an activity has a configured schedule_to_start_timeout and the elapsed time since scheduling exceeds the timeout without the activity being started, THE Runtime SHALL submit an `ActivityResolved` command with a TimedOut resolution.
+1. WHEN an activity has a configured schedule_to_start_timeout and its schedule-to-start deadline is due without the activity being started, THE Runtime SHALL submit an `ActivityResolved` command with a TimedOut resolution.
 2. THE Runtime SHALL check schedule-to-start timeout as part of the activity timeout scanning background task.
 
 ### Requirement 3.4: Start-to-Close Timeout Detection
@@ -217,7 +217,7 @@ The implementation is organized into 15 incremental features with explicit depen
 
 #### Acceptance Criteria
 
-1. WHEN an activity has a configured start_to_close_timeout and the elapsed time since the activity was started exceeds the timeout, THE Runtime SHALL submit an `ActivityResolved` command with a TimedOut resolution.
+1. WHEN an activity has a configured start_to_close_timeout and its start-to-close deadline is due, THE Runtime SHALL submit an `ActivityResolved` command with a TimedOut resolution.
 2. THE Runtime SHALL check start-to-close timeout as part of the activity timeout scanning background task.
 
 ### Requirement 3.5: Schedule-to-Close Timeout Detection
@@ -226,8 +226,8 @@ The implementation is organized into 15 incremental features with explicit depen
 
 #### Acceptance Criteria
 
-1. WHEN an activity has a configured schedule_to_close_timeout and the elapsed time since scheduling exceeds the timeout, THE Runtime SHALL submit an `ActivityResolved` command with a TimedOut resolution regardless of whether the activity has been started.
-2. THE schedule-to-close timeout SHALL take precedence when it fires before other timeout types.
+1. WHEN an activity has a configured schedule_to_close_timeout and its schedule-to-close deadline is due, THE Runtime SHALL submit an `ActivityResolved` command with a TimedOut resolution regardless of whether the activity has been started.
+2. THE Runtime SHALL choose the earliest exact deadline, breaking ties by timeout enum order: start-to-close, schedule-to-start, schedule-to-close, heartbeat (`service/history/workflow/timer_sequence.go:394-425 @ v1.31.0`). THE timeout due comparison SHALL use `floor_ms(deadline) <= floor_ms(now)`, flooring before the Unix epoch too (`service/history/queues/queue_scheduled.go:286-300`; `common/constants.go:46 @ v1.31.0`). Only a terminal retry decision SHALL resolve the selected timeout (`service/history/timer_queue_active_task_executor.go:300-316 @ v1.31.0`).
 
 ---
 

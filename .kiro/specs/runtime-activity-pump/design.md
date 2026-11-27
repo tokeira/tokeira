@@ -164,13 +164,15 @@ pub enum RetryDecision {
 pub fn evaluate_activity_retry(
     policy: &RetryPolicy,
     current_attempt: u32,
-    failure_error_type: Option<&str>,
+    failure: &ActivityFailure,
+    now: OffsetDateTime,
+    expiration: Option<OffsetDateTime>,
 ) -> RetryDecision;
 
 /// Compute the backoff interval for a retry attempt.
 ///
 /// Formula: initial_interval * backoff_coefficient^(attempt - 1),
-/// capped at maximum_interval.
+/// computed in signed nanoseconds; a zero maximum means uncapped.
 pub fn compute_retry_backoff(
     policy: &RetryPolicy,
     attempt: u32,
@@ -216,7 +218,7 @@ impl<R> TokeiraRuntime<R> where R: RunRepository + 'static {
         &self,
         token: ActivityTaskToken,
         failure_message: String,
-        failure_error_type: Option<String>,
+        failure_classification: ActivityFailure,
     ) -> Result<()>;
 
     pub async fn republish_activity_queue(
@@ -352,13 +354,13 @@ Input: ActivityTaskToken { run_key, activity_id, schedule_event_id, attempt, sha
 
 ### Property 7: Retry-or-resolve decision
 
-*For any* `RetryPolicy` and `(current_attempt, failure_error_type)` pair, `evaluate_activity_retry` shall return `Exhausted` if and only if either (a) `maximum_attempts > 0` and `current_attempt >= maximum_attempts`, (b) `failure_error_type` matches any entry in `non_retryable_error_types`, or (c) the next attempt would start strictly after retry expiration, after capping the backoff at the maximum interval (`service/history/workflow/retry.go:105-112 @ v1.31.0`). Equality at expiration permits retry. In all other cases it shall return `Retry { next_attempt: current_attempt + 1 }`. When `maximum_attempts == 0`, retryable error types remain subject to the same expiration check.
+*For any* policy and outer failure, retry evaluation SHALL classify only the outer failure: missing or unrecognized kinds retry; canceled and terminated failures do not; server failures honor their non-retryable flag; application failures honor that flag and exact type exclusions, including the empty string; timeout failures retry only for start-to-close and heartbeat, subject to `TemporalTimeout:<type>` exclusions (`service/history/workflow/retry.go:115-151 @ v1.31.0`). It SHALL then enforce the attempt limit, reject a nonpositive interval without a maximum as Timeout, and reject a next start strictly after expiration; equality at expiration permits retry (`service/history/workflow/retry.go:96-112 @ v1.31.0`). A present outer application `next_retry_delay` SHALL replace both interval and maximum, retaining signed duration conversion and zero/negative values (`service/history/workflow/retry.go:56-68`; `service/history/workflow/mutable_state_impl.go:6300-6317 @ v1.31.0`).
 
 **Validates: Requirements 5.3, 5.4, 5.6, 6.2, 6.3**
 
 ### Property 8: Backoff computation
 
-*For any* `RetryPolicy` with `initial_interval`, `backoff_coefficient`, and optional `maximum_interval`, and *for any* attempt number `n ≥ 1`, `compute_retry_backoff` shall return `min(initial_interval * backoff_coefficient^(n-1), maximum_interval)` when `maximum_interval` is set, or `initial_interval * backoff_coefficient^(n-1)` when it is not.
+*For any* policy and attempt number `n >= 1`, `compute_retry_backoff` SHALL compute `initial_interval * backoff_coefficient^(attempt - 1)` in floating-point nanoseconds, taking the power by repeated squaring from the lowest bit as Go's `math.Pow` does for a whole exponent (`src/math/pow.go:131-156 @ go1.26.2`), truncate with saturation into `0..=i64::MAX` nanoseconds, and treat a missing or zero maximum as uncapped. A nonzero maximum SHALL replace a nonpositive interval or an interval above that maximum (`common/backoff/retry.go:183-185`; `service/history/workflow/retry.go:100-107 @ v1.31.0`). Saturating positive float overflow selects the architecture-dependent conversion used by the behaviour model.
 
 **Validates: Requirements 6.4, 6.5**
 
@@ -410,7 +412,7 @@ When the start transaction encounters an OCC conflict, the runtime retries (relo
 
 ### Retry policy evaluation errors
 
-The retry evaluation functions are pure and infallible. Invalid policy configurations (e.g., `backoff_coefficient < 1.0`, `initial_interval` of zero) are handled defensively: `backoff_coefficient` is clamped to `max(1.0, value)`, and `initial_interval` of zero produces zero backoff. These are not error paths — they are defensive defaults.
+The retry evaluation functions are pure and infallible. Stored coefficients are preserved. Arithmetic uses signed nanoseconds with saturating float conversion; a nonzero maximum replaces nonpositive or over-maximum intervals. An uncapped nonpositive interval ends retry with Timeout (`common/backoff/retry.go:183-185`; `service/history/workflow/retry.go:100-107 @ v1.31.0`).
 
 ### Activity broker publish failure
 
@@ -451,7 +453,7 @@ Unit tests complement property tests for specific examples and edge cases:
 - **Poll timeout returns None**: verify that polling an empty queue with a short timeout returns `None`.
 - **Start transaction failure returns None**: verify that when the activity is removed between match and start, `poll_activity_task` returns `None`.
 - **Zero max_attempts means unlimited retry**: verify that `evaluate_activity_retry` with `maximum_attempts = 0` returns `Retry` for any attempt count.
-- **Backoff capping**: verify that when `maximum_interval` is set, the computed backoff never exceeds it.
+- **Backoff capping**: verify that a nonzero `maximum_interval` replaces a nonpositive or over-maximum interval; zero is uncapped (Property 8).
 - **Republish on empty storage**: verify that `republish_activity_queue` returns 0 when storage has no dispatchable tasks.
 - **Complete after activity resolved**: verify that completing an activity whose `activity_id` was already deleted from state returns an error.
 

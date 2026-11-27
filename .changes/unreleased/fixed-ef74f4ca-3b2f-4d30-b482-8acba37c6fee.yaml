@@ -1,0 +1,5 @@
+kind: fixed
+body: Workflow activities now retry and time out as they do in v1.31.0, honour a failure's requested retry delay, and refuse a worker's cancel unless cancellation was requested.
+time: 2026-11-27T00:00:00+00:00
+custom:
+    Slice: ef74f4ca-3b2f-4d30-b482-8acba37c6fee

@@ -1,6 +1,6 @@
 //! Activity decisions compared to independently sourced expectations on a real
 //! in-memory runtime. Ordinary agreements remain provisional; exact instants use
-//! source-only evidence. Known differences remain executable ignored assertions.
+//! source-only evidence.
 
 use super::*;
 use crate::retry::{RetryDecision as EngineRetry, evaluate_activity_retry};
@@ -74,8 +74,11 @@ fn check_retry(
     let actual = evaluate_activity_retry(
         policy,
         attempt,
-        Some(error),
-        non_retryable,
+        &crate::retry::ActivityFailure::Application {
+            error_type: error.into(),
+            non_retryable,
+            next_retry_delay: None,
+        },
         OffsetDateTime::UNIX_EPOCH,
         expiration.map(|t| OffsetDateTime::from_unix_timestamp_nanos(t).unwrap()),
     );
@@ -253,31 +256,26 @@ async fn model_options_reschedule_table() {
 }
 
 #[tokio::test(start_paused = true)]
-#[ignore = "differs from v1.31.0: zero interval with a positive maximum preserves the old schedule"]
 async fn model_options_zero_interval_uses_maximum() {
     reschedule(Duration::ZERO, Some(Duration::seconds(5)), 2.0, true, false).await;
 }
 
 #[tokio::test(start_paused = true)]
-#[ignore = "differs from v1.31.0: a present zero maximum is treated as a zero cap"]
 async fn model_options_zero_maximum_is_uncapped() {
     reschedule(Duration::seconds(2), Some(Duration::ZERO), 2.0, true, false).await;
 }
 
 #[tokio::test(start_paused = true)]
-#[ignore = "differs from v1.31.0: submillisecond initial intervals lose precision"]
 async fn model_options_preserve_nanoseconds() {
     reschedule(Duration::nanoseconds(1), None, 2.0, true, false).await;
 }
 
 #[tokio::test(start_paused = true)]
-#[ignore = "differs from v1.31.0: backoff exceeds signed 64-bit nanoseconds"]
 async fn model_options_interval_fits_signed_nanoseconds() {
     reschedule(Duration::seconds(5_000_000_000), None, 2.0, true, false).await;
 }
 
 #[test]
-#[ignore = "differs from v1.31.0: nonpositive retry interval without a maximum retries instead of timing out"]
 fn model_retry_zero_interval_without_maximum() {
     let mut p = policy();
     p.initial_interval = Duration::ZERO;
@@ -285,7 +283,6 @@ fn model_retry_zero_interval_without_maximum() {
 }
 
 #[test]
-#[ignore = "differs from v1.31.0: submillisecond retry intervals lose precision"]
 fn model_retry_submillisecond() {
     // service/history/workflow/retry.go:100-112; common/backoff/retry.go:183-185 @ v1.31.0.
     check_retry(
@@ -302,7 +299,6 @@ fn model_retry_submillisecond() {
 }
 
 #[test]
-#[ignore = "differs from v1.31.0: zero retry intervals do not fall back to the positive maximum"]
 fn model_retry_zero_with_cap() {
     // service/history/workflow/retry.go:100-112; common/backoff/retry.go:183-185 @ v1.31.0.
     check_retry(
@@ -319,7 +315,6 @@ fn model_retry_zero_with_cap() {
 }
 
 #[test]
-#[ignore = "differs from v1.31.0: a present zero retry maximum is treated as a zero cap"]
 fn model_retry_zero_maximum() {
     // service/history/workflow/retry.go:100-112; common/backoff/retry.go:183-185 @ v1.31.0.
     check_retry(
@@ -336,7 +331,6 @@ fn model_retry_zero_maximum() {
 }
 
 #[test]
-#[ignore = "differs from v1.31.0: negative retry intervals retry instead of timing out"]
 fn model_retry_negative_without_cap() {
     // service/history/workflow/retry.go:100-112; common/backoff/retry.go:183-185 @ v1.31.0.
     check_retry(
@@ -428,13 +422,11 @@ async fn model_heartbeat_and_cancel_response() {
 }
 
 #[tokio::test(start_paused = true)]
-#[ignore = "differs from v1.31.0: cancellation response is accepted without a cancellation request"]
 async fn model_cancel_response_requires_request() {
     cancel_response_case(false).await;
 }
 
 #[tokio::test(start_paused = true)]
-#[ignore = "differs from v1.31.0: worker next_retry_delay is ignored"]
 async fn model_requested_delay_overrides_policy_cap() {
     // service/history/workflow/mutable_state_impl.go:6300-6317 @ v1.31.0.
     let f = Fixture::new(Some(policy()), false).await;
@@ -453,8 +445,11 @@ async fn model_requested_delay_overrides_policy_cap() {
         .fail_activity_task(
             f.token.clone(),
             failure_to_payload(&failure),
-            Some("retryable".into()),
-            false,
+            crate::retry::ActivityFailure::Application {
+                error_type: "retryable".into(),
+                non_retryable: false,
+                next_retry_delay: Some(Duration::seconds(3)),
+            },
             None,
             None,
             RequestContext::unattributed(at),
@@ -592,7 +587,6 @@ async fn model_timeout_result_table() {
 }
 
 #[tokio::test(start_paused = true)]
-#[ignore = "differs from v1.31.0: an unpolled ScheduleToStart/ScheduleToClose tie reports ScheduleToClose"]
 async fn model_schedule_to_start_close_tie_unpolled() {
     let (repo, runtime) = timer_deadline_tests::fixture().await;
     let request = start(&runtime, false);
@@ -938,7 +932,7 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: 100, failure_persistence: None, ..ProptestConfig::default() })]
     // Feature: conformance-harness, Property 10. Requested worker delay must survive the runtime failure path.
     #[test]
-    #[ignore = "differs from v1.31.0: worker next_retry_delay is ignored"]
+
     fn model_requested_delay_generated(delay in 2i64..10) {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             tokio::time::pause();
@@ -946,7 +940,7 @@ proptest! {
             let at = f.runtime.clock.now();
             let failure = application_failure(false, "retryable", Some(delay * 1_000_000_000));
             let expected = model::retry(&model::RetryInput { policy: Some(wire_policy(&policy())), attempt: 1, ..Default::default() }, Some(&failure), at.unix_timestamp_nanos());
-            f.runtime.fail_activity_task(f.token.clone(), failure_to_payload(&failure), Some("retryable".into()), false, None, None, RequestContext::unattributed(at)).await.unwrap();
+            f.runtime.fail_activity_task(f.token.clone(), failure_to_payload(&failure), crate::retry::ActivityFailure::Application { error_type: "retryable".into(), non_retryable: false, next_retry_delay: Some(Duration::seconds(delay)) }, None, None, RequestContext::unattributed(at)).await.unwrap();
             let next = f.state().await.activities[&f.token.activity_id].current_attempt_scheduled_at.unwrap();
             discovery_tests::stop(&f.runtime).await;
             assert_eq!(model::RetryDecision::After((next-at).whole_nanoseconds().try_into().unwrap()), expected);

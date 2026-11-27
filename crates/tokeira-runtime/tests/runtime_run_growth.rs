@@ -593,8 +593,11 @@ async fn an_activity_retry_over_a_limit_terminates_the_run() -> Result<()> {
                     ..Default::default()
                 },
             ),
-            Some("Retryable".to_string()),
-            false,
+            tokeira_runtime::retry::ActivityFailure::Application {
+                error_type: "Retryable".to_string(),
+                non_retryable: false,
+                next_retry_delay: None,
+            },
             None,
             Some(WorkerIdentity("worker".to_string())),
             RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),

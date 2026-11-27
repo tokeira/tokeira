@@ -262,7 +262,8 @@ async fn publication_with_fault(
     {
         *task_queue = original.task_queue.clone();
         retry_policy.as_mut().unwrap().initial_interval = if matches!(path, Path::FailureDue) {
-            Duration::ZERO
+            // A zero uncapped interval stops retries (service/history/workflow/retry.go:100-107 @ v1.31.0).
+            Duration::nanoseconds(1)
         } else {
             delay
         };
@@ -385,8 +386,7 @@ async fn publication_with_fault(
             let failed = owner.fail_activity_task(
                 task.token,
                 Payload::new(Vec::new()),
-                None,
-                false,
+                crate::retry::ActivityFailure::Other,
                 None,
                 None,
                 request_context(now),
@@ -398,6 +398,9 @@ async fn publication_with_fault(
                 let due = next.activities["activity"]
                     .current_attempt_scheduled_at
                     .unwrap();
+                if matches!(path, Path::FailureDue) {
+                    tokio::time::advance(std::time::Duration::from_nanos(1)).await;
+                }
                 assert_eq!(due <= owner.clock.now(), matches!(path, Path::FailureDue));
                 if due > owner.clock.now() {
                     tokio::time::advance((due - owner.clock.now()).try_into().unwrap()).await;

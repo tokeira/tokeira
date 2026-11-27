@@ -12,11 +12,7 @@ The feature has two distinct halves:
 
 The runtime-local tracking state (`ActivityTrackingState`) is a new in-memory structure keyed by `(RunKey, String)` (run_key, activity_id). It records `scheduled_at`, `started_at`, `last_heartbeat_at`, and `cancel_requested` per activity. This state is populated by hooks in the existing activity lifecycle: dispatch publication sets `scheduled_at`, the activity-task-start transaction sets `started_at`, heartbeat calls update `last_heartbeat_at`, and activity resolution removes the entry.
 
-The four timeout types follow Temporal's semantics:
-- **Heartbeat timeout**: elapsed since `last_heartbeat_at` (or `started_at` if no heartbeat received) exceeds `ActivityState.heartbeat_timeout`. Only checked for started activities.
-- **Schedule-to-start timeout**: elapsed since `scheduled_at` exceeds `ActivityState.schedule_to_start_timeout`. Only checked for unstarted activities.
-- **Start-to-close timeout**: elapsed since `started_at` exceeds `ActivityState.start_to_close_timeout`. Only checked for started activities.
-- **Schedule-to-close timeout**: elapsed since `scheduled_at` exceeds `ActivityState.schedule_to_close_timeout`. Checked regardless of start state. Takes precedence when multiple timeouts fire in the same scan cycle.
+The four timeout deadlines use positive configured durations. Heartbeat is anchored at the later of start and last heartbeat; start-to-close at start; schedule-to-start at the current attempt's schedule (unstarted only); schedule-to-close at the original schedule, regardless of start state. A deadline is due when `floor_ms(deadline) <= floor_ms(now)`, flooring before the Unix epoch too (`service/history/queues/queue_scheduled.go:286-300`; `common/constants.go:46 @ v1.31.0`). Select the earliest exact deadline, breaking ties by timeout enum order: start-to-close, schedule-to-start, schedule-to-close, heartbeat (`service/history/workflow/timer_sequence.go:394-425 @ v1.31.0`). Only one timeout applies per attempt (`service/history/timer_queue_active_task_executor.go:243-267,292-295 @ v1.31.0`).
 
 ## Architecture
 
@@ -77,7 +73,7 @@ It submits no kernel command and creates no history event.
 
 **Cached configuration selects wakes; storage authorizes decisions.** Tracking caches all four timeout durations and the pause flag beside the anchors. Each due entry reloads its `ActivityState` before evaluation and refreshes that cache, including when no timeout fires. A full pass every interval repairs a cache later than the real deadline; `UpdateActivityOptions` and other lane commits also refresh tracked configuration.
 
-**Schedule-to-close takes precedence.** When multiple timeouts fire for the same activity in a single scan cycle, only the `SCHEDULE_TO_CLOSE` resolution is submitted. This matches Temporal's semantics: schedule-to-close is the outer bound that subsumes all other timeouts.
+**Timeout ordering follows deadlines.** Choose the earliest exact deadline, breaking ties by timeout enum order: start-to-close, schedule-to-start, schedule-to-close, heartbeat (`service/history/workflow/timer_sequence.go:394-425 @ v1.31.0`). Retry can advance the attempt, making the remaining old-attempt timers stale (`service/history/timer_queue_active_task_executor.go:292-295 @ v1.31.0`).
 
 **Scanner submits through the lane, not directly to the kernel.** The scanner uses the same `self.submit(run_key, Command::ActivityResolved(...))` path as completions and failures. This preserves the lane's single-writer serialization for each run and ensures the kernel's fenced transition logic handles conflicts correctly.
 
@@ -201,7 +197,7 @@ The scanner loop:
    tie-break. Every interval, include all entries to reconcile stale caches.
 4. Before each await, mark the captured entry revision attempted. Read its run
    unless this pass already read it, refresh cached timeouts and pause state, then
-   evaluate authoritative activity state using the existing precedence, retry
+   evaluate authoritative activity state using deadline and enum ordering, retry
    decisions and lane submission.
 5. Retire successful/stale entries conditionally on revision and acquisition.
    Failed attempts wait for the next interval. A bounded pass leaves unattempted
@@ -234,11 +230,12 @@ in the next wake.
 
 Cache all four timeout values and the pause flag beside the timing anchors. Unknown
 configuration is immediately due for one reload. Paused activities and zero/unset
-timeouts have no deadline. Otherwise the earliest applicable strict deadline is
-one nanosecond after the saturating deadline: schedule-to-close always applies;
+timeouts have no deadline. Otherwise the earliest applicable deadline is floored
+to a millisecond, and equality is due (service/history/queues/queue_scheduled.go:298-300;
+common/constants.go:46 @ v1.31.0): schedule-to-close always applies;
 started activities add start-to-close and heartbeat (the later of start and last
-heartbeat); unstarted activities add schedule-to-start. Saturated deadlines cannot
-expire. Publisher scheduling, committed state, ordinary starts and recovery supply
+heartbeat); unstarted activities add schedule-to-start. Saturated deadlines become due
+at the millisecond floor of the latest representable date. Publisher scheduling, committed state, ordinary starts and recovery supply
 the cache; re-anchoring preserves it. Every lane commit refreshes changed options
 and pause state of tracked activities without rearming unchanged entries. A changed
 entry takes that commit's whole image, in the same order as other updates.
@@ -295,8 +292,8 @@ pub enum TimeoutViolation {
 
 /// Evaluate which timeout (if any) has been violated for an activity.
 ///
-/// Returns the highest-precedence violation, or None if no timeout has fired.
-/// Schedule-to-close takes precedence over all others.
+/// Returns the earliest due deadline, breaking ties by timeout enum order.
+/// Due comparisons are inclusive at millisecond precision.
 pub fn evaluate_activity_timeout(
     entry: &ActivityTrackingEntry,
     activity: &ActivityState,
@@ -407,30 +404,17 @@ ActivityTrackingEntry:
 
 ```
 evaluate_activity_timeout(entry, activity_state, now):
-  // Schedule-to-close takes precedence (uses original scheduling time)
-  if activity_state.schedule_to_close_timeout is Some(d):
-    if now - activity_state.scheduled_at > d:
-      return Some(ScheduleToClose)
+  if activity_state is paused: return None
+  candidates = positive configured deadlines for the current attempt:
+    schedule-to-close: original schedule + timeout
+    if started:
+      start-to-close: start + timeout
+      heartbeat: max(start, durable heartbeat, valid cached heartbeat) + timeout
+    else:
+      schedule-to-start: current attempt schedule + timeout
+  selected = minimum(candidates, key = (exact deadline, timeout enum value))
+  return selected.kind if floor_ms(selected.deadline) <= floor_ms(now) else None
 
-  if activity_state.started_at is Some(started):
-    // Heartbeat timeout (only for started activities)
-    if activity_state.heartbeat_timeout is Some(d):
-      let baseline = max(started, activity_state.last_heartbeat_at, entry.last_heartbeat_at)
-      if now - baseline > d:
-        return Some(Heartbeat)
-
-    // Start-to-close timeout (only for started activities)
-    if activity_state.start_to_close_timeout is Some(d):
-      if now - started > d:
-        return Some(StartToClose)
-  else:
-    // Schedule-to-start timeout (uses this attempt's authoritative schedule)
-    if activity_state.schedule_to_start_timeout is Some(d):
-      let scheduled = activity_state.current_attempt_scheduled_at.unwrap_or(activity_state.scheduled_at)
-      if now - scheduled > d:
-        return Some(ScheduleToStart)
-
-  return None
 ```
 
 ### Scanner lifecycle
@@ -490,31 +474,31 @@ TokeiraRuntime::shutdown (or Drop):
 
 ### Property 7: Heartbeat timeout fires for started activities with expired heartbeat
 
-*For any* cached entry and reloaded `ActivityState` with `started_at = Some(t)` and `heartbeat_timeout = Some(d)`, if `now - max(t, durable_last_heartbeat_at, cached_last_heartbeat_at) > d`, then `evaluate_activity_timeout` shall return `Some(Heartbeat)` — unless `schedule_to_close_timeout` also fires, in which case `ScheduleToClose` takes precedence. If `last_heartbeat_at` is `None`, the baseline shall be `started_at`. If `started_at` is `None`, the function shall never return `Heartbeat`.
+*For any* started activity with a positive configured `Heartbeat` timeout, the deadline anchored at `max(start, durable heartbeat, valid cached heartbeat)` SHALL be eligible when `floor_ms(deadline) <= floor_ms(now)`, flooring before the Unix epoch too (`service/history/queues/queue_scheduled.go:286-300`; `common/constants.go:46 @ v1.31.0`). `evaluate_activity_timeout` SHALL return `Some(Heartbeat)` if that deadline wins Property 11’s ordering. Timers requiring a start SHALL never apply to unstarted activities; schedule-to-start SHALL never apply to started activities.
 
 **Validates: Requirements 3.1, 3.2, 3.3**
 
 ### Property 8: Schedule-to-start timeout fires only for unstarted activities
 
-*For any* cached entry and reloaded `ActivityState` with `started_at = None` and `schedule_to_start_timeout = Some(d)`, if `now - current_attempt_scheduled_at.unwrap_or(scheduled_at) > d`, then `evaluate_activity_timeout` shall return `Some(ScheduleToStart)` — unless `schedule_to_close_timeout` also fires, in which case `ScheduleToClose` takes precedence. If `started_at` is `Some(_)`, the function shall never return `ScheduleToStart`.
+*For any* unstarted activity with a positive configured `ScheduleToStart` timeout, the deadline anchored at `current_attempt_scheduled_at.unwrap_or(scheduled_at)` SHALL be eligible when `floor_ms(deadline) <= floor_ms(now)`, flooring before the Unix epoch too (`service/history/queues/queue_scheduled.go:286-300`; `common/constants.go:46 @ v1.31.0`). `evaluate_activity_timeout` SHALL return `Some(ScheduleToStart)` if that deadline wins Property 11’s ordering. Timers requiring a start SHALL never apply to unstarted activities; schedule-to-start SHALL never apply to started activities.
 
 **Validates: Requirements 4.1, 4.2**
 
 ### Property 9: Start-to-close timeout fires only for started activities
 
-*For any* cached entry and reloaded `ActivityState` with `started_at = Some(t)` and `start_to_close_timeout = Some(d)`, if `now - t > d`, then `evaluate_activity_timeout` shall return `Some(StartToClose)` — unless `schedule_to_close_timeout` or `heartbeat_timeout` also fires with higher precedence. If `started_at` is `None`, the function shall never return `StartToClose`.
+*For any* started activity with a positive configured `StartToClose` timeout, the deadline anchored at `started_at` SHALL be eligible when `floor_ms(deadline) <= floor_ms(now)`, flooring before the Unix epoch too (`service/history/queues/queue_scheduled.go:286-300`; `common/constants.go:46 @ v1.31.0`). `evaluate_activity_timeout` SHALL return `Some(StartToClose)` if that deadline wins Property 11’s ordering. Timers requiring a start SHALL never apply to unstarted activities; schedule-to-start SHALL never apply to started activities.
 
 **Validates: Requirements 5.1, 5.2**
 
 ### Property 10: Schedule-to-close timeout fires regardless of start state
 
-*For any* `ActivityTrackingEntry` (with or without `started_at`) and *for any* `ActivityState` with `schedule_to_close_timeout = Some(d)`, if `now - scheduled_at > d`, then `evaluate_activity_timeout` shall return `Some(ScheduleToClose)`.
+*For any* started or unstarted activity with a positive configured `ScheduleToClose` timeout, the deadline anchored at `scheduled_at` SHALL be eligible when `floor_ms(deadline) <= floor_ms(now)`, flooring before the Unix epoch too (`service/history/queues/queue_scheduled.go:286-300`; `common/constants.go:46 @ v1.31.0`). `evaluate_activity_timeout` SHALL return `Some(ScheduleToClose)` if that deadline wins Property 11’s ordering. Timers requiring a start SHALL never apply to unstarted activities; schedule-to-start SHALL never apply to started activities.
 
 **Validates: Requirements 6.1**
 
-### Property 11: Schedule-to-close takes precedence over all other timeouts
+### Property 11: Timeout selection follows deadline and enum order
 
-*For any* `ActivityTrackingEntry` and `ActivityState` where `schedule_to_close_timeout` fires AND at least one other timeout (heartbeat, schedule-to-start, or start-to-close) also fires, `evaluate_activity_timeout` shall return `Some(ScheduleToClose)`.
+*For any* activity with multiple due deadlines, `evaluate_activity_timeout` SHALL return the earliest exact deadline, breaking ties by timeout enum order: start-to-close, schedule-to-start, schedule-to-close, heartbeat (`service/history/workflow/timer_sequence.go:394-425 @ v1.31.0`). An unpolled schedule-to-start/schedule-to-close tie SHALL select schedule-to-start; equal start-to-close/heartbeat deadlines SHALL select start-to-close. The fenced recheck SHALL select the same timer from its authoritative state.
 
 **Validates: Requirements 6.2**
 
@@ -604,7 +588,7 @@ Unit tests complement property tests for specific examples and edge cases:
 
 - **Heartbeat with no tracking entry**: verify that heartbeat for a valid token but missing tracking entry returns `false` (no cancellation) without error.
 - **Scanner default config**: verify that `ActivityTimeoutScannerConfig::default()` has `scan_interval = 1s` and `max_timeouts_per_scan = 100`.
-- **Timeout evaluation with all timeouts configured and all expired**: verify that `ScheduleToClose` is returned (precedence).
+- **Timeout evaluation with all timeouts configured and all expired**: verify that the earliest deadline wins and equal deadlines follow timeout enum order (Property 11).
 - **Timeout evaluation with zero-duration timeout**: verify that a timeout of `Duration::ZERO` fires immediately.
 - **Scanner removes tracking entry after successful timeout submission**: verify the entry is gone after the scanner processes it.
 - **Scanner removes tracking entry after kernel rejection**: verify the entry is gone even when the kernel rejects.
@@ -616,7 +600,7 @@ Integration tests exercise the full `TokeiraRuntime` with `InMemoryStore`:
 - Schedule an activity, poll it (start it), wait without heartbeating, and verify the scanner submits a heartbeat timeout that produces an `ActivityTaskTimedOut` history event.
 - Schedule an activity, do not poll it, and verify the scanner submits a schedule-to-start timeout.
 - Schedule an activity, poll it, send heartbeats, then stop heartbeating, and verify the heartbeat timeout fires after the configured interval.
-- Schedule an activity with `schedule_to_close_timeout`, poll it, and verify the schedule-to-close timeout fires and takes precedence over start-to-close.
+- Schedule an activity with `schedule_to_close_timeout`, poll it, and verify schedule-to-close wins only when its deadline precedes start-to-close (Property 11).
 - Verify that `record_activity_heartbeat` returns `true` after a `RequestCancelActivity` command is processed.
 
 ### Test configuration

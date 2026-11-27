@@ -882,14 +882,15 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         request: RequestContext,
     ) -> Result<WorkflowMutationOutcome>;
 
+    /// The classification preserves only the outer failure's retry fields,
+    /// including its requested delay (service/history/workflow/retry.go:56-68,115-151 @ v1.31.0).
     /// `last_heartbeat_details` is the progress reported with the failure,
     /// which a retry records as a heartbeat; the by-id path passes `None`.
     async fn fail_activity_task(
         &self,
         token: ActivityTaskToken,
         failure: Payload,
-        failure_error_type: Option<String>,
-        is_non_retryable: bool,
+        failure_classification: tokeira_runtime::retry::ActivityFailure,
         last_heartbeat_details: Option<Payloads>,
         worker_identity: Option<tokeira_types::WorkerIdentity>,
         request: RequestContext,
@@ -7314,8 +7315,7 @@ impl WorkflowService {
                     .fail_activity_task(
                         token.clone(),
                         req.failure,
-                        req.failure_error_type,
-                        req.is_non_retryable,
+                        req.failure_classification,
                         req.last_heartbeat_details,
                         Some(tokeira_types::WorkerIdentity(req.identity)),
                         request,
@@ -7701,8 +7701,7 @@ impl WorkflowService {
                     .fail_activity_task(
                         token,
                         req.failure,
-                        req.failure_error_type,
-                        req.is_non_retryable,
+                        req.failure_classification,
                         None,
                         worker_identity_from_request(req.identity),
                         request,
@@ -12161,8 +12160,7 @@ mod tests {
                             run_id: run_id.clone(),
                             activity_id: activity_id.to_string(),
                             failure: payload(b"failure"),
-                            failure_error_type: None,
-                            is_non_retryable: false,
+                            failure_classification: tokeira_runtime::retry::ActivityFailure::Other,
                             identity: "worker-b".to_string(),
                         },
                     )

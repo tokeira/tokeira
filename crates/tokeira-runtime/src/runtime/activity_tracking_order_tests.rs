@@ -136,8 +136,7 @@ async fn short_retry_local_offer_keeps_started_heartbeat_deadline() {
     let fail = runtime.fail_activity_task(
         first.token,
         Payload::new(Vec::new()),
-        None,
-        false,
+        crate::retry::ActivityFailure::Other,
         None,
         None,
         RequestContext::unattributed(runtime.clock.now()),

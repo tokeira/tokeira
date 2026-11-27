@@ -8,6 +8,65 @@
 # are fast — anything hitting this is a hang (deadlock, missed wakeup), not work.
 slow-timeout = { period = "60s", terminate-after = 3 }
 
+# Decision evidence needs completed outcomes, including failures and ignored tests
+# explicitly selected by the caller. Retries must not hide an earlier difference.
+[profile.behaviour-ledger]
+default-filter = '''
+test(=activity_timeout::deadline_tests::model_timeout_earliest_deadline) |
+test(=activity_timeout::deadline_tests::model_timeout_equal_deadline) |
+test(=activity_timeout::deadline_tests::model_timeout_equal_deadlines_order) |
+test(=activity_timeout::deadline_tests::model_timeout_same_millisecond) |
+test(=activity_timeout::deadline_tests::model_timeout_selection_generated) |
+test(=activity_timeout::deadline_tests::model_timeout_selection_table) |
+test(=grpc::translate::activity_model_tests::model_activity_policy_defaults_table) |
+test(=grpc::translate::activity_model_tests::model_failure_canceled_and_terminated) |
+test(=grpc::translate::activity_model_tests::model_failure_classification_generated) |
+test(=grpc::translate::activity_model_tests::model_failure_classification_table) |
+test(=grpc::translate::activity_model_tests::model_failure_does_not_classify_cause) |
+test(=grpc::translate::activity_model_tests::model_failure_empty_type_matches_exactly) |
+test(=grpc::translate::activity_model_tests::model_failure_timeout_types) |
+test(=grpc::translate::activity_model_tests::model_policy_defaults_generated) |
+test(=runtime::activity_cancel_retry_tests::cancel_requested_retry_order_matches_temporal) |
+test(=runtime::activity_cancel_retry_tests::first_heartbeat_timeout_preserves_absent_completion_and_starts_retry) |
+test(=runtime::activity_cancel_retry_tests::first_start_to_close_timeout_preserves_absent_completion_and_starts_retry) |
+test(=runtime::activity_cancel_retry_tests::heartbeat_timeout_preserves_worker_failure_completion_and_starts_retry) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_cancel_command_generated) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_cancel_command_table) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_cancel_response_requires_request) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_completion_generated) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_completion_provenance_table) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_heartbeat_and_cancel_response) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_heartbeat_generated) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_options_generated) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_options_interval_fits_signed_nanoseconds) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_options_preserve_nanoseconds) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_options_reschedule_table) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_options_zero_interval_uses_maximum) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_options_zero_maximum_is_uncapped) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_paused_spent_budget_and_timer_suppression) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_requested_delay_generated) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_requested_delay_overrides_policy_cap) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_retry_branch_table) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_retry_generated) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_retry_interval_generated) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_retry_negative_without_cap) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_retry_submillisecond) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_retry_zero_interval_without_maximum) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_retry_zero_maximum) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_retry_zero_with_cap) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_schedule_to_start_close_tie_unpolled) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_timeout_result_generated) |
+test(=runtime::activity_cancel_retry_tests::model_tests::model_timeout_result_table) |
+test(=runtime::activity_cancel_retry_tests::start_to_close_timeout_preserves_worker_failure_completion_and_starts_retry)
+'''
+retries = 0
+fail-fast = false
+
+[profile.behaviour-ledger.junit]
+path = "junit.xml"
+store-success-output = false
+store-failure-output = false
+
 # The generated-provisioner test runs a full `cargo build` of the bound
 # provisioner inside the test. A cold container build is deliberately limited
 # to one Cargo job to stay within the CI runner's memory limit, so its final

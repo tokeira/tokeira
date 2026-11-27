@@ -1,0 +1,5 @@
+kind: fixed
+body: Workflow activities now default and validate their retry policy as v1.31.0 does, so an invalid policy fails the workflow task with v1.31.0's message.
+time: 2026-11-27T00:00:00+00:00
+custom:
+    Slice: cfda4bb0-5d1e-4214-b82c-ab4741edcabd

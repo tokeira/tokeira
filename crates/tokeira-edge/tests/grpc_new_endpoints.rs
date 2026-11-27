@@ -36,6 +36,8 @@ use tokeira_edge::grpc::runtime_adapter::RuntimeAdapter;
 
 #[path = "grpc_new_endpoints/activity_cancel_retry.rs"]
 mod activity_cancel_retry;
+#[path = "grpc_new_endpoints/activity_policy.rs"]
+mod activity_policy;
 
 struct StoreExecutionResolver {
     repo: Arc<InMemoryStore>,

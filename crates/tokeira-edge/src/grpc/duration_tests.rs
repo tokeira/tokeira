@@ -554,7 +554,15 @@ fn retry_command_and_standalone_durations_validate_and_cap() {
             for (mut attributes, cause, _) in command_cases(wire(1, 0)) {
                 let prefix = match &mut attributes {
                     Attributes::ScheduleActivityTaskCommandAttributes(a) => {
-                        a.retry_policy = Some(policy.clone());
+                        let mut activity_policy = policy.clone();
+                        if initial && error.is_none() {
+                            // Defaulting the oversized initial would wrap the
+                            // derived maximum negative before validation. Supply
+                            // a maximum to isolate the duration cap in this test
+                            // (common/retrypolicy/retry_policy.go:49-50,70-80 @ v1.31.0).
+                            activity_policy.maximum_interval = Some(value);
+                        }
+                        a.retry_policy = Some(activity_policy);
                         ""
                     }
                     Attributes::StartChildWorkflowExecutionCommandAttributes(a) => {
@@ -859,4 +867,55 @@ fn activity_patch_duration_validation_respects_the_mask_and_restore() {
             .to_string(),
         "invalid InitialInterval set on retry policy: negative duration"
     );
+}
+
+#[test]
+fn duration_value_retains_seconds_overflow_before_opposite_nanos() {
+    // AsDuration keeps intermediate overflow at both signed limits, while the
+    // validated path rejects these raw signs before conversion
+    // (types/known/durationpb/duration.pb.go:171-187 @ google.golang.org/protobuf v1.36.10;
+    // common/primitives/timestamp/duration.go:73-85 @ v1.31.0).
+    for (seconds, nanos, expected) in [
+        (9_223_372_037, -145_224_192, i64::MAX),
+        (9_223_372_037, -145_224_193, i64::MAX),
+        (9_223_372_037, -145_224_194, i64::MAX),
+        (9_223_372_037, -999_999_999, i64::MAX),
+        (-9_223_372_037, 145_224_191, i64::MIN),
+        (-9_223_372_037, 145_224_192, i64::MIN),
+        (-9_223_372_037, 145_224_193, i64::MIN),
+        (-9_223_372_037, 999_999_999, i64::MIN),
+    ] {
+        let value = wire(seconds, nanos);
+        assert_eq!(
+            proto_duration_value(Some(&value)),
+            Some(time::Duration::nanoseconds(expected))
+        );
+        assert_eq!(
+            validate_and_cap_proto_duration(Some(&value)),
+            Err("duration has seconds and nanos with different signs")
+        );
+        assert_eq!(proto_duration_to_time(Some(&value)), None);
+    }
+    assert_eq!(proto_duration_value(None), None);
+}
+
+proptest! {
+    // Same-sign fields cannot cancel intermediate overflow, so exact-sum clamping
+    // and AsDuration agree; the unchanged validator only adds rejection and its cap.
+    #[test]
+    fn same_sign_duration_conversion_preserves_validation(
+        seconds in 0i64..=i64::MAX,
+        nanos in 0i32..=i32::MAX,
+        negative in any::<bool>(),
+    ) {
+        let value = wire(if negative { -seconds } else { seconds }, if negative { -nanos } else { nanos });
+        let exact = i128::from(value.seconds) * 1_000_000_000 + i128::from(value.nanos);
+        let expected = exact.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+        prop_assert_eq!(proto_duration_value(Some(&value)), Some(time::Duration::nanoseconds(expected)));
+        if exact < 0 {
+            prop_assert_eq!(proto_duration_to_time(Some(&value)), None);
+        } else {
+            prop_assert_eq!(proto_duration_to_time(Some(&value)), Some(time::Duration::nanoseconds(expected).min(CAP)));
+        }
+    }
 }

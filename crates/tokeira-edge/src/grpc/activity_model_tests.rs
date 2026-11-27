@@ -126,19 +126,15 @@ fn model_failure_empty_type_matches_exactly() {
 }
 
 fn defaults(policy: Option<&proto_common::RetryPolicy>) {
-    // common/retrypolicy/retry_policy.go:32-56 @ v1.31.0.
     let expected = model::default_policy(policy.cloned().unwrap_or_default());
     let actual = activity_retry_policy_with_defaults(policy);
+    assert_eq!(actual.initial_interval, expected.initial_interval);
+    assert_eq!(actual.maximum_interval, expected.maximum_interval);
     assert_eq!(
-        actual.initial_interval.whole_nanoseconds(),
-        i128::from(model::duration_ns(expected.initial_interval.as_ref()))
+        actual.backoff_coefficient.to_bits(),
+        expected.backoff_coefficient.to_bits()
     );
-    assert_eq!(
-        actual.maximum_interval.unwrap().whole_nanoseconds(),
-        i128::from(model::duration_ns(expected.maximum_interval.as_ref()))
-    );
-    assert_eq!(actual.backoff_coefficient, expected.backoff_coefficient);
-    assert_eq!(actual.maximum_attempts, expected.maximum_attempts as u32);
+    assert_eq!(actual.maximum_attempts, expected.maximum_attempts);
     assert_eq!(
         actual.non_retryable_error_types,
         expected.non_retryable_error_types

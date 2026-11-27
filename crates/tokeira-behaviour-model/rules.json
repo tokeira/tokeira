@@ -415,6 +415,304 @@
               "range_digest": "a4e3191009a85cd99dd21b796eeacc2ac284d4bdf0162eab6f628941273a31d1"
             }
           ]
+        },
+        {
+          "transition": "DurationValue delegates to AsDuration: seconds-product overflow saturates by the sign of seconds even when opposite-sign nanos bring the exact sum back into range.",
+          "citations": [
+            {
+              "function": "DurationValue",
+              "path": "common/primitives/timestamp/duration.go",
+              "start": 21,
+              "end": 25,
+              "tag": "v1.31.0",
+              "source_digest": "559cc98458ba4c591ec2bf3a3d90fc3b8a898c1084f1c33ba30747f4ca4d6d1a",
+              "range_digest": "6c991bf3128c7b2d72a6d8e6b03104862e8c3a533121996344729ceb04b2cdc9"
+            }
+          ]
+        }
+      ],
+      "evidence": {
+        "kind": "awaiting-calibration"
+      }
+    },
+    {
+      "key": "activity.policy-validation",
+      "area": "workflow-activities",
+      "input_domain": "Defaulted upstream activity RetryPolicy, including raw duration signs, all coefficients, int32 attempts and excluded error types.",
+      "precondition": "ScheduleActivityTask under default activity retry settings; supplied policy has passed EnsureDefaults.",
+      "observable_outputs": "Accepted policy with capped intervals, or the first InvalidArgument message.",
+      "rows": [
+        {
+          "transition": "Absent command policy becomes empty before normalization.",
+          "citations": [
+            {
+              "function": "ValidateActivityScheduleAttributes",
+              "path": "service/history/api/command_attr_validator.go",
+              "start": 99,
+              "end": 110,
+              "tag": "v1.31.0",
+              "source_digest": "993bafd862228eedb1c2b023bc4b0c6d51f82c4d561f5f957f924fda6791aa7e",
+              "range_digest": "a15147c70722ecb3d2f60377b764f0ac925e7cb8f9498f1f506547eb3037478b"
+            }
+          ]
+        },
+        {
+          "transition": "Embedded activity validates the retry policy before lengths, priority and timeouts; defaulting precedes validation.",
+          "citations": [
+            {
+              "function": "validateAndNormalizeActivityAttributes",
+              "path": "chasm/lib/activity/validator.go",
+              "start": 98,
+              "end": 125,
+              "tag": "v1.31.0",
+              "source_digest": "febab2bea6c28c140a926aaf5256857a7800664541df8c1a4816a3055e56590e",
+              "range_digest": "26b61e65cbbc08a49c5ac8b79684e8b4776b30665464926f009473a708934279"
+            },
+            {
+              "function": "validateActivityRetryPolicy",
+              "path": "chasm/lib/activity/validator.go",
+              "start": 128,
+              "end": 140,
+              "tag": "v1.31.0",
+              "source_digest": "febab2bea6c28c140a926aaf5256857a7800664541df8c1a4816a3055e56590e",
+              "range_digest": "7add7fbe2a160f95bbde911ea4385cc3d6548dedf3dd307b4bfd202068666c8e"
+            }
+          ]
+        },
+        {
+          "transition": "MaximumAttempts equal to one accepts unchanged, bypassing every check and cap.",
+          "citations": [
+            {
+              "function": "Validate",
+              "path": "common/retrypolicy/retry_policy.go",
+              "start": 65,
+              "end": 69,
+              "tag": "v1.31.0",
+              "source_digest": "d6f72f8448a23c8221e6b896d04dfcaa16419c59b556ff8bcd06df593cf6375d",
+              "range_digest": "7e2d1284b988660c01b6aa7f5d7f6f8b77b51eb7e0d6e2c472b51c2c20ae1342"
+            }
+          ]
+        },
+        {
+          "transition": "InitialInterval rejects mismatched signs before a negative converted duration, with the field-specific error prefix.",
+          "citations": [
+            {
+              "function": "Validate",
+              "path": "common/retrypolicy/retry_policy.go",
+              "start": 70,
+              "end": 72,
+              "tag": "v1.31.0",
+              "source_digest": "d6f72f8448a23c8221e6b896d04dfcaa16419c59b556ff8bcd06df593cf6375d",
+              "range_digest": "e36d6f43ce9bd1a52577e8d85259fc922262a0dbb8c66a25c054e49e92b9c6e1"
+            },
+            {
+              "function": "ValidateAndCapProtoDuration",
+              "path": "common/primitives/timestamp/duration.go",
+              "start": 14,
+              "end": 16,
+              "tag": "v1.31.0",
+              "source_digest": "559cc98458ba4c591ec2bf3a3d90fc3b8a898c1084f1c33ba30747f4ca4d6d1a",
+              "range_digest": "aa1de0ebbe2b0c517e35313ce7cb6ba1279bcdf67f212ce04e120decd90d0086"
+            },
+            {
+              "function": "ValidateAndCapProtoDuration",
+              "path": "common/primitives/timestamp/duration.go",
+              "start": 73,
+              "end": 80,
+              "tag": "v1.31.0",
+              "source_digest": "559cc98458ba4c591ec2bf3a3d90fc3b8a898c1084f1c33ba30747f4ca4d6d1a",
+              "range_digest": "28145e253612e09603ae3bbf39c60b4abe0c10f6f850056e8bde8f84e2720905"
+            }
+          ]
+        },
+        {
+          "transition": "InitialInterval above 100 years is capped to 3153600000 seconds and zero nanos; nil and nonnegative intervals at or below the cap remain unchanged.",
+          "citations": [
+            {
+              "function": "Validate",
+              "path": "common/retrypolicy/retry_policy.go",
+              "start": 70,
+              "end": 72,
+              "tag": "v1.31.0",
+              "source_digest": "d6f72f8448a23c8221e6b896d04dfcaa16419c59b556ff8bcd06df593cf6375d",
+              "range_digest": "e36d6f43ce9bd1a52577e8d85259fc922262a0dbb8c66a25c054e49e92b9c6e1"
+            },
+            {
+              "function": "ValidateAndCapProtoDuration",
+              "path": "common/primitives/timestamp/duration.go",
+              "start": 10,
+              "end": 12,
+              "tag": "v1.31.0",
+              "source_digest": "559cc98458ba4c591ec2bf3a3d90fc3b8a898c1084f1c33ba30747f4ca4d6d1a",
+              "range_digest": "cd2d420cca5c6b00ed3b6c72c8ad3bef6637d53133273da9b1d9462bc4ad1490"
+            },
+            {
+              "function": "ValidateAndCapProtoDuration",
+              "path": "common/primitives/timestamp/duration.go",
+              "start": 67,
+              "end": 88,
+              "tag": "v1.31.0",
+              "source_digest": "559cc98458ba4c591ec2bf3a3d90fc3b8a898c1084f1c33ba30747f4ca4d6d1a",
+              "range_digest": "bfba2406133aec7a654bc6bee2731b6766955d2e3bf57e691645ad071eb63c7f"
+            }
+          ]
+        },
+        {
+          "transition": "BackoffCoefficient below one is rejected; NaN passes the less-than comparison.",
+          "citations": [
+            {
+              "function": "Validate",
+              "path": "common/retrypolicy/retry_policy.go",
+              "start": 73,
+              "end": 75,
+              "tag": "v1.31.0",
+              "source_digest": "d6f72f8448a23c8221e6b896d04dfcaa16419c59b556ff8bcd06df593cf6375d",
+              "range_digest": "4d31ce745d7cdc82a6223c21e875c031aa1986c679e300af81c4c50e7aa4b40e"
+            }
+          ]
+        },
+        {
+          "transition": "MaximumInterval rejects mismatched signs before a negative converted duration, with the field-specific error prefix.",
+          "citations": [
+            {
+              "function": "Validate",
+              "path": "common/retrypolicy/retry_policy.go",
+              "start": 76,
+              "end": 78,
+              "tag": "v1.31.0",
+              "source_digest": "d6f72f8448a23c8221e6b896d04dfcaa16419c59b556ff8bcd06df593cf6375d",
+              "range_digest": "542c939b53f89d9dbc474d0cba3dd3995959c728c8f39893565645290fc44c75"
+            },
+            {
+              "function": "ValidateAndCapProtoDuration",
+              "path": "common/primitives/timestamp/duration.go",
+              "start": 14,
+              "end": 16,
+              "tag": "v1.31.0",
+              "source_digest": "559cc98458ba4c591ec2bf3a3d90fc3b8a898c1084f1c33ba30747f4ca4d6d1a",
+              "range_digest": "aa1de0ebbe2b0c517e35313ce7cb6ba1279bcdf67f212ce04e120decd90d0086"
+            },
+            {
+              "function": "ValidateAndCapProtoDuration",
+              "path": "common/primitives/timestamp/duration.go",
+              "start": 73,
+              "end": 80,
+              "tag": "v1.31.0",
+              "source_digest": "559cc98458ba4c591ec2bf3a3d90fc3b8a898c1084f1c33ba30747f4ca4d6d1a",
+              "range_digest": "28145e253612e09603ae3bbf39c60b4abe0c10f6f850056e8bde8f84e2720905"
+            }
+          ]
+        },
+        {
+          "transition": "MaximumInterval above 100 years is capped to 3153600000 seconds and zero nanos; nil and nonnegative intervals at or below the cap remain unchanged.",
+          "citations": [
+            {
+              "function": "Validate",
+              "path": "common/retrypolicy/retry_policy.go",
+              "start": 76,
+              "end": 78,
+              "tag": "v1.31.0",
+              "source_digest": "d6f72f8448a23c8221e6b896d04dfcaa16419c59b556ff8bcd06df593cf6375d",
+              "range_digest": "542c939b53f89d9dbc474d0cba3dd3995959c728c8f39893565645290fc44c75"
+            },
+            {
+              "function": "ValidateAndCapProtoDuration",
+              "path": "common/primitives/timestamp/duration.go",
+              "start": 10,
+              "end": 12,
+              "tag": "v1.31.0",
+              "source_digest": "559cc98458ba4c591ec2bf3a3d90fc3b8a898c1084f1c33ba30747f4ca4d6d1a",
+              "range_digest": "cd2d420cca5c6b00ed3b6c72c8ad3bef6637d53133273da9b1d9462bc4ad1490"
+            },
+            {
+              "function": "ValidateAndCapProtoDuration",
+              "path": "common/primitives/timestamp/duration.go",
+              "start": 67,
+              "end": 88,
+              "tag": "v1.31.0",
+              "source_digest": "559cc98458ba4c591ec2bf3a3d90fc3b8a898c1084f1c33ba30747f4ca4d6d1a",
+              "range_digest": "bfba2406133aec7a654bc6bee2731b6766955d2e3bf57e691645ad071eb63c7f"
+            }
+          ]
+        },
+        {
+          "transition": "A positive MaximumInterval below InitialInterval after both caps is rejected.",
+          "citations": [
+            {
+              "function": "Validate",
+              "path": "common/retrypolicy/retry_policy.go",
+              "start": 79,
+              "end": 81,
+              "tag": "v1.31.0",
+              "source_digest": "d6f72f8448a23c8221e6b896d04dfcaa16419c59b556ff8bcd06df593cf6375d",
+              "range_digest": "667ef7cb639ca0241167213f04b5ddddfc58faf33a20a2c78ddac7353a250779"
+            }
+          ]
+        },
+        {
+          "transition": "Negative MaximumAttempts is rejected.",
+          "citations": [
+            {
+              "function": "Validate",
+              "path": "common/retrypolicy/retry_policy.go",
+              "start": 82,
+              "end": 84,
+              "tag": "v1.31.0",
+              "source_digest": "d6f72f8448a23c8221e6b896d04dfcaa16419c59b556ff8bcd06df593cf6375d",
+              "range_digest": "9d970a2a1bbf0c796fd9d4162be6989761c72be15d3930390e365abf75ebf4a8"
+            }
+          ]
+        },
+        {
+          "transition": "Each TemporalTimeout: suffix must parse as a non-unspecified timeout; other excluded strings pass unchanged. The first invalid suffix determines the message.",
+          "citations": [
+            {
+              "function": "Validate",
+              "path": "common/retrypolicy/retry_policy.go",
+              "start": 86,
+              "end": 94,
+              "tag": "v1.31.0",
+              "source_digest": "d6f72f8448a23c8221e6b896d04dfcaa16419c59b556ff8bcd06df593cf6375d",
+              "range_digest": "3c2bf8483c280e72e3235f2454564dd15baac5290c6997f14fe276fd771031dd"
+            }
+          ]
+        },
+        {
+          "transition": "All remaining policies are accepted.",
+          "citations": [
+            {
+              "function": "Validate",
+              "path": "common/retrypolicy/retry_policy.go",
+              "start": 96,
+              "end": 97,
+              "tag": "v1.31.0",
+              "source_digest": "d6f72f8448a23c8221e6b896d04dfcaa16419c59b556ff8bcd06df593cf6375d",
+              "range_digest": "c28fb29430091e46ad7bc38895bcfdea69fc296f9e7529ff2e9cfa4b54cb1fdd"
+            }
+          ]
+        },
+        {
+          "transition": "The normalized retry policy replaces the command policy and is recorded in ActivityTaskScheduled.",
+          "citations": [
+            {
+              "function": "ValidateActivityScheduleAttributes",
+              "path": "service/history/api/command_attr_validator.go",
+              "start": 123,
+              "end": 133,
+              "tag": "v1.31.0",
+              "source_digest": "993bafd862228eedb1c2b023bc4b0c6d51f82c4d561f5f957f924fda6791aa7e",
+              "range_digest": "5cc9acf249f74132c9509087dffbf6c5ca6f5eaded462096b6a0a0452ddf76a8"
+            },
+            {
+              "function": "CreateActivityTaskScheduledEvent",
+              "path": "service/history/historybuilder/event_factory.go",
+              "start": 228,
+              "end": 245,
+              "tag": "v1.31.0",
+              "source_digest": "af04bada2c987d58c8b508352bdb8d86bb033b1d9033c373c92efcb65f0ffb8e",
+              "range_digest": "b6a829fb2031db6af1ff9fd73d633e35fcedf76a4f5fa2f8f903a4b5187e4a53"
+            }
+          ]
         }
       ],
       "evidence": {

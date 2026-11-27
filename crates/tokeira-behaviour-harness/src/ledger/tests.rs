@@ -265,7 +265,7 @@ fn descriptor_partition_and_all_three_kinds_are_retained() {
         page.lines()
             .filter(|line| line.starts_with("| activity."))
             .count(),
-        15
+        16
     );
     assert_eq!(
         page.lines()
@@ -273,7 +273,7 @@ fn descriptor_partition_and_all_three_kinds_are_retained() {
             .count(),
         129
     );
-    assert!(page.contains("15 decision rows | 13 | 2 |"));
+    assert!(page.contains("16 decision rows | 14 | 2 |"));
 }
 
 fn profile_config(filter: &str) -> String {
@@ -347,10 +347,10 @@ proptest! {
     // Feature: conformance-harness, Property 15. Input order cannot change provenance, reasons, gaps or row kinds.
     #[test]
     fn generated_evidence_is_deterministic_and_conservative(
-        states in prop::collection::vec(0u8..8, 15),
+        states in prop::collection::vec(0u8..8, 16),
         reason in "[a-zA-Z0-9|<>&][a-zA-Z0-9 |<>&]{0,63}",
         rotation in any::<usize>(),
-        ranks in prop::collection::vec(any::<u64>(), 15),
+        ranks in prop::collection::vec(any::<u64>(), 16),
     ) {
         let (mut ledger, mut catalog) = fixture();
         for (decision, state) in ledger.decisions.iter_mut().zip(states) {
@@ -383,8 +383,8 @@ proptest! {
         prop_assert_eq!(first.lines().filter(|line| line.starts_with("| /temporal.")).count(), 129);
         prop_assert!(first.lines().filter(|line| line.starts_with("| /temporal.")).all(|line| line.ends_with("| no behavioural evidence yet |")));
         prop_assert!(first.contains("rule catalog"));
-        prop_assert!(first.contains("15 decision rows | 13 | 2 |"));
-        ledger.decisions.rotate_left(rotation % 15);
+        prop_assert!(first.contains("16 decision rows | 14 | 2 |"));
+        ledger.decisions.rotate_left(rotation % 16);
         ledger.decisions.reverse();
         ledger.decisions.sort_by_key(|decision| ranks[catalog.rules.iter().position(|rule| rule.key == decision.rule).unwrap()]);
         catalog.rules.reverse();

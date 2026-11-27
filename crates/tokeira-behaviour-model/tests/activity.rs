@@ -367,3 +367,221 @@ proptest! {
         prop_assert_eq!(next_backoff(now, 1, 0, delay, 0, Some(end - separation)), RetryDecision::Stop(RetryState::Timeout));
     }
 }
+
+#[test]
+fn policy_validation_order_and_messages() {
+    let mismatch = prost_types::Duration {
+        seconds: -1,
+        nanos: 1,
+    };
+    let mut p = RetryPolicy {
+        initial_interval: Some(mismatch),
+        maximum_interval: Some(duration(-1)),
+        backoff_coefficient: 0.5,
+        maximum_attempts: -1,
+        non_retryable_error_types: vec!["TemporalTimeout:bad".into()],
+    };
+    assert_eq!(
+        validate_policy(p.clone()).unwrap_err(),
+        "invalid InitialInterval set on retry policy: duration has seconds and nanos with different signs"
+    );
+    p.initial_interval = Some(duration(-1));
+    assert_eq!(
+        validate_policy(p.clone()).unwrap_err(),
+        "invalid InitialInterval set on retry policy: negative duration"
+    );
+    p.initial_interval = Some(duration(2));
+    assert_eq!(
+        validate_policy(p.clone()).unwrap_err(),
+        "BackoffCoefficient cannot be less than 1 on retry policy."
+    );
+    p.backoff_coefficient = 1.0;
+    p.maximum_interval = Some(mismatch);
+    assert_eq!(
+        validate_policy(p.clone()).unwrap_err(),
+        "invalid MaximumInterval set on retry policy: duration has seconds and nanos with different signs"
+    );
+    p.maximum_interval = Some(duration(-1));
+    assert_eq!(
+        validate_policy(p.clone()).unwrap_err(),
+        "invalid MaximumInterval set on retry policy: negative duration"
+    );
+    p.maximum_interval = Some(duration(1));
+    assert_eq!(
+        validate_policy(p.clone()).unwrap_err(),
+        "MaximumInterval cannot be less than InitialInterval on retry policy."
+    );
+    p.maximum_interval = Some(duration(2));
+    assert_eq!(
+        validate_policy(p.clone()).unwrap_err(),
+        "MaximumAttempts cannot be negative on retry policy."
+    );
+    p.maximum_attempts = 0;
+    assert_eq!(
+        validate_policy(p.clone()).unwrap_err(),
+        "Invalid timeout type value: bad."
+    );
+    p.non_retryable_error_types.clear();
+    assert_eq!(validate_policy(p.clone()).unwrap(), p);
+}
+
+#[test]
+fn policy_one_attempt_preserves_every_field() {
+    let p = RetryPolicy {
+        initial_interval: Some(prost_types::Duration {
+            seconds: -1,
+            nanos: 1,
+        }),
+        maximum_interval: Some(duration(i64::MAX)),
+        backoff_coefficient: -1.0,
+        maximum_attempts: 1,
+        non_retryable_error_types: vec!["TemporalTimeout:Unspecified".into()],
+    };
+    assert_eq!(validate_policy(p.clone()).unwrap(), p);
+}
+
+#[test]
+fn policy_caps_before_comparing_intervals() {
+    let cap = 3_153_600_000_000_000_000;
+    for (initial, maximum, expected_initial, expected_maximum) in [
+        (cap - 1, cap, cap - 1, cap),
+        (cap, cap + 1, cap, cap),
+        (cap + 2, cap + 1, cap, cap),
+        (i64::MAX, i64::MAX, cap, cap),
+        (0, 0, 0, 0),
+        (2, 0, 2, 0),
+    ] {
+        let p = RetryPolicy {
+            initial_interval: Some(duration(initial)),
+            maximum_interval: Some(duration(maximum)),
+            backoff_coefficient: 1.0,
+            ..Default::default()
+        };
+        let got = validate_policy(p).unwrap();
+        assert_eq!(got.initial_interval, Some(duration(expected_initial)));
+        assert_eq!(got.maximum_interval, Some(duration(expected_maximum)));
+    }
+    let p = RetryPolicy {
+        backoff_coefficient: f64::NAN,
+        ..Default::default()
+    };
+    let got = validate_policy(p).unwrap();
+    assert!(got.backoff_coefficient.is_nan());
+    assert_eq!(got.initial_interval, None);
+    assert_eq!(got.maximum_interval, None);
+}
+
+#[test]
+fn policy_timeout_spellings_and_first_invalid_type() {
+    for name in [
+        "StartToClose",
+        "ScheduleToStart",
+        "ScheduleToClose",
+        "Heartbeat",
+        "TIMEOUT_TYPE_START_TO_CLOSE",
+        "TIMEOUT_TYPE_SCHEDULE_TO_START",
+        "TIMEOUT_TYPE_SCHEDULE_TO_CLOSE",
+        "TIMEOUT_TYPE_HEARTBEAT",
+    ] {
+        let p = RetryPolicy {
+            non_retryable_error_types: vec![
+                "application".into(),
+                format!("TemporalTimeout:{name}"),
+            ],
+            ..policy()
+        };
+        assert_eq!(validate_policy(p.clone()).unwrap(), p);
+    }
+    for name in [
+        "",
+        "Unspecified",
+        "TIMEOUT_TYPE_UNSPECIFIED",
+        "1",
+        "heartbeat",
+        "Heartbeat ",
+        "bad",
+    ] {
+        let p = RetryPolicy {
+            non_retryable_error_types: vec![
+                format!("TemporalTimeout:{name}"),
+                "TemporalTimeout:later".into(),
+            ],
+            ..policy()
+        };
+        assert_eq!(
+            validate_policy(p).unwrap_err(),
+            format!("Invalid timeout type value: {name}.")
+        );
+    }
+}
+
+#[test]
+fn policy_defaulting_precedes_validation() {
+    let initial = duration(3 * 365 * 24 * 60 * 60 * 1_000_000_000);
+    let p = default_policy(RetryPolicy {
+        initial_interval: Some(initial),
+        ..Default::default()
+    });
+    assert_eq!(
+        p.maximum_interval,
+        Some(prost_types::Duration {
+            seconds: -8_985_944_073,
+            nanos: -709_551_616
+        })
+    );
+    assert_eq!(
+        validate_policy(p.clone()).unwrap_err(),
+        "invalid MaximumInterval set on retry policy: negative duration"
+    );
+    let one = RetryPolicy {
+        maximum_attempts: 1,
+        ..p
+    };
+    assert_eq!(validate_policy(one.clone()).unwrap(), one);
+    assert_eq!(validate_policy(policy()).unwrap(), policy());
+}
+
+#[test]
+fn duration_value_preserves_intermediate_overflow() {
+    // AsDuration keeps seconds overflow even when the exact sum fits; defaulting
+    // must therefore derive -100ns or zero, not multiply that exact sum
+    // (types/known/durationpb/duration.pb.go:171-187 @ google.golang.org/protobuf v1.36.10;
+    // common/retrypolicy/retry_policy.go:49-50 @ v1.31.0).
+    for (seconds, nanos, converted, maximum) in [
+        (9_223_372_037, -145_224_192, i64::MAX, -100),
+        (9_223_372_037, -145_224_193, i64::MAX, -100),
+        (9_223_372_037, -145_224_194, i64::MAX, -100),
+        (9_223_372_037, -999_999_999, i64::MAX, -100),
+        (-9_223_372_037, 145_224_191, i64::MIN, 0),
+        (-9_223_372_037, 145_224_192, i64::MIN, 0),
+        (-9_223_372_037, 145_224_193, i64::MIN, 0),
+        (-9_223_372_037, 999_999_999, i64::MIN, 0),
+    ] {
+        let initial = prost_types::Duration { seconds, nanos };
+        assert_eq!(duration_ns(Some(&initial)), converted);
+        let p = default_policy(RetryPolicy {
+            initial_interval: Some(initial),
+            maximum_attempts: 1,
+            ..Default::default()
+        });
+        assert_eq!(p.initial_interval, Some(initial));
+        assert_eq!(p.maximum_interval, Some(duration(maximum)));
+        assert_eq!(validate_policy(p.clone()).unwrap(), p);
+    }
+    for (seconds, nanos, expected) in [
+        (9_223_372_036, 854_775_806, i64::MAX - 1),
+        (9_223_372_036, 854_775_807, i64::MAX),
+        (9_223_372_036, 854_775_808, i64::MAX),
+        (-9_223_372_036, -854_775_807, i64::MIN + 1),
+        (-9_223_372_036, -854_775_808, i64::MIN),
+        (-9_223_372_036, -854_775_809, i64::MIN),
+        (1, -1, 999_999_999),
+        (-1, 1, -999_999_999),
+    ] {
+        assert_eq!(
+            duration_ns(Some(&prost_types::Duration { seconds, nanos })),
+            expected
+        );
+    }
+    assert_eq!(duration_ns(None), 0);
+}

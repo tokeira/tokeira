@@ -7,7 +7,9 @@
       "line_count": 488,
       "digest": "febab2bea6c28c140a926aaf5256857a7800664541df8c1a4816a3055e56590e",
       "ranges": {
-        "166-176": "fbcc5d5380c0e432e9f6fe75b197cbd479aad138eeb1395b7d665c4a2bae3323"
+        "128-140": "7add7fbe2a160f95bbde911ea4385cc3d6548dedf3dd307b4bfd202068666c8e",
+        "166-176": "fbcc5d5380c0e432e9f6fe75b197cbd479aad138eeb1395b7d665c4a2bae3323",
+        "98-125": "26b61e65cbbc08a49c5ac8b79684e8b4776b30665464926f009473a708934279"
       }
     },
     "common/backoff/retry.go": {
@@ -18,19 +20,40 @@
         "188-197": "c370dcc5d0360fb3131f690d51f31eb28e6d856423590235507afe3b596fa234"
       }
     },
+    "common/primitives/timestamp/duration.go": {
+      "line_count": 88,
+      "digest": "559cc98458ba4c591ec2bf3a3d90fc3b8a898c1084f1c33ba30747f4ca4d6d1a",
+      "ranges": {
+        "10-12": "cd2d420cca5c6b00ed3b6c72c8ad3bef6637d53133273da9b1d9462bc4ad1490",
+        "14-16": "aa1de0ebbe2b0c517e35313ce7cb6ba1279bcdf67f212ce04e120decd90d0086",
+        "21-25": "6c991bf3128c7b2d72a6d8e6b03104862e8c3a533121996344729ceb04b2cdc9",
+        "67-88": "bfba2406133aec7a654bc6bee2731b6766955d2e3bf57e691645ad071eb63c7f",
+        "73-80": "28145e253612e09603ae3bbf39c60b4abe0c10f6f850056e8bde8f84e2720905"
+      }
+    },
     "common/retrypolicy/retry_policy.go": {
       "line_count": 97,
       "digest": "d6f72f8448a23c8221e6b896d04dfcaa16419c59b556ff8bcd06df593cf6375d",
       "ranges": {
         "32-37": "7a27c02939c7ec121c822597d1c15445b1649414d179afa39ea4e102ec64fefa",
-        "40-56": "a4e3191009a85cd99dd21b796eeacc2ac284d4bdf0162eab6f628941273a31d1"
+        "40-56": "a4e3191009a85cd99dd21b796eeacc2ac284d4bdf0162eab6f628941273a31d1",
+        "65-69": "7e2d1284b988660c01b6aa7f5d7f6f8b77b51eb7e0d6e2c472b51c2c20ae1342",
+        "70-72": "e36d6f43ce9bd1a52577e8d85259fc922262a0dbb8c66a25c054e49e92b9c6e1",
+        "73-75": "4d31ce745d7cdc82a6223c21e875c031aa1986c679e300af81c4c50e7aa4b40e",
+        "76-78": "542c939b53f89d9dbc474d0cba3dd3995959c728c8f39893565645290fc44c75",
+        "79-81": "667ef7cb639ca0241167213f04b5ddddfc58faf33a20a2c78ddac7353a250779",
+        "82-84": "9d970a2a1bbf0c796fd9d4162be6989761c72be15d3930390e365abf75ebf4a8",
+        "86-94": "3c2bf8483c280e72e3235f2454564dd15baac5290c6997f14fe276fd771031dd",
+        "96-97": "c28fb29430091e46ad7bc38895bcfdea69fc296f9e7529ff2e9cfa4b54cb1fdd"
       }
     },
     "service/history/api/command_attr_validator.go": {
       "line_count": 684,
       "digest": "993bafd862228eedb1c2b023bc4b0c6d51f82c4d561f5f957f924fda6791aa7e",
       "ranges": {
-        "112-131": "bd068a18117993b41581875ba9fc87c37836a46d020b4f4c139121fb0a20d54d"
+        "112-131": "bd068a18117993b41581875ba9fc87c37836a46d020b4f4c139121fb0a20d54d",
+        "123-133": "5cc9acf249f74132c9509087dffbf6c5ca6f5eaded462096b6a0a0452ddf76a8",
+        "99-110": "a15147c70722ecb3d2f60377b764f0ac925e7cb8f9498f1f506547eb3037478b"
       }
     },
     "service/history/api/recordactivitytaskheartbeat/api.go": {
@@ -61,6 +84,13 @@
       "digest": "5b0f8a00788283beb5ad6b178b49cfe8a9ff0436e238448fa23e6dce992141f9",
       "ranges": {
         "647-667": "c4cd1ea9653e1eff5c2f2d736f7a4e6290fb47c03d4f07f33d0cf3f429e8b026"
+      }
+    },
+    "service/history/historybuilder/event_factory.go": {
+      "line_count": 1081,
+      "digest": "af04bada2c987d58c8b508352bdb8d86bb033b1d9033c373c92efcb65f0ffb8e",
+      "ranges": {
+        "228-245": "b6a829fb2031db6af1ff9fd73d633e35fcedf76a4f5fa2f8f903a4b5187e4a53"
       }
     },
     "service/history/queues/queue_scheduled.go": {

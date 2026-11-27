@@ -69,12 +69,33 @@ pub fn retryable(failure: Option<&Failure>, excluded: &[String]) -> bool {
 
 /// Exponential interval for the supplied attempt, with nanosecond precision.
 ///
+/// The whole power follows Go's `math.Pow` multiplication order to preserve its
+/// rounding (`common/backoff/retry.go:184 @ v1.31.0`;
+/// `src/math/pow.go:131-165 @ go1.26.2`).
+///
 /// `common/backoff/retry.go:180-185 @ v1.31.0`. Positive overflow follows
 /// the saturating conversion on arm64; Go's out-of-range float conversion is
 /// architecture dependent, so that part of the domain is not portable evidence.
 pub fn exponential_interval(initial: i64, coefficient: f64, attempt: i32) -> i64 {
     let exponent = attempt.wrapping_sub(1);
-    ((initial as f64 * coefficient.powf(f64::from(exponent))) as i64).max(0)
+    ((initial as f64 * integer_power(coefficient, exponent)) as i64).max(0)
+}
+
+// Go rescales intermediates by exact powers of two. For finite bases >= 1 this
+// multiplication order preserves normal results; other results still truncate
+// to zero or saturate in exponential_interval. Neither powf nor powi guarantees
+// this rounding order.
+fn integer_power(mut factor: f64, exponent: i32) -> f64 {
+    let mut result = 1.0;
+    let mut magnitude = exponent.unsigned_abs();
+    while magnitude != 0 {
+        if magnitude & 1 == 1 {
+            result *= factor;
+        }
+        factor *= factor;
+        magnitude >>= 1;
+    }
+    if exponent < 0 { 1.0 / result } else { result }
 }
 
 /// Earliest retry decision, before delay calculation.

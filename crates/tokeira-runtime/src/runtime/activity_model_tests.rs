@@ -132,11 +132,29 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: 128, failure_persistence: None, ..ProptestConfig::default() })]
     // Feature: conformance-harness, Property 10. Each retry decision preserves reason and exact deadline.
     #[test]
-    fn model_retry_generated(initial in 1i64..1000, attempt in 1u32..30, cap in 1i64..1000, maximum in 0u32..30, coefficient in 1u32..4, non_retryable in any::<bool>(), listed in any::<bool>(), expiration in prop::option::of(0i64..1_000_000)) {
+    fn model_retry_generated(initial in 1i64..1000, attempt in 1u32..30, cap in prop_oneof![Just(0i64), 1i64..1000], maximum in 0u32..30, coefficient in prop_oneof![(1u32..=3).prop_map(f64::from), (100u32..=300).prop_map(|value| f64::from(value) / 100.0)], non_retryable in any::<bool>(), listed in any::<bool>(), expiration in prop::option::of(0i64..1_000_000)) {
         let mut p = policy();
-        p.initial_interval = Duration::seconds(initial); p.backoff_coefficient = f64::from(coefficient);
+        p.initial_interval = Duration::seconds(initial); p.backoff_coefficient = coefficient;
         p.maximum_interval = Some(Duration::seconds(cap)); p.maximum_attempts = maximum;
         check_retry(&p, attempt, non_retryable, if listed { "listed" } else { "retryable" }, expiration.map(|s| i128::from(s)*1_000_000_000));
+    }
+
+    // Feature: conformance-harness, Property 10. Retry intervals agree without attempt or expiration limits masking rounding.
+    #[test]
+    fn model_retry_interval_generated(
+        initial in 1i64..=1000,
+        attempt in 1u32..30,
+        cap in prop_oneof![Just(0i64), 1i64..=1000],
+        coefficient in prop_oneof![(1u32..=3).prop_map(f64::from), (100u32..=300).prop_map(|value| f64::from(value) / 100.0)],
+    ) {
+        let p = RetryPolicy {
+            initial_interval: Duration::seconds(initial),
+            backoff_coefficient: coefficient,
+            maximum_interval: Some(Duration::seconds(cap)),
+            maximum_attempts: 0,
+            non_retryable_error_types: Vec::new(),
+        };
+        check_retry(&p, attempt, false, "retryable", None);
     }
 }
 

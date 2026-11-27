@@ -164,6 +164,33 @@ fn requested_delay_including_zero_and_negative() {
 }
 
 #[test]
+fn exponential_interval_matches_go_integer_power_rounding() {
+    // Expected intervals come from Go's math.Pow and the nanosecond conversion
+    // in common/backoff/retry.go:183-185 @ v1.31.0. The negative exponent covers
+    // the function's int32 domain, beyond the positive attempts its callers pass.
+    let inputs = [
+        (1_000_000_000, 1.01, 4),
+        (1_000_000_000, 1.2, 4),
+        (1_000_000_000, 1.2, 6),
+        (1, 3.0, 35),
+        (10_000_000_000_000_000, 1.01, -77),
+    ];
+    let actual = inputs
+        .map(|(initial, coefficient, attempt)| exponential_interval(initial, coefficient, attempt));
+    assert_eq!(
+        actual,
+        [
+            1_030_300_999,
+            1_728_000_000,
+            2_488_320_000,
+            16_677_181_699_666_568,
+            4_601_854_095_137_946,
+        ],
+        "inputs: {inputs:?}"
+    );
+}
+
+#[test]
 fn options_interval_boundaries() {
     // service/history/workflow/activity.go:238-251; common/backoff/retry.go:180-185 @ v1.31.0.
     for (initial, maximum, expected) in [

@@ -10,7 +10,10 @@ options rescheduling, completion-time provenance, timeout selection and outcomes
 and activity cancellation. Times are signed Unix nanoseconds in the protobuf
 Timestamp domain. Durations use signed 64-bit nanoseconds. Positive floating-point
 overflow in the exponential function explicitly selects arm64 conversion semantics;
-only its signed-duration bound is portable across Go architectures.
+only its signed-duration bound is portable across Go architectures. The exponential
+function takes its whole power as Go's `math.Pow` does
+(`src/math/pow.go:131-165 @ go1.26.2`); the source index cannot check this citation
+because it refers to Go's source, not Temporal's.
 
 `rules.json` records the ordered branches, their input domains and observable
 outputs, and evidence for every branch. Ordinary rules await corpus calibration;

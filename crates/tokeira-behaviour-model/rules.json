@@ -363,7 +363,7 @@
       "observable_outputs": "Nonnegative signed nanoseconds; negative results clamp to zero.",
       "rows": [
         {
-          "transition": "Multiply initial nanoseconds by coefficient to attempt minus one; convert to signed duration and clamp.",
+          "transition": "Multiply initial nanoseconds by coefficient to attempt minus one, taking the whole power as Go's math.Pow does; convert to signed duration and clamp.",
           "citations": [
             {
               "function": "ExponentialBackoffAlgorithm",

@@ -24,7 +24,8 @@ fn entry(now: OffsetDateTime) -> ActivityTrackingEntry {
 }
 
 #[test]
-fn due_time_matches_each_strict_timeout_and_later_heartbeat() {
+fn due_time_matches_each_inclusive_timeout_and_later_heartbeat() {
+    // service/history/queues/queue_scheduled.go:298-300; common/constants.go:46 @ v1.31.0.
     let now = OffsetDateTime::UNIX_EPOCH;
     for kind in 0..4 {
         for heartbeat_offset in [-5, 0, 5] {
@@ -53,7 +54,7 @@ fn due_time_matches_each_strict_timeout_and_later_heartbeat() {
                     } else {
                         0
                     }
-                ) + Duration::nanoseconds(1)
+                )
             );
             assert!(
                 evaluate_activity_timeout(&tracked, &activity, due - Duration::nanoseconds(1))
@@ -76,7 +77,10 @@ fn due_time_matches_each_strict_timeout_and_later_heartbeat() {
         ..Default::default()
     });
     tracked.original_scheduled_at = time::PrimitiveDateTime::MAX.assume_utc();
-    assert_eq!(activity_timeout_due_at(&tracked), None);
+    assert_eq!(
+        activity_timeout_due_at(&tracked),
+        Some(timeout_tick(tracked.original_scheduled_at))
+    );
 }
 
 #[test]
@@ -190,7 +194,7 @@ async fn future_insert_during_scan_is_quiet_but_overdue_is_not_lost() {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
     // Feature: runtime-activity-timeouts, Property 17
-    // A wake is bounded by the full-pass interval and every active future deadline.
+    // A wake includes equality at millisecond precision (service/history/queues/queue_scheduled.go:298-300 @ v1.31.0).
     #[test]
     fn sleep_is_bounded_by_interval_and_active_future_deadlines(offsets in prop::collection::vec(1i64..100_000, 0..30), interval_ms in 1u64..100_000) {
         let now = OffsetDateTime::UNIX_EPOCH;
@@ -200,7 +204,7 @@ proptest! {
             let mut tracked = entry(now);
             tracked.timeouts.as_mut().unwrap().schedule_to_start = Some(Duration::milliseconds(offset));
             tracking.insert(tracked);
-            expected = expected.min(std::time::Duration::from_millis(offset as u64) + std::time::Duration::from_nanos(1));
+            expected = expected.min(std::time::Duration::from_millis(offset as u64));
         }
         prop_assert_eq!(tracking.scan_delay(now, std::time::Duration::from_millis(interval_ms)), expected);
     }
@@ -227,8 +231,13 @@ fn evaluation_uses_reloaded_attempt_anchors() {
                 "cached anchors must not authorize a timeout for the reloaded attempt"
             );
             assert_eq!(
+                // service/history/queues/queue_scheduled.go:298-300 @ v1.31.0.
                 evaluate_activity_timeout(&cached, &activity, base + Duration::seconds(60)),
-                None
+                Some(if started {
+                    TimeoutViolation::Heartbeat
+                } else {
+                    TimeoutViolation::ScheduleToStart
+                })
             );
             assert_eq!(
                 evaluate_activity_timeout(
@@ -246,13 +255,15 @@ fn evaluation_uses_reloaded_attempt_anchors() {
                 cached.last_heartbeat_at = Some(base + Duration::seconds(58));
                 activity.last_heartbeat_at = Some(base + Duration::seconds(59));
                 assert_eq!(
+                    // service/history/queues/queue_scheduled.go:298-300 @ v1.31.0.
                     evaluate_activity_timeout(&cached, &activity, base + Duration::seconds(69)),
-                    None
+                    Some(TimeoutViolation::Heartbeat)
                 );
                 cached.last_heartbeat_at = Some(base + Duration::seconds(60));
                 assert_eq!(
+                    // Equal deadlines use enum order (service/history/workflow/timer_sequence.go:394-425 @ v1.31.0).
                     evaluate_activity_timeout(&cached, &activity, base + Duration::seconds(70)),
-                    None
+                    Some(TimeoutViolation::StartToClose)
                 );
                 assert_eq!(
                     evaluate_activity_timeout(
@@ -260,7 +271,7 @@ fn evaluation_uses_reloaded_attempt_anchors() {
                         &activity,
                         base + Duration::seconds(70) + Duration::nanoseconds(1)
                     ),
-                    Some(TimeoutViolation::Heartbeat)
+                    Some(TimeoutViolation::StartToClose)
                 );
             }
         }
@@ -286,7 +297,8 @@ fn reload_replaces_superseded_attempt_cache() {
     );
     assert_eq!(
         activity_timeout_due_at(&cached),
-        Some(base + Duration::seconds(25) + Duration::nanoseconds(1))
+        // service/history/queues/queue_scheduled.go:298-300 @ v1.31.0.
+        Some(base + Duration::seconds(25))
     );
     activity.started_at = Some(base + Duration::seconds(21));
     activity.heartbeat_timeout = Some(Duration::seconds(1));
@@ -395,13 +407,11 @@ fn model_timeout_selection_table() {
 }
 
 #[test]
-#[ignore = "differs from v1.31.0: timeout equality is not due"]
 fn model_timeout_equal_deadline() {
     model_timeout_case(2, true, 0, 0);
 }
 
 #[test]
-#[ignore = "differs from v1.31.0: timeout due check does not truncate to milliseconds"]
 fn model_timeout_same_millisecond() {
     // service/history/queues/queue_scheduled.go:298-300 @ v1.31.0.
     let mut activity = sample_activity();
@@ -428,7 +438,6 @@ fn model_timeout_same_millisecond() {
 }
 
 #[test]
-#[ignore = "differs from v1.31.0: timeout selection uses fixed priority instead of earliest deadline"]
 fn model_timeout_earliest_deadline() {
     // service/history/workflow/timer_sequence.go:393-425 @ v1.31.0.
     let mut activity = sample_activity();
@@ -457,7 +466,6 @@ fn model_timeout_earliest_deadline() {
 }
 
 #[test]
-#[ignore = "differs from v1.31.0: equal timeout deadlines use fixed priority instead of enum order"]
 fn model_timeout_equal_deadlines_order() {
     // service/history/workflow/timer_sequence.go:417-425 @ v1.31.0.
     let mut activity = sample_activity();
@@ -491,5 +499,25 @@ proptest! {
     #[test]
     fn model_timeout_selection_generated(kind in 0usize..4, started in any::<bool>(), heartbeat in -100i64..100, after in any::<bool>()) {
         model_timeout_case(kind, started, heartbeat, if after { 1_000_000 } else { -1_000_000 });
+    }
+}
+
+#[test]
+fn timeout_precision_floors_pre_epoch_deadlines() {
+    // service/history/queues/queue_scheduled.go:298-300 and common/constants.go:46 @ v1.31.0.
+    let mut activity = sample_activity();
+    activity.started_at = Some(OffsetDateTime::UNIX_EPOCH - Duration::milliseconds(2));
+    activity.start_to_close_timeout = Some(Duration::nanoseconds(1_999_999));
+    for (nanos, due) in [
+        (-1_000_001, false),
+        (-1_000_000, true),
+        (-1, true),
+        (0, true),
+    ] {
+        let now = OffsetDateTime::from_unix_timestamp_nanos(nanos).unwrap();
+        assert_eq!(
+            evaluate_activity_timeout_with_heartbeat(&activity, None, now),
+            due.then_some(TimeoutViolation::StartToClose)
+        );
     }
 }

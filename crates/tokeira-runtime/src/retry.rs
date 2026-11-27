@@ -5,7 +5,74 @@
 //! how long to wait; it does not use the workflow defaulting function.
 
 use time::Duration;
+use tokeira_proto::enums::TimeoutType;
 use tokeira_types::RetryPolicy;
+
+/// Retry-relevant fields of the outer worker failure, or a server timeout.
+///
+/// Causes remain in the opaque history payload but never influence this decision
+/// (service/history/workflow/retry.go:56-68,115-151 @ v1.31.0). This is request
+/// data, not durable state; the edge preserves duration conversion semantics.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ActivityFailure {
+    /// Missing failures and unrecognized outer kinds are retryable.
+    #[default]
+    Other,
+    /// Cancellation failures never retry.
+    Canceled,
+    /// Termination failures never retry.
+    Terminated,
+    /// Preserve unknown enum values as well as the four named timeout kinds.
+    Timeout(i32),
+    /// Server failures ignore application-type exclusions.
+    Server {
+        /// Worker or payload-admission decision to end retries.
+        non_retryable: bool,
+    },
+    /// Application failures match the exact type, including an empty string.
+    Application {
+        /// Case-sensitive policy exclusion key.
+        error_type: String,
+        /// Worker decision to end retries before checking the retry budget.
+        non_retryable: bool,
+        /// Overrides both the interval and maximum, even when zero or negative.
+        next_retry_delay: Option<Duration>,
+    },
+}
+
+impl ActivityFailure {
+    /// Whether the outer failure permits retry under the policy's exclusions.
+    /// Schedule timeouts additionally carry terminal `RetryState::Timeout` in
+    /// the runtime (service/history/workflow/mutable_state_impl.go:6260-6269
+    /// @ v1.31.0).
+    pub fn is_retryable(&self, excluded: &[String]) -> bool {
+        // Only application and eligible timeout kinds consult the type list:
+        // service/history/workflow/retry.go:115-151 @ v1.31.0.
+        match self {
+            Self::Other => true,
+            Self::Canceled | Self::Terminated => false,
+            Self::Server { non_retryable } => !non_retryable,
+            Self::Application {
+                error_type,
+                non_retryable,
+                ..
+            } => !non_retryable && !excluded.contains(error_type),
+            Self::Timeout(kind) => {
+                let name = match TimeoutType::try_from(*kind) {
+                    Ok(TimeoutType::StartToClose) => "TemporalTimeout:StartToClose",
+                    Ok(TimeoutType::Heartbeat) => "TemporalTimeout:Heartbeat",
+                    _ => return false,
+                };
+                !excluded.iter().any(|candidate| candidate == name)
+            }
+        }
+    }
+
+    pub(crate) fn is_schedule_timeout(&self) -> bool {
+        matches!(self, Self::Timeout(kind) if matches!(TimeoutType::try_from(*kind),
+            Ok(TimeoutType::ScheduleToStart | TimeoutType::ScheduleToClose)))
+    }
+}
 
 /// Fill unset fields of a supplied workflow policy before creating a run.
 ///
@@ -51,8 +118,9 @@ pub enum RetryExhaustedReason {
     NonRetryableFailure,
     /// `maximum_attempts` was reached (`retry.go:96-98`).
     MaximumAttemptsReached,
-    /// The next attempt would begin strictly after the retry-expiration deadline
-    /// (schedule-to-close anchor; `service/history/workflow/retry.go:109 @ v1.31.0`).
+    /// The interval is nonpositive without a maximum, or the next attempt begins
+    /// strictly after retry expiration (service/history/workflow/retry.go:100-110
+    /// @ v1.31.0).
     Timeout,
 }
 
@@ -69,45 +137,48 @@ pub enum RetryDecision {
 }
 
 /// Evaluate whether a failed activity should be retried, mirroring
-/// `nextBackoffInterval` (`retry.go:70-113 @ v1.31.0`): non-retryable type →
-/// terminal; max attempts → terminal; next attempt past `expiration`
-/// (first-schedule + schedule-to-close) → terminal Timeout; otherwise retry
-/// after the exponential backoff.
+/// `nextBackoffInterval` (service/history/workflow/retry.go:70-113 @ v1.31.0):
+/// classify the outer failure, enforce the attempt limit, then test the interval
+/// and exact expiration. An application's requested delay replaces policy timing.
+/// The caller owns no-policy, cancel, schedule-timeout and pause precedence.
 pub fn evaluate_activity_retry(
     policy: &RetryPolicy,
     current_attempt: u32,
-    failure_error_type: Option<&str>,
-    failure_non_retryable: bool,
+    failure: &ActivityFailure,
     now: time::OffsetDateTime,
     expiration: Option<time::OffsetDateTime>,
 ) -> RetryDecision {
-    // A worker-flagged non-retryable failure never retries, regardless of the
-    // policy's non-retryable list (`isRetryable` checks
-    // `ApplicationFailureInfo.NonRetryable` before the type list,
-    // retry.go:139-147 @ v1.31.0).
-    if failure_non_retryable {
-        return RetryDecision::Exhausted {
-            reason: RetryExhaustedReason::NonRetryableFailure,
-        };
-    }
-    if let Some(error_type) = failure_error_type
-        && policy
-            .non_retryable_error_types
-            .iter()
-            .any(|candidate| candidate == error_type)
-    {
+    if !failure.is_retryable(&policy.non_retryable_error_types) {
         return RetryDecision::Exhausted {
             reason: RetryExhaustedReason::NonRetryableFailure,
         };
     }
 
-    if policy.maximum_attempts > 0 && current_attempt >= policy.maximum_attempts {
+    if policy.maximum_attempts > 0 && current_attempt.max(1) >= policy.maximum_attempts {
         return RetryDecision::Exhausted {
             reason: RetryExhaustedReason::MaximumAttemptsReached,
         };
     }
 
-    let backoff = compute_retry_backoff(policy, current_attempt);
+    // A requested delay replaces both interval and maximum after the attempt
+    // limit. Negative delays deliberately survive: a nonzero maximum replaces
+    // a nonpositive interval with itself (service/history/workflow/mutable_state_impl.go:6300-6317;
+    // service/history/workflow/retry.go:96-107 @ v1.31.0).
+    let (backoff, maximum) = match failure {
+        ActivityFailure::Application {
+            next_retry_delay: Some(delay),
+            ..
+        } => (*delay, *delay),
+        _ => (
+            compute_retry_backoff(policy, current_attempt),
+            policy.maximum_interval.unwrap_or_default(),
+        ),
+    };
+    if maximum.is_zero() && backoff <= Duration::ZERO {
+        return RetryDecision::Exhausted {
+            reason: RetryExhaustedReason::Timeout,
+        };
+    }
     // Equality permits retry (service/history/workflow/retry.go:109 @ v1.31.0).
     // Do not saturate this comparison: overflow past the latest stored date
     // is still after expiration, not equality with that date.
@@ -127,29 +198,84 @@ pub fn evaluate_activity_retry(
     }
 }
 
-/// Compute the backoff duration for a retry attempt
-/// using exponential backoff with an optional cap.
+/// Compute a nanosecond retry interval; zero maximum means uncapped.
+/// A nonzero maximum replaces both nonpositive and over-maximum results.
 pub fn compute_retry_backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
-    if policy.initial_interval.is_zero() {
-        return Duration::ZERO;
-    }
-
-    let coefficient = policy.backoff_coefficient.max(1.0);
-    let exponent = i32::try_from(attempt.saturating_sub(1)).unwrap_or(i32::MAX);
-    let millis = (policy.initial_interval.whole_milliseconds() as f64) * coefficient.powi(exponent);
-    let mut computed = Duration::milliseconds(millis.round() as i64);
-    if let Some(maximum) = policy.maximum_interval
-        && computed > maximum
+    // The interval domain is signed nanoseconds, including conversion of legacy
+    // stored inputs. Rust's float cast saturates overflow; this selects the
+    // saturating interpretation of the architecture-dependent Go conversion
+    // (common/backoff/retry.go:183-185 @ v1.31.0).
+    let initial = policy
+        .initial_interval
+        .whole_nanoseconds()
+        .clamp(i128::from(i64::MIN), i128::from(i64::MAX));
+    let nanos =
+        initial as f64 * integer_retry_power(policy.backoff_coefficient, attempt.saturating_sub(1));
+    let mut computed = Duration::nanoseconds((nanos as i64).max(0));
+    if let Some(maximum) = policy.maximum_interval.map(|maximum| {
+        Duration::nanoseconds(
+            maximum
+                .whole_nanoseconds()
+                .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64,
+        )
+    }) && !maximum.is_zero()
+        && (computed <= Duration::ZERO || computed > maximum)
     {
         computed = maximum;
     }
     computed
 }
 
+// Match Go's low-bit multiplication order so platform powf/powi rounding cannot
+// change the truncated nanosecond interval (common/backoff/retry.go:183-185
+// @ v1.31.0; Go src/math/pow.go:131-156 @ go1.26.2).
+fn integer_retry_power(mut factor: f64, mut exponent: u32) -> f64 {
+    let mut result = 1.0;
+    while exponent != 0 {
+        if exponent & 1 == 1 {
+            result *= factor;
+        }
+        factor *= factor;
+        exponent >>= 1;
+    }
+    result
+}
+
 #[cfg(test)]
 mod duration_tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn retry_backoff_matches_go_integer_power_rounding() {
+        // Expected intervals come from Go's math.Pow and the nanosecond conversion
+        // in common/backoff/retry.go:183-185 @ v1.31.0, without a maximum masking rounding.
+        let actual = [
+            (1.01, 4, Duration::seconds(1)),
+            (1.2, 4, Duration::seconds(1)),
+            (1.2, 6, Duration::seconds(1)),
+            (3.0, 35, Duration::nanoseconds(1)),
+        ]
+        .map(|(backoff_coefficient, attempt, initial_interval)| {
+            let policy = RetryPolicy {
+                initial_interval,
+                backoff_coefficient,
+                maximum_interval: None,
+                maximum_attempts: 0,
+                non_retryable_error_types: Vec::new(),
+            };
+            compute_retry_backoff(&policy, attempt).whole_nanoseconds()
+        });
+        assert_eq!(
+            actual,
+            [
+                1_030_300_999,
+                1_728_000_000,
+                2_488_320_000,
+                16_677_181_699_666_568,
+            ]
+        );
+    }
 
     #[test]
     fn activity_retry_expiration_is_inclusive() {
@@ -210,7 +336,13 @@ mod duration_tests {
             ),
         ] {
             assert_eq!(
-                evaluate_activity_retry(&policy, 1, None, false, now, expiration),
+                evaluate_activity_retry(
+                    &policy,
+                    1,
+                    &crate::retry::ActivityFailure::Other,
+                    now,
+                    expiration
+                ),
                 expected,
                 "{case}"
             );
@@ -236,9 +368,7 @@ mod duration_tests {
             let _ = crate::runtime::workflow_task::retry_backoff(&policy, attempt);
             let _ = evaluate_activity_retry(
                 &policy,
-                attempt,
-                None,
-                false,
+                attempt, &crate::retry::ActivityFailure::Other,
                 time::OffsetDateTime::UNIX_EPOCH,
                 Some(time::OffsetDateTime::UNIX_EPOCH.saturating_add(Duration::MAX)),
             );

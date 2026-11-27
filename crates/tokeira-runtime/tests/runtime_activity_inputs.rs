@@ -397,8 +397,7 @@ fn arb_scheduled() -> impl Strategy<Value = Scheduled> {
     })
 }
 
-/// Schedule `activity-{index}` with `scheduled`'s input and header. Retries are
-/// due at once, so a retried attempt is delivered without waiting.
+/// Schedule `activity-{index}` with `scheduled`'s input and header.
 fn schedule_generated(index: usize, scheduled: &Scheduled) -> WorkflowCommand {
     WorkflowCommand::ScheduleActivity {
         activity_id: format!("activity-{index}"),
@@ -409,7 +408,8 @@ fn schedule_generated(index: usize, scheduled: &Scheduled) -> WorkflowCommand {
         request_eager_execution: false,
         use_workflow_build_id: false,
         retry_policy: Some(RetryPolicy {
-            initial_interval: Duration::ZERO,
+            // A zero uncapped interval stops retries (service/history/workflow/retry.go:100-107 @ v1.31.0).
+            initial_interval: Duration::nanoseconds(1),
             backoff_coefficient: 1.0,
             maximum_interval: None,
             maximum_attempts: 0,
@@ -613,8 +613,7 @@ async fn deliver(
                     .fail_activity_task(
                         task.token,
                         Payload::new(b"retryable".to_vec()),
-                        None,
-                        false,
+                        tokeira_runtime::retry::ActivityFailure::Other,
                         None,
                         None,
                         RequestContext::unattributed(OffsetDateTime::now_utc()),
@@ -902,8 +901,7 @@ async fn take_steps(activities: &[Scheduled], steps: &[Step]) -> Result<()> {
                         .fail_activity_task(
                             token,
                             Payload::new(b"retryable".to_vec()),
-                            None,
-                            false,
+                            tokeira_runtime::retry::ActivityFailure::Other,
                             None,
                             None,
                             request,

@@ -821,8 +821,8 @@ pub struct RespondActivityTaskFailedRequest {
     pub namespace: String,
     pub task_token: Vec<u8>,
     pub failure: Payload,
-    pub failure_error_type: Option<String>,
-    pub is_non_retryable: bool,
+    /// Outer failure fields consumed by the runtime retry decision.
+    pub failure_classification: tokeira_runtime::retry::ActivityFailure,
     /// Progress the worker reports with the failure; a retry records it as a
     /// heartbeat (respondactivitytaskfailed/api.go:87-94 @ v1.31.0).
     pub last_heartbeat_details: Option<Payloads>,
@@ -839,8 +839,8 @@ pub struct RespondActivityTaskFailedByIdRequest {
     pub run_id: Option<String>,
     pub activity_id: String,
     pub failure: Payload,
-    pub failure_error_type: Option<String>,
-    pub is_non_retryable: bool,
+    /// Outer failure fields consumed by the runtime retry decision.
+    pub failure_classification: tokeira_runtime::retry::ActivityFailure,
     pub identity: String,
 }
 

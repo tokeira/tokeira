@@ -13,8 +13,7 @@ use tokeira_proto::{
 
 fn classification(failure: &Failure, excluded: &[String]) {
     // service/history/workflow/retry.go:115-151 @ v1.31.0.
-    let (kind, non_retryable) = activity_retry_classification(failure);
-    let actual = !non_retryable && kind.is_none_or(|kind| !excluded.contains(&kind));
+    let actual = activity_retry_classification(failure).is_retryable(excluded);
     assert_eq!(actual, model::retryable(Some(failure), excluded));
 }
 
@@ -64,7 +63,6 @@ fn model_failure_classification_table() {
 }
 
 #[test]
-#[ignore = "differs from v1.31.0: canceled and terminated worker failures are treated as retryable"]
 fn model_failure_canceled_and_terminated() {
     classification(
         &Failure {
@@ -87,7 +85,6 @@ fn model_failure_canceled_and_terminated() {
 }
 
 #[test]
-#[ignore = "differs from v1.31.0: nonretryable timeout kinds and excluded timeout types are treated as retryable"]
 fn model_failure_timeout_types() {
     for kind in [
         TimeoutType::Unspecified,
@@ -113,7 +110,6 @@ fn model_failure_timeout_types() {
 }
 
 #[test]
-#[ignore = "differs from v1.31.0: failure causes influence retryability instead of only the outer failure"]
 fn model_failure_does_not_classify_cause() {
     classification(
         &Failure {
@@ -125,7 +121,6 @@ fn model_failure_does_not_classify_cause() {
 }
 
 #[test]
-#[ignore = "differs from v1.31.0: empty application type is replaced by a sentinel"]
 fn model_failure_empty_type_matches_exactly() {
     classification(&application("", false), &[String::new()]);
 }

@@ -87,8 +87,18 @@ impl From<&ActivityState> for ActivityTimeouts {
     }
 }
 
-/// Earliest strict deadline, matching evaluation rather than choosing a violation.
-/// Unknown configuration requires one reload; a saturated deadline cannot expire.
+/// Floor a timeout deadline to the timer executor's millisecond precision.
+/// Euclidean division also floors dates before the Unix epoch, matching Go's
+/// Truncate (service/history/queues/queue_scheduled.go:286-300 and
+/// common/constants.go:46 @ v1.31.0).
+fn timeout_tick(at: OffsetDateTime) -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp_nanos(
+        at.unix_timestamp_nanos().div_euclid(1_000_000) * 1_000_000,
+    )
+    .expect("millisecond floor remains within the timestamp range")
+}
+
+/// Earliest timeout wake at executor precision; unknown options require a reload.
 fn activity_timeout_due_at(entry: &ActivityTrackingEntry) -> Option<OffsetDateTime> {
     let Some(timeouts) = entry.timeouts else {
         return Some(time::PrimitiveDateTime::MIN.assume_utc());
@@ -98,10 +108,8 @@ fn activity_timeout_due_at(entry: &ActivityTrackingEntry) -> Option<OffsetDateTi
     }
     let due = |anchor, timeout: Option<Duration>| {
         timeout
-            .filter(|timeout| !timeout.is_zero())
-            .and_then(|timeout| {
-                deadline_after(anchor, timeout).checked_add(Duration::nanoseconds(1))
-            })
+            .filter(|timeout| *timeout > Duration::ZERO)
+            .map(|timeout| timeout_tick(deadline_after(anchor, timeout)))
     };
     let close = due(entry.original_scheduled_at, timeouts.schedule_to_close);
     let attempt = if let Some(started) = entry.started_at {
@@ -606,16 +614,12 @@ impl Default for ActivityTimeoutScannerConfig {
 /// Its schedule and start anchors are authoritative; the cache can only extend a
 /// heartbeat deadline with a heartbeat at or after the reloaded start.
 ///
-/// Precedence is deliberate and matches the activity lifecycle:
-/// schedule-to-close bounds the whole activity and so is checked first; then, if
-/// the activity has started, heartbeat is checked before start-to-close (a
-/// heartbeat lapse is the tighter, more specific failure); if it has *not* started
-/// yet, only schedule-to-start applies. The heartbeat clock runs from the later
-/// of `started_at` and the last heartbeat, so the first interval is measured
-/// from start and a heartbeat from an earlier attempt never shortens it. A zero timeout never fires: v1.31.0 creates a timeout
-/// timer only for positive durations (`timer_sequence.go:268-271 @ v1.31.0`) —
-/// zero/unset means "no deadline" (the edge already normalizes present-zero
-/// SDK durations to `None`; the guards here are defense in depth).
+/// Choose the earliest active deadline, breaking ties by wire timeout enum order
+/// (service/history/workflow/timer_sequence.go:394-425 @ v1.31.0). Due times are
+/// inclusive at millisecond precision (service/history/queues/queue_scheduled.go:286-300 and
+/// common/constants.go:46 @ v1.31.0). Only the current attempt contributes timers;
+/// a heartbeat cannot move its anchor before that attempt's start.
+/// Zero/unset durations create no timer.
 pub fn evaluate_activity_timeout(
     entry: &ActivityTrackingEntry,
     activity: &ActivityState,
@@ -629,50 +633,55 @@ fn evaluate_activity_timeout_with_heartbeat(
     heartbeat_at: Option<OffsetDateTime>,
     now: OffsetDateTime,
 ) -> Option<TimeoutViolation> {
-    if let Some(timeout) = activity.schedule_to_close_timeout
-        && !timeout.is_zero()
-        && now > deadline_after(activity.scheduled_at, timeout)
-    {
-        return Some(TimeoutViolation::ScheduleToClose);
+    if activity.pause_info.is_some() {
+        return None;
     }
-
-    // Timers are derived from the current attempt, not the cached incarnation
-    // (service/history/timer_queue_active_task_executor.go:204-258,292-295;
-    // service/history/workflow/timer_sequence.go:229-257,291-355 @ v1.31.0).
-    if let Some(started_at) = activity.started_at {
-        if let Some(timeout) = activity.heartbeat_timeout
-            && !timeout.is_zero()
-        {
-            // The later of the attempt's start and the last heartbeat
-            // (`getActivityHeartbeatTimeout`, timer_sequence.go:341-351 @
-            // v1.31.0): a time restored from durable state may predate the
-            // current attempt, whose clock then runs from its start.
-            let heartbeat_at = heartbeat_at.unwrap_or(started_at).max(started_at);
-            if now > deadline_after(heartbeat_at, timeout) {
-                return Some(TimeoutViolation::Heartbeat);
-            }
-        }
-
-        if let Some(timeout) = activity.start_to_close_timeout
-            && !timeout.is_zero()
-            && now > deadline_after(started_at, timeout)
-        {
-            return Some(TimeoutViolation::StartToClose);
-        }
-    } else if let Some(timeout) = activity.schedule_to_start_timeout
-        && !timeout.is_zero()
-        && now
-            > deadline_after(
+    // Sorting exact deadlines before the due check preserves ordering even when
+    // several distinct deadlines fall in the same millisecond. Only one timer
+    // can resolve an attempt (service/history/timer_queue_active_task_executor.go:243-267,292-295
+    // @ v1.31.0); the commit rechecks this same choice against durable anchors.
+    let deadline = |anchor, timeout: Option<Duration>, kind| {
+        timeout
+            .filter(|timeout| *timeout > Duration::ZERO)
+            .map(|timeout| (deadline_after(anchor, timeout), kind))
+    };
+    let close = deadline(
+        activity.scheduled_at,
+        activity.schedule_to_close_timeout,
+        TimeoutViolation::ScheduleToClose,
+    );
+    let (start, execution, heartbeat) = match activity.started_at {
+        Some(started) => (
+            None,
+            deadline(
+                started,
+                activity.start_to_close_timeout,
+                TimeoutViolation::StartToClose,
+            ),
+            deadline(
+                heartbeat_at.unwrap_or(started).max(started),
+                activity.heartbeat_timeout,
+                TimeoutViolation::Heartbeat,
+            ),
+        ),
+        None => (
+            deadline(
                 activity
                     .current_attempt_scheduled_at
                     .unwrap_or(activity.scheduled_at),
-                timeout,
-            )
-    {
-        return Some(TimeoutViolation::ScheduleToStart);
-    }
-
-    None
+                activity.schedule_to_start_timeout,
+                TimeoutViolation::ScheduleToStart,
+            ),
+            None,
+            None,
+        ),
+    };
+    [close, start, execution, heartbeat]
+        .into_iter()
+        .flatten()
+        .min_by_key(|(at, kind)| (*at, proto_timeout_type(*kind) as i32))
+        .filter(|(at, _)| timeout_tick(*at) <= timeout_tick(now))
+        .map(|(_, kind)| kind)
 }
 
 /// Volatile evidence carried with a scanner mutation, never serialized with commands.
@@ -940,16 +949,10 @@ pub(crate) async fn scan_activity_timeouts_at<R: RunRepository + 'static>(
         // Timeout failures classify against the non-retryable list as
         // "TemporalTimeout:<type>" (`isRetryable`, retry.go:124-132 +
         // retrypolicy.TimeoutFailureTypePrefix @ v1.31.0).
-        let error_type = format!("TemporalTimeout:{}", timeout_type_name(violation));
         let retry_state = match activity_retry_decision(
             &activity,
             retry_policy.as_ref(),
-            Some(&error_type),
-            false,
-            matches!(
-                violation,
-                TimeoutViolation::ScheduleToStart | TimeoutViolation::ScheduleToClose
-            ),
+            &crate::retry::ActivityFailure::Timeout(proto_timeout_type(violation) as i32),
             now,
         ) {
             ActivityRetryDecision::Retry {
@@ -1353,7 +1356,7 @@ mod tests {
         }
 
         // Feature: activity-heartbeat-time, Property 6: The heartbeat deadline is
-        // v1.31.0's
+        // v1.31.0's inclusive timer comparison (service/history/queues/queue_scheduled.go:298-300 @ v1.31.0).
         #[test]
         fn property_heartbeat_deadline_runs_from_the_later_of_start_and_heartbeat(
             started_offset in -10_000i64..10_000,
@@ -1382,7 +1385,7 @@ mod tests {
             let anchor = last_heartbeat_at.map_or(started_at, |at| at.max(started_at));
             prop_assert_eq!(
                 evaluate_activity_timeout(&entry, &activity, now) == Some(TimeoutViolation::Heartbeat),
-                now - anchor > Duration::seconds(timeout_secs),
+                now - anchor >= Duration::seconds(timeout_secs),
             );
         }
 
@@ -1445,8 +1448,10 @@ mod tests {
         }
     }
 
+    // Feature: runtime-activity-timeouts, Property 11: equal deadlines follow timeout enum order.
+    // service/history/workflow/timer_sequence.go:394-425 @ v1.31.0.
     #[test]
-    fn schedule_to_close_takes_precedence() {
+    fn equal_deadlines_follow_timeout_enum_order() {
         let now = OffsetDateTime::now_utc();
         let entry = ActivityTrackingEntry {
             timeouts: None,
@@ -1467,7 +1472,7 @@ mod tests {
         activity.heartbeat_timeout = Some(Duration::seconds(1));
         assert_eq!(
             evaluate_activity_timeout(&entry, &activity, now),
-            Some(TimeoutViolation::ScheduleToClose)
+            Some(TimeoutViolation::StartToClose)
         );
     }
 }

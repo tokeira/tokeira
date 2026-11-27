@@ -388,6 +388,17 @@ impl From<anyhow::Error> for EdgeError {
                     .to_string(),
             );
         }
+        // Preserve the public code and message after the kernel's fenced check
+        // (service/history/consts/const.go:48-49 @ v1.31.0).
+        if let Some(tokeira_runtime::KernelRejected(
+            tokeira_kernel::Reject::ActivityCancelNotRequested,
+        )) = value.downcast_ref::<tokeira_runtime::KernelRejected>()
+        {
+            return Self::BadRequest(
+                "unable to mark activity as canceled without activity being request canceled first"
+                    .into(),
+            );
+        }
         if let Some(tokeira_runtime::KernelRejected(tokeira_kernel::Reject::UnknownActivity(
             activity,
         ))) = value.downcast_ref::<tokeira_runtime::KernelRejected>()

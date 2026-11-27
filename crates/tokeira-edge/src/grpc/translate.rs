@@ -71,6 +71,7 @@ use tokeira_runtime::{
     NewManagerIdentity, ScheduleError, SetCurrent, SetCurrentOutcome, SetManager,
     SetManagerOutcome, SetRamping, SetRampingOutcome, UpdateComputeConfig, UpdateMetadata,
     ValidateComputeConfig, VersionMetadataView, VersionView, cron_initial_backoff,
+    retry::ActivityFailure,
 };
 use tokeira_storage::{
     BuildId as DeploymentBuildId, ComputeConfig, ComputeConfigScalingGroup, ComputeProvider,
@@ -123,7 +124,6 @@ use tokeira_kernel::state::ParentClosePolicy;
 use tokeira_proto::public::temporal::api::command::v1::command::Attributes;
 
 const DEFAULT_STICKY_TTL: Duration = Duration::from_secs(30);
-const NON_RETRYABLE_ACTIVITY_SENTINEL: &str = "__tokeira_non_retryable__";
 // These are Temporal's v1.31.0 admission defaults, not deployment tuning:
 // `common/dynamicconfig/constants.go:988 @ v1.31.0`.
 const CALLBACK_URL_MAX_LENGTH: usize = 1000;
@@ -836,28 +836,34 @@ fn on_conflict_options_to_edge(
     }
 }
 
-fn activity_retry_classification(failure: &failure_proto::Failure) -> (Option<String>, bool) {
-    // A server failure retries unless it is marked non-retryable, as in
-    // v1.31.0's `isRetryable` (`service/history/workflow/retry.go:115-150 @
-    // v1.31.0`); the payload limits record such failures for oversized
-    // worker responses (`payload-admission-limits` criteria 2.5 and 2.7).
-    if let Some(failure_proto::failure::FailureInfo::ServerFailureInfo(info)) =
-        &failure.failure_info
-    {
-        return (None, info.non_retryable);
-    }
-    let mut cursor = Some(failure);
-    while let Some(current) = cursor {
-        if let Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(info)) =
-            &current.failure_info
-        {
-            let error_type = non_empty(info.r#type.clone())
-                .or_else(|| Some(NON_RETRYABLE_ACTIVITY_SENTINEL.to_string()));
-            return (error_type, info.non_retryable);
+fn activity_retry_classification(failure: &failure_proto::Failure) -> ActivityFailure {
+    // Only the outer failure is classified. Keep the exact application type and
+    // requested delay, including zero/negative values; causes belong to history
+    // (service/history/workflow/retry.go:56-68,115-151 @ v1.31.0).
+    match &failure.failure_info {
+        Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(info)) => {
+            ActivityFailure::Application {
+                error_type: info.r#type.clone(),
+                non_retryable: info.non_retryable,
+                next_retry_delay: proto_duration_value(info.next_retry_delay.as_ref()),
+            }
         }
-        cursor = current.cause.as_deref();
+        Some(failure_proto::failure::FailureInfo::TimeoutFailureInfo(info)) => {
+            ActivityFailure::Timeout(info.timeout_type)
+        }
+        Some(failure_proto::failure::FailureInfo::ServerFailureInfo(info)) => {
+            ActivityFailure::Server {
+                non_retryable: info.non_retryable,
+            }
+        }
+        Some(failure_proto::failure::FailureInfo::CanceledFailureInfo(_)) => {
+            ActivityFailure::Canceled
+        }
+        Some(failure_proto::failure::FailureInfo::TerminatedFailureInfo(_)) => {
+            ActivityFailure::Terminated
+        }
+        _ => ActivityFailure::Other,
     }
-    (None, false)
 }
 
 fn retry_policy_to_domain(value: &tokeira_proto::common::RetryPolicy) -> RetryPolicy {
@@ -6564,23 +6570,21 @@ pub fn respond_activity_completed_by_id_to_proto()
 pub fn respond_activity_failed_to_edge(
     req: workflowservice::RespondActivityTaskFailedRequest,
 ) -> Result<crate::translate::RespondActivityTaskFailedRequest, ProtoConversionError> {
-    let (failure, failure_error_type, is_non_retryable) = match req.failure {
+    let (failure, failure_classification) = match req.failure {
         Some(f) => {
-            let (error_type, non_retryable) = activity_retry_classification(&f);
-            (failure_to_payload(&f), error_type, non_retryable)
+            let classification = activity_retry_classification(&f);
+            (failure_to_payload(&f), classification)
         }
         None => (
             failure_to_payload(&failure_proto::Failure::default()),
-            None,
-            false,
+            ActivityFailure::Other,
         ),
     };
     Ok(crate::translate::RespondActivityTaskFailedRequest {
         namespace: req.namespace,
         task_token: req.task_token,
         failure,
-        failure_error_type,
-        is_non_retryable,
+        failure_classification,
         last_heartbeat_details: req.last_heartbeat_details.as_ref().map(payloads_to_domain),
         identity: req.identity,
     })
@@ -6595,15 +6599,14 @@ pub fn respond_activity_failed_to_proto() -> workflowservice::RespondActivityTas
 pub fn respond_activity_failed_by_id_to_edge(
     req: workflowservice::RespondActivityTaskFailedByIdRequest,
 ) -> Result<crate::translate::RespondActivityTaskFailedByIdRequest, ProtoConversionError> {
-    let (failure, failure_error_type, is_non_retryable) = match req.failure {
+    let (failure, failure_classification) = match req.failure {
         Some(f) => {
-            let (error_type, non_retryable) = activity_retry_classification(&f);
-            (failure_to_payload(&f), error_type, non_retryable)
+            let classification = activity_retry_classification(&f);
+            (failure_to_payload(&f), classification)
         }
         None => (
             failure_to_payload(&failure_proto::Failure::default()),
-            None,
-            false,
+            ActivityFailure::Other,
         ),
     };
     Ok(crate::translate::RespondActivityTaskFailedByIdRequest {
@@ -6612,8 +6615,7 @@ pub fn respond_activity_failed_by_id_to_edge(
         run_id: non_empty(req.run_id),
         activity_id: req.activity_id,
         failure,
-        failure_error_type,
-        is_non_retryable,
+        failure_classification,
         identity: req.identity,
     })
 }
@@ -10402,10 +10404,13 @@ mod tests {
             Some("temporal/failure+proto")
         );
         assert_eq!(
-            edge.failure_error_type.as_deref(),
-            Some("CustomActivityError")
+            edge.failure_classification,
+            ActivityFailure::Application {
+                error_type: "CustomActivityError".into(),
+                non_retryable: true,
+                next_retry_delay: None,
+            }
         );
-        assert!(edge.is_non_retryable);
         assert_eq!(edge.last_heartbeat_details, None);
     }
 

@@ -68,7 +68,7 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 
 #### Acceptance Criteria
 
-1. WHEN an activity has a configured heartbeat_timeout and the activity has been started and the elapsed time since the last heartbeat exceeds the heartbeat_timeout, THE Activity_Timeout_Scanner SHALL submit an `ActivityResolved` command with a `TimedOut` resolution (timeout_type "HEARTBEAT") to the owning run via the lane.
+1. WHEN an activity has a configured heartbeat_timeout and the activity has been started and its heartbeat deadline is due at millisecond precision, THE Activity_Timeout_Scanner SHALL consider that deadline for the ordered selection in criterion 6.2 and, if selected and terminal after retry evaluation, submit an `ActivityResolved` command with a `TimedOut` resolution (timeout_type "HEARTBEAT") to the owning run via the lane.
 2. WHEN an activity has a configured heartbeat_timeout and the activity has been started but no heartbeat has been received, THE Activity_Timeout_Scanner SHALL use the started_at timestamp as the baseline for heartbeat timeout detection.
 3. THE Activity_Timeout_Scanner SHALL check heartbeat timeouts only when the reloaded activity has a `started_at` timestamp, using that start and the later of its durable heartbeat and a cached heartbeat at or after that start (`service/history/workflow/timer_sequence.go:323-355 @ v1.31.0`).
 
@@ -80,7 +80,7 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 
 #### Acceptance Criteria
 
-1. WHEN the reloaded activity has a configured schedule_to_start_timeout and no `started_at` timestamp, and the elapsed time since that attempt's scheduled time exceeds the timeout, THE Activity_Timeout_Scanner SHALL submit an `ActivityResolved` command with a `TimedOut` resolution (timeout_type "SCHEDULE_TO_START") to the owning run via the lane. THE scheduled time SHALL be the reloaded `current_attempt_scheduled_at`, falling back to its original `scheduled_at` when absent (`service/history/workflow/timer_sequence.go:229-257 @ v1.31.0`).
+1. WHEN the reloaded activity has a configured schedule_to_start_timeout and no `started_at` timestamp, and that attempt's schedule-to-start deadline is due at millisecond precision, THE Activity_Timeout_Scanner SHALL consider that deadline for the ordered selection in criterion 6.2 and, if selected and terminal after retry evaluation, submit an `ActivityResolved` command with a `TimedOut` resolution (timeout_type "SCHEDULE_TO_START") to the owning run via the lane. THE scheduled time SHALL be the reloaded `current_attempt_scheduled_at`, falling back to its original `scheduled_at` when absent (`service/history/workflow/timer_sequence.go:229-257 @ v1.31.0`).
 2. THE Activity_Timeout_Scanner SHALL NOT check schedule-to-start timeout when the reloaded activity has a `started_at` timestamp, regardless of the cached start (`service/history/workflow/timer_sequence.go:239-242 @ v1.31.0`).
 
 ---
@@ -91,7 +91,7 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 
 #### Acceptance Criteria
 
-1. WHEN an activity has a configured start_to_close_timeout and the activity has a started_at timestamp and the elapsed time since started_at exceeds the timeout, THE Activity_Timeout_Scanner SHALL submit an `ActivityResolved` command with a `TimedOut` resolution (timeout_type "START_TO_CLOSE") to the owning run via the lane.
+1. WHEN an activity has a configured start_to_close_timeout and the activity has a started_at timestamp and its start-to-close deadline is due at millisecond precision, THE Activity_Timeout_Scanner SHALL consider that deadline for the ordered selection in criterion 6.2 and, if selected and terminal after retry evaluation, submit an `ActivityResolved` command with a `TimedOut` resolution (timeout_type "START_TO_CLOSE") to the owning run via the lane.
 2. THE Activity_Timeout_Scanner SHALL check start-to-close timeout only when the reloaded activity has a `started_at` timestamp, and SHALL measure it from that reloaded start, regardless of the cached start (`service/history/workflow/timer_sequence.go:291-321 @ v1.31.0`).
 
 ---
@@ -102,8 +102,8 @@ The authoritative specifications are [010-history-as-authority](../../../docs/ar
 
 #### Acceptance Criteria
 
-1. WHEN an activity has a configured schedule_to_close_timeout and the elapsed time since `original_scheduled_at` exceeds the timeout, THE Activity_Timeout_Scanner SHALL submit an `ActivityResolved` command with a `TimedOut` resolution (timeout_type "SCHEDULE_TO_CLOSE") to the owning run via the lane, regardless of whether the activity has been started.
-2. WHEN both schedule-to-close timeout and another timeout type (heartbeat, schedule-to-start, or start-to-close) fire for the same activity in the same scan cycle, THE Activity_Timeout_Scanner SHALL submit only the schedule-to-close timeout resolution.
+1. WHEN an activity has a configured schedule_to_close_timeout and its schedule-to-close deadline is due at millisecond precision, THE Activity_Timeout_Scanner SHALL consider that deadline for the ordered selection in criterion 6.2 and, if selected and terminal after retry evaluation, submit an `ActivityResolved` command with a `TimedOut` resolution (timeout_type "SCHEDULE_TO_CLOSE") to the owning run via the lane, regardless of whether the activity has been started.
+2. WHEN multiple activity timeouts are due in one scan, THE Activity_Timeout_Scanner SHALL choose the earliest exact deadline, breaking ties by timeout enum order: start-to-close, schedule-to-start, schedule-to-close, heartbeat (`service/history/workflow/timer_sequence.go:394-425 @ v1.31.0`). THE due comparison SHALL be `floor_ms(deadline) <= floor_ms(now)`, flooring before the Unix epoch too (`service/history/queues/queue_scheduled.go:286-300`; `common/constants.go:46 @ v1.31.0`). THE scanner and fenced commit recheck SHALL use the same comparison; retry expiration SHALL retain its exact strict-after comparison (`service/history/workflow/retry.go:109 @ v1.31.0`).
 
 ---
 

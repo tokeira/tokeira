@@ -3244,20 +3244,30 @@ pub(crate) mod tests {
 
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         assert_eq!(
-            evaluate_activity_retry(&policy, 1, None, false, now, None),
+            evaluate_activity_retry(&policy, 1, &crate::retry::ActivityFailure::Other, now, None),
             RetryDecision::Retry {
                 next_attempt: 2,
                 backoff: Duration::seconds(1),
             }
         );
         assert_eq!(
-            evaluate_activity_retry(&policy, 3, None, false, now, None),
+            evaluate_activity_retry(&policy, 3, &crate::retry::ActivityFailure::Other, now, None),
             RetryDecision::Exhausted {
                 reason: crate::retry::RetryExhaustedReason::MaximumAttemptsReached,
             }
         );
         assert_eq!(
-            evaluate_activity_retry(&policy, 1, Some("fatal"), false, now, None),
+            evaluate_activity_retry(
+                &policy,
+                1,
+                &crate::retry::ActivityFailure::Application {
+                    error_type: "fatal".into(),
+                    non_retryable: false,
+                    next_retry_delay: None
+                },
+                now,
+                None
+            ),
             RetryDecision::Exhausted {
                 reason: crate::retry::RetryExhaustedReason::NonRetryableFailure,
             }
@@ -3266,7 +3276,15 @@ pub(crate) mod tests {
         // type is not in the policy's list (`isRetryable` checks the flag
         // before the list, retry.go:139-147 @ v1.31.0).
         assert_eq!(
-            evaluate_activity_retry(&policy, 1, None, true, now, None),
+            evaluate_activity_retry(
+                &policy,
+                1,
+                &crate::retry::ActivityFailure::Server {
+                    non_retryable: true
+                },
+                now,
+                None
+            ),
             RetryDecision::Exhausted {
                 reason: crate::retry::RetryExhaustedReason::NonRetryableFailure,
             }
@@ -3277,8 +3295,7 @@ pub(crate) mod tests {
             evaluate_activity_retry(
                 &policy,
                 1,
-                None,
-                false,
+                &crate::retry::ActivityFailure::Other,
                 now,
                 Some(now + Duration::milliseconds(500))
             ),

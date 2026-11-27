@@ -716,8 +716,11 @@ impl Lifecycle {
                 .fail_activity_task(
                     retried.token,
                     Payload::new(b"transient".to_vec()),
-                    Some("Transient".to_owned()),
-                    false,
+                    tokeira_runtime::retry::ActivityFailure::Application {
+                        error_type: "Transient".to_owned(),
+                        non_retryable: false,
+                        next_retry_delay: None,
+                    },
                     None,
                     Some(WorkerIdentity("worker".to_owned())),
                     context("fail-1"),

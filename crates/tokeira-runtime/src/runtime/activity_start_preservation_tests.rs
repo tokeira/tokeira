@@ -215,7 +215,9 @@ proptest! {
         tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap().block_on(async {
             let fixture = Fixture::new(data, true, false, false).await;
             let first = fixture.poll().await;
-            fixture.runtime.fail_activity_task(first.token, Payload::new(Vec::new()), None, false, None, None, request_context(fixture.runtime.clock.now())).await.unwrap();
+            fixture.runtime.fail_activity_task(first.token, Payload::new(Vec::new()), crate::retry::ActivityFailure::Other, None, None, request_context(fixture.runtime.clock.now())).await.unwrap();
+            // A retry needs a positive interval (service/history/workflow/retry.go:100-107 @ v1.31.0).
+            tokio::time::advance(std::time::Duration::from_nanos(1)).await;
             let current = fixture.state().await;
             let task = activity_dispatch_task(current.run_key, &current, &current.activities["activity"]);
             prop_assert_eq!(task.attempt, fixture.request.offered.attempt + 1);
@@ -439,7 +441,9 @@ proptest! {
             let token = ActivityTaskToken { run_key: before.run_key, activity_id: "activity".into(), schedule_event_id: fixture.request.offered.schedule_event_id, attempt: 1, shard_epoch: epoch };
             let heartbeat = Payloads(vec![Payload::new(data)]);
             fixture.runtime.record_activity_heartbeat(token.clone(), Some(heartbeat.clone()), None).await.unwrap();
-            fixture.runtime.fail_activity_task(token, Payload::new(Vec::new()), None, false, None, None, request_context(fixture.runtime.clock.now())).await.unwrap();
+            fixture.runtime.fail_activity_task(token, Payload::new(Vec::new()), crate::retry::ActivityFailure::Other, None, None, request_context(fixture.runtime.clock.now())).await.unwrap();
+            // service/history/workflow/retry.go:100-107 @ v1.31.0 requires a positive retry interval.
+            tokio::time::advance(std::time::Duration::from_nanos(1)).await;
             if reset_heartbeat {
                 let now = fixture.runtime.clock.now();
                 fixture.runtime.reset_activities(before.run_key, ResetActivitiesRequest { target: ActivityControlTarget::All, reset_heartbeat: true, keep_paused: false, jitter: None, restore_original_options: false, request: request_context(now), now }).await.unwrap();

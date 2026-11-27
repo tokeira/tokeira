@@ -116,8 +116,11 @@ async fn retryable_activity_failure_redispatches_next_attempt() -> Result<()> {
         .fail_activity_task(
             first.token,
             Payload::new(b"boom".to_vec()),
-            Some("retryable".to_string()),
-            false,
+            tokeira_runtime::retry::ActivityFailure::Application {
+                error_type: "retryable".to_string(),
+                non_retryable: false,
+                next_retry_delay: None,
+            },
             None,
             None,
             RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
@@ -244,8 +247,11 @@ async fn retryable_activity_failure_preserves_versioned_queue() -> Result<()> {
         .fail_activity_task(
             first.token,
             Payload::new(b"boom".to_vec()),
-            Some("retryable".to_string()),
-            false,
+            tokeira_runtime::retry::ActivityFailure::Application {
+                error_type: "retryable".to_string(),
+                non_retryable: false,
+                next_retry_delay: None,
+            },
             None,
             None,
             RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
@@ -324,8 +330,11 @@ async fn non_retryable_activity_failure_submits_failed_resolution() -> Result<()
         .fail_activity_task(
             started.token,
             Payload::new(b"boom".to_vec()),
-            Some("fatal".to_string()),
-            false,
+            tokeira_runtime::retry::ActivityFailure::Application {
+                error_type: "fatal".to_string(),
+                non_retryable: false,
+                next_retry_delay: None,
+            },
             None,
             None,
             RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
@@ -642,6 +651,57 @@ async fn cancel_activity_task_emits_canceled_history_with_worker_identity() -> R
         .expect("activity should be pollable");
     let identity = WorkerIdentity("worker-a".to_string());
     let details = payloads("cancel-details");
+
+    // A worker may acknowledge only a requested cancellation
+    // (service/history/api/respondactivitytaskcanceled/api.go:81-95 @ v1.31.0).
+    let now = OffsetDateTime::now_utc();
+    runtime
+        .submit(
+            run_key,
+            Command::Signal(tokeira_kernel::SignalRequest {
+                signal_name: "cancel".into(),
+                input: Payloads::default(),
+                header: None,
+                links: Vec::new(),
+                request: RequestContext::unattributed(now),
+                now,
+            }),
+        )
+        .await?;
+    let task = runtime
+        .poll_workflow_task(
+            workflow_queue(namespace_id),
+            identity.clone(),
+            tokio::time::Duration::from_millis(5),
+        )
+        .await?
+        .expect("cancel task");
+    runtime
+        .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
+            token: task.token,
+            identity: identity.clone(),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky: None,
+            commands: vec![WorkflowCommand::RequestCancelActivity {
+                scheduled_event_id: started.token.schedule_event_id,
+            }],
+            eager_activities: Default::default(),
+            inline_workflow_task: None,
+            heartbeat: Default::default(),
+            force_new_workflow_task: false,
+            limits: Default::default(),
+            delivered_update_ids: Vec::new(),
+            request: RequestContext::unattributed(now),
+            now,
+            command_sizes: Vec::new(),
+        })
+        .await?;
 
     runtime
         .cancel_activity_task(
@@ -1193,8 +1253,11 @@ async fn retry_backoff_is_respected_by_reconciliation_and_recovery() -> Result<(
         .fail_activity_task(
             first.token,
             Payload::new(b"boom".to_vec()),
-            Some("retryable".to_string()),
-            false,
+            tokeira_runtime::retry::ActivityFailure::Application {
+                error_type: "retryable".to_string(),
+                non_retryable: false,
+                next_retry_delay: None,
+            },
             None,
             None,
             RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
@@ -1363,8 +1426,11 @@ async fn backoff_interval_rule_between_publication_and_start_pauses_durably() ->
         .fail_activity_task(
             first.token,
             Payload::new(b"boom".to_vec()),
-            Some("retryable".to_string()),
-            false,
+            tokeira_runtime::retry::ActivityFailure::Application {
+                error_type: "retryable".to_string(),
+                non_retryable: false,
+                next_retry_delay: None,
+            },
             None,
             None,
             RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),

@@ -199,14 +199,14 @@ async fn recovery<R: RunRepository + LeaseRepository + 'static>(
                 .fail_activity_task(
                     token,
                     Payload::new(Vec::new()),
-                    None,
-                    false,
+                    tokeira_runtime::retry::ActivityFailure::Other,
                     None,
                     None,
                     fresh_request(c.clock.now()),
                 )
                 .await
                 .unwrap();
+            c.clock.advance(1);
         } else {
             c.nodes[1].activity_faults.set_and_drain(fault).await;
             c.nodes[1]

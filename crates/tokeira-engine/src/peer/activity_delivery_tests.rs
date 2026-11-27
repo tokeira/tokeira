@@ -233,7 +233,8 @@ impl<R: RunRepository + LeaseRepository + 'static> Cluster<R> {
                 request_eager_execution: false,
                 use_workflow_build_id: false,
                 retry_policy: retry.then_some(RetryPolicy {
-                    initial_interval: time::Duration::ZERO,
+                    // Zero uncapped intervals stop retries (service/history/workflow/retry.go:100-107 @ v1.31.0).
+                    initial_interval: time::Duration::nanoseconds(1),
                     backoff_coefficient: 1.0,
                     maximum_interval: None,
                     maximum_attempts: 3,
@@ -573,14 +574,14 @@ async fn grpc_activity_first_retry_control_and_renewal() {
         .fail_activity_task(
             token,
             Payload::new(Vec::new()),
-            None,
-            false,
+            tokeira_runtime::retry::ActivityFailure::Other,
             None,
             None,
             fresh_request(c.clock.now()),
         )
         .await;
     assert!(failed.is_ok(), "failure transition: {failed:?}");
+    c.clock.advance(1);
     let current = current_incarnation(&c.state().await);
     let retry = c.admitted_for(0, &current).await;
     assert_eq!(retry.offer.task.attempt, 2, "retry push: {retry:?}");
@@ -609,8 +610,7 @@ async fn grpc_activity_first_retry_control_and_renewal() {
         .fail_activity_task(
             token,
             Payload::new(Vec::new()),
-            None,
-            false,
+            tokeira_runtime::retry::ActivityFailure::Other,
             None,
             None,
             fresh_request(now),

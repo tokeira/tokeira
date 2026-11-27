@@ -201,8 +201,7 @@ async fn retry_delivery(pause: bool) {
         .fail_activity_task(
             task.token,
             Payload::new(Vec::new()),
-            None,
-            false,
+            crate::retry::ActivityFailure::Other,
             None,
             None,
             RequestContext::unattributed(runtime.clock.now()),

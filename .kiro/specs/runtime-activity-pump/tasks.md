@@ -67,25 +67,25 @@ Add the activity task delivery pipeline to `tokeira-runtime`, completing the sec
 - [x] 3. Implement retry policy pure functions
   - [x] 3.1 Add `evaluate_activity_retry` and `compute_retry_backoff` in `tokeira/crates/tokeira-runtime/src/runtime.rs` (or a new `retry.rs`)
     - `RetryDecision` enum: `Retry { next_attempt: u32 }` or `Exhausted`
-    - `evaluate_activity_retry(policy, current_attempt, failure_error_type) -> RetryDecision`
+    - `evaluate_activity_retry(policy, current_attempt, failure, now, expiration) -> RetryDecision`
       - `Exhausted` when `maximum_attempts > 0 && current_attempt >= maximum_attempts`
-      - `Exhausted` when `failure_error_type` matches any entry in `non_retryable_error_types`
+      - `Exhausted` when the outer failure is non-retryable under Property 7, including exact empty-type matches
       - `Exhausted` with timeout reason when the capped next-attempt start is strictly after expiration; equality retries (`service/history/workflow/retry.go:105-112 @ v1.31.0`)
       - `Retry { next_attempt: current_attempt + 1 }` otherwise
       - `maximum_attempts == 0` removes the attempt limit but does not bypass expiration
     - `compute_retry_backoff(policy, attempt) -> Duration`
-      - Formula: `initial_interval * backoff_coefficient^(attempt - 1)`, capped at `maximum_interval`
-      - Defensive: clamp `backoff_coefficient` to `max(1.0, value)`, zero `initial_interval` produces zero backoff
+      - Arithmetic: compute `initial_interval * backoff_coefficient^(attempt - 1)` in floating-point nanoseconds, taking the power by repeated squaring from the lowest bit as Go's `math.Pow` does for a whole exponent (`src/math/pow.go:131-156 @ go1.26.2`), truncate with saturation into `0..=i64::MAX` nanoseconds, and treat a missing or zero maximum as uncapped. A nonzero maximum SHALL replace a nonpositive interval or an interval above that maximum (`common/backoff/retry.go:183-185`; `service/history/workflow/retry.go:100-107 @ v1.31.0`). Saturating positive float overflow selects the architecture-dependent conversion used by the behaviour model
+      - Preserve the coefficient; apply a nonzero maximum to a nonpositive interval, and reject a nonpositive uncapped interval as Timeout (`service/history/workflow/retry.go:100-107 @ v1.31.0`)
     - _Requirements: 5.5, 6.1, 6.2, 6.3, 6.4, 6.5_
 
   - [x] 3.2 Write property test: Retry-or-resolve decision
     - **Property 7: Retry-or-resolve decision**
-    - For any `(RetryPolicy, current_attempt, failure_error_type)`, verify `Exhausted` iff `(maximum_attempts > 0 && current_attempt >= maximum_attempts)` or error type matches `non_retryable_error_types` or the capped next-attempt start is strictly after expiration; `Retry` with `next_attempt = current_attempt + 1` otherwise, including equality at expiration; `maximum_attempts == 0` does not bypass expiration (`service/history/workflow/retry.go:105-112 @ v1.31.0`)
+    - Verify outer-failure classification, requested-delay override, attempt limit, nonpositive uncapped interval and exact expiration as specified in Property 7
     - **Validates: Requirements 5.3, 5.4, 5.6, 6.2, 6.3**
 
   - [x] 3.3 Write property test: Backoff computation
     - **Property 8: Backoff computation**
-    - For any `(RetryPolicy, attempt)`, verify result equals `min(initial_interval * backoff_coefficient^(attempt-1), maximum_interval)` when `maximum_interval` is set, or `initial_interval * backoff_coefficient^(attempt-1)` when not
+    - Verify signed-nanosecond precision, saturation, zero-as-uncapped semantics and nonpositive fallback as specified in Property 8
     - **Validates: Requirements 6.4, 6.5**
 
 - [x] 4. Checkpoint — Ensure all tests pass
@@ -151,7 +151,7 @@ Add the activity task delivery pipeline to `tokeira-runtime`, completing the sec
 
 - [x] 8. Implement `fail_activity_task` with retry logic
   - [x] 8.1 Implement `fail_activity_task` on `TokeiraRuntime`
-    - Accept `token: ActivityTaskToken`, `failure_message: String`, `failure_error_type: Option<String>`
+    - Accept `token: ActivityTaskToken`, `failure_message: String`, `failure_classification: ActivityFailure`
     - Validate token
     - Load activity's `RetryPolicy` from `ActivityState.retry_policy` (per-activity), falling back to `WorkflowState.retry_policy` (workflow-level) if not set
     - Call `evaluate_activity_retry` to decide retry vs exhausted

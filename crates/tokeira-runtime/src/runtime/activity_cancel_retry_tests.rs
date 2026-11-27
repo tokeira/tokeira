@@ -259,8 +259,11 @@ impl Fixture {
             .fail_activity_task(
                 self.token.clone(),
                 worker_failure(),
-                Some(error_type.into()),
-                non_retryable,
+                crate::retry::ActivityFailure::Application {
+                    error_type: error_type.into(),
+                    non_retryable,
+                    next_retry_delay: None,
+                },
                 None,
                 None,
                 RequestContext::unattributed(self.runtime.clock.now()),
@@ -434,8 +437,7 @@ async fn cancel_requested_worker_failure_ends_unlimited_retry_and_workflow_compl
             .fail_activity_task(
                 f.token.clone(),
                 worker_failure(),
-                None,
-                false,
+                crate::retry::ActivityFailure::Other,
                 None,
                 None,
                 RequestContext::unattributed(f.runtime.clock.now())
@@ -733,8 +735,11 @@ async fn failure_rule_fields(timeout: bool) {
             .fail_activity_task(
                 f.token.clone(),
                 failure.clone(),
-                Some("retryable".into()),
-                false,
+                crate::retry::ActivityFailure::Application {
+                    error_type: "retryable".into(),
+                    non_retryable: false,
+                    next_retry_delay: None,
+                },
                 None,
                 None,
                 RequestContext::unattributed(f.runtime.clock.now()),

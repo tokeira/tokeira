@@ -213,8 +213,7 @@ async fn retry_eligibility_deadline_wakes_one_hour_scanner() {
         .fail_activity_task(
             task.token,
             Payload::new(Vec::new()),
-            None,
-            false,
+            crate::retry::ActivityFailure::Other,
             None,
             None,
             RequestContext::unattributed(OffsetDateTime::now_utc()),

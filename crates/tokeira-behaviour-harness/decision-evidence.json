@@ -29,7 +29,7 @@
       "fix_commit": null,
       "run": {
         "rule_digest": "fc057f462e3b30db2a654640baebccac9c2ed57ab2ac76b30b8022ba8e506968",
-        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "junit_digest": "7151c29ef6dcb84cba4aa7f0dfc82f608d28ba1b9872c18a7d531869e0ebd3e6",
         "tests": {
           "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_cancel_command_generated": "passed",
           "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_cancel_command_table": "passed"
@@ -65,7 +65,7 @@
       "fix_commit": "b68c7a86",
       "run": {
         "rule_digest": "0fea3147020f7c99305a5a36895aaefe7d36d13cc3f2b60ac6a46af0e7136a8f",
-        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "junit_digest": "7151c29ef6dcb84cba4aa7f0dfc82f608d28ba1b9872c18a7d531869e0ebd3e6",
         "tests": {
           "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_cancel_response_requires_request": "passed",
           "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_heartbeat_and_cancel_response": "passed"
@@ -125,7 +125,7 @@
       "fix_commit": null,
       "run": {
         "rule_digest": "2686ea56628f35d6b8b48518713a638d1e0c6b1686a22bfd0d6197ac5dbfb21f",
-        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "junit_digest": "7151c29ef6dcb84cba4aa7f0dfc82f608d28ba1b9872c18a7d531869e0ebd3e6",
         "tests": {
           "tokeira-runtime::runtime::activity_cancel_retry_tests::first_heartbeat_timeout_preserves_absent_completion_and_starts_retry": "passed",
           "tokeira-runtime::runtime::activity_cancel_retry_tests::first_start_to_close_timeout_preserves_absent_completion_and_starts_retry": "passed",
@@ -171,7 +171,7 @@
       "fix_commit": "b68c7a86",
       "run": {
         "rule_digest": "b4871dac963ba8a5c2ecf5976c19384259a5ccdee17dd465d2e3dba27fa177c4",
-        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "junit_digest": "7151c29ef6dcb84cba4aa7f0dfc82f608d28ba1b9872c18a7d531869e0ebd3e6",
         "tests": {
           "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_retry_branch_table": "passed",
           "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_retry_interval_generated": "passed",
@@ -208,7 +208,7 @@
       "fix_commit": null,
       "run": {
         "rule_digest": "9be07fbb228f050e65a279e9bafa7dee38a5eea8a95886438c5d918ffb5ff0e5",
-        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "junit_digest": "7151c29ef6dcb84cba4aa7f0dfc82f608d28ba1b9872c18a7d531869e0ebd3e6",
         "tests": {
           "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_heartbeat_and_cancel_response": "passed",
           "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_heartbeat_generated": "passed"
@@ -263,7 +263,7 @@
       "fix_commit": "b68c7a86",
       "run": {
         "rule_digest": "51eed2011e2471cf8703cfc2b112d95fd0f719bdab5e8084e9aecaf5f7478fab",
-        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "junit_digest": "7151c29ef6dcb84cba4aa7f0dfc82f608d28ba1b9872c18a7d531869e0ebd3e6",
         "tests": {
           "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_options_generated": "passed",
           "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_options_interval_fits_signed_nanoseconds": "passed",
@@ -297,15 +297,50 @@
       "rpcs": [
         "/temporal.api.workflowservice.v1.WorkflowService/RespondWorkflowTaskCompleted"
       ],
-      "verdict": "agrees",
-      "reason": "Tables and generated inputs compare absent policy and zero/explicit admitted values. Gap: preservation of nonempty excluded-error lists is not directly compared.",
-      "fix_commit": null,
+      "verdict": "differed and fixed",
+      "reason": "The derived maximum was capped at 100 years even when one attempt skips Validate, and saturated where Go wraps. Duration conversion also lost seconds-product overflow when opposite-sign nanos brought the exact sum back into range. Tables and generated inputs now compare defaulting before validation across the protobuf duration domain and signed nanosecond boundaries. Gaps: nonempty excluded-error lists are not compared by this defaulting rule; one-attempt raw duration representation is normalized in the domain and cannot round-trip mismatched signs or values beyond signed nanoseconds; namespace-specific defaults and corpus calibration remain untested.",
+      "fix_commit": "421b0834",
       "run": {
-        "rule_digest": "c22d5ca7fbacc3988084e3917d30752bf9eddd86ccccf14e25811d7eb9b3642b",
-        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "rule_digest": "61e0f28ee9e32a021ad96858179edff049d82326c46947daf4dedfa2194800c8",
+        "junit_digest": "7151c29ef6dcb84cba4aa7f0dfc82f608d28ba1b9872c18a7d531869e0ebd3e6",
         "tests": {
           "tokeira-edge::grpc::translate::activity_model_tests::model_activity_policy_defaults_table": "passed",
           "tokeira-edge::grpc::translate::activity_model_tests::model_policy_defaults_generated": "passed"
+        }
+      }
+    },
+    {
+      "rule": "activity.policy-validation",
+      "counterparts": [
+        {
+          "path": "crates/tokeira-edge/src/grpc/translate.rs",
+          "item": "validate_activity_retry_policy"
+        }
+      ],
+      "tests": [
+        {
+          "crate_name": "tokeira-edge",
+          "file": "crates/tokeira-edge/src/grpc/activity_model_tests.rs",
+          "name": "grpc::translate::activity_model_tests::model_activity_policy_validation_table"
+        },
+        {
+          "crate_name": "tokeira-edge",
+          "file": "crates/tokeira-edge/src/grpc/activity_model_tests.rs",
+          "name": "grpc::translate::activity_model_tests::model_policy_validation_generated"
+        }
+      ],
+      "rpcs": [
+        "/temporal.api.workflowservice.v1.WorkflowService/RespondWorkflowTaskCompleted"
+      ],
+      "verdict": "differed and fixed",
+      "reason": "Tokeira validated supplied durations before defaulting and lacked coefficient, maximum-versus-initial, negative-attempt and timeout-type checks. Tables and generated inputs now compare ordered errors, caps and accepted normalized policies, including the one-attempt bypass and NaN. Gaps: one-attempt wire durations are normalized and saturated to signed nanoseconds, namespace-specific defaults and non-policy validation ordering are not compared, and corpus calibration remains absent. Two command-path examples are separate from these decision comparisons.",
+      "fix_commit": "421b0834",
+      "run": {
+        "rule_digest": "d8bfd26e462c0b085f27597b7280d886f84e0b5552af59dcc1fa64276de7a102",
+        "junit_digest": "7151c29ef6dcb84cba4aa7f0dfc82f608d28ba1b9872c18a7d531869e0ebd3e6",
+        "tests": {
+          "tokeira-edge::grpc::translate::activity_model_tests::model_activity_policy_validation_table": "passed",
+          "tokeira-edge::grpc::translate::activity_model_tests::model_policy_validation_generated": "passed"
         }
       }
     },
@@ -342,7 +377,7 @@
       "fix_commit": "b68c7a86",
       "run": {
         "rule_digest": "8b7cf46b010954748cf87be15408c4ded46970c7ac47b3891271c0b46ad4f607",
-        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "junit_digest": "7151c29ef6dcb84cba4aa7f0dfc82f608d28ba1b9872c18a7d531869e0ebd3e6",
         "tests": {
           "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_requested_delay_generated": "passed",
           "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_requested_delay_overrides_policy_cap": "passed"
@@ -373,7 +408,7 @@
       "fix_commit": null,
       "run": {
         "rule_digest": "071043cf0b05f5d2d3e86b04467e9433dba7c793a9c40f44c9fa61d1d900f466",
-        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "junit_digest": "7151c29ef6dcb84cba4aa7f0dfc82f608d28ba1b9872c18a7d531869e0ebd3e6",
         "tests": {
           "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_retry_branch_table": "passed"
         }
@@ -413,7 +448,7 @@
       "fix_commit": null,
       "run": {
         "rule_digest": "875b24931a9712976fb50dfee817be028eed10ad71e259bcc724318107f87036",
-        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "junit_digest": "7151c29ef6dcb84cba4aa7f0dfc82f608d28ba1b9872c18a7d531869e0ebd3e6",
         "tests": {
           "tokeira-runtime::runtime::activity_cancel_retry_tests::cancel_requested_retry_order_matches_temporal": "passed",
           "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_paused_spent_budget_and_timer_suppression": "passed",
@@ -470,7 +505,7 @@
       "fix_commit": "b68c7a86",
       "run": {
         "rule_digest": "066a06ca10a05156f8369002ddc373e755f07b25d2468fcdcca686e2e937e2e7",
-        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "junit_digest": "7151c29ef6dcb84cba4aa7f0dfc82f608d28ba1b9872c18a7d531869e0ebd3e6",
         "tests": {
           "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_retry_branch_table": "passed",
           "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_retry_generated": "passed",
@@ -534,7 +569,7 @@
       "fix_commit": "b68c7a86",
       "run": {
         "rule_digest": "4ace31b630acfa50ab435d9b2e98f0e4adf69e22c1deeac5daf6d0a0b927793b",
-        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "junit_digest": "7151c29ef6dcb84cba4aa7f0dfc82f608d28ba1b9872c18a7d531869e0ebd3e6",
         "tests": {
           "tokeira-edge::grpc::translate::activity_model_tests::model_failure_canceled_and_terminated": "passed",
           "tokeira-edge::grpc::translate::activity_model_tests::model_failure_classification_generated": "passed",
@@ -571,7 +606,7 @@
       "fix_commit": "b68c7a86",
       "run": {
         "rule_digest": "ea46c2100276cdd04a3d845a78cedb8b4f46e1b3b814ba6536cad3bf18266643",
-        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "junit_digest": "7151c29ef6dcb84cba4aa7f0dfc82f608d28ba1b9872c18a7d531869e0ebd3e6",
         "tests": {
           "tokeira-runtime::activity_timeout::deadline_tests::model_timeout_equal_deadline": "passed",
           "tokeira-runtime::activity_timeout::deadline_tests::model_timeout_same_millisecond": "passed"
@@ -609,7 +644,7 @@
       "fix_commit": "b68c7a86",
       "run": {
         "rule_digest": "c947c798463b81543168f4a53fff1e9f659e9bdac49190f7d3aaf1f9680abe7d",
-        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "junit_digest": "7151c29ef6dcb84cba4aa7f0dfc82f608d28ba1b9872c18a7d531869e0ebd3e6",
         "tests": {
           "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_schedule_to_start_close_tie_unpolled": "passed",
           "tokeira-runtime::runtime::activity_cancel_retry_tests::model_tests::model_timeout_result_generated": "passed",
@@ -663,7 +698,7 @@
       "fix_commit": "b68c7a86",
       "run": {
         "rule_digest": "99d453e5e6d91960da074eaf7da97d5d0f655b9de08df8a27e9128dbc0b2025b",
-        "junit_digest": "27e762a9558c1bd0e5351576f36e806b8e6362de40cc15069f40c3a3521bd727",
+        "junit_digest": "7151c29ef6dcb84cba4aa7f0dfc82f608d28ba1b9872c18a7d531869e0ebd3e6",
         "tests": {
           "tokeira-runtime::activity_timeout::deadline_tests::model_timeout_earliest_deadline": "passed",
           "tokeira-runtime::activity_timeout::deadline_tests::model_timeout_equal_deadlines_order": "passed",

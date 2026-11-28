@@ -185,8 +185,20 @@ pub(crate) fn proto_duration_value(
     value: Option<&prost_types::Duration>,
 ) -> Option<time::Duration> {
     value.map(|value| {
-        let nanos = i128::from(value.seconds) * 1_000_000_000 + i128::from(value.nanos);
-        time::Duration::nanoseconds(nanos.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64)
+        // AsDuration detects seconds overflow before adding nanos, even when
+        // opposite-sign nanos would bring the exact sum back into range
+        // (types/known/durationpb/duration.pb.go:171-187
+        // @ google.golang.org/protobuf v1.36.10, pinned by v1.31.0).
+        let nanos = value
+            .seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|seconds| seconds.checked_add(i64::from(value.nanos)))
+            .unwrap_or(if value.seconds < 0 {
+                i64::MIN
+            } else {
+                i64::MAX
+            });
+        time::Duration::nanoseconds(nanos)
     })
 }
 
@@ -897,40 +909,105 @@ fn retry_policy_from_domain(value: &RetryPolicy) -> tokeira_proto::common::Retry
     }
 }
 
-/// Materialize v1.31.0's default activity retry policy and fill unset subfields
-/// (`common/retrypolicy/retry_policy.go` `DefaultDefaultRetrySettings` + `EnsureDefaults`:
-/// InitialInterval 1s, BackoffCoefficient 2.0, MaximumInterval 100×InitialInterval,
-/// MaximumAttempts 0 = unlimited). Activities always carry a retry policy in v1.31.0, so the
-/// ScheduleActivity command records this even when the SDK omits one — unlike the generic
-/// `retry_policy_to_domain`, which defaults BackoffCoefficient to 1.0.
+/// Default the command's policy without validating or normalizing supplied wire fields.
+/// An absent policy becomes empty before EnsureDefaults, and validation follows it
+/// (service/history/api/command_attr_validator.go:99-110;
+/// chasm/lib/activity/validator.go:128-140 @ v1.31.0).
 fn activity_retry_policy_with_defaults(
-    proto: Option<&tokeira_proto::common::RetryPolicy>,
-) -> RetryPolicy {
-    let initial_interval = proto
-        .and_then(|p| retry_duration_to_time(p.initial_interval.as_ref(), p.maximum_attempts))
-        .filter(|interval| !interval.is_zero())
-        .unwrap_or(time::Duration::seconds(1));
-    let backoff_coefficient = proto
-        .map(|p| p.backoff_coefficient)
-        .filter(|coefficient| *coefficient > 0.0)
-        .unwrap_or(2.0);
-    let maximum_interval = proto
-        .and_then(|p| retry_duration_to_time(p.maximum_interval.as_ref(), p.maximum_attempts))
-        .filter(|interval| !interval.is_zero())
-        .unwrap_or(
-            initial_interval
-                .saturating_mul(100)
-                .min(time::Duration::seconds(3_153_600_000)),
-        );
-    RetryPolicy {
-        initial_interval,
-        backoff_coefficient,
-        maximum_interval: Some(maximum_interval),
-        maximum_attempts: proto.map(|p| p.maximum_attempts.max(0) as u32).unwrap_or(0),
-        non_retryable_error_types: proto
-            .map(|p| p.non_retryable_error_types.clone())
-            .unwrap_or_default(),
+    proto: Option<&proto_common::RetryPolicy>,
+) -> proto_common::RetryPolicy {
+    let mut policy = proto.cloned().unwrap_or_default();
+    let mut initial = proto_duration_value(policy.initial_interval.as_ref()).unwrap_or_default();
+    if initial.is_zero() {
+        initial = time::Duration::seconds(1);
+        policy.initial_interval = Some(to_proto_duration(initial));
     }
+    if proto_duration_value(policy.maximum_interval.as_ref())
+        .unwrap_or_default()
+        .is_zero()
+    {
+        // EnsureDefaults multiplies in Go's signed nanosecond domain after the
+        // saturating DurationValue conversion. Wrapping is observable both as a
+        // validation error and as recorded history when retries are disabled
+        // (common/retrypolicy/retry_policy.go:49-50,65-77 @ v1.31.0).
+        let maximum = (initial.whole_nanoseconds() as i64).wrapping_mul(100);
+        policy.maximum_interval = Some(to_proto_duration(time::Duration::nanoseconds(maximum)));
+    }
+    if policy.backoff_coefficient == 0.0 {
+        policy.backoff_coefficient = 2.0;
+    }
+    policy
+}
+
+/// Validate a defaulted command policy and return the values history must record.
+/// The order determines the first error and whether caps apply at all
+/// (common/retrypolicy/retry_policy.go:65-97 @ v1.31.0).
+fn validate_activity_retry_policy(
+    policy: proto_common::RetryPolicy,
+) -> Result<RetryPolicy, ProtoConversionError> {
+    let (initial_interval, maximum_interval) = if policy.maximum_attempts == 1 {
+        // Domain durations retain normalized nanoseconds, so raw mismatched-sign
+        // fields cannot round-trip even though this upstream exception accepts them.
+        (
+            proto_duration_value(policy.initial_interval.as_ref()).unwrap_or_default(),
+            proto_duration_value(policy.maximum_interval.as_ref()),
+        )
+    } else {
+        let interval = |name, value| {
+            validate_and_cap_proto_duration(value).map_err(|error| {
+                ProtoConversionError::InvalidArgument(format!(
+                    "invalid {name} set on retry policy: {error}"
+                ))
+            })
+        };
+        let initial = interval("InitialInterval", policy.initial_interval.as_ref())?;
+        if policy.backoff_coefficient < 1.0 {
+            return Err(ProtoConversionError::InvalidArgument(
+                "BackoffCoefficient cannot be less than 1 on retry policy.".into(),
+            ));
+        }
+        let maximum = interval("MaximumInterval", policy.maximum_interval.as_ref())?;
+        if maximum.is_positive() && maximum < initial {
+            return Err(ProtoConversionError::InvalidArgument(
+                "MaximumInterval cannot be less than InitialInterval on retry policy.".into(),
+            ));
+        }
+        if policy.maximum_attempts < 0 {
+            return Err(ProtoConversionError::InvalidArgument(
+                "MaximumAttempts cannot be negative on retry policy.".into(),
+            ));
+        }
+        for excluded in &policy.non_retryable_error_types {
+            if let Some(name) = excluded.strip_prefix("TemporalTimeout:") {
+                // TimeoutTypeFromString accepts canonical and shorthand names,
+                // but Validate excludes Unspecified. The server pins this parser
+                // in enums/v1/workflow.go-helpers.pb.go:199-217 @ go.temporal.io/api v1.62.8.
+                if !matches!(
+                    name,
+                    "StartToClose"
+                        | "ScheduleToStart"
+                        | "ScheduleToClose"
+                        | "Heartbeat"
+                        | "TIMEOUT_TYPE_START_TO_CLOSE"
+                        | "TIMEOUT_TYPE_SCHEDULE_TO_START"
+                        | "TIMEOUT_TYPE_SCHEDULE_TO_CLOSE"
+                        | "TIMEOUT_TYPE_HEARTBEAT"
+                ) {
+                    return Err(ProtoConversionError::InvalidArgument(format!(
+                        "Invalid timeout type value: {name}."
+                    )));
+                }
+            }
+        }
+        (initial, policy.maximum_interval.map(|_| maximum))
+    };
+    Ok(RetryPolicy {
+        initial_interval,
+        backoff_coefficient: policy.backoff_coefficient,
+        maximum_interval,
+        maximum_attempts: policy.maximum_attempts as u32,
+        non_retryable_error_types: policy.non_retryable_error_types,
+    })
 }
 
 /// Normalize a supplied workflow policy before history and runtime state consume it.
@@ -5269,17 +5346,19 @@ fn invalid_timer_duration(attrs: &command::StartTimerCommandAttributes) -> Optio
 fn invalid_activity_duration(
     attrs: &command::ScheduleActivityTaskCommandAttributes,
 ) -> Option<String> {
-    validate_retry_durations(attrs.retry_policy.as_ref())
-        .and_then(|()| {
-            validate_activity_durations(
-                attrs.schedule_to_close_timeout.as_ref(),
-                attrs.schedule_to_start_timeout.as_ref(),
-                attrs.start_to_close_timeout.as_ref(),
-                attrs.heartbeat_timeout.as_ref(),
-            )
-        })
-        .err()
-        .map(|error| error.to_string())
+    validate_activity_retry_policy(activity_retry_policy_with_defaults(
+        attrs.retry_policy.as_ref(),
+    ))
+    .and_then(|_| {
+        validate_activity_durations(
+            attrs.schedule_to_close_timeout.as_ref(),
+            attrs.schedule_to_start_timeout.as_ref(),
+            attrs.start_to_close_timeout.as_ref(),
+            attrs.heartbeat_timeout.as_ref(),
+        )
+    })
+    .err()
+    .map(|error| error.to_string())
 }
 
 fn invalid_child_workflow_duration(
@@ -5408,10 +5487,14 @@ pub fn proto_command_to_workflow_command(
                 header: attrs.header.as_ref().map(headers_to_domain),
                 request_eager_execution: attrs.request_eager_execution,
                 use_workflow_build_id: attrs.use_workflow_build_id,
-                // Activities always carry a retry policy in v1.31.0; default/ensure it here.
-                retry_policy: Some(activity_retry_policy_with_defaults(
-                    attrs.retry_policy.as_ref(),
-                )),
+                // The scheduled event records the validated policy, including caps
+                // (service/history/historybuilder/event_factory.go:228-245 @ v1.31.0).
+                retry_policy: Some(
+                    validate_activity_retry_policy(activity_retry_policy_with_defaults(
+                        attrs.retry_policy.as_ref(),
+                    ))
+                    .expect("command retry policy validated before translation"),
+                ),
                 deployment: None,
                 build_id: None,
                 schedule_to_close_timeout: activity_timeout_to_time(

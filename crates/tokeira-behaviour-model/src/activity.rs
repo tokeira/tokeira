@@ -1,8 +1,9 @@
 //! Observable workflow-activity decisions, independent of execution machinery.
 //!
 //! Timestamps are signed Unix nanoseconds within the protobuf timestamp domain.
-//! Durations use Temporal's signed 64-bit nanosecond domain. Arithmetic on absolute
-//! times uses i128 so adding any supported duration remains exact.
+//! Duration arithmetic uses Temporal's signed 64-bit nanosecond domain; admission
+//! retains wire fields until validation. Arithmetic on absolute times uses i128
+//! so adding any supported duration remains exact.
 
 use prost_types::Duration;
 use tokeira_proto::{
@@ -14,8 +15,14 @@ use tokeira_proto::{
 /// Protobuf duration converted to the saturated signed nanosecond domain used by Go.
 pub fn duration_ns(value: Option<&Duration>) -> i64 {
     value.map_or(0, |d| {
-        (i128::from(d.seconds) * 1_000_000_000 + i128::from(d.nanos))
-            .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+        // AsDuration retains seconds-product overflow even when opposite-sign
+        // nanos would bring the exact sum back into range. The server pins this
+        // dependency: types/known/durationpb/duration.pb.go:171-187
+        // @ google.golang.org/protobuf v1.36.10 (outside the source index).
+        d.seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|seconds| seconds.checked_add(i64::from(d.nanos)))
+            .unwrap_or(if d.seconds < 0 { i64::MIN } else { i64::MAX })
     })
 }
 
@@ -43,6 +50,73 @@ pub fn default_policy(mut policy: RetryPolicy) -> RetryPolicy {
         policy.backoff_coefficient = 2.0;
     }
     policy
+}
+
+/// Validate an already defaulted activity policy, retaining its recorded wire values.
+///
+/// Returns the InvalidArgument message at the first failed check. One attempt
+/// bypasses every check and cap; otherwise intervals above 100 years are capped.
+/// `common/retrypolicy/retry_policy.go:65-97 @ v1.31.0`.
+pub fn validate_policy(mut policy: RetryPolicy) -> Result<RetryPolicy, String> {
+    if policy.maximum_attempts == 1 {
+        return Ok(policy);
+    }
+    validate_interval(&mut policy.initial_interval)
+        .map_err(|error| format!("invalid InitialInterval set on retry policy: {error}"))?;
+    if policy.backoff_coefficient < 1.0 {
+        return Err("BackoffCoefficient cannot be less than 1 on retry policy.".into());
+    }
+    validate_interval(&mut policy.maximum_interval)
+        .map_err(|error| format!("invalid MaximumInterval set on retry policy: {error}"))?;
+    let maximum = duration_ns(policy.maximum_interval.as_ref());
+    if maximum > 0 && maximum < duration_ns(policy.initial_interval.as_ref()) {
+        return Err("MaximumInterval cannot be less than InitialInterval on retry policy.".into());
+    }
+    if policy.maximum_attempts < 0 {
+        return Err("MaximumAttempts cannot be negative on retry policy.".into());
+    }
+    for excluded in &policy.non_retryable_error_types {
+        if let Some(name) = excluded.strip_prefix("TemporalTimeout:") {
+            // The API module pinned by v1.31.0 accepts canonical and shorthand
+            // names, not numeric strings: enums/v1/workflow.go-helpers.pb.go:199-217
+            // @ go.temporal.io/api v1.62.8. This dependency is outside the source index.
+            if !matches!(
+                name,
+                "StartToClose"
+                    | "ScheduleToStart"
+                    | "ScheduleToClose"
+                    | "Heartbeat"
+                    | "TIMEOUT_TYPE_START_TO_CLOSE"
+                    | "TIMEOUT_TYPE_SCHEDULE_TO_START"
+                    | "TIMEOUT_TYPE_SCHEDULE_TO_CLOSE"
+                    | "TIMEOUT_TYPE_HEARTBEAT"
+            ) {
+                return Err(format!("Invalid timeout type value: {name}."));
+            }
+        }
+    }
+    Ok(policy)
+}
+
+// Wire signs must be checked before conversion loses their representation. The
+// upstream validator deliberately permits oversized durations and caps them;
+// protobuf validity alone is stricter (common/primitives/timestamp/duration.go:57-88
+// @ v1.31.0).
+fn validate_interval(value: &mut Option<Duration>) -> Result<(), &'static str> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if (value.seconds > 0 && value.nanos < 0) || (value.seconds < 0 && value.nanos > 0) {
+        return Err("duration has seconds and nanos with different signs");
+    }
+    let nanos = duration_ns(Some(value));
+    if nanos < 0 {
+        return Err("negative duration");
+    }
+    if nanos > 3_153_600_000_000_000_000 {
+        *value = duration(3_153_600_000_000_000_000);
+    }
+    Ok(())
 }
 
 /// Whether a failure permits retry, before policy, cancellation, and budget checks.
